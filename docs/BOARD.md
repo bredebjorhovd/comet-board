@@ -85,6 +85,14 @@ nearly verbatim — it never depended on herdr:
   `review.rs` minus the wake latch and busy-check, delivering over the
   command ledger via `Runtime::prompt`. See §H5 below for what was dropped
   and why the loop still converges.
+- `crates/proto/src/view/board.rs` — **new** (H7): the view's shared
+  derivations — `BoardState` (moved from `comet-board`, glyphs included),
+  `TaskRow` (moved, wire contract), plus `Filter`, `sections`,
+  `routes_present`/`filter_cycle`, `finished_today`, `row_metadata` — so the
+  TUI and the future gpui app derive the same rows.
+- `crates/tui/src/board.rs` + the board section of `crates/tui/src/render.rs` —
+  **new** (H7): the board pane (`B`), consuming `WatchBoard`, dispatching over
+  `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
 `DispatchTask {taskId, via?}` → `{chatId, cwd, attempt}`, `CancelTask
@@ -179,14 +187,25 @@ agent") — the agent conventions text depends on it. `wait` becomes a
 `agent-conventions.md` with names swapped (herdr-board → comet-board,
 pane → chat).
 
-### H7 — Board view in `comet-tui` (M–L, needs H2)
-A board pane in the TUI: sections in fixed order (blocked / working / ready /
-review / failed / done), glyph-carried state, `enter` to dispatch, the
-filter cycle. Row derivations belong in `comet_proto::view` so the gpui app
-can grow the same view later without divergence — that split is a comet
-architecture rule, not a suggestion. herdr-board's `ui/render.rs` and
-`ui/state.rs` are the reference for what rows say; its README documents every
-interaction's rationale.
+### H7 — Board view in `comet-tui` — **done**
+Landed as a board pane in `comet-tui` (`crates/tui/src/board.rs` + the board
+section of `render.rs`) plus the shared derivations in `crates/proto/src/view/board.rs`:
+- `B` swaps the main pane for the board and back; `esc`/`h`/`B` returns.
+- Sections in herdr-board's fixed order (blocked → working → ready → review →
+  failed → done), `done` folded and bounded to today; headers fold with `enter`.
+- Glyph-carried state — `▲ ● ▸ ✓ ✕ ·` — with the herdr-board colour mapping
+  (blocked/failed share red, working amber, review the accent) carried on
+  `Theme::board_state`, which survives `NO_COLOR` exactly as herdr's did.
+- `enter` dispatches a ready row (the operator's dispatch, so no `via`), opens
+  a working/blocked row's chat, and folds section headers.
+- The `f` / `/` / `F` filter cycle, with the `/` field replacing the footer and
+  the filter's label holding the header corner.
+- The derivations live in `comet_proto::view::board` — `Filter`, `sections`,
+  `routes_present`/`filter_cycle`, `finished_today`, `row_metadata`, plus the
+  state glyphs — so the gpui app can grow the same view later without
+  divergence, as the comet architecture rule requires. Two RFC-3339 timestamps
+  (`updated_at`, `started_at`) were added to `TaskRow` to feed them; the rest
+  of herdr-board's `list --json` contract is unchanged.
 
 ### H8 — Adopt, doctor, `init` — **done**
 Landed as `crates/board/src/{adopt,doctor,init}.rs` plus `apps/board-cli`

@@ -9,65 +9,15 @@
 //! ids now, and a contract that lies about what its ids address is worse than
 //! one that renames.
 
-use serde::{Deserialize, Serialize};
-
 use crate::config::{Route, RoutingConfig};
 use crate::db::Db;
 use crate::model::{BoardState, Task, UpstreamState};
 use crate::sync::route_context;
 
-/// One task, in the shape callers are promised.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskRow {
-    pub id: String,
-    pub identifier: String,
-    pub title: String,
-    pub state: String,
-    pub source: String,
-    pub url: String,
-    pub labels: Vec<String>,
-    /// False when no route matches, or when the issue is gone upstream: the
-    /// task is on the board but cannot be dispatched, and `dispatch` refuses it.
-    pub dispatchable: bool,
-    /// The issue behind this row no longer exists upstream. The row is kept for
-    /// the attempts on it; there is nothing left to work on.
-    pub gone: bool,
-    pub route: Option<String>,
-    /// The comet space (herdr's workspace — the config key keeps that name).
-    pub workspace: Option<String>,
-    pub runtime: Option<String>,
-    /// The live attempt's chat (herdr-board's `pane_id`).
-    pub chat_id: Option<String>,
-    /// Set on `review` rows, which is how a PR reaches an orchestrator.
-    pub pr_url: Option<String>,
-    pub pr_number: Option<i64>,
-    pub branch: Option<String>,
-    /// Parent task id when the board dispatched the releasing agent too. Null
-    /// on its own does **not** mean the operator: an orchestrating chat has no
-    /// attempt and so no task id — read `dispatched_by_chat` as well.
-    pub dispatched_by: Option<String>,
-    /// The chat the dispatch ran from, when an agent was in it (herdr-board's
-    /// `dispatched_by_pane`). Set for every agent-released row, and the address
-    /// a parent can be reached at. Both this and `dispatched_by` null means the
-    /// operator released it.
-    pub dispatched_by_chat: Option<String>,
-    /// How the most recent *ended* attempt ended: `done`, `failed`, `cancelled`
-    /// or `orphaned`. Null means no attempt has ever ended.
-    ///
-    /// This is what makes cancellation legible to a parent agent. `cancelled`
-    /// derives back to `ready` — deliberately, since the issue is still owed —
-    /// so without this field a child the operator killed is indistinguishable
-    /// from one that was never dispatched. Set even while a *newer* attempt is
-    /// live, so a retry does not erase how the previous one went.
-    pub last_outcome: Option<String>,
-    /// When that attempt ended (RFC 3339). Pairs with `last_outcome` so a
-    /// long-lived poller can tell a fresh cancellation from one it already saw.
-    pub last_outcome_at: Option<String>,
-    pub attempts: usize,
-    /// How many times the board closed this row's attempt and then found its
-    /// agent still working (herdr-board gh#34's honesty field).
-    pub reopened: i64,
-}
+/// The row shape itself lives in proto (`comet_proto::view::board`) so the
+/// viewports can deserialize `WatchBoard` items without depending on this
+/// crate; it is re-exported here because this crate owns the contract.
+pub use comet_proto::view::board::TaskRow;
 
 /// One task, in the shape callers are promised.
 ///
@@ -109,6 +59,8 @@ pub fn task_row(task: &Task, route: Option<&Route>) -> TaskRow {
         last_outcome_at: closed.and_then(|a| a.ended_at.clone()),
         attempts: task.attempts.len(),
         reopened: live.or(last).map(|a| a.reopened).unwrap_or(0),
+        updated_at: task.updated_at.clone(),
+        started_at: live.map(|a| a.started_at.clone()),
     }
 }
 

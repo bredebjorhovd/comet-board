@@ -13,6 +13,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
+    /// The board pane — replaces the main pane, not a third column.
+    Board,
     Transcript,
     Composer,
 }
@@ -21,7 +23,8 @@ impl Focus {
     /// Tab order.
     pub fn next(self) -> Self {
         match self {
-            Focus::Sidebar => Focus::Transcript,
+            Focus::Sidebar => Focus::Board,
+            Focus::Board => Focus::Transcript,
             Focus::Transcript => Focus::Composer,
             Focus::Composer => Focus::Sidebar,
         }
@@ -30,8 +33,9 @@ impl Focus {
     pub fn previous(self) -> Self {
         match self {
             Focus::Sidebar => Focus::Composer,
-            Focus::Transcript => Focus::Sidebar,
+            Focus::Transcript => Focus::Board,
             Focus::Composer => Focus::Transcript,
+            Focus::Board => Focus::Sidebar,
         }
     }
 }
@@ -42,6 +46,8 @@ pub enum Action {
     /// Leave the viewport. The engine keeps running.
     Quit,
     ToggleHelp,
+    /// Scroll the help screen, which is longer than a pane.
+    HelpScroll(isize),
     CloseOverlay,
     /// Open the context menu for the row under the cursor.
     ContextMenu,
@@ -97,6 +103,33 @@ pub enum Action {
     Send,
     Interrupt,
     Edit(Edit),
+
+    // Board
+    /// `B` — swap the main pane for the task board, and back.
+    ToggleBoard,
+    BoardUp,
+    BoardDown,
+    BoardPage(isize),
+    BoardTop,
+    BoardBottom,
+    /// `enter` on the board: dispatch a ready task, fold a section header, or
+    /// open a running task's chat.
+    BoardEnter,
+    /// `f` — the next route filter, then no route, then all.
+    BoardCycleFilter,
+    /// `/` — open the find field.
+    BoardFind,
+    /// `F` — clear whichever filter is on.
+    BoardClearFilter,
+    /// A keystroke aimed at the board's find field.
+    BoardFindType(char),
+    BoardFindBackspace,
+    /// `enter` on the find field: keep the query, close the field.
+    BoardFindAccept,
+    /// `esc` on the find field: clear it and close it.
+    BoardFindEscape,
+    /// `esc` / `h` / `B` from the board: back to the chat.
+    BoardClose,
 }
 
 /// A composer mutation. Separated from [`Action`] so the app can apply the whole
@@ -130,6 +163,23 @@ pub enum Edit {
 /// (quit, as in a shell); with text it would be a destructive surprise, so it
 /// is ignored.
 pub fn map(focus: Focus, overlay: bool, composer_empty: bool, key: KeyEvent) -> Option<Action> {
+    map_with(focus, overlay, composer_empty, false, false, key)
+}
+
+/// Like [`map`], plus whether the board's `/` field is open and swallowing the
+/// printable keys, and whether the overlay up is the help screen (whose list is
+/// longer than a pane and scrolls with `j`/`k`).
+///
+/// Split out so the event loop can pass the two live flags without the test
+/// suite having to repeat them everywhere. `map` keeps the three-flag shape.
+pub fn map_with(
+    focus: Focus,
+    overlay: bool,
+    composer_empty: bool,
+    board_typing: bool,
+    help: bool,
+    key: KeyEvent,
+) -> Option<Action> {
     // Terminals with the kitty keyboard protocol report releases too; acting on
     // both would double every keystroke.
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -140,7 +190,10 @@ pub fn map(focus: Focus, overlay: bool, composer_empty: bool, key: KeyEvent) -> 
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     if overlay {
-        return map_overlay(ctrl, alt, key);
+        return map_overlay(ctrl, alt, key, help);
+    }
+    if focus == Focus::Board {
+        return map_board(board_typing, key);
     }
 
     // ---- bindings that mean the same thing in every pane ----
@@ -175,6 +228,51 @@ pub fn map(focus: Focus, overlay: bool, composer_empty: bool, key: KeyEvent) -> 
         Focus::Composer => map_composer(ctrl, alt, composer_empty, key),
         Focus::Sidebar => map_sidebar(ctrl, shift, key),
         Focus::Transcript => map_transcript(ctrl, shift, key),
+        Focus::Board => unreachable!("board focus is routed to map_board"),
+    }
+}
+
+/// Keys while the board pane owns the keyboard.
+///
+/// `typing` is true while the `/` field is open: then the field takes every
+/// printable key and the navigation set shrinks to what closes or accepts it —
+/// the same shape as the composer, because the field is a line of text.
+fn map_board(typing: bool, key: KeyEvent) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if typing {
+        return match key.code {
+            KeyCode::Esc => Some(Action::BoardFindEscape),
+            KeyCode::Enter => Some(Action::BoardFindAccept),
+            KeyCode::Backspace => Some(Action::BoardFindBackspace),
+            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::BoardFindType(ch)),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Char('c') if ctrl => Some(Action::Quit),
+        KeyCode::Char('b') if ctrl => Some(Action::ToggleSidebar),
+        KeyCode::Tab => Some(Action::FocusNext),
+        KeyCode::BackTab => Some(Action::FocusPrevious),
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('?') => Some(Action::ToggleHelp),
+        KeyCode::Char('r') if !ctrl => Some(Action::Reconnect),
+        KeyCode::Char('B') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+            Some(Action::BoardClose)
+        }
+        KeyCode::Char('f') => Some(Action::BoardCycleFilter),
+        KeyCode::Char('/') => Some(Action::BoardFind),
+        KeyCode::Char('F') => Some(Action::BoardClearFilter),
+        KeyCode::Enter => Some(Action::BoardEnter),
+        KeyCode::Char('j') | KeyCode::Down => Some(Action::BoardDown),
+        KeyCode::Char('k') | KeyCode::Up => Some(Action::BoardUp),
+        KeyCode::Char('g') if !ctrl => Some(Action::BoardTop),
+        KeyCode::Char('G') => Some(Action::BoardBottom),
+        KeyCode::Home => Some(Action::BoardTop),
+        KeyCode::End => Some(Action::BoardBottom),
+        KeyCode::PageUp => Some(Action::BoardPage(-1)),
+        KeyCode::PageDown => Some(Action::BoardPage(1)),
+        _ => None,
     }
 }
 
@@ -182,7 +280,20 @@ pub fn map(focus: Focus, overlay: bool, composer_empty: bool, key: KeyEvent) -> 
 /// inside it, Esc dismisses, and printable characters go to its text input if
 /// it has one — otherwise they are swallowed, so a stray letter can't act on
 /// the shell behind the panel.
-fn map_overlay(ctrl: bool, alt: bool, key: KeyEvent) -> Option<Action> {
+///
+/// The help screen is the one exception: its list is longer than a 24-row pane
+/// has lines, so `j`/`k` scroll it instead of doing nothing, and the pickers'
+/// up/down step would be lost entirely without a way to reach the bottom rows.
+fn map_overlay(ctrl: bool, alt: bool, key: KeyEvent, help: bool) -> Option<Action> {
+    if help {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => return Some(Action::HelpScroll(1)),
+            KeyCode::Char('k') | KeyCode::Up => return Some(Action::HelpScroll(-1)),
+            KeyCode::PageUp => return Some(Action::HelpScroll(-5)),
+            KeyCode::PageDown => return Some(Action::HelpScroll(5)),
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Char('c') if ctrl => Some(Action::Quit),
         KeyCode::Esc => Some(Action::CloseOverlay),
@@ -252,6 +363,7 @@ fn map_sidebar(ctrl: bool, shift: bool, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Some(Action::NewSession),
         KeyCode::Char('e') => Some(Action::ToggleArchive),
         KeyCode::Char('A') => Some(Action::ToggleShowArchived),
+        KeyCode::Char('B') => Some(Action::ToggleBoard),
         KeyCode::Char('m') => Some(Action::ContextMenu),
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => Some(Action::Open),
         KeyCode::Char('i') => Some(Action::Focus(Focus::Composer)),
@@ -273,6 +385,7 @@ fn map_transcript(ctrl: bool, shift: bool, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('r') if !ctrl => Some(Action::Reconnect),
         KeyCode::Char('n') => Some(Action::NewSession),
         KeyCode::Char('A') => Some(Action::ToggleShowArchived),
+        KeyCode::Char('B') => Some(Action::ToggleBoard),
         KeyCode::Enter | KeyCode::Char('i') => Some(Action::Focus(Focus::Composer)),
         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => Some(Action::Focus(Focus::Sidebar)),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::ScrollDown(1)),
@@ -316,6 +429,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("A", "show or hide archived sessions"),
     ("Ctrl-X", "interrupt the running agent"),
     ("r", "reconnect now"),
+    ("B", "the task board (B again, esc, h: back)"),
+    ("enter", "board: dispatch a ready task"),
+    ("f / F", "board: cycle the route filter / clear it"),
+    ("/", "board: find as you type"),
     ("?", "this help"),
     ("q, Ctrl-C", "detach — the engine keeps running"),
 ];
@@ -511,9 +628,15 @@ mod tests {
 
     #[test]
     fn focus_cycles_both_ways() {
-        assert_eq!(Focus::Sidebar.next().next().next(), Focus::Sidebar);
+        assert_eq!(Focus::Sidebar.next().next().next().next(), Focus::Sidebar);
         assert_eq!(Focus::Sidebar.previous(), Focus::Composer);
-        for focus in [Focus::Sidebar, Focus::Transcript, Focus::Composer] {
+        assert_eq!(Focus::Transcript.previous(), Focus::Board);
+        for focus in [
+            Focus::Sidebar,
+            Focus::Board,
+            Focus::Transcript,
+            Focus::Composer,
+        ] {
             assert_eq!(focus.next().previous(), focus);
         }
     }
@@ -528,5 +651,107 @@ mod tests {
             map(Focus::Transcript, false, true, press(KeyCode::Esc)),
             Some(Action::Focus(Focus::Sidebar))
         );
+    }
+
+    #[test]
+    fn the_board_owns_its_keys() {
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('j'))),
+            Some(Action::BoardDown)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('k'))),
+            Some(Action::BoardUp)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Enter)),
+            Some(Action::BoardEnter)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('f'))),
+            Some(Action::BoardCycleFilter)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('/'))),
+            Some(Action::BoardFind)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('F'))),
+            Some(Action::BoardClearFilter)
+        );
+        for closer in [
+            press(KeyCode::Char('B')),
+            press(KeyCode::Esc),
+            press(KeyCode::Char('h')),
+            press(KeyCode::Left),
+        ] {
+            assert_eq!(map(Focus::Board, false, true, closer), Some(Action::BoardClose));
+        }
+        // `q` still quits, `?` still reaches help.
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('q'))),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char('?'))),
+            Some(Action::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn the_board_find_field_takes_the_letters_while_it_is_open() {
+        let typing = true;
+        // Letters go to the query, not to the board.
+        assert_eq!(
+            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Char('f'))),
+            Some(Action::BoardFindType('f')),
+            "with the field open, f must not filter"
+        );
+        assert_eq!(
+            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Char('q'))),
+            Some(Action::BoardFindType('q')),
+            "q must not quit while finding"
+        );
+        assert_eq!(
+            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Backspace)),
+            Some(Action::BoardFindBackspace)
+        );
+        assert_eq!(
+            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Enter)),
+            Some(Action::BoardFindAccept)
+        );
+        assert_eq!(
+            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Esc)),
+            Some(Action::BoardFindEscape)
+        );
+        // Control chords are still dropped rather than typed.
+        assert_eq!(map_with(Focus::Board, false, true, typing, false, ctrl('p')), None);
+    }
+
+    #[test]
+    fn b_toggles_the_board_from_the_chat_panes() {
+        for focus in [Focus::Sidebar, Focus::Transcript] {
+            assert_eq!(
+                map(focus, false, true, press(KeyCode::Char('B'))),
+                Some(Action::ToggleBoard),
+                "{focus:?} must open the board"
+            );
+        }
+        // Not in the composer, where capital letters are input.
+        assert_eq!(
+            map(Focus::Composer, false, false, press(KeyCode::Char('B'))),
+            Some(Action::Edit(Edit::Insert('B')))
+        );
+    }
+
+    #[test]
+    fn board_focus_cycles_through_the_tab_order() {
+        assert_eq!(Focus::Sidebar.next(), Focus::Board);
+        assert_eq!(Focus::Board.next(), Focus::Transcript);
+        assert_eq!(Focus::Composer.previous(), Focus::Transcript);
+        assert_eq!(Focus::Board.previous(), Focus::Sidebar);
+        for focus in [Focus::Sidebar, Focus::Board, Focus::Transcript, Focus::Composer] {
+            assert_eq!(focus.next().previous(), focus);
+        }
     }
 }

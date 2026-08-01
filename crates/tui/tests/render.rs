@@ -343,7 +343,6 @@ fn the_help_overlay_covers_the_body_and_lists_the_real_bindings() {
     app.act(Action::ToggleHelp);
     let screen = joined(&snapshot(&mut app, 96, 30));
     assert!(screen.contains("Keys"), "{screen}");
-    assert!(screen.contains("detach"), "{screen}");
     // A modal, not a floating panel: no transcript survives beside it, which is
     // what made it look like a rendering fault.
     assert!(
@@ -357,10 +356,36 @@ fn the_help_overlay_covers_the_body_and_lists_the_real_bindings() {
     // The tab strip still names the sessions; only the body is covered.
     assert!(screen.contains("Rework the diff"), "{screen}");
     // Every entry comes from the keymap's own table, so the overlay cannot drift
-    // from the bindings.
+    // from the bindings. The reference is longer than the pane, so the bottom
+    // entries — including detach — need a scroll to be seen.
     for (key, _) in comet_tui::keys::HELP.iter().take(3) {
         assert!(screen.contains(key.trim()), "missing {key:?} in:\n{screen}");
     }
+    for _ in 0..12 {
+        app.act(Action::HelpScroll(1));
+    }
+    let scrolled = joined(&snapshot(&mut app, 96, 30));
+    assert!(scrolled.contains("detach"), "at the bottom:\n{scrolled}");
+}
+
+#[test]
+fn the_help_overlay_scrolls_with_jk_and_says_so() {
+    let mut app = populated();
+    app.act(Action::ToggleHelp);
+    // The reference binds more keys than a 30-row pane has lines for; the
+    // bottom entries are off-screen and the marker says they exist.
+    let top = joined(&snapshot(&mut app, 96, 30));
+    assert!(top.contains("↓"), "the overflow marker is missing:\n{top}");
+    let board_visible = comet_tui::keys::HELP.iter().any(|(k, _)| top.contains(k.trim()));
+    assert!(!board_visible || top.contains("board"), "no marker:\n{top}");
+
+    // Scrolling down reaches the board keys and, further, the detach binding.
+    for _ in 0..8 {
+        app.act(Action::HelpScroll(1));
+    }
+    let scrolled = joined(&snapshot(&mut app, 96, 30));
+    assert!(scrolled.contains("task board"), "{scrolled}");
+    assert!(scrolled.contains("↑"), "the upward marker is missing:\n{scrolled}");
 }
 
 #[test]
@@ -2057,4 +2082,160 @@ fn a_space_that_is_not_a_checkout_has_no_footer_at_all() {
     app.apply(Update::Spaces(vec![plain]));
     app.activate_space("s1".into());
     assert!(app.composer_footer().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Board
+// ---------------------------------------------------------------------------
+
+fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_proto::view::board::TaskRow {
+    use comet_proto::view::board::TaskRow;
+    TaskRow {
+        id: id.into(),
+        identifier: format!("gh#{id}"),
+        title: format!("Fix the thing in {id}"),
+        state: state.as_str().into(),
+        source: "github".into(),
+        url: format!("https://github.com/o/r/issues/{id}"),
+        labels: vec![],
+        dispatchable: true,
+        gone: false,
+        route: Some("offhand".into()),
+        workspace: Some("offhand".into()),
+        runtime: Some("claude-code".into()),
+        chat_id: None,
+        pr_url: None,
+        pr_number: Some(9),
+        branch: Some("board/gh-x".into()),
+        dispatched_by: None,
+        dispatched_by_chat: None,
+        last_outcome: None,
+        last_outcome_at: None,
+        attempts: 0,
+        reopened: 0,
+        updated_at: Utc::now().to_rfc3339(),
+        started_at: None,
+    }
+}
+
+/// A signed-in app with the board open and a few rows on it.
+fn boarded() -> App {
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    let mut review = board_row("3", comet_proto::view::board::BoardState::Review);
+    review.branch = None;
+    app.apply(Update::Board(vec![
+        board_row("1", comet_proto::view::board::BoardState::Ready),
+        board_row("2", comet_proto::view::board::BoardState::Working),
+        review,
+        board_row("4", comet_proto::view::board::BoardState::Blocked),
+    ]));
+    app
+}
+
+#[test]
+fn the_board_shows_sections_in_fixed_order_with_glyph_carried_state() {
+    let mut app = boarded();
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+
+    // Sections in fixed order, done folded by default.
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{screen}"))
+    };
+    let (blocked, working, ready, review) = (
+        at("BLOCKED"),
+        at("WORKING"),
+        at("READY"),
+        at("REVIEW"),
+    );
+    assert!(
+        blocked < working && working < ready && ready < review,
+        "sections must keep board order:\n{screen}"
+    );
+
+    // The glyphs carry the state — the same six shapes herdr-board uses, so the
+    // board survives colour being stripped.
+    for glyph in ['▲', '●', '▸', '✓'] {
+        assert!(screen.contains(glyph), "glyph {glyph:?} missing:\n{screen}");
+    }
+
+    // Rows say what herdr-board rows say: identifier, title, and a metadata
+    // block naming where the work is.
+    assert!(screen.contains("gh#1"), "{screen}");
+    assert!(screen.contains("Fix the thing in 1"), "{screen}");
+    assert!(screen.contains("offhand"), "{screen}");
+
+    // The header names the pane and the footer offers the board's keys.
+    assert!(screen.contains("board"), "{screen}");
+    assert!(screen.contains("filter"), "{screen}");
+}
+
+#[test]
+fn a_selected_ready_row_offers_dispatch_in_the_footer() {
+    let mut app = boarded();
+    app.board.selected = Some("1".into());
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+    assert!(screen.contains("enter dispatch"), "{screen}");
+    assert!(screen.contains("[enter to dispatch]"), "{screen}");
+
+    // Enter actually dispatches.
+    let effects = app.act(Action::BoardEnter);
+    match effects.first() {
+        Some(comet_tui::link::Command::Dispatch { task_id, .. }) => assert_eq!(task_id, "1"),
+        other => panic!("expected a Dispatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_board_render_pane_is_the_main_pane_not_a_third_column() {
+    let mut app = boarded();
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+    // The sidebar survives…
+    assert!(screen.contains("Sessions"), "{screen}");
+    // …but the chat body is gone: no transcript, no composer.
+    assert!(
+        !screen.contains("why is the room test flaky?"),
+        "the board replaced the transcript:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Do anything"),
+        "the composer gave way too:\n{screen}"
+    );
+}
+
+#[test]
+fn the_board_stays_glyph_readable_under_no_color() {
+    let mut app = boarded();
+    app.theme = Theme::plain();
+    let screen = joined(&snapshot(&mut app, 100, 26));
+    // No hue means no way to tell blocked from failed except the glyph — which
+    // is why the shapes are distinct.
+    for glyph in ['▲', '●', '▸', '✓'] {
+        assert!(screen.contains(glyph), "{glyph:?} must survive NO_COLOR:\n{screen}");
+    }
+}
+
+#[test]
+fn clicking_a_board_row_selects_it() {
+    let mut app = boarded();
+    let (x, y) = cell_of(&mut app, 100, 26, "Fix the thing in 2");
+    app.click(x, y);
+    assert_eq!(app.board.selected.as_deref(), Some("2"));
+    assert_eq!(app.focus, Focus::Board);
+}
+
+#[test]
+fn the_board_find_field_counts_matches_as_you_type() {
+    let mut app = boarded();
+    app.act(Action::BoardFind);
+    let screen = joined(&snapshot(&mut app, 100, 26));
+    assert!(screen.contains("4 rows"), "the count before typing:\n{screen}");
+    app.act(Action::BoardFindType('2'));
+    let screen = joined(&snapshot(&mut app, 100, 26));
+    assert!(screen.contains("1 row"), "the count after typing:\n{screen}");
 }

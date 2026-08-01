@@ -21,11 +21,13 @@ use comet_proto::view::{
     self, CheckoutKind, CheckoutPlan, ConnectionStatus, GatePhase, Indicator, display_status,
     format_time_ago,
 };
+use comet_proto::view::board::BoardState;
 use comet_proto::{
     AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, Space,
 };
 use comet_rpc::methods;
 
+use crate::board::Board;
 use crate::composer::Composer;
 use crate::daemon::Attachment;
 use crate::keys::{Action, Edit, Focus};
@@ -189,6 +191,8 @@ pub enum Hit {
     NewSession,
     /// The `+` on the Spaces header.
     AddSpace,
+    /// A board row, by index into the lines the last render drew.
+    BoardRow(usize),
     /// One of the composer's chips.
     Chip(ChipKind),
     /// A pane, which takes focus.
@@ -381,6 +385,14 @@ pub struct App {
     pub transcript: Transcript,
     pub composer: Composer,
     pub help: bool,
+    /// Where the help overlay is scrolled to. Its list is longer than a pane,
+    /// and a reference that silently stops halfway is how keys stay unknown.
+    pub help_scroll: usize,
+    /// The board pane: the derivations come from `comet_proto::view::board`,
+    /// the interaction state lives here. `board_open` decides whether the main
+    /// pane is the board at all.
+    pub board: Board,
+    pub board_open: bool,
     /// The one floating panel, if any.
     pub overlay: Option<Overlay>,
     pub notice: Option<Notice>,
@@ -447,6 +459,9 @@ impl App {
             transcript: Transcript::new(),
             composer: Composer::default(),
             help: false,
+            help_scroll: 0,
+            board: Board::new(),
+            board_open: false,
             overlay: None,
             notice: None,
             started: std::time::Instant::now(),
@@ -568,6 +583,10 @@ impl App {
                 self.notify(text);
                 Vec::new()
             }
+            Update::Board(rows) => {
+                self.board.set_rows(rows);
+                Vec::new()
+            }
             Update::SendFailed {
                 chat_id,
                 message_id,
@@ -600,6 +619,11 @@ impl App {
             }
             Action::ToggleHelp => {
                 self.help = !self.help;
+                self.help_scroll = 0;
+                Vec::new()
+            }
+            Action::HelpScroll(delta) => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(delta);
                 Vec::new()
             }
             Action::CloseOverlay => {
@@ -725,6 +749,67 @@ impl App {
                 self.edit(edit);
                 Vec::new()
             }
+
+            // Board
+            Action::ToggleBoard => {
+                self.toggle_board();
+                Vec::new()
+            }
+            Action::BoardClose => {
+                self.close_board();
+                Vec::new()
+            }
+            Action::BoardUp => {
+                self.board.select_delta(-1);
+                Vec::new()
+            }
+            Action::BoardDown => {
+                self.board.select_delta(1);
+                Vec::new()
+            }
+            Action::BoardPage(delta) => {
+                self.board.select_page(delta);
+                Vec::new()
+            }
+            Action::BoardTop => {
+                self.board.select_top();
+                Vec::new()
+            }
+            Action::BoardBottom => {
+                self.board.select_bottom();
+                Vec::new()
+            }
+            Action::BoardEnter => self.board_enter(),
+            Action::BoardCycleFilter => {
+                if let Some(message) = self.board.cycle_filter() {
+                    self.notify(message);
+                }
+                Vec::new()
+            }
+            Action::BoardFind => {
+                self.board.open_find();
+                Vec::new()
+            }
+            Action::BoardClearFilter => {
+                self.board.clear_filter();
+                Vec::new()
+            }
+            Action::BoardFindType(ch) => {
+                self.board.find_type(ch);
+                Vec::new()
+            }
+            Action::BoardFindBackspace => {
+                self.board.find_backspace();
+                Vec::new()
+            }
+            Action::BoardFindAccept => {
+                self.board.accept_find();
+                Vec::new()
+            }
+            Action::BoardFindEscape => {
+                self.board.escape_find();
+                Vec::new()
+            }
         }
     }
 
@@ -763,14 +848,105 @@ impl App {
 
     /// Tab past a pane that isn't on screen.
     fn skip_hidden(&self, focus: Focus, forward: bool) -> Focus {
-        if focus == Focus::Sidebar && !self.sidebar_visible {
-            if forward {
-                focus.next()
-            } else {
-                focus.previous()
+        let mut at = focus;
+        // Loop, not a single skip: with the board open, Transcript and Composer
+        // are both hidden, so one step could land on the second of them.
+        for _ in 0..4 {
+            if self.pane_visible(at) {
+                return at;
             }
+            at = if forward { at.next() } else { at.previous() };
+        }
+        at
+    }
+
+    /// Whether a pane is on screen right now. The board replaces the main pane
+    /// when it is open, so Transcript and Composer only exist when it is not.
+    fn pane_visible(&self, focus: Focus) -> bool {
+        match focus {
+            Focus::Sidebar => self.sidebar_visible,
+            Focus::Board => self.board_open,
+            Focus::Transcript | Focus::Composer => !self.board_open,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Board
+    // -----------------------------------------------------------------------
+
+    /// `B` — swap the main pane for the board, and back.
+    fn toggle_board(&mut self) {
+        self.board_open = !self.board_open;
+        if self.board_open {
+            self.focus = Focus::Board;
         } else {
-            focus
+            self.close_board();
+        }
+    }
+
+    /// Leave the board: back to the chat panes.
+    ///
+    /// The filter survives, as herdr-board's does within a session — only a
+    /// pane restart forgets it, and closing the board is navigating, not
+    /// restarting.
+    fn close_board(&mut self) {
+        self.board_open = false;
+        if self.focus == Focus::Board {
+            // The composer is where a return to the chat usually lands; if the
+            // board was opened from the sidebar, keep the cursor there.
+            self.focus = if self.sidebar_visible {
+                Focus::Sidebar
+            } else {
+                Focus::Transcript
+            };
+        }
+    }
+
+    /// `enter` on the board: dispatch a ready task, fold a section header, or
+    /// open a running task's chat.
+    fn board_enter(&mut self) -> Effects {
+        if let Some(state) = self.board.on_section() {
+            self.board.toggle_collapsed(state);
+            return Vec::new();
+        }
+        let Some(row) = self.board.selected_task() else {
+            return Vec::new();
+        };
+        match row.state() {
+            BoardState::Ready => {
+                if row.dispatchable {
+                    vec![Command::Dispatch {
+                        task_id: row.id.clone(),
+                        identifier: row.identifier.clone(),
+                    }]
+                } else {
+                    self.notify(format!(
+                        "{} has no route — it cannot be dispatched",
+                        row.identifier
+                    ));
+                    Vec::new()
+                }
+            }
+            // herdr-board's `g`: a running task's chat is where the work is,
+            // and comet's answer to a pane is a chat.
+            BoardState::Working | BoardState::Blocked => {
+                if let Some(chat_id) = row.chat_id.clone() {
+                    self.board_open = false;
+                    self.focus = Focus::Composer;
+                    self.select_chat(Some(chat_id))
+                } else {
+                    self.notify(format!("{} is running but has no chat to open", row.identifier));
+                    Vec::new()
+                }
+            }
+            _ => {
+                self.notify(format!(
+                    "{} — {}; enter dispatches a ready task",
+                    row.identifier,
+                    row.state().as_str()
+                ));
+                Vec::new()
+            }
         }
     }
 
@@ -2294,6 +2470,15 @@ impl App {
             Some(Hit::Chip(ChipKind::Checkout)) => self.open_checkout_picker(),
             Some(Hit::Chip(ChipKind::Model)) => self.open_model_picker(),
             Some(Hit::Chip(ChipKind::Reasoning)) => self.open_reasoning_picker(),
+            Some(Hit::BoardRow(index)) => {
+                // Clicking a board row selects it; enter dispatches. Like the
+                // sidebar, the row is the target, not wherever the cursor was.
+                if let Some(line) = self.board.lines().get(index).cloned() {
+                    self.board.selected = Some(line.id());
+                    self.focus = Focus::Board;
+                }
+                Vec::new()
+            }
             Some(Hit::AddSpace) => {
                 self.notify(
                     "Adding a space needs a folder picker — use the desktop app for now.".into(),
@@ -3048,5 +3233,230 @@ mod tests {
         assert!(!app.transcript.following());
         app.act(Action::ScrollBottom);
         assert!(app.transcript.following());
+    }
+
+    // -----------------------------------------------------------------------
+    // Board
+    // -----------------------------------------------------------------------
+
+    fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_proto::view::board::TaskRow {
+        use comet_proto::view::board::TaskRow;
+        TaskRow {
+            id: id.into(),
+            identifier: format!("gh#{id}"),
+            title: format!("task {id}"),
+            state: state.as_str().into(),
+            source: "github".into(),
+            url: format!("https://github.com/o/r/issues/{id}"),
+            labels: vec![],
+            dispatchable: true,
+            gone: false,
+            route: Some("offhand".into()),
+            workspace: Some("offhand".into()),
+            runtime: Some("claude-code".into()),
+            chat_id: None,
+            pr_url: None,
+            pr_number: None,
+            branch: Some("board/gh-x".into()),
+            dispatched_by: None,
+            dispatched_by_chat: None,
+            last_outcome: None,
+            last_outcome_at: None,
+            attempts: 0,
+            reopened: 0,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+        }
+    }
+
+    #[test]
+    fn b_toggles_the_board_and_owning_it_focuses_it() {
+        let mut app = seeded();
+        assert!(!app.board_open);
+        app.act(Action::ToggleBoard);
+        assert!(app.board_open);
+        assert_eq!(app.focus, Focus::Board);
+        app.act(Action::ToggleBoard);
+        assert!(!app.board_open);
+        assert_eq!(app.focus, Focus::Sidebar, "back to the chat panes");
+    }
+
+    #[test]
+    fn the_board_stream_seeds_rows_and_lands_the_cursor_on_a_task() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![
+            board_row("1", BoardState::Ready),
+            board_row("2", BoardState::Working),
+            board_row("3", BoardState::Done),
+            board_row("4", BoardState::Blocked),
+        ]));
+        // Sections in fixed order, done folded by default; the cursor starts on
+        // the first *task*, which is the blocked row (fixed order, not arrival).
+        assert!(app.board.selected_task().is_some());
+        assert_eq!(
+            app.board
+                .lines()
+                .into_iter()
+                .filter(|line| matches!(line, crate::board::BoardRow::Task(_)))
+                .count(),
+            3,
+            "done starts folded, so its one row is hidden"
+        );
+        assert_eq!(
+            app.board.selected.as_deref(),
+            Some("4"),
+            "blocked is the first section, so it owns the cursor"
+        );
+    }
+
+    #[test]
+    fn enter_dispatches_a_ready_row_and_not_an_unrouted_one() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        let mut ready = board_row("1", BoardState::Ready);
+        ready.route = Some("offhand".into());
+        let mut unrouted = board_row("2", BoardState::Ready);
+        unrouted.dispatchable = false;
+        app.apply(Update::Board(vec![ready, unrouted]));
+
+        // Cursor starts on "1" (first task, ready section).
+        app.board.selected = Some("1".into());
+        let effects = app.act(Action::BoardEnter);
+        match effects.first() {
+            Some(Command::Dispatch { task_id, identifier }) => {
+                assert_eq!(task_id, "1");
+                assert_eq!(identifier, "gh#1");
+            }
+            other => panic!("expected a dispatch, got {other:?}"),
+        }
+
+        // A row nothing routes dispatches nowhere and says why.
+        app.board.selected = Some("2".into());
+        assert!(app.act(Action::BoardEnter).is_empty());
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.text.contains("no route")),
+            "the reason must be said"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_working_row_opens_its_chat() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![chat("chat-1", "s1", 1)]));
+        app.act(Action::ToggleBoard);
+        let mut working = board_row("w", BoardState::Working);
+        working.chat_id = Some("chat-1".into());
+        app.apply(Update::Board(vec![working]));
+        app.board.selected = Some("w".into());
+
+        let effects = app.act(Action::BoardEnter);
+        assert_eq!(app.selected_chat.as_deref(), Some("chat-1"));
+        assert!(!app.board_open, "the board gives way to the chat");
+        assert!(
+            effects
+                .iter()
+                .any(|c| is_watch(c, Some("chat-1"))),
+            "the chat's transcript must stream"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_section_header_folds_it() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![
+            board_row("1", BoardState::Ready),
+            board_row("2", BoardState::Ready),
+        ]));
+        let header = crate::board::section_row_id(BoardState::Ready);
+        app.board.selected = Some(header.clone());
+        let lines_before = app.board.lines().len();
+        assert!(app.act(Action::BoardEnter).is_empty());
+        assert_eq!(app.board.lines().len(), lines_before - 2, "rows fold away");
+        assert!(app.board.is_collapsed(BoardState::Ready));
+        // And the header stays, or it could never be reopened.
+        assert!(app.board.lines().iter().any(|l| l.id() == header));
+    }
+
+    #[test]
+    fn f_cycles_the_routes_then_back_to_all() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        let mut a = board_row("a", BoardState::Ready);
+        a.route = Some("offhand".into());
+        let mut b = board_row("b", BoardState::Ready);
+        b.route = Some("tally".into());
+        let mut u = board_row("u", BoardState::Ready);
+        u.route = None;
+        u.dispatchable = false;
+        app.apply(Update::Board(vec![a, b, u]));
+
+        app.act(Action::BoardCycleFilter);
+        assert_eq!(app.board.filter, comet_proto::view::board::Filter::Route("offhand".into()));
+        app.act(Action::BoardCycleFilter);
+        assert_eq!(app.board.filter, comet_proto::view::board::Filter::Route("tally".into()));
+        app.act(Action::BoardCycleFilter);
+        assert_eq!(app.board.filter, comet_proto::view::board::Filter::NoRoute);
+        app.act(Action::BoardCycleFilter);
+        assert_eq!(app.board.filter, comet_proto::view::board::Filter::All, "wraps to everything");
+
+        // The cursor never rests on a hidden row.
+        app.act(Action::BoardCycleFilter); // offhand
+        app.board.selected = Some("b".into());
+        app.act(Action::BoardCycleFilter); // tally — b stays
+        app.act(Action::BoardCycleFilter); // no route — b leaves
+        assert_eq!(app.board.selected.as_deref(), Some("u"), "onto a shown row");
+    }
+
+    #[test]
+    fn find_filters_as_you_type_and_esc_clears() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![
+            board_row("1", BoardState::Ready),
+            board_row("2", BoardState::Working),
+        ]));
+        app.board.selected = Some("1".into());
+
+        app.act(Action::BoardFind);
+        assert!(app.board.typing);
+        for ch in "task 2".chars() {
+            app.act(Action::BoardFindType(ch));
+        }
+        // "task 2" only matches row 2, so the cursor moves onto it.
+        assert_eq!(app.board.selected_task().map(|r| r.id.as_str()), Some("2"));
+        assert_eq!(app.board.shown_tasks(), 1);
+
+        app.act(Action::BoardFindEscape);
+        assert!(!app.board.typing);
+        assert_eq!(app.board.filter, comet_proto::view::board::Filter::All, "esc clears the query");
+        assert_eq!(app.board.shown_tasks(), 2);
+    }
+
+    #[test]
+    fn selection_survives_a_refresh_that_reorders_the_list() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("a", BoardState::Ready)]));
+        app.board.selected = Some("a".into());
+        // The row stays where it is, just re-ordered in the stream.
+        app.apply(Update::Board(vec![
+            board_row("z", BoardState::Working),
+            board_row("a", BoardState::Ready),
+        ]));
+        assert_eq!(app.board.selected.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn focus_cycles_skip_hidden_panes() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard); // board open: transcript and composer are gone
+        app.focus = Focus::Composer;
+        app.act(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Sidebar, "composer is hidden, so it is skipped");
+        app.focus = Focus::Board;
+        app.act(Action::FocusNext);
+        assert_eq!(app.focus, Focus::Sidebar, "the chat panes are hidden when the board is open");
     }
 }

@@ -272,6 +272,31 @@ impl Theme {
             style
         }
     }
+
+    /// The board gutter's one colored cell: the state glyph.
+    ///
+    /// herdr-board's mapping onto comet's palette — blocked and failed share
+    /// red on purpose (both mean "needs you"; the shape-distinct glyph is what
+    /// tells them apart), working is amber, review is the accent. Ready carries
+    /// no hue and done is dim, so the two still read apart when every color is
+    /// stripped — the glyph is the carrier, not the colour.
+    pub fn board_state(&self, state: comet_proto::view::board::BoardState) -> Style {
+        use comet_proto::view::board::BoardState as S;
+        let style = Style::default().fg(match state {
+            S::Blocked | S::Failed => self.danger,
+            S::Working => self.warning,
+            S::Review => self.accent,
+            S::Ready => self.text,
+            S::Done => self.faint,
+        });
+        // Emphasis is not colour: DONE stays dim even under NO_COLOR, which is
+        // what separates it from READY when hue is gone.
+        if state == S::Done {
+            style.add_modifier(Modifier::DIM)
+        } else {
+            style
+        }
+    }
 }
 
 /// The status dot. One glyph for every state — "status is a rail, not a word"
@@ -405,6 +430,32 @@ mod tests {
         );
         assert!(t.selected().add_modifier.contains(Modifier::REVERSED));
         assert!(t.bubble().add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn board_states_map_onto_the_palette_and_survive_no_color() {
+        use comet_proto::view::board::BoardState as S;
+        let t = Theme::dark();
+        // Blocked and failed share red on purpose — the glyph tells them apart.
+        assert_eq!(t.board_state(S::Blocked).fg, t.board_state(S::Failed).fg);
+        assert_eq!(t.board_state(S::Blocked).fg, Some(t.danger));
+        assert_eq!(t.board_state(S::Working).fg, Some(t.warning));
+        assert_eq!(t.board_state(S::Review).fg, Some(t.accent));
+        assert_eq!(t.board_state(S::Ready).fg, Some(t.text));
+        // Done is dim, and the emphasis is the carrier: it must survive NO_COLOR.
+        assert!(t.board_state(S::Done).add_modifier.contains(Modifier::DIM));
+
+        let t = Theme::plain();
+        for s in S::SECTION_ORDER {
+            assert!(
+                matches!(t.board_state(s).fg, None | Some(Color::Reset)),
+                "{s} still emits a hue under NO_COLOR"
+            );
+        }
+        assert!(
+            t.board_state(S::Done).add_modifier.contains(Modifier::DIM),
+            "DONE lost its dim under NO_COLOR"
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@
 //! streaming cost is bounded by the terminal size rather than by the transcript.
 
 pub mod app;
+pub mod board;
 pub mod cli;
 pub mod composer;
 pub mod daemon;
@@ -262,10 +263,12 @@ impl Loop {
     fn on_event(&mut self, event: Event, effects: &mut Effects) {
         match event {
             Event::Key(key) => {
-                if let Some(action) = keys::map(
+                if let Some(action) = keys::map_with(
                     self.app.focus,
                     self.app.overlay_open(),
                     self.app.composer.is_empty(),
+                    self.app.board.typing,
+                    self.app.help,
                     key,
                 ) {
                     effects.extend(self.app.act(action));

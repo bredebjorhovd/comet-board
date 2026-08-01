@@ -60,9 +60,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
+use comet_proto::view::board::{self, BoardState};
 use comet_proto::view::{ConnectionStatus, GatePhase};
 
 use crate::app::{App, ChipKind, Hit, Overlay, Row};
+use crate::board::BoardRow;
 use crate::keys::{Focus, HELP};
 use crate::loaders;
 use crate::theme::{self, Theme};
@@ -149,7 +151,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         };
         // Registered last, so it wins over everything beneath it.
         app.push_hit(panel, Hit::Overlay);
-        draw_help(frame, panel, &theme);
+        draw_help(frame, panel, app, &theme);
     }
 }
 
@@ -510,6 +512,12 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         width: area.width.saturating_sub(MAIN_PAD * 2),
         ..area
     };
+    if app.board_open {
+        // The board takes the whole main pane — tabs, transcript and composer
+        // give way, and the sidebar stays. `B` swaps back.
+        draw_board(frame, area, app, theme);
+        return;
+    }
     // The tab strip IS the header — in the desktop shell it replaced one
     // (`shell/tabs.rs`), so there is no separate title row. A blank row, not a
     // rule, separates it from the transcript: the active tab already carries a
@@ -548,6 +556,381 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     draw_transcript(frame, transcript, app, theme);
     draw_status_strip(frame, strip, app, theme);
     draw_composer(frame, composer, text_rows, app, theme);
+}
+
+// ---------------------------------------------------------------------------
+// Board
+// ---------------------------------------------------------------------------
+
+/// The board pane, in the same visual language as the rest of the app: no line
+/// work, the selection as a wash, the state carried by glyph first and colour
+/// second. Columns are herdr-board's — gutter, id, title, metadata
+/// right-aligned — so a row says what a herdr-board row says.
+const BOARD_COL_GUTTER: u16 = 1;
+const BOARD_COL_ID: u16 = 3;
+const BOARD_ID_WIDTH: u16 = 8;
+const BOARD_COL_TITLE: u16 = 13;
+
+fn draw_board(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let last = area.height.saturating_sub(1);
+    draw_board_header(frame, area, app, theme);
+
+    let lines = app.board.lines();
+    let body_top = 1u16;
+
+    if lines.is_empty() {
+        // Two different empty sentences. A board whose filter hid every row has
+        // to name the keypress that did it; a board with nothing on it is a
+        // different situation entirely.
+        let text = if !app.board.rows.is_empty() {
+            app.board
+                .empty_note()
+                .unwrap_or_else(|| "Nothing on the board.".into())
+        } else {
+            "Nothing on the board — issues routed by routing.toml appear here.".to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("  {}", wrap::truncate(&text, area.width.saturating_sub(2) as usize)),
+                theme.subtle(),
+            )),
+            Rect {
+                y: body_top,
+                height: 1,
+                ..area
+            },
+        );
+    } else {
+        let body_height = last.saturating_sub(body_top) as usize;
+        app.board.ensure_visible(body_height);
+        for (index, line) in lines
+            .iter()
+            .enumerate()
+            .skip(app.board.scroll)
+            .take(body_height)
+        {
+            let selected = app.board.selected.as_deref() == Some(&line.id());
+            let slot = Rect {
+                y: body_top + index as u16 - app.board.scroll as u16,
+                height: 1,
+                ..area
+            };
+            // Click targets first, then draw: the sidebar does the same split
+            // because drawing needs `&App` and registering needs `&mut App`.
+            app.push_hit(slot, Hit::BoardRow(index));
+            match line {
+                BoardRow::Section(state) => {
+                    draw_board_section(frame, slot, *state, app, theme);
+                }
+                BoardRow::Task(id) => {
+                    if let Some(row) = app.board.task(id) {
+                        draw_board_task(frame, slot, row, selected, theme);
+                    }
+                }
+            }
+        }
+    }
+
+    draw_board_footer(frame, area, last, app, theme);
+}
+
+/// The header: the pane's name left, the active filter in the corner right.
+///
+/// The filter holds the corner outright — the same order herdr-board uses, for
+/// the same reason: a board hiding most of its rows and not saying why looks
+/// broken, so the thing the operator just did outranks the pane's name.
+fn draw_board_header(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let mut x = area.x + 1;
+    let title = "board";
+    frame.render_widget(
+        Paragraph::new(Span::styled(title, theme.hint())),
+        Rect {
+            x,
+            width: wrap::width_of(title) as u16,
+            height: 1,
+            ..area
+        },
+    );
+    x += wrap::width_of(title) as u16 + 2;
+    if !app.board.typing
+        && let Some(label) = app.board.filter.label()
+    {
+        let label = wrap::truncate(&label, area.width.saturating_sub(4) as usize);
+        let w = wrap::width_of(&label) as u16;
+        let right = area.x + area.width.saturating_sub(1);
+        if right.saturating_sub(w) > x {
+            frame.render_widget(
+                Paragraph::new(Span::styled(label, theme.body())),
+                Rect {
+                    x: right - w + 1,
+                    width: w,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+    }
+}
+
+/// A section header is a different *shape* from a row, not just a different
+/// colour: glyph, bold uppercase label, then the folded count where the rows
+/// would be. The count exists only when folded — open, it competes with the
+/// rows it would be counting.
+fn draw_board_section(frame: &mut Frame, slot: Rect, state: BoardState, app: &mut App, theme: &Theme) {
+    let selected = app.board.selected.as_deref() == Some(&crate::board::section_row_id(state));
+    if selected {
+        fill(frame, slot, theme.selected());
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            state.glyph(),
+            theme.board_state(state),
+        )),
+        Rect {
+            x: slot.x + BOARD_COL_GUTTER,
+            width: 1,
+            height: 1,
+            ..slot
+        },
+    );
+    let label = if state == BoardState::Done {
+        "DONE today".to_string()
+    } else {
+        format!("{}  ", state.label())
+    };
+    let label_w = wrap::width_of(&label) as u16;
+    frame.render_widget(
+        Paragraph::new(Span::styled(label, theme.label())),
+        Rect {
+            x: slot.x + BOARD_COL_ID,
+            width: label_w,
+            height: 1,
+            ..slot
+        },
+    );
+    if app.board.is_collapsed(state) {
+        let hint = format!("{} hidden · enter to expand", app.board.section_len(state));
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, theme.hint())),
+            Rect {
+                x: slot.x + BOARD_COL_ID + label_w,
+                width: slot.width.saturating_sub(BOARD_COL_ID + label_w),
+                height: 1,
+                ..slot
+            },
+        );
+    }
+}
+
+/// Row hierarchy, in order of loudness: gutter (colour) → title (body) → id
+/// and metadata (dim). The gutter is the only colored cell in the row.
+fn draw_board_task(frame: &mut Frame, slot: Rect, row: &board::TaskRow, selected: bool, theme: &Theme) {
+    if selected {
+        fill(frame, slot, theme.selected());
+    }
+    let state = row.state();
+    frame.render_widget(
+        Paragraph::new(Span::styled(state.glyph(), theme.board_state(state))),
+        Rect {
+            x: slot.x + BOARD_COL_GUTTER,
+            width: 1,
+            height: 1,
+            ..slot
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            wrap::truncate(&row.identifier, BOARD_ID_WIDTH as usize),
+            theme.hint(),
+        )),
+        Rect {
+            x: slot.x + BOARD_COL_ID,
+            width: BOARD_ID_WIDTH,
+            height: 1,
+            ..slot
+        },
+    );
+
+    let meta = board::row_metadata(row, selected, slot.width, chrono::Utc::now());
+    let meta_w = wrap::width_of(&meta) as u16;
+    let right = slot.x + slot.width.saturating_sub(1);
+    let title_w = right
+        .saturating_sub(meta_w)
+        .saturating_sub(2)
+        .saturating_sub(slot.x + BOARD_COL_TITLE)
+        .saturating_add(1);
+    let title_style = if state == BoardState::Done {
+        theme.hint()
+    } else {
+        theme.body()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            wrap::truncate(&row.title, title_w as usize),
+            title_style,
+        )),
+        Rect {
+            x: slot.x + BOARD_COL_TITLE,
+            width: title_w,
+            height: 1,
+            ..slot
+        },
+    );
+    if meta_w > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(meta, theme.hint())),
+            Rect {
+                x: right - meta_w + 1,
+                width: meta_w,
+                height: 1,
+                ..slot
+            },
+        );
+    }
+}
+
+/// The keys the current selection makes relevant, then the board's two
+/// standing ones. Filtering adds its own way out, which the help screen cannot
+/// be expected to provide on a board that is showing a fraction of its rows.
+fn board_footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
+    let mut hints: Vec<(&'static str, &'static str, char)> = Vec::new();
+    if let Some(state) = app.board.on_section() {
+        let folded = app.board.is_collapsed(state);
+        hints.push(("enter", if folded { "expand" } else { "collapse" }, '\r'));
+    } else if let Some(row) = app.board.selected_task() {
+        match row.state() {
+            BoardState::Ready => hints.push(("enter", "dispatch", '\r')),
+            BoardState::Working | BoardState::Blocked => hints.push(("enter", "open chat", '\r')),
+            _ => {}
+        }
+    }
+    hints.push(("f", "filter", 'f'));
+    hints.push(("/", "find", '/'));
+    if app.board.filter.active() {
+        hints.push(("F", "clear the filter", 'F'));
+    }
+    hints.push(("B", "back", 'B'));
+    hints
+}
+
+fn draw_board_footer(frame: &mut Frame, area: Rect, y: u16, app: &mut App, theme: &Theme) {
+    // The `/` field replaces the footer the way the find field in herdr-board
+    // does — one line, because the board has one place it talks to you.
+    if app.board.typing {
+        draw_board_find(frame, area, y, app, theme);
+        return;
+    }
+    // A transient message owns the footer until it expires, exactly as it owns
+    // the status strip in the chat view — the board is where the operator
+    // dispatches, and dispatch talks.
+    if let Some(notice) = &app.notice {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                wrap::truncate(
+                    &wrap::sanitize(&notice.text),
+                    (area.width as usize).saturating_sub(2),
+                ),
+                Style::default().fg(theme.warning),
+            )),
+            Rect {
+                x: area.x + 1,
+                y,
+                height: 1,
+                ..area
+            },
+        );
+        return;
+    }
+
+    let mut x = area.x + 1;
+    for (i, (key, label, _)) in board_footer_hints(app).into_iter().enumerate() {
+        if i > 0 {
+            let sep = " · ";
+            frame.render_widget(
+                Paragraph::new(Span::styled(sep, theme.hint())),
+                Rect {
+                    x,
+                    y,
+                    width: wrap::width_of(sep) as u16,
+                    height: 1,
+                },
+            );
+            x += wrap::width_of(sep) as u16;
+        }
+        frame.render_widget(
+            Paragraph::new(Span::styled(key, theme.body())),
+            Rect {
+                x,
+                y,
+                width: wrap::width_of(key) as u16,
+                height: 1,
+            },
+        );
+        x += wrap::width_of(key) as u16 + 1;
+        let label = format!("{label}  ");
+        frame.render_widget(
+            Paragraph::new(Span::styled(label.clone(), theme.hint())),
+            Rect {
+                x,
+                y,
+                width: wrap::width_of(&label) as u16,
+                height: 1,
+            },
+        );
+        x += wrap::width_of(&label) as u16;
+    }
+}
+
+/// The `/` field: **a line, not a box**, like herdr-board's. It replaces the
+/// footer the way the notice does — the board has one place it talks to you,
+/// and a floating input would be the first bordered thing on screen.
+fn draw_board_find(frame: &mut Frame, area: Rect, y: u16, app: &mut App, theme: &Theme) {
+    let q = match &app.board.filter {
+        board::Filter::Text(q) => q.clone(),
+        _ => String::new(),
+    };
+    let mut x = area.x + 1;
+    frame.render_widget(
+        Paragraph::new(Span::styled("/", theme.hint())),
+        Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        },
+    );
+    x += 1;
+    frame.render_widget(
+        Paragraph::new(Span::styled(q.clone(), theme.body())),
+        Rect {
+            x,
+            y,
+            width: area.width.saturating_sub((x - area.x) + 1),
+            height: 1,
+        },
+    );
+    let caret_x = x + wrap::width_of(&q) as u16;
+    if caret_x < area.right() {
+        draw_caret(frame, caret_x, y, theme);
+        frame.set_cursor_position(Position { x: caret_x, y });
+    }
+
+    // What the query has found so far, so you can stop typing when it is down
+    // to one row rather than typing the whole identifier every time.
+    let n = app.board.shown_tasks();
+    let count = format!("{n} row{} · esc clears", if n == 1 { "" } else { "s" });
+    if area.width.saturating_sub(2) > (caret_x - area.x) + count.len() as u16 + 2 {
+        let w = count.len() as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(count, theme.hint())),
+            Rect {
+                x: area.x + area.width - w - 1,
+                width: w,
+                height: 1,
+                ..area
+            },
+        );
+    }
 }
 
 /// Width of one tab. The desktop strip uses a fixed 140px; a fixed column width
@@ -1188,7 +1571,7 @@ fn draw_gate(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, phase: Gat
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn draw_help(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // Clear the whole body, not just the panel. A centered panel over live
     // content leaves the right-hand ends of long transcript lines floating
     // beside it, which reads as a rendering fault rather than as a modal.
@@ -1209,7 +1592,14 @@ fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         .map(|(key, _)| wrap::width_of(key))
         .max()
         .unwrap_or(0);
-    for (index, (key, what)) in HELP.iter().take(inner.height as usize).enumerate() {
+
+    // The reference binds more keys than a 24-row pane has lines, and a list
+    // that silently stops halfway is how keys stay undocumented. It scrolls,
+    // and says that it does, on the panel's own last row.
+    let rows = HELP.len();
+    let room = inner.height as usize;
+    app.help_scroll = app.help_scroll.min(rows.saturating_sub(room));
+    for (index, (key, what)) in HELP.iter().skip(app.help_scroll).take(room).enumerate() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("{key:>key_column$}  "), theme.panel()),
@@ -1223,6 +1613,26 @@ fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
                 y: inner.y + index as u16,
                 height: 1,
                 ..inner
+            },
+        );
+    }
+
+    if rows > room {
+        let more = rows - room - app.help_scroll.min(rows - room);
+        let marker = if app.help_scroll > 0 && more > 0 {
+            format!(" ↑{} ↓{more} ", app.help_scroll)
+        } else if app.help_scroll > 0 {
+            format!(" ↑{} ", app.help_scroll)
+        } else {
+            format!(" ↓{more} ")
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(marker, theme.panel_hint())),
+            Rect {
+                y: panel.y + panel.height - 1,
+                width: panel.width,
+                height: 1,
+                ..panel
             },
         );
     }

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use comet_doc::SessionMessageEntry;
+use comet_proto::view::board::TaskRow;
 use comet_proto::view::ConnectionStatus;
 use comet_proto::{AuthState, Chat, Device, Session, Space};
 use comet_rpc::{RpcClient, methods};
@@ -50,6 +51,10 @@ pub enum Update {
     Models(Vec<comet_proto::Model>),
     /// A space's branches, answering [`Command::ListRefs`].
     Refs(Vec<comet_proto::RepoRef>),
+    /// A board snapshot: every task as a row, in board order. Best-effort — an
+    /// engine without the board serves nothing and the app just shows an empty
+    /// board.
+    Board(Vec<TaskRow>),
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
         chat_id: String,
@@ -102,6 +107,13 @@ pub enum Command {
     /// sessions; sequencing it here means a failure at any step leaves nothing
     /// behind but a notice.
     StartSession(Box<StartSession>),
+    /// Release a board task from the TUI: the operator is dispatching, so there
+    /// is no `via` — provenance is never fabricated. The reply names the chat
+    /// that will hold the run; the identifier travels so the notice reads well.
+    Dispatch {
+        task_id: String,
+        identifier: String,
+    },
     /// Drop this connection and dial again now, skipping the backoff. What `r`
     /// does after the user has fixed whatever was wrong.
     Reconnect,
@@ -285,6 +297,20 @@ async fn session(
         None => None,
     };
 
+    // The board is best-effort: an engine built without the board, or with
+    // `COMET_BOARD=0`, refuses the stream and the chat viewport must keep
+    // working anyway.
+    let mut board = match client.subscribe(methods::WATCH_BOARD, empty()).await {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            tracing::debug!(error = %err, "WatchBoard unavailable");
+            if updates.send(Update::Board(Vec::new())).is_err() {
+                return SessionEnd::AppGone;
+            }
+            None
+        }
+    };
+
     loop {
         tokio::select! {
             // Biased so a burst of doc frames can never starve a command: the
@@ -322,6 +348,12 @@ async fn session(
                 }
                 Some(Command::StartSession(start)) => {
                     spawn_start_session(client.clone(), updates.clone(), *start);
+                }
+                Some(Command::Dispatch {
+                    task_id,
+                    identifier,
+                }) => {
+                    spawn_dispatch(client.clone(), updates.clone(), task_id, identifier);
                 }
             },
 
@@ -374,7 +406,31 @@ async fn session(
                     }
                 }
             },
+
+            // An absent board stream pends forever, so it never fires.
+            frame = recv_maybe(&mut board) => if let Some(value) = frame {
+                match decode::<Vec<TaskRow>>(Some(value), "board") {
+                    Frame::Value(rows) => {
+                        if updates.send(Update::Board(rows)).is_err() {
+                            return SessionEnd::AppGone;
+                        }
+                    }
+                    Frame::Skip => {}
+                    Frame::Ended => return SessionEnd::ConnectionLost,
+                }
+            },
         }
+    }
+}
+
+/// `recv` on an optional stream, pending forever when there is none, so it can
+/// sit in the `select!` unconditionally. For streams that carry no chat id.
+async fn recv_maybe(
+    slot: &mut Option<mpsc::UnboundedReceiver<serde_json::Value>>,
+) -> Option<serde_json::Value> {
+    match slot {
+        Some(stream) => stream.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -625,6 +681,34 @@ fn spawn_send(
                 message_id,
                 error: err.to_string(),
             });
+        }
+    });
+}
+
+/// Release a board task. The reply names the chat the run landed in; the row
+/// flips to `working` on the next board frame either way.
+fn spawn_dispatch(
+    client: Arc<RpcClient>,
+    updates: mpsc::UnboundedSender<Update>,
+    task_id: String,
+    identifier: String,
+) {
+    tokio::spawn(async move {
+        let params = serde_json::json!({ "taskId": task_id });
+        match client.call(methods::DISPATCH_TASK, params).await {
+            Ok(value) => {
+                let chat = value
+                    .get("chatId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let _ = updates.send(Update::Notice(format!(
+                    "Dispatched {identifier} — chat {chat} is on it"
+                )));
+            }
+            Err(err) => {
+                let _ = updates.send(Update::Notice(format!("Couldn't dispatch {identifier}: {err}")));
+            }
         }
     });
 }
