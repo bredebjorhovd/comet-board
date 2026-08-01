@@ -207,6 +207,7 @@ impl EngineHandle {
             default_harness: config.default_harness,
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
+            board: comet_engine::board_enabled_from_env(),
         };
         let auth = Engine::build_auth(&engine_config).await;
         let refresh_task = auth.spawn_refresh_loop();

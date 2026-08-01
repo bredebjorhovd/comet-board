@@ -189,6 +189,7 @@ fn engine_config_from_env() -> comet_engine::EngineConfig {
         // `workos_client_id_from_env` for the dev-mode escape hatches.
         workos_client_id: workos_client_id_from_env(&edge_token),
         edge_token,
+        board: comet_engine::board_enabled_from_env(),
     }
 }
 
