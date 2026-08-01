@@ -227,6 +227,9 @@ impl Harness for CodexHarness {
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::prepend_exe_dir_to_path(&mut cmd, &exe);
+        if let Some(chat_id) = &controls.chat_id {
+            cmd.env("COMET_BOARD_CHAT_ID", chat_id);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -392,6 +395,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        chat_id: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

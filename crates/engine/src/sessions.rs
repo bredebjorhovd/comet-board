@@ -314,6 +314,7 @@ impl SessionsEngine {
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            chat_id: Some(chat_id.to_string()),
         };
 
         lock(&self.inner.runs).insert(

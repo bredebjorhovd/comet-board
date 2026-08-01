@@ -87,11 +87,12 @@ impl Runtime for CometRuntime {
         // The brief, as a durable first send. `queue_command` returns once the
         // entry is in the session doc — the ledger guarantees delivery, which
         // is the property herdr-board's nudge-and-verify loop approximated.
+        // `prompt_at` resolves `{worktree}` now that the checkout exists.
         self.doc_host.queue_command(
             &chat_id,
             SessionCommandPayload::Run {
                 request: RunRequest {
-                    prompt: spec.prompt.clone(),
+                    prompt: spec.prompt_at(&cwd),
                     model: spec.model.clone(),
                     reasoning: None,
                     model_options: Default::default(),

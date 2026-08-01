@@ -70,9 +70,17 @@ nearly verbatim — it never depended on herdr:
   into it. Config/credential changes are picked up per cycle. On by default,
   `COMET_BOARD=0` disables (`EngineConfig::board`).
 
-- `crates/board/src/dispatch.rs` — **new** (H2): task + route → `DispatchSpec`
-  resolution (branch template, brief, space matching), the planning half of
-  herdr-board's `dispatch.rs`. H3 grows the pipeline around it.
+- `crates/board/src/dispatch.rs` — **new** (H2+H3): herdr-board's `dispatch.rs`
+  minus panes. Task + route → `DispatchSpec` resolution (branch template,
+  brief, space matching) plus the pipeline decisions: `check_capacity`
+  (`max_concurrent_per_workspace` counts live attempts per space),
+  `dispatcher_for` (the `via` chat id → parent-task/chat provenance verdict),
+  `dispatcher_name` for the upstream comment. `{worktree}` in a brief resolves
+  late, via `DispatchSpec::prompt_at`, once the executor knows the checkout.
+  Every harness run exports `COMET_BOARD_CHAT_ID` (the chat it serves) into
+  the child's env — `RunControls::chat_id`, stamped by the engine on every
+  dispatch — so `comet-board dispatch` inherits identity the way
+  `HERDR_PANE_ID` provided it.
 - `crates/board/src/rows.rs` — **new** (H2): `TaskRow` — herdr-board's
   `list --json` contract with the pane→chat renames (`chat_id`,
   `dispatched_by_chat`). What `WatchBoard` streams and H6's `list` prints.
@@ -124,19 +132,16 @@ Landed as `crates/engine/src/board_runtime.rs` (`CometRuntime`) plus the real
 RPC handlers (see the ported-and-working list above). Dispatch/cancel execute
 on the board loop's thread through a command channel; `WatchBoard` is a
 `watch_stream` fed by the loop after every cycle, status refresh, and command.
-Left deliberately open for later tasks: concurrency caps, resolving `via` into
-a parent task id, `COMET_BOARD_CHAT_ID` in the harness env (all H3), and
-wiring `chat_alive` into reconcile's never-started-chat verdict.
+Still deliberately open: wiring `chat_alive` into reconcile's
+never-started-chat verdict.
 
-### H3 — Dispatch pipeline (M, needs H2)
-Port `dispatch.rs` minus panes: route resolution (exists in `config.rs`),
-branch templating (exists), brief building from task + route `prompt`
-template (exists as `interpolate`), concurrency caps
-(`max_concurrent_per_workspace` counts live attempts per space), attempt
-row lifecycle. Provenance: accept `via` (dispatching chat id) on
-`DispatchTask`; export `COMET_BOARD_CHAT_ID` into the harness process env
-(one-line change where the harness spawns) so `comet-board dispatch` inherits
-identity the way `HERDR_PANE_ID` provided it.
+### H3 — Dispatch pipeline — **done**
+Landed in `crates/board/src/dispatch.rs` + the engine's `handle_dispatch`
+(see the ported-and-working list above): concurrency caps as a refusal before
+anything is created, `via` resolved into parent-task/chat provenance on the
+attempt row and the upstream dispatch comment, `{worktree}` threaded into the
+brief at execution time, and `COMET_BOARD_CHAT_ID` exported where the harness
+spawns (`RunControls::chat_id` → child env, claude and codex adapters).
 
 ### H4 — Settle logic (M, needs H2)
 Port `settled.rs`'s *decision* (PR = the agent's own statement of done,

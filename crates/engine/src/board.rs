@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use comet_board::config::Paths;
 use comet_board::db::NewAttempt;
-use comet_board::dispatch::{SpaceRef, build_spec, route_for, space_matches};
+use comet_board::dispatch::{
+    SpaceRef, build_spec, check_capacity, dispatcher_for, dispatcher_name, route_for, space_matches,
+};
 use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
 use comet_board::rows::{TaskRow, board_rows};
@@ -283,14 +285,13 @@ fn publish_rows(engine: &SyncEngine, rows: &watch::Sender<Vec<TaskRow>>, log: &L
     }
 }
 
-/// One dispatch, on the loop thread (docs/BOARD.md §H2).
+/// One dispatch, on the loop thread (docs/BOARD.md §H2/H3).
 ///
-/// Ordering is deliberate: the attempt row is inserted **first**, so the
-/// partial unique index refuses a duplicate before anything is created. A
-/// failure after that closes the attempt rather than leaving it live forever.
-///
-/// H3 grows this: concurrency caps, resolving `via` into a parent task id, and
-/// `COMET_BOARD_CHAT_ID` in the harness env.
+/// The refusals come first — live attempt, route, capacity, space — so nothing
+/// is created for a dispatch that cannot happen. Then ordering is deliberate:
+/// the attempt row is inserted **first**, so the partial unique index refuses
+/// a duplicate before anything is created. A failure after that closes the
+/// attempt rather than leaving it live forever.
 fn handle_dispatch(
     engine: &SyncEngine,
     runtime: &(dyn Runtime + Send + Sync),
@@ -310,6 +311,7 @@ fn handle_dispatch(
         );
     }
     let route = route_for(&engine.cfg, &task)?;
+    check_capacity(&engine.db, &engine.cfg, route)?;
     let space = spaces
         .borrow()
         .iter()
@@ -327,6 +329,13 @@ fn handle_dispatch(
         })?;
     let spec = build_spec(&engine.cfg, route, &task, &space)?;
 
+    // Provenance: a `via` chat with a live attempt names its task as the
+    // parent; one without is still an agent if the chat is alive. The
+    // `chat_alive` lookup runs only when it is the deciding fact.
+    let dispatcher = dispatcher_for(&engine.db, via.as_deref(), |chat| {
+        runtime.chat_alive(chat).unwrap_or(false)
+    });
+
     let attempt_no = task.attempt_count() + 1;
     // The duplicate-dispatch guard: a second concurrent dispatch fails on the
     // partial unique index here, before a worktree or chat exists.
@@ -337,8 +346,8 @@ fn handle_dispatch(
         runtime: route.runtime.clone(),
         worktree: None,
         branch: Some(spec.branch.clone()),
-        dispatched_by: None,
-        dispatched_by_pane: via.clone(),
+        dispatched_by: dispatcher.task().map(str::to_string),
+        dispatched_by_pane: dispatcher.pane().map(str::to_string),
         base_sha: None,
     })?;
 
@@ -357,12 +366,15 @@ fn handle_dispatch(
                     task.identifier, handle.cwd
                 )),
             }
+            // The upstream comment names the parent legibly: the issue
+            // identifier when the board dispatched it too, the chat id
+            // otherwise — not the raw task id.
             engine.enqueue_dispatch(
                 &task,
                 &route.runtime,
                 &route.workspace,
                 attempt_no,
-                via.as_deref(),
+                dispatcher_name(&engine.db, &dispatcher).as_deref(),
             )?;
             engine.rederive_all()?;
             Ok(Dispatched {
@@ -470,10 +482,21 @@ mod tests {
     }
 
     /// Records what the board asked of comet; answers like a healthy engine.
-    #[derive(Default)]
     struct FakeRuntime {
         dispatched: std::sync::Mutex<Vec<DispatchSpec>>,
         cancelled: std::sync::Mutex<Vec<String>>,
+        /// What `chat_alive` answers — flip to fake an archived/gone chat.
+        alive: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for FakeRuntime {
+        fn default() -> Self {
+            Self {
+                dispatched: Default::default(),
+                cancelled: Default::default(),
+                alive: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
     }
 
     impl Runtime for FakeRuntime {
@@ -495,7 +518,7 @@ mod tests {
             Ok(None)
         }
         fn chat_alive(&self, _chat_id: &str) -> anyhow::Result<bool> {
-            Ok(true)
+            Ok(self.alive.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
 
@@ -546,12 +569,16 @@ mod tests {
     }
 
     fn seed_attempt(paths: &Paths, task_id: &str, chat_id: &str) {
+        seed_attempt_in(paths, task_id, chat_id, "offhand");
+    }
+
+    fn seed_attempt_in(paths: &Paths, task_id: &str, chat_id: &str, workspace: &str) {
         let db = Db::open(&paths.db()).unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
                 task_id: task_id.into(),
                 pane_id: None,
-                workspace: "offhand".into(),
+                workspace: workspace.into(),
                 runtime: "claude-code".into(),
                 worktree: None,
                 branch: None,
@@ -679,6 +706,104 @@ runtime = "mock"
         let rows = service.watch_rows().borrow().clone();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id.as_deref(), Some("chat-for-gh#7"));
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_is_refused_at_the_space_cap() {
+        let paths = scratch_paths();
+        std::fs::write(
+            paths.routing(),
+            r#"
+[[route]]
+match = { gh_repo = "owner/widget" }
+workspace = "widget"
+repo = "~/dev/widget"
+runtime = "mock"
+
+[defaults]
+max_concurrent_per_workspace = 1
+"#,
+        )
+        .unwrap();
+        seed_task(&paths, "gh:owner/widget#20", "gh#20");
+        seed_task(&paths, "gh:owner/widget#21", "gh#21");
+        seed_attempt_in(&paths, "gh:owner/widget#20", "chat-20", "widget");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        let err = service
+            .dispatch_task("gh:owner/widget#21", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cancel one first"), "{err}");
+
+        // Refused before anything was created: no chat, no attempt row.
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#21").unwrap().unwrap();
+        assert!(task.live_attempt().is_none());
+
+        service.shutdown();
+    }
+
+    /// `via` naming a chat a live attempt owns resolves to that attempt's
+    /// task: the chain reads `via gh#30`, not a bare chat id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn via_resolves_to_the_parent_task_when_the_board_dispatched_it() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#30", "gh#30");
+        seed_task(&paths, "gh:owner/widget#31", "gh#31");
+        // The parent works in another space, so the cap is not in play.
+        seed_attempt_in(&paths, "gh:owner/widget#30", "chat-parent-30", "other");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        service
+            .dispatch_task("gh:owner/widget#31", Some("chat-parent-30".into()))
+            .await
+            .unwrap();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#31").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        assert_eq!(attempt.dispatched_by.as_deref(), Some("gh:owner/widget#30"));
+        assert_eq!(
+            attempt.dispatched_by_pane.as_deref(),
+            Some("chat-parent-30")
+        );
+
+        service.shutdown();
+    }
+
+    /// A `via` chat that is archived or gone is not claimed as an agent; the
+    /// dispatch is recorded as the operator's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn via_from_a_dead_chat_records_nobody() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#40", "gh#40");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        runtime
+            .alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        service
+            .dispatch_task("gh:owner/widget#40", Some("chat-gone".into()))
+            .await
+            .unwrap();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#40").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        assert!(attempt.dispatched_by.is_none());
+        assert!(attempt.dispatched_by_pane.is_none());
 
         service.shutdown();
     }
