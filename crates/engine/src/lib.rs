@@ -526,6 +526,7 @@ impl Engine {
                 core.workspace.clone(),
                 core.doc_host.clone(),
                 sessions_watch.clone(),
+                core.sessions.journal(),
                 tokio::runtime::Handle::current(),
             ));
             match board::BoardService::spawn(
@@ -598,7 +599,8 @@ impl Engine {
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
             _ = sigterm.recv() => Ok(()),

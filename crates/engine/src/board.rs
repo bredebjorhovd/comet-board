@@ -218,7 +218,7 @@ fn run_loop(
             if let Some(fresh) = engine.reload_if_configuration_changed() {
                 engine = fresh;
             }
-            match engine.sync_once(statuses.as_ref()) {
+            match engine.sync_once_with(statuses.as_ref(), Some(runtime.as_ref())) {
                 // Review delivery rides the cycle's own PR poll, and runs
                 // after it so the `review` states it keys on are this tick's.
                 Ok(pulls) => engine.deliver_reviews(runtime.as_ref(), &pulls),
@@ -231,8 +231,9 @@ fn run_loop(
         match rx.recv_timeout(wait) {
             Ok(Msg::Sessions(sessions)) => {
                 let mapped = map_statuses(&sessions);
-                // Status-only fast path; lifecycle stays on the interval clock.
-                match engine.refresh_statuses(&mapped) {
+                // The event fast path: statuses, plus §H4's settle/reopen —
+                // the clocked lifecycle (orphaning) stays on the interval.
+                match engine.refresh_statuses_with(&mapped, Some(runtime.as_ref())) {
                     Ok(true) => publish_rows(&engine, &rows, &log),
                     Ok(false) => {}
                     Err(e) => log.warn(format!("refreshing agent statuses: {e}")),
@@ -527,6 +528,12 @@ mod tests {
         fn chat_cwd(&self, _chat_id: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
+        fn last_run_end(
+            &self,
+            _chat_id: &str,
+        ) -> anyhow::Result<Option<comet_board::runtime::RunEnd>> {
+            Ok(None)
+        }
     }
 
     fn spawn_service(
@@ -665,6 +672,51 @@ runtime = "mock"
         assert_eq!(
             wait_for_state(&paths, "linear:LIN-142", BoardState::Working),
             BoardState::Working
+        );
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_ending_settles_an_attempt_with_a_pull_request() {
+        // §H4 through the service: the session flipping Working → Idle is the
+        // run-end event, and with a PR recorded the attempt closes on it —
+        // no interval tick, no clock.
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#4", "gh#4");
+        seed_attempt(&paths, "gh:owner/widget#4", "chat-4");
+        {
+            let db = Db::open(&paths.db()).unwrap();
+            db.set_pr(
+                "gh:owner/widget#4",
+                Some("https://github.com/owner/widget/pull/9"),
+                Some(9),
+                true,
+            )
+            .unwrap();
+        }
+
+        let (tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![]);
+
+        tx.send(vec![session("chat-4", SessionStatus::Working)])
+            .unwrap();
+        assert_eq!(
+            wait_for_state(&paths, "gh:owner/widget#4", BoardState::Working),
+            BoardState::Working
+        );
+        tx.send(vec![session("chat-4", SessionStatus::Idle)])
+            .unwrap();
+        assert_eq!(
+            wait_for_state(&paths, "gh:owner/widget#4", BoardState::Review),
+            BoardState::Review
+        );
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#4").unwrap().unwrap();
+        assert!(task.live_attempt().is_none(), "the attempt settled");
+        assert_eq!(
+            task.attempts.last().and_then(|a| a.outcome),
+            Some(Outcome::Done)
         );
 
         service.shutdown();

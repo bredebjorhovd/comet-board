@@ -12,12 +12,14 @@
 //! [`AgentStatus`], and [`SyncEngine::reconcile_sessions`] writes them onto
 //! live attempts. No screens, no vitals, no nudges.
 //!
+//! Settle decisions (§H4) key off run-journal events: a run ending is a
+//! recorded fact, so "the turn ended, now check the checkout" needs no
+//! debounce clock. The decision itself is [`crate::settled::decide`]; the
+//! artifact checks and the wrongly-settled rewatch live here, on both the
+//! interval reconcile (catch-up) and the event path (the moment the run ends).
+//!
 //! ## What is deliberately NOT here yet
 //!
-//! - **Settle decisions** (PR ⇒ attempt done, commits ⇒ weaker evidence) key
-//!   off run-journal events in comet, not idle-sampling — that is H4
-//!   (docs/BOARD.md). Until it lands, attempts end only by orphaning or by an
-//!   operator's cancel.
 //! - **Unadopted detection** — lives in [`crate::adopt`] (H8), walking comet
 //!   spaces on demand from `comet-board adopt` / `doctor` rather than on the
 //!   sync cycle; H7's board view decides whether a periodic sweep earns a
@@ -27,6 +29,8 @@ use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
 use crate::log::Logger;
 use crate::model::*;
+use crate::runtime::{RunEnd, Runtime};
+use crate::settled::{self, Evidence, Verdict};
 use crate::sources::github::{Github, HttpRest, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
@@ -200,18 +204,29 @@ impl SyncEngine {
     /// caller has not received a snapshot yet (engine still booting), and
     /// reconciliation is skipped rather than run against a world where every
     /// chat would read as missing.
-    ///
     /// Returns the pull requests this cycle polled, handed on rather than
     /// refetched: review delivery ([`SyncEngine::deliver_reviews`]) needs each
     /// one's `updated_at` to decide whether asking about its comments is worth
     /// a call at all. The caller runs delivery *after* the cycle, because
     /// `review` is only correct once this cycle's reconciliation has landed.
     pub fn sync_once(&self, statuses: Option<&SessionStatuses>) -> Result<Vec<PullRequest>> {
+        self.sync_once_with(statuses, None)
+    }
+
+    /// As [`SyncEngine::sync_once`], with the [`Runtime`] the settle logic
+    /// consults for run-journal facts (§H4). `None` — the read-only callers —
+    /// still settles on `Idle`, but leaves an errored end unrecognised.
+    pub fn sync_once_with(
+        &self,
+        statuses: Option<&SessionStatuses>,
+        runtime: Option<&dyn Runtime>,
+    ) -> Result<Vec<PullRequest>> {
+
         self.poll_linear();
         let pulls = self.poll_github();
 
         if let Some(statuses) = statuses {
-            self.reconcile_sessions(statuses)?;
+            self.reconcile_sessions_with(statuses, runtime)?;
         }
         self.rederive_all()?;
         self.drain_writebacks();
@@ -602,9 +617,8 @@ impl SyncEngine {
     /// commits locally and stops is done, and waiting for a PR that is never
     /// coming leaves the row `working` forever. Counting commits against the
     /// attempt's own starting commit is the local equivalent of "explicit done
-    /// detection". The settle logic that consumes this lands with H4; the
-    /// measurement ports now because it has no herdr in it and its regression
-    /// tests are worth keeping green.
+    /// detection". [`SyncEngine::maybe_settle`] consumes this (§H4); the
+    /// ranking of what it measures is [`crate::settled::decide`].
     pub fn attempt_has_commits(&self, worktree: Option<&str>, base_sha: Option<&str>) -> bool {
         let Some(worktree) = worktree else {
             return false;
@@ -696,14 +710,30 @@ impl SyncEngine {
     ///   command ledger until the host device executes it). Ticks are counted
     ///   for observability, but the verdict needs `Runtime::chat_alive` — H2.
     ///   Nothing is orphaned on absence-of-evidence alone.
-    /// - Settling (PR/commit evidence ending an attempt) is H4 and keys off
-    ///   run-journal events, not statuses seen here.
+    /// - Settling (§H4): a live attempt whose chat's last run has ended is
+    ///   checked for artifacts — see [`SyncEngine::maybe_settle`]. This is the
+    ///   catch-up path (the event path settles the moment the run ends); it
+    ///   makes no fresh PR lookup because the cycle polled seconds ago.
+    /// - Re-opening (§H4's inverse): a settled attempt whose chat is working
+    ///   again — [`SyncEngine::rewatch_settled_attempts`].
     ///
     /// Call this on the steady sync interval only. Session-watch *events*
     /// should go through [`SyncEngine::refresh_statuses`] instead, so a burst
     /// of change notifications cannot run the missing-ticks counter faster
     /// than wall clock — the exact flap gh#34 taught herdr-board about.
     pub fn reconcile_sessions(&self, statuses: &SessionStatuses) -> Result<()> {
+        self.reconcile_sessions_with(statuses, None)
+    }
+
+    /// As [`SyncEngine::reconcile_sessions`], with the [`Runtime`] whose run
+    /// journal the settle logic reads. Without one an `Errored` end cannot be
+    /// told apart from a question mid-run (both read `Blocked`), so neither is
+    /// acted on.
+    pub fn reconcile_sessions_with(
+        &self,
+        statuses: &SessionStatuses,
+        runtime: Option<&dyn Runtime>,
+    ) -> Result<()> {
         for attempt in self.db.live_attempts()? {
             let Some(chat_id) = attempt.pane_id.as_deref() else {
                 // Dispatch is still in flight; nothing to reconcile yet.
@@ -762,7 +792,14 @@ impl SyncEngine {
             if status == AgentStatus::Working && !attempt.saw_working {
                 self.db.set_saw_working(attempt.id)?;
             }
+            // §H4: the turn ended — check the checkout. No fresh PR lookup on
+            // this path: the cycle polled GitHub moments ago, so the recorded
+            // PR state is as fresh as a lookup would be.
+            self.maybe_settle(runtime, &task, &attempt, status, false)?;
         }
+        // Last, because it may re-open an attempt: doing it first would hand
+        // the live pass above a row it has already decided about.
+        self.rewatch_settled_attempts(statuses)?;
         Ok(())
     }
 
@@ -772,19 +809,258 @@ impl SyncEngine {
         self.enqueue_outcome(task, Outcome::Orphaned, None)
     }
 
-    /// Refresh what the board *displays* from the session watch, and nothing
-    /// else.
+    // ---- settling (§H4) --------------------------------------------------
+
+    /// Has this attempt's chat's last run ended, and if so how did it end?
     ///
-    /// Deliberately not [`SyncEngine::reconcile_sessions`]: that owns lifecycle
-    /// decisions — orphaning a vanished chat — and running it from every watch
-    /// event would count `missing_ticks` in event time rather than wall time.
-    /// This only writes the agent status a live attempt is showing, so a
-    /// `blocked` is visible the moment it happens rather than on the next
-    /// interval tick. A status change is caused by *input*: an agent becomes
-    /// blocked when it asks something, and unblocked the moment it is answered.
-    /// Waiting up to a full poll interval to notice makes the board lie about
-    /// the one thing it exists to show.
+    /// The status carries most of the answer: `Idle` is only ever written
+    /// after the engine journals a `Done`, and a chat is fresh per attempt, so
+    /// `Idle` means *this attempt's* run ended — whether it completed or was
+    /// interrupted decides nothing (both settle the same way), so no journal
+    /// read is needed. `Blocked` is the one status hiding two different facts
+    /// — `Errored` (the run ended, badly) and `AwaitingInput` (the run is
+    /// alive, asking) — and only the journal can split them.
+    ///
+    /// `None` for everything else: `Working` is a live run, `Unknown` is a
+    /// crashed engine (absence of evidence, which must never read as
+    /// completion), `Missing` is the orphan logic's business.
+    fn run_end(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        chat_id: &str,
+        status: AgentStatus,
+    ) -> Option<RunEnd> {
+        match status {
+            AgentStatus::Idle | AgentStatus::Done => Some(RunEnd::Completed),
+            AgentStatus::Blocked => match runtime?.last_run_end(chat_id) {
+                Ok(Some(RunEnd::Errored)) => Some(RunEnd::Errored),
+                // A live run mid-question — or a journal that disagrees with
+                // the status, where doing nothing is the safe reading.
+                Ok(_) => None,
+                Err(e) => {
+                    self.log.warn(format!(
+                        "{}: reading chat {chat_id}'s journal: {e}",
+                        task.identifier
+                    ));
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// The §H4 settle check: if this attempt's run has ended, weigh the
+    /// artifacts and maybe close it. Returns whether it settled.
+    ///
+    /// `fresh_pr` allows one targeted GitHub lookup before closing on commits
+    /// alone. Only the event path passes true — the interval path polls before
+    /// it reconciles, so a lookup there would repeat the poll — and the lookup
+    /// itself is gated on commits existing, because a pull request cannot
+    /// exist without them.
+    fn maybe_settle(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        status: AgentStatus,
+        fresh_pr: bool,
+    ) -> Result<bool> {
+        let Some(chat_id) = attempt.pane_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(end) = self.run_end(runtime, task, chat_id, status) else {
+            return Ok(false);
+        };
+        let mut pr_open = task.pr_open;
+        let mut pr_url = task.pr_url.clone().filter(|_| pr_open);
+        if !pr_open
+            && fresh_pr
+            && self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+            && let Some(url) = self.recheck_pull_request(task, attempt)
+        {
+            pr_open = true;
+            pr_url = Some(url);
+        }
+        let verdict = settled::decide(end, pr_open, || {
+            self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+        });
+        match verdict {
+            Verdict::Finished(evidence) => {
+                self.settle(task, attempt, evidence, pr_url.as_deref())?;
+                Ok(true)
+            }
+            // Not logged: the interval path re-asks every cycle, and an
+            // errored or artifact-less attempt is already visible on the
+            // board as blocked / dim idle. The settle is the event.
+            Verdict::StayLive(_) => Ok(false),
+        }
+    }
+
+    /// Ask GitHub, now, whether this attempt's branch has an open pull
+    /// request the board has not recorded yet.
+    ///
+    /// A run ends the moment the journal says so; the board records pull
+    /// requests on its poll cycle; and the two race reliably, because an agent
+    /// opens its PR moments before its final turn ends. herdr chose to live
+    /// inside that window and made its settle notice "never assert an absence
+    /// it has not checked" (its gh#29). Here the check is affordable — run
+    /// ends are rare events, where herdr's settles were idle samples — so the
+    /// window is closed instead: one `pulls` call per repo the task can own.
+    fn recheck_pull_request(&self, task: &Task, attempt: &Attempt) -> Option<String> {
+        let gh = self.github.as_ref()?;
+        let branch = attempt.branch.as_deref()?;
+        // The poll's own scoping rule (see `link_pull_requests`): a GitHub
+        // task owns its repo and only that repo's PRs can be its own; a Linear
+        // task names none, so its branch is honoured wherever it turns up.
+        let repos: Vec<String> = match crate::model::gh_repo(&task.id) {
+            Some(r) => vec![r.to_string()],
+            None => self.cfg.github.repos.clone(),
+        };
+        for repo in &repos {
+            let pulls = match gh.pulls(repo) {
+                Ok(p) => p,
+                Err(e) => {
+                    // A GitHub outage must not block the settle — the commits
+                    // verdict stands, and the next poll links the PR.
+                    self.log
+                        .warn(format!("{}: PR recheck in {repo}: {e}", task.identifier));
+                    continue;
+                }
+            };
+            if let Some(pr) = pulls
+                .iter()
+                .find(|p| p.open && pr_matches_branch(p, branch))
+            {
+                // Record it, so the settle carries the URL and the row derives
+                // straight to review with its pull request attached.
+                let _ = self
+                    .db
+                    .set_pr(&task.id, Some(&pr.url), Some(pr.number), true);
+                return Some(pr.url.clone());
+            }
+        }
+        None
+    }
+
+    /// Close an attempt whose evidence cleared the bar, and tell everyone
+    /// reading upstream. The §H4 half of what herdr-board's `settle` did — the
+    /// dispatcher wake (its AGE-25) is deliberately not ported here.
+    fn settle(
+        &self,
+        task: &Task,
+        attempt: &Attempt,
+        evidence: Evidence,
+        pr_url: Option<&str>,
+    ) -> Result<()> {
+        self.db.close_attempt(attempt.id, Outcome::Done)?;
+        self.enqueue_outcome(task, Outcome::Done, pr_url)?;
+        self.log.info(format!(
+            "{}: run ended with {} — attempt done",
+            task.identifier,
+            evidence.as_str()
+        ));
+        Ok(())
+    }
+
+    /// Look again at attempts the board has already closed (§H4's inverse,
+    /// herdr gh#34: "a settle the board got wrong").
+    ///
+    /// An attempt settles on evidence, and evidence can be wrong — commits are
+    /// routinely there long before the work is done. A settled attempt whose
+    /// chat starts working again was settled wrongly, and is **re-opened, not
+    /// re-dispatched**: nobody dispatched anything, so a second attempt row
+    /// would claim a retry that never happened. The one number worth keeping —
+    /// that the board was wrong about *this* attempt — is `reopened`, carried
+    /// on the row and in `list --json`.
+    ///
+    /// herdr needed a screen-moved check here, because its `working` could be
+    /// a stale spinner in scrollback flapping every finished row. comet's
+    /// `Working` means a run is executing right now — written by the engine,
+    /// staleness-gated by [`crate::runtime::agent_status`] — so the status
+    /// alone is the whole check. Its pane-holds-somebody-else check has no
+    /// equivalent either: chat ids are never reused, and the chat *is* the
+    /// attempt's, so whoever prompts it (review feedback, an operator's
+    /// follow-up) is continuing this attempt.
+    fn rewatch_settled_attempts(&self, statuses: &SessionStatuses) -> Result<bool> {
+        let mut changed = false;
+        for attempt in self.db.settled_attempts()? {
+            let Some(chat_id) = attempt.pane_id.as_deref() else {
+                continue;
+            };
+            let status = statuses
+                .get(chat_id)
+                .copied()
+                .unwrap_or(AgentStatus::Missing);
+            // The cheap pre-filter, before a task read: the usual case by far
+            // is a finished chat sitting `Idle` forever, and the settle stands.
+            if status != AgentStatus::Working {
+                continue;
+            }
+            let Some(task) = self.db.get_task(&attempt.task_id)? else {
+                continue;
+            };
+            if !settled::should_reopen(
+                status,
+                task.upstream.is_final(),
+                task.local_done,
+                task.live_attempt().is_some(),
+            ) {
+                continue;
+            }
+            if !self.db.reopen_attempt(attempt.id)? {
+                // Lost a race with a dispatch between the check above and
+                // here. The live attempt is the current one; nothing wrong.
+                continue;
+            }
+            // Both, so this same pass's derivation already puts the row back
+            // in WORKING rather than leaving it claiming review for a tick.
+            self.db
+                .set_attempt_status(attempt.id, AgentStatus::Working)?;
+            self.db.set_saw_working(attempt.id)?;
+            self.log.warn(format!(
+                "{} was closed as {} but chat {chat_id} is working again — \
+                 attempt re-opened ({} time(s) now)",
+                task.identifier,
+                attempt.outcome.map(Outcome::as_str).unwrap_or("finished"),
+                attempt.reopened + 1
+            ));
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Refresh the board from the session watch, the moment things happen.
+    ///
+    /// Deliberately not [`SyncEngine::reconcile_sessions`]: that owns the
+    /// clocked lifecycle decision — orphaning a vanished chat — and running it
+    /// from every watch event would count `missing_ticks` in event time rather
+    /// than wall time. What runs here is what event time is *correct* for:
+    ///
+    /// - **Status display.** A status change is caused by input — an agent
+    ///   becomes blocked when it asks something, unblocked the moment it is
+    ///   answered — and waiting an interval tick to notice makes the board lie
+    ///   about the one thing it exists to show.
+    /// - **Settling (§H4).** A transition onto a settled-looking status *is*
+    ///   the run-end event arriving; this is the "the turn ended, now check
+    ///   the checkout" moment the run journal replaced the 60-second clock
+    ///   with. Checked on the transition only — the interval reconcile owns
+    ///   the steady re-check, so a burst of unchanged snapshots costs no git.
+    /// - **Re-opening (§H4's inverse).** comet's `Working` is written by the
+    ///   engine that runs the agent and staleness-gated on the way in, so —
+    ///   unlike herdr's screen-sampled `working` — acting on it immediately
+    ///   cannot flap a finished row.
     pub fn refresh_statuses(&self, statuses: &SessionStatuses) -> Result<bool> {
+        self.refresh_statuses_with(statuses, None)
+    }
+
+    /// As [`SyncEngine::refresh_statuses`], with the [`Runtime`] whose run
+    /// journal distinguishes an `Errored` end from a question mid-run.
+    pub fn refresh_statuses_with(
+        &self,
+        statuses: &SessionStatuses,
+        runtime: Option<&dyn Runtime>,
+    ) -> Result<bool> {
         let mut changed = false;
         for attempt in self.db.live_attempts()? {
             let Some(chat_id) = attempt.pane_id.as_deref() else {
@@ -794,7 +1070,8 @@ impl SyncEngine {
                 // Missing chats are the interval reconcile's business, not ours.
                 continue;
             };
-            if attempt.agent_status != Some(status) {
+            let transitioned = attempt.agent_status != Some(status);
+            if transitioned {
                 self.db.set_attempt_status(attempt.id, status)?;
                 changed = true;
             }
@@ -803,6 +1080,21 @@ impl SyncEngine {
             if status == AgentStatus::Working && !attempt.saw_working {
                 self.db.set_saw_working(attempt.id)?;
             }
+            if transitioned {
+                let Some(task) = self.db.get_task(&attempt.task_id)? else {
+                    continue;
+                };
+                // Fresh PR lookup allowed: the run just ended, and the poll
+                // may be a whole cycle behind the agent's own `gh pr create`
+                // (herdr's gh#29 window — the reason "finished — committed"
+                // notices used to reach dispatchers whose PR already existed).
+                if self.maybe_settle(runtime, &task, &attempt, status, true)? {
+                    changed = true;
+                }
+            }
+        }
+        if self.rewatch_settled_attempts(statuses)? {
+            changed = true;
         }
         if changed {
             self.rederive_all()?;
@@ -1550,10 +1842,9 @@ mod tests {
 
     #[test]
     fn an_idle_status_leaves_the_attempt_live() {
-        // "only finalize on explicit done detection or user action" — and the
-        // done detection (PR / commits, keyed off run events) is H4. Until it
-        // lands, a settled-looking status changes the display, never the
-        // lifecycle.
+        // "only finalize on explicit done detection or user action". The run
+        // ended, and the checkout was checked (§H4) — but this attempt has no
+        // worktree, no commits and no PR, and between turns is not finished.
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -1658,6 +1949,472 @@ mod tests {
             e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
             BoardState::Blocked
         );
+    }
+
+    // ---- settling on run events (§H4) ------------------------------------
+
+    use crate::runtime::{DispatchHandle, DispatchSpec};
+
+    /// A runtime that answers only the journal question — nothing else on the
+    /// trait is reachable from the settle path.
+    struct JournalFact(Option<RunEnd>);
+
+    impl Runtime for JournalFact {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("settling never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!("settling never prompts")
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("settling never cancels")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            unreachable!("settling never reads the chat cwd")
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(self.0)
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Give an attempt a real checkout: base recorded at dispatch, and — when
+    /// asked — a commit the agent made after it. Built on the AGE-19 fixture
+    /// so the operator's own unpushed commit is always present underneath,
+    /// proving every settle here measures from the attempt's base.
+    fn agent_worked_in(e: &SyncEngine, attempt: i64, committed: bool) -> std::path::PathBuf {
+        let work = repo_ahead_of_its_remote();
+        let head = std::process::Command::new("git")
+            .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if committed {
+            std::fs::write(work.join("agent"), "work").unwrap();
+            git_in(&work, &["add", "."]);
+            git_in(&work, &["commit", "-m", "the agent's work"]);
+        }
+        e.db.set_attempt_worktree(attempt, &work.to_string_lossy())
+            .unwrap();
+        e.db.set_attempt_base_sha(attempt, &base).unwrap();
+        work
+    }
+
+    fn outcome_payload(e: &SyncEngine) -> Value {
+        let w =
+            e.db.pending_writebacks(20)
+                .unwrap()
+                .into_iter()
+                .find(|w| w.kind == "outcome")
+                .expect("an outcome writeback");
+        serde_json::from_str(&w.payload).unwrap()
+    }
+
+    #[test]
+    fn a_pull_request_settles_the_attempt_the_moment_the_run_ends() {
+        // The whole §H4 headline: no clock, no second sample. The run ended,
+        // a PR is open — the agent said it is finished, so it is.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/18"),
+            Some(18),
+            true,
+        )
+        .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        assert!(live(&e).outcome.is_none(), "a live run settles nothing");
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        // The writeback names the PR — the trail a dispatcher acts on.
+        assert_eq!(
+            outcome_payload(&e)["pr_url"].as_str(),
+            Some("https://github.com/o/r/pull/18")
+        );
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Review
+        );
+    }
+
+    #[test]
+    fn commits_settle_a_run_that_ended_cleanly() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, true);
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        // Commits are the evidence, and no PR is claimed — the payload says
+        // null, which delivery renders as the log-pointer comment.
+        assert!(outcome_payload(&e)["pr_url"].is_null());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_run_that_ends_with_nothing_new_committed_stays_live() {
+        // The checkout exists and holds the operator's own unpushed commit —
+        // the AGE-19 trap. Measured from the attempt's base there is nothing,
+        // and nothing is what must be found.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, false);
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_errored_run_keeps_the_attempt_for_the_retry() {
+        // §H4's `reopened` contract, first half: an `Errored`→retried run is
+        // the same attempt, not a new one. The errored end never closes the
+        // row — even over commits — so the retry lands on it, and the clean
+        // end that follows settles it with nothing reopened and nothing
+        // double-counted.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, true);
+        let rt = JournalFact(Some(RunEnd::Errored));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        // The run dies: the engine maps Errored to blocked, the journal holds
+        // the errored Done.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert!(
+            live(&e).outcome.is_none(),
+            "an errored run must not settle on its commits"
+        );
+
+        // The operator retries in the same chat; a run is live again.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.attempts.len(), 1, "the retry is the same attempt");
+
+        // And this time it ends cleanly.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.attempts.len(), 1);
+        assert_eq!(task.attempts[0].outcome, Some(Outcome::Done));
+        assert_eq!(task.attempts[0].reopened, 0, "a retry is not a reopen");
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_errored_run_with_a_pull_request_still_finishes() {
+        // A harness that crashes moments after `gh pr create` still finished
+        // the work: the PR is the agent's own statement, whatever the exit
+        // said.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact(Some(RunEnd::Errored));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+    }
+
+    #[test]
+    fn a_question_mid_run_settles_nothing() {
+        // `Blocked` hides two facts, and this is the other one: the agent
+        // asked something, the run is alive, the journal's last word is not a
+        // `Done`. Even an open PR must not settle it — the question may be
+        // about that very PR.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+    }
+
+    #[test]
+    fn without_a_journal_a_blocked_status_decides_nothing() {
+        // A caller with no runtime cannot tell an errored end from a pending
+        // question, so it must act on neither.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Blocked)]))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+    }
+
+    #[test]
+    fn a_crashed_engine_reading_unknown_is_not_completion() {
+        // Staleness is absence of evidence. Settling on it would close
+        // attempts every time an engine wedges with commits on the branch.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, true);
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Unknown)]))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- the settle the board got wrong (§H4's inverse) ------------------
+
+    /// Settle an attempt on commits, returning its checkout for cleanup.
+    fn settled_on_commits(e: &SyncEngine, attempt: i64) -> std::path::PathBuf {
+        let work = agent_worked_in(e, attempt, true);
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert_eq!(live(e).outcome, Some(Outcome::Done), "fixture must settle");
+        work
+    }
+
+    #[test]
+    fn a_settled_chat_seen_working_again_is_reopened_not_redispatched() {
+        // Commits are routinely there before the work is done, so a settle on
+        // them can be wrong. The chat working again is the proof — and it is
+        // counted on this attempt as `reopened`, because nobody dispatched
+        // anything.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = settled_on_commits(&e, a);
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        let attempt = live(&e);
+        assert!(attempt.outcome.is_none(), "back to work");
+        assert_eq!(attempt.reopened, 1);
+        assert_eq!(attempt.agent_status, Some(AgentStatus::Working));
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.attempts.len(), 1, "re-opened, not re-dispatched");
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_finished_chat_sitting_idle_leaves_the_settle_standing() {
+        // Every finished chat reads Idle forever; only Working reopens.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = settled_on_commits(&e, a);
+        for _ in 0..3 {
+            e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+                .unwrap();
+        }
+        let attempt = live(&e);
+        assert_eq!(attempt.outcome, Some(Outcome::Done));
+        assert_eq!(attempt.reopened, 0);
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn reopening_is_refused_once_somebody_redispatched() {
+        // The re-dispatch names a decision-maker, and that attempt is the
+        // current one — the old chat still typing does not overrule it.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = settled_on_commits(&e, a);
+        dispatch(&e, "linear:LIN-142", "chat-10");
+
+        e.reconcile_sessions(&statuses(&[
+            ("chat-9", AgentStatus::Working),
+            ("chat-10", AgentStatus::Working),
+        ]))
+        .unwrap();
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.attempts[0].outcome, Some(Outcome::Done));
+        assert_eq!(task.attempts[0].reopened, 0);
+        assert!(task.attempts[1].outcome.is_none());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_task_marked_done_is_not_reopened() {
+        // `mark done` is the operator deciding the task is over; an agent
+        // still typing does not overrule them.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = settled_on_commits(&e, a);
+        e.db.set_local_done("linear:LIN-142", true).unwrap();
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- the event path --------------------------------------------------
+
+    #[test]
+    fn the_event_path_settles_on_the_transition() {
+        // The moment the run ends — not the next interval tick. The 60-second
+        // clock this replaces is the whole of §H4.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/18"),
+            Some(18),
+            true,
+        )
+        .unwrap();
+        e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        assert!(
+            e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Idle)]))
+                .unwrap()
+        );
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        // refresh rederives, so the row is already in review.
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Review
+        );
+    }
+
+    #[test]
+    fn the_event_path_reopens_the_moment_a_settled_chat_works() {
+        // herdr ran its rewatch on the interval because a screen-sampled
+        // `working` could lie. comet's cannot, so the event path acts on it.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = settled_on_commits(&e, a);
+
+        assert!(
+            e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
+                .unwrap()
+        );
+        let attempt = live(&e);
+        assert!(attempt.outcome.is_none());
+        assert_eq!(attempt.reopened, 1);
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Working,
+            "this same pass's derivation already reads the row as working"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_run_end_rechecks_github_before_settling_on_commits() {
+        // herdr's gh#29: an agent opens its PR moments before its final turn
+        // ends, and the board's poll is up to a cycle behind — so its settles
+        // said "committed" about work whose PR already existed. Run ends are
+        // rare events, so here the window is closed with one targeted lookup.
+        let fixture = FixtureRest::new(vec![(
+            "/repos/o/r/pulls".into(),
+            serde_json::json!([{
+                "number": 18,
+                "title": "Add retry",
+                "state": "open",
+                "updated_at": "2026-08-01T00:00:00Z",
+                "html_url": "https://github.com/o/r/pull/18",
+                "head": { "ref": "board/lin-142" },
+            }]),
+        )]);
+        let mut e = engine_with(None, Some(Github::new(Box::new(fixture) as Box<dyn Rest>)));
+        // A Linear task names no repo, so the lookup walks the configured ones.
+        e.cfg.github.repos = vec!["o/r".into()];
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, true);
+
+        e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.attempts[0].outcome, Some(Outcome::Done));
+        assert!(task.pr_open, "the lookup recorded what the poll had not");
+        assert_eq!(
+            outcome_payload(&e)["pr_url"].as_str(),
+            Some("https://github.com/o/r/pull/18"),
+            "the settle carries the PR rather than asserting an absence"
+        );
+        assert_eq!(task.state, BoardState::Review);
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_interval_path_leaves_the_lookup_to_the_poll() {
+        // The cycle polls GitHub moments before it reconciles, so a lookup
+        // there would repeat the poll. Same fixture, interval path: the settle
+        // rests on commits and claims nothing about a PR it did not check.
+        let fixture = FixtureRest::new(vec![(
+            "/repos/o/r/pulls".into(),
+            serde_json::json!([{
+                "number": 18,
+                "title": "Add retry",
+                "state": "open",
+                "updated_at": "2026-08-01T00:00:00Z",
+                "html_url": "https://github.com/o/r/pull/18",
+                "head": { "ref": "board/lin-142" },
+            }]),
+        )]);
+        let mut e = engine_with(None, Some(Github::new(Box::new(fixture) as Box<dyn Rest>)));
+        e.cfg.github.repos = vec!["o/r".into()];
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, true);
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert!(outcome_payload(&e)["pr_url"].is_null());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     // ---- pull-request linking -------------------------------------------

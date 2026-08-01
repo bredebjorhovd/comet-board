@@ -95,6 +95,24 @@ pub fn agent_status(session: Option<&Session>, now: DateTime<Utc>) -> AgentStatu
     }
 }
 
+/// How the last run in a chat ended, as the run journal records it — the
+/// board's view of comet's `DoneStatus`.
+///
+/// This is the fact §H4's settle logic keys off: a run ending is a journal
+/// event (`AgentEvent::Done`), not an inference from an idle-looking status,
+/// so "the turn ended, now check the checkout" needs no debounce clock. The
+/// distinction the *status* mapping cannot make — `Errored` and
+/// `AwaitingInput` both read [`AgentStatus::Blocked`] — is exactly the one
+/// this preserves: an errored run has ended (and must not settle on commits),
+/// a question mid-run has not ended at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunEnd {
+    Completed,
+    Interrupted,
+    Errored,
+}
+
 /// Everything a dispatch resolved from a task + its route, expressed in comet
 /// vocabulary. The board core produces this; an engine-side executor consumes
 /// it. No RPC types leak in here — this crate stays sync and transport-free.
@@ -188,6 +206,12 @@ pub trait Runtime {
     /// a session that moved on reaches the wrong author. What herdr-board read
     /// off the pane's live cwd, comet states on the chat row.
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>>;
+
+    /// How the chat's most recent run ended, straight off the run journal:
+    /// `Some` when the journal's last event is a `Done`, `None` while a run is
+    /// mid-stream (or nothing has ever run). The settle authority §H4 names —
+    /// see [`RunEnd`] for why the session status cannot carry this.
+    fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>>;
 }
 
 #[cfg(test)]
