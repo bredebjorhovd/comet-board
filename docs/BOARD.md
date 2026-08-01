@@ -60,6 +60,10 @@ nearly verbatim — it never depended on herdr:
   a chat with no session row yet is indistinguishable from a dispatch whose
   first run has not started, and the verdict on those waits for H2's
   `chat_alive`.
+- `adopt.rs`, `doctor.rs`, `init.rs` — the operator-facing trio (H8), walking
+  comet spaces where herdr-board walked workspaces. Exposed by
+  `apps/board-cli` (binary `comet-board`), which fetches this device's spaces
+  over the IPC WebSocket; see §H8 below for what changed in the port.
 - `crates/engine/src/board.rs` — **new** (H1): `BoardService`, the engine
   hosting what `syncd` was. One dedicated thread owns `board.db` and the
   blocking source clients; a task forwards `WatchSessions`-shaped snapshots
@@ -86,8 +90,9 @@ Do not resurrect these; their reasons to exist are herdr's, not comet's.
   existing frontends instead (H7).
 - `settled.rs`'s screen-resample half and `gc.rs`'s pane logic. Settle keys
   off run-journal events now (H4); worktrees are the engine's (`repos.rs`).
-- `adopt.rs` for now — it walked herdr workspaces. Its successor walks comet
-  spaces (H8); the config it writes is already supported.
+- herdr-board's `adopt.rs` as written — it walked herdr workspaces. Its
+  successor landed with H8 as `crates/board/src/adopt.rs`, walking comet
+  spaces; the routing.toml writer came over verbatim.
 
 ## Remaining work, in dependency order
 
@@ -139,10 +144,11 @@ supersede rules handle pileups. Keep "verify the chat still exists and its
 cwd is still the attempt's checkout" (`chat_alive` + chat row cwd).
 
 ### H6 — `comet-board` CLI (M, needs H2; agents' entry point)
-A thin binary (new `apps/board-cli`, name the binary `comet-board`) speaking
-the existing typed RPC to the local IPC port, exactly as `comet-tui` attaches:
+Grow `apps/board-cli` (the `comet-board` binary, created by H8 with
+`doctor`/`init`/`adopt`) into the full surface, speaking the existing typed
+RPC to the local IPC port, exactly as `comet-tui` attaches:
 `list [--state --json]`, `dispatch --task`, `cancel --task`, `wait`, `new`,
-`stats`, `doctor`. JSON shapes: keep herdr-board's `list --json` contract
+`stats`. JSON shapes: keep herdr-board's `list --json` contract
 verbatim (documented in herdr-board's README §"Driving the board from an
 agent") — the agent conventions text depends on it. `wait` becomes a
 `WatchBoard` subscription rather than a poll loop. Port
@@ -158,12 +164,25 @@ architecture rule, not a suggestion. herdr-board's `ui/render.rs` and
 `ui/state.rs` are the reference for what rows say; its README documents every
 interaction's rationale.
 
-### H8 — Adopt, doctor, `init` (S–M each, needs H1)
-`doctor`: port, replacing herdr checks with comet ones (space exists, repo is
-a git repo, harness resolves, IPC reachable). `init`: walk spaces instead of
-workspaces. `adopt`: offer git-detected spaces with no route (the workspace
-doc already stamps `git_detected`); the label-picker screen ports as-is
-conceptually.
+### H8 — Adopt, doctor, `init` — **done**
+Landed as `crates/board/src/{adopt,doctor,init}.rs` plus `apps/board-cli`
+(binary `comet-board` — H6's binary, started early with the three commands
+that need only H1):
+- `doctor` — herdr checks replaced with comet ones: per route the *space*
+  exists (case-insensitive display-name match), the repo is a git checkout,
+  the runtime resolves to a comet harness; plus "engine reachable on the IPC
+  port" instead of pidfile-based `syncd` liveness. The herdr-only checks
+  (manifest overrides, stall nudge) are gone. An unreachable engine fails its
+  own check and leaves route space-checks "not checked" rather than failing
+  them all.
+- `init` — walks this device's spaces (first `WatchSpaces` snapshot, filtered
+  by `LocalDevice`); `git_detected` gates, linked worktrees are skipped as
+  attempts' checkouts. Linear team discovery unchanged.
+- `adopt` — detection offers git-detected spaces whose repo is missing a
+  route and/or a `[github] repos` entry; the validated text-edit writer,
+  `.bak` backup, ignore list, and backlog preview came over verbatim. The
+  label-picker survives as `--labels`/`--all-issues` on the CLI (H7's screen
+  can reuse `preview` + `adopt_with` as-is).
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

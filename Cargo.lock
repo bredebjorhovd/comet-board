@@ -1215,6 +1215,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "comet-board-bin"
+version = "0.1.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comet-board",
+ "comet-proto",
+ "comet-rpc",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "comet-doc"
 version = "0.1.6"
 dependencies = [
