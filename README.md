@@ -1,3 +1,18 @@
+# comet-board
+
+A fork of [zeronsh/comet](https://github.com/zeronsh/comet) adding an
+autonomous-agent task board, ported from
+[herdr-board](https://github.com/bredebjorhovd/herdr-board): Linear and GitHub
+issues come in, a dispatch releases a task into a comet chat with a coding
+agent, and session state reconciles back to the board and the trackers.
+Agents read the board and dispatch from it themselves.
+
+Board code lives in `crates/board`; the port's status, design mapping, and
+remaining work are in [docs/BOARD.md](docs/BOARD.md). Upstream comet is the
+`upstream` remote; everything below this section is its README.
+
+---
+
 # Comet
 
 Control your coding agents (Claude Code, Codex) from any of your devices.

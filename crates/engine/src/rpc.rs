@@ -800,6 +800,13 @@ impl RpcService for EngineRpc {
                 self.mutate(p)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            // Board surface (comet-board fork). Stubs until the board service
+            // lands in the engine — the method names are claimed now so both
+            // frontends and the `comet-board` CLI can build against them.
+            // Wiring plan: docs/BOARD.md §engine.
+            methods::WATCH_BOARD | methods::DISPATCH_TASK | methods::CANCEL_TASK => Err(
+                RpcError::Failed("board: not wired into this engine yet (docs/BOARD.md)".into()),
+            ),
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }

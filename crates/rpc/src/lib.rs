@@ -90,6 +90,19 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+    // Board (comet-board fork addition). The board store lives on one device —
+    // wherever `syncd` runs, usually the always-on engine — so these are served
+    // locally for now; making them relay-forwardable is a later, deliberate step.
+    /// Stream: current board rows (tasks + attempts, board order), then every
+    /// change. The `list --json` shape from herdr-board, one row per task.
+    pub const WATCH_BOARD: &str = "WatchBoard";
+    /// Release a task: cut the worktree, create the chat on the route's space,
+    /// queue the brief. Params: `{taskId, via?}` — `via` is the dispatching
+    /// chat's id when an agent released it (provenance, never authority).
+    pub const DISPATCH_TASK: &str = "DispatchTask";
+    /// End a task's live attempt (interrupt + archive the chat). The issue
+    /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
+    pub const CANCEL_TASK: &str = "CancelTask";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
