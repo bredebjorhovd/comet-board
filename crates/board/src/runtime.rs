@@ -167,6 +167,14 @@ pub trait Runtime {
     /// Whether the chat still exists and is not archived. Reconciliation's
     /// "does the pane still exist" check, minus the screen.
     fn chat_alive(&self, chat_id: &str) -> anyhow::Result<bool>;
+
+    /// Where the chat runs — its row's cwd, recorded at creation. `None` when
+    /// the chat is gone or never recorded one. Review delivery (H5) compares
+    /// this against the authoring attempt's checkout before delivering: an
+    /// operator can re-point a chat at another repo, and a review pasted into
+    /// a session that moved on reaches the wrong author. What herdr-board read
+    /// off the pane's live cwd, comet states on the chat row.
+    fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>>;
 }
 
 #[cfg(test)]

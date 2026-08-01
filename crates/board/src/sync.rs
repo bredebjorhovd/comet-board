@@ -18,8 +18,6 @@
 //!   off run-journal events in comet, not idle-sampling — that is H4
 //!   (docs/BOARD.md). Until it lands, attempts end only by orphaning or by an
 //!   operator's cancel.
-//! - **Review delivery** (H5) — `poll_github` already hands the pulls back for
-//!   it, exactly as it did in herdr-board.
 //! - **Unadopted detection** — lives in [`crate::adopt`] (H8), walking comet
 //!   spaces on demand from `comet-board adopt` / `doctor` rather than on the
 //!   sync cycle; H7's board view decides whether a periodic sweep earns a
@@ -113,7 +111,7 @@ pub mod meta {
         format!("wb_at:{task_id}")
     }
     /// Which review comments have already been delivered into a task's chat —
-    /// consumed by review delivery (H5), schema already in place.
+    /// [`crate::review::Delivered`], as JSON.
     pub fn reviews_for(task_id: &str) -> String {
         format!("reviews:{task_id}")
     }
@@ -202,12 +200,15 @@ impl SyncEngine {
     /// caller has not received a snapshot yet (engine still booting), and
     /// reconciliation is skipped rather than run against a world where every
     /// chat would read as missing.
-    pub fn sync_once(&self, statuses: Option<&SessionStatuses>) -> Result<()> {
+    ///
+    /// Returns the pull requests this cycle polled, handed on rather than
+    /// refetched: review delivery ([`SyncEngine::deliver_reviews`]) needs each
+    /// one's `updated_at` to decide whether asking about its comments is worth
+    /// a call at all. The caller runs delivery *after* the cycle, because
+    /// `review` is only correct once this cycle's reconciliation has landed.
+    pub fn sync_once(&self, statuses: Option<&SessionStatuses>) -> Result<Vec<PullRequest>> {
         self.poll_linear();
-        // The polled pull requests are handed on rather than refetched: review
-        // delivery (H5) needs each one's `updated_at` to decide whether asking
-        // about its comments is worth a call at all.
-        let _pulls = self.poll_github();
+        let pulls = self.poll_github();
 
         if let Some(statuses) = statuses {
             self.reconcile_sessions(statuses)?;
@@ -215,7 +216,7 @@ impl SyncEngine {
         self.rederive_all()?;
         self.drain_writebacks();
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
-        Ok(())
+        Ok(pulls)
     }
 
     // ---- polling --------------------------------------------------------
