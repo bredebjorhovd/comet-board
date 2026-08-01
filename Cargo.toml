@@ -13,6 +13,7 @@ members = [
     "crates/tui",
     "apps/comet",
     "apps/tui",
+    "apps/board-cli",
 ]
 
 [workspace.package]

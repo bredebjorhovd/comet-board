@@ -20,8 +20,10 @@
 //!   operator's cancel.
 //! - **Review delivery** (H5) — `poll_github` already hands the pulls back for
 //!   it, exactly as it did in herdr-board.
-//! - **Unadopted detection** (H8) — walked herdr workspaces; its successor
-//!   walks comet spaces.
+//! - **Unadopted detection** — lives in [`crate::adopt`] (H8), walking comet
+//!   spaces on demand from `comet-board adopt` / `doctor` rather than on the
+//!   sync cycle; H7's board view decides whether a periodic sweep earns a
+//!   place here.
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
@@ -62,7 +64,10 @@ pub enum SourceHealth {
     /// Not configured — the header omits it entirely.
     Absent,
     Ok,
-    Down { error: String, retry_in: u64 },
+    Down {
+        error: String,
+        retry_in: u64,
+    },
 }
 
 /// How a writeback left the queue — see [`SyncEngine::drain_writebacks`].
@@ -178,9 +183,8 @@ impl SyncEngine {
              github credential:{github_changed} \
              repos:{repos_changed} routes:{routes_changed}) — rebuilding"
         ));
-        let rebuilt = Db::open(&self.paths.db()).and_then(|db| {
-            Self::build(db, cfg, self.paths.clone(), self.log.clone(), credentials)
-        });
+        let rebuilt = Db::open(&self.paths.db())
+            .and_then(|db| Self::build(db, cfg, self.paths.clone(), self.log.clone(), credentials));
         match rebuilt {
             Ok(e) => Some(e),
             Err(e) => {
@@ -344,10 +348,7 @@ impl SyncEngine {
                     // A PR attached to the Linear issue is one of the two ways a
                     // task reaches `review`.
                     if let Some(pr) = i.pr_url() {
-                        let number = pr
-                            .rsplit('/')
-                            .next()
-                            .and_then(|n| n.parse::<i64>().ok());
+                        let number = pr.rsplit('/').next().and_then(|n| n.parse::<i64>().ok());
                         let _ = self.db.set_pr(&i.task_id(), Some(pr), number, true);
                     }
                     if i.updated_at > high {
@@ -373,9 +374,7 @@ impl SyncEngine {
             Err(e) => {
                 // Serve stale data and mark the header. Never blank the list.
                 let failures = self.bump_failures(meta::LINEAR_FAILURES);
-                let _ = self
-                    .db
-                    .meta_set(meta::LINEAR_STATUS, &format!("error:{e}"));
+                let _ = self.db.meta_set(meta::LINEAR_STATUS, &format!("error:{e}"));
                 self.log
                     .warn(format!("linear poll failed (attempt {failures}): {e}"));
             }
@@ -459,12 +458,9 @@ impl SyncEngine {
                 seen.insert(pr.task_id());
                 // Setting the PR fields is what makes derivation reach
                 // `review` rather than `ready`.
-                let _ = self.db.set_pr(
-                    &pr.task_id(),
-                    Some(&pr.url),
-                    Some(pr.number),
-                    pr.open,
-                );
+                let _ = self
+                    .db
+                    .set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), pr.open);
                 let _ = self.db.set_pr_merged(&pr.task_id(), pr.merged);
                 if check_mergeable && pr.open {
                     let state = gh.mergeable_state(&pr.repo, pr.number);
@@ -501,7 +497,11 @@ impl SyncEngine {
         for task in self.db.load_tasks().unwrap_or_default() {
             for branch in task.attempts.iter().filter_map(|a| a.branch.clone()) {
                 match crate::model::gh_repo(&task.id) {
-                    Some(repo) => set.in_repo.entry(repo.to_string()).or_default().insert(branch),
+                    Some(repo) => set
+                        .in_repo
+                        .entry(repo.to_string())
+                        .or_default()
+                        .insert(branch),
                     None => set.anywhere.insert(branch),
                 };
             }
@@ -604,11 +604,7 @@ impl SyncEngine {
     /// detection". The settle logic that consumes this lands with H4; the
     /// measurement ports now because it has no herdr in it and its regression
     /// tests are worth keeping green.
-    pub fn attempt_has_commits(
-        &self,
-        worktree: Option<&str>,
-        base_sha: Option<&str>,
-    ) -> bool {
+    pub fn attempt_has_commits(&self, worktree: Option<&str>, base_sha: Option<&str>) -> bool {
         let Some(worktree) = worktree else {
             return false;
         };
@@ -621,7 +617,13 @@ impl SyncEngine {
         // dispatch look finished the instant it started (herdr-board AGE-19).
         if let Some(sha) = base_sha {
             let out = Command::new("git")
-                .args(["-C", worktree, "rev-list", "--count", &format!("{sha}..HEAD")])
+                .args([
+                    "-C",
+                    worktree,
+                    "rev-list",
+                    "--count",
+                    &format!("{sha}..HEAD"),
+                ])
                 .output();
             if let Ok(o) = out
                 && o.status.success()
@@ -661,7 +663,11 @@ impl SyncEngine {
         // Try the remote default branch, then the local one git reports for the
         // main checkout. Either way: commits on this branch that are not on the
         // base mean the agent produced something.
-        for range in [format!("{base}..HEAD"), "master..HEAD".into(), "main..HEAD".into()] {
+        for range in [
+            format!("{base}..HEAD"),
+            "master..HEAD".into(),
+            "main..HEAD".into(),
+        ] {
             if let Some(n) = count(&range) {
                 return n > 0;
             }
@@ -987,7 +993,10 @@ impl SyncEngine {
             // Reaping a never-dispatched task drops its queued writebacks in the
             // same transaction, so this is only reachable if the row went some
             // other way. Either way there is nothing left to say it to.
-            return Ok(Sent::Dropped(format!("{} is no longer on the board", w.task_id)));
+            return Ok(Sent::Dropped(format!(
+                "{} is no longer on the board",
+                w.task_id
+            )));
         };
         if task.upstream == UpstreamState::Gone {
             // The row is kept for its history, but the issue it points at is not
@@ -1096,10 +1105,8 @@ impl SyncEngine {
                         match linear.completed_state_id(team) {
                             Ok(Some(state_id)) => {
                                 linear.set_state(&task.source_id, &state_id)?;
-                                linear.comment(
-                                    &task.source_id,
-                                    "comet-board: pull request merged",
-                                )?;
+                                linear
+                                    .comment(&task.source_id, "comet-board: pull request merged")?;
                             }
                             _ => self.log.warn(format!(
                                 "no completed-type state for team {team}; leaving it open"
@@ -1189,7 +1196,9 @@ impl SyncEngine {
                 let mut parts = rest.split('/');
                 Some(format!("{}/{}", parts.next()?, parts.next()?))
             })
-            .ok_or_else(|| anyhow::anyhow!("cannot tell which repo {} belongs to", task.identifier))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot tell which repo {} belongs to", task.identifier)
+            })?;
 
         gh.merge_pr(&repo, number)?;
         self.log
@@ -1197,7 +1206,8 @@ impl SyncEngine {
 
         // Reflect it immediately rather than waiting for a poll: the operator
         // just pressed the key and needs the row to move.
-        self.db.set_pr(&task.id, task.pr_url.as_deref(), Some(number), false)?;
+        self.db
+            .set_pr(&task.id, task.pr_url.as_deref(), Some(number), false)?;
         self.db.set_pr_merged(&task.id, true)?;
         self.finish_on_merge(task, &repo, number)?;
         self.rederive_all()?;
@@ -1420,16 +1430,12 @@ mod tests {
     /// This cycle's session statuses, as the engine's board service builds
     /// them: chat id → status already mapped through `runtime::agent_status`.
     fn statuses(pairs: &[(&str, AgentStatus)]) -> SessionStatuses {
-        pairs
-            .iter()
-            .map(|(id, s)| (id.to_string(), *s))
-            .collect()
+        pairs.iter().map(|(id, s)| (id.to_string(), *s)).collect()
     }
 
     fn dispatch(e: &SyncEngine, task: &str, chat_id: &str) -> i64 {
-        let a = e
-            .db
-            .insert_attempt(&crate::db::NewAttempt {
+        let a =
+            e.db.insert_attempt(&crate::db::NewAttempt {
                 task_id: task.into(),
                 pane_id: None,
                 workspace: "offhand".into(),
@@ -1520,7 +1526,10 @@ mod tests {
             e.reconcile_sessions(&statuses(&[])).unwrap();
         }
         let a = live(&e);
-        assert!(a.outcome.is_none(), "never orphaned without evidence of life");
+        assert!(
+            a.outcome.is_none(),
+            "never orphaned without evidence of life"
+        );
         assert_eq!(a.missing_ticks, 5, "but the absence is on the record");
         assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
     }
@@ -1684,7 +1693,12 @@ mod tests {
         // to `board/gh-2`, and one repo's *merged* PR attached itself to the
         // other's task — deriving it to review with no work done.
         let e = engine(None);
-        seed(&e, "gh:Florin-AS/tripletex-mcp#2", "gh#2", UpstreamState::Started);
+        seed(
+            &e,
+            "gh:Florin-AS/tripletex-mcp#2",
+            "gh#2",
+            UpstreamState::Started,
+        );
         dispatch_on(&e, "gh:Florin-AS/tripletex-mcp#2", "board/gh-2");
 
         e.link_pull_requests(&[PullRequest {
@@ -1701,7 +1715,10 @@ mod tests {
         }])
         .unwrap();
 
-        let t = e.db.get_task("gh:Florin-AS/tripletex-mcp#2").unwrap().unwrap();
+        let t =
+            e.db.get_task("gh:Florin-AS/tripletex-mcp#2")
+                .unwrap()
+                .unwrap();
         assert_eq!(t.pr_url, None, "another repo's PR is not this task's PR");
         assert!(!t.pr_merged, "and must not mark it finished");
     }
@@ -1737,7 +1754,12 @@ mod tests {
             "Florin-AS/tripletex-mcp".into(),
             "bredebjorhovd/OIOS".into(),
         ];
-        seed(&e, "gh:Florin-AS/tripletex-mcp#2", "gh#2", UpstreamState::Started);
+        seed(
+            &e,
+            "gh:Florin-AS/tripletex-mcp#2",
+            "gh#2",
+            UpstreamState::Started,
+        );
         dispatch_on(&e, "gh:Florin-AS/tripletex-mcp#2", "board/gh-2");
 
         e.poll_github();
@@ -1747,7 +1769,10 @@ mod tests {
             pr.is_some(),
             "the pull request is nobody's attempt and belongs on the board"
         );
-        let t = e.db.get_task("gh:Florin-AS/tripletex-mcp#2").unwrap().unwrap();
+        let t =
+            e.db.get_task("gh:Florin-AS/tripletex-mcp#2")
+                .unwrap()
+                .unwrap();
         assert_eq!(t.pr_url, None, "and is still not the other repo's");
     }
 
@@ -1919,10 +1944,9 @@ mod tests {
     #[test]
     fn recovery_clears_the_header_and_the_failure_count() {
         let page = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            page.clone(),
-            page,
-        ])) as Box<dyn GraphQl>)));
+        let e = engine(Some(Linear::new(
+            Box::new(FixtureTransport::new(vec![page.clone(), page])) as Box<dyn GraphQl>,
+        )));
         e.db.meta_set(meta::LINEAR_STATUS, "error:earlier").unwrap();
         e.db.meta_set(meta::LINEAR_FAILURES, "4").unwrap();
         e.poll_linear();
@@ -1952,10 +1976,9 @@ mod tests {
     #[test]
     fn a_full_sweep_removes_a_task_deleted_upstream() {
         let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            empty.clone(),
-            empty,
-        ])) as Box<dyn GraphQl>)));
+        let e = engine(Some(Linear::new(
+            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
+        )));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         assert_eq!(e.db.load_tasks().unwrap().len(), 1);
 
@@ -1970,10 +1993,9 @@ mod tests {
     #[test]
     fn a_sweep_never_removes_a_task_with_a_running_agent() {
         let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            empty.clone(),
-            empty,
-        ])) as Box<dyn GraphQl>)));
+        let e = engine(Some(Linear::new(
+            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
+        )));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -1991,10 +2013,9 @@ mod tests {
     #[test]
     fn a_sweep_keeps_the_attempts_of_a_task_that_was_worked_on() {
         let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            empty.clone(),
-            empty,
-        ])) as Box<dyn GraphQl>)));
+        let e = engine(Some(Linear::new(
+            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
+        )));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.conn
@@ -2026,10 +2047,9 @@ mod tests {
         // The noise case: created, mislabelled or deleted again, never worked
         // on. Nothing to keep.
         let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            empty.clone(),
-            empty,
-        ])) as Box<dyn GraphQl>)));
+        let e = engine(Some(Linear::new(
+            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
+        )));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
 
         e.poll_linear();
@@ -2076,7 +2096,8 @@ mod tests {
         ])) as Box<dyn GraphQl>)));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         // Mark a sweep as just done, so this poll is incremental.
-        e.db.meta_set(meta::LAST_FULL_SWEEP, &crate::db::now()).unwrap();
+        e.db.meta_set(meta::LAST_FULL_SWEEP, &crate::db::now())
+            .unwrap();
         e.db.meta_set(meta::LINEAR_WATERMARK, "2026-07-01T00:00:00Z")
             .unwrap();
 
@@ -2149,8 +2170,13 @@ mod tests {
         // thirty seconds.
         let e = engine_with(None, Some(gh_client()));
         seed_gh(&e);
-        e.db.set_pr("gh:o/r#87", Some("https://github.com/o/r/pull/87"), Some(87), true)
-            .unwrap();
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/87"),
+            Some(87),
+            true,
+        )
+        .unwrap();
         e.rederive_all().unwrap();
         assert_eq!(
             e.db.get_task("gh:o/r#87").unwrap().unwrap().state,
@@ -2169,8 +2195,13 @@ mod tests {
     fn merging_queues_the_ticket_to_be_closed() {
         let e = engine_with(None, Some(gh_client()));
         seed_gh(&e);
-        e.db.set_pr("gh:o/r#87", Some("https://github.com/o/r/pull/87"), Some(87), true)
-            .unwrap();
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/87"),
+            Some(87),
+            true,
+        )
+        .unwrap();
         let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
         e.merge_pull_request(&task).unwrap();
         assert!(
@@ -2191,11 +2222,11 @@ mod tests {
         e.drain_writebacks();
         assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
         // It was actually delivered, not dropped.
-        assert!(
-            e.github
-                .as_ref()
-                .is_some_and(|_| e.db.meta_get(&meta::writeback_at("gh:o/r#87")).unwrap().is_some())
-        );
+        assert!(e.github.as_ref().is_some_and(|_| {
+            e.db.meta_get(&meta::writeback_at("gh:o/r#87"))
+                .unwrap()
+                .is_some()
+        }));
     }
 
     /// Reaping drops the queued writebacks it can see, but one enqueued between
@@ -2342,7 +2373,8 @@ mod tests {
         let e = engine_with_one_read_only_repo();
         seed_gh_in(&e, "gh:bredebjorhovd/OIOS#12");
         seed_gh_in(&e, "gh:Florin-AS/Tally#34");
-        e.db.set_local_done("gh:bredebjorhovd/OIOS#12", true).unwrap();
+        e.db.set_local_done("gh:bredebjorhovd/OIOS#12", true)
+            .unwrap();
         e.db.set_local_done("gh:Florin-AS/Tally#34", true).unwrap();
         e.rederive_all().unwrap();
 
@@ -2355,14 +2387,13 @@ mod tests {
                 "{id} did not reach done locally"
             );
         }
-        let queued: Vec<String> = e
-            .db
-            .pending_writebacks(10)
-            .unwrap()
-            .into_iter()
-            .filter(|w| w.kind == "close")
-            .map(|w| w.task_id)
-            .collect();
+        let queued: Vec<String> =
+            e.db.pending_writebacks(10)
+                .unwrap()
+                .into_iter()
+                .filter(|w| w.kind == "close")
+                .map(|w| w.task_id)
+                .collect();
         assert_eq!(queued, ["gh:bredebjorhovd/OIOS#12"], "{queued:?}");
     }
 
@@ -2693,8 +2724,13 @@ mod tests {
         let mut e = engine_with_gh_writeback();
         e.cfg.linear.review_state = Some("In Review".into());
         seed_gh(&e);
-        e.db.set_pr("gh:o/r#87", Some("https://github.com/o/r/pull/87"), Some(87), true)
-            .unwrap();
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/87"),
+            Some(87),
+            true,
+        )
+        .unwrap();
         e.rederive_all().unwrap();
 
         assert_eq!(
@@ -2791,7 +2827,11 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         Command::new("git")
             .args(["init", "--bare", "-b", "main"])
@@ -2804,7 +2844,10 @@ mod tests {
         std::fs::write(work.join("a"), "1").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "base"]);
-        git(&work, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(
+            &work,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
         git(&work, &["push", "-u", "origin", "main"]);
         // The operator's own unpushed commit — the whole point.
         std::fs::write(work.join("b"), "2").unwrap();
@@ -2841,7 +2884,10 @@ mod tests {
             ["-C", &wt, "add", "."].as_slice(),
             ["-C", &wt, "commit", "-m", "the cancelled run's work"].as_slice(),
         ] {
-            std::process::Command::new("git").args(args).output().unwrap();
+            std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
         }
 
         // The retry: same checkout, and the branch tip is now the honest base.
@@ -2887,7 +2933,10 @@ mod tests {
             ["-C", &wt, "add", "."].as_slice(),
             ["-C", &wt, "commit", "-m", "the agent's work"].as_slice(),
         ] {
-            std::process::Command::new("git").args(args).output().unwrap();
+            std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
         }
         assert!(
             e.attempt_has_commits(Some(&wt), Some(&base)),
