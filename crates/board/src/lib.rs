@@ -13,9 +13,12 @@
 //! port deliberately did NOT bring along (screen scraping, nudge machinery,
 //! delivery verification) is documented in `docs/BOARD.md`.
 
+pub mod adopt;
 pub mod config;
 pub mod db;
 pub mod dispatch;
+pub mod doctor;
+pub mod init;
 pub mod log;
 pub mod model;
 pub mod rows;
