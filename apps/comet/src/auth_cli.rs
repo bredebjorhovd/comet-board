@@ -88,7 +88,11 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
 pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
     let auth = Engine::build_auth(&config).await;
     println!("Data dir: {}", config.data_dir.display());
-    println!("Edge:     {}", config.edge_url);
+    if config.edge_enabled() {
+        println!("Edge:     {}", config.edge_url);
+    } else {
+        println!("Edge:     disabled (local mode)");
+    }
     let signed_in = match (auth.workos_enabled(), auth.state()) {
         (false, _) => {
             println!("Auth:     dev mode (bearer = user id)");

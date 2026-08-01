@@ -58,7 +58,8 @@ enum DaemonCommand {
 }
 
 /// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `COMET_EDGE_URL` overrides (local dev / self-hosting).
+/// `COMET_EDGE_URL` overrides (local dev / self-hosting); `COMET_EDGE_URL=off`
+/// disables the edge entirely (local mode — single-box deployments).
 const DEFAULT_EDGE_URL: &str = "https://edge.comet.zeron.sh";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
@@ -132,8 +133,15 @@ fn main() -> anyhow::Result<()> {
             runtime.block_on(auth_cli::status(engine_config_from_env()))
         }
         Some(Command::Update { check }) => {
+            let edge_url = edge_url_from_env();
+            if comet_engine::edge_url_is_off(&edge_url) {
+                anyhow::bail!(
+                    "edge is disabled (COMET_EDGE_URL=off) — releases are served by the edge, \
+                     so local-mode installs update from source or their own package flow"
+                );
+            }
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+            runtime.block_on(update_cli::update(&edge_url, check))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),

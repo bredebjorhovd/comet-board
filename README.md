@@ -11,6 +11,31 @@ Board code lives in `crates/board`; the port's status, design mapping, and
 remaining work are in [docs/BOARD.md](docs/BOARD.md). Upstream comet is the
 `upstream` remote; everything below this section is its README.
 
+## Local (edge-less) mode — the fork's primary deployment
+
+This fork is built to run on a single box: the daemon and the TUI talk over
+localhost IPC, and you reach the box over mosh or Tailscale. No edge service,
+no account, no sync — the box is the whole system.
+
+Set `COMET_EDGE_URL=off` to make that a stated configuration instead of an
+accident:
+
+```bash
+COMET_EDGE_URL=off comet headless        # or: COMET_EDGE_URL=off comet daemon install
+comet tui                                # attaches over localhost IPC
+```
+
+With the edge off, the engine skips every edge transport — no session-room
+joins (and none of the per-chat join warnings), no presence, no device room,
+no release polling — and auth runs in dev mode with no sign-in.
+`COMET_EDGE_URL=off comet status` reports `Edge: disabled (local mode)`.
+`comet daemon install` captures the variable into the service unit, so an
+installed daemon stays local across restarts.
+
+Multi-device sync needs an edge: leave `COMET_EDGE_URL` unset for the
+production edge, or point it at a self-hosted one. `comet update` also fetches
+releases from the edge, so local-mode installs update from source instead.
+
 ---
 
 # Comet
