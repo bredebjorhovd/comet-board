@@ -17,6 +17,9 @@ fn local_config(data_dir: &std::path::Path) -> EngineConfig {
         // A configured client id would normally probe {edge}/health and gate
         // on sign-in — local mode forces dev auth instead.
         workos_client_id: Some("client_test".into()),
+        // The board polls trackers over its own HTTP, not the edge — H9 is
+        // about edge transports, so keep it out of this test's world.
+        board: false,
     }
 }
 
