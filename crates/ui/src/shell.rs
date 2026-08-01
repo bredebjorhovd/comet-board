@@ -24,6 +24,7 @@ use gpui::{
 use comet_rpc::methods;
 use gpui_tokio::Tokio;
 
+use crate::board::{BoardPanel, ToggleBoard};
 use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
@@ -129,6 +130,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_terminal, "mod-j"),
             ToggleTerminal,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.toggle_board, "mod-shift-b"),
+            ToggleBoard,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -423,6 +429,11 @@ pub struct Shell {
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     changes: Option<Entity<Changes>>,
+    /// The task board (docs/BOARD.md §H10). Unlike the terminal and changes
+    /// panes it is a GLOBAL view — the queue across every workspace — so its
+    /// open flag lives on the shell, not in [`SessionPanels`].
+    board: Option<Entity<BoardPanel>>,
+    board_open: bool,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -629,6 +640,8 @@ impl Shell {
             file_drag_active: false,
             terminal: None,
             changes: None,
+            board: None,
+            board_open: false,
             route,
             nav,
             devices_page: None,
@@ -878,13 +891,20 @@ impl Shell {
         self.panels.get(&self.panel_key(cx)).changes_open && self.space_git_detected(cx)
     }
 
+    /// Whether the right dock holds anything at all: the changes pane or the
+    /// board. Only one is ever open — toggling one closes the other — so this
+    /// is the single open test the width target and the card margin use.
+    fn right_slot_open(&self, cx: &App) -> bool {
+        self.board_open || self.right_pane_open(cx)
+    }
+
     /// The current chat's terminal flag (per-session, in-memory).
     fn terminal_open(&self, cx: &App) -> bool {
         self.panels.get(&self.panel_key(cx)).terminal_open
     }
 
     fn right_target(&self, cx: &App) -> f32 {
-        if self.right_pane_open(cx) {
+        if self.right_slot_open(cx) {
             self.settings.right_pane_width
         } else {
             0.0
@@ -907,13 +927,16 @@ impl Shell {
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
-        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
+            // The dock shows one thing: opening changes closes the board (the
+            // changes flag keeps its own per-session life either way).
+            self.board_open = false;
             // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
             // once the pane has been opened.
             let changes = self.changes_pane(cx);
             changes.update(cx, |changes, cx| changes.ensure_watch(cx));
         }
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
     }
 
@@ -924,6 +947,42 @@ impl Shell {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
         self.changes = Some(changes.clone());
         changes
+    }
+
+    /// Cmd/Ctrl+Shift+B and the tab-strip button (docs/BOARD.md §H10). The
+    /// board is a global queue, so unlike the per-session terminal/changes
+    /// flags this one lives on the shell. Width animates 200 ms in the shared
+    /// right-dock slot, which shows one thing at a time: opening the board
+    /// closes the changes pane.
+    fn toggle_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        self.board_open = !self.board_open;
+        if self.board_open {
+            // The changes flag flips off so the dock does not silently re-show
+            // the diff pane the moment the board closes.
+            let key = self.panel_key(cx);
+            if self.panels.get(&key).changes_open {
+                self.panels.toggle_changes(&key);
+            }
+            let panel = self.board_panel(cx);
+            panel.update(cx, |panel, cx| panel.set_open(true, cx));
+            // Keyboard focus lands in the board so ↑↓/f// keys work with no
+            // click — the same lazy-focus the terminal panel gets.
+            window.focus(&panel.read(cx).focus_handle(), cx);
+        } else {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
+    }
+
+    fn board_panel(&mut self, cx: &mut Context<Self>) -> Entity<BoardPanel> {
+        if let Some(board) = &self.board {
+            return board.clone();
+        }
+        let board = cx.new(|cx| BoardPanel::new(self.state.clone(), cx));
+        self.board = Some(board.clone());
+        board
     }
 
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
@@ -3007,12 +3066,19 @@ impl Shell {
         }
     }
 
-    /// Right "Changes" pane — hidden by default, drag-resizable; content is the
-    /// lazy [`Changes`] diff viewer (created on first open).
+    /// Right dock — hidden by default, drag-resizable; content is either the
+    /// task board (global) or the lazy [`Changes`] diff viewer. They share the
+    /// slot and the width; toggling one closes the other.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
-        let content: AnyElement = if self.right_pane_open(cx) {
+        let content: AnyElement = if self.board_open {
+            let panel = self.board_panel(cx);
+            // Idempotent — also covers a toggle that landed before the engine
+            // finished booting.
+            panel.update(cx, |panel, cx| panel.set_open(true, cx));
+            panel.into_any_element()
+        } else if self.right_pane_open(cx) {
             let changes = self.changes_pane(cx);
             // Idempotent — also covers a persisted-open pane on boot.
             changes.update(cx, |changes, cx| changes.ensure_watch(cx));
@@ -3684,6 +3750,11 @@ impl Render for Shell {
                     this.toggle_right_pane(cx)
                 }
             }))
+            .on_action(cx.listener(|this, _: &ToggleBoard, window, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.toggle_board(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
                 if this.add_space.is_some() {
                     this.add_space = None;
@@ -3785,7 +3856,7 @@ impl Render for Shell {
                 // pane is closed, but the SEAM between the two inset cards
                 // when it's open — a full gutter there read double-wide next
                 // to the two borders it separates (user report).
-                let right_gap = if on_chat && self.right_pane_open(cx) {
+                let right_gap = if on_chat && self.right_slot_open(cx) {
                     4.0
                 } else {
                     8.0
