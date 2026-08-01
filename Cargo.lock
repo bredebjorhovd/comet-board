@@ -1223,6 +1223,7 @@ dependencies = [
  "comet-board",
  "comet-proto",
  "comet-rpc",
+ "serde",
  "serde_json",
  "tokio",
 ]
