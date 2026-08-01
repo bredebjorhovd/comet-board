@@ -30,6 +30,10 @@
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
+//! - Board (comet-board fork, docs/BOARD.md): `WatchBoard` → stream of board
+//!   rows (herdr-board's `list --json` shape), `DispatchTask {taskId, via?}` →
+//!   `{chatId, cwd, attempt}`, `CancelTask {taskId}` → `{ok}`. Served off the
+//!   engine-hosted board service; deliberately not relay-forwardable yet.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -325,6 +329,7 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
+    board: Option<std::sync::Arc<crate::board::BoardService>>,
 }
 
 impl EngineRpc {
@@ -353,6 +358,7 @@ impl EngineRpc {
             auth: None,
             links: None,
             updater: None,
+            board: None,
         }
     }
 
@@ -374,6 +380,12 @@ impl EngineRpc {
         self
     }
 
+    /// Attach the board service (WatchBoard / DispatchTask / CancelTask).
+    pub fn with_board(mut self, board: std::sync::Arc<crate::board::BoardService>) -> Self {
+        self.board = Some(board);
+        self
+    }
+
     fn auth(&self) -> Result<&Auth, RpcError> {
         self.auth
             .as_ref()
@@ -384,6 +396,16 @@ impl EngineRpc {
         self.updater
             .as_ref()
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
+    }
+
+    fn board(&self) -> Result<&crate::board::BoardService, RpcError> {
+        self.board.as_deref().ok_or_else(|| {
+            RpcError::Failed(
+                "board unavailable (COMET_BOARD=0, or the service failed to start — \
+                 see the engine log)"
+                    .into(),
+            )
+        })
     }
 
     /// Forward a device-addressed call over the target device's relay. On transport
@@ -800,13 +822,40 @@ impl RpcService for EngineRpc {
                 self.mutate(p)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            // Board surface (comet-board fork). Stubs until the board service
-            // lands in the engine — the method names are claimed now so both
-            // frontends and the `comet-board` CLI can build against them.
-            // Wiring plan: docs/BOARD.md §engine.
-            methods::WATCH_BOARD | methods::DISPATCH_TASK | methods::CANCEL_TASK => Err(
-                RpcError::Failed("board: not wired into this engine yet (docs/BOARD.md)".into()),
-            ),
+            // Board surface (comet-board fork, docs/BOARD.md §H2). Served off
+            // the board service's loop; absent when the board is disabled.
+            methods::WATCH_BOARD => Ok(RpcReply::Stream(watch_stream(self.board()?.watch_rows()))),
+            methods::DISPATCH_TASK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    /// The dispatching chat's id when an agent released it —
+                    /// provenance, never authority.
+                    #[serde(default)]
+                    via: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let dispatched = self
+                    .board()?
+                    .dispatch_task(&p.task_id, p.via)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&dispatched)
+            }
+            methods::CANCEL_TASK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.board()?
+                    .cancel_task(&p.task_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }
