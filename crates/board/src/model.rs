@@ -6,104 +6,11 @@
 //! matrix can be tested exhaustively.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
-/// Board-level task state. Note the deliberate divergence from herdr's
-/// vocabulary: herdr's `done` means "agent finished, you haven't looked", which
-/// is our `review`. Our `done` means the issue is closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BoardState {
-    Blocked,
-    Working,
-    Ready,
-    Review,
-    Failed,
-    Done,
-}
-
-impl BoardState {
-    /// Fixed section order on the board: blocked → working → ready → review →
-    /// failed → done.
-    pub const SECTION_ORDER: [BoardState; 6] = [
-        BoardState::Blocked,
-        BoardState::Working,
-        BoardState::Ready,
-        BoardState::Review,
-        BoardState::Failed,
-        BoardState::Done,
-    ];
-
-    /// Shape-distinct glyph per state. Three shape families on purpose —
-    /// pointed (`▲ ▸`), round (`● ·`), crossed (`✓ ✕`) — so every state
-    /// survives color being stripped.
-    pub fn glyph(self) -> &'static str {
-        match self {
-            BoardState::Blocked => "▲",
-            BoardState::Working => "●",
-            BoardState::Ready => "▸",
-            BoardState::Review => "✓",
-            BoardState::Failed => "✕",
-            BoardState::Done => "·",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            BoardState::Blocked => "BLOCKED",
-            BoardState::Working => "WORKING",
-            BoardState::Ready => "READY",
-            BoardState::Review => "REVIEW",
-            BoardState::Failed => "FAILED",
-            BoardState::Done => "DONE",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BoardState::Blocked => "blocked",
-            BoardState::Working => "working",
-            BoardState::Ready => "ready",
-            BoardState::Review => "review",
-            BoardState::Failed => "failed",
-            BoardState::Done => "done",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<BoardState> {
-        Some(match s {
-            "blocked" => BoardState::Blocked,
-            "working" => BoardState::Working,
-            "ready" => BoardState::Ready,
-            "review" => BoardState::Review,
-            "failed" => BoardState::Failed,
-            "done" => BoardState::Done,
-            _ => return None,
-        })
-    }
-
-    /// A task holding a pane. `blocked` counts — it still occupies a pane, so it
-    /// counts against `max_concurrent_per_workspace`.
-    pub fn holds_pane(self) -> bool {
-        matches!(self, BoardState::Working | BoardState::Blocked)
-    }
-
-    /// Finished for good, with no retry left to come.
-    ///
-    /// Only `done` qualifies: `review` is waiting for you and `failed` is
-    /// waiting for a retry, and both of those still have a use for the attempt's
-    /// worktree — a retry reuses the checkout already holding the branch. This
-    /// is the filter `gc` prunes by.
-    pub fn is_terminal(self) -> bool {
-        matches!(self, BoardState::Done)
-    }
-}
-
-impl fmt::Display for BoardState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// Board-level task state. Moved to proto so the viewports can share the
+/// glyph/section vocabulary without depending on this crate; the semantics
+/// (and the derivation matrix below) are the board's.
+pub use comet_proto::view::board::BoardState;
 
 /// Upstream state, normalized across sources. Linear workflow states are mapped
 /// by **type**, not name; GitHub has only open/closed.
