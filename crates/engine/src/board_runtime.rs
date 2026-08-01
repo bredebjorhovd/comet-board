@@ -13,15 +13,19 @@
 //! run on the `comet-board-sync` thread only.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use comet_board::runtime::{DispatchHandle, DispatchSpec, Runtime};
+use comet_board::runtime::{DispatchHandle, DispatchSpec, RunEnd, Runtime};
 use comet_doc::SessionCommandPayload;
-use comet_proto::{ChatConfig, RunRequest, SandboxLevel, Session, SessionStatus};
+use comet_proto::{
+    AgentEvent, ChatConfig, DoneStatus, RunRequest, SandboxLevel, Session, SessionStatus,
+};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::doc_host::DocHost;
 use crate::repos::Repos;
+use crate::run_journal::RunJournal;
 use crate::workspace_host::WorkspaceHost;
 
 pub struct CometRuntime {
@@ -31,6 +35,9 @@ pub struct CometRuntime {
     /// The same merged local+remote session stream `WatchSessions` serves —
     /// one mirror, so the board can never disagree with the frontends.
     sessions: watch::Receiver<Vec<Session>>,
+    /// The engine's run journal — the settle authority (docs/BOARD.md §H4):
+    /// `last_run_end` reads a chat's final journaled event off it.
+    journal: Arc<RunJournal>,
     handle: Handle,
 }
 
@@ -40,6 +47,7 @@ impl CometRuntime {
         workspace: WorkspaceHost,
         doc_host: DocHost,
         sessions: watch::Receiver<Vec<Session>>,
+        journal: Arc<RunJournal>,
         handle: Handle,
     ) -> Self {
         Self {
@@ -47,6 +55,7 @@ impl CometRuntime {
             workspace,
             doc_host,
             sessions,
+            journal,
             handle,
         }
     }
@@ -185,5 +194,20 @@ impl Runtime for CometRuntime {
 
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self.workspace.doc().chat(chat_id)?.and_then(|c| c.cwd))
+    }
+
+    fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>> {
+        // The journal's last event is a `Done` exactly when no run is live in
+        // the chat — every teardown path writes one (including boot recovery,
+        // which stamps a synthetic errored `Done` on a journal a crash left
+        // open), and a new run's first events displace it.
+        Ok(match self.journal.last_event(chat_id)? {
+            Some((_, AgentEvent::Done { status, .. })) => Some(match status {
+                DoneStatus::Completed => RunEnd::Completed,
+                DoneStatus::Interrupted => RunEnd::Interrupted,
+                DoneStatus::Errored => RunEnd::Errored,
+            }),
+            _ => None,
+        })
     }
 }

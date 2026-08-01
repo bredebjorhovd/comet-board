@@ -844,6 +844,9 @@ mod tests {
         fn chat_cwd(&self, _chat_id: &str) -> Result<Option<String>> {
             Ok(self.cwd.clone())
         }
+        fn last_run_end(&self, _chat_id: &str) -> Result<Option<crate::runtime::RunEnd>> {
+            Ok(None)
+        }
     }
 
     /// Shares one fixture between the engine, which owns its transport, and the

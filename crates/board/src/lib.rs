@@ -24,6 +24,7 @@ pub mod model;
 pub mod review;
 pub mod rows;
 pub mod runtime;
+pub mod settled;
 pub mod sources;
 pub mod stats;
 pub mod sync;

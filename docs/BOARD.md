@@ -53,13 +53,21 @@ nearly verbatim — it never depended on herdr:
   polling with watermarks and full sweeps, reaping, PR linking with repo
   scoping, merge observation, state derivation with the review/close
   writebacks, the writeback drain, source health. The reconcile half is
-  reshaped: `reconcile_sessions` (lifecycle, interval-clocked) and
-  `refresh_statuses` (status-only, event-driven) consume chat-id→status maps
-  built from the session watch through `runtime::agent_status`. Orphaning
-  keeps the two-tick rule but only fires on a chat that was *seen working* —
-  a chat with no session row yet is indistinguishable from a dispatch whose
-  first run has not started, and the verdict on those waits for H2's
-  `chat_alive`.
+  reshaped: `reconcile_sessions` (clocked lifecycle, interval) and
+  `refresh_statuses` (event-driven: statuses, plus H4's settle/reopen)
+  consume chat-id→status maps built from the session watch through
+  `runtime::agent_status`. Orphaning keeps the two-tick rule but only fires
+  on a chat that was *seen working* — a chat with no session row yet is
+  indistinguishable from a dispatch whose first run has not started, and the
+  verdict on those waits for H2's `chat_alive`.
+- `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
+  The evidence hierarchy (PR = the agent's own statement, closes the attempt
+  immediately whatever the run's exit said; commits = weaker, close only a
+  run that ended cleanly; an `Errored` run stays live so its retry is the
+  same attempt) and the reopen rule. The machinery around it is in `sync.rs`
+  (`maybe_settle`, `rewatch_settled_attempts`, the targeted PR recheck) and
+  keys off run-journal facts via `Runtime::last_run_end` — no debounce
+  clock anywhere.
 - `adopt.rs`, `doctor.rs`, `init.rs` — the operator-facing trio (H8), walking
   comet spaces where herdr-board walked workspaces. Exposed by
   `apps/board-cli` (binary `comet-board`), which fetches this device's spaces
@@ -147,14 +155,24 @@ attempt row and the upstream dispatch comment, `{worktree}` threaded into the
 brief at execution time, and `COMET_BOARD_CHAT_ID` exported where the harness
 spawns (`RunControls::chat_id` → child env, claude and codex adapters).
 
-### H4 — Settle logic (M, needs H2)
-Port `settled.rs`'s *decision* (PR = the agent's own statement of done,
-closes the attempt immediately; commits alone = weaker evidence) onto run
-events instead of idle-sampling: a run ending is a journal fact, so "the
-turn ended, now check the checkout for a PR/commits" replaces the 60-second
-clock entirely. Keep the artifact checks (branch pushed? PR open? — GitHub
-client already ported). Keep `reopened` semantics: an `Errored`→retried run
-is the same attempt, not a new one.
+### H4 — Settle logic — **done**
+Landed as `crates/board/src/settled.rs` (the pure decision) plus the settle
+machinery in `sync.rs` (see the ported-and-working list above). The decision
+keys off run-journal facts: `Runtime::last_run_end` reads the chat's last
+journaled event (`CometRuntime` reads the engine's `RunJournal`), which is
+what splits `Errored` (run ended, badly — no settle on commits, PR still
+counts) from `AwaitingInput` (run alive — nothing settles) inside the one
+`Blocked` status. `Idle` needs no journal read: it is only ever written
+after a `Done`, and a chat is fresh per attempt. The 60-second clock is gone;
+the event path settles on the status *transition*, the interval reconcile is
+the catch-up. Artifact checks kept: recorded PR → commits-since-base → and,
+only on the event path (the interval polls seconds earlier), one targeted
+GitHub `pulls` recheck before closing on commits, which closes herdr's gh#29
+window instead of wording around it. `reopened` semantics kept both ways: an
+`Errored`→retried run never left its attempt, and a settled attempt whose
+chat works again is re-opened in place (refused when re-dispatched, closed
+upstream, or marked done). The dispatcher wake (herdr AGE-25) was
+deliberately not ported with this.
 
 ### H5 — Review delivery — **done**
 Landed as `crates/board/src/review.rs`: `SyncEngine::deliver_reviews`, run by

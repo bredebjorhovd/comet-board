@@ -136,6 +136,12 @@ impl SessionsEngine {
         }
     }
 
+    /// The run journal this engine appends to — the board's settle authority
+    /// (docs/BOARD.md §H4): `CometRuntime::last_run_end` reads it.
+    pub fn journal(&self) -> Arc<RunJournal> {
+        self.inner.journal.clone()
+    }
+
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
     pub fn set_doc_host(&self, host: DocHost) {

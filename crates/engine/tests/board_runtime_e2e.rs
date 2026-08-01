@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use comet_board::runtime::{DispatchSpec, Runtime};
+use comet_board::runtime::{DispatchSpec, RunEnd, Runtime};
 use comet_doc::{MessageRole, MessageStatus};
 use comet_engine::{CometRuntime, EngineCore, HarnessRegistry};
 use comet_harness::mock::MockHarness;
@@ -107,6 +107,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         core.doc_host.clone(),
         core.workspace
             .merged_sessions_watch(core.sessions.watch_sessions()),
+        core.sessions.journal(),
         tokio::runtime::Handle::current(),
     ));
 
@@ -178,6 +179,12 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     )
     .await;
     assert!(runtime.chat_alive(&handle.chat_id).unwrap());
+    // The journal fact §H4's settle logic reads: the turn's `Done` is the
+    // chat's last journaled event, and it completed.
+    assert_eq!(
+        runtime.last_run_end(&handle.chat_id).unwrap(),
+        Some(RunEnd::Completed)
+    );
 
     // ── prompt (idle chat → a send, which runs a second turn) ───────────────
     runtime
