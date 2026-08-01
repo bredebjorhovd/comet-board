@@ -1,11 +1,12 @@
 //! Resolving a task + its route into a [`DispatchSpec`] — the planning half of
-//! herdr-board's `dispatch.rs`, in comet vocabulary (docs/BOARD.md §H2).
+//! herdr-board's `dispatch.rs`, in comet vocabulary (docs/BOARD.md §H2/H3).
 //!
-//! Deliberately only the *resolution* lives here: task → route → branch →
-//! brief, pure functions over config and stored rows. Executing the spec is
-//! [`crate::runtime::Runtime::dispatch`]'s job, and the surrounding pipeline —
-//! concurrency caps, dispatcher provenance, the attempt-row lifecycle around a
-//! failed dispatch — is H3's port of the rest of herdr-board's `dispatch.rs`.
+//! Deliberately only the *decisions* live here: task → route → branch → brief,
+//! plus the two refusals a dispatch owes its caller before anything is created
+//! ([`check_capacity`], [`route_for`]) and the provenance verdict
+//! ([`dispatcher_for`]) — pure functions over config and stored rows.
+//! Executing the spec is [`crate::runtime::Runtime::dispatch`]'s job; the
+//! attempt-row lifecycle around it lives with the board loop in the engine.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +14,8 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use crate::config::{Route, RoutingConfig, interpolate, slugify};
-use crate::model::{Task, UpstreamState, gh_repo_name};
+use crate::db::Db;
+use crate::model::{Dispatcher, Task, UpstreamState, gh_repo_name};
 use crate::runtime::{DispatchSpec, harness_for_runtime};
 use crate::sync::route_context;
 
@@ -45,12 +47,11 @@ pub fn prompt_vars<'a>(
     v
 }
 
-/// The brief actually sent for a task under a route, fully interpolated.
-///
-/// `{worktree}` stays unresolved here: comet's engine picks the checkout path
-/// while executing the spec, after this string is built. `interpolate` leaves
-/// unknown keys visible rather than blanking them, so a route prompt using it
-/// degrades legibly until H3 threads the real path through.
+/// The brief actually sent for a task under a route, fully interpolated —
+/// except `{worktree}`, which comet's engine only knows while executing the
+/// spec, after this string is built. [`DispatchSpec::prompt_at`] resolves it
+/// once the checkout exists; `interpolate` leaves unknown keys visible rather
+/// than blanking them, so the seam is legible in between.
 pub fn resolve_prompt(route: &Route, task: &Task, branch: &str) -> String {
     let vars = prompt_vars(task, branch, &route.workspace);
     let template = route.prompt.clone().unwrap_or_else(|| {
@@ -77,6 +78,78 @@ pub struct SpaceRef {
     pub device_id: String,
     /// The space's folder on the host device — the dispatch's repo root.
     pub path: String,
+}
+
+/// Refuse a dispatch that would exceed the space's concurrency cap.
+///
+/// `max_concurrent_per_workspace` counts **live attempts per space** — the key
+/// keeps herdr-board's spelling, the count is comet's. `blocked` attempts count
+/// too: they still hold a chat, and the cap exists to bound simultaneous
+/// agents, not simultaneous progress.
+pub fn check_capacity(db: &Db, cfg: &RoutingConfig, route: &Route) -> Result<()> {
+    let live = db.live_count_in_workspace(&route.workspace)?;
+    let cap = cfg.max_concurrent(route);
+    if live >= cap {
+        bail!(
+            "space `{}` is at {live} of {cap} working — cancel one first",
+            route.workspace
+        );
+    }
+    Ok(())
+}
+
+/// Who released a task, resolved from the dispatching chat id (`via`) — the
+/// provenance decision, herdr-board's `dispatcher_from` minus panes.
+///
+/// The chat id is the identity, exactly as the pane id was: every harness run
+/// carries `COMET_BOARD_CHAT_ID`, whether or not the board dispatched the chat
+/// (see `crate::runtime`'s table), so `comet-board dispatch` passes it as
+/// `via` without anyone threading ids by hand. From there:
+///
+/// - a live attempt owning that chat is a board-dispatched agent, and names
+///   its **task** as the parent — the chain keeps the richer `via LIN-138`
+///   label rather than dropping to a chat id;
+/// - a chat the board never dispatched (the usual long-lived orchestrator, the
+///   case AGE-24 existed for) is still an agent, recorded by its chat alone —
+///   `chat_alive` is comet's answer to "does the pane hold an agent";
+/// - a chat that is archived or gone is not claimed as an agent: recording it
+///   would hand any future notifier an address that answers for nobody.
+///
+/// No `via` is the operator. `chat_alive` is taken as a closure so the lookup
+/// runs only when it is the deciding fact — a chat a live attempt owns is
+/// settled from the board's own records.
+pub fn dispatcher_for(
+    db: &Db,
+    via: Option<&str>,
+    chat_alive: impl FnOnce(&str) -> bool,
+) -> Dispatcher {
+    let Some(chat) = via.filter(|c| !c.is_empty()) else {
+        return Dispatcher::Operator;
+    };
+    let live = db.live_attempt_for_pane(chat).ok().flatten();
+    let is_agent = live.is_some() || chat_alive(chat);
+    Dispatcher::agent(live.map(|a| a.task_id), is_agent.then(|| chat.to_string()))
+}
+
+/// The short name for a dispatcher: the parent's issue identifier when the
+/// board dispatched it too, its chat id otherwise. `None` is the operator, who
+/// is named by the surrounding copy rather than by this.
+pub fn dispatcher_name(db: &Db, d: &Dispatcher) -> Option<String> {
+    match d {
+        Dispatcher::Operator => None,
+        Dispatcher::Agent { task, pane } => task
+            .as_deref()
+            // A reaped parent leaves an id with no row behind it; the id is
+            // still the truth we have, and naming it beats saying nothing.
+            .map(|id| {
+                db.get_task(id)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.identifier)
+                    .unwrap_or_else(|| id.to_string())
+            })
+            .or_else(|| pane.clone()),
+    }
 }
 
 /// Resolve the route for a task, with the refusals a dispatch owes its caller
@@ -242,5 +315,165 @@ mod tests {
         assert!(space_matches(None, "/home/x/dev/widget", "widget"));
         assert!(space_matches(Some("widget"), "/anything", "widget"));
         assert!(!space_matches(None, "/home/x/dev/other", "widget"));
+    }
+
+    // ---- concurrency + provenance (H3) ----------------------------------
+
+    use crate::db::{Db, NewAttempt, UpsertTask};
+    use crate::model::{Dispatcher, Outcome};
+
+    /// A task row plus a live attempt holding `chat` in `workspace` — a
+    /// board-dispatched agent, as far as the records go.
+    fn working_agent(db: &Db, task_id: &str, chat: &str, workspace: &str) {
+        db.upsert_task(&UpsertTask {
+            id: task_id.into(),
+            source: Source::Linear,
+            source_id: "u".into(),
+            identifier: task_id.trim_start_matches("linear:").into(),
+            title: "parent".into(),
+            body: None,
+            url: "u".into(),
+            labels: vec![],
+            source_state: None,
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Started,
+            updated_at: crate::db::now(),
+        })
+        .unwrap();
+        let a = db
+            .insert_attempt(&NewAttempt {
+                task_id: task_id.into(),
+                pane_id: None,
+                workspace: workspace.into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: None,
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+            })
+            .unwrap();
+        db.set_attempt_pane(a, chat).unwrap();
+    }
+
+    #[test]
+    fn capacity_counts_live_attempts_in_the_route_space() {
+        let db = Db::open_in_memory().unwrap();
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [defaults]
+            max_concurrent_per_workspace = 2
+            "#,
+        )
+        .unwrap();
+        let r = route();
+        working_agent(&db, "linear:LIN-1", "chat-1", "widget");
+        working_agent(&db, "linear:LIN-2", "chat-2", "widget");
+        // Another space's attempts do not count against this route.
+        working_agent(&db, "linear:LIN-3", "chat-3", "other");
+
+        let err = check_capacity(&db, &cfg, &r).unwrap_err().to_string();
+        assert!(err.contains("2 of 2"), "{err}");
+        assert!(err.contains("widget"), "{err}");
+
+        // A closed attempt frees its slot.
+        let live = db.live_attempt_for_pane("chat-1").unwrap().unwrap();
+        db.close_attempt(live.id, Outcome::Done).unwrap();
+        assert!(check_capacity(&db, &cfg, &r).is_ok());
+    }
+
+    #[test]
+    fn no_via_is_the_operator() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(
+            dispatcher_for(&db, None, |_| unreachable!("no chat to ask about")),
+            Dispatcher::Operator
+        );
+        assert_eq!(
+            dispatcher_for(&db, Some(""), |_| true),
+            Dispatcher::Operator
+        );
+    }
+
+    /// A `via` chat a live attempt owns names its task as the parent — the
+    /// board-dispatched chain keeps the `via LIN-138` label. The liveness
+    /// lookup must not run: the board's own records already settled it.
+    #[test]
+    fn a_via_chat_with_a_live_attempt_names_the_parent_task() {
+        let db = Db::open_in_memory().unwrap();
+        working_agent(&db, "linear:LIN-138", "chat-p", "widget");
+        let d = dispatcher_for(&db, Some("chat-p"), |_| {
+            unreachable!("a chat a live attempt owns is settled without asking")
+        });
+        assert_eq!(d.task(), Some("linear:LIN-138"));
+        assert_eq!(d.pane(), Some("chat-p"));
+        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("LIN-138"));
+    }
+
+    /// The usual case (AGE-24): a long-lived orchestrator chat the board never
+    /// dispatched. Still an agent, recorded by its chat alone.
+    #[test]
+    fn a_live_chat_without_an_attempt_is_an_agent_by_chat() {
+        let db = Db::open_in_memory().unwrap();
+        let d = dispatcher_for(&db, Some("chat-orch"), |_| true);
+        assert_eq!(d.task(), None);
+        assert_eq!(d.pane(), Some("chat-orch"));
+        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("chat-orch"));
+    }
+
+    /// An archived or gone chat is not claimed as an agent — recording it
+    /// would hand a future notifier an address that answers for nobody.
+    #[test]
+    fn a_dead_via_chat_is_the_operators_dispatch() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(
+            dispatcher_for(&db, Some("chat-gone"), |_| false),
+            Dispatcher::Operator
+        );
+    }
+
+    /// A parent whose attempt has ended is no longer named by its task, but
+    /// its chat can still be an agent (an orchestrator waiting on children).
+    #[test]
+    fn a_finished_parents_chat_is_still_an_agent_while_alive() {
+        let db = Db::open_in_memory().unwrap();
+        working_agent(&db, "linear:LIN-138", "chat-p", "widget");
+        let live = db.live_attempt_for_pane("chat-p").unwrap().unwrap();
+        db.close_attempt(live.id, Outcome::Done).unwrap();
+        let d = dispatcher_for(&db, Some("chat-p"), |_| true);
+        assert_eq!(d.task(), None);
+        assert_eq!(d.pane(), Some("chat-p"));
+        // ...and once the chat is gone too, it is the operator's.
+        assert_eq!(
+            dispatcher_for(&db, Some("chat-p"), |_| false),
+            Dispatcher::Operator
+        );
+    }
+
+    /// A reaped parent leaves an id with no row behind it. The id is still the
+    /// truth we have, and naming it beats saying nothing.
+    #[test]
+    fn a_parent_whose_row_is_gone_is_named_by_its_id() {
+        let db = Db::open_in_memory().unwrap();
+        let d = Dispatcher::agent(Some("linear:LIN-999".into()), None);
+        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("linear:LIN-999"));
+        assert_eq!(dispatcher_name(&db, &Dispatcher::Operator), None);
+    }
+
+    #[test]
+    fn prompt_at_resolves_the_worktree_late() {
+        let mut r = route();
+        r.prompt = Some("Work on {title} in {worktree}.".into());
+        let spec = build_spec(&RoutingConfig::default(), &r, &task(), &space()).unwrap();
+        // Unresolved (and legible) until the executor knows the checkout…
+        assert!(spec.prompt.contains("{worktree}"), "{}", spec.prompt);
+        // …then resolved with the real path.
+        let sent = spec.prompt_at("/worktrees/widget/board-gh-7-widget");
+        assert!(
+            sent.contains("in /worktrees/widget/board-gh-7-widget."),
+            "{sent}"
+        );
+        assert!(!sent.contains('{'), "unresolved placeholder: {sent}");
     }
 }

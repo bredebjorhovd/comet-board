@@ -120,7 +120,20 @@ pub struct DispatchSpec {
     pub model: Option<String>,
     /// The brief: task title, body, links, and the board conventions
     /// (commit as you go, open a PR, `comet-board list --json` to poll).
+    /// `{worktree}` may still be unresolved — see [`DispatchSpec::prompt_at`].
     pub prompt: String,
+}
+
+impl DispatchSpec {
+    /// The brief with `{worktree}` resolved to the checkout the dispatch
+    /// actually cut. The one variable resolution cannot fill in advance: the
+    /// engine picks the path while executing the spec, so the executor calls
+    /// this with the real cwd just before sending the brief.
+    pub fn prompt_at(&self, cwd: &str) -> String {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("worktree", cwd.to_string());
+        crate::config::interpolate(&self.prompt, &vars)
+    }
 }
 
 /// A dispatched attempt, from the board's side of the fence.
