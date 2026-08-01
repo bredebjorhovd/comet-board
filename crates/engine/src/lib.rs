@@ -14,6 +14,7 @@ use comet_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod board;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
@@ -30,6 +31,7 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use board::{BoardService, board_enabled_from_env};
 pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -88,6 +90,10 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
+    /// Host the board service (docs/BOARD.md §H1). Default on via
+    /// [`board_enabled_from_env`] (`COMET_BOARD=0` disables); with no board
+    /// config on disk the loop is idle-cheap.
+    pub board: bool,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -111,6 +117,9 @@ pub struct EngineCore {
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
+    /// Board service (attached by [`Engine::assemble_runtime`] when enabled) —
+    /// the sync loop over `board.db`. H2 wires the board RPC methods to it.
+    board: std::sync::Mutex<Option<Arc<board::BoardService>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -208,6 +217,7 @@ impl EngineCore {
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
+            board: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
     }
@@ -249,6 +259,21 @@ impl EngineCore {
 
     pub fn links(&self) -> Option<Arc<comet_rpc::LinkCache>> {
         self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Attach the board service.
+    pub fn set_board(&self, board: Arc<board::BoardService>) {
+        *self
+            .board
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(board);
+    }
+
+    pub fn board(&self) -> Option<Arc<board::BoardService>> {
+        self.board
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -331,6 +356,16 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        // First, so its final cycle sees live session state and its SQLite
+        // writes land before the stores close.
+        let board = self
+            .board
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(board) = board {
+            board.shutdown();
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
@@ -438,6 +473,20 @@ impl Engine {
             Some(quiescent),
         ));
         tracing::info!(device_id = %core.device_id, "engine core assembled");
+
+        // The board service (docs/BOARD.md §H1): the sync loop herdr-board ran
+        // as `syncd`, fed by the same merged session stream `WatchSessions`
+        // serves. Failure to start is a warning, not fatal — the engine's job
+        // is chats, and the board is an addition.
+        if config.board {
+            let sessions_watch = core
+                .workspace
+                .merged_sessions_watch(core.sessions.watch_sessions());
+            match board::BoardService::spawn(&config.data_dir, sessions_watch) {
+                Ok(board) => core.set_board(Arc::new(board)),
+                Err(err) => tracing::warn!(error = %err, "board service failed to start"),
+            }
+        }
 
         let host_relay = edge.as_ref().map(|edge| {
             let links = comet_rpc::LinkCache::new(comet_rpc::LinkCacheConfig::new(

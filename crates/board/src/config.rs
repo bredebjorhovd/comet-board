@@ -22,10 +22,20 @@ impl Paths {
         // `~/.comet-native/board` — inside the engine's data dir on purpose:
         // one directory to back up, and its lifetime is already the engine's.
         // `COMET_DATA_DIR` follows the engine's dev-mode override.
-        let base = match std::env::var("COMET_DATA_DIR") {
-            Ok(v) if !v.is_empty() => PathBuf::from(v).join("board"),
-            _ => PathBuf::from(&home).join(".comet-native").join("board"),
+        let data_dir = match std::env::var("COMET_DATA_DIR") {
+            Ok(v) if !v.is_empty() => PathBuf::from(v),
+            _ => PathBuf::from(&home).join(".comet-native"),
         };
+        Self::under(&data_dir)
+    }
+
+    /// The board directories under an already-resolved engine data dir — the
+    /// engine's board service passes its own `EngineConfig::data_dir` here so
+    /// config precedence cannot diverge between the two. The
+    /// `COMET_BOARD_CONFIG_DIR` / `COMET_BOARD_STATE_DIR` overrides still win,
+    /// so tests and a by-hand `doctor` run keep working against scratch dirs.
+    pub fn under(data_dir: &Path) -> Result<Paths> {
+        let base = data_dir.join("board");
         let config_dir = match std::env::var("COMET_BOARD_CONFIG_DIR") {
             Ok(v) if !v.is_empty() => PathBuf::from(v),
             _ => base.clone(),

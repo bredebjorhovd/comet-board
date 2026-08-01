@@ -49,6 +49,22 @@ nearly verbatim — it never depended on herdr:
   `SessionStatus → AgentStatus` mapping with the staleness gate, and
   `harness_for_runtime`. Read this file first; it is the contract every
   remaining task implements against.
+- `sync.rs` — the tracker half of herdr-board's sync cycle, ported (H1):
+  polling with watermarks and full sweeps, reaping, PR linking with repo
+  scoping, merge observation, state derivation with the review/close
+  writebacks, the writeback drain, source health. The reconcile half is
+  reshaped: `reconcile_sessions` (lifecycle, interval-clocked) and
+  `refresh_statuses` (status-only, event-driven) consume chat-id→status maps
+  built from the session watch through `runtime::agent_status`. Orphaning
+  keeps the two-tick rule but only fires on a chat that was *seen working* —
+  a chat with no session row yet is indistinguishable from a dispatch whose
+  first run has not started, and the verdict on those waits for H2's
+  `chat_alive`.
+- `crates/engine/src/board.rs` — **new** (H1): `BoardService`, the engine
+  hosting what `syncd` was. One dedicated thread owns `board.db` and the
+  blocking source clients; a task forwards `WatchSessions`-shaped snapshots
+  into it. Config/credential changes are picked up per cycle. On by default,
+  `COMET_BOARD=0` disables (`EngineConfig::board`).
 
 RPC surface claimed (stubs): `WatchBoard`, `DispatchTask`, `CancelTask` in
 `crates/rpc/src/lib.rs::methods`, answered in `crates/engine/src/rpc.rs` with
@@ -77,17 +93,13 @@ Do not resurrect these; their reasons to exist are herdr's, not comet's.
 
 Sizes: S < half a day of focused agent work, M ≈ a day, L = several.
 
-### H1 — Board service in the engine (L, unblocks everything)
-A `BoardService` owned by the engine (feature-gated or always-on; decide with
-a flag in engine config), hosting the sync loop that herdr-board's `syncd`
-ran as a daemon: poll Linear/GitHub on `sync.interval`, upsert into
-`board.db`, drain the writeback queue, derive states. Port the tracker half
-of herdr-board's `sync.rs` (~the parts with no `herdr::` imports). The
-reconcile half changes shape: subscribe to the engine's session watch (what
-`WatchSessions` streams) and map through `runtime::agent_status` instead of
-polling panes. Store stays SQLite at `Paths::db()` — the board is
-device-local state, not a CRDT doc (rationale: one writer, no offline
-merge problem, and herdr-board's schema/tests come for free).
+### H1 — Board service in the engine — **done**
+Landed as `crates/board/src/sync.rs` + `crates/engine/src/board.rs` (see the
+ported-and-working list above). Store is SQLite at `Paths::db()` — the board
+is device-local state, not a CRDT doc (rationale: one writer, no offline
+merge problem, and herdr-board's schema/tests came for free). Left with H1
+deliberately open: settle decisions (H4) and orphaning a never-started chat
+(needs H2's `chat_alive`).
 
 ### H2 — `Runtime` impl against engine internals (M, needs H1's skeleton)
 `CometRuntime` inside the engine implementing `crates/board`'s trait:

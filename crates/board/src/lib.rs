@@ -20,3 +20,4 @@ pub mod model;
 pub mod runtime;
 pub mod sources;
 pub mod stats;
+pub mod sync;
