@@ -21,6 +21,7 @@ pub mod doctor;
 pub mod init;
 pub mod log;
 pub mod model;
+pub mod review;
 pub mod rows;
 pub mod runtime;
 pub mod sources;

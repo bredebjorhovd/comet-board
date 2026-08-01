@@ -46,6 +46,14 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// The chat this run serves, exported into the harness child's env as
+    /// `COMET_BOARD_CHAT_ID` — the identity `HERDR_PANE_ID` carried in herdr:
+    /// a `comet-board dispatch` run by the agent inherits its own chat id
+    /// without anyone passing ids by hand (docs/BOARD.md §H3). Every chat's
+    /// runs get it, not only board-dispatched ones — an orchestrator the board
+    /// never dispatched still names itself. `None` only for chat-less runs
+    /// (title generation).
+    pub chat_id: Option<String>,
 }
 
 #[async_trait]

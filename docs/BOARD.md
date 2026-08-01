@@ -45,7 +45,7 @@ nearly verbatim — it never depended on herdr:
   spelling so ported routing.toml files load.
 - `stats.rs`, `log.rs` — unchanged.
 - `runtime.rs` — **new**, the seam. `Runtime` trait (dispatch / prompt /
-  cancel / session / chat_alive), `DispatchSpec`/`DispatchHandle`, the
+  cancel / session / chat_alive / chat_cwd), `DispatchSpec`/`DispatchHandle`, the
   `SessionStatus → AgentStatus` mapping with the staleness gate, and
   `harness_for_runtime`. Read this file first; it is the contract every
   remaining task implements against.
@@ -70,9 +70,17 @@ nearly verbatim — it never depended on herdr:
   into it. Config/credential changes are picked up per cycle. On by default,
   `COMET_BOARD=0` disables (`EngineConfig::board`).
 
-- `crates/board/src/dispatch.rs` — **new** (H2): task + route → `DispatchSpec`
-  resolution (branch template, brief, space matching), the planning half of
-  herdr-board's `dispatch.rs`. H3 grows the pipeline around it.
+- `crates/board/src/dispatch.rs` — **new** (H2+H3): herdr-board's `dispatch.rs`
+  minus panes. Task + route → `DispatchSpec` resolution (branch template,
+  brief, space matching) plus the pipeline decisions: `check_capacity`
+  (`max_concurrent_per_workspace` counts live attempts per space),
+  `dispatcher_for` (the `via` chat id → parent-task/chat provenance verdict),
+  `dispatcher_name` for the upstream comment. `{worktree}` in a brief resolves
+  late, via `DispatchSpec::prompt_at`, once the executor knows the checkout.
+  Every harness run exports `COMET_BOARD_CHAT_ID` (the chat it serves) into
+  the child's env — `RunControls::chat_id`, stamped by the engine on every
+  dispatch — so `comet-board dispatch` inherits identity the way
+  `HERDR_PANE_ID` provided it.
 - `crates/board/src/rows.rs` — **new** (H2): `TaskRow` — herdr-board's
   `list --json` contract with the pane→chat renames (`chat_id`,
   `dispatched_by_chat`). What `WatchBoard` streams and H6's `list` prints.
@@ -81,6 +89,10 @@ nearly verbatim — it never depended on herdr:
   (`create_worktree_on` — exact branch names), chats via
   `workspace.create_chat`, briefs/steers/interrupts via the command ledger,
   status off the merged session mirror.
+- `crates/board/src/review.rs` — review delivery (H5): herdr-board's
+  `review.rs` minus the wake latch and busy-check, delivering over the
+  command ledger via `Runtime::prompt`. See §H5 below for what was dropped
+  and why the loop still converges.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
 `DispatchTask {taskId, via?}` → `{chatId, cwd, attempt}`, `CancelTask
@@ -124,19 +136,16 @@ Landed as `crates/engine/src/board_runtime.rs` (`CometRuntime`) plus the real
 RPC handlers (see the ported-and-working list above). Dispatch/cancel execute
 on the board loop's thread through a command channel; `WatchBoard` is a
 `watch_stream` fed by the loop after every cycle, status refresh, and command.
-Left deliberately open for later tasks: concurrency caps, resolving `via` into
-a parent task id, `COMET_BOARD_CHAT_ID` in the harness env (all H3), and
-wiring `chat_alive` into reconcile's never-started-chat verdict.
+Still deliberately open: wiring `chat_alive` into reconcile's
+never-started-chat verdict.
 
-### H3 — Dispatch pipeline (M, needs H2)
-Port `dispatch.rs` minus panes: route resolution (exists in `config.rs`),
-branch templating (exists), brief building from task + route `prompt`
-template (exists as `interpolate`), concurrency caps
-(`max_concurrent_per_workspace` counts live attempts per space), attempt
-row lifecycle. Provenance: accept `via` (dispatching chat id) on
-`DispatchTask`; export `COMET_BOARD_CHAT_ID` into the harness process env
-(one-line change where the harness spawns) so `comet-board dispatch` inherits
-identity the way `HERDR_PANE_ID` provided it.
+### H3 — Dispatch pipeline — **done**
+Landed in `crates/board/src/dispatch.rs` + the engine's `handle_dispatch`
+(see the ported-and-working list above): concurrency caps as a refusal before
+anything is created, `via` resolved into parent-task/chat provenance on the
+attempt row and the upstream dispatch comment, `{worktree}` threaded into the
+brief at execution time, and `COMET_BOARD_CHAT_ID` exported where the harness
+spawns (`RunControls::chat_id` → child env, claude and codex adapters).
 
 ### H4 — Settle logic (M, needs H2)
 Port `settled.rs`'s *decision* (PR = the agent's own statement of done,
@@ -147,12 +156,21 @@ clock entirely. Keep the artifact checks (branch pushed? PR open? — GitHub
 client already ported). Keep `reopened` semantics: an `Errored`→retried run
 is the same attempt, not a new one.
 
-### H5 — Review delivery (M, needs H2)
-Port `review.rs`: per-PR per-endpoint watermarks (schema already in `db.rs`),
-`updated_at`-gated polling, deliver via `Runtime::prompt`. Drop the wake
-latch and busy-check — the ledger queues into a busy chat safely, and
-supersede rules handle pileups. Keep "verify the chat still exists and its
-cwd is still the attempt's checkout" (`chat_alive` + chat row cwd).
+### H5 — Review delivery — **done**
+Landed as `crates/board/src/review.rs`: `SyncEngine::deliver_reviews`, run by
+the board loop after every sync cycle against the pulls that cycle already
+polled. Per-PR per-endpoint watermarks (`meta` under `reviews:<task>`), the
+`updated_at` gate, the first-sight floor, and the actionability filter came
+over verbatim; delivery is `Runtime::prompt` — a durable ledger entry, steer
+or send. Dropped as planned: the wake latch and busy-check — the ledger
+queues into a busy chat safely and supersede rules handle pileups. The honest
+consequence is documented at the top of `review.rs`: with no author to key on
+and no latch, an agent's own PR reply is relayed back into its chat once (the
+composed message says so), instead of herdr-board's trade of swallowing human
+comments that landed inside the wake window; the watermark still makes it a
+single bounce. The author check survives as `Runtime::chat_alive` plus a new
+`Runtime::chat_cwd` — the chat row's cwd must still be the attempt's
+checkout.
 
 ### H6 — `comet-board` CLI (M, needs H2; agents' entry point)
 Grow `apps/board-cli` (the `comet-board` binary, created by H8 with
