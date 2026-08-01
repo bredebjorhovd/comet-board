@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/proto",
+    "crates/board",
     "crates/doc",
     "crates/sync",
     "crates/harness",
@@ -22,6 +23,7 @@ publish = false
 
 [workspace.dependencies]
 comet-proto = { path = "crates/proto" }
+comet-board = { path = "crates/board" }
 comet-doc = { path = "crates/doc" }
 comet-sync = { path = "crates/sync" }
 comet-harness = { path = "crates/harness" }

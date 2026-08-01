@@ -1,0 +1,133 @@
+# Copy to the board config dir and edit:
+#   cp routing.example.toml ~/.comet-native/board/routing.toml
+
+[sync]
+# How often syncd polls. Floors at 5s.
+interval = "30s"
+# Linear labels that mean "dispatchable". Issues assigned to you are always
+# included; these labels widen that set.
+labels = ["herd"]
+
+# First matching route wins. All keys given in `match` must match (AND).
+# Available keys: linear_team, linear_project, gh_repo, label.
+[[route]]
+match = { linear_team = "OFF" }
+workspace = "offhand"          # a comet SPACE name (device + folder pair)
+repo = "~/code/offhand"        # the git repo worktrees are cut from
+runtime = "claude-code"        # display name; mapped to comet harness ClaudeCode
+prompt = """
+You are working on: {title} ({identifier})
+
+{body}
+
+Work in this worktree. Open a PR when done; branch {branch} is prepared.
+"""
+
+[[route]]
+match = { label = "fintech" }
+workspace = "fintech"
+repo = "~/code/tripletex-int"
+runtime = "claude-code"
+
+# `runtime` is not decoration. Anything `runtime::harness_for_runtime` maps is
+# dispatchable — `codex` and `cursor` alongside `claude-code`. `doctor` rejects
+# a runtime it cannot map rather than failing at dispatch time.
+#
+# `match` ANDs its keys, so one repo can route to different runtimes by label.
+[[route]]
+match = { gh_repo = "you/scratch", label = "codex" }
+workspace = "scratch"
+repo = "~/code/scratch"
+runtime = "codex"
+
+# A route with no `match` is a catch-all and must come last.
+
+[defaults]
+max_concurrent_per_workspace = 3
+# `{identifier_lower}` is the identifier made branch-safe: `LIN-145` →
+# `lin-145`. For GitHub it also carries the repo — `gh#2` in tripletex-mcp is
+# `gh-2-tripletex-mcp` — because GitHub numbers issues per repository, and every
+# watched repo's issue 2 sharing one branch name is how another repo's merged
+# pull request ends up attached to an untouched task.
+branch_template = "board/{identifier_lower}"
+# Surface a notification when released work settles. A conversational
+# orchestrator cannot be woken, so somebody has to notice — this is how you do,
+# without watching the board.
+# notify = true
+# Which tracker `comet-board new` writes to: "linear" or "github". This is not
+# inferable — a label routes work to a repo and says nothing about where that
+# project's tickets live. This board's own backlog may be in Linear while its
+# code is on GitHub; a repo whose issues you already keep on GitHub is the
+# reverse.
+# new_source = "linear"
+
+[linear]
+# Which workflow state means "finished, waiting on a human". When the board
+# derives `review`, the issue moves there — otherwise dispatch leaves it at
+# In Progress and nothing moves it again until the PR merges, so anyone reading
+# Linear rather than the board sees In Progress for the whole review window.
+#
+# A name, not a type, and unavoidably so: `In Review` and `In Progress` are both
+# `type: started`, so the API cannot be asked which one means review. Every other
+# state the board touches is resolved by type. Unset (the default) means no
+# transition at all, which is right if your workflow has no such state.
+# `comet-board doctor` checks the name resolves in each team you route to.
+# review_state = "In Review"
+
+# GitHub is entirely optional. With no repos listed it is never polled, the
+# header omits it, and GITHUB_TOKEN is not needed at all.
+[github]
+repos = []
+# The fallback filter, not the law — an empty list means every open issue.
+# Repos want different answers here: a curated tracker is right to say
+# "everything", while a repo that keeps its roadmap as open issues would put
+# its whole backlog on the board. Override per repo below.
+labels = ["herd"]
+# Show open pull requests as their own `review` rows — work waiting on you that
+# nobody dispatched. A PR from a board dispatch attaches to its task instead.
+pull_requests = true
+# Leave the same trail on GitHub that Linear gets: a comment on dispatch and on
+# outcome, and close the issue on done. Needs a token with `repo` scope.
+# Off by default: the board should not start writing to your issues just
+# because you pointed it at a repo.
+#
+# The fallback, not the law — repos differ here more than anything else does. A
+# comment on a project of your own is provenance nobody minds; the same comment
+# on a production repo lands on an issue other people read. Override per repo
+# below, and `doctor` names the repos it will write to.
+writeback = false
+# Deliver review comments back into the chat that wrote the pull request.
+#
+# A task in `review` keeps its chat, so the agent that wrote the PR still has
+# the whole task in context — and a review is a notification it has no way to
+# receive. This queues the comment, the PR url, and for an inline comment the
+# file and line into that chat. Issue comments, inline comments and review
+# submissions all count; `changes requested` is the loudest and is not an
+# issue comment at all.
+#
+# On by default, unlike `writeback`: this writes nothing to anybody's
+# repository, it queues into a chat of your own. Delivery rides the command
+# ledger, so a comment reaches the agent exactly once.
+deliver_reviews = true
+
+# One repo, answering differently from the list above. `name` must also appear
+# in `repos` — a table naming anything else is settings that apply to nothing,
+# and `doctor` refuses it rather than letting it sit there looking effective.
+#
+# Omit `labels` to fall back to `[github] labels`; `labels = []` is every open
+# issue, said out loud. Omit `writeback` to fall back to `[github] writeback`.
+#
+# [[github.repo]]
+# name = "bredebjorhovd/itsm-agent"
+# labels = ["release-a"]
+#
+# [[github.repo]]
+# name = "Florin-AS/Tally"
+# writeback = false
+
+# The board lists git repos that have a comet space but no config here, in an
+# UNADOPTED section. Ignoring is needed because you open a chat in plenty of
+# repos you are only reading — another org's, a dependency, something you
+# cloned to look at. Delete a line to be offered that repo again.
+[adopt]
+ignore = []
