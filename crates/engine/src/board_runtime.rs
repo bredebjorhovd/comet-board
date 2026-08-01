@@ -182,4 +182,8 @@ impl Runtime for CometRuntime {
             .chat(chat_id)?
             .is_some_and(|chat| !chat.archived))
     }
+
+    fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.workspace.doc().chat(chat_id)?.and_then(|c| c.cwd))
+    }
 }

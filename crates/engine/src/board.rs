@@ -6,7 +6,8 @@
 //!
 //! - **The sync interval** (`[sync] interval` in `routing.toml`, default 30s):
 //!   poll Linear/GitHub, reconcile session state, derive states, drain the
-//!   writeback queue. This is the loop with lifecycle authority — orphaning
+//!   writeback queue, deliver review comments (§H5) against the pulls the
+//!   cycle just polled. This is the loop with lifecycle authority — orphaning
 //!   rides its steady clock, so a burst of events cannot age an attempt faster
 //!   than wall time.
 //! - **The session watch** (the same merged stream `WatchSessions` serves):
@@ -217,8 +218,11 @@ fn run_loop(
             if let Some(fresh) = engine.reload_if_configuration_changed() {
                 engine = fresh;
             }
-            if let Err(e) = engine.sync_once(statuses.as_ref()) {
-                log.error(format!("sync cycle failed: {e}"));
+            match engine.sync_once(statuses.as_ref()) {
+                // Review delivery rides the cycle's own PR poll, and runs
+                // after it so the `review` states it keys on are this tick's.
+                Ok(pulls) => engine.deliver_reviews(runtime.as_ref(), &pulls),
+                Err(e) => log.error(format!("sync cycle failed: {e}")),
             }
             publish_rows(&engine, &rows, &log);
             next_sync = Instant::now() + Duration::from_secs(engine.cfg.sync.interval_secs());
@@ -519,6 +523,9 @@ mod tests {
         }
         fn chat_alive(&self, _chat_id: &str) -> anyhow::Result<bool> {
             Ok(self.alive.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn chat_cwd(&self, _chat_id: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
         }
     }
 
