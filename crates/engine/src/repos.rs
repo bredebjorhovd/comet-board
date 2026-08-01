@@ -540,6 +540,60 @@ impl Repos {
         })
     }
 
+    /// Cut a worktree on an exact branch name — the board's dispatch path
+    /// (docs/BOARD.md §H2), where the branch comes from routing.toml's
+    /// `branch_template` rather than a generated `comet/…` name.
+    ///
+    /// A retry reuses what exists, because git allows a branch in only one
+    /// worktree: an existing checkout already on `branch` is returned as-is,
+    /// and an existing branch without a checkout is opened rather than re-cut
+    /// (it may carry the previous attempt's commits). A fresh branch starts at
+    /// the repo's current HEAD, which is what herdr-board did.
+    pub async fn create_worktree_on(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+    ) -> Result<Worktree, EngineError> {
+        let repo_name = repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string());
+        let base = self.inner.worktrees_root.join(&repo_name);
+        std::fs::create_dir_all(&base)?;
+        let name = branch.replace('/', "-");
+        let path = base.join(&name);
+
+        if path.exists() {
+            let current = self.current_branch(&path).await?;
+            if current != branch {
+                return Err(EngineError::Other(format!(
+                    "{} exists but is on {current}, not {branch}",
+                    path.display()
+                )));
+            }
+        } else if self.branch_exists(repo_path, branch).await {
+            self.git(
+                &["worktree", "add", &path.to_string_lossy(), branch],
+                Some(repo_path),
+            )
+            .await?;
+        } else {
+            self.git(
+                &["worktree", "add", "-b", branch, &path.to_string_lossy()],
+                Some(repo_path),
+            )
+            .await?;
+        }
+        let checkout = self.checkout_identity(&path).await?;
+        Ok(Worktree {
+            repo_path: repo_path.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string(),
+            branch: branch.to_string(),
+            name,
+            checkout_id: Some(checkout.id),
+        })
+    }
+
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
         self.git(
             &[

@@ -558,6 +558,17 @@ impl Db {
         Ok(())
     }
 
+    /// Record where the attempt's checkout actually landed. Known only after
+    /// the engine cuts it — the row is inserted first as the duplicate-dispatch
+    /// guard, so the path arrives as an update.
+    pub fn set_attempt_worktree(&self, attempt_id: i64, worktree: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET worktree = ?2 WHERE id = ?1",
+            params![attempt_id, worktree],
+        )?;
+        Ok(())
+    }
+
     pub fn close_attempt(&self, attempt_id: i64, outcome: Outcome) -> Result<()> {
         self.conn.execute(
             "UPDATE attempts SET outcome = ?2, ended_at = ?3 WHERE id = ?1 AND outcome IS NULL",

@@ -15,6 +15,7 @@ use comet_sync::DocsStore;
 pub mod agent_accounts;
 pub mod auth;
 pub mod board;
+pub mod board_runtime;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
@@ -32,6 +33,7 @@ pub mod workspace_host;
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use board::{BoardService, board_enabled_from_env};
+pub use board_runtime::CometRuntime;
 pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -134,7 +136,8 @@ pub struct EngineCore {
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<comet_update::Updater>>,
     /// Board service (attached by [`Engine::assemble_runtime`] when enabled) —
-    /// the sync loop over `board.db`. H2 wires the board RPC methods to it.
+    /// the sync loop over `board.db`, serving `WatchBoard` / `DispatchTask` /
+    /// `CancelTask` through [`rpc::EngineRpc`].
     board: std::sync::Mutex<Option<Arc<board::BoardService>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
@@ -365,6 +368,9 @@ impl EngineCore {
         if let Some(updater) = self.updater() {
             rpc = rpc.with_updater(updater);
         }
+        if let Some(board) = self.board() {
+            rpc = rpc.with_board(board);
+        }
         Arc::new(rpc)
     }
 
@@ -513,7 +519,21 @@ impl Engine {
             let sessions_watch = core
                 .workspace
                 .merged_sessions_watch(core.sessions.watch_sessions());
-            match board::BoardService::spawn(&config.data_dir, sessions_watch) {
+            // The runtime reads the same mirror the loop is fed — one stream,
+            // so the board and the frontends can never disagree on status.
+            let runtime = Arc::new(board_runtime::CometRuntime::new(
+                core.repos.clone(),
+                core.workspace.clone(),
+                core.doc_host.clone(),
+                sessions_watch.clone(),
+                tokio::runtime::Handle::current(),
+            ));
+            match board::BoardService::spawn(
+                &config.data_dir,
+                sessions_watch,
+                runtime,
+                core.workspace.watch_spaces(),
+            ) {
                 Ok(board) => core.set_board(Arc::new(board)),
                 Err(err) => tracing::warn!(error = %err, "board service failed to start"),
             }

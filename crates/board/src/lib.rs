@@ -16,10 +16,12 @@
 pub mod adopt;
 pub mod config;
 pub mod db;
+pub mod dispatch;
 pub mod doctor;
 pub mod init;
 pub mod log;
 pub mod model;
+pub mod rows;
 pub mod runtime;
 pub mod sources;
 pub mod stats;

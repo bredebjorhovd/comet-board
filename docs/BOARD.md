@@ -70,9 +70,22 @@ nearly verbatim — it never depended on herdr:
   into it. Config/credential changes are picked up per cycle. On by default,
   `COMET_BOARD=0` disables (`EngineConfig::board`).
 
-RPC surface claimed (stubs): `WatchBoard`, `DispatchTask`, `CancelTask` in
-`crates/rpc/src/lib.rs::methods`, answered in `crates/engine/src/rpc.rs` with
-a "not wired yet" error pointing here.
+- `crates/board/src/dispatch.rs` — **new** (H2): task + route → `DispatchSpec`
+  resolution (branch template, brief, space matching), the planning half of
+  herdr-board's `dispatch.rs`. H3 grows the pipeline around it.
+- `crates/board/src/rows.rs` — **new** (H2): `TaskRow` — herdr-board's
+  `list --json` contract with the pane→chat renames (`chat_id`,
+  `dispatched_by_chat`). What `WatchBoard` streams and H6's `list` prints.
+- `crates/engine/src/board_runtime.rs` — **new** (H2): `CometRuntime`, the
+  `Runtime` trait against engine internals. Worktrees via `repos.rs`
+  (`create_worktree_on` — exact branch names), chats via
+  `workspace.create_chat`, briefs/steers/interrupts via the command ledger,
+  status off the merged session mirror.
+
+RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
+`DispatchTask {taskId, via?}` → `{chatId, cwd, attempt}`, `CancelTask
+{taskId}` — served in `crates/engine/src/rpc.rs` off the board service, which
+executes dispatch/cancel on its loop thread (`board.db` has one writer).
 
 ## What was deliberately NOT ported
 
@@ -106,16 +119,14 @@ merge problem, and herdr-board's schema/tests came for free). Left with H1
 deliberately open: settle decisions (H4) and orphaning a never-started chat
 (needs H2's `chat_alive`).
 
-### H2 — `Runtime` impl against engine internals (M, needs H1's skeleton)
-`CometRuntime` inside the engine implementing `crates/board`'s trait:
-- `dispatch`: worktree via `repos.rs` (`CreateWorktree` path), chat via
-  `workspace.create_chat` (cwd/branch/checkout/space/config from
-  `DispatchSpec`), brief via `doc_host.queue_command` send. Return the chat id.
-- `prompt`: `queue_command` steer-or-send.
-- `cancel`: `queue_command` interrupt, then archive the chat.
-- `session`/`chat_alive`: read the workspace mirror.
-Then replace the three RPC stubs in `engine/src/rpc.rs` with real handlers
-(`WatchBoard` as a `watch_stream`, same pattern as `WATCH_CHATS`).
+### H2 — `Runtime` impl against engine internals — **done**
+Landed as `crates/engine/src/board_runtime.rs` (`CometRuntime`) plus the real
+RPC handlers (see the ported-and-working list above). Dispatch/cancel execute
+on the board loop's thread through a command channel; `WatchBoard` is a
+`watch_stream` fed by the loop after every cycle, status refresh, and command.
+Left deliberately open for later tasks: concurrency caps, resolving `via` into
+a parent task id, `COMET_BOARD_CHAT_ID` in the harness env (all H3), and
+wiring `chat_alive` into reconcile's never-started-chat verdict.
 
 ### H3 — Dispatch pipeline (M, needs H2)
 Port `dispatch.rs` minus panes: route resolution (exists in `config.rs`),
