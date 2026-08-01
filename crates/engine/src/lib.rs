@@ -71,11 +71,19 @@ pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// `edge_url` sentinel that disables the edge entirely (`COMET_EDGE_URL=off`,
+/// any case): no room joins, no presence, no device room, no release polling,
+/// and dev-mode auth. The stated configuration for intentionally local
+/// (single-box) deployments, as opposed to offline-tolerant failing.
+pub fn edge_url_is_off(url: &str) -> bool {
+    url.trim().eq_ignore_ascii_case("off")
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Data directory (default `~/.comet-native`, dev `~/.comet-native-dev`).
     pub data_dir: PathBuf,
-    /// Edge base URL.
+    /// Edge base URL, or the [`edge_url_is_off`] sentinel for local mode.
     pub edge_url: String,
     /// Bearer for edge room joins; `None` runs fully offline (sync disabled).
     pub edge_token: Option<String>,
@@ -88,6 +96,14 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
+}
+
+impl EngineConfig {
+    /// False in local mode ([`edge_url_is_off`]) — every edge transport
+    /// (rooms, presence, device room, nudges, release polling) stays unbuilt.
+    pub fn edge_enabled(&self) -> bool {
+        !edge_url_is_off(&self.edge_url)
+    }
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -371,7 +387,12 @@ impl Engine {
     /// bearers still opt into the local dev identity.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
-        auth_config.workos_client_id = config.workos_client_id.clone();
+        // Local mode has no edge to authenticate against: force dev auth so
+        // neither the sign-in gate nor the `{edge}/health` probe ever fires.
+        auth_config.workos_client_id = config
+            .edge_enabled()
+            .then(|| config.workos_client_id.clone())
+            .flatten();
         if let Ok(base) = std::env::var("COMET_WORKOS_API_BASE")
             && !base.trim().is_empty()
         {
@@ -396,7 +417,10 @@ impl Engine {
         config: &EngineConfig,
         auth: Auth,
     ) -> anyhow::Result<EngineRuntime> {
-        let online = (auth.workos_enabled() || config.edge_token.is_some())
+        // Local mode wins over any token: a dev bearer (or saved session) must
+        // not produce connect attempts against an edge configured away.
+        let online = config.edge_enabled()
+            && (auth.workos_enabled() || config.edge_token.is_some())
             && auth.access_token().await.is_some();
         let edge = online.then(|| EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())));
 
@@ -428,15 +452,22 @@ impl Engine {
         // Release checker: polls {edge}/releases on a 6h cadence; headless
         // installs with COMET_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.
-        let quiescent: comet_update::QuiescentCheck = {
-            let sessions = core.sessions.clone();
-            let terminals = core.terminals.clone();
-            Arc::new(move || !sessions.any_active() && !terminals.any_open())
-        };
-        core.set_updater(comet_update::Updater::spawn(
-            config.edge_url.clone(),
-            Some(quiescent),
-        ));
+        // Releases come from the edge, so local mode skips the poller too.
+        if config.edge_enabled() {
+            let quiescent: comet_update::QuiescentCheck = {
+                let sessions = core.sessions.clone();
+                let terminals = core.terminals.clone();
+                Arc::new(move || !sessions.any_active() && !terminals.any_open())
+            };
+            core.set_updater(comet_update::Updater::spawn(
+                config.edge_url.clone(),
+                Some(quiescent),
+            ));
+        } else {
+            tracing::info!(
+                "edge disabled (local mode) — room sync, presence, device room, and release polling are off"
+            );
+        }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
         let host_relay = edge.as_ref().map(|edge| {
