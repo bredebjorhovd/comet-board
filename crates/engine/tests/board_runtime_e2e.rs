@@ -166,6 +166,22 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     };
     wait_for(|| complete_turns(&doc) == 1, "the brief to execute").await;
 
+    // The brief is VISIBLE in the transcript as the first user message — the
+    // task's title + body land in the chat as the run's opening prompt, not
+    // only in some internal queue (the report that a dispatched chat "showed
+    // no prompt" is a crashed serve / un-executed command, not a missing send).
+    let entries = doc.doc().read_entries().unwrap_or_default();
+    let first_user_text = entries
+        .iter()
+        .filter(|e| e.role == MessageRole::User)
+        .find_map(|e| {
+            e.parts.iter().find_map(|p| match p {
+                comet_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+        });
+    assert_eq!(first_user_text, Some("do the thing"));
+
     // The session mirror answers for the chat, and settles back to Idle.
     let rt = runtime.clone();
     let chat_id = handle.chat_id.clone();

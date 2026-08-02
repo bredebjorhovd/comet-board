@@ -31,12 +31,46 @@ use gpui::{
 
 use comet_proto::view::board::{self, BoardState, Filter, TaskRow};
 use comet_rpc::methods;
+use serde::Deserialize;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+
+/// One runtime a dispatch can be pointed at, as the engine's `ListBoardRuntimes`
+/// reports it — the same set `build_spec` validates an override against.
+#[derive(Debug, Clone, Deserialize)]
+struct BoardRuntime {
+    name: String,
+    label: String,
+}
+
+/// A dispatch in the pick step: the operator chose a task, and the panel is
+/// asking which runtime to release it under. The runtimes load asynchronously
+/// after the picker opens; keyboard nav is inert until they land.
+#[derive(Debug, Clone)]
+struct DispatchDraft {
+    task_id: String,
+    identifier: String,
+    /// The route's runtime — the picker's default, when the list offers it.
+    route_runtime: Option<String>,
+    runtimes: Vec<BoardRuntime>,
+    active: usize,
+    /// A failed `ListBoardRuntimes`, shown in the strip instead of a stale
+    /// "Loading…" (enter still dispatches with the route's runtime).
+    error: Option<String>,
+}
+
+/// The picker's starting row: the route's runtime when the list offers it by
+/// its canonical name, else the first option. A route configured with an alias
+/// (`claude`, `openai-codex`) lands on its harness's canonical entry.
+fn default_runtime_index(options: &[BoardRuntime], route_runtime: Option<&str>) -> usize {
+    route_runtime
+        .and_then(|route| options.iter().position(|o| o.name == route))
+        .unwrap_or(0)
+}
 
 /// A line the board body draws: a section header, or a task row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +360,9 @@ pub struct BoardPanel {
     scroll: ScrollHandle,
     /// A transient dispatch/cancel message for the footer.
     notice: Option<SharedString>,
+    /// An open runtime picker for a dispatch (ready row → enter). `None` =
+    /// no dispatch is being confirmed.
+    dispatch: Option<DispatchDraft>,
     /// Keeps the elapsed counters on working/blocked rows live.
     _ticker: Task<()>,
     _observe: Subscription,
@@ -373,6 +410,7 @@ impl BoardPanel {
             find_focus_pending: false,
             scroll: ScrollHandle::new(),
             notice: None,
+            dispatch: None,
             _ticker: ticker,
             _observe: observe,
         }
@@ -472,8 +510,10 @@ impl BoardPanel {
 
     // ---- verbs ----
 
-    /// Release a ready task. The operator is dispatching, so there is no `via`
-    /// — provenance is never fabricated (the same rule the TUI follows).
+    /// Release a ready task, asking which runtime first. The operator is
+    /// dispatching, so there is no `via` — provenance is never fabricated (the
+    /// same rule the TUI follows). The picker defaults to the route's runtime
+    /// and loads the options off the engine; `enter` confirms, `esc` cancels.
     fn dispatch(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             self.set_notice("Engine not connected", cx);
@@ -487,13 +527,107 @@ impl BoardPanel {
             );
             return;
         }
-        let identifier = row.identifier.clone();
         let task_id = row.id.clone();
+        let identifier = row.identifier.clone();
+        self.dispatch = Some(DispatchDraft {
+            route_runtime: row.runtime.clone(),
+            task_id,
+            identifier,
+            runtimes: Vec::new(),
+            active: 0,
+            error: None,
+        });
+        cx.notify();
+        self.load_dispatch_runtimes(engine, cx);
+    }
+
+    /// Fetch `ListBoardRuntimes` into the open picker. The picker renders
+    /// immediately with "Loading…"; the list landing re-homes the cursor onto
+    /// the route's runtime. A failed load leaves the picker open (escape always
+    /// works) with a notice naming the failure.
+    fn load_dispatch_runtimes(&mut self, engine: EngineHandle, cx: &mut Context<Self>) {
+        let Some(task_id) = self.dispatch.as_ref().map(|d| d.task_id.clone()) else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::DISPATCH_TASK, serde_json::json!({ "taskId": task_id }))
+                .call(methods::LIST_BOARD_RUNTIMES, serde_json::json!({}))
                 .await;
+            this.update(cx, |panel, cx| {
+                // A newer pick (or a cancel) replaced this one while the load
+                // was in flight — its options would be stale, so drop them.
+                let Some(draft) = panel.dispatch.as_mut() else { return };
+                if draft.task_id != task_id {
+                    return;
+                }
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<BoardRuntime>>(value) {
+                        Ok(options) => {
+                            draft.runtimes = options;
+                            draft.active = default_runtime_index(
+                                &draft.runtimes,
+                                draft.route_runtime.as_deref(),
+                            );
+                        }
+                        Err(err) => {
+                            draft.error = Some(format!("Couldn't read runtimes: {err}"));
+                            panel.set_notice(
+                                format!("Couldn't read runtimes — enter dispatches with the route's: {err}"),
+                                cx,
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        draft.error = Some(format!("Couldn't list runtimes: {err}"));
+                        panel.set_notice(
+                            format!("Couldn't list runtimes — enter dispatches with the route's: {err}"),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `enter` on the picker: dispatch with the highlighted runtime.
+    fn confirm_dispatch(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.dispatch.take() else { return };
+        let runtime = draft.runtimes.get(draft.active).map(|r| r.name.clone());
+        self.send_dispatch(&draft.task_id, &draft.identifier, runtime.as_deref(), cx);
+    }
+
+    /// Clicking a runtime chip: dispatch with that runtime, no confirm step.
+    fn confirm_with_runtime(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(draft) = self.dispatch.take() else { return };
+        self.send_dispatch(&draft.task_id, &draft.identifier, Some(name), cx);
+    }
+
+    /// Send `DispatchTask` for a task, with the picked runtime override (if
+    /// any). The chat the run landed in is named in the confirmation notice.
+    fn send_dispatch(
+        &mut self,
+        task_id: &str,
+        identifier: &str,
+        runtime: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine(cx) else {
+            self.set_notice("Engine not connected", cx);
+            return;
+        };
+        let task_id = task_id.to_string();
+        let identifier = identifier.to_string();
+        let runtime = runtime.map(str::to_string);
+        cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "taskId": task_id });
+            if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
+                object.insert("runtime".into(), serde_json::Value::String(runtime));
+            }
+            let result = engine.client().call(methods::DISPATCH_TASK, params).await;
             this.update(cx, |panel, cx| match result {
                 Ok(value) => {
                     let chat = value
@@ -642,6 +776,38 @@ impl BoardPanel {
                 _ => {}
             }
             return;
+        }
+
+        // The runtime picker owns the keys while it is open: arrows move the
+        // highlighted runtime, enter dispatches with it, escape cancels.
+        if self.dispatch.is_some() {
+            match key {
+                "up" | "down" => {
+                    let delta = if key == "up" { -1 } else { 1 };
+                    if let Some(draft) = self.dispatch.as_mut()
+                        && !draft.runtimes.is_empty()
+                    {
+                        draft.active = (draft.active as isize + delta)
+                            .clamp(0, draft.runtimes.len() as isize - 1)
+                            as usize;
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" => {
+                    self.confirm_dispatch(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "escape" => {
+                    self.dispatch = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match key {
@@ -1244,6 +1410,91 @@ impl BoardPanel {
         cx.open_url(url);
     }
 
+    /// The runtime picker: a strip under the header, one chip per runtime the
+    /// engine offers, the highlighted one on the route's runtime. Enter
+    /// dispatches with the highlight; clicking a chip dispatches with that one
+    /// immediately. Before the options load it is a single "Loading…" row.
+    fn render_dispatch_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let draft = self.dispatch.clone().expect("picker renders only when open");
+
+        let label: SharedString = match (&draft.error, draft.runtimes.is_empty()) {
+            (Some(err), _) => format!("{err} — enter dispatches with the route's runtime").into(),
+            (None, true) => "Loading runtimes…".into(),
+            (None, false) => "Dispatch with:".into(),
+        };
+
+        let mut strip = div()
+            .id("board-runtime-picker")
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_LG))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(theme.white_alpha(0.06))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .text_color(if draft.error.is_some() {
+                        theme.warning
+                    } else {
+                        theme.text_faint
+                    })
+                    .child(label),
+            );
+
+        for (ix, runtime) in draft.runtimes.iter().enumerate() {
+            let active = ix == draft.active;
+            let name = runtime.name.clone();
+            let label = runtime.label.clone();
+            let key = format!("board-runtime-{}-{}", draft.task_id, name);
+            strip = strip.child(
+                div()
+                    .id(key)
+                    .flex_none()
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(if active {
+                        theme.accent.opacity(0.16)
+                    } else {
+                        theme.wash(0.05)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.confirm_with_runtime(&name, cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(if active {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(SharedString::from(label)),
+                    ),
+            );
+        }
+
+        strip.child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint.opacity(0.7))
+                    .child(SharedString::from("enter to dispatch · esc cancel")),
+            )
+            .into_any_element()
+    }
+
     /// The footer: a transient dispatch/cancel message owns it until it
     /// expires, then the board's key hints take over.
     fn render_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1254,9 +1505,12 @@ impl BoardPanel {
         let filter_active = self.model.filter.active();
         let on_section = self.model.on_section().is_some();
         let selected_task = self.model.selected_task().map(|r| r.state());
+        let picking = self.dispatch.is_some();
 
         let content: SharedString = if let Some(notice) = notice {
             notice
+        } else if picking {
+            "runtime picker — enter to dispatch · esc cancel".into()
         } else if typing {
             "enter to keep the filter · esc to clear".into()
         } else {
@@ -1402,6 +1656,9 @@ impl Render for BoardPanel {
                         .text_color(theme.warning)
                         .child(message),
                 )
+            })
+            .when(self.dispatch.is_some(), |el| {
+                el.child(self.render_dispatch_picker(cx))
             })
             .child(body)
             .child(self.render_footer(cx))
@@ -1577,5 +1834,45 @@ mod tests {
         let mut f = row("f", BoardState::Failed);
         f.state = BoardState::Failed.as_str().into();
         assert_eq!(metadata(&f, now), "pane exited without completing");
+    }
+
+    fn runtimes() -> Vec<BoardRuntime> {
+        [
+            ("claude-code", "Claude Code"),
+            ("opencode", "OpenCode"),
+            ("codex", "Codex"),
+        ]
+        .into_iter()
+        .map(|(name, label)| BoardRuntime {
+            name: name.into(),
+            label: label.into(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_picker_defaults_to_the_routes_runtime() {
+        let options = runtimes();
+        assert_eq!(
+            default_runtime_index(&options, Some("opencode")),
+            1,
+            "a route's canonical runtime is where the cursor starts"
+        );
+    }
+
+    #[test]
+    fn a_route_alias_lands_on_its_harnesss_canonical_entry() {
+        let options = runtimes();
+        // `claude` is config spelling for the claude-code harness; the picker
+        // offers only canonical names, so the cursor starts at the first
+        // (claude-code) rather than nowhere.
+        assert_eq!(default_runtime_index(&options, Some("claude")), 0);
+        assert_eq!(default_runtime_index(&options, None), 0);
+    }
+
+    #[test]
+    fn an_unknown_route_runtime_falls_back_to_the_first_option() {
+        let options = runtimes();
+        assert_eq!(default_runtime_index(&options, Some("nonesuch")), 0);
     }
 }

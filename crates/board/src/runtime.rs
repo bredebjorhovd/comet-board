@@ -62,6 +62,56 @@ pub const RUNTIME_NAMES: &[&str] = &[
     "mock",
 ];
 
+/// One runtime a dispatch can be pointed at, as a picker renders it.
+///
+/// `name` is exactly what `routing.toml` and the `DispatchTask` override
+/// accept; `label` is the human spelling a picker shows. Served to the
+/// frontends by the engine's `ListBoardRuntimes`, so the board panel and the
+/// CLI offer the same set the engine validates against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOption {
+    pub name: String,
+    pub label: String,
+}
+
+/// The runtimes a dispatch can be told to use, in picker order.
+///
+/// One canonical name per harness — the aliases `RUNTIME_NAMES` also accepts
+/// (`claude`, `openai-codex`) are config spelling, not things to offer: a
+/// route saying `openai-codex` still dispatches to the codex harness, and a
+/// picker offering both would be offering the same thing twice. `mock` is
+/// listed because it is dispatchable on purpose (`demo`, integration tests).
+pub fn runtime_options() -> Vec<RuntimeOption> {
+    use HarnessId::*;
+    [
+        (ClaudeCode, "Claude Code"),
+        (Opencode, "OpenCode"),
+        (Codex, "Codex"),
+        (Cursor, "Cursor"),
+        (Mock, "Mock"),
+    ]
+    .into_iter()
+    .map(|(id, label)| RuntimeOption {
+        name: runtime_name(id).to_string(),
+        label: label.to_string(),
+    })
+    .collect()
+}
+
+/// The canonical runtime name for a harness — the one a picker offers and a
+/// dispatch override sends. The reverse of [`harness_for_runtime`], restricted
+/// to the canonical spelling (no aliases).
+pub fn runtime_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "claude-code",
+        HarnessId::Codex => "codex",
+        HarnessId::Cursor => "cursor",
+        HarnessId::Opencode => "opencode",
+        HarnessId::Mock => "mock",
+    }
+}
+
 /// Derive the board's view of an agent from a comet session row.
 ///
 /// The mapping is deliberately lossy in one direction only: comet has no
@@ -279,5 +329,36 @@ mod tests {
             assert!(harness_for_runtime(name).is_some(), "{name} must resolve");
         }
         assert_eq!(harness_for_runtime("gemini"), None);
+    }
+
+    #[test]
+    fn the_runtime_picker_offers_one_canonical_name_per_harness() {
+        use std::collections::HashSet;
+        // Every picker option is a valid override, and no two options map to
+        // the same harness — offering both `claude-code` and `claude` would be
+        // the same thing twice.
+        let options = runtime_options();
+        let harnesses: HashSet<HarnessId> = options
+            .iter()
+            .map(|o| harness_for_runtime(&o.name).expect("picker options must resolve"))
+            .collect();
+        assert_eq!(harnesses.len(), options.len());
+        for (name, label) in options
+            .iter()
+            .map(|o| (o.name.as_str(), o.label.as_str()))
+        {
+            assert_eq!(runtime_name(harness_for_runtime(name).unwrap()), name);
+            assert!(!label.is_empty(), "{name} needs a picker label");
+        }
+    }
+
+    #[test]
+    fn runtime_name_round_trips_through_harness_for_runtime() {
+        use HarnessId::*;
+        for id in [ClaudeCode, Codex, Cursor, Opencode, Mock] {
+            assert_eq!(harness_for_runtime(runtime_name(id)), Some(id));
+        }
+        // The canonical names are exactly the kebab-case harness ids.
+        assert_eq!(runtime_name(HarnessId::Opencode), "opencode");
     }
 }

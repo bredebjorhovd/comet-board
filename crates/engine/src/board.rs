@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 use comet_board::config::Paths;
 use comet_board::db::NewAttempt;
 use comet_board::dispatch::{
-    SpaceRef, build_spec, check_capacity, dispatcher_for, dispatcher_name, route_for, space_matches,
+    DispatchOverrides, SpaceRef, build_spec, check_capacity, dispatcher_for, dispatcher_name,
+    route_for, space_matches,
 };
 use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
@@ -56,6 +57,7 @@ enum Msg {
     Dispatch {
         task_id: String,
         via: Option<String>,
+        overrides: DispatchOverrides,
         reply: oneshot::Sender<anyhow::Result<Dispatched>>,
     },
     Cancel {
@@ -139,17 +141,20 @@ impl BoardService {
 
     /// Release a task: resolve its route, cut the checkout, create the chat,
     /// queue the brief. `via` is the dispatching chat's id when an agent
-    /// released it — provenance, never authority.
+    /// released it — provenance, never authority. `overrides` are the
+    /// per-dispatch runtime/model choices that replace the route's defaults.
     pub async fn dispatch_task(
         &self,
         task_id: &str,
         via: Option<String>,
+        overrides: DispatchOverrides,
     ) -> anyhow::Result<Dispatched> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Dispatch {
                 task_id: task_id.to_string(),
                 via,
+                overrides,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
@@ -243,9 +248,11 @@ fn run_loop(
             Ok(Msg::Dispatch {
                 task_id,
                 via,
+                overrides,
                 reply,
             }) => {
-                let result = handle_dispatch(&engine, runtime.as_ref(), &spaces, &task_id, via);
+                let result =
+                    handle_dispatch(&engine, runtime.as_ref(), &spaces, &task_id, via, &overrides);
                 match &result {
                     Ok(d) => log.info(format!(
                         "dispatched {task_id} → chat {} at {} (attempt {})",
@@ -303,6 +310,7 @@ fn handle_dispatch(
     spaces: &watch::Receiver<Vec<Space>>,
     task_id: &str,
     via: Option<String>,
+    overrides: &DispatchOverrides,
 ) -> anyhow::Result<Dispatched> {
     let task = engine
         .db
@@ -332,7 +340,9 @@ fn handle_dispatch(
                 route.workspace
             )
         })?;
-    let spec = build_spec(&engine.cfg, route, &task, &space)?;
+    let spec = build_spec(&engine.cfg, route, &task, &space, overrides)?;
+    // What the attempt actually runs under — the override, else the route's.
+    let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
 
     // Provenance: a `via` chat with a live attempt names its task as the
     // parent; one without is still an agent if the chat is alive. The
@@ -348,7 +358,7 @@ fn handle_dispatch(
         task_id: task.id.clone(),
         pane_id: None,
         workspace: route.workspace.clone(),
-        runtime: route.runtime.clone(),
+        runtime: runtime_name.to_string(),
         worktree: None,
         branch: Some(spec.branch.clone()),
         dispatched_by: dispatcher.task().map(str::to_string),
@@ -732,7 +742,7 @@ runtime = "mock"
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let d = service
-            .dispatch_task("gh:owner/widget#7", Some("chat-parent".into()))
+            .dispatch_task("gh:owner/widget#7", Some("chat-parent".into()), DispatchOverrides::default())
             .await
             .unwrap();
         assert_eq!(d.chat_id, "chat-for-gh#7");
@@ -756,7 +766,7 @@ runtime = "mock"
 
         // A second dispatch is refused while the first attempt is live.
         let err = service
-            .dispatch_task("gh:owner/widget#7", None)
+            .dispatch_task("gh:owner/widget#7", None, DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
@@ -765,6 +775,76 @@ runtime = "mock"
         let rows = service.watch_rows().borrow().clone();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id.as_deref(), Some("chat-for-gh#7"));
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_runtime_override_reaches_the_spec_and_the_attempt_row() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget"); // route runtime = mock
+        seed_task(&paths, "gh:owner/widget#50", "gh#50");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#50",
+                None,
+                DispatchOverrides {
+                    runtime: Some("opencode".into()),
+                    model: Some("gpt-5.2".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The runtime got the override, not the route's mock.
+        let specs = runtime.dispatched.lock().unwrap();
+        assert_eq!(specs[0].harness, comet_proto::HarnessId::Opencode);
+        assert_eq!(specs[0].model.as_deref(), Some("gpt-5.2"));
+        drop(specs);
+
+        // …and the attempt row records what the agent actually runs under, so
+        // the board's metadata and future retries name the real runtime.
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#50").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        assert_eq!(attempt.runtime, "opencode");
+        let rows = service.watch_rows().borrow().clone();
+        assert_eq!(rows[0].runtime.as_deref(), Some("opencode"));
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_dispatch_runtime_override_is_refused_and_leaves_no_attempt() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#51", "gh#51");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#51",
+                None,
+                DispatchOverrides {
+                    runtime: Some("nonesuch".into()),
+                    model: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonesuch"), "{err}");
+
+        // Refused before anything was created.
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#51").unwrap().unwrap();
+        assert!(task.live_attempt().is_none());
 
         service.shutdown();
     }
@@ -794,7 +874,7 @@ max_concurrent_per_workspace = 1
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let err = service
-            .dispatch_task("gh:owner/widget#21", None)
+            .dispatch_task("gh:owner/widget#21", None, DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cancel one first"), "{err}");
@@ -823,7 +903,7 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         service
-            .dispatch_task("gh:owner/widget#31", Some("chat-parent-30".into()))
+            .dispatch_task("gh:owner/widget#31", Some("chat-parent-30".into()), DispatchOverrides::default())
             .await
             .unwrap();
 
@@ -854,7 +934,7 @@ max_concurrent_per_workspace = 1
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         service
-            .dispatch_task("gh:owner/widget#40", Some("chat-gone".into()))
+            .dispatch_task("gh:owner/widget#40", Some("chat-gone".into()), DispatchOverrides::default())
             .await
             .unwrap();
 
@@ -877,7 +957,7 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![]);
 
         let err = service
-            .dispatch_task("gh:owner/widget#8", None)
+            .dispatch_task("gh:owner/widget#8", None, DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no comet space"), "{err}");

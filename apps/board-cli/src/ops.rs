@@ -169,13 +169,17 @@ pub async fn dispatch(
     client: &RpcClient,
     task_id: &str,
     via: Option<&str>,
+    runtime: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Dispatched> {
-    let reply = client
-        .call(
-            methods::DISPATCH_TASK,
-            serde_json::json!({ "taskId": task_id, "via": via }),
-        )
-        .await?;
+    let mut params = serde_json::json!({ "taskId": task_id, "via": via });
+    if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
+        object.insert("runtime".into(), serde_json::Value::String(runtime.to_string()));
+    }
+    if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
+        object.insert("model".into(), serde_json::Value::String(model.to_string()));
+    }
+    let reply = client.call(methods::DISPATCH_TASK, params).await?;
     serde_json::from_value(reply).context("parsing DispatchTask reply")
 }
 

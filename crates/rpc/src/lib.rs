@@ -97,9 +97,15 @@ pub mod methods {
     /// change. The `list --json` shape from herdr-board, one row per task.
     pub const WATCH_BOARD: &str = "WatchBoard";
     /// Release a task: cut the worktree, create the chat on the route's space,
-    /// queue the brief. Params: `{taskId, via?}` — `via` is the dispatching
-    /// chat's id when an agent released it (provenance, never authority).
+    /// queue the brief. Params: `{taskId, via?, runtime?, model?}` — `via` is
+    /// the dispatching chat's id when an agent released it (provenance, never
+    /// authority); `runtime`/`model` override the route's configured runtime
+    /// and the harness's default model for this dispatch.
     pub const DISPATCH_TASK: &str = "DispatchTask";
+    /// The runtimes a dispatch can be pointed at, for pickers: one canonical
+    /// name + label per harness, the set the engine validates overrides
+    /// against. Params: `{}` → `[{name, label}]`.
+    pub const LIST_BOARD_RUNTIMES: &str = "ListBoardRuntimes";
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";

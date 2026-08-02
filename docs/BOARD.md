@@ -111,9 +111,15 @@ nearly verbatim — it never depended on herdr:
   `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?}` → `{chatId, cwd, attempt}`, `CancelTask
-{taskId}` — served in `crates/engine/src/rpc.rs` off the board service, which
-executes dispatch/cancel on its loop thread (`board.db` has one writer).
+`DispatchTask {taskId, via?, runtime?, model?}` → `{chatId, cwd, attempt}`,
+`CancelTask {taskId}` — served in `crates/engine/src/rpc.rs` off the board
+service, which executes dispatch/cancel on its loop thread (`board.db` has one
+writer). `ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch
+can be pointed at (the canonical set `build_spec` validates an override
+against) for pickers in the desktop panel and the CLI. `runtime`/`model`
+override the route's configured runtime and the harness's default model for
+that one dispatch; the attempt row records whatever the agent actually ran
+under.
 
 ## What was deliberately NOT ported
 
