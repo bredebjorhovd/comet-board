@@ -891,8 +891,8 @@ impl BoardPanel {
         window.dispatch_action(Box::new(ToggleBoard), cx);
     }
 
-    /// `enter` on the board: dispatch a ready task, fold a section header, or
-    /// open a running task's chat.
+    /// `enter` on the board: dispatch a ready (or failed) task, fold a section
+    /// header, or open a running task's chat.
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.model.on_section() {
             self.model.toggle_collapsed(state);
@@ -904,7 +904,7 @@ impl BoardPanel {
         };
         let (id, state) = (row.id.clone(), row.state());
         match state {
-            BoardState::Ready => self.dispatch(&id, cx),
+            BoardState::Ready | BoardState::Failed => self.dispatch(&id, cx),
             BoardState::Working | BoardState::Blocked => self.open_chat(&id, window, cx),
             _ => {}
         }
@@ -1500,7 +1500,9 @@ impl BoardPanel {
                     if event.click_count == 2 {
                         this.model.selected = Some(open_id.clone());
                         match this.model.task(&open_id).map(|r| r.state()) {
-                            Some(BoardState::Ready) => this.dispatch(&open_id, cx),
+                            Some(BoardState::Ready | BoardState::Failed) => {
+                                this.dispatch(&open_id, cx)
+                            }
                             Some(BoardState::Working | BoardState::Blocked) => {
                                 this.open_chat(&open_id, window, cx)
                             }
@@ -1645,6 +1647,35 @@ impl BoardPanel {
                         cx.stop_propagation();
                         this.open_pr_url(&url, cx);
                     }))
+                    .into_any_element()
+            }
+            // A failed attempt is not the end of the issue: retry starts a new
+            // attempt (the same release flow a `ready` row uses), and cancel
+            // ends the dead attempt so the issue returns to `ready`.
+            BoardState::Failed => {
+                let mut actions = div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0));
+                if row.dispatchable {
+                    actions = actions.child(
+                        chip(format!("board-retry-{id}"), "Retry", theme.text)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dispatch(&dispatch_id, cx);
+                            })),
+                    );
+                }
+                actions
+                    .child(
+                        chip(format!("board-cancel-{id}"), "Cancel", theme.danger)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.cancel(&cancel_id, cx);
+                            })),
+                    )
                     .into_any_element()
             }
             _ => gpui::Empty.into_any_element(),
@@ -1916,6 +1947,7 @@ impl BoardPanel {
             }
             match selected_task {
                 Some(BoardState::Ready) => hints.push("enter to dispatch"),
+                Some(BoardState::Failed) => hints.push("enter to retry"),
                 Some(BoardState::Working | BoardState::Blocked) => hints.push("enter to open chat"),
                 _ => {}
             }

@@ -577,6 +577,19 @@ impl Db {
         Ok(())
     }
 
+    /// Rewrite a closed attempt's outcome — the panel's cancel on a `failed`
+    /// row (gh#42). The attempt is already over, so `ended_at` is left alone;
+    /// only the verdict changes, and flipping `failed`/`orphaned` to `cancelled`
+    /// is what re-derives the issue to `ready`. Guarded to closed rows: a live
+    /// attempt ends through [`Self::close_attempt`], which owns the timestamp.
+    pub fn set_attempt_outcome(&self, attempt_id: i64, outcome: Outcome) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET outcome = ?2 WHERE id = ?1 AND outcome IS NOT NULL",
+            params![attempt_id, outcome.as_str()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_attempt_status(&self, attempt_id: i64, status: AgentStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE attempts SET agent_status = ?2 WHERE id = ?1",
@@ -1207,6 +1220,33 @@ mod tests {
             .map(|a| a.id)
             .collect();
         assert_eq!(ids, watched);
+    }
+
+    #[test]
+    fn a_closed_attempts_outcome_can_be_rewritten_but_not_a_live_ones() {
+        // The panel's cancel on a `failed` row: `set_attempt_outcome` flips the
+        // closed attempt to `cancelled` (gh#42). A live attempt must refuse —
+        // that is `close_attempt`'s job, and it owns the timestamp.
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.set_attempt_pane(a, "w1:p9").unwrap();
+        db.close_attempt(a, Outcome::Orphaned).unwrap();
+
+        db.set_attempt_outcome(a, Outcome::Cancelled).unwrap();
+        let attempts = db.attempts_for("linear:LIN-142").unwrap();
+        assert_eq!(attempts[0].outcome, Some(Outcome::Cancelled));
+        // The rewrite is a verdict change on an already-finished attempt, not a
+        // re-close: `ended_at` is the orphaning's, untouched.
+        assert!(attempts[0].ended_at.is_some());
+
+        let b = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.set_attempt_outcome(b, Outcome::Cancelled).unwrap();
+        assert_eq!(
+            db.attempts_for("linear:LIN-142").unwrap()[1].outcome,
+            None,
+            "a live attempt is not rewritten"
+        );
     }
 
     #[test]

@@ -419,7 +419,9 @@ fn handle_dispatch(
 }
 
 /// One cancel, on the loop thread. The chat may already be gone; that is not a
-/// reason to keep the attempt open.
+/// reason to keep the attempt open. A row whose last attempt already closed
+/// `failed`/`orphaned` can be cancelled too: that is the panel's reset — the
+/// verdict flips to `cancelled` and the issue derives back to `ready` (gh#42).
 fn handle_cancel(
     engine: &SyncEngine,
     runtime: &(dyn Runtime + Send + Sync),
@@ -430,19 +432,35 @@ fn handle_cancel(
         .db
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
-    let Some(attempt) = task.live_attempt() else {
-        anyhow::bail!("{} has no live attempt", task.identifier);
-    };
-    if let Some(chat_id) = attempt.pane_id.as_deref()
-        && let Err(e) = runtime.cancel(chat_id)
-    {
-        log.warn(format!("cancelling chat {chat_id}: {e:#}"));
+    if let Some(attempt) = task.live_attempt() {
+        if let Some(chat_id) = attempt.pane_id.as_deref()
+            && let Err(e) = runtime.cancel(chat_id)
+        {
+            log.warn(format!("cancelling chat {chat_id}: {e:#}"));
+        }
+        engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
+        engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
+        engine.rederive_all()?;
+        log.info(format!("cancelled {}", task.identifier));
+        return Ok(());
     }
-    engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
-    engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
-    engine.rederive_all()?;
-    log.info(format!("cancelled {}", task.identifier));
-    Ok(())
+    // No live attempt. A closed `failed`/`orphaned` attempt is the one case the
+    // panel still offers cancel on: nothing to interrupt, just the outcome to
+    // change. The same state matrix that derived `failed` from the outcome is
+    // what `cancelled` un-derives to `ready`, so the operator can re-dispatch.
+    if let Some(attempt) = task.last_closed_attempt()
+        && matches!(attempt.outcome, Some(Outcome::Failed | Outcome::Orphaned))
+    {
+        engine.db.set_attempt_outcome(attempt.id, Outcome::Cancelled)?;
+        engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
+        engine.rederive_all()?;
+        log.info(format!(
+            "cancelled failed attempt on {} — back to ready",
+            task.identifier
+        ));
+        return Ok(());
+    }
+    anyhow::bail!("{} has no live attempt", task.identifier);
 }
 
 fn head_sha(checkout: &str) -> Option<String> {
@@ -1073,6 +1091,89 @@ max_concurrent_per_workspace = 1
         // Cancelling again is an error a caller can read, not a crash.
         let err = service.cancel_task("gh:owner/widget#9").await.unwrap_err();
         assert!(err.to_string().contains("no live attempt"), "{err}");
+
+        service.shutdown();
+    }
+
+    /// The panel's cancel on a `failed` row has no live chat to interrupt — it
+    /// flips the closed attempt's verdict so the issue re-derives to `ready`
+    /// (gh#42), ready to be dispatched again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canceling_a_failed_attempt_returns_the_issue_to_ready() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#61", "gh#61");
+        seed_attempt(&paths, "gh:owner/widget#61", "chat-61");
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt_id = db
+            .get_task("gh:owner/widget#61")
+            .unwrap()
+            .unwrap()
+            .live_attempt()
+            .unwrap()
+            .id;
+        db.close_attempt(attempt_id, Outcome::Orphaned).unwrap();
+        drop(db);
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![]);
+        assert_eq!(
+            wait_for_state(&paths, "gh:owner/widget#61", BoardState::Failed),
+            BoardState::Failed
+        );
+
+        service.cancel_task("gh:owner/widget#61").await.unwrap();
+        // Nothing live to interrupt — the dead attempt is just re-verdict'd.
+        assert!(runtime.cancelled.lock().unwrap().is_empty());
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#61").unwrap().unwrap();
+        assert!(task.live_attempt().is_none());
+        assert_eq!(
+            task.attempts.last().and_then(|a| a.outcome),
+            Some(Outcome::Cancelled)
+        );
+        assert_eq!(task.state, BoardState::Ready);
+
+        service.shutdown();
+    }
+
+    /// Retry on a failed row is the same release flow as a `ready` one: the
+    /// closed attempt is gone, so the unique index lets a fresh attempt in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_after_a_failed_attempt_starts_a_new_one() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#62", "gh#62");
+        seed_attempt_in(&paths, "gh:owner/widget#62", "chat-62", "widget");
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt_id = db
+            .get_task("gh:owner/widget#62")
+            .unwrap()
+            .unwrap()
+            .live_attempt()
+            .unwrap()
+            .id;
+        db.close_attempt(attempt_id, Outcome::Failed).unwrap();
+        drop(db);
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        let dispatched = service
+            .dispatch_task("gh:owner/widget#62", None, DispatchOverrides::default())
+            .await
+            .unwrap();
+        assert_eq!(dispatched.attempt, 2);
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#62").unwrap().unwrap();
+        assert_eq!(task.attempt_count(), 2);
+        assert!(task.live_attempt().is_some());
+        assert_eq!(
+            task.attempts[0].outcome,
+            Some(Outcome::Failed),
+            "the failed attempt stays on the record"
+        );
 
         service.shutdown();
     }
