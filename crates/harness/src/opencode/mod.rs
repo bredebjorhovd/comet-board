@@ -389,6 +389,10 @@ fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// The turn went idle (or its feed ended) without the assistant message ever
+/// settling — the server claimed a completion it never delivered (gh#37).
+const STALLED_TURN: &str = "opencode went idle without completing the assistant message";
+
 /// Rotate the assistant message id; returns (previous, next).
 fn rotate(id: &mut String) -> (String, String) {
     let prev = std::mem::replace(id, new_message_id());
@@ -627,6 +631,12 @@ async fn run_session(session: Session) {
     let mut done_after_interrupt = false;
     // A non-aborted `session.error` failed the current turn.
     let mut turn_error: Option<String> = None;
+    // The in-flight assistant message (the last one `message.updated` named)
+    // and whether it reached completion (`time.completed`) — the signal that a
+    // turn actually settled. An `Idle` that lands before the current message
+    // completed is a mid-stream stall (gh#37), not a completion.
+    let mut current_msg: Option<String> = None;
+    let mut current_msg_completed = false;
     let mut steering_open = true;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -666,13 +676,22 @@ async fn run_session(session: Session) {
                 }
 
                 Some(Event::MessageUpdated { info }) => {
-                    if normalize::assistant_message_completed(&info) {
-                        let id = normalize::assistant_message_id(&info);
-                        if !completed_msgs.contains(&id) {
-                            completed_msgs.insert(id.clone());
-                            if !send(&event_tx, AgentEvent::AssistantMessageCompleted { assistant_message_id: id }).await {
-                                break 'main;
-                            }
+                    let id = normalize::assistant_message_id(&info);
+                    let completed = normalize::assistant_message_completed(&info);
+                    // Track the in-flight assistant message: a new id starts a
+                    // fresh (not yet settled) message; a completion settles it.
+                    // The completion must precede the turn's idle for the turn
+                    // to count as Completed (gh#37).
+                    if current_msg.as_deref() != Some(id.as_str()) {
+                        current_msg = Some(id.clone());
+                        current_msg_completed = completed;
+                    } else if completed {
+                        current_msg_completed = true;
+                    }
+                    if completed && !completed_msgs.contains(&id) {
+                        completed_msgs.insert(id.clone());
+                        if !send(&event_tx, AgentEvent::AssistantMessageCompleted { assistant_message_id: id }).await {
+                            break 'main;
                         }
                     }
                 }
@@ -683,6 +702,7 @@ async fn run_session(session: Session) {
                 }
 
                 Some(Event::Idle) => {
+                    let turn_was_active = turn_active;
                     turn_active = false;
                     if interrupted {
                         if !done_after_interrupt {
@@ -702,7 +722,14 @@ async fn run_session(session: Session) {
                     }
                     if !done_for_turn {
                         done_for_turn = true;
-                        let status = if turn_error.is_some() {
+                        let error = turn_error.take();
+                        // A turn that was in flight but whose assistant message
+                        // never reached completion (`message.updated` with
+                        // `time.completed`) before the idle is a stall, not a
+                        // finished turn — report it Errored rather than a
+                        // spurious Completed (gh#37).
+                        let stalled = turn_was_active && error.is_none() && !current_msg_completed;
+                        let status = if error.is_some() || stalled {
                             DoneStatus::Errored
                         } else {
                             DoneStatus::Completed
@@ -712,7 +739,7 @@ async fn run_session(session: Session) {
                             AgentEvent::Done {
                                 status,
                                 result: None,
-                                error: turn_error.take(),
+                                error: error.or_else(|| stalled.then(|| STALLED_TURN.into())),
                                 session_id: Some(session_id.clone()),
                             },
                         )
@@ -859,11 +886,22 @@ async fn run_session(session: Session) {
             let exit = child.try_wait();
             match (&turn_error, exit) {
                 (None, Ok(None)) => {
+                    // A server still running (try_wait → Ok(None)) merely
+                    // closed its SSE feed (idle-parked / one-shot
+                    // subscription). If the in-flight turn's assistant message
+                    // settled, it's a clean Completed; a turn still streaming
+                    // when the feed died never settled — a stall, Errored
+                    // (gh#37).
+                    let error = (!current_msg_completed).then(|| STALLED_TURN.into());
                     let _ = event_tx
                         .send(Ok(AgentEvent::Done {
-                            status: DoneStatus::Completed,
+                            status: if error.is_some() {
+                                DoneStatus::Errored
+                            } else {
+                                DoneStatus::Completed
+                            },
                             result: None,
-                            error: None,
+                            error,
                             session_id: Some(session_id.clone()),
                         }))
                         .await;

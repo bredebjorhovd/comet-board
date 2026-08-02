@@ -29,14 +29,18 @@ const SESSION_ID: &str = "ses_fake";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Scenario {
-    /// Emit a busy→delta turn, close the SSE feed, and keep the process alive
-    /// — a clean stream end on a live server.
+    /// Emit a busy→delta turn (assistant message settles), close the SSE feed,
+    /// and keep the process alive — a clean stream end on a live server.
     StreamEnd,
     /// Emit a busy→delta turn, then exit(1) mid-run — the server dies.
     Crash,
-    /// Emit a full busy→delta→idle turn and stay parked (persistent session);
-    /// the harness reaps the process when the run ends.
+    /// Emit a full busy→delta→completed-message→idle turn and stay parked
+    /// (persistent session); the harness reaps the process when the run ends.
     Happy,
+    /// Emit a busy→delta→idle turn WITHOUT the assistant message ever settling
+    /// (`message.updated` with `time.completed`) — a mid-stream stall that must
+    /// surface as Errored, never a spurious Completed (gh#37).
+    IdleMidTurn,
 }
 
 #[tokio::main]
@@ -93,6 +97,8 @@ async fn handle(
                 Scenario::StreamEnd
             } else if body.contains("scenario:crash") {
                 Scenario::Crash
+            } else if body.contains("scenario:idle-mid-turn") {
+                Scenario::IdleMidTurn
             } else {
                 Scenario::Happy
             };
@@ -144,12 +150,25 @@ async fn serve_events(
     )
     .await;
     match sc {
+        // A settled turn's assistant message completes before the turn ends; a
+        // mid-turn stall (IdleMidTurn) never does.
+        Scenario::StreamEnd | Scenario::Happy => {
+            sse(
+                &mut stream,
+                "message.updated",
+                "{\"info\":{\"id\":\"msg_fake1\",\"role\":\"assistant\",\"time\":{\"created\":1,\"completed\":2}},\"sessionID\":\"ses_fake\"}",
+            )
+            .await;
+        }
+        Scenario::Crash | Scenario::IdleMidTurn => {}
+    }
+    match sc {
         Scenario::StreamEnd => {}
         Scenario::Crash => {
             let _ = stream.flush().await;
             std::process::exit(1);
         }
-        Scenario::Happy => {
+        Scenario::Happy | Scenario::IdleMidTurn => {
             sse(&mut stream, "session.idle", "{\"sessionID\":\"ses_fake\"}").await;
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
