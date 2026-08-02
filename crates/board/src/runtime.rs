@@ -43,6 +43,7 @@ pub fn harness_for_runtime(runtime: &str) -> Option<HarnessId> {
         "claude-code" | "claude" => Some(HarnessId::ClaudeCode),
         "openai-codex" | "codex" => Some(HarnessId::Codex),
         "cursor" => Some(HarnessId::Cursor),
+        "opencode" => Some(HarnessId::Opencode),
         // The mock harness is dispatchable on purpose: `demo` and the
         // integration tests release real tasks through the real pipeline.
         "mock" => Some(HarnessId::Mock),
@@ -57,6 +58,7 @@ pub const RUNTIME_NAMES: &[&str] = &[
     "openai-codex",
     "codex",
     "cursor",
+    "opencode",
     "mock",
 ];
 

@@ -112,10 +112,20 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, comet settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
+    // opencode signs its own providers in (`opencode auth login`); comet has no
+    // add/swap flow for it, so the card renders the detected login without an
+    // "Add account" action.
+    (HarnessId::Opencode, "OpenCode", "opencode auth login"),
 ];
+
+/// Whether comet drives the provider's login flow (claude/codex do; opencode
+/// manages its own provider auth).
+fn supports_login(harness: HarnessId) -> bool {
+    matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex)
+}
 
 /// Accounts of one provider, active first (stable otherwise). Pure.
 pub fn provider_accounts(
@@ -164,6 +174,7 @@ impl LoginFlow {
         };
         match harness {
             HarnessId::Codex => "Add Codex account",
+            HarnessId::Opencode => "OpenCode sign-in",
             _ => "Add Claude account",
         }
     }
@@ -1196,6 +1207,7 @@ impl Render for AccountsPage {
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
+            HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             _ => (crate::icons::CLAUDE_MARK, Some(crate::icons::claude_brand())),
         };
         // Brand mark inside a 24px centered box (comet: `grid size-6
@@ -1223,6 +1235,7 @@ impl Render for AccountsPage {
                 .map(|(harness, name, _cli)| {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
+                        HarnessId::Opencode => "accounts-skeleton-opencode",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -1305,9 +1318,10 @@ impl Render for AccountsPage {
                                 self.render_account_row(account, ix, ix == 0, &theme, now, cx)
                             })
                             .collect();
+                        let has_rows = !rows.is_empty();
                         let add_id: SharedString = format!("add-account-{name}").into();
                         let card = widgets::section_card(&theme).mt(px(8.0));
-                        let card = if rows.is_empty() {
+                        let card = if !has_rows {
                             card.child(
                                 div()
                                     .px(px(20.0))
@@ -1315,13 +1329,45 @@ impl Render for AccountsPage {
                                     .text_center()
                                     .text_size(px(14.0))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(format!(
-                                        "No {name} login detected on this device — sign in \
-                                         with \u{201C}{cli}\u{201D} or add an account."
-                                    ))),
+                                    .child(SharedString::from(if supports_login(harness) {
+                                        format!(
+                                            "No {name} login detected on this device — sign in \
+                                             with \u{201C}{cli}\u{201D} or add an account."
+                                        )
+                                    } else {
+                                        format!(
+                                            "No {name} login detected on this device — sign in \
+                                             with \u{201C}{cli}\u{201D}."
+                                        )
+                                    })),
                             )
                         } else {
                             card.children(rows)
+                        };
+                        let add_action = if supports_login(harness) {
+                            widgets::ghost_action(&theme)
+                                .id(add_id)
+                                .hover(widgets::ghost_hover)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_login(harness, cx);
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::ADD_CIRCLE)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Add account"))
+                                .into_any_element()
+                        } else if has_rows {
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme.text_muted.opacity(0.6))
+                                .child(SharedString::from("Signed in via opencode"))
+                                .into_any_element()
+                        } else {
+                            // No opencode auth: the empty-state card below
+                            // carries the sign-in hint; nothing in the header.
+                            div().into_any_element()
                         };
                         div()
                             .mt(px(24.0))
@@ -1342,20 +1388,7 @@ impl Render for AccountsPage {
                                             .child(SharedString::from(name)),
                                     )
                                     .child(div().flex_1())
-                                    .child(
-                                        widgets::ghost_action(&theme)
-                                            .id(add_id)
-                                            .hover(widgets::ghost_hover)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.start_login(harness, cx);
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from("Add account")),
-                                    ),
+                                    .child(add_action),
                             )
                             .children(
                                 warnings
@@ -1407,9 +1440,9 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code and Codex logins on this device. Comet detects the \
-                         live session, keeps each account backed up, and can swap between \
-                         them.",
+                        "The Claude Code, Codex and OpenCode logins on this device. Comet \
+                         detects the live sessions, keeps each account backed up, and can swap \
+                         between them.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
