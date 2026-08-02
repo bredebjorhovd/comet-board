@@ -204,6 +204,47 @@ async fn happy_path_parks_then_reaps_when_steering_closes() {
     assert_serve_reaped(&dir).await;
 }
 
+/// Regression for gh#37: the session goes `Idle` mid-stream — text deltas were
+/// streamed but the assistant message never reached `assistantMessageCompleted`
+/// (no `message.updated` with `time.completed`) and no `session.error` fired.
+/// The terminal event must be Errored — a stalled/aborted turn — never a
+/// spurious Completed.
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_mid_turn_without_message_completion_reports_errored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, steer, _token) = fake_controls();
+    drop(steer); // close the mailbox so the run settles after its turn
+    let events = run_to_end(
+        &harness(),
+        fake_request("scenario:idle-mid-turn", &dir),
+        controls,
+    )
+    .await;
+
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "hello".into()
+        }),
+        "turn streamed before the stall: {events:?}"
+    );
+    match events.last() {
+        Some(AgentEvent::Done {
+            status,
+            error: Some(error),
+            ..
+        }) => {
+            assert_eq!(*status, DoneStatus::Errored, "{events:?}");
+            assert!(
+                error.contains("assistant message"),
+                "stall message should name the unsettled message: {error}"
+            );
+        }
+        other => panic!("expected Errored Done for the mid-stream stall, got {other:?}"),
+    }
+    assert_serve_reaped(&dir).await;
+}
+
 // ---------------------------------------------------------------------------
 // Real-CLI smoke tests (skipped when the binary isn't on this device).
 // ---------------------------------------------------------------------------
