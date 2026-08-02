@@ -14,7 +14,7 @@
 use gpui::{Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px};
 
 use crate::motion::{self, AnimationExt as _, COMET_PULSE};
-use crate::theme::{Theme, grey, white_alpha};
+use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
 // Loadable — async slot state shared by pickers/settings pages
@@ -137,27 +137,20 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 
 /// The floating-menu surface (comet `.glass-surface` + `menuSurface`):
 /// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
-/// gpui has no backdrop blur at the pinned rev, so the glass
-/// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
-/// the near-opaque tone it composites to on the dark panels (~#161616), plus
-/// the same hairline + baked-in shadow.
+/// gpui has no backdrop blur at the pinned rev, so the glass is approximated
+/// with the tone it composites to over the frosted backdrop
+/// ([`Theme::float_card`]) plus the same hairline + baked-in shadow.
 pub fn popover_card(theme: &Theme) -> gpui::Div {
-    let card = div()
+    div()
         .border_1()
-        .border_color(white_alpha(0.10))
+        .border_color(theme.white_alpha(0.10))
         .rounded(px(12.0))
         .shadow_lg()
         .p(px(4.0))
         .overflow_hidden()
         .text_size(px(13.0))
-        .text_color(theme.text);
-    if Theme::GLASS_ALPHA < 1.0 {
-        // Translucent tint — the backdrop blur beneath it comes from the
-        // [`crate::frost::frosted`] wrapper at the mount helpers below.
-        card.bg(grey(0x16).opacity(0.65))
-    } else {
-        card.bg(grey(0x16))
-    }
+        .text_color(theme.text)
+        .bg(theme.float_card())
 }
 
 /// [`popover_card`] without the `p-1` inset — for popovers that manage their
@@ -307,19 +300,15 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .text_size(px(13.0))
         .cursor_pointer();
     if active {
-        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
+        row.bg(theme.wash(0.14)).text_color(theme.text)
     } else {
         let fade_key = fade_key.into();
         let mut row = row
-            .text_color(motion::hover_blend(
-                &fade_key,
-                theme.text.opacity(0.9),
-                Theme::dark().text,
-            ))
+            .text_color(motion::hover_blend(&fade_key, theme.text.opacity(0.9), theme.text))
             .bg(motion::hover_blend(
                 &fade_key,
-                crate::theme::wash(0.0),
-                crate::theme::wash(0.14),
+                theme.wash(0.0),
+                theme.wash(0.14),
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
@@ -340,7 +329,7 @@ pub fn menu_row_nav(
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
-        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
+        row.bg(theme.wash(0.14)).text_color(theme.text)
     } else {
         row
     }
@@ -378,10 +367,14 @@ pub fn tracked_upper(label: &str) -> String {
 
 /// Hairline divider between menu sections (comet `MenuSeparator`:
 /// `mx-1 my-1 h-px bg-white/[0.07]`).
-pub fn menu_separator() -> gpui::Div {
+pub fn menu_separator(theme: &Theme) -> gpui::Div {
     // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
     // runs border to border (user request).
-    div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(white_alpha(0.07))
+    div()
+        .h(px(1.0))
+        .mx(px(-4.0))
+        .my(px(4.0))
+        .bg(theme.white_alpha(0.07))
 }
 
 /// The trailing check on the selected row (comet `MenuCheck`): 14px,
@@ -395,14 +388,19 @@ pub fn menu_check(theme: &Theme) -> impl IntoElement {
 /// The recessed band tone for a palette/picker header or footer strip — a
 /// translucent black so the glass still reads through (the add-space palette
 /// converged on this; measured subtler tones vanish against the dim scrim).
-pub fn band() -> gpui::Hsla {
-    gpui::hsla(0.0, 0.0, 0.0, 0.16)
+/// Inverts to a translucent white over light glass.
+pub fn band(theme: &Theme) -> gpui::Hsla {
+    if theme.light {
+        theme.white_alpha(0.10)
+    } else {
+        gpui::hsla(0.0, 0.0, 0.0, 0.16)
+    }
 }
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
 /// children — the base of [`key_hint`]/[`key_hint_pair`] and the search-bar
 /// chips ("⌘K", "esc").
-pub fn key_cap(_theme: &Theme) -> gpui::Div {
+pub fn key_cap(theme: &Theme) -> gpui::Div {
     div()
         .h(px(22.0))
         .px(px(5.0))
@@ -412,7 +410,7 @@ pub fn key_cap(_theme: &Theme) -> gpui::Div {
         .items_center()
         .justify_center()
         .gap(px(4.0))
-        .bg(white_alpha(0.05))
+        .bg(theme.white_alpha(0.05))
 }
 
 /// The tiny verb after a key-cap.
@@ -461,7 +459,7 @@ pub fn key_hint_pair(
                         .size(px(12.5))
                         .text_color(theme.text_muted.opacity(0.7)),
                 )
-                .child(div().w(px(1.0)).h(px(11.0)).bg(white_alpha(0.10)))
+                .child(div().w(px(1.0)).h(px(11.0)).bg(theme.white_alpha(0.10)))
                 .child(
                     crate::icons::icon(second)
                         .size(px(12.5))
@@ -478,9 +476,9 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .px(px(5.0))
         .py(px(1.0))
         .rounded(px(5.0))
-        .bg(white_alpha(0.05))
+        .bg(theme.white_alpha(0.05))
         .text_size(px(10.0))
-        .font_family(Theme::dark().font_mono.clone())
+        .font_family(theme.font_mono.clone())
         .text_color(theme.text_muted.opacity(0.6))
         .child(SharedString::from(label.to_string()))
 }
@@ -489,13 +487,13 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
 /// `searchInput`: `w-full rounded-lg bg-white/[0.04] px-2.5 py-1.5
 /// text-[13px]` + `mb-1`, borderless — full width inside the card's own
 /// p-1, only a 4px bottom margin).
-pub fn search_input_frame(_theme: &Theme, input: AnyElement) -> gpui::Div {
+pub fn search_input_frame(theme: &Theme, input: AnyElement) -> gpui::Div {
     div()
         .mb(px(4.0))
         .px(px(10.0))
         .py(px(6.0))
         .rounded(px(8.0))
-        .bg(white_alpha(0.04))
+        .bg(theme.white_alpha(0.04))
         .text_size(px(13.0))
         .child(input)
 }
@@ -504,12 +502,12 @@ pub fn search_input_frame(_theme: &Theme, input: AnyElement) -> gpui::Div {
 /// branch-picker worktree block: `mt-1 flex flex-col gap-0.5 border-t
 /// border-white/[0.06] pt-1` — the hairline runs edge-to-edge of the card's
 /// p-1 inset, unlike [`menu_separator`]'s mx-1).
-pub fn menu_section() -> gpui::Div {
+pub fn menu_section(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(4.0))
         .pt(px(4.0))
         .border_t_1()
-        .border_color(white_alpha(0.06))
+        .border_color(theme.white_alpha(0.06))
         .flex()
         .flex_col()
         .gap(px(2.0))
@@ -526,9 +524,9 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
         .w(px(360.0))
         .p(px(20.0))
         .rounded(px(16.0))
-        .bg(grey(0x10))
+        .bg(theme.float_card())
         .border_1()
-        .border_color(white_alpha(0.10))
+        .border_color(theme.white_alpha(0.10))
         .shadow_lg()
         .flex()
         .flex_col()
@@ -555,15 +553,15 @@ pub fn dialog_body(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
 
 /// Dialog text-field frame: `rounded-lg border border-white/[0.08]
 /// bg-white/[0.04] px-3 py-2 text-[14px]`.
-pub fn dialog_field(input: AnyElement) -> gpui::Div {
+pub fn dialog_field(theme: &Theme, input: AnyElement) -> gpui::Div {
     div()
         .w_full()
         .px(px(12.0))
         .py(px(8.0))
         .rounded(px(8.0))
         .border_1()
-        .border_color(white_alpha(0.08))
-        .bg(white_alpha(0.04))
+        .border_color(theme.white_alpha(0.08))
+        .bg(theme.white_alpha(0.04))
         .text_size(px(14.0))
         .child(input)
 }
@@ -578,15 +576,11 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         .py(px(6.0))
         .rounded(px(8.0))
         .text_size(px(13.0))
-        .text_color(motion::hover_blend(
-            &fade_key,
-            theme.text_muted,
-            Theme::dark().text,
-        ))
+        .text_color(motion::hover_blend(&fade_key, theme.text_muted, theme.text))
         .bg(motion::hover_blend(
             &fade_key,
-            crate::theme::wash(0.0),
-            white_alpha(0.06),
+            theme.wash(0.0),
+            theme.white_alpha(0.06),
         ))
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
@@ -603,7 +597,7 @@ pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
         .bg(theme.text)
         .text_size(px(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(grey(0x0e))
+        .text_color(theme.bg)
         .cursor_pointer()
         .hover(|s| s.opacity(0.9))
         .child(SharedString::from(label.to_string()))
@@ -626,8 +620,8 @@ pub fn btn_danger(_theme: &Theme, label: &str) -> gpui::Div {
 
 /// Pulsing skeleton rows shown while a list loads (comet:
 /// `h-7 animate-pulse rounded-md bg-white/[0.04]`).
-pub fn skeleton_rows(id: &'static str, _theme: &Theme, count: usize) -> AnyElement {
-    let wash = white_alpha(0.04);
+pub fn skeleton_rows(id: &'static str, theme: &Theme, count: usize) -> AnyElement {
+    let wash = theme.white_alpha(0.04);
     div()
         .flex()
         .flex_col()

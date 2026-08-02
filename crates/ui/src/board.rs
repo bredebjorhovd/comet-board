@@ -749,7 +749,7 @@ impl BoardPanel {
                     .flex()
                     .items_center()
                     .rounded_full()
-                    .bg(crate::theme::wash(0.08))
+                    .bg(theme.wash(0.08))
                     .text_size(px(10.0))
                     .text_color(theme.text_faint)
                     .child(SharedString::from(shown.to_string())),
@@ -764,7 +764,7 @@ impl BoardPanel {
             .gap(px(6.0))
             .px(px(Theme::SPACE_LG))
             .border_b_1()
-            .border_color(crate::theme::white_alpha(0.06))
+            .border_color(theme.white_alpha(0.06))
             .child(title)
             .child(div().flex_1());
 
@@ -780,7 +780,7 @@ impl BoardPanel {
                     .rounded(px(6.0))
                     .border_1()
                     .border_color(theme.border_strong)
-                    .bg(crate::theme::wash(0.05))
+                    .bg(theme.wash(0.05))
                     .flex()
                     .items_center()
                     .child(find_input),
@@ -795,7 +795,7 @@ impl BoardPanel {
                     .justify_center()
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::wash(0.1)))
+                    .hover(|s| s.bg(theme.wash(0.1)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         // Close the field, keeping the query — the X is the
                         // mouse's "enter" (esc still clears).
@@ -822,8 +822,8 @@ impl BoardPanel {
                 .cursor_pointer()
                 .bg(motion::hover_blend(
                     "board-filter",
-                    crate::theme::wash(if filter_active { 0.09 } else { 0.0 }),
-                    crate::theme::wash(0.14),
+                    theme.wash(if filter_active { 0.09 } else { 0.0 }),
+                    theme.wash(0.14),
                 ))
                 .on_hover(motion::hover_listener("board-filter"))
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -864,7 +864,7 @@ impl BoardPanel {
                         .justify_center()
                         .rounded(px(6.0))
                         .cursor_pointer()
-                        .hover(|s| s.bg(crate::theme::wash(0.1)))
+                        .hover(|s| s.bg(theme.wash(0.1)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.model.clear_filter();
@@ -888,7 +888,7 @@ impl BoardPanel {
                     .justify_center()
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::wash(0.1)))
+                    .hover(|s| s.bg(theme.wash(0.1)))
                     .on_click(cx.listener(|this, _, _, cx| this.open_find_field(cx)))
                     .child(
                         icon(icons::MAGNIFER)
@@ -907,7 +907,7 @@ impl BoardPanel {
                     .justify_center()
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::wash(0.1)))
+                    .hover(|s| s.bg(theme.wash(0.1)))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(ToggleBoard), cx);
                     })
@@ -976,11 +976,11 @@ impl BoardPanel {
             // never darkens toward a weaker wash.
             .bg(motion::hover_blend(
                 &fade_key,
-                selected_bg(selected),
+                selected_bg(&theme, selected),
                 if selected {
-                    crate::theme::wash(0.18)
+                    theme.wash(0.18)
                 } else {
-                    crate::theme::wash(0.06)
+                    theme.wash(0.06)
                 },
             ))
             .on_hover(motion::hover_listener(&fade_key))
@@ -1015,7 +1015,7 @@ impl BoardPanel {
                         .flex()
                         .items_center()
                         .rounded_full()
-                        .bg(crate::theme::wash(0.08))
+                        .bg(theme.wash(0.08))
                         .text_size(px(10.0))
                         .text_color(theme.text_faint)
                         .child(SharedString::from(format!("{len} hidden"))),
@@ -1071,11 +1071,11 @@ impl BoardPanel {
             .cursor_pointer()
             .bg(motion::hover_blend(
                 &fade_key,
-                selected_bg(selected),
+                selected_bg(&theme, selected),
                 if selected {
-                    crate::theme::wash(0.18)
+                    theme.wash(0.18)
                 } else {
-                    crate::theme::wash(0.05)
+                    theme.wash(0.05)
                 },
             ))
             .on_hover(motion::hover_listener(&fade_key))
@@ -1187,12 +1187,12 @@ impl BoardPanel {
                 .h(px(20.0))
                 .px(px(8.0))
                 .rounded(px(5.0))
-                .bg(crate::theme::wash(0.12))
+                .bg(theme.wash(0.12))
                 .flex()
                 .items_center()
                 .text_size(px(10.5))
                 .text_color(color)
-                .hover(|s| s.bg(crate::theme::wash(0.18)))
+                .hover(|s| s.bg(theme.wash(0.18)))
                 .child(SharedString::from(label))
         };
         match state {
@@ -1284,7 +1284,7 @@ impl BoardPanel {
             .items_center()
             .px(px(Theme::SPACE_LG))
             .border_t_1()
-            .border_color(crate::theme::white_alpha(0.06))
+            .border_color(theme.white_alpha(0.06))
             .text_size(px(10.5))
             .text_color(if has_notice {
                 theme.warning
@@ -1296,11 +1296,11 @@ impl BoardPanel {
     }
 }
 
-fn selected_bg(selected: bool) -> gpui::Hsla {
+fn selected_bg(theme: &Theme, selected: bool) -> gpui::Hsla {
     if selected {
-        crate::theme::glass_selected_bg()
+        theme.glass_selected_bg()
     } else {
-        crate::theme::wash(0.0)
+        theme.wash(0.0)
     }
 }
 

@@ -804,7 +804,7 @@ impl Changes {
             .flex()
             .flex_col()
             .border_b_1()
-            .border_color(crate::theme::white_alpha(0.04))
+            .border_color(theme.white_alpha(0.04))
             .child(header)
             .child(body)
             .into_any_element()
@@ -860,9 +860,9 @@ impl Changes {
             .items_center()
             .gap(px(8.0))
             .px(px(Theme::SPACE_MD))
-            .bg(crate::theme::white_alpha(0.025))
+            .bg(theme.white_alpha(0.025))
             .cursor_pointer()
-            .hover(|s| s.bg(crate::theme::white_alpha(0.05)))
+            .hover(|s| s.bg(theme.white_alpha(0.05)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_fold(&path, expanded_height);
                 cx.notify();
@@ -875,7 +875,7 @@ impl Changes {
                     .truncate()
                     .font_family(theme.font_mono.clone())
                     .text_size(px(12.0))
-                    .text_color(crate::theme::grey(0x98))
+                    .text_color(theme.text_faint)
                     .child(SharedString::from(file.path.clone())),
             )
             .when(file.binary, |el| {
@@ -922,7 +922,7 @@ impl Changes {
                 .gap(px(10.0))
                 .px(px(Theme::SPACE_LG))
                 .border_b_1()
-                .border_color(crate::theme::white_alpha(0.06))
+                .border_color(theme.white_alpha(0.06))
                 .child(
                     div()
                         .text_size(px(12.0))

@@ -149,7 +149,7 @@ impl DevicesPage {
             .child(
                 div()
                     .mt(px(12.0))
-                    .child(popover::dialog_field(input.into_any_element())),
+                    .child(popover::dialog_field(&theme, input.into_any_element())),
             )
             .child(
                 div()
@@ -252,7 +252,7 @@ impl Render for DevicesPage {
                                 inset: false,
                             }])
                         })
-                        .when(!online, |el| el.bg(crate::theme::white_alpha(0.22))),
+                        .when(!online, |el| el.bg(theme.white_alpha(0.22))),
                 );
                 // One quiet meta line: platform · version · (offline: last
                 // seen) · id chip.
@@ -302,7 +302,7 @@ impl Render for DevicesPage {
                             theme.text_muted.opacity(0.5)
                         })
                         .cursor_pointer()
-                        .hover(|s| s.text_color(Theme::dark().text_muted))
+                        .hover(|s| s.text_color(theme.text_muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.copy_id(copy_id.clone(), cx);
                         }))
@@ -337,8 +337,8 @@ impl Render for DevicesPage {
                             .opacity(0.7)
                             .hover(|s| {
                                 s.opacity(1.0)
-                                    .bg(crate::theme::white_alpha(0.06))
-                                    .text_color(Theme::dark().text)
+                                    .bg(theme.white_alpha(0.06))
+                                    .text_color(theme.text)
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_rename(rename_id.clone(), rename_name.clone(), cx);

@@ -319,12 +319,12 @@ impl AccountsPage {
             .gap(px(6.0))
             .cursor_pointer()
             .bg(if open {
-                crate::theme::white_alpha(0.06)
+                theme.white_alpha(0.06)
             } else {
                 gpui::transparent_black()
             })
             .when(!open, |el| {
-                el.hover(|s| s.bg(crate::theme::white_alpha(0.04)))
+                el.hover(|s| s.bg(theme.white_alpha(0.04)))
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 let just_dismissed = this
@@ -357,7 +357,7 @@ impl AccountsPage {
                     .bg(if effective == local_id {
                         emerald
                     } else {
-                        crate::theme::white_alpha(0.2)
+                        theme.white_alpha(0.2)
                     }),
             )
             .child(
@@ -418,7 +418,7 @@ impl AccountsPage {
                                 .bg(if is_local {
                                     emerald
                                 } else {
-                                    crate::theme::white_alpha(0.2)
+                                    theme.white_alpha(0.2)
                                 }),
                         )
                 }))
@@ -724,7 +724,7 @@ impl AccountsPage {
                     .h(px(5.0))
                     .rounded_full()
                     .overflow_hidden()
-                    .bg(crate::theme::white_alpha(0.07))
+                    .bg(theme.white_alpha(0.07))
                     .when(fraction > 0.0, |el| {
                         el.child(
                             div()
@@ -819,8 +819,7 @@ impl AccountsPage {
                         .cursor_pointer()
                         .when(is_busy, |el| el.opacity(0.5))
                         .hover(|s| {
-                            s.bg(crate::theme::white_alpha(0.06))
-                                .text_color(Theme::dark().text)
+                            s.bg(theme.white_alpha(0.06)).text_color(theme.text)
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.account_action(
@@ -875,7 +874,7 @@ impl AccountsPage {
                     .rounded_full()
                     .border_1()
                     .border_color(theme.border)
-                    .bg(crate::theme::white_alpha(0.03))
+                    .bg(theme.white_alpha(0.03))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -953,7 +952,7 @@ impl AccountsPage {
                 .text_color(theme.text_muted.opacity(0.6))
                 .truncate()
                 .cursor_pointer()
-                .hover(|s| s.text_color(Theme::dark().text))
+                .hover(|s| s.text_color(theme.text))
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.open_url(&open_url);
                 }))
@@ -988,7 +987,7 @@ impl AccountsPage {
                     ))
                     .child(
                         div().mt(px(12.0)).child(
-                            popover::dialog_field(self.code_input.clone().into_any_element())
+                            popover::dialog_field(&theme, self.code_input.clone().into_any_element())
                                 .font_family(theme.font_mono.clone())
                                 .text_size(px(13.0)),
                         ),
@@ -1127,7 +1126,7 @@ impl AccountsPage {
                         el.rounded(px(4.0))
                     }
                 })
-                .bg(crate::theme::white_alpha(0.05))
+                .bg(theme.white_alpha(0.05))
         };
         let meters = div().mt(px(8.0)).flex().flex_col().gap(px(7.0)).children(
             (0..2).map(|_| {
@@ -1144,7 +1143,7 @@ impl AccountsPage {
                             .max_w(px(230.0))
                             .h(px(5.0))
                             .rounded_full()
-                            .bg(crate::theme::white_alpha(0.04)),
+                            .bg(theme.white_alpha(0.04)),
                     )
                     .child(ghost(px(64.0).into(), 9.0, false))
             }),
@@ -1160,7 +1159,7 @@ impl AccountsPage {
                     .self_center()
                     .size(px(32.0))
                     .rounded_full()
-                    .bg(crate::theme::white_alpha(0.05)),
+                    .bg(theme.white_alpha(0.05)),
             )
             .child(
                 div()
@@ -1292,7 +1291,7 @@ impl Render for AccountsPage {
                             div()
                                 .mt(px(4.0))
                                 .text_size(px(11.5))
-                                .text_color(Theme::dark().text_muted)
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from("Click to retry")),
                         )
                         .into_any_element(),
@@ -1347,7 +1346,7 @@ impl Render for AccountsPage {
                         let add_action = if supports_login(harness) {
                             widgets::ghost_action(&theme)
                                 .id(add_id)
-                                .hover(widgets::ghost_hover)
+                                .hover(widgets::ghost_hover(&theme))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.start_login(harness, cx);
                                 }))
@@ -1424,7 +1423,7 @@ impl Render for AccountsPage {
                                     .id("accounts-refresh")
                                     .flex_none()
                                     .text_size(px(12.5))
-                                    .hover(widgets::ghost_hover)
+                                    .hover(widgets::ghost_hover(&theme))
                                     .when(refreshing, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.load(force_usage_for(LoadTrigger::Refresh), cx)

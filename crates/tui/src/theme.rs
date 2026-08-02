@@ -98,6 +98,33 @@ impl Theme {
         }
     }
 
+    /// The same ramp inverted — the sRGB conversions of the desktop app's
+    /// light theme (comet-ui `Theme::light`): surfaces walk DOWN from a
+    /// near-white base, text walks UP to near-black, and the accents move to
+    /// the 600-shades so they keep contrast on white. Status dot hues are
+    /// unchanged — they carry meaning, not decoration.
+    pub fn light() -> Self {
+        Self {
+            text: Color::Rgb(0x1b, 0x1b, 0x1b),
+            muted: Color::Rgb(0x5d, 0x5d, 0x5d),
+            faint: Color::Rgb(0x92, 0x92, 0x92),
+            accent: Color::Rgb(0x4f, 0x39, 0xf6),
+            base: Color::Rgb(0xf6, 0xf6, 0xf6),
+            panel: Color::Rgb(0xf0, 0xf0, 0xf0),
+            element: Color::Rgb(0xe1, 0xe1, 0xe1),
+            selection: Color::Rgb(0xd4, 0xd4, 0xd4),
+            code_wash: Color::Rgb(0xe9, 0xe9, 0xe9),
+            danger: Color::Rgb(0xe6, 0x2b, 0x30),
+            warning: Color::Rgb(0xd6, 0x8d, 0x00),
+            dot_working: Color::Rgb(0xfb, 0x64, 0xb6),
+            dot_awaiting: Color::Rgb(0x4f, 0x39, 0xf6),
+            dot_errored: Color::Rgb(0xff, 0x64, 0x67),
+            dot_completed: Color::Rgb(0x00, 0xd4, 0x92),
+            dot_idle: Color::Rgb(0xb0, 0xb0, 0xb0),
+            plain: false,
+        }
+    }
+
     /// `NO_COLOR`: every hue collapses to the terminal default. Callers that
     /// carry meaning in color also set a [`Modifier`], so nothing is lost.
     pub fn plain() -> Self {
@@ -123,11 +150,16 @@ impl Theme {
         }
     }
 
-    /// `NO_COLOR` set to anything non-empty disables color
-    /// ([no-color.org](https://no-color.org)).
+    /// Environment-driven theme. `NO_COLOR` set to anything non-empty disables
+    /// color ([no-color.org](https://no-color.org)) and wins over everything.
+    /// Otherwise `COMET_THEME=light` selects the light variant; anything else
+    /// (including unset) is the dark default.
     pub fn from_env() -> Self {
-        match std::env::var_os("NO_COLOR") {
-            Some(v) if !v.is_empty() => Self::plain(),
+        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Self::plain();
+        }
+        match std::env::var("COMET_THEME").ok().as_deref() {
+            Some("light") => Self::light(),
             _ => Self::dark(),
         }
     }
@@ -347,6 +379,90 @@ mod tests {
         assert_eq!(t.accent, oklch(0.673, 0.182, 276.935), "indigo-400");
         assert_eq!(t.danger, oklch(0.704, 0.191, 22.216), "red-400");
         assert_eq!(t.warning, oklch(0.828, 0.189, 84.429), "amber-400");
+    }
+
+    #[test]
+    fn the_light_palette_inverts_the_ramp() {
+        // The sRGB conversions of the desktop app's light theme (comet-ui
+        // `Theme::light`) — same oklch, so these pin against the shared ramp.
+        let t = Theme::light();
+        assert_eq!(t.text, oklch(0.22, 0.0, 0.0), "near-black body text");
+        assert_eq!(t.muted, oklch(0.48, 0.0, 0.0), "mid-grey sub-lines");
+        assert_eq!(t.faint, oklch(0.66, 0.0, 0.0), "light-grey timestamps");
+        assert_eq!(t.accent, oklch(0.511, 0.262, 276.966), "indigo, darkened");
+        assert_eq!(t.danger, oklch(0.60, 0.22, 26.0), "red, darkened");
+        assert_eq!(t.warning, oklch(0.70, 0.16, 76.0), "amber, darkened");
+        // Text darkens down the ramp, surfaces lighten up from the base —
+        // the mirror of dark.
+        let luma = |c: Color| match c {
+            Color::Rgb(r, g, b) => r as u32 + g as u32 + b as u32,
+            _ => panic!("expected rgb"),
+        };
+        assert!(luma(t.text) < luma(t.muted));
+        assert!(luma(t.muted) < luma(t.faint));
+        assert!(luma(t.base) > luma(t.panel));
+        assert!(luma(t.panel) > luma(t.element));
+        assert!(luma(t.element) > luma(t.selection));
+        assert!(!t.plain);
+    }
+
+    #[test]
+    fn light_status_dots_stay_on_the_shared_hues() {
+        // Status meaning does not change with the theme: working stays pink,
+        // errored red, completed emerald. Awaiting rides the light accent.
+        let t = Theme::light();
+        let d = comet_proto::view::dot::WORKING;
+        assert_eq!(t.dot_working, oklch(d.0, d.1, d.2));
+        let d = comet_proto::view::dot::ERRORED;
+        assert_eq!(t.dot_errored, oklch(d.0, d.1, d.2));
+        let d = comet_proto::view::dot::COMPLETED;
+        assert_eq!(t.dot_completed, oklch(d.0, d.1, d.2));
+        assert_eq!(t.dot_awaiting, t.accent);
+    }
+
+    #[test]
+    fn from_env_honors_comet_theme_and_no_color() {
+        unsafe {
+            std::env::set_var("COMET_THEME", "light");
+            std::env::remove_var("NO_COLOR");
+        }
+        assert!(!Theme::from_env().plain, "light is not plain");
+        let light = Theme::from_env();
+        let luma = |c: Color| match c {
+            Color::Rgb(r, g, b) => r as u32 + g as u32 + b as u32,
+            _ => panic!("expected rgb"),
+        };
+        assert!(
+            luma(light.base) > 3 * 0xc0,
+            "light base is bright: {light:?}"
+        );
+
+        unsafe {
+            std::env::set_var("COMET_THEME", "dark");
+        }
+        assert!(!Theme::from_env().plain);
+        let dark = Theme::from_env();
+        assert!(
+            luma(dark.base) < 3 * 0x30,
+            "dark base is dark: {dark:?}"
+        );
+
+        // NO_COLOR wins over COMET_THEME.
+        unsafe {
+            std::env::set_var("COMET_THEME", "light");
+            std::env::set_var("NO_COLOR", "1");
+        }
+        assert!(Theme::from_env().plain);
+        unsafe {
+            std::env::remove_var("COMET_THEME");
+            std::env::remove_var("NO_COLOR");
+        }
+        // Unset = dark default.
+        assert!(!Theme::from_env().plain);
+        assert!(
+            luma(Theme::from_env().base) < 3 * 0x30,
+            "unset falls back to dark"
+        );
     }
 
     #[test]

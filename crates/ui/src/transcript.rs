@@ -1455,6 +1455,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
+        let theme = Theme::of(cx).clone();
         let device_ids = self.attachment_device_ids(cx);
         let mut strip = div()
             .w_full()
@@ -1484,8 +1485,8 @@ impl Transcript {
                     frame
                         .id(SharedString::from(format!("{row_id}#att{aix}")))
                         .border_1()
-                        .border_color(crate::theme::white_alpha(0.11))
-                        .bg(crate::theme::white_alpha(0.035))
+                        .border_color(theme.white_alpha(0.11))
+                        .bg(theme.white_alpha(0.035))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.attachment_preview = Some(preview.clone());
@@ -1502,14 +1503,14 @@ impl Transcript {
                 AttachmentSnapshot::Error { .. } => frame
                     .border_1()
                     .border_dashed()
-                    .border_color(crate::theme::white_alpha(0.14))
-                    .bg(crate::theme::white_alpha(0.025))
+                    .border_color(theme.white_alpha(0.14))
+                    .bg(theme.white_alpha(0.025))
                     .into_any_element(),
                 // Loading: the pulsing skeleton (same wash as popover skeletons).
                 AttachmentSnapshot::Loading => frame
                     .border_1()
-                    .border_color(crate::theme::white_alpha(0.08))
-                    .bg(crate::theme::white_alpha(0.055))
+                    .border_color(theme.white_alpha(0.08))
+                    .bg(theme.white_alpha(0.055))
                     .with_animation(
                         SharedString::from(format!("{row_id}#att-pulse{aix}")),
                         motion::COMET_PULSE.repeating(),
@@ -1855,7 +1856,7 @@ impl Transcript {
             // chips (destructive tint, comet tool-chip.tsx) and in the
             // summary's "· N failed" count.
             .text_color(theme.text_muted)
-            .hover(|s| s.text_color(Theme::dark().text))
+            .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_fold(toggle_id.clone(), tool_count, auto_open);
                 cx.notify();
@@ -1865,7 +1866,7 @@ impl Transcript {
                     .size(px(18.0))
                     .flex_none()
                     .rounded(px(5.0))
-                    .bg(crate::theme::white_alpha(0.06))
+                    .bg(theme.white_alpha(0.06))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -2011,8 +2012,8 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                 .overflow_hidden()
                 .rounded(px(10.0))
                 .border_1()
-                .border_color(crate::theme::white_alpha(0.08))
-                .bg(crate::theme::white_alpha(0.045))
+                .border_color(theme.white_alpha(0.08))
+                .bg(theme.white_alpha(0.045))
                 .px(px(8.0))
                 .text_size(px(12.0))
                 .child(
@@ -2020,7 +2021,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                         .flex_none()
                         .size(px(20.0))
                         .rounded(px(6.0))
-                        .bg(crate::theme::white_alpha(0.09))
+                        .bg(theme.white_alpha(0.09))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2090,7 +2091,7 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .h_full()
                 .w(px(1.0))
                 .flex_none()
-                .bg(crate::theme::white_alpha(0.08)),
+                .bg(theme.white_alpha(0.08)),
         )
         .child(
             div()
@@ -2105,8 +2106,8 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
-                .border_color(crate::theme::white_alpha(0.07))
-                .bg(crate::theme::white_alpha(0.03))
+                .border_color(theme.white_alpha(0.07))
+                .bg(theme.white_alpha(0.03))
                 .px(px(8.0))
                 .text_size(px(12.0))
                 .child(
@@ -2116,7 +2117,7 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                         .size(px(18.0))
                         .flex_none()
                         .rounded(px(5.0))
-                        .bg(crate::theme::white_alpha(0.08))
+                        .bg(theme.white_alpha(0.08))
                         .flex()
                         .items_center()
                         .justify_center()

@@ -57,8 +57,8 @@ pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
 /// width; wider ones wrap down to this floor, then the table scrolls.
 pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
 /// Hairline tone (comet md theme `table.borderColor`: rgba(255,255,255,0.1)).
-pub fn table_hairline() -> Hsla {
-    crate::theme::white_alpha(0.10)
+pub fn table_hairline(theme: &Theme) -> Hsla {
+    theme.white_alpha(0.10)
 }
 
 /// Options for one rendered tree (a transcript row or a whole live message).
@@ -421,7 +421,7 @@ fn render_table(
     // rows are the only paint (`table.gap` = 1, borderColor white@10%); the
     // theme's headerBackground is transparent and its radius 0, so there is no
     // header fill, outer box, or rounding.
-    let hairline = table_hairline();
+    let hairline = table_hairline(theme);
     let mut inner = div()
         .flex()
         .flex_col()
@@ -1015,7 +1015,7 @@ fn render_code_block(
             .bg(crate::motion::hover_blend(
                 &fade_key,
                 gpui::transparent_black(),
-                crate::theme::white_alpha(0.08),
+                theme.white_alpha(0.08),
             ))
             .on_hover(crate::motion::hover_listener(fade_key))
             .text_size(px(10.5))
@@ -1036,7 +1036,7 @@ fn render_code_block(
         .rounded(px(10.0))
         // Faint white wash over the near-black panel ≈ #101010 (comet's code
         // surface), with the hairline border.
-        .bg(crate::theme::white_alpha(0.035))
+        .bg(theme.white_alpha(0.035))
         .border_1()
         .border_color(theme.border)
         .overflow_hidden()
@@ -1049,7 +1049,7 @@ fn render_code_block(
                     .border_b_1()
                     .border_color(theme.border)
                     // A whisper of tone separation between header and body.
-                    .bg(crate::theme::white_alpha(0.02))
+                    .bg(theme.white_alpha(0.02))
                     .text_size(px(11.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(lang.to_string())),

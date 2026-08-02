@@ -136,7 +136,12 @@ pub fn run_app(config: UiConfig) {
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
         register_fonts(cx);
-        cx.set_global(theme::Theme::dark());
+        // Theme at boot: `COMET_THEME=dark|light` wins, otherwise the persisted
+        // choice from `ui-settings.json`. The shell re-sets this global when the
+        // Appearance page flips it live (settings.rs).
+        let theme_choice = theme::ThemeChoice::from_env()
+            .unwrap_or_else(|| settings::UiSettings::load(&config.data_dir).theme);
+        cx.set_global(theme::Theme::for_choice(theme_choice));
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);

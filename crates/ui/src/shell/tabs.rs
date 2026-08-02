@@ -245,11 +245,11 @@ impl Shell {
                 // close), so the wash snaps off it too — gpui allows only one
                 // `on_hover` per element, and the state listener wins.
                 let (text_color, bg) = if is_selected {
-                    (theme.text, crate::theme::glass_selected_bg())
+                    (theme.text, theme.glass_selected_bg())
                 } else if is_hovered {
                     (theme.text_muted.opacity(0.8), theme.element_hover)
                 } else {
-                    (theme.text_muted.opacity(0.6), crate::theme::wash(0.0))
+                    (theme.text_muted.opacity(0.6), theme.wash(0.0))
                 };
                 let glyph_alpha = if is_selected { 0.9 } else { 0.6 };
                 let brand = harness.map(crate::pickers::harness_brand_icon);
@@ -271,7 +271,7 @@ impl Shell {
                         .items_center()
                         .justify_center()
                         .rounded(px(6.0))
-                        .hover(|s| s.bg(crate::theme::wash(0.14)))
+                        .hover(|s| s.bg(theme.wash(0.14)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_session_tab(close_id.clone(), cx);
@@ -321,7 +321,7 @@ impl Shell {
                     .text_color(text_color)
                     .bg(bg)
                     .when(is_selected, |el| {
-                        el.shadow(crate::theme::glass_selected_shadows())
+                        el.shadow(theme.glass_selected_shadows())
                     })
                     .cursor_pointer()
                     // Tabs sit inside the titlebar drag strip — carve them out.
@@ -424,16 +424,16 @@ impl Shell {
             .rounded(px(8.0))
             .cursor_pointer()
             .bg(if on_canvas && has_space {
-                crate::theme::glass_selected_bg()
+                theme.glass_selected_bg()
             } else {
                 motion::hover_blend(
                     "session-tab-new",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.12),
+                    theme.wash(0.0),
+                    theme.wash(0.12),
                 )
             })
             .when(on_canvas && has_space, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
+                el.shadow(theme.glass_selected_shadows())
             })
             .on_hover(motion::hover_listener("session-tab-new"))
             .occlude()
@@ -569,8 +569,8 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .bg(motion::hover_blend(
                 "toggle-board",
-                crate::theme::wash(if board_active { 0.14 } else { 0.0 }),
-                crate::theme::wash(0.2),
+                theme.wash(if board_active { 0.14 } else { 0.0 }),
+                theme.wash(0.2),
             ))
             .on_hover(motion::hover_listener("toggle-board"))
             .on_click(cx.listener(|this, _, window, cx| {
