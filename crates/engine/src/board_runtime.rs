@@ -8,9 +8,11 @@
 //! decisions.
 //!
 //! The trait is sync on purpose (the board loop is a blocking thread), so the
-//! async engine calls run through a captured runtime [`Handle`]. Methods must
-//! therefore never be called from a tokio worker thread — in the engine they
-//! run on the `comet-board-sync` thread only.
+//! async engine calls run through a captured runtime [`Handle`]. The loop enters
+//! that handle for its life (`run_loop`'s `handle.enter()`), so `Handle::block_on`
+//! and the `tokio::spawn`s inside `doc_host.open` work from its plain thread.
+//! Methods must therefore never be called from a tokio worker thread — in the
+//! engine they run on the `comet-board-sync` thread only.
 
 use std::path::Path;
 use std::sync::Arc;

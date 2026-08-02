@@ -534,6 +534,7 @@ impl Engine {
                 sessions_watch,
                 runtime,
                 core.workspace.watch_spaces(),
+                tokio::runtime::Handle::current(),
             ) {
                 Ok(board) => core.set_board(Arc::new(board)),
                 Err(err) => tracing::warn!(error = %err, "board service failed to start"),
