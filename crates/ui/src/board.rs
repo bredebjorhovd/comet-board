@@ -16,7 +16,9 @@
 //!   opens that attempt's chat; on a section header it folds/unfolds;
 //! - the dispatch picker asks which runtime (and which model on that harness —
 //!   `ListModels`, defaulted to the harness's first catalog row) to release
-//!   under, and sends both overrides;
+//!   under, and sends both overrides. The model list is type-to-filter: typing
+//!   narrows it by id or label (`deepseek` finds `opencode/deepseek-v4-flash`),
+//!   arrows walk the matches, enter dispatches the highlighted one;
 //! - `f` cycles the routes on the board, `F` clears the filter, `/` opens the
 //!   find field (live substring matching), `esc` closes the panel;
 //! - the panel is lazy: no RPC until it is first opened, and the stream
@@ -39,6 +41,7 @@ use serde::Deserialize;
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::motion;
+use crate::popover;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -126,11 +129,29 @@ fn default_runtime_index(options: &[BoardRuntime], route_runtime: Option<&str>) 
         .unwrap_or(0)
 }
 
-/// The model a dispatch actually runs with, given the picker's highlight:
-/// the highlighted catalog row — index 0 is the harness default, every other
-/// index a picked model. `None` only when the catalog is missing.
-fn highlighted_model(models: &[BoardModelInfo], active: usize) -> Option<&BoardModelInfo> {
-    models.get(active)
+/// Indices of the active runtime's catalog models matching the dispatch
+/// picker's query — matched against the model id OR its display label, best
+/// (prefix-over-substring) rank per model, stable in catalog order. An empty
+/// query matches everything: the whole catalog in order, so row 0 stays the
+/// harness default (no override). This is the board-side twin of the
+/// composer's model filter (`pickers.rs`).
+fn filtered_model_indices(models: &[BoardModelInfo], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..models.len()).collect();
+    }
+    let mut ranked: Vec<(usize, usize)> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, m)| {
+            [m.id.as_str(), m.label.as_str()]
+                .into_iter()
+                .filter_map(|field| popover::match_rank(query, field))
+                .min()
+                .map(|rank| (rank, ix))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, ix)| (rank, ix));
+    ranked.into_iter().map(|(_, ix)| ix).collect()
 }
 
 /// The override a dispatch should SEND for a highlight: `None` at the default
@@ -427,6 +448,10 @@ pub struct BoardPanel {
     _find_events: Option<Subscription>,
     /// Focus the find field on its first paint (opened without window access).
     find_focus_pending: bool,
+    /// The dispatch picker's model filter (PaletteSearch context, so ↑↓/←→/
+    /// enter bubble to the board frame's dispatch handling).
+    dispatch_search: Entity<ComposerInput>,
+    _dispatch_search_events: Subscription,
     /// The board body's scroll position.
     scroll: ScrollHandle,
     /// The model row's scroll position (the catalog is long — opencode alone
@@ -449,6 +474,23 @@ impl BoardPanel {
                 this.ensure_watch(cx);
             }
         });
+        let dispatch_search = cx.new(|cx| {
+            ComposerInput::with_context("Search models…", "PaletteSearch", cx)
+        });
+        // Type-to-filter: a fresh query re-homes the model highlight on the
+        // first match (the Edited event fires on every keystroke).
+        let dispatch_search_events =
+            cx.subscribe(&dispatch_search, |this: &mut Self, _, event, cx| match event {
+                ComposerInputEvent::Edited => {
+                    if let Some(draft) = this.dispatch.as_mut() {
+                        draft.active_model = 0;
+                    }
+                    cx.notify();
+                }
+                ComposerInputEvent::Submitted
+                | ComposerInputEvent::PastedImages(_)
+                | ComposerInputEvent::PastedPaths(_) => {}
+            });
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -482,6 +524,8 @@ impl BoardPanel {
             find: None,
             _find_events: None,
             find_focus_pending: false,
+            dispatch_search,
+            _dispatch_search_events: dispatch_search_events,
             scroll: ScrollHandle::new(),
             model_scroll: ScrollHandle::new(),
             notice: None,
@@ -604,6 +648,9 @@ impl BoardPanel {
         }
         let task_id = row.id.clone();
         let identifier = row.identifier.clone();
+        // A fresh picker starts with an empty model filter (the search input
+        // persists across dispatches on the panel).
+        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
         self.dispatch = Some(DispatchDraft {
             route_runtime: row.runtime.clone(),
             task_id,
@@ -730,15 +777,20 @@ impl BoardPanel {
     }
 
     /// `enter` on the picker: dispatch with the highlighted runtime and model.
+    /// The model highlight indexes the FILTERED list — typing narrows the
+    /// rows, and enter dispatches the highlighted match.
     fn confirm_dispatch(&mut self, cx: &mut Context<Self>) {
+        let indices = self.dispatch_filtered_models(cx);
         let Some(draft) = self.dispatch.take() else { return };
         let runtime = draft.active_runtime_name();
         let (model, effective) = match draft.catalog() {
-            Some(ModelCatalog::Ready(models)) => {
-                let effective = highlighted_model(models, draft.active_model).map(|m| m.id.clone());
-                let model = override_model_id(models, draft.active_model).map(str::to_string);
-                (model, effective)
-            }
+            Some(ModelCatalog::Ready(models)) => match indices.get(draft.active_model) {
+                Some(catalog_ix) => (
+                    override_model_id(models, *catalog_ix).map(str::to_string),
+                    models.get(*catalog_ix).map(|m| m.id.clone()),
+                ),
+                None => (None, None),
+            },
             _ => (None, None),
         };
         self.send_dispatch(
@@ -751,9 +803,29 @@ impl BoardPanel {
         );
     }
 
+    /// The catalog rows (indices) the dispatch picker displays for the active
+    /// runtime, filtered by the model query.
+    fn dispatch_filtered_models(&self, cx: &App) -> Vec<usize> {
+        let Some(draft) = self.dispatch.as_ref() else {
+            return Vec::new();
+        };
+        let Some(ModelCatalog::Ready(models)) = draft.catalog() else {
+            return Vec::new();
+        };
+        let query = self.dispatch_search.read(cx).text().to_string();
+        filtered_model_indices(models, &query)
+    }
+
+    /// Focus the picker's model search input (typing then lands there). Only
+    /// meaningful while the picker is open.
+    fn focus_dispatch_model_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.dispatch_search.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
     /// Clicking a runtime chip: select that runtime and load its models. A
     /// selection is never itself a release — the model row (or enter) is.
-    fn select_runtime(&mut self, name: &str, cx: &mut Context<Self>) {
+    fn select_runtime(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.dispatch.as_mut() else { return };
         let Some(ix) = draft.runtimes.iter().position(|r| r.name == name) else {
             return;
@@ -768,19 +840,24 @@ impl BoardPanel {
         }
         let Some(engine) = self.engine(cx) else { return };
         self.ensure_dispatch_models(engine, cx);
+        // Typing after a click lands in the model filter, not nowhere; a query
+        // that narrowed the old harness's catalog gets dropped for the new one.
+        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+        self.focus_dispatch_model_search(window, cx);
         cx.notify();
     }
 
-    /// Clicking a model chip: dispatch with the current runtime + that model.
-    fn confirm_with_model(&mut self, chip_ix: usize, cx: &mut Context<Self>) {
+    /// Clicking a model row: dispatch with the current runtime + that model.
+    /// `catalog_ix` is the catalog row's own index (rows carry it through the
+    /// filtered display).
+    fn confirm_with_model(&mut self, catalog_ix: usize, cx: &mut Context<Self>) {
         let Some(draft) = self.dispatch.take() else { return };
         let runtime = draft.active_runtime_name();
         let (model, effective) = match draft.catalog() {
-            Some(ModelCatalog::Ready(models)) => {
-                let effective = highlighted_model(models, chip_ix).map(|m| m.id.clone());
-                let model = override_model_id(models, chip_ix).map(str::to_string);
-                (model, effective)
-            }
+            Some(ModelCatalog::Ready(models)) => (
+                override_model_id(models, catalog_ix).map(str::to_string),
+                models.get(catalog_ix).map(|m| m.id.clone()),
+            ),
             _ => (None, None),
         };
         self.send_dispatch(
@@ -981,16 +1058,55 @@ impl BoardPanel {
         }
 
         // The dispatch picker owns the keys while it is open: up/down switches
-        // between the runtime and model rows, left/right moves the highlight
-        // within the focused row, enter dispatches with both, escape cancels.
+        // between the runtime and model rows — or, with the model filter
+        // focused, walks the filtered matches — left/right moves the highlight
+        // within the focused row, typing filters the models, enter dispatches
+        // with both highlights, escape cancels.
         if self.dispatch.is_some() {
+            let search_focused = self
+                .dispatch_search
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window);
             match key {
                 "up" | "down" => {
+                    let delta = if key == "up" { -1 } else { 1 };
+                    let filter_empty = self.dispatch_search.read(cx).is_empty();
+                    let model_count = self.dispatch_filtered_models(cx).len();
+                    let mut focus_search = false;
+                    let mut focus_frame = false;
                     if let Some(draft) = self.dispatch.as_mut() {
-                        draft.row = match draft.row {
-                            PickerRow::Runtime => PickerRow::Model,
-                            PickerRow::Model => PickerRow::Runtime,
-                        };
+                        match draft.row {
+                            PickerRow::Runtime => {
+                                draft.row = PickerRow::Model;
+                                draft.active_model = 0;
+                                focus_search = true;
+                            }
+                            PickerRow::Model if search_focused => {
+                                // Empty filter + up on the top row returns to
+                                // the runtime strip; otherwise walk the matches.
+                                if filter_empty && delta < 0 && draft.active_model == 0 {
+                                    draft.row = PickerRow::Runtime;
+                                    focus_frame = true;
+                                } else {
+                                    draft.active_model = popover::menu_step(
+                                        Some(draft.active_model),
+                                        model_count,
+                                        delta,
+                                    )
+                                    .unwrap_or(0);
+                                }
+                            }
+                            PickerRow::Model => {
+                                draft.row = PickerRow::Runtime;
+                                focus_frame = true;
+                            }
+                        }
+                    }
+                    if focus_search {
+                        self.focus_dispatch_model_search(window, cx);
+                    } else if focus_frame {
+                        window.focus(&self.focus_handle, cx);
                     }
                     self.reveal_model_chip();
                     cx.notify();
@@ -999,6 +1115,8 @@ impl BoardPanel {
                 }
                 "left" | "right" => {
                     let delta = if key == "left" { -1 } else { 1 };
+                    let model_count = self.dispatch_filtered_models(cx).len();
+                    let mut runtime_moved = false;
                     if let Some(draft) = self.dispatch.as_mut() {
                         match draft.row {
                             PickerRow::Runtime if !draft.runtimes.is_empty() => {
@@ -1006,22 +1124,26 @@ impl BoardPanel {
                                     .clamp(0, draft.runtimes.len() as isize - 1)
                                     as usize;
                                 draft.active_model = 0;
+                                runtime_moved = true;
                             }
                             PickerRow::Model => {
-                                let len = match draft.catalog() {
-                                    Some(ModelCatalog::Ready(models)) => models.len(),
-                                    _ => 1,
-                                };
-                                draft.active_model = (draft.active_model as isize + delta)
-                                    .clamp(0, len.saturating_sub(1) as isize)
-                                    as usize;
+                                draft.active_model = popover::menu_step(
+                                    Some(draft.active_model),
+                                    model_count,
+                                    delta,
+                                )
+                                .unwrap_or(0);
                             }
                             _ => {}
                         }
                     }
-                    // A runtime move re-homes onto the default; a model move
-                    // walks the (long) strip — either way keep the highlight
-                    // in view.
+                    // A runtime move re-homes onto the default AND drops the
+                    // model filter — the query that narrowed the old harness's
+                    // catalog would otherwise read as "no matches" on the new.
+                    if runtime_moved {
+                        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+                    }
+                    // Either way keep the highlight in view.
                     self.reveal_model_chip();
                     if let Some(engine) = self.engine(cx) {
                         self.ensure_dispatch_models(engine, cx);
@@ -1032,11 +1154,18 @@ impl BoardPanel {
                 }
                 "enter" => {
                     self.confirm_dispatch(cx);
+                    // The picker closes on dispatch; hand keyboard control back
+                    // to the board (the model filter had been focused).
+                    if self.dispatch.is_none() {
+                        window.focus(&self.focus_handle, cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
                 "escape" => {
                     self.dispatch = None;
+                    self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+                    window.focus(&self.focus_handle, cx);
                     cx.notify();
                     cx.stop_propagation();
                     return;
@@ -1099,9 +1228,10 @@ impl BoardPanel {
         }
     }
 
-    /// Scroll the model row so the highlighted chip stays in view. The strip
-    /// is horizontally scrollable (opencode's catalog is 70+ models), so the
-    /// keyboard must reveal what it highlights.
+    /// Scroll the filtered model list so the highlighted row stays in view.
+    /// The list scrolls vertically (opencode's catalog is 70+ models), so the
+    /// keyboard must reveal what it highlights — the rows are the scroll
+    /// container's direct children, so the display index maps 1:1.
     fn reveal_model_chip(&self) {
         if let Some(draft) = self.dispatch.as_ref() {
             let model_scroll = self.model_scroll.clone();
@@ -1655,21 +1785,21 @@ impl BoardPanel {
         cx.open_url(url);
     }
 
-    /// The dispatch picker: two strips under the header. The first rows the
-    /// runtimes the engine offers, the highlighted one on the route's runtime;
-    /// the second rows that harness's models (a "Default" first — index 0 —
-    /// then the catalog in order), scrolling horizontally when the catalog is
-    /// long. Clicking a runtime SELECTS it and loads its models; clicking a
-    /// model dispatches immediately; enter dispatches with both highlights.
-    /// Before the options load it is a single "Loading…" row.
+    /// The dispatch picker: the runtime strip, then a type-to-filter model
+    /// search and the filtered, scrollable list of that harness's models.
+    /// Clicking a runtime SELECTS it and loads its models; typing narrows the
+    /// model list (matched against id OR label); clicking a model dispatches
+    /// immediately; enter dispatches with both highlights. Before the options
+    /// load it is a single "Loading…" row.
     fn render_dispatch_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let draft = self.dispatch.clone().expect("picker renders only when open");
         let runtime_focused = draft.row == PickerRow::Runtime;
         let model_focused = draft.row == PickerRow::Model;
+        let query = self.dispatch_search.read(cx).text().to_string();
 
         // Row 1: the runtime. Highlight = the route's runtime; the label shows
-        // which row the keyboard is on.
+        // which row the keyboard is on. Runtimes are few — chips stay.
         let runtime_label: SharedString = match (&draft.runtime_error, draft.runtimes.is_empty()) {
             (Some(err), _) => format!("{err} — enter dispatches with the route's runtime").into(),
             (None, true) => "Loading runtimes…".into(),
@@ -1718,9 +1848,9 @@ impl BoardPanel {
                     } else {
                         theme.wash(0.05)
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.select_runtime(&name, cx);
+                        this.select_runtime(&name, window, cx);
                     }))
                     .child(
                         div()
@@ -1739,89 +1869,140 @@ impl BoardPanel {
             );
         }
 
-        // Row 2: the highlighted runtime's models — the harness default (no
-        // override) first, then the catalog in order.
+        // Row 2: the model search + a "shown of total" count.
+        let (total_models, filtered): (usize, Vec<usize>) = match draft.catalog() {
+            Some(ModelCatalog::Ready(models)) => {
+                (models.len(), filtered_model_indices(models, &query))
+            }
+            _ => (0, Vec::new()),
+        };
+        let models_ready = matches!(draft.catalog(), Some(ModelCatalog::Ready(_)));
         let mut model_row = div()
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .px(px(Theme::SPACE_LG))
             .py(px(6.0))
-            .border_b_1()
             .border_t_1()
-            .border_color(theme.white_alpha(0.06));
-
-        match draft.catalog() {
-            Some(ModelCatalog::Error(err)) => {
-                model_row = model_row.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(10.5))
-                        .text_color(theme.warning)
-                        .child(
-                            SharedString::from(format!(
-                                "{err} — enter dispatches with the harness default"
-                            )),
-                        ),
-                );
-            }
-            Some(ModelCatalog::Ready(models)) => {
-                model_row = model_row.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(10.5))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if model_focused {
-                            theme.accent
-                        } else {
-                            theme.text_faint
-                        })
-                        .child(SharedString::from("Model")),
-                );
-                // The catalog is long (opencode: 70+); the chips scroll
-                // horizontally, and `scroll_to_item` reveals the keyboard
-                // highlight by chip index (the Default chip is index 0).
-                let mut chips = div()
-                    .id("board-model-chips")
+            .border_color(theme.white_alpha(0.06))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(if model_focused {
+                        theme.accent
+                    } else {
+                        theme.text_faint
+                    })
+                    .child(SharedString::from("Model")),
+            )
+            .child(
+                // The type-to-filter input (PaletteSearch context: typing
+                // narrows the list, ↑↓/←→/enter bubble to the board frame).
+                div()
                     .flex_1()
                     .min_w_0()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if model_focused {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    })
+                    .bg(theme.wash(0.05))
                     .flex()
-                    .flex_row()
                     .items_center()
-                    .gap(px(6.0))
-                    .overflow_x_scroll()
-                    .track_scroll(&self.model_scroll);
-                for (ix, model) in models.iter().enumerate() {
-                    chips = chips.child(self.render_model_chip(&draft, ix, model, &theme, cx));
-                }
-                model_row = model_row.child(chips);
-            }
-            _ => {
-                model_row = model_row.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from("Loading models…")),
-                );
-            }
-        }
-
-        // The chips container is itself `flex_1` — it owns the free width so
-        // as many models as fit are visible before the strip scrolls. Only the
-        // loading/error rows need the trailing spacer to right-align the hint.
-        let models_ready = matches!(draft.catalog(), Some(ModelCatalog::Ready(_)));
-        let model_row = model_row
-            .when(!models_ready, |el| el.child(div().flex_1()))
-            .child(
+                    .child(self.dispatch_search.clone()),
+            );
+        if models_ready {
+            model_row = model_row.child(
                 div()
                     .flex_none()
                     .text_size(px(10.0))
                     .text_color(theme.text_faint.opacity(0.7))
+                    .child(SharedString::from(format!("{}/{}", filtered.len(), total_models))),
+            );
+        }
+
+        // Row 3: the filtered model list — vertical and scrollable now that a
+        // search narrows it (the old horizontal chip strip was unusable at
+        // 70+ models).
+        let list: AnyElement = match draft.catalog() {
+            Some(ModelCatalog::Error(err)) => div()
+                .flex_none()
+                .px(px(Theme::SPACE_LG))
+                .py(px(6.0))
+                .text_size(px(10.5))
+                .text_color(theme.warning)
+                .child(SharedString::from(format!(
+                    "{err} — enter dispatches with the harness default"
+                )))
+                .into_any_element(),
+            Some(ModelCatalog::Ready(_)) if filtered.is_empty() => div()
+                .flex_none()
+                .px(px(Theme::SPACE_LG))
+                .py(px(8.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(format!("No models match “{query}”")))
+                .into_any_element(),
+            Some(ModelCatalog::Ready(models)) => {
+                let rows: Vec<AnyElement> = filtered
+                    .into_iter()
+                    .enumerate()
+                    .map(|(display_ix, catalog_ix)| {
+                        self.render_model_row(
+                            &draft,
+                            display_ix,
+                            catalog_ix,
+                            &models[catalog_ix],
+                            &theme,
+                            cx,
+                        )
+                    })
+                    .collect();
+                div()
+                    .id("board-model-list")
+                    .flex_none()
+                    .max_h(px(184.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.model_scroll)
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .px(px(Theme::SPACE_LG))
+                    .py(px(4.0))
+                    .children(rows)
+                    .into_any_element()
+            }
+            _ => div()
+                .flex_none()
+                .px(px(Theme::SPACE_LG))
+                .py(px(6.0))
+                .text_size(px(10.5))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("Loading models…"))
+                .into_any_element(),
+        };
+
+        // Row 4: the key hint.
+        let hint = div()
+            .flex_none()
+            .px(px(Theme::SPACE_LG))
+            .py(px(6.0))
+            .border_t_1()
+            .border_color(theme.white_alpha(0.06))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint.opacity(0.7))
                     .child(SharedString::from(
-                        "↑↓ switch · ←→ pick · enter dispatch · esc cancel",
+                        "type to filter · ↑↓ switch · ←→ pick · enter dispatch · esc cancel",
                     )),
             );
 
@@ -1832,62 +2013,101 @@ impl BoardPanel {
             .flex_col()
             .child(runtime_row)
             .child(model_row)
+            .child(list)
+            .child(hint)
             .into_any_element()
     }
 
-    /// One model chip in the picker's second row. Index 0 is the harness
-    /// default — labelled with its actual model, but sending no override — and
-    /// every further chip is that catalog model as an explicit override.
-    fn render_model_chip(
+    /// One model row in the picker's filtered list. The catalog's first row —
+    /// the harness default — sends no override (the route's behavior); every
+    /// other row is that catalog model as an explicit override. Rows carry
+    /// their CATALOG index, so a click dispatches the right model even when a
+    /// filter reorders what is visible.
+    fn render_model_row(
         &mut self,
         draft: &DispatchDraft,
-        ix: usize,
+        display_ix: usize,
+        catalog_ix: usize,
         model: &BoardModelInfo,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let active = ix == draft.active_model;
+        let active = display_ix == draft.active_model;
         let focused = draft.row == PickerRow::Model;
-        let label: SharedString = if ix == 0 {
-            format!("Default · {}", model.label).into()
-        } else {
-            SharedString::from(model.label.clone())
-        };
-        let key = format!("board-model-{}-{}", draft.task_id, ix);
+        let label: SharedString = model.label.clone().into();
+        let id: SharedString = model.id.clone().into();
+        let is_default = catalog_ix == 0;
+        let key = format!("board-model-{}-{}", draft.task_id, catalog_ix);
         div()
             .id(key)
             .flex_none()
-            .h(px(22.0))
             .px(px(9.0))
+            .py(px(4.0))
             .rounded(px(6.0))
             .flex()
+            .flex_row()
             .items_center()
+            .gap(px(8.0))
             .cursor_pointer()
             .bg(if active && focused {
                 theme.accent.opacity(0.16)
             } else if active {
                 theme.accent.opacity(0.08)
             } else {
-                theme.wash(0.05)
+                theme.wash(0.0)
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .hover(|s| s.bg(theme.wash(0.1)))
+            .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.confirm_with_model(ix, cx);
+                this.confirm_with_model(catalog_ix, cx);
+                // The picker closes on the click — hand keyboard control back
+                // to the board (the model filter may have held focus).
+                if this.dispatch.is_none() {
+                    window.focus(&this.focus_handle, cx);
+                }
             }))
             .child(
+                // Name + muted id subline — the id is what the filter matches,
+                // so surfacing it makes the narrowing legible.
                 div()
-                    .text_size(px(10.5))
-                    .text_color(if active {
-                        if focused {
-                            theme.accent
-                        } else {
-                            theme.text_muted.opacity(0.9)
-                        }
-                    } else {
-                        theme.text_muted
-                    })
-                    .child(label),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(px(11.5))
+                            .text_color(if active {
+                                if focused {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted.opacity(0.9)
+                                }
+                            } else {
+                                theme.text
+                            })
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(px(9.5))
+                            .text_color(theme.text_muted.opacity(0.55))
+                            .child(id),
+                    ),
             )
+            .when(is_default, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from("default")),
+                )
+            })
             .into_any_element()
     }
 
@@ -2033,8 +2253,10 @@ impl Render for BoardPanel {
                 cx.listener(|this, _, window: &mut Window, cx| {
                     // Clicks on the board body re-arm keyboard navigation; a
                     // click inside the open find field must NOT steal focus
-                    // from the input (typing owns it).
-                    if !this.model.typing {
+                    // from the input (typing owns it). Same for the dispatch
+                    // picker's model filter — it must keep the focus a click
+                    // just gave it.
+                    if !this.model.typing && this.dispatch.is_none() {
                         window.focus(&this.focus_handle, cx);
                     }
                 }),
@@ -2289,12 +2511,9 @@ mod tests {
     fn the_default_row_highlights_the_harness_default_without_an_override() {
         let catalog = models();
         // The first catalog row is the harness default (gh#38: big-pickle); the
-        // picker's row 0 IS that model — the chip labels it, but dispatch sends
+        // picker's row 0 IS that model — the row labels it, but dispatch sends
         // no override, so the route's behavior is unchanged.
-        assert_eq!(
-            highlighted_model(&catalog, 0).map(|m| m.id.as_str()),
-            Some("opencode/big-pickle")
-        );
+        assert_eq!(catalog[0].id, "opencode/big-pickle");
         assert_eq!(override_model_id(&catalog, 0), None);
     }
 
@@ -2302,8 +2521,8 @@ mod tests {
     fn a_picked_model_is_the_override_and_the_effective_model() {
         let catalog = models();
         assert_eq!(
-            highlighted_model(&catalog, 1).map(|m| m.id.as_str()),
-            Some("opencode/deepseek-v4-flash"),
+            catalog[1].id,
+            "opencode/deepseek-v4-flash",
             "deepseek-v4-flash is selectable, one row past the default"
         );
         assert_eq!(override_model_id(&catalog, 1), Some("opencode/deepseek-v4-flash"));
@@ -2312,7 +2531,50 @@ mod tests {
     #[test]
     fn an_out_of_range_highlight_never_sends_a_foreign_model() {
         let catalog = models();
-        assert!(highlighted_model(&catalog, 99).is_none());
+        assert_eq!(catalog.get(99).map(|m| m.id.as_str()), None);
         assert_eq!(override_model_id(&catalog, 99), None);
+    }
+
+    #[test]
+    fn model_search_matches_id_and_label_and_narrows() {
+        let catalog = models();
+        // An empty query shows the whole catalog in order, so row 0 stays the
+        // harness default (no override).
+        assert_eq!(filtered_model_indices(&catalog, ""), vec![0, 1]);
+        assert_eq!(filtered_model_indices(&catalog, "  "), vec![0, 1]);
+        // "deepseek" matches the id opencode/deepseek-v4-flash.
+        assert_eq!(
+            filtered_model_indices(&catalog, "deepseek"),
+            vec![1],
+            "an id substring match narrows to that model"
+        );
+        // A label match finds the model too.
+        assert_eq!(
+            filtered_model_indices(&catalog, "big"),
+            vec![0],
+            "a label substring match narrows to that model"
+        );
+        // No match → the list empties (nothing to dispatch blindly).
+        assert!(filtered_model_indices(&catalog, "nonesuch").is_empty());
+    }
+
+    #[test]
+    fn enter_dispatches_the_filtered_selection() {
+        let catalog = models();
+        // Type "deepseek" → the filter narrows to catalog row 1. The highlight
+        // re-homes on the first match (the Edited event resets active to 0),
+        // and that row maps to a real override — enter sends it.
+        let filtered = filtered_model_indices(&catalog, "deepseek");
+        assert_eq!(filtered, vec![1]);
+        let active = 0; // what typing re-homes the highlight to
+        assert_eq!(filtered.get(active), Some(&1));
+        assert_eq!(
+            override_model_id(&catalog, filtered[active]),
+            Some("opencode/deepseek-v4-flash"),
+            "enter dispatches the filtered selection as the override"
+        );
+        // An out-of-range highlight (nothing matches) dispatches nothing.
+        let empty = filtered_model_indices(&catalog, "nonesuch");
+        assert!(empty.get(0).is_none());
     }
 }

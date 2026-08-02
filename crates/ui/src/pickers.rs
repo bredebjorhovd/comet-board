@@ -1,8 +1,9 @@
 //! Composer pickers (feature-inventory §1.7): RepoPicker (recents + search +
 //! in-app folder browser + clone/create), BranchPicker (search + isolated-
-//! worktree toggle), HarnessModelPicker (harness rail + model list, harness
-//! locked once the chat exists), TraitsPicker (reasoning ladder + advertised
-//! model options; trigger shows the non-default summary "High · 1M · Fast").
+//! worktree toggle), HarnessModelPicker (harness rail + type-to-filter model
+//! search + reasoning ladder; harness locked once the chat exists),
+//! TraitsPicker (reasoning ladder + advertised model options; trigger shows
+//! the non-default summary "High · 1M · Fast").
 //!
 //! All selections accumulate into a [`DraftConfig`] the composer threads into
 //! the Run command and the `Mutate createChat` call on first send.
@@ -118,6 +119,29 @@ impl ResolvedRunConfig {
 /// the same row here).
 pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
+}
+
+/// Indices of a harness's catalog models matching the search query — matched
+/// against the model id OR its display label, best (prefix-over-substring)
+/// rank per model, stable in catalog order. An empty query matches everything.
+/// The composer-side twin of the board's dispatch model filter (`board.rs`).
+fn filtered_model_indices(models: &[Model], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..models.len()).collect();
+    }
+    let mut ranked: Vec<(usize, usize)> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, model)| {
+            [model.id.as_str(), model.label.as_str()]
+                .into_iter()
+                .filter_map(|field| popover::match_rank(query, field))
+                .min()
+                .map(|rank| (rank, ix))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, ix)| (rank, ix));
+    ranked.into_iter().map(|(_, ix)| ix).collect()
 }
 
 /// A model's default reasoning: X-High when the ladder offers it (comet
@@ -307,7 +331,10 @@ pub struct Pickers {
 
 impl Pickers {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| ComposerInput::new("Search…", cx));
+        // PaletteSearch context: binds only text-editing keys, so ↑↓/enter
+        // bubble to the popover frame and drive the list beneath the input —
+        // the same convention the branch picker and the add-space palette use.
+        let search = cx.new(|cx| ComposerInput::with_context("Search…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
                 this.active = 0;
@@ -602,6 +629,15 @@ impl Pickers {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
                     input.set_placeholder("Search refs…", cx);
+                });
+                window.focus(&handle, cx);
+            }
+            // The combined model menu's model list is the other long list
+            // (opencode: 70+ models) — it gets the same type-to-filter search.
+            PickerKind::HarnessModel | PickerKind::Traits => {
+                let handle = self.search.read(cx).focus_handle(cx);
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder("Search models…", cx);
                 });
                 window.focus(&handle, cx);
             }
@@ -1172,22 +1208,35 @@ impl Pickers {
         }
     }
 
+    /// Indices (into the viewed harness's catalog) of the models the search
+    /// query matches, in display order — the rows keyboard nav walks.
+    fn filtered_model_rows(&self, cx: &App) -> Vec<usize> {
+        let Some(harness) = self.effective_harness(cx) else {
+            return Vec::new();
+        };
+        let Some(models) = self.models.get(&harness).and_then(|l| l.ready()) else {
+            return Vec::new();
+        };
+        let query = self.search.read(cx).text().to_string();
+        filtered_model_indices(models, &query)
+    }
+
     /// The viewed harness's model list, when loaded (keyboard nav rows).
     fn model_rows_len(&self, cx: &App) -> usize {
-        self.effective_harness(cx)
-            .and_then(|h| self.models.get(&h))
-            .and_then(|l| l.ready())
-            .map(|m| m.len())
-            .unwrap_or(0)
+        self.filtered_model_rows(cx).len()
     }
 
     /// Enter on the harness/model popover: pick the highlighted model.
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
+        let rows = self.filtered_model_rows(cx);
+        let Some(catalog_ix) = rows.get(self.active).copied() else {
+            return;
+        };
         let Some(id) = self
             .effective_harness(cx)
             .and_then(|h| self.models.get(&h))
             .and_then(|l| l.ready())
-            .and_then(|m| m.get(self.active))
+            .and_then(|m| m.get(catalog_ix))
             .map(|m| m.id.clone())
         else {
             return;
@@ -1298,13 +1347,15 @@ impl Pickers {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &Window, cx: &mut Context<Self>) {
         let key = popover::classify_key(
             event.keystroke.key.as_str(),
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.control,
         );
-        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
+        // The search input is PaletteSearch-context, so ↑↓/enter bubble here
+        // even while it holds focus — Enter activates unconditionally (no
+        // `search_focused` guard; the input never handles it itself).
         match key {
             MenuKey::Escape => {
                 self.open = None;
@@ -1334,7 +1385,7 @@ impl Pickers {
                 }
                 cx.notify();
             }
-            MenuKey::Enter if !search_focused => {
+            MenuKey::Enter => {
                 if self.open == Some(PickerKind::HarnessModel) {
                     // Combined flat index: models, then ladder/options.
                     let models = self.model_rows_len(cx);
@@ -1998,16 +2049,28 @@ impl Pickers {
                 let selected = self.selected_model(cx).map(|m| m.id.clone());
                 let active = self.active;
                 let models = models.clone();
-                models
+                let query = self.search.read(cx).text().to_string();
+                let indices = filtered_model_indices(&models, &query);
+                if indices.is_empty() {
+                    return div()
+                        .px(px(8.0))
+                        .py(px(24.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_center()
+                        .child(SharedString::from(format!("No models match “{query}”")))
+                        .into_any_element();
+                }
+                indices
                     .into_iter()
                     .enumerate()
-                    .map(|(ix, model)| {
+                    .map(|(ix, catalog_ix)| {
+                        let model = &models[catalog_ix];
                         let label: SharedString = model.label.clone().into();
                         let description: Option<SharedString> =
                             model.description.clone().map(Into::into);
                         let id = model.id.clone();
-                        let is_selected = selected.as_deref() == Some(model.id.as_str())
-                            || (selected.is_none() && ix == 0);
+                        let is_selected = selected.as_deref() == Some(model.id.as_str());
                         popover::menu_row_nav(
                             &theme,
                             is_selected,
@@ -2103,12 +2166,39 @@ impl Pickers {
                             .flex()
                             .flex_col()
                             .child(
-                                // Pinned heading (the palette's crumbs slot).
+                                // Pinned heading (the palette's crumbs slot),
+                                // with the type-to-filter search beneath it.
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(4.0))
+                                    .pt(px(4.0))
+                                    .child(popover::menu_heading(&theme, "Models"))
+                                    .child(
+                                        div()
+                                            .px(px(8.0))
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_faint)
+                                            .child(SharedString::from(format!(
+                                                "{}/{}",
+                                                self.model_rows_len(cx),
+                                                effective
+                                                    .and_then(|h| self.models.get(&h))
+                                                    .and_then(|l| l.ready())
+                                                    .map_or(0, Vec::len),
+                                            ))),
+                                    ),
+                            )
+                            .child(
+                                // The search input (search_input_frame: the
+                                // input's own frame — rounded, quiet fill).
                                 div()
                                     .flex_none()
                                     .px(px(4.0))
-                                    .pt(px(4.0))
-                                    .child(popover::menu_heading(&theme, "Models")),
+                                    .child(self.search_box(&theme)),
                             )
                             .child(
                                 // Models scroll — gutters on the WRAPPER,
@@ -2448,6 +2538,17 @@ impl Render for Pickers {
                         window.focus(&handle, cx);
                     }
                 }
+                Some(PickerKind::HarnessModel) | Some(PickerKind::Traits) => {
+                    self.search.update(cx, |input, cx| {
+                        input.set_placeholder("Search models…", cx);
+                    });
+                    let handle = self.search.read(cx).focus_handle(cx);
+                    if handle.is_focused(window) {
+                        self.boot_focus_pending = false;
+                    } else {
+                        window.focus(&handle, cx);
+                    }
+                }
                 Some(_) => {
                     if self.focus.is_focused(window) {
                         self.boot_focus_pending = false;
@@ -2728,6 +2829,45 @@ mod tests {
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
         assert!(default_model(&[]).is_none());
+    }
+
+    fn catalog_models() -> Vec<Model> {
+        [
+            ("opencode/big-pickle", "Big Pickle"),
+            ("opencode/deepseek-v4-flash", "Deepseek V4 Flash"),
+            ("anthropic/claude-sonnet", "Claude Sonnet"),
+        ]
+        .into_iter()
+        .map(|(id, label)| Model {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![],
+        })
+        .collect()
+    }
+
+    #[test]
+    fn model_search_matches_id_and_label_and_narrows() {
+        let models = catalog_models();
+        // Empty query matches everything, in catalog order.
+        assert_eq!(filtered_model_indices(&models, ""), vec![0, 1, 2]);
+        assert_eq!(filtered_model_indices(&models, "  "), vec![0, 1, 2]);
+        // Substring over the id: "deepseek" finds opencode/deepseek-v4-flash.
+        assert_eq!(
+            filtered_model_indices(&models, "deepseek"),
+            vec![1],
+            "an id substring match narrows to that model"
+        );
+        // Substring over the label, case-insensitive.
+        assert_eq!(
+            filtered_model_indices(&models, "sonnet"),
+            vec![2],
+            "a label match finds the model too"
+        );
+        // A query matching neither id nor label narrows to nothing.
+        assert!(filtered_model_indices(&models, "nonesuch").is_empty());
     }
 
     #[test]
