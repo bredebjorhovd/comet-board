@@ -1655,9 +1655,14 @@ impl Transcript {
                 if let Some(veil) = &veil {
                     veil.borrow_mut().finish_seeding();
                 }
-                // Drive the veil clock: while any chunk is still dissolving,
-                // repaint next frame (self-limiting — one callback per frame).
-                if veil.is_some_and(|v| v.borrow().is_fading()) {
+                // Drive the veil clock: while any chunk is still dissolving
+                // (WALL-CLOCK, not chunk-presence), repaint next frame
+                // (self-limiting — one callback per frame). The check is
+                // clock-based so a stream that dies mid-fade still dissolves
+                // to full opacity even if no further doc messages arrive —
+                // `advance` prunes the aged chunk on the next repaint and the
+                // text renders settled (gh#28).
+                if veil.is_some_and(|v| v.borrow().is_fading_at(Instant::now())) {
                     let id = cx.entity_id();
                     window.on_next_frame(move |_, cx| cx.notify(id));
                 }
