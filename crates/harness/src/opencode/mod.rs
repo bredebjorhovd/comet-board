@@ -751,7 +751,9 @@ async fn run_session(session: Session) {
                     let _ = client.reply_permission(&request_id, "always").await;
                 }
 
-                // SSE EOF or reader gone: the server exited.
+                // SSE EOF or reader gone: the server exited, or simply closed
+                // its feed (idle-parked / one-shot subscription). The terminal
+                // bookkeeping below probes try_wait to tell the two apart.
                 Some(Event::Eof) | None => break 'main,
             },
 
@@ -846,20 +848,40 @@ async fn run_session(session: Session) {
                 }))
                 .await;
         } else if !done_for_turn {
-            // The stream ended before the turn settled: the server died
-            // mid-run (unless a turn error already booked the terminal Done).
-            let status = child.try_wait().ok().flatten();
-            let error = turn_error.unwrap_or_else(|| {
-                crate::crash_message("opencode serve", status, &stderr_tail)
-            });
-            let _ = event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(error),
-                    session_id: Some(session_id.clone()),
-                }))
-                .await;
+            // The stream ended before the turn settled. Distinguish a real
+            // server exit from a clean stream end: a server still running
+            // (try_wait → Ok(None)) merely closed its SSE feed (idle-parked or
+            // a one-shot subscription), so the in-flight turn finishes
+            // Completed rather than reporting a bogus "still running" crash.
+            // A server that actually exited — or a turn error already booked —
+            // keeps the Errored terminal event. shutdown_child below reaps the
+            // (possibly still-running, parked) serve we own either way.
+            let exit = child.try_wait();
+            match (&turn_error, exit) {
+                (None, Ok(None)) => {
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Completed,
+                            result: None,
+                            error: None,
+                            session_id: Some(session_id.clone()),
+                        }))
+                        .await;
+                }
+                (turn_error, exit) => {
+                    let error = turn_error.clone().unwrap_or_else(|| {
+                        crate::crash_message("opencode serve", exit.ok().flatten(), &stderr_tail)
+                    });
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(error),
+                            session_id: Some(session_id.clone()),
+                        }))
+                        .await;
+                }
+            }
         }
     }
 
