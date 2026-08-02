@@ -1,6 +1,6 @@
 //! Terminal paint + input encoding.
 //!
-//! - the ANSI palette on the `#090909` terminal background (feature-inventory
+//! - the ANSI palette on the theme-aware terminal background (feature-inventory
 //!   §1.10) and the 256-color cube/grayscale resolution;
 //! - keystroke → PTY byte encoding (printables, control keys, arrows/nav
 //!   escape sequences, Ctrl- combos, Alt prefixing);
@@ -17,7 +17,7 @@ use gpui::{
     SharedString, Style, TextRun, Window, fill, font, outline, point, px, relative, size,
 };
 
-use crate::theme::{Theme, rgb_to_hsl};
+use crate::theme::{Theme, grey, rgb_to_hsl};
 
 use super::emulator::{CellColor, CellSnapshot};
 use super::panel::TerminalPanel;
@@ -37,15 +37,25 @@ pub const RESIZE_DEBOUNCE_MS: u64 = 80;
 // Palette
 // ---------------------------------------------------------------------------
 
-/// Terminal background — `#090909` (one step below the app's `#0a0a0a`).
-pub fn terminal_bg() -> Hsla {
-    rgb8(0x09, 0x09, 0x09)
+/// Terminal background — the app's terminal "well". Dark mode keeps the
+/// near-black `#090909` (one step below the app's `#0a0a0a`); light mode uses
+/// the theme surface so the pane reads as a light well inside the light UI.
+pub fn terminal_bg(theme: &Theme) -> Hsla {
+    if theme.light {
+        theme.surface
+    } else {
+        grey(9)
+    }
 }
 
-/// The 16 ANSI colors tuned for the near-black background (indexes 0-7 normal,
-/// 8-15 bright).
+/// The 16 ANSI colors (indexes 0-7 normal, 8-15 bright). This is the terminal
+/// PROTOCOL palette — the hue bands (1-6) and the bright range (8-15) never
+/// change with the app theme, so color-meaning parity with real terminals is
+/// preserved. Only the neutral entries follow the theme: ANSI black (index 0)
+/// is resolved theme-aware in [`resolve_color`] (a near-black text tone in
+/// light mode, the visible-against-`#090909` grey in dark).
 const ANSI16: [(u8, u8, u8); 16] = [
-    (0x24, 0x24, 0x24), // black — visible against #090909
+    (0x24, 0x24, 0x24), // black — dark-theme tone, visible against #090909 (light mode resolves theme-aware)
     (0xf8, 0x71, 0x71), // red
     (0x4a, 0xde, 0x80), // green
     (0xfa, 0xcc, 0x15), // yellow
@@ -90,11 +100,16 @@ pub fn indexed_rgb(index: u8) -> (u8, u8, u8) {
     }
 }
 
-/// Resolve a cell color to paint against the theme.
+/// Resolve a cell color to paint against the theme. The ANSI protocol palette
+/// is fixed; only the neutral ramp follows the theme — background (the light
+/// well in light mode) and ANSI black (a near-black text tone so black text
+/// stays legible on the light terminal background). Hue bands and the 8-15
+/// bright range are identical across themes.
 pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
     match color {
         CellColor::Foreground => theme.text,
-        CellColor::Background => terminal_bg(),
+        CellColor::Background => terminal_bg(theme),
+        CellColor::Indexed(0) if theme.light => theme.text,
         CellColor::Indexed(ix) => {
             let (r, g, b) = indexed_rgb(ix);
             rgb8(r, g, b)
@@ -407,12 +422,14 @@ impl gpui::Element for TerminalElement {
                 size(cell_w, line_h),
             );
             if self.focused {
-                // Translucent block: the glyph underneath stays legible.
-                fill(cursor_bounds, gpui::hsla(0.0, 0.0, 1.0, 0.35))
+                // Translucent block: the glyph underneath stays legible. The
+                // tone follows the theme (white in dark, black in light) so
+                // the cursor reads on both terminal backgrounds.
+                fill(cursor_bounds, theme.white_alpha(0.35))
             } else {
                 outline(
                     cursor_bounds,
-                    gpui::hsla(0.0, 0.0, 1.0, 0.35),
+                    theme.white_alpha(0.35),
                     gpui::BorderStyle::Solid,
                 )
             }
@@ -721,10 +738,56 @@ mod tests {
     }
 
     #[test]
-    fn terminal_bg_is_090909() {
-        let bg = terminal_bg();
-        assert_eq!(bg.s, 0.0);
-        assert!((bg.l - 9.0 / 255.0).abs() < 1e-4);
+    fn terminal_bg_follows_theme() {
+        // Dark keeps the near-black #090909 well.
+        let dark_bg = terminal_bg(&Theme::dark());
+        assert_eq!(dark_bg.s, 0.0);
+        assert!((dark_bg.l - 9.0 / 255.0).abs() < 1e-4);
+        // Light inverts to a bright well (the theme surface).
+        let light_bg = terminal_bg(&Theme::light());
+        assert_eq!(light_bg.s, 0.0);
+        assert!(light_bg.l > 0.9, "light terminal bg {}, expected bright", light_bg.l);
+        assert!(light_bg.l > dark_bg.l);
+    }
+
+    #[test]
+    fn light_terminal_resolves_neutral_ramp() {
+        let light = Theme::light();
+        let dark = Theme::dark();
+        // Default foreground follows the theme: dark text in light mode.
+        assert!(resolve_color(CellColor::Foreground, &light).l < 0.5);
+        assert!(resolve_color(CellColor::Foreground, &dark).l > 0.5);
+        // Background inverts: light well in light mode, near-black in dark.
+        assert!(resolve_color(CellColor::Background, &light).l > 0.9);
+        assert!(resolve_color(CellColor::Background, &dark).l < 0.1);
+        // ANSI black follows the neutral ramp — a near-black text tone in
+        // light mode (readable on the light background), the raised grey in
+        // dark (readable against #090909).
+        let light_black = resolve_color(CellColor::Indexed(0), &light);
+        let dark_black = resolve_color(CellColor::Indexed(0), &dark);
+        assert!(light_black.l < 0.5, "light ANSI black readable on light bg");
+        assert!(dark_black.l > light_black.l, "dark ANSI black is the raised grey");
+        // Hue bands (1-6) and the 8-15 bright range never change with the
+        // theme — the protocol palette stays fixed.
+        for ix in 1..=15 {
+            assert_eq!(
+                resolve_color(CellColor::Indexed(ix), &dark),
+                resolve_color(CellColor::Indexed(ix), &light),
+                "index {ix} must not change with the theme"
+            );
+        }
+        // Direct RGB and cube/grayscale indexes resolve identically too.
+        for ix in [16usize, 21, 196, 231, 232, 255] {
+            assert_eq!(
+                resolve_color(CellColor::Indexed(ix as u8), &dark),
+                resolve_color(CellColor::Indexed(ix as u8), &light),
+                "index {ix} must not change with the theme"
+            );
+        }
+        assert_eq!(
+            resolve_color(CellColor::Rgb(0xf8, 0x71, 0x71), &light),
+            resolve_color(CellColor::Rgb(0xf8, 0x71, 0x71), &dark)
+        );
     }
 
     #[test]
