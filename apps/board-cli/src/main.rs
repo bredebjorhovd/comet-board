@@ -69,6 +69,14 @@ enum Command {
         /// on behalf of a chat that is not you.
         #[arg(long)]
         via: Option<String>,
+        /// Override the route's configured runtime for this dispatch — e.g.
+        /// claude-code, opencode, codex, cursor. `comet-board list --json`
+        /// shows each row's default.
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Override the harness's default model for this dispatch.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
@@ -192,11 +200,23 @@ fn main() -> Result<()> {
                 json,
             )
         }
-        Command::Dispatch { task, via } => {
+        Command::Dispatch {
+            task,
+            via,
+            runtime: runtime_flag,
+            model,
+        } => {
             let via = ops::provenance(via);
             let d = runtime.block_on(async {
                 let client = ops::attach(port).await?;
-                ops::dispatch(&client, &task, via.as_deref()).await
+                ops::dispatch(
+                    &client,
+                    &task,
+                    via.as_deref(),
+                    runtime_flag.as_deref(),
+                    model.as_deref(),
+                )
+                .await
             })?;
             println!(
                 "dispatched {task} → chat {} (attempt {}, {})",
@@ -204,6 +224,19 @@ fn main() -> Result<()> {
             );
             if let Some(v) = &via {
                 println!("released by chat {v}");
+            }
+            if runtime_flag.is_some() || model.is_some() {
+                println!(
+                    "overrides: {}",
+                    [
+                        runtime_flag.as_deref().map(|r| format!("runtime={r}")),
+                        model.as_deref().map(|m| format!("model={m}")),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                );
             }
             Ok(())
         }
@@ -308,7 +341,7 @@ fn main() -> Result<()> {
                 let d = runtime.block_on(async {
                     let client = ops::attach(port).await?;
                     ops::await_row(&client, &id, pickup).await?;
-                    ops::dispatch(&client, &id, via.as_deref()).await
+                    ops::dispatch(&client, &id, via.as_deref(), None, None).await
                 })?;
                 println!("dispatched {id} → chat {} (attempt {})", d.chat_id, d.attempt);
             }

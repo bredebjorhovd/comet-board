@@ -178,11 +178,12 @@ pub fn build_spec(
     route: &Route,
     task: &Task,
     space: &SpaceRef,
+    overrides: &DispatchOverrides,
 ) -> Result<DispatchSpec> {
-    let harness = harness_for_runtime(&route.runtime).ok_or_else(|| {
+    let runtime = overrides.runtime.as_deref().unwrap_or(&route.runtime);
+    let harness = harness_for_runtime(runtime).ok_or_else(|| {
         anyhow::anyhow!(
-            "runtime `{}` is not a comet harness; expected one of: {}",
-            route.runtime,
+            "runtime `{runtime}` is not a comet harness; expected one of: {}",
             crate::runtime::RUNTIME_NAMES.join(", ")
         )
     })?;
@@ -201,8 +202,23 @@ pub fn build_spec(
         branch,
         worktree: true,
         harness,
-        model: None,
+        model: overrides.model.clone(),
     })
+}
+
+/// Per-dispatch deviations from the route's defaults — what the operator (or an
+/// orchestrating agent) chooses at release time over what `routing.toml` says.
+///
+/// `runtime` is validated against the same [`harness_for_runtime`] mapping as
+/// the route's own `runtime` key; the pickers surface exactly the canonical
+/// names [`crate::runtime::runtime_options`] offers, and the engine refuses a
+/// name that maps to no harness the way it refuses a bad route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchOverrides {
+    /// Runtime name (e.g. `opencode`). `None` = the route's configured runtime.
+    pub runtime: Option<String>,
+    /// Model id for the chosen harness. `None` = the harness default.
+    pub model: Option<String>,
 }
 
 /// Does `space` answer to the name a route's `workspace` key uses? Comet spaces
@@ -270,13 +286,13 @@ mod tests {
 
     #[test]
     fn branch_comes_from_the_template_repo_qualified() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space()).unwrap();
+        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
         assert_eq!(spec.branch, "board/gh-7-widget");
     }
 
     #[test]
     fn the_brief_names_task_and_branch() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space()).unwrap();
+        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
         assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
         assert!(
             spec.prompt
@@ -287,7 +303,7 @@ mod tests {
 
     #[test]
     fn the_space_path_is_the_repo_root() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space()).unwrap();
+        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
         assert_eq!(spec.repo_path, "/home/x/dev/widget");
         assert_eq!(spec.space_id, "space-1");
         assert_eq!(spec.harness, comet_proto::HarnessId::ClaudeCode);
@@ -297,10 +313,69 @@ mod tests {
     fn an_unknown_runtime_is_refused_by_name() {
         let mut r = route();
         r.runtime = "gemini".into();
-        let err = build_spec(&RoutingConfig::default(), &r, &task(), &space())
+        let err = build_spec(&RoutingConfig::default(), &r, &task(), &space(), &DispatchOverrides::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("gemini"), "{err}");
+    }
+
+    #[test]
+    fn a_dispatch_runtime_override_wins_over_the_route() {
+        // The route says claude-code; the release says opencode — the harness
+        // follows the override, the brief is unchanged.
+        let overrides = DispatchOverrides {
+            runtime: Some("opencode".into()),
+            model: None,
+        };
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &overrides,
+        )
+        .unwrap();
+        assert_eq!(spec.harness, comet_proto::HarnessId::Opencode);
+        assert_eq!(spec.model, None);
+        assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
+    }
+
+    #[test]
+    fn a_dispatch_model_override_is_carried_into_the_spec() {
+        let overrides = DispatchOverrides {
+            runtime: None,
+            model: Some("sonnet-4".into()),
+        };
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &overrides,
+        )
+        .unwrap();
+        assert_eq!(spec.model.as_deref(), Some("sonnet-4"));
+        // No runtime override: the route's claude-code stays.
+        assert_eq!(spec.harness, comet_proto::HarnessId::ClaudeCode);
+    }
+
+    #[test]
+    fn a_bad_dispatch_runtime_override_is_refused_by_name() {
+        let overrides = DispatchOverrides {
+            runtime: Some("nonesuch".into()),
+            model: None,
+        };
+        let err = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &overrides,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nonesuch"), "{err}");
+        assert!(err.contains("claude-code"), "the known list is named: {err}");
     }
 
     #[test]
@@ -465,7 +540,7 @@ mod tests {
     fn prompt_at_resolves_the_worktree_late() {
         let mut r = route();
         r.prompt = Some("Work on {title} in {worktree}.".into());
-        let spec = build_spec(&RoutingConfig::default(), &r, &task(), &space()).unwrap();
+        let spec = build_spec(&RoutingConfig::default(), &r, &task(), &space(), &DispatchOverrides::default()).unwrap();
         // Unresolved (and legible) until the executor knows the checkout…
         assert!(spec.prompt.contains("{worktree}"), "{}", spec.prompt);
         // …then resolved with the real path.

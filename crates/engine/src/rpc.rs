@@ -31,8 +31,9 @@
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
 //! - Board (comet-board fork, docs/BOARD.md): `WatchBoard` → stream of board
-//!   rows (herdr-board's `list --json` shape), `DispatchTask {taskId, via?}` →
-//!   `{chatId, cwd, attempt}`, `CancelTask {taskId}` → `{ok}`. Served off the
+//!   rows (herdr-board's `list --json` shape), `DispatchTask {taskId, via?,
+//!   runtime?, model?}` → `{chatId, cwd, attempt}`, `CancelTask {taskId}` →
+//!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
 //!   engine-hosted board service; deliberately not relay-forwardable yet.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
@@ -70,6 +71,8 @@ use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
+
+use comet_board::dispatch::DispatchOverrides;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -825,6 +828,13 @@ impl RpcService for EngineRpc {
             // Board surface (comet-board fork, docs/BOARD.md §H2). Served off
             // the board service's loop; absent when the board is disabled.
             methods::WATCH_BOARD => Ok(RpcReply::Stream(watch_stream(self.board()?.watch_rows()))),
+            // The runtimes a dispatch can be pointed at — a static catalog from
+            // the board core, so the pickers and the engine validate against
+            // the same set. Not board-loop state: served regardless of the
+            // service's health.
+            methods::LIST_BOARD_RUNTIMES => {
+                RpcReply::value(&comet_board::runtime::runtime_options())
+            }
             methods::DISPATCH_TASK => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
@@ -834,11 +844,24 @@ impl RpcService for EngineRpc {
                     /// provenance, never authority.
                     #[serde(default)]
                     via: Option<String>,
+                    /// Runtime override (e.g. `opencode`); `None` = the route's.
+                    #[serde(default)]
+                    runtime: Option<String>,
+                    /// Model override for the chosen harness.
+                    #[serde(default)]
+                    model: Option<String>,
                 }
                 let p: P = parse_params(params)?;
                 let dispatched = self
                     .board()?
-                    .dispatch_task(&p.task_id, p.via)
+                    .dispatch_task(
+                        &p.task_id,
+                        p.via,
+                        DispatchOverrides {
+                            runtime: p.runtime,
+                            model: p.model,
+                        },
+                    )
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&dispatched)
