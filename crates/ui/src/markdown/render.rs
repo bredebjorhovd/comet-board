@@ -447,7 +447,7 @@ fn render_table(
                 TableAlign::Right => cell.text_right(),
             };
             if let Some(flat) = cell_flat {
-                cell = cell.child(flat_text_element(flat, table_cell_ix(ix, r, c), opts));
+                cell = cell.child(flat_text_element(flat, table_cell_ix(ix, r, c), opts, theme));
             }
             row_el = row_el.child(cell);
         }
@@ -479,11 +479,22 @@ pub struct FlatText {
 /// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
 /// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
 /// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
-pub fn inline_code_text() -> Hsla {
-    crate::theme::oklch(0.811, 0.111, 293.571) // violet-300
+/// Light mode inverts: the pale violet-300 would vanish on white, so the text
+/// deepens to violet-600 and the wash runs slightly stronger over the bright
+/// surface (see [`Theme::light`] — the same "darker accents on white" rule).
+pub fn inline_code_text(theme: &Theme) -> Hsla {
+    if theme.light {
+        crate::theme::oklch(0.541, 0.281, 293.009) // violet-600
+    } else {
+        crate::theme::oklch(0.811, 0.111, 293.571) // violet-300
+    }
 }
-pub fn inline_code_wash() -> Hsla {
-    crate::theme::oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400/12
+pub fn inline_code_wash(theme: &Theme) -> Hsla {
+    if theme.light {
+        crate::theme::oklch(0.702, 0.183, 293.541).opacity(0.14) // violet-400/14 over white
+    } else {
+        crate::theme::oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400/12
+    }
 }
 /// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
 /// x extends 2px past the glyphs, y insets 2px from the 22px line box).
@@ -539,7 +550,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // Inline code reads violet (see `inline_code_text`); everything else
         // stays the monochrome foreground.
         let color = if run.style.code {
-            inline_code_text()
+            inline_code_text(theme)
         } else {
             theme.text
         };
@@ -614,7 +625,12 @@ fn flatten_cached(
 }
 
 /// Veiled, clickable text for a flattened block (no sizing wrapper).
-fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyElement {
+fn flat_text_element(
+    flat: &FlatText,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> AnyElement {
     // Streaming veil: opacity-only recolor of the runs covering newly appended
     // chunks. Same text, same fonts, same lengths — layout is untouched.
     // Settled elements return no spans and reuse the cached runs unsplit.
@@ -648,16 +664,16 @@ fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyEle
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
     let code_ranges = flat.code_ranges.clone();
     let flat_text = flat.text.clone();
+    let code_wash = inline_code_wash(theme);
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
-            let wash = inline_code_wash();
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
                     window.paint_quad(quad(
                         rect,
                         px(INLINE_CODE_RADIUS),
-                        wash,
+                        code_wash,
                         px(0.0),
                         gpui::transparent_black(),
                         BorderStyle::default(),
@@ -923,7 +939,7 @@ fn text_element(
         FontWeight::NORMAL
     };
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
-    let inner = flat_text_element(&flat, ix, opts);
+    let inner = flat_text_element(&flat, ix, opts, theme);
     div()
         .text_size(px(size))
         .line_height(px(line_height))
@@ -1089,11 +1105,31 @@ fn render_code_block(
 /// Paint color for a token class — the soft syntax palette (round 9: the
 /// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
 /// asked for color; these are the diff pane's hues, now shared by both).
+/// Dark keeps the light pastels (readable on the near-black code block);
+/// light deepens each hue to its 700-shade so it keeps contrast on white.
 pub fn token_color(class: TokenClass, theme: &Theme) -> Hsla {
     match class {
-        TokenClass::Keyword => crate::theme::oklch(0.709, 0.129, 20.0), // soft rose
-        TokenClass::StringLit => crate::theme::oklch(0.77, 0.11, 168.0), // soft green
-        TokenClass::Number => crate::theme::oklch(0.78, 0.12, 80.0),    // soft amber
+        TokenClass::Keyword => {
+            if theme.light {
+                crate::theme::oklch(0.514, 0.222, 16.935) // rose-700
+            } else {
+                crate::theme::oklch(0.709, 0.129, 20.0) // soft rose
+            }
+        }
+        TokenClass::StringLit => {
+            if theme.light {
+                crate::theme::oklch(0.508, 0.118, 165.612) // emerald-700
+            } else {
+                crate::theme::oklch(0.77, 0.11, 168.0) // soft green
+            }
+        }
+        TokenClass::Number => {
+            if theme.light {
+                crate::theme::oklch(0.555, 0.163, 48.998) // amber-700
+            } else {
+                crate::theme::oklch(0.78, 0.12, 80.0) // soft amber
+            }
+        }
         TokenClass::Comment => theme.text_faint,
     }
 }
@@ -1207,7 +1243,7 @@ mod tests {
         assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
         // Code text is the violet tint; the square run background is gone
         // (the rounded wash is painted by the canvas underlay instead).
-        assert_eq!(flat.runs[1].color, inline_code_text());
+        assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.text);
     }
@@ -1223,6 +1259,40 @@ mod tests {
             token_color(TokenClass::Keyword, &theme)
         );
         assert_eq!(token_color(TokenClass::Comment, &theme), theme.text_faint);
+    }
+
+    #[test]
+    fn light_mode_deepens_code_accents() {
+        // Round 2 light mode: the pale pastels tuned for the #060606 panel wash
+        // out on white, so inline code and the syntax palette deepen while dark
+        // keeps the glowing tones.
+        let dark = Theme::dark();
+        let light = Theme::light();
+        // Inline code: violet-600 text on white, dark keeps violet-300.
+        assert!(inline_code_text(&light).l < inline_code_text(&dark).l);
+        assert!(inline_code_wash(&light).a > inline_code_wash(&dark).a);
+        // Syntax tokens: every colored class deepens in light; comments stay
+        // the theme's faint neutral in both.
+        for class in [
+            TokenClass::Keyword,
+            TokenClass::StringLit,
+            TokenClass::Number,
+        ] {
+            assert!(
+                token_color(class, &light).l < token_color(class, &dark).l,
+                "{class:?} should deepen in light"
+            );
+        }
+        assert_eq!(token_color(TokenClass::Comment, &light), light.text_faint);
+        assert_eq!(token_color(TokenClass::Comment, &dark), dark.text_faint);
+        // And light tokens stay distinct from the plain text color.
+        for class in [
+            TokenClass::Keyword,
+            TokenClass::StringLit,
+            TokenClass::Number,
+        ] {
+            assert_ne!(token_color(class, &light), light.text);
+        }
     }
 
     #[test]

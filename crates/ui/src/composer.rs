@@ -2598,8 +2598,13 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.white_alpha(0.03))
-            .shadow_lg()
+            .bg(if theme.light {
+                theme.surface_raised
+            } else {
+                theme.white_alpha(0.03)
+            })
+            .when(theme.light, |el| el.shadow_sm())
+            .when(!theme.light, |el| el.shadow_lg())
             .flex()
             .flex_col()
             .child(
@@ -2886,19 +2891,17 @@ impl Render for Composer {
                 let offline = message.as_ref() == "Engine not connected";
                 let (border_c, wash, text_c) = if offline {
                     let amber = theme.warning; // amber-400
-                    let amber_200 = crate::theme::oklch(0.924, 0.12, 95.746);
                     (
                         amber.opacity(0.16),
                         amber.opacity(0.05),
-                        amber_200.opacity(0.9),
+                        theme.warning_text().opacity(0.9),
                     )
                 } else {
                     let danger = theme.danger; // red-400
-                    let red_300 = crate::theme::oklch(0.808, 0.114, 19.571);
                     (
                         danger.opacity(0.16),
                         danger.opacity(0.05),
-                        red_300.opacity(0.9),
+                        theme.danger_text().opacity(0.9),
                     )
                 };
                 el.child(
@@ -3007,13 +3010,23 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = theme.white_alpha(0.03);
+        //
+        // Light mode inverts the wash: a 3% black tint over the near-white
+        // panel reads as a smudge under the heavy shadow, so the pill goes
+        // SOLID (`surface_raised`) with a lighter shadow — a crisp raised well
+        // with the same hairline.
+        let pill_bg = if theme.light {
+            theme.surface_raised
+        } else {
+            theme.white_alpha(0.03)
+        };
         let pill = div()
             .rounded(px(26.0))
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
-            .shadow_lg();
+            .when(theme.light, |el| el.shadow_sm())
+            .when(!theme.light, |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
