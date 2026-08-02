@@ -78,14 +78,17 @@ pub struct BoardService {
 
 impl BoardService {
     /// Open the board under the engine's data dir and start the loop. Must be
-    /// called from a tokio runtime (the session-watch forwarder is a task).
+    /// called from a tokio runtime (the session-watch forwarder is a task);
+    /// `handle` is the runtime the loop enters so dispatch's `tokio::spawn` /
+    /// `Handle::block_on` work from its plain thread.
     pub fn spawn(
         data_dir: &std::path::Path,
         sessions: watch::Receiver<Vec<Session>>,
         runtime: Arc<dyn Runtime + Send + Sync>,
         spaces: watch::Receiver<Vec<Space>>,
+        handle: tokio::runtime::Handle,
     ) -> anyhow::Result<BoardService> {
-        Self::spawn_at(Paths::under(data_dir)?, sessions, runtime, spaces)
+        Self::spawn_at(Paths::under(data_dir)?, sessions, runtime, spaces, handle)
     }
 
     /// As [`BoardService::spawn`], with the directories chosen by the caller —
@@ -95,6 +98,7 @@ impl BoardService {
         mut sessions: watch::Receiver<Vec<Session>>,
         runtime: Arc<dyn Runtime + Send + Sync>,
         spaces: watch::Receiver<Vec<Space>>,
+        handle: tokio::runtime::Handle,
     ) -> anyhow::Result<BoardService> {
         let log = Arc::new(Logger::new(paths.logfile(), false));
         // Surface an unopenable store here, where the caller can log it as the
@@ -122,7 +126,7 @@ impl BoardService {
         let thread = std::thread::Builder::new()
             .name("comet-board-sync".into())
             .spawn(move || match SyncEngine::from_paths(&paths, log.clone()) {
-                Ok(engine) => run_loop(engine, rx, log, runtime, spaces, rows_tx),
+                Ok(engine) => run_loop(engine, rx, log, runtime, handle, spaces, rows_tx),
                 Err(e) => log.error(format!("board loop failed to start: {e}")),
             })?;
         tracing::info!("board service started");
@@ -204,9 +208,16 @@ fn run_loop(
     rx: mpsc::Receiver<Msg>,
     log: Arc<Logger>,
     runtime: Arc<dyn Runtime + Send + Sync>,
+    handle: tokio::runtime::Handle,
     spaces: watch::Receiver<Vec<Space>>,
     rows: watch::Sender<Vec<TaskRow>>,
 ) {
+    // The loop is a plain thread, but dispatch/cancel call engine code that
+    // `tokio::spawn`s (doc_host.open) and `Handle::block_on`s (CometRuntime).
+    // Enter the engine's runtime for the loop's life so those calls have a
+    // context — a `tokio::spawn` outside any runtime panics and kills the
+    // loop, which surfaces as "board stream interrupted" to the caller.
+    let _enter = handle.enter();
     log.info(format!(
         "board loop up (interval {}s)",
         engine.cfg.sync.interval_secs()
@@ -502,6 +513,12 @@ mod tests {
         cancelled: std::sync::Mutex<Vec<String>>,
         /// What `chat_alive` answers — flip to fake an archived/gone chat.
         alive: std::sync::atomic::AtomicBool,
+        /// Mirror `CometRuntime::dispatch` → `doc_host.open`, which `tokio::spawn`s
+        /// the chat task: when set, `dispatch` needs a tokio context. The board
+        /// loop runs on a plain thread, so without the fix this panics and kills
+        /// the loop — the regression the `dispatch_from_a_plain_thread...` test
+        /// pins.
+        spawn_in_dispatch: std::sync::atomic::AtomicBool,
     }
 
     impl Default for FakeRuntime {
@@ -510,12 +527,16 @@ mod tests {
                 dispatched: Default::default(),
                 cancelled: Default::default(),
                 alive: std::sync::atomic::AtomicBool::new(true),
+                spawn_in_dispatch: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
 
     impl Runtime for FakeRuntime {
         fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            if self.spawn_in_dispatch.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::spawn(async move {});
+            }
             self.dispatched.lock().unwrap().push(spec.clone());
             Ok(DispatchHandle {
                 chat_id: format!("chat-for-{}", spec.identifier),
@@ -554,8 +575,14 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::default());
         // A closed spaces channel still serves its last value via `borrow`.
         let (_, spaces_rx) = watch::channel(spaces);
-        let service =
-            BoardService::spawn_at(paths.clone(), sessions, runtime.clone(), spaces_rx).unwrap();
+        let service = BoardService::spawn_at(
+            paths.clone(),
+            sessions,
+            runtime.clone(),
+            spaces_rx,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
         (service, runtime)
     }
 
@@ -775,6 +802,60 @@ runtime = "mock"
         let rows = service.watch_rows().borrow().clone();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id.as_deref(), Some("chat-for-gh#7"));
+
+        service.shutdown();
+    }
+
+    /// Dispatch must survive the board loop's plain thread. `CometRuntime::dispatch`
+    /// `tokio::spawn`s from it (doc_host.open's chat task), and a thread with no
+    /// tokio context panics there — killing the loop, which surfaces as "board
+    /// stream interrupted". A runtime whose dispatch really spawns reproduces it,
+    /// and the whole call comes from a non-runtime thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_from_a_plain_thread_spawns_and_the_loop_survives() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#60", "gh#60");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        let service = Arc::new(service);
+        runtime
+            .spawn_in_dispatch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Dispatch through the board service from a plain thread: the loop
+        // executes `handle_dispatch` → `dispatch` → `tokio::spawn` on
+        // `comet-board-sync`, a `std::thread` that needs the engine's runtime
+        // context to spawn.
+        let handle = tokio::runtime::Handle::current();
+        let dispatch = service.clone();
+        let d = std::thread::spawn(move || {
+            handle.block_on(async {
+                dispatch
+                    .dispatch_task("gh:owner/widget#60", None, DispatchOverrides::default())
+                    .await
+                    .expect("dispatch succeeds")
+            })
+        })
+        .join()
+        .expect("dispatch thread did not panic");
+
+        assert_eq!(d.chat_id, "chat-for-gh#60");
+        assert_eq!(d.attempt, 1);
+
+        // The loop survived: a second dispatch is refused on the live attempt
+        // with a real answer, not "board loop is not running".
+        let err = service
+            .dispatch_task("gh:owner/widget#60", None, DispatchOverrides::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("live attempt"), "{err}");
+
+        // …and WatchBoard still streams the dispatched row.
+        let rows = service.watch_rows().borrow().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chat_id.as_deref(), Some("chat-for-gh#60"));
 
         service.shutdown();
     }
