@@ -14,12 +14,15 @@
 //!   derivation;
 //! - `enter` on a ready row dispatches it (`DispatchTask`); on a running row it
 //!   opens that attempt's chat; on a section header it folds/unfolds;
+//! - the dispatch picker asks which runtime (and which model on that harness —
+//!   `ListModels`, defaulted to the harness's first catalog row) to release
+//!   under, and sends both overrides;
 //! - `f` cycles the routes on the board, `F` clears the filter, `/` opens the
 //!   find field (live substring matching), `esc` closes the panel;
 //! - the panel is lazy: no RPC until it is first opened, and the stream
 //!   reconnects with a 2 s backoff if the engine drops it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -47,9 +50,36 @@ struct BoardRuntime {
     label: String,
 }
 
+/// One model a dispatch can be pointed at, as the engine's `ListModels` reports
+/// it for a harness — `id` is exactly what the `DispatchTask` override sends.
+#[derive(Debug, Clone, Deserialize)]
+struct BoardModelInfo {
+    id: String,
+    label: String,
+}
+
+/// Which of the picker's two rows the keyboard highlights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerRow {
+    Runtime,
+    Model,
+}
+
+/// A harness's model catalog in the dispatch picker, loaded for the highlighted
+/// runtime on demand and cached (switching back is instant).
+#[derive(Debug, Clone, Default)]
+enum ModelCatalog {
+    #[default]
+    Idle,
+    Loading,
+    Ready(Vec<BoardModelInfo>),
+    Error(String),
+}
+
 /// A dispatch in the pick step: the operator chose a task, and the panel is
-/// asking which runtime to release it under. The runtimes load asynchronously
-/// after the picker opens; keyboard nav is inert until they land.
+/// asking which runtime — and which model on that harness — to release it
+/// under. Runtimes load asynchronously after the picker opens; keyboard nav is
+/// inert until they land.
 #[derive(Debug, Clone)]
 struct DispatchDraft {
     task_id: String,
@@ -57,10 +87,34 @@ struct DispatchDraft {
     /// The route's runtime — the picker's default, when the list offers it.
     route_runtime: Option<String>,
     runtimes: Vec<BoardRuntime>,
-    active: usize,
+    active_runtime: usize,
     /// A failed `ListBoardRuntimes`, shown in the strip instead of a stale
     /// "Loading…" (enter still dispatches with the route's runtime).
-    error: Option<String>,
+    runtime_error: Option<String>,
+    /// Per-runtime model catalogs, fetched for the highlighted runtime on
+    /// demand (`ListModels { harness }` keyed by the canonical runtime name,
+    /// which is exactly the harness's kebab-case id).
+    catalogs: HashMap<String, ModelCatalog>,
+    /// The row the keyboard highlights.
+    row: PickerRow,
+    /// The model highlight for the ACTIVE runtime: 0 = the harness default
+    /// (no override — the route's behavior), `i` = the catalog's `i`-th model.
+    active_model: usize,
+}
+
+impl DispatchDraft {
+    /// The canonical name of the highlighted runtime.
+    fn active_runtime_name(&self) -> Option<String> {
+        self.runtimes
+            .get(self.active_runtime)
+            .map(|r| r.name.clone())
+    }
+
+    /// The model catalog of the highlighted runtime, when loaded.
+    fn catalog(&self) -> Option<&ModelCatalog> {
+        let name = self.active_runtime_name()?;
+        self.catalogs.get(&name)
+    }
 }
 
 /// The picker's starting row: the route's runtime when the list offers it by
@@ -70,6 +124,23 @@ fn default_runtime_index(options: &[BoardRuntime], route_runtime: Option<&str>) 
     route_runtime
         .and_then(|route| options.iter().position(|o| o.name == route))
         .unwrap_or(0)
+}
+
+/// The model a dispatch actually runs with, given the picker's highlight:
+/// the highlighted catalog row — index 0 is the harness default, every other
+/// index a picked model. `None` only when the catalog is missing.
+fn highlighted_model(models: &[BoardModelInfo], active: usize) -> Option<&BoardModelInfo> {
+    models.get(active)
+}
+
+/// The override a dispatch should SEND for a highlight: `None` at the default
+/// row (the harness default needs no override — the route's behavior), the
+/// catalog model's id otherwise.
+fn override_model_id(models: &[BoardModelInfo], active: usize) -> Option<&str> {
+    match active {
+        0 => None,
+        k => models.get(k).map(|m| m.id.as_str()),
+    }
 }
 
 /// A line the board body draws: a section header, or a task row.
@@ -358,6 +429,9 @@ pub struct BoardPanel {
     find_focus_pending: bool,
     /// The board body's scroll position.
     scroll: ScrollHandle,
+    /// The model row's scroll position (the catalog is long — opencode alone
+    /// offers 70+ models — so the strip scrolls horizontally).
+    model_scroll: ScrollHandle,
     /// A transient dispatch/cancel message for the footer.
     notice: Option<SharedString>,
     /// An open runtime picker for a dispatch (ready row → enter). `None` =
@@ -409,6 +483,7 @@ impl BoardPanel {
             _find_events: None,
             find_focus_pending: false,
             scroll: ScrollHandle::new(),
+            model_scroll: ScrollHandle::new(),
             notice: None,
             dispatch: None,
             _ticker: ticker,
@@ -534,8 +609,11 @@ impl BoardPanel {
             task_id,
             identifier,
             runtimes: Vec::new(),
-            active: 0,
-            error: None,
+            active_runtime: 0,
+            runtime_error: None,
+            catalogs: HashMap::new(),
+            row: PickerRow::Runtime,
+            active_model: 0,
         });
         cx.notify();
         self.load_dispatch_runtimes(engine, cx);
@@ -543,8 +621,9 @@ impl BoardPanel {
 
     /// Fetch `ListBoardRuntimes` into the open picker. The picker renders
     /// immediately with "Loading…"; the list landing re-homes the cursor onto
-    /// the route's runtime. A failed load leaves the picker open (escape always
-    /// works) with a notice naming the failure.
+    /// the route's runtime and starts the model load for it. A failed load
+    /// leaves the picker open (escape always works) with a notice naming the
+    /// failure.
     fn load_dispatch_runtimes(&mut self, engine: EngineHandle, cx: &mut Context<Self>) {
         let Some(task_id) = self.dispatch.as_ref().map(|d| d.task_id.clone()) else {
             return;
@@ -565,13 +644,13 @@ impl BoardPanel {
                     Ok(value) => match serde_json::from_value::<Vec<BoardRuntime>>(value) {
                         Ok(options) => {
                             draft.runtimes = options;
-                            draft.active = default_runtime_index(
+                            draft.active_runtime = default_runtime_index(
                                 &draft.runtimes,
                                 draft.route_runtime.as_deref(),
                             );
                         }
                         Err(err) => {
-                            draft.error = Some(format!("Couldn't read runtimes: {err}"));
+                            draft.runtime_error = Some(format!("Couldn't read runtimes: {err}"));
                             panel.set_notice(
                                 format!("Couldn't read runtimes — enter dispatches with the route's: {err}"),
                                 cx,
@@ -579,12 +658,69 @@ impl BoardPanel {
                         }
                     },
                     Err(err) => {
-                        draft.error = Some(format!("Couldn't list runtimes: {err}"));
+                        draft.runtime_error = Some(format!("Couldn't list runtimes: {err}"));
                         panel.set_notice(
                             format!("Couldn't list runtimes — enter dispatches with the route's: {err}"),
                             cx,
                         );
                     }
+                }
+                // Whatever landed (or failed), start the model load for the
+                // highlighted runtime — enter must know which model it will
+                // release under, not just which runtime.
+                panel.ensure_dispatch_models(engine.clone(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Kick off `ListModels` for the highlighted runtime when its catalog isn't
+    /// loaded yet. Idempotent per runtime: a catalog that landed stays cached,
+    /// so highlighting back and forth never re-fetches.
+    fn ensure_dispatch_models(&mut self, engine: EngineHandle, cx: &mut Context<Self>) {
+        let Some(draft) = self.dispatch.as_mut() else { return };
+        let Some(runtime) = draft.active_runtime_name() else { return };
+        let slot = draft.catalogs.entry(runtime.clone()).or_default();
+        if !matches!(slot, ModelCatalog::Idle) {
+            return;
+        }
+        *slot = ModelCatalog::Loading;
+        let task_id = draft.task_id.clone();
+        let runtime_for_landing = runtime.clone();
+        cx.spawn(async move |this, cx| {
+            // The canonical runtime name IS the harness's kebab-case id, so it
+            // deserializes straight into `ListModels { harness }`.
+            let result = engine
+                .client()
+                .call(methods::LIST_MODELS, serde_json::json!({ "harness": runtime }))
+                .await;
+            this.update(cx, |panel, cx| {
+                // A newer pick (or a cancel) replaced this one mid-flight.
+                let Some(draft) = panel.dispatch.as_mut() else { return };
+                if draft.task_id != task_id {
+                    return;
+                }
+                let loaded = match result {
+                    Ok(value) => match serde_json::from_value::<Vec<BoardModelInfo>>(value) {
+                        Ok(models) => ModelCatalog::Ready(models),
+                        Err(err) => {
+                            ModelCatalog::Error(format!("Couldn't read models: {err}"))
+                        }
+                    },
+                    Err(err) => ModelCatalog::Error(format!("Couldn't list models: {err}")),
+                };
+                draft.catalogs.insert(runtime_for_landing.clone(), loaded);
+                // If the operator moved off this runtime while loading, the
+                // landing must not re-home the highlight it left behind.
+                if draft
+                    .runtimes
+                    .get(draft.active_runtime)
+                    .map(|r| r.name.as_str())
+                    == Some(runtime_for_landing.as_str())
+                {
+                    draft.active_model = 0;
                 }
                 cx.notify();
             })
@@ -593,26 +729,81 @@ impl BoardPanel {
         .detach();
     }
 
-    /// `enter` on the picker: dispatch with the highlighted runtime.
+    /// `enter` on the picker: dispatch with the highlighted runtime and model.
     fn confirm_dispatch(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.dispatch.take() else { return };
-        let runtime = draft.runtimes.get(draft.active).map(|r| r.name.clone());
-        self.send_dispatch(&draft.task_id, &draft.identifier, runtime.as_deref(), cx);
+        let runtime = draft.active_runtime_name();
+        let (model, effective) = match draft.catalog() {
+            Some(ModelCatalog::Ready(models)) => {
+                let effective = highlighted_model(models, draft.active_model).map(|m| m.id.clone());
+                let model = override_model_id(models, draft.active_model).map(str::to_string);
+                (model, effective)
+            }
+            _ => (None, None),
+        };
+        self.send_dispatch(
+            &draft.task_id,
+            &draft.identifier,
+            runtime.as_deref(),
+            model.as_deref(),
+            effective.as_deref(),
+            cx,
+        );
     }
 
-    /// Clicking a runtime chip: dispatch with that runtime, no confirm step.
-    fn confirm_with_runtime(&mut self, name: &str, cx: &mut Context<Self>) {
+    /// Clicking a runtime chip: select that runtime and load its models. A
+    /// selection is never itself a release — the model row (or enter) is.
+    fn select_runtime(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(draft) = self.dispatch.as_mut() else { return };
+        let Some(ix) = draft.runtimes.iter().position(|r| r.name == name) else {
+            return;
+        };
+        if draft.active_runtime != ix {
+            draft.active_runtime = ix;
+            // A new harness's highlight starts on its default — the old pick
+            // would be a model the new harness may not even offer.
+            draft.active_model = 0;
+            // The runtime is settled; the next input belongs to the models.
+            draft.row = PickerRow::Model;
+        }
+        let Some(engine) = self.engine(cx) else { return };
+        self.ensure_dispatch_models(engine, cx);
+        cx.notify();
+    }
+
+    /// Clicking a model chip: dispatch with the current runtime + that model.
+    fn confirm_with_model(&mut self, chip_ix: usize, cx: &mut Context<Self>) {
         let Some(draft) = self.dispatch.take() else { return };
-        self.send_dispatch(&draft.task_id, &draft.identifier, Some(name), cx);
+        let runtime = draft.active_runtime_name();
+        let (model, effective) = match draft.catalog() {
+            Some(ModelCatalog::Ready(models)) => {
+                let effective = highlighted_model(models, chip_ix).map(|m| m.id.clone());
+                let model = override_model_id(models, chip_ix).map(str::to_string);
+                (model, effective)
+            }
+            _ => (None, None),
+        };
+        self.send_dispatch(
+            &draft.task_id,
+            &draft.identifier,
+            runtime.as_deref(),
+            model.as_deref(),
+            effective.as_deref(),
+            cx,
+        );
     }
 
-    /// Send `DispatchTask` for a task, with the picked runtime override (if
-    /// any). The chat the run landed in is named in the confirmation notice.
+    /// Send `DispatchTask` for a task, with the picked runtime/model overrides
+    /// (if any). The confirmation names the chat AND the model the run will
+    /// actually use — the override when one was picked, else the harness
+    /// default the catalog leads with.
     fn send_dispatch(
         &mut self,
         task_id: &str,
         identifier: &str,
         runtime: Option<&str>,
+        model: Option<&str>,
+        effective_model: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.engine(cx) else {
@@ -622,10 +813,21 @@ impl BoardPanel {
         let task_id = task_id.to_string();
         let identifier = identifier.to_string();
         let runtime = runtime.map(str::to_string);
+        let model = model.map(str::to_string);
+        let effective = effective_model.map(str::to_string);
+        // Computed before the params consume `runtime`/`model`.
+        let detail = match (&runtime, &effective) {
+            (Some(runtime), Some(model)) => format!(" · {runtime} / {model}"),
+            (Some(runtime), None) => format!(" · {runtime}"),
+            _ => String::new(),
+        };
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "taskId": task_id });
             if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
                 object.insert("runtime".into(), serde_json::Value::String(runtime));
+            }
+            if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
+                object.insert("model".into(), serde_json::Value::String(model));
             }
             let result = engine.client().call(methods::DISPATCH_TASK, params).await;
             this.update(cx, |panel, cx| match result {
@@ -636,7 +838,7 @@ impl BoardPanel {
                         .map(str::to_string)
                         .unwrap_or_default();
                     panel.set_notice(
-                        format!("Dispatched {identifier} — chat {chat} is on it"),
+                        format!("Dispatched {identifier} — chat {chat} is on it{detail}"),
                         cx,
                     );
                 }
@@ -778,18 +980,51 @@ impl BoardPanel {
             return;
         }
 
-        // The runtime picker owns the keys while it is open: arrows move the
-        // highlighted runtime, enter dispatches with it, escape cancels.
+        // The dispatch picker owns the keys while it is open: up/down switches
+        // between the runtime and model rows, left/right moves the highlight
+        // within the focused row, enter dispatches with both, escape cancels.
         if self.dispatch.is_some() {
             match key {
                 "up" | "down" => {
-                    let delta = if key == "up" { -1 } else { 1 };
-                    if let Some(draft) = self.dispatch.as_mut()
-                        && !draft.runtimes.is_empty()
-                    {
-                        draft.active = (draft.active as isize + delta)
-                            .clamp(0, draft.runtimes.len() as isize - 1)
-                            as usize;
+                    if let Some(draft) = self.dispatch.as_mut() {
+                        draft.row = match draft.row {
+                            PickerRow::Runtime => PickerRow::Model,
+                            PickerRow::Model => PickerRow::Runtime,
+                        };
+                    }
+                    self.reveal_model_chip();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                "left" | "right" => {
+                    let delta = if key == "left" { -1 } else { 1 };
+                    if let Some(draft) = self.dispatch.as_mut() {
+                        match draft.row {
+                            PickerRow::Runtime if !draft.runtimes.is_empty() => {
+                                draft.active_runtime = (draft.active_runtime as isize + delta)
+                                    .clamp(0, draft.runtimes.len() as isize - 1)
+                                    as usize;
+                                draft.active_model = 0;
+                            }
+                            PickerRow::Model => {
+                                let len = match draft.catalog() {
+                                    Some(ModelCatalog::Ready(models)) => models.len(),
+                                    _ => 1,
+                                };
+                                draft.active_model = (draft.active_model as isize + delta)
+                                    .clamp(0, len.saturating_sub(1) as isize)
+                                    as usize;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A runtime move re-homes onto the default; a model move
+                    // walks the (long) strip — either way keep the highlight
+                    // in view.
+                    self.reveal_model_chip();
+                    if let Some(engine) = self.engine(cx) {
+                        self.ensure_dispatch_models(engine, cx);
                     }
                     cx.notify();
                     cx.stop_propagation();
@@ -861,6 +1096,16 @@ impl BoardPanel {
                 self.scroll.scroll_to_item(ix);
             }
             cx.notify();
+        }
+    }
+
+    /// Scroll the model row so the highlighted chip stays in view. The strip
+    /// is horizontally scrollable (opencode's catalog is 70+ models), so the
+    /// keyboard must reveal what it highlights.
+    fn reveal_model_chip(&self) {
+        if let Some(draft) = self.dispatch.as_ref() {
+            let model_scroll = self.model_scroll.clone();
+            model_scroll.scroll_to_item(draft.active_model);
         }
     }
 
@@ -1410,22 +1655,27 @@ impl BoardPanel {
         cx.open_url(url);
     }
 
-    /// The runtime picker: a strip under the header, one chip per runtime the
-    /// engine offers, the highlighted one on the route's runtime. Enter
-    /// dispatches with the highlight; clicking a chip dispatches with that one
-    /// immediately. Before the options load it is a single "Loading…" row.
+    /// The dispatch picker: two strips under the header. The first rows the
+    /// runtimes the engine offers, the highlighted one on the route's runtime;
+    /// the second rows that harness's models (a "Default" first — index 0 —
+    /// then the catalog in order), scrolling horizontally when the catalog is
+    /// long. Clicking a runtime SELECTS it and loads its models; clicking a
+    /// model dispatches immediately; enter dispatches with both highlights.
+    /// Before the options load it is a single "Loading…" row.
     fn render_dispatch_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let draft = self.dispatch.clone().expect("picker renders only when open");
+        let runtime_focused = draft.row == PickerRow::Runtime;
+        let model_focused = draft.row == PickerRow::Model;
 
-        let label: SharedString = match (&draft.error, draft.runtimes.is_empty()) {
+        // Row 1: the runtime. Highlight = the route's runtime; the label shows
+        // which row the keyboard is on.
+        let runtime_label: SharedString = match (&draft.runtime_error, draft.runtimes.is_empty()) {
             (Some(err), _) => format!("{err} — enter dispatches with the route's runtime").into(),
             (None, true) => "Loading runtimes…".into(),
-            (None, false) => "Dispatch with:".into(),
+            (None, false) => "Runtime".into(),
         };
-
-        let mut strip = div()
-            .id("board-runtime-picker")
+        let mut runtime_row = div()
             .flex_none()
             .flex()
             .flex_row()
@@ -1433,26 +1683,25 @@ impl BoardPanel {
             .gap(px(6.0))
             .px(px(Theme::SPACE_LG))
             .py(px(6.0))
-            .border_b_1()
-            .border_color(theme.white_alpha(0.06))
             .child(
                 div()
                     .flex_none()
                     .text_size(px(10.5))
-                    .text_color(if draft.error.is_some() {
-                        theme.warning
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(if runtime_focused {
+                        theme.accent
                     } else {
                         theme.text_faint
                     })
-                    .child(label),
+                    .child(runtime_label),
             );
 
         for (ix, runtime) in draft.runtimes.iter().enumerate() {
-            let active = ix == draft.active;
+            let active = ix == draft.active_runtime;
             let name = runtime.name.clone();
             let label = runtime.label.clone();
             let key = format!("board-runtime-{}-{}", draft.task_id, name);
-            strip = strip.child(
+            runtime_row = runtime_row.child(
                 div()
                     .id(key)
                     .flex_none()
@@ -1462,20 +1711,26 @@ impl BoardPanel {
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .bg(if active {
+                    .bg(if active && runtime_focused {
                         theme.accent.opacity(0.16)
+                    } else if active {
+                        theme.accent.opacity(0.08)
                     } else {
                         theme.wash(0.05)
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.confirm_with_runtime(&name, cx);
+                        this.select_runtime(&name, cx);
                     }))
                     .child(
                         div()
                             .text_size(px(10.5))
                             .text_color(if active {
-                                theme.accent
+                                if runtime_focused {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted.opacity(0.9)
+                                }
                             } else {
                                 theme.text_muted
                             })
@@ -1484,13 +1739,154 @@ impl BoardPanel {
             );
         }
 
-        strip.child(div().flex_1())
+        // Row 2: the highlighted runtime's models — the harness default (no
+        // override) first, then the catalog in order.
+        let mut model_row = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_LG))
+            .py(px(6.0))
+            .border_b_1()
+            .border_t_1()
+            .border_color(theme.white_alpha(0.06));
+
+        match draft.catalog() {
+            Some(ModelCatalog::Error(err)) => {
+                model_row = model_row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .text_color(theme.warning)
+                        .child(
+                            SharedString::from(format!(
+                                "{err} — enter dispatches with the harness default"
+                            )),
+                        ),
+                );
+            }
+            Some(ModelCatalog::Ready(models)) => {
+                model_row = model_row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(if model_focused {
+                            theme.accent
+                        } else {
+                            theme.text_faint
+                        })
+                        .child(SharedString::from("Model")),
+                );
+                // The catalog is long (opencode: 70+); the chips scroll
+                // horizontally, and `scroll_to_item` reveals the keyboard
+                // highlight by chip index (the Default chip is index 0).
+                let mut chips = div()
+                    .id("board-model-chips")
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.model_scroll);
+                for (ix, model) in models.iter().enumerate() {
+                    chips = chips.child(self.render_model_chip(&draft, ix, model, &theme, cx));
+                }
+                model_row = model_row.child(chips);
+            }
+            _ => {
+                model_row = model_row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("Loading models…")),
+                );
+            }
+        }
+
+        // The chips container is itself `flex_1` — it owns the free width so
+        // as many models as fit are visible before the strip scrolls. Only the
+        // loading/error rows need the trailing spacer to right-align the hint.
+        let models_ready = matches!(draft.catalog(), Some(ModelCatalog::Ready(_)));
+        let model_row = model_row
+            .when(!models_ready, |el| el.child(div().flex_1()))
             .child(
                 div()
                     .flex_none()
                     .text_size(px(10.0))
                     .text_color(theme.text_faint.opacity(0.7))
-                    .child(SharedString::from("enter to dispatch · esc cancel")),
+                    .child(SharedString::from(
+                        "↑↓ switch · ←→ pick · enter dispatch · esc cancel",
+                    )),
+            );
+
+        div()
+            .id("board-dispatch-picker")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(runtime_row)
+            .child(model_row)
+            .into_any_element()
+    }
+
+    /// One model chip in the picker's second row. Index 0 is the harness
+    /// default — labelled with its actual model, but sending no override — and
+    /// every further chip is that catalog model as an explicit override.
+    fn render_model_chip(
+        &mut self,
+        draft: &DispatchDraft,
+        ix: usize,
+        model: &BoardModelInfo,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = ix == draft.active_model;
+        let focused = draft.row == PickerRow::Model;
+        let label: SharedString = if ix == 0 {
+            format!("Default · {}", model.label).into()
+        } else {
+            SharedString::from(model.label.clone())
+        };
+        let key = format!("board-model-{}-{}", draft.task_id, ix);
+        div()
+            .id(key)
+            .flex_none()
+            .h(px(22.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .bg(if active && focused {
+                theme.accent.opacity(0.16)
+            } else if active {
+                theme.accent.opacity(0.08)
+            } else {
+                theme.wash(0.05)
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.confirm_with_model(ix, cx);
+            }))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(if active {
+                        if focused {
+                            theme.accent
+                        } else {
+                            theme.text_muted.opacity(0.9)
+                        }
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(label),
             )
             .into_any_element()
     }
@@ -1510,7 +1906,7 @@ impl BoardPanel {
         let content: SharedString = if let Some(notice) = notice {
             notice
         } else if picking {
-            "runtime picker — enter to dispatch · esc cancel".into()
+            "dispatch picker — enter to dispatch · esc cancel".into()
         } else if typing {
             "enter to keep the filter · esc to clear".into()
         } else {
@@ -1874,5 +2270,49 @@ mod tests {
     fn an_unknown_route_runtime_falls_back_to_the_first_option() {
         let options = runtimes();
         assert_eq!(default_runtime_index(&options, Some("nonesuch")), 0);
+    }
+
+    fn models() -> Vec<BoardModelInfo> {
+        [
+            ("opencode/big-pickle", "OpenCode Big Pickle"),
+            ("opencode/deepseek-v4-flash", "Deepseek V4 Flash"),
+        ]
+        .into_iter()
+        .map(|(id, label)| BoardModelInfo {
+            id: id.into(),
+            label: label.into(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_default_row_highlights_the_harness_default_without_an_override() {
+        let catalog = models();
+        // The first catalog row is the harness default (gh#38: big-pickle); the
+        // picker's row 0 IS that model — the chip labels it, but dispatch sends
+        // no override, so the route's behavior is unchanged.
+        assert_eq!(
+            highlighted_model(&catalog, 0).map(|m| m.id.as_str()),
+            Some("opencode/big-pickle")
+        );
+        assert_eq!(override_model_id(&catalog, 0), None);
+    }
+
+    #[test]
+    fn a_picked_model_is_the_override_and_the_effective_model() {
+        let catalog = models();
+        assert_eq!(
+            highlighted_model(&catalog, 1).map(|m| m.id.as_str()),
+            Some("opencode/deepseek-v4-flash"),
+            "deepseek-v4-flash is selectable, one row past the default"
+        );
+        assert_eq!(override_model_id(&catalog, 1), Some("opencode/deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn an_out_of_range_highlight_never_sends_a_foreign_model() {
+        let catalog = models();
+        assert!(highlighted_model(&catalog, 99).is_none());
+        assert_eq!(override_model_id(&catalog, 99), None);
     }
 }
