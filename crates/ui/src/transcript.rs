@@ -1931,10 +1931,12 @@ impl Transcript {
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
 /// "Error" label, then the human message truncating at `text-foreground/80` —
-/// a subtle red-tinted wash, never a bare red-stroke box.
+/// a subtle red-tinted wash, never a bare red-stroke box. The text/icon tone
+/// follows [`Theme::danger_text`]: light red-300 on dark, the darker red-700
+/// on white.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
-    let red_300 = crate::theme::oklch(0.808, 0.114, 19.571); // tailwind red-300
     let danger = theme.danger; // red-400
+    let red_text = theme.danger_text();
     div()
         .py(px(4.0))
         .w_full()
@@ -1964,14 +1966,14 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .child(
                             crate::icons::icon(crate::icons::DANGER_TRIANGLE)
                                 .size(px(12.0))
-                                .text_color(red_300.opacity(0.8)),
+                                .text_color(red_text.opacity(0.8)),
                         ),
                 )
                 .child(
                     div()
                         .flex_none()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(red_300.opacity(0.8))
+                        .text_color(red_text.opacity(0.8))
                         .child(SharedString::from("Error")),
                 )
                 .child(

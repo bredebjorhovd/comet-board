@@ -286,6 +286,29 @@ impl Theme {
         }]
     }
 
+    /// The danger text/icon tone for THIS theme's error UI (error chips,
+    /// failure notices): dark uses the light red-300, readable on the
+    /// near-black chip; light uses the darker red-700 so it keeps contrast on
+    /// white. Borders/washes stay on [`Self::danger`]; only the foreground
+    /// inverts (a light tone on a light wash would wash out).
+    pub fn danger_text(&self) -> Hsla {
+        if self.light {
+            oklch(0.505, 0.213, 27.518) // red-700
+        } else {
+            oklch(0.808, 0.114, 19.571) // red-300
+        }
+    }
+
+    /// The warning text/icon tone for THIS theme's notice UI (offline notices):
+    /// amber-200 in dark, the darker amber-700 in light — see [`Self::danger_text`].
+    pub fn warning_text(&self) -> Hsla {
+        if self.light {
+            oklch(0.555, 0.163, 48.998) // amber-700
+        } else {
+            oklch(0.924, 0.12, 95.746) // amber-200
+        }
+    }
+
     /// The floating card tone (popovers, dialogs, palettes): over the frosted
     /// backdrop blur on macOS the card is a translucent tint the vibrancy reads
     /// through; elsewhere it is the opaque tone it composites to. Dark uses the
@@ -677,6 +700,27 @@ mod tests {
         // The light accents are visibly darker than the dark theme's.
         assert!(t.accent.l < Theme::dark().accent.l);
         assert!(t.danger.l < Theme::dark().danger.l);
+    }
+
+    #[test]
+    fn error_notice_text_inverts_with_theme() {
+        // Error/notice bars: dark keeps the pale 300/200 tones (readable on the
+        // near-black chip), light uses the darker 700-shades so the text keeps
+        // contrast on white.
+        let dark = Theme::dark();
+        let light = Theme::light();
+        assert!(light.danger_text().l < dark.danger_text().l);
+        assert!(light.warning_text().l < dark.warning_text().l);
+        // Dark mode pins the previous hardcoded tones unchanged.
+        assert_eq!(dark.danger_text(), oklch(0.808, 0.114, 19.571)); // red-300
+        assert_eq!(dark.warning_text(), oklch(0.924, 0.12, 95.746)); // amber-200
+        // Light mode uses the darker equivalents.
+        assert_eq!(light.danger_text(), oklch(0.505, 0.213, 27.518)); // red-700
+        assert_eq!(light.warning_text(), oklch(0.555, 0.163, 48.998)); // amber-700
+        // The light tones still hold contrast against the light surfaces they
+        // sit on (darker than the chip fills, like the rest of the ramp).
+        assert!(light.danger_text().l < light.surface.l);
+        assert!(light.warning_text().l < light.surface.l);
     }
 
     #[test]
