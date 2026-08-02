@@ -120,7 +120,8 @@ display EXCLUDED. File paths refer to the reference repo.
 - dialog-in 0.18s scale 0.96->1
 - fade-quick 0.15s; view-transition resort 260ms; many 200ms width/height/margin/colors eases
 - prefers-reduced-motion disables cell animations
-- Theme: always-dark monochrome, Geist / Geist Mono, oklch neutral scale, hairline white borders,
+- Theme: always-dark monochrome by default (light variant opt-in via Settings → Appearance /
+  `COMET_THEME=light`), Geist / Geist Mono, oklch neutral scale, hairline white borders,
   glass-surface (blur 44 saturate 1.8 brightness 1.18), bg-grid, drag regions, thin scrollbars.
 
 ### 1.13 State & connection

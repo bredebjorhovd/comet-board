@@ -119,7 +119,7 @@ impl Render for ArchivedPage {
                     .rounded(px(8.0))
                     .px(px(12.0))
                     .py(px(8.0))
-                    .hover(|s| s.bg(crate::theme::white_alpha(0.03)))
+                    .hover(|s| s.bg(theme.white_alpha(0.03)))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.hovered = Some(ix);

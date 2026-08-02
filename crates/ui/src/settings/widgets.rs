@@ -5,7 +5,7 @@
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
-use crate::theme::{Theme, white_alpha};
+use crate::theme::Theme;
 
 /// Centered page column: `mx-auto w-full max-w-3xl px-6 pb-16 pt-8`.
 pub fn page_column() -> gpui::Div {
@@ -75,7 +75,7 @@ pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
         .px(px(20.0))
         .py(px(14.0))
         .when(!first, |el| el.border_t_1().border_color(theme.border))
-        .hover(|s| s.bg(white_alpha(0.015)))
+        .hover(|s| s.bg(theme.white_alpha(0.015)))
         .flex()
         .flex_row()
         .items_center()
@@ -91,7 +91,7 @@ pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
         .rounded(px(10.0))
         .border_1()
         .border_color(theme.border)
-        .bg(white_alpha(0.03))
+        .bg(theme.white_alpha(0.03))
         .flex()
         .items_center()
         .justify_center()
@@ -191,8 +191,9 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
 
 /// The default ghost-action hover wash (`hover:bg-white/[0.06]
 /// hover:text-foreground`).
-pub fn ghost_hover(s: gpui::StyleRefinement) -> gpui::StyleRefinement {
-    s.bg(white_alpha(0.06)).text_color(Theme::dark().text)
+pub fn ghost_hover(theme: &Theme) -> impl Fn(gpui::StyleRefinement) -> gpui::StyleRefinement {
+    let theme = theme.clone();
+    move |s: gpui::StyleRefinement| s.bg(theme.white_alpha(0.06)).text_color(theme.text)
 }
 
 /// The dismissible red error strip (`flex items-start gap-2 rounded-xl border

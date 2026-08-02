@@ -1,5 +1,6 @@
-//! UI settings persisted to a small JSON file in the data dir — pane widths and
-//! collapse flags (comet persisted the same set in localStorage).
+//! UI settings persisted to a small JSON file in the data dir — pane widths,
+//! collapse flags, and the theme choice (comet persisted the same set in
+//! localStorage).
 //!
 //! Loaded once at boot; saved debounced by the shell ([`SAVE_DEBOUNCE_MS`]).
 //! Corrupt or missing files fall back to defaults; loaded values are clamped so a
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
@@ -72,6 +74,8 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Theme variant (dark default; light opt-in). `COMET_THEME` env overrides.
+    pub theme: crate::theme::ThemeChoice,
 }
 
 impl Default for UiSettings {
@@ -89,6 +93,7 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            theme: crate::theme::ThemeChoice::default(),
         }
     }
 }
@@ -360,6 +365,7 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            theme: crate::theme::ThemeChoice::Light,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -403,6 +409,7 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert_eq!(d.theme, crate::theme::ThemeChoice::Dark, "dark stays default");
     }
 
     #[test]
@@ -491,6 +498,17 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+        // ...and so does the theme (dark unless a file says otherwise).
+        assert_eq!(loaded.theme, crate::theme::ThemeChoice::Dark);
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"theme": "light", "sidebarWidth": 300}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            UiSettings::load(dir.path()).theme,
+            crate::theme::ThemeChoice::Light
+        );
     }
 
     #[test]

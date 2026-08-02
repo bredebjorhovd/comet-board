@@ -1818,7 +1818,7 @@ impl Composer {
                             .rounded(px(8.0))
                             .overflow_hidden()
                             .border_1()
-                            .border_color(crate::theme::white_alpha(0.10))
+                            .border_color(theme.white_alpha(0.10))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.preview = Some(preview.clone());
@@ -2533,18 +2533,18 @@ impl Composer {
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(if picked {
-                    crate::theme::white_alpha(0.16)
+                    theme.white_alpha(0.16)
                 } else {
                     gpui::transparent_black()
                 })
                 // comet question-panel.tsx option rows: `transition-colors`.
                 .bg(if picked {
-                    crate::theme::white_alpha(0.09)
+                    theme.white_alpha(0.09)
                 } else {
                     motion::hover_blend(
                         &format!("wizard-option-{ix}"),
-                        crate::theme::white_alpha(0.025),
-                        crate::theme::white_alpha(0.06),
+                        theme.white_alpha(0.025),
+                        theme.white_alpha(0.06),
                     )
                 })
                 .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
@@ -2574,9 +2574,9 @@ impl Composer {
                             .justify_center()
                             .rounded(px(6.0))
                             .bg(if picked {
-                                crate::theme::white_alpha(0.16)
+                                theme.white_alpha(0.16)
                             } else {
-                                crate::theme::white_alpha(0.05)
+                                theme.white_alpha(0.05)
                             })
                             .text_size(px(11.0))
                             .text_color(if picked {
@@ -2598,7 +2598,7 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(crate::theme::white_alpha(0.03))
+            .bg(theme.white_alpha(0.03))
             .shadow_lg()
             .flex()
             .flex_col()
@@ -2632,7 +2632,7 @@ impl Composer {
                                         .flex()
                                         .items_center()
                                         .rounded(px(6.0))
-                                        .bg(crate::theme::white_alpha(0.06))
+                                        .bg(theme.white_alpha(0.06))
                                         .text_size(px(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text_muted.opacity(0.6))
@@ -2672,7 +2672,7 @@ impl Composer {
                         div()
                             .mt(px(12.0))
                             .border_t_1()
-                            .border_color(crate::theme::white_alpha(0.06))
+                            .border_color(theme.white_alpha(0.06))
                             .pt(px(12.0))
                             .pb(px(4.0))
                             .px(px(4.0))
@@ -2990,7 +2990,7 @@ impl Render for Composer {
             .bg(motion::hover_blend(
                 "composer-attach",
                 gpui::transparent_black(),
-                crate::theme::white_alpha(0.10),
+                theme.white_alpha(0.10),
             ))
             .on_hover(motion::hover_listener("composer-attach"))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
@@ -3007,7 +3007,7 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = crate::theme::white_alpha(0.03);
+        let pill_bg = theme.white_alpha(0.03);
         let pill = div()
             .rounded(px(26.0))
             .bg(pill_bg)

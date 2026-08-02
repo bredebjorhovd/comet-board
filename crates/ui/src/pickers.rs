@@ -1405,7 +1405,7 @@ impl Pickers {
                 } else {
                     theme.text_muted
                 },
-                Theme::dark().text,
+                theme.text,
             ))
             .bg(if open {
                 theme.element_hover
@@ -1807,7 +1807,7 @@ impl Pickers {
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
-            popover = popover.child(popover::menu_section().child(
+            popover = popover.child(popover::menu_section(&theme).child(
                 div()
                     .px(px(Theme::SPACE_SM))
                     .py(px(4.0))
@@ -1818,7 +1818,7 @@ impl Pickers {
         }
         if total > shown {
             popover = popover.child(
-                popover::menu_section().child(
+                popover::menu_section(&theme).child(
                     div()
                         .px(px(Theme::SPACE_SM))
                         .py(px(4.0))
@@ -1962,13 +1962,13 @@ impl Pickers {
                                 theme.text_muted
                             })
                             .when(is_viewed, |el| {
-                                el.bg(crate::theme::glass_selected_bg())
-                                    .shadow(crate::theme::glass_selected_shadows())
+                                el.bg(theme.glass_selected_bg())
+                                    .shadow(theme.glass_selected_shadows())
                             })
                             .when(is_disabled, |el| el.opacity(0.35))
                             .when(!is_disabled, |el| {
                                 el.cursor_pointer()
-                                    .hover(|s| s.bg(crate::theme::white_alpha(0.06)))
+                                    .hover(|s| s.bg(theme.white_alpha(0.06)))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -2015,7 +2015,7 @@ impl Pickers {
                             format!("model-row-{ix}"),
                         )
                         .when(is_selected || ix == active, |el| {
-                            el.shadow(crate::theme::glass_selected_shadows())
+                            el.shadow(theme.glass_selected_shadows())
                         })
                         .id(("model-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2093,7 +2093,7 @@ impl Pickers {
                             .w(px(148.0))
                             .flex_none()
                             .border_r_1()
-                            .border_color(crate::theme::white_alpha(0.06))
+                            .border_color(theme.white_alpha(0.06))
                             .child(rail),
                     )
                     .child(
@@ -2138,7 +2138,7 @@ impl Pickers {
                                     .max_h(px(190.0))
                                     .overflow_y_scroll()
                                     .border_t_1()
-                                    .border_color(crate::theme::white_alpha(0.06))
+                                    .border_color(theme.white_alpha(0.06))
                                     .p(px(4.0))
                                     .child(traits),
                             ),
@@ -2148,9 +2148,9 @@ impl Pickers {
                 // The palette's legend footer, on the recessed band.
                 div()
                     .flex_none()
-                    .bg(popover::band())
+                    .bg(popover::band(&theme))
                     .border_t_1()
-                    .border_color(crate::theme::white_alpha(0.06))
+                    .border_color(theme.white_alpha(0.06))
                     .px(px(12.0))
                     .py(px(8.0))
                     .flex()
@@ -2307,15 +2307,15 @@ fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
         .text_size(px(11.5))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(crate::theme::glass_selected_bg()).text_color(theme.text)
+            el.bg(theme.glass_selected_bg()).text_color(theme.text)
         })
         .when(!active, |el| {
-            el.bg(crate::theme::white_alpha(0.04))
+            el.bg(theme.white_alpha(0.04))
                 .text_color(theme.text_muted.opacity(0.7))
                 .hover(|s| s.bg(theme.element_hover))
         })
         .when(active || highlighted, |el| {
-            el.shadow(crate::theme::glass_selected_shadows())
+            el.shadow(theme.glass_selected_shadows())
         })
 }
 
@@ -2347,7 +2347,7 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
         .bg(if on {
             theme.text
         } else {
-            crate::theme::white_alpha(0.15)
+            theme.white_alpha(0.15)
         })
         .relative()
         .child(
@@ -2358,9 +2358,9 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
                 .size(px(14.0))
                 .rounded_full()
                 .bg(if on {
-                    crate::theme::grey(0x0e)
+                    theme.bg
                 } else {
-                    crate::theme::white_alpha(0.7)
+                    theme.white_alpha(0.7)
                 }),
         )
 }
