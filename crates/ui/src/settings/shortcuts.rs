@@ -127,6 +127,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
         ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
+        ShortcutId::ToggleBoard => "Show or hide the task board.",
     }
 }
 

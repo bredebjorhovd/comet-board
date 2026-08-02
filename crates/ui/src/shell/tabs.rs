@@ -552,6 +552,37 @@ impl Shell {
         // cluster.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
+        // The board toggle (docs/BOARD.md §H10): a sibling of the changes
+        // toggle, showing an active wash while the board dock is open. Not
+        // gated on git — the board is a global queue, not a checkout view.
+        let board_active = self.board_open;
+        let board_button = div()
+            .id("toggle-board")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .bg(motion::hover_blend(
+                "toggle-board",
+                crate::theme::wash(if board_active { 0.14 } else { 0.0 }),
+                crate::theme::wash(0.2),
+            ))
+            .on_hover(motion::hover_listener("toggle-board"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_board(window, cx);
+            }))
+            .child(
+                icon(icons::CHECKLIST)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            )
+            .into_any_element();
         let inner = div()
             .size_full()
             .flex()
@@ -565,6 +596,7 @@ impl Shell {
             .child(div().flex_1())
             // Stable location: the toggle shows whether the pane is open or
             // not (the pane's own header is gone).
+            .child(board_button)
             .when(git, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",

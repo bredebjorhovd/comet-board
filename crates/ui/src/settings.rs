@@ -103,13 +103,15 @@ pub enum ShortcutId {
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
+    ToggleBoard,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 3] = [
+    pub const ALL: [ShortcutId; 4] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
+        ShortcutId::ToggleBoard,
     ];
 
     /// Row label (comet lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -118,6 +120,9 @@ impl ShortcutId {
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
+            // The board is a comet-native addition (docs/BOARD.md H10); there is
+            // no comet `SHORTCUT_DEFINITIONS` entry to quote.
+            ShortcutId::ToggleBoard => "Toggle board",
         }
     }
 
@@ -126,6 +131,10 @@ impl ShortcutId {
             ShortcutId::ToggleSidebar => "mod-s",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-j",
+            // `mod-b` is already the Changes pane, so the board takes the
+            // shifted variant of the same letter — the board and the changes
+            // pane are sibling right docks.
+            ShortcutId::ToggleBoard => "mod-shift-b",
         }
     }
 }
@@ -138,6 +147,7 @@ pub struct KeymapConfig {
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
+    pub toggle_board: String,
 }
 
 impl Default for KeymapConfig {
@@ -146,6 +156,7 @@ impl Default for KeymapConfig {
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
+            toggle_board: ShortcutId::ToggleBoard.default_combo().into(),
         }
     }
 }
@@ -156,6 +167,7 @@ impl KeymapConfig {
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
+            ShortcutId::ToggleBoard => &self.toggle_board,
         }
     }
 
@@ -164,6 +176,7 @@ impl KeymapConfig {
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
+            ShortcutId::ToggleBoard => self.toggle_board = combo,
         }
     }
 

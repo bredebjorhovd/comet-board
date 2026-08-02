@@ -14,6 +14,7 @@
 
 pub mod app_menus;
 pub mod attachments;
+pub mod board;
 pub mod changes;
 pub mod composer;
 pub mod edge_fade;
