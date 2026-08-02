@@ -116,6 +116,8 @@ icon_assets![
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
+    // opencode's favicon mark (the brand asset the CLI itself ships).
+    (OPENCODE_MARK, "opencode-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — comet keeps it even on the

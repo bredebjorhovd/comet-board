@@ -8,6 +8,9 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Cursor,
+    /// The opencode CLI (`opencode serve` — an HTTP/SSE headless server, the
+    /// same interface the TUI/web frontends talk to).
+    Opencode,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -303,6 +306,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HarnessId::Opencode).unwrap(),
+            "\"opencode\""
         );
     }
 }

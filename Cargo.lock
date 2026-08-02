@@ -1284,6 +1284,7 @@ dependencies = [
  "comet-proto",
  "futures",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

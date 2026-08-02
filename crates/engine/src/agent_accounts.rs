@@ -80,6 +80,11 @@ pub struct AgentAccountsConfig {
     pub claude_config_file: PathBuf,
     /// Codex home (`$CODEX_HOME` or `~/.codex`) — holds `auth.json`.
     pub codex_home: PathBuf,
+    /// opencode's auth store (`$OPENCODE_AUTH_FILE`, `$XDG_DATA_HOME/opencode`,
+    /// or `~/.local/share/opencode`) — holds `auth.json`: a map of provider id
+    /// → credential. opencode has no per-account concept (its logins are
+    /// provider keys), so detection only reports "signed in".
+    pub opencode_auth_file: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -101,6 +106,15 @@ impl AgentAccountsConfig {
             claude_config_dir: claude_dir.unwrap_or_else(|| home_dir().join(".claude")),
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
+            opencode_auth_file: env_dir("OPENCODE_AUTH_FILE")
+                .or_else(|| env_dir("XDG_DATA_HOME").map(|d| d.join("opencode").join("auth.json")))
+                .unwrap_or_else(|| {
+                    home_dir()
+                        .join(".local")
+                        .join("share")
+                        .join("opencode")
+                        .join("auth.json")
+                }),
         }
     }
 
@@ -319,6 +333,25 @@ impl AgentAccounts {
                     saved_at: None,
                 });
             }
+        }
+
+        // opencode: single detected "signed in" account when its provider auth
+        // store is non-empty (no slots — comet has no opencode swap/login, so
+        // it's always active and never switchable).
+        if let Some(detected) = self.detect_opencode() {
+            accounts.push(AgentAccount {
+                id: slot_id_for(HarnessId::Opencode, &detected.account_key),
+                harness: HarnessId::Opencode,
+                email: Some(detected.profile.email.clone()),
+                plan_label: detected.profile.plan.clone(),
+                active: true,
+                usage_windows: Vec::new(),
+                display_name: detected.profile.display_name.clone(),
+                organization: detected.profile.organization.clone(),
+                auth_kind: Some(detected.profile.auth_kind),
+                switchable: false,
+                saved_at: None,
+            });
         }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
@@ -913,6 +946,36 @@ impl AgentAccounts {
         read_json(&self.inner.config.codex_auth_file()).and_then(parse_codex_auth)
     }
 
+    /// opencode detection: its auth store is a map of provider id → credential
+    /// (`opencode auth login` manages them); there is no per-account concept,
+    /// so a non-empty store is reported as a single detected (non-switchable)
+    /// "signed in" account. Credentials stay unread — comet has no opencode
+    /// swap/add flows (the CLI owns provider auth), so no secret is needed.
+    fn detect_opencode(&self) -> Option<Detected> {
+        let auth = read_json(&self.inner.config.opencode_auth_file)?;
+        let providers: Vec<String> = auth
+            .as_object()?
+            .iter()
+            .filter(|(_, v)| v.is_object() && v.get("type").is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        if providers.is_empty() {
+            return None;
+        }
+        Some(Detected {
+            account_key: "opencode".into(),
+            profile: SlotProfile {
+                email: "opencode CLI".into(),
+                display_name: None,
+                organization: None,
+                plan: Some(format!("{} providers", providers.len())),
+                auth_kind: AgentAuthKind::ApiKey,
+            },
+            credentials: None,
+            claude_config: None,
+        })
+    }
+
     /// Persist a detected login into its slot (refreshing stored tokens).
     fn snapshot_detected(&self, harness: HarnessId, d: &Detected) -> Result<(), EngineError> {
         let Some(credentials) = &d.credentials else {
@@ -1295,6 +1358,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "cursor",
+        HarnessId::Opencode => "opencode",
         HarnessId::Mock => "mock",
     }
 }

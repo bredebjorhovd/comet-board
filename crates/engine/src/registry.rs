@@ -207,6 +207,29 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
+    // Opencode, same lazy pattern. The static descriptor mirrors
+    // OpencodeHarness exactly: "OpenCode" per the display name, StepBoundary
+    // steering (prompt_async into a busy session steers the live turn), and
+    // the unified reasoning ladder from comet_harness::opencode::catalog. CLI
+    // discovery only happens when a run/model call actually resolves the slot.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Opencode,
+            name: "OpenCode".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+                ReasoningLevel::Ultra,
+            ],
+        },
+        Box::new(|| Ok(Arc::new(comet_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -246,12 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_and_codex_slots() {
+    fn default_registry_lists_mock_claude_codex_and_opencode_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![
+                HarnessId::Mock,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Opencode
+            ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
@@ -259,6 +287,9 @@ mod tests {
         // cheap; CLI discovery is deferred to models()/run()).
         let codex = registry.resolve(HarnessId::Codex).unwrap();
         assert_eq!(codex.id(), HarnessId::Codex);
+        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
+        assert_eq!(opencode.id(), HarnessId::Opencode);
+        assert_eq!(opencode.display_name(), "OpenCode");
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`
@@ -285,5 +316,30 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    /// The opencode lazy descriptor must also be indistinguishable from
+    /// `describe()` after the first resolve (the same descriptor-stability
+    /// rule as codex — otherwise the catalog entry flips in the picker rail
+    /// the moment the harness is used).
+    #[test]
+    fn opencode_lazy_descriptor_matches_resolved_harness() {
+        let registry = default_registry();
+        let before = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Opencode)
+            .unwrap();
+        registry.resolve(HarnessId::Opencode).unwrap();
+        let after = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Opencode)
+            .unwrap();
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.supports_steering, after.supports_steering);
+        assert_eq!(before.steering_mode, after.steering_mode);
+        assert_eq!(before.reasoning_levels, after.reasoning_levels);
+        assert_eq!(before.name, "OpenCode");
     }
 }

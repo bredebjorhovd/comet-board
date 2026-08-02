@@ -32,6 +32,7 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         claude_config_dir: root.join("claude"),
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
+        opencode_auth_file: root.join("opencode").join("auth.json"),
     };
     (AgentAccounts::new(config.clone()), config)
 }
