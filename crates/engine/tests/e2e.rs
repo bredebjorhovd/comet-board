@@ -443,6 +443,94 @@ async fn interrupt_stamps_streaming_entry_aborted() {
 }
 
 #[tokio::test]
+async fn bare_error_with_no_done_finalizes_the_segment() {
+    // gh#28: a harness that dies without a clean `Done` (here: a bare
+    // `Error` event, then the stream simply ends) must not leave the
+    // assistant entry `streaming`. The engine synthesizes the terminal Done
+    // and the segment is finished — the transcript row flips, so its
+    // streaming fade veil is dropped instead of freezing a fading chunk.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::TextDelta {
+                    text: "partial stream".into(),
+                },
+                AgentEvent::Error {
+                    message: "serve died mid-turn".into(),
+                },
+            ],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("bare error"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status != Some(MessageStatus::Streaming)
+            })
+        },
+        "finalized assistant entry",
+    )
+    .await;
+
+    let all = entries(&core);
+    let assistant = all
+        .iter()
+        .find(|e| e.role == MessageRole::Assistant)
+        .unwrap();
+    assert_ne!(
+        assistant.status,
+        Some(MessageStatus::Streaming),
+        "a dead stream must not leave a stale `streaming` entry (the transcript \
+         row would keep its fade veil live)"
+    );
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    // The streamed tail is preserved and the bare error surfaced visibly.
+    let texts: Vec<_> = assistant
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["partial stream"]);
+    assert!(
+        assistant
+            .parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Error { .. }))
+    );
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Errored)
+    );
+    // Journal closed with the synthesized Done — nothing left to recover.
+    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    assert!(journal.stale_sessions().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn steer_with_no_live_run_falls_back_to_new_turn() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(

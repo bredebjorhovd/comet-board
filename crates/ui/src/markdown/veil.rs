@@ -169,9 +169,22 @@ impl ElemVeil {
             .collect()
     }
 
-    /// Any chunk still fading (as of the last [`advance`](Self::advance))?
-    pub fn is_fading(&self) -> bool {
-        !self.chunks.is_empty()
+    /// Any chunk still fading as of `now` (wall-clock)? A chunk is fading
+    /// until its cadence-adaptive duration has elapsed — independent of
+    /// whether [`advance`](Self::advance) has pruned it yet. This is what
+    /// keeps the veil clock honest on a dead stream: once the last chunk's
+    /// duration genuinely runs out, the row stops being repainted even if no
+    /// further doc messages (and therefore no further `advance` calls) ever
+    /// arrive.
+    pub fn is_fading_at(&self, now: Instant) -> bool {
+        if self.chunks.is_empty() {
+            return false;
+        }
+        let boost = veil_boost(self.chunks.len());
+        self.chunks.iter().any(|c| {
+            let elapsed = now.saturating_duration_since(c.started).as_secs_f32() * 1000.0;
+            elapsed * boost < c.duration_ms
+        })
     }
 }
 
@@ -214,9 +227,10 @@ impl RowVeil {
         self.elems.entry(elem).or_default().advance(text, now)
     }
 
-    /// Any element still fading? Drives the once-per-frame repaint request.
-    pub fn is_fading(&self) -> bool {
-        self.elems.values().any(ElemVeil::is_fading)
+    /// Any element still fading as of `now` (wall-clock)? Drives the
+    /// once-per-frame repaint request.
+    pub fn is_fading_at(&self, now: Instant) -> bool {
+        self.elems.values().any(|e| e.is_fading_at(now))
     }
 }
 
@@ -303,7 +317,7 @@ mod tests {
         assert!(spans[0].1 > 0.0 && spans[0].1 < 1.0);
         // Settled: pruned, never re-animates.
         assert!(v.advance("hello", at(t0, 600)).is_empty());
-        assert!(!v.is_fading());
+        assert!(!v.is_fading_at(at(t0, 600)));
         assert!(v.advance("hello", at(t0, 700)).is_empty());
     }
 
@@ -356,7 +370,7 @@ mod tests {
         let mut row = RowVeil::seeded();
         assert!(row.advance(0, "already streamed text", t0).is_empty());
         assert!(row.advance(1, "second block", t0).is_empty());
-        assert!(!row.is_fading());
+        assert!(!row.is_fading_at(t0));
         // Appends AFTER the attach fade normally — only the new suffix.
         let spans = row.advance(0, "already streamed text plus", at(t0, 100));
         assert_eq!(spans, vec![(21..26, 0.0)]);
@@ -499,10 +513,62 @@ mod tests {
         let mut row = RowVeil::default();
         row.advance(0, "para", t0);
         row.advance(2, "code", t0);
-        assert!(row.is_fading());
-        row.advance(0, "para", at(t0, 600));
-        assert!(row.is_fading(), "elem 2 hasn't been advanced past its fade");
-        row.advance(2, "code", at(t0, 600));
-        assert!(!row.is_fading());
+        assert!(row.is_fading_at(t0));
+        // Advancing ONLY elem 0 leaves the row fading on elem 2's account.
+        row.advance(0, "para", at(t0, 100));
+        assert!(
+            row.is_fading_at(at(t0, 100)),
+            "elem 2 is still within its fade window"
+        );
+        // Wall-clock: elem 2's t0 chunk (≤ 400ms) settles even though that
+        // element is never advanced again — the row's clock is not gated on
+        // per-element `advance` calls (gh#28).
+        assert!(
+            !row.is_fading_at(at(t0, VEIL_MAX_FADE_MS as u64 + 100)),
+            "elem 2's chunk aged out by wall-clock"
+        );
+        // A fresh append re-arms the row for the new chunk's own window.
+        let spans = row.advance(0, "para more", at(t0, VEIL_MAX_FADE_MS as u64 + 100));
+        assert!(!spans.is_empty(), "only the appended suffix veils");
+        assert!(row.is_fading_at(at(t0, VEIL_MAX_FADE_MS as u64 + 200)));
+        assert!(
+            !row.is_fading_at(at(t0, VEIL_MAX_FADE_MS as u64 + 600)),
+            "the new chunk settles on wall-clock too"
+        );
+    }
+
+    #[test]
+    fn dead_stream_still_settles_on_wall_clock() {
+        // A stream that dies mid-fade — the last chunk registered, then no
+        // further appends and no terminal event (gh#28). The veil must reach
+        // full opacity on wall-clock alone: the repaint loop drives `advance`
+        // with the SAME committed text and a later `now`, the aged chunk is
+        // pruned, and `is_fading_at` goes false once the duration elapses —
+        // even though no doc message ever arrives again.
+        let t0 = Instant::now();
+        let mut v = ElemVeil::default();
+        v.advance("tail frozen mid-stream", t0);
+        assert!(v.is_fading_at(t0));
+
+        // A mid-fade repaint with no text change (the dead stream's pattern).
+        let spans = v.advance("tail frozen mid-stream", at(t0, 100));
+        assert_eq!(spans.len(), 1, "chunk still fading");
+        assert!(spans[0].1 > 0.0 && spans[0].1 < 1.0);
+        assert!(v.is_fading_at(at(t0, 100)));
+
+        // Past the max fade duration: pruned, opaque, clock stopped.
+        let settled = at(t0, VEIL_MAX_FADE_MS as u64 + 100);
+        assert!(v.advance("tail frozen mid-stream", settled).is_empty());
+        assert!(!v.is_fading_at(settled));
+
+        // Row-level: one fading element keeps the row fading until wall-clock
+        // runs out, with no further `advance` in between.
+        let mut row = RowVeil::default();
+        row.advance(0, "tail", t0);
+        assert!(row.is_fading_at(at(t0, 50)));
+        assert!(
+            !row.is_fading_at(at(t0, VEIL_MAX_FADE_MS as u64 + 100)),
+            "the veil clock must stop once the last chunk's duration elapses"
+        );
     }
 }

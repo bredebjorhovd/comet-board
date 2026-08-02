@@ -1260,6 +1260,34 @@ async fn drive_run(
         }
     };
 
+    // Invariant guard: no run may leave a half-open segment. Every terminal
+    // path finalizes through the `Done` handling above (each takes the
+    // writer), so a writer still held here means a segment was begun but
+    // NEVER finalized — a run that died without a terminal event reaching
+    // this task (gh#28). The transcript keeps a stale `streaming` row live
+    // if the doc entry stays `Streaming`, and its streaming fade veil can
+    // freeze a fading chunk, so stamp the dangling segment `aborted` with a
+    // visible note before the run is torn down.
+    if writer.is_some() {
+        let mut dangling = folded.clone();
+        dangling.push(MessagePart::Error {
+            id: format!("e{}", dangling.len()),
+            message: "Run ended without a terminal event".into(),
+        });
+        tracing::warn!(chat = %chat_id, "run ended with an unfinalized segment; stamping aborted");
+        if let Err(err) = finish_segment(
+            doc_ref,
+            writer.take(),
+            &entry_id,
+            &device_id,
+            segment_started,
+            &dangling,
+            MessageStatus::Aborted,
+        ) {
+            tracing::warn!(chat = %chat_id, error = %err, "dangling segment finalize failed");
+        }
+    }
+
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
 }
