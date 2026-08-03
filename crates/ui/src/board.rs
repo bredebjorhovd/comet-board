@@ -164,6 +164,19 @@ fn override_model_id(models: &[BoardModelInfo], active: usize) -> Option<&str> {
     }
 }
 
+/// Whether the dispatch picker consumes a keystroke instead of letting it
+/// reach the board frame's key handler. Navigation, confirm and cancel keys
+/// are always the picker's; while the model search is focused a plain
+/// printable key (e.g. `f`) is the input's too, so it cannot fall through and
+/// cycle the board filter mid-typing — the same guard the find field gets via
+/// `model.typing`.
+fn dispatch_picker_owns_key(key: &str, search_focused: bool) -> bool {
+    match key {
+        "up" | "down" | "left" | "right" | "enter" | "escape" => true,
+        _ => search_focused,
+    }
+}
+
 /// A line the board body draws: a section header, or a task row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoardLine {
@@ -1170,7 +1183,17 @@ impl BoardPanel {
                     cx.stop_propagation();
                     return;
                 }
-                _ => {}
+                _ => {
+                    // The model search input owns plain printable keys while
+                    // it is focused (PaletteSearch binds only text editing): a
+                    // letter like `f` must not fall through to the frame
+                    // handler below and cycle the board filter WHILE it also
+                    // types.
+                    if dispatch_picker_owns_key(key, search_focused) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
             }
         }
 
@@ -2416,6 +2439,41 @@ mod tests {
         // The wrap: back to everything.
         assert!(m.cycle_filter().is_none());
         assert_eq!(m.filter, Filter::All);
+    }
+
+    #[test]
+    fn f_in_the_focused_model_search_does_not_cycle_the_filter() {
+        // Regression for gh#45: `f` typed into the model search must filter
+        // models, not the board. While the search is focused the picker
+        // consumes the plain key, so the frame's `f` → cycle_filter path never
+        // runs and the board filter is untouched.
+        let key = "f";
+        assert!(
+            dispatch_picker_owns_key(key, true),
+            "the focused search owns the letter"
+        );
+        let mut m = model(vec![row("a", BoardState::Ready), row("b", BoardState::Ready)]);
+        let before = m.filter.clone();
+        if !dispatch_picker_owns_key(key, true) {
+            // The buggy fall-through: the frame handler runs cycle_filter.
+            m.cycle_filter();
+        }
+        assert_eq!(m.filter, before, "the board filter did not change");
+        assert_eq!(m.filter, Filter::All);
+
+        // Control: with the search NOT focused, `f` reaches the frame handler
+        // and cycles the filter as the shortcut intends.
+        assert!(
+            !dispatch_picker_owns_key(key, false),
+            "frame-focused f still cycles"
+        );
+        let mut frame = model(vec![row("a", BoardState::Ready), row("b", BoardState::Ready)]);
+        frame.cycle_filter();
+        assert_eq!(frame.filter, Filter::Route("offhand".into()));
+
+        // Navigation keys are always the picker's, focused or not.
+        assert!(dispatch_picker_owns_key("down", true));
+        assert!(dispatch_picker_owns_key("down", false));
     }
 
     #[test]
