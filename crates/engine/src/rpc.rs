@@ -850,20 +850,24 @@ impl RpcService for EngineRpc {
                     /// Model override for the chosen harness.
                     #[serde(default)]
                     model: Option<String>,
+                    /// End the task's live attempt and release a fresh one — the
+                    /// blocked row's Retry (gh#49). Off for ordinary dispatches,
+                    /// which are refused on a live attempt.
+                    #[serde(default)]
+                    replace: bool,
                 }
                 let p: P = parse_params(params)?;
-                let dispatched = self
-                    .board()?
-                    .dispatch_task(
-                        &p.task_id,
-                        p.via,
-                        DispatchOverrides {
-                            runtime: p.runtime,
-                            model: p.model,
-                        },
-                    )
-                    .await
-                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                let board = self.board()?;
+                let overrides = DispatchOverrides {
+                    runtime: p.runtime,
+                    model: p.model,
+                };
+                let dispatched = if p.replace {
+                    board.retry_task(&p.task_id, p.via, overrides).await
+                } else {
+                    board.dispatch_task(&p.task_id, p.via, overrides).await
+                }
+                .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&dispatched)
             }
             methods::CANCEL_TASK => {

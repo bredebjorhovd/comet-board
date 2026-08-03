@@ -58,6 +58,10 @@ enum Msg {
         task_id: String,
         via: Option<String>,
         overrides: DispatchOverrides,
+        /// End the task's live attempt and release a fresh one — the blocked
+        /// row's Retry (gh#49), the deliberate exception to the one-live-attempt
+        /// rule. Plain dispatches send `false` and are refused on a live attempt.
+        replace: bool,
         reply: oneshot::Sender<anyhow::Result<Dispatched>>,
     },
     Cancel {
@@ -153,12 +157,37 @@ impl BoardService {
         via: Option<String>,
         overrides: DispatchOverrides,
     ) -> anyhow::Result<Dispatched> {
+        self.dispatch_with(task_id, via, overrides, false).await
+    }
+
+    /// Retry a task: end the live attempt the row is stuck on and start a new
+    /// one — the blocked row's Retry (gh#49). [`BoardService::dispatch_task`]
+    /// refuses a live attempt; this is the deliberate exception. The replaced
+    /// attempt is interrupted and archived as `cancelled` first, then the
+    /// release runs the normal dispatch flow.
+    pub async fn retry_task(
+        &self,
+        task_id: &str,
+        via: Option<String>,
+        overrides: DispatchOverrides,
+    ) -> anyhow::Result<Dispatched> {
+        self.dispatch_with(task_id, via, overrides, true).await
+    }
+
+    async fn dispatch_with(
+        &self,
+        task_id: &str,
+        via: Option<String>,
+        overrides: DispatchOverrides,
+        replace: bool,
+    ) -> anyhow::Result<Dispatched> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Dispatch {
                 task_id: task_id.to_string(),
                 via,
                 overrides,
+                replace,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
@@ -260,10 +289,18 @@ fn run_loop(
                 task_id,
                 via,
                 overrides,
+                replace,
                 reply,
             }) => {
-                let result =
-                    handle_dispatch(&engine, runtime.as_ref(), &spaces, &task_id, via, &overrides);
+                let result = handle_dispatch(
+                    &engine,
+                    runtime.as_ref(),
+                    &spaces,
+                    &task_id,
+                    via,
+                    &overrides,
+                    replace,
+                );
                 match &result {
                     Ok(d) => log.info(format!(
                         "dispatched {task_id} → chat {} at {} (attempt {})",
@@ -315,6 +352,15 @@ fn publish_rows(engine: &SyncEngine, rows: &watch::Sender<Vec<TaskRow>>, log: &L
 /// the attempt row is inserted **first**, so the partial unique index refuses
 /// a duplicate before anything is created. A failure after that closes the
 /// attempt rather than leaving it live forever.
+///
+/// A retry (`replace`) is the one deliberate breach of the first refusal: it
+/// ends the live attempt the row is stuck on before the release below, because
+/// the one-live-attempt rule would otherwise refuse it — the whole point of a
+/// blocked row's Retry is that the attempt exists. The cancellation runs
+/// first, so the slot its chat held is free for the fresh attempt: ending a
+/// stuck agent to replace it is what the operator asked for, and if the
+/// release then fails the issue sits `ready` (the replaced attempt archived as
+/// `cancelled`), never wedged.
 fn handle_dispatch(
     engine: &SyncEngine,
     runtime: &(dyn Runtime + Send + Sync),
@@ -322,17 +368,38 @@ fn handle_dispatch(
     task_id: &str,
     via: Option<String>,
     overrides: &DispatchOverrides,
+    replace: bool,
 ) -> anyhow::Result<Dispatched> {
     let task = engine
         .db
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
-    if let Some(live) = task.live_attempt() {
+    if !replace
+        && let Some(live) = task.live_attempt()
+    {
         anyhow::bail!(
             "{} already has a live attempt (chat {})",
             task.identifier,
             live.pane_id.as_deref().unwrap_or("pending")
         );
+    }
+    if replace
+        && let Some(attempt) = task.live_attempt()
+    {
+        // The attempt the retry replaces may still hold a live chat; interrupt
+        // it the way a cancel does, then archive the attempt so the fresh
+        // release below can take its place.
+        if let Some(chat_id) = attempt.pane_id.as_deref()
+            && let Err(e) = runtime.cancel(chat_id)
+        {
+            engine.log.warn(format!("cancelling chat {chat_id}: {e:#}"));
+        }
+        engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
+        engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
+        engine.log.info(format!(
+            "retrying {}: replaced live attempt {}",
+            task.identifier, attempt.id
+        ));
     }
     let route = route_for(&engine.cfg, &task)?;
     check_capacity(&engine.db, &engine.cfg, route)?;
@@ -1173,6 +1240,50 @@ max_concurrent_per_workspace = 1
             task.attempts[0].outcome,
             Some(Outcome::Failed),
             "the failed attempt stays on the record"
+        );
+
+        service.shutdown();
+    }
+
+    /// Retry on a blocked row is the one place the live-attempt rule is meant
+    /// to be broken (gh#49): the row is stuck because its attempt IS alive and
+    /// awaiting input, so retrying ends that attempt and releases a fresh one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_on_a_live_attempt_replaces_it_with_a_fresh_one() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#63", "gh#63");
+        seed_attempt_in(&paths, "gh:owner/widget#63", "chat-63", "widget");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        // A plain dispatch is still refused while the attempt is live — only
+        // the retry is allowed past the guard.
+        let err = service
+            .dispatch_task("gh:owner/widget#63", None, DispatchOverrides::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("live attempt"), "{err}");
+
+        // The retry interrupts the stuck chat and archives it…
+        let dispatched = service
+            .retry_task("gh:owner/widget#63", None, DispatchOverrides::default())
+            .await
+            .unwrap();
+        assert_eq!(dispatched.attempt, 2);
+        assert_eq!(runtime.cancelled.lock().unwrap().as_slice(), ["chat-63"]);
+
+        // …and a fresh attempt is live.
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#63").unwrap().unwrap();
+        assert_eq!(task.attempt_count(), 2);
+        let live = task.live_attempt().expect("fresh attempt");
+        assert_eq!(live.pane_id.as_deref(), Some("chat-for-gh#63"));
+        assert_eq!(
+            task.attempts[0].outcome,
+            Some(Outcome::Cancelled),
+            "the replaced attempt is archived as cancelled"
         );
 
         service.shutdown();
