@@ -103,6 +103,9 @@ pub struct OpencodeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Total deadline for the short JSON requests; the `/event` SSE stream is
+    /// exempt (a total timeout would close a busy mid-run feed, gh#46).
+    request_timeout: Duration,
     /// Short-TTL cache for the live model catalog (models() spawns a server).
     models_cache: Mutex<Option<(Instant, Vec<Model>)>>,
 }
@@ -113,6 +116,7 @@ impl Default for OpencodeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            request_timeout: client::REQUEST_TIMEOUT,
             models_cache: Mutex::new(None),
         }
     }
@@ -133,6 +137,15 @@ impl OpencodeHarness {
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
+        self
+    }
+
+    /// Override the total deadline for the short JSON requests (default 20s).
+    /// The `/event` SSE stream ignores this — it only carries a read timeout —
+    /// which is what lets tests shrink the deadline below a turn's length and
+    /// assert the stream survives it (gh#46).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -218,7 +231,7 @@ impl Harness for OpencodeHarness {
         };
         let (mut child, base, stderr_tail) =
             spawn_server(&exe, cwd, controls.chat_id.as_deref()).await?;
-        let client = Client::new(base);
+        let client = Client::with_timeouts(base, self.request_timeout, client::STREAM_READ_TIMEOUT);
 
         let session_id = if let Some(resume) = &request.resume {
             // opencode session ids (`ses_…`) are durable in its db; resume the

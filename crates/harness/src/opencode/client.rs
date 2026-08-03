@@ -16,12 +16,26 @@ use serde_json::{Value, json};
 
 use crate::HarnessError;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Total deadline for the short JSON requests (create/prompt/abort/reply/
+/// health) — the response body is read to completion quickly, so a total
+/// timeout is fine there.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The long-lived `/event` SSE stream is exempt from the total request
+/// deadline: a total timeout closes a busy, mid-run stream when the deadline
+/// fires — even while events are actively streaming (reqwest wraps the body in
+/// `TotalTimeoutBody`, gh#46). A read timeout resets on every event instead:
+/// opencode serves a `server.heartbeat` every 10s, so a live stream never
+/// trips it while a genuinely dead connection is still caught.
+pub(crate) const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct Client {
     base: String,
+    /// Short JSON requests — total deadline `REQUEST_TIMEOUT`.
     http: reqwest::Client,
+    /// The `/event` SSE stream — no total timeout, only `STREAM_READ_TIMEOUT`.
+    stream: reqwest::Client,
 }
 
 /// A model reference on the opencode wire: `(providerID, modelID)`, with an
@@ -38,11 +52,25 @@ fn protocol_error(context: &str, err: impl std::fmt::Display) -> HarnessError {
 
 impl Client {
     pub(crate) fn new(base: String) -> Self {
+        Self::with_timeouts(base, REQUEST_TIMEOUT, STREAM_READ_TIMEOUT)
+    }
+
+    /// Build with explicit timeouts so tests can shrink the total deadline
+    /// below a turn's length and prove the stream ignores it (gh#46).
+    pub(crate) fn with_timeouts(
+        base: String,
+        request_timeout: Duration,
+        stream_read_timeout: Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { base, http }
+        let stream = reqwest::Client::builder()
+            .read_timeout(stream_read_timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { base, http, stream }
     }
 
     pub(crate) async fn health(&self) -> bool {
@@ -172,10 +200,13 @@ impl Client {
         Ok(())
     }
 
-    /// Open the instance `/event` SSE stream; the caller owns reading it.
+    /// Open the instance `/event` SSE stream; the caller owns reading it. The
+    /// stream client carries no total deadline — a total timeout would close a
+    /// busy mid-run feed (gh#46); only the read timeout (reset by each
+    /// heartbeat) applies.
     pub(crate) async fn event_stream(&self) -> Result<reqwest::Response, HarnessError> {
         let res = self
-            .http
+            .stream
             .get(format!("{}/event", self.base))
             .send()
             .await

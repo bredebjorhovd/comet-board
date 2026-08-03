@@ -15,7 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 use comet_harness::{
     CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
 };
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel};
+use comet_proto::{
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
+};
 
 fn fake_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_opencode"))
@@ -204,11 +206,11 @@ async fn happy_path_parks_then_reaps_when_steering_closes() {
     assert_serve_reaped(&dir).await;
 }
 
-/// Regression for gh#37: the session goes `Idle` mid-stream — text deltas were
-/// streamed but the assistant message never reached `assistantMessageCompleted`
-/// (no `message.updated` with `time.completed`) and no `session.error` fired.
-/// The terminal event must be Errored — a stalled/aborted turn — never a
-/// spurious Completed.
+/// Regression for gh#37: the session goes `Idle` mid-stream — text deltas and
+/// real tool traffic were streamed but the assistant message never reached
+/// `assistantMessageCompleted` (no `message.updated` with `time.completed`) and
+/// no `session.error` fired (the exact fjaerpenn#1 journal shape). The terminal
+/// event must be Errored — a stalled/aborted turn — never a spurious Completed.
 #[cfg(unix)]
 #[tokio::test]
 async fn idle_mid_turn_without_message_completion_reports_errored() {
@@ -228,6 +230,22 @@ async fn idle_mid_turn_without_message_completion_reports_errored() {
         }),
         "turn streamed before the stall: {events:?}"
     );
+    assert!(
+        events.contains(&AgentEvent::ToolCall {
+            id: "prt_tool1".into(),
+            call: ToolCall::Exec {
+                command: "ls".into()
+            },
+        }),
+        "the stalled turn did real tool work before going idle: {events:?}"
+    );
+    assert!(
+        events.contains(&AgentEvent::ToolResult {
+            id: "prt_tool1".into(),
+            is_error: false
+        }),
+        "the stalled turn's tool settled before the idle: {events:?}"
+    );
     match events.last() {
         Some(AgentEvent::Done {
             status,
@@ -245,9 +263,46 @@ async fn idle_mid_turn_without_message_completion_reports_errored() {
     assert_serve_reaped(&dir).await;
 }
 
-// ---------------------------------------------------------------------------
-// Real-CLI smoke tests (skipped when the binary isn't on this device).
-// ---------------------------------------------------------------------------
+/// Regression for gh#46: the harness pointed its `/event` SSE reader at a
+/// reqwest client with a TOTAL request deadline, so a busy mid-run stream was
+/// force-closed when the deadline fired (reqwest's `TotalTimeoutBody` returns
+/// `TimedOut` even while events flow) — a genuinely-progressing run read as an
+/// EOF stall and was killed Errored mid-answer. The stream must be exempt from
+/// the total deadline (only the read timeout applies). Here the total deadline
+/// is shrunk to 300ms while the fake server holds the feed open for 2s of
+/// heartbeats before a settled turn — the run must still finish Completed.
+#[cfg(unix)]
+#[tokio::test]
+async fn sse_stream_survives_past_the_total_request_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, steer, _token) = fake_controls();
+    drop(steer); // close the mailbox so the run settles after its turn
+    let harness = harness().with_request_timeout(Duration::from_millis(300));
+    let events = run_to_end(
+        &harness,
+        fake_request("scenario:slow-turn", &dir),
+        controls,
+    )
+    .await;
+
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "hello".into()
+        }),
+        "turn streamed after the slow feed: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("ses_fake".into()),
+        }),
+        "the slow-but-progressing turn must complete, not stall: {events:?}"
+    );
+    assert_serve_reaped(&dir).await;
+}
 
 fn real_request(prompt: &str) -> RunRequest {
     RunRequest {
@@ -284,7 +339,12 @@ fn real_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
 #[tokio::test]
 async fn real_opencode_streams_a_run_end_to_end() {
     let harness = OpencodeHarness::new();
-    let (controls, _steer, _token) = real_controls();
+    let (controls, steer, _token) = real_controls();
+    // Close the steering mailbox so the persistent-session run settles after
+    // its turn — the stream stays parked on an open mailbox (the old harness
+    // only "ended" here because its 20s total request deadline closed the SSE
+    // feed mid-run, gh#46).
+    drop(steer);
     let stream = match harness
         .run(real_request("Reply with exactly one word: ZORP."), controls)
         .await
