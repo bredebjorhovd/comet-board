@@ -37,10 +37,18 @@ enum Scenario {
     /// Emit a full busy→delta→completed-message→idle turn and stay parked
     /// (persistent session); the harness reaps the process when the run ends.
     Happy,
-    /// Emit a busy→delta→idle turn WITHOUT the assistant message ever settling
-    /// (`message.updated` with `time.completed`) — a mid-stream stall that must
-    /// surface as Errored, never a spurious Completed (gh#37).
+    /// Emit a busy→delta→tool-call→tool-result→idle turn WITHOUT the assistant
+    /// message ever settling (`message.updated` with `time.completed`) — a
+    /// mid-stream stall exactly like the fjaerpenn#1 journal (text + real tool
+    /// results, then idle, no completion) that must surface as Errored, never a
+    /// spurious Completed (gh#37, gh#46).
     IdleMidTurn,
+    /// Hold the SSE feed open for `SLOW_TURN_SLEEP` (streaming heartbeats, the
+    /// way the real opencode `/event` handler does) BEFORE a normal settled
+    /// turn — a slow-but-progressing run that outlives the harness's short
+    /// total request deadline. Must still complete (gh#46: the stream is
+    /// exempt from the total timeout).
+    SlowTurn,
 }
 
 #[tokio::main]
@@ -99,6 +107,8 @@ async fn handle(
                 Scenario::Crash
             } else if body.contains("scenario:idle-mid-turn") {
                 Scenario::IdleMidTurn
+            } else if body.contains("scenario:slow-turn") {
+                Scenario::SlowTurn
             } else {
                 Scenario::Happy
             };
@@ -119,6 +129,11 @@ async fn handle(
     }
 }
 
+/// How long `SlowTurn` holds the feed open before its turn — comfortably past
+/// the harness's (test-shortened) total request deadline, well inside the read
+/// timeout the stream actually carries.
+const SLOW_TURN_SLEEP: Duration = Duration::from_secs(2);
+
 /// Play the scenario on the SSE feed. Drops the stream at the end: closing it
 /// delivers EOF to the harness's reader while this process stays alive (the
 /// accept loop above keeps serving, and `shutdown_child`'s SIGTERM is what
@@ -137,6 +152,17 @@ async fn serve_events(
     }
     prompt.notified().await;
     let sc = scenario.lock().await.unwrap_or(Scenario::Happy);
+    if sc == Scenario::SlowTurn {
+        // A slow-but-progressing run: stream heartbeats (the real `/event`
+        // handler emits one every 10s) past the total request deadline, then
+        // play the settled turn. The harness must not read this as a dropped
+        // feed / stall (gh#46).
+        let deadline = tokio::time::Instant::now() + SLOW_TURN_SLEEP;
+        while tokio::time::Instant::now() < deadline {
+            sse(&mut stream, "server.heartbeat", "{}").await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
     sse(
         &mut stream,
         "session.status",
@@ -149,10 +175,26 @@ async fn serve_events(
         "{\"field\":\"text\",\"delta\":\"hello\",\"sessionID\":\"ses_fake\"}",
     )
     .await;
+    // A mid-turn stall works real tools before going idle (the fjaerpenn#1
+    // journal shape: deltas + tool calls + idle, no settled message).
+    if sc == Scenario::IdleMidTurn {
+        sse(
+            &mut stream,
+            "message.part.updated",
+            "{\"part\":{\"id\":\"prt_tool1\",\"title\":\"ls\",\"state\":{\"status\":\"running\",\"input\":{\"command\":\"ls\"}}},\"sessionID\":\"ses_fake\"}",
+        )
+        .await;
+        sse(
+            &mut stream,
+            "message.part.updated",
+            "{\"part\":{\"id\":\"prt_tool1\",\"title\":\"ls\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls\"},\"metadata\":{\"exit\":0}}},\"sessionID\":\"ses_fake\"}",
+        )
+        .await;
+    }
     match sc {
         // A settled turn's assistant message completes before the turn ends; a
         // mid-turn stall (IdleMidTurn) never does.
-        Scenario::StreamEnd | Scenario::Happy => {
+        Scenario::StreamEnd | Scenario::Happy | Scenario::SlowTurn => {
             sse(
                 &mut stream,
                 "message.updated",
@@ -168,7 +210,7 @@ async fn serve_events(
             let _ = stream.flush().await;
             std::process::exit(1);
         }
-        Scenario::Happy | Scenario::IdleMidTurn => {
+        Scenario::Happy | Scenario::IdleMidTurn | Scenario::SlowTurn => {
             sse(&mut stream, "session.idle", "{\"sessionID\":\"ses_fake\"}").await;
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
