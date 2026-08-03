@@ -900,6 +900,15 @@ impl BoardPanel {
             self.set_notice("Engine not connected", cx);
             return;
         };
+        // A retry on a blocked row ends the live attempt it is stuck on before
+        // releasing (gh#49). Read the row now, not when the picker opened: if
+        // it cleared (cancelled, or the agent moved on) meanwhile, a plain
+        // dispatch is the right call and the engine's one-live-attempt guard
+        // is free to refuse if it did not.
+        let replace = self
+            .model
+            .task(task_id)
+            .is_some_and(|row| row.state() == BoardState::Blocked);
         let task_id = task_id.to_string();
         let identifier = identifier.to_string();
         let runtime = runtime.map(str::to_string);
@@ -913,6 +922,9 @@ impl BoardPanel {
         };
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "taskId": task_id });
+            if replace {
+                params["replace"] = serde_json::Value::Bool(true);
+            }
             if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
                 object.insert("runtime".into(), serde_json::Value::String(runtime));
             }
@@ -994,7 +1006,13 @@ impl BoardPanel {
         };
         let (id, state) = (row.id.clone(), row.state());
         match state {
+            // Enter dispatches a ready task, and retries a failed one (gh#42).
             BoardState::Ready | BoardState::Failed => self.dispatch(&id, cx),
+            // Enter opens a running task's chat — including a blocked one
+            // (gh#49): its agent is alive and awaiting input, so the chat is
+            // where the answer is, and ending the attempt to replace it is
+            // explicit enough for a chip, not something enter should do by
+            // accident. The Retry chip is the blocked row's redispatch path.
             BoardState::Working | BoardState::Blocked => self.open_chat(&id, window, cx),
             _ => {}
         }
@@ -1772,7 +1790,7 @@ impl BoardPanel {
                 this.dispatch(&dispatch_id, cx);
             }))
             .into_any_element(),
-            BoardState::Working | BoardState::Blocked => div()
+            BoardState::Working => div()
                 .flex_none()
                 .flex()
                 .flex_row()
@@ -1793,6 +1811,45 @@ impl BoardPanel {
                         })),
                 )
                 .into_any_element(),
+            // A blocked row's agent is alive but waiting on input, and retrying
+            // must end it first — so the chip routes through the same release
+            // flow a `failed` Retry does, and the dispatch picker marks the
+            // release as a replace (gh#49). Open stays: the awaiting chat is
+            // where the answer often is, and `enter` opens it for the same
+            // reason (the agent is alive, unlike a `failed` one).
+            BoardState::Blocked => {
+                let mut actions = div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0));
+                if row.dispatchable {
+                    actions = actions.child(
+                        chip(format!("board-retry-{id}"), "Retry", theme.text)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dispatch(&dispatch_id, cx);
+                            })),
+                    );
+                }
+                actions
+                    .child(
+                        chip(format!("board-open-{id}"), "Open", theme.text_muted)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_chat(&open_id, window, cx);
+                            })),
+                    )
+                    .child(
+                        chip(format!("board-cancel-{id}"), "Cancel", theme.danger)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.cancel(&cancel_id, cx);
+                            })),
+                    )
+                    .into_any_element()
+            }
             BoardState::Review if pr_url.is_some() => {
                 let url = pr_url.clone().unwrap_or_default();
                 chip(format!("board-pr-{id}"), "Open PR", theme.accent)
