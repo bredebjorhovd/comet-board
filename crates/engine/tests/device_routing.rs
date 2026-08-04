@@ -502,6 +502,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
             .workspace
             .merged_sessions_watch(core_b.sessions.watch_sessions()),
         core_b.sessions.journal(),
+        core_b.agent_accounts.clone(),
         tokio::runtime::Handle::current(),
     ));
     let board_b = comet_engine::BoardService::spawn_at(

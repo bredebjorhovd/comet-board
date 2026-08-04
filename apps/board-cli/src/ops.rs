@@ -192,6 +192,7 @@ pub async fn dispatch_checked(
     via: Option<&str>,
     runtime: Option<&str>,
     model: Option<&str>,
+    account: Option<&str>,
 ) -> Result<Dispatched> {
     // A model with no runtime beside it runs under the row's — which is what
     // `list --json` shows as that row's `runtime`, and what `--runtime`'s help
@@ -205,7 +206,7 @@ pub async fn dispatch_checked(
         _ => None,
     };
     check_overrides(client, runtime, model, row_runtime.as_deref()).await?;
-    dispatch(client, task_id, via, runtime, model).await
+    dispatch(client, task_id, via, runtime, model, account).await
 }
 
 /// Refuse an override the dispatch would only choke on later.
