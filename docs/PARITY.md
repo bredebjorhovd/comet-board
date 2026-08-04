@@ -43,9 +43,9 @@ not built yet).
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `comet login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `comet login` first"; `comet daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
-| 3.2 Sessions engine | partial | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS. Gaps: idle reaper + 10-min stall watchdog for persistent harness sessions. |
-| 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
+| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock, crash shield (`crash_shield.rs`: panic hook → bounded drain → exit 101, so a panicked task can't leave a live-looking half-dead daemon; headless only). CLI auth decoupled from the daemon: `comet login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `comet login` first"; `comet daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, parent-PID watchdog. |
+| 3.2 Sessions engine | done | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS, 30-min idle reaper for parked persistent sessions, tiered 10-min stall watchdog (terminal for a run that never emitted anything — a harness wedged at startup; advisory-only once it has produced output, since a live child mid-tool-call is the working signal and no timeout can bound a legitimate wait). |
+| 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt), boot-time warm-open of locally-hosted recent chats (14d, cap 30, newest first) so a command queued while the device was down drains at restart instead of relying on a nudge alone. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
 | 3.7 Auth / uploads / accounts / device-room | done | WorkOS code+loopback and paste-code flows, refresh persistence (0600), org gate, dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
@@ -98,11 +98,14 @@ not built yet).
   contents not designed.
 - **Cursor harness** (§4).
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
-- **Engine hardening**: single-instance lock, parent-PID watchdog, crash
-  shield, idle reaper / stall watchdog, boot warm-open of recent chats.
+- **Engine hardening** — done except the parent-PID watchdog: single-instance
+  lock, crash shield, idle reaper + stall watchdog, boot warm-open of recent
+  chats all shipped (§3.1–§3.3). The parent-PID watchdog stays deferred: it
+  guards a supervisor that exits without reaping, which neither launchd nor
+  systemd does, and the crash shield now covers the failure it was aimed at.
 
 ## Summary
 
-Table rows above: **39 done · 6 partial · 1 deferred** (Cursor harness), plus
+Table rows above: **40 done · 5 partial · 1 deferred** (Cursor harness), plus
 the cross-cutting deferrals (mobile, E2EE, macOS packaging execution,
-engine hardening) — the last overlaps the named gaps in the partial rows.
+parent-PID watchdog) — the last overlaps the named gap in §3.1.

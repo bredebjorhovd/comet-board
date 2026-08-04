@@ -16,6 +16,7 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod board;
 pub mod board_runtime;
+pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
@@ -210,6 +211,13 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
+        // §3.3 boot warm-open: after recovery (so a revived run owns its chat's
+        // handle first) but before we start serving. Needs a runtime — every
+        // open spawns the chat task — so a bare synchronous caller skips it
+        // rather than panicking.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            doc_host.warm_open_recent();
+        }
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
@@ -393,6 +401,42 @@ impl EngineCore {
         self.agent_accounts.shutdown();
         self.doc_host.flush_all();
         self.workspace.shutdown();
+    }
+
+    /// A DETACHED copy of [`Self::shutdown`] for the crash shield: the same
+    /// teardown, over cloned service handles rather than a borrow of the core.
+    /// It has to be detached — the shield runs it after a panic that may well
+    /// have happened inside the core, and a `&self` closure would keep the
+    /// panicking frame's borrow alive.
+    ///
+    /// Build it AFTER assembly (the board attaches during
+    /// [`Engine::assemble_runtime`]), or the shield will drain a core whose
+    /// board loop it never learned about.
+    pub fn drain_hook(&self) -> crash_shield::Drain {
+        let board = self.board();
+        let sessions = self.sessions.clone();
+        let terminals = self.terminals.clone();
+        let agent_accounts = self.agent_accounts.clone();
+        let doc_host = self.doc_host.clone();
+        let workspace = self.workspace.clone();
+        Arc::new(move || {
+            let board = board.clone();
+            let sessions = sessions.clone();
+            let terminals = terminals.clone();
+            let agent_accounts = agent_accounts.clone();
+            let doc_host = doc_host.clone();
+            let workspace = workspace.clone();
+            Box::pin(async move {
+                if let Some(board) = board {
+                    board.shutdown();
+                }
+                sessions.shutdown().await;
+                terminals.shutdown();
+                agent_accounts.shutdown();
+                doc_host.flush_all();
+                workspace.shutdown();
+            })
+        })
     }
 }
 
@@ -580,6 +624,12 @@ impl Engine {
         }
 
         let runtime = Self::assemble_runtime(&config, auth).await?;
+
+        // Crash shield (§3.1) — headless only, and deliberately so. This is the
+        // process that runs unattended on the shared box, where a panicked task
+        // leaves a "Working" row nobody will ever come clear. The headed app has
+        // a human in front of it and a UI that can say so.
+        crash_shield::install(runtime.core().drain_hook());
 
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process

@@ -11,11 +11,14 @@
 //! - recovery (interrupt or a stale journal at boot) stamps the streaming entry `aborted`.
 //!
 //! Scope notes: sessions are keyed by chat id (one live run per chat). Comet's pulse
-//! loop is ported as the 15s liveness heartbeat in `drive_run`; its stall watchdog is
-//! deliberately NOT ported (rejected in review — agents may legitimately wait on
-//! something for far longer than any timeout, and a live child IS the working signal).
-//! Every dying path must instead carry its own visible error (child crash with stderr,
-//! spawn failure, stream error, engine-restart recovery).
+//! loop is ported as the 15s liveness heartbeat in `drive_run`, and its `STALL_MS`
+//! watchdog is ported in TIERED form (see `drive_run`): terminal only for a run that
+//! never produced anything at all, advisory for silence after real output. The
+//! blanket "10 minutes quiet = kill it" version stays rejected (review: agents may
+//! legitimately wait on something for far longer than any timeout, and a live child
+//! that has already spoken IS the working signal). Every dying path must still carry
+//! its own visible error (child crash with stderr, spawn failure, stream error,
+//! engine-restart recovery, startup stall).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -972,6 +975,23 @@ async fn drive_run(
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
+    // STALL WATCHDOG (feature-inventory §3.2 `STALL_MS`), two tiers — because
+    // silence on its own is not evidence of death. A healthy agent can be
+    // completely quiet for an hour inside one Exec tool call, which is why the
+    // blanket version was rejected in review. What IS unambiguous is a run that
+    // has produced *nothing* — not even `SessionStarted` — since it started:
+    // the CLI wedged at spawn, hung on a credential prompt it can never get
+    // answered on a headless box, or left a pipe open with no process behind
+    // it. Nothing legitimate is silent from second zero, so that case ends
+    // terminally (tier 1) and gives the box back its child, its RAM and its
+    // "Working" row. Silence AFTER real output only logs and re-arms (tier 2):
+    // the child proved itself, and a live child is the working signal.
+    const STALL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    let mut saw_any_event = false;
+    let mut stall_at = tokio::time::Instant::now() + STALL;
+    // Set by tier 1 so the failed-resume retry below cannot mistake the
+    // synthesized errored `Done` for a rejected `--resume` id.
+    let mut stall_killed = false;
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -1011,6 +1031,46 @@ async fn drive_run(
                     token.cancel();
                 }
                 break SessionStatus::Idle;
+            }
+            // Stall watchdog (see STALL above). Disabled while parked — a
+            // parked session is silent BY DESIGN and belongs to the idle
+            // reaper; `stall_at` is re-armed by the first event of the next
+            // turn like any other event.
+            _ = tokio::time::sleep_until(stall_at), if idle_since.is_none() => {
+                stall_at = tokio::time::Instant::now() + STALL;
+                if saw_any_event {
+                    // Tier 2, advisory: it spoke once, so it is working until
+                    // proven otherwise. Log and keep waiting, forever if need be.
+                    tracing::warn!(
+                        chat = %chat_id,
+                        "harness silent for 10min; child is live, leaving the run alone"
+                    );
+                    continue;
+                }
+                // Tier 1, terminal: never produced a single event.
+                tracing::warn!(
+                    chat = %chat_id,
+                    "harness produced no output within 10min of starting; ending the wedged run"
+                );
+                stall_killed = true;
+                // Release the child. Its stream may still emit afterwards; this
+                // task settles the run right here, so nothing else observes it.
+                if let Some(token) = lock(&inner.runs)
+                    .get(&chat_id)
+                    .filter(|h| h.run_id == run_id)
+                    .map(|h| h.interrupt_token.clone())
+                {
+                    token.cancel();
+                }
+                AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: Some(
+                        "Harness produced no output for 10 minutes after starting — \
+                         ending the wedged run".into(),
+                    ),
+                    session_id: None,
+                }
             }
             Some(event) = engine_rx.recv() => event,
             next = stream.next() => match next {
@@ -1052,7 +1112,12 @@ async fn drive_run(
         };
 
         // Any stream activity proves the run is alive — keep the session's
-        // freshness inside the UI's 45s staleness window (throttled).
+        // freshness inside the UI's 45s staleness window (throttled), and
+        // re-arm the stall watchdog. `saw_any_event` is per-RUN, not per-turn:
+        // once a harness has spoken it is never tier-1 again, so a steered
+        // turn that opens with a long silent tool call is safe.
+        saw_any_event = true;
+        stall_at = tokio::time::Instant::now() + STALL;
         inner.touch_session(&chat_id);
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
@@ -1077,6 +1142,7 @@ async fn drive_run(
             && !saw_session_started
             && folded.is_empty()
             && !interrupted
+            && !stall_killed
             && matches!(
                 &event,
                 AgentEvent::Done {
