@@ -121,6 +121,9 @@ pub enum Action {
     BoardFind,
     /// `F` — clear whichever filter is on.
     BoardClearFilter,
+    /// `d` — step to the next board host: automatic, then this device, then
+    /// each registered device, then back to automatic (gh#55).
+    BoardCycleHost,
     /// A keystroke aimed at the board's find field.
     BoardFindType(char),
     BoardFindBackspace,
@@ -263,6 +266,7 @@ fn map_board(typing: bool, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('f') => Some(Action::BoardCycleFilter),
         KeyCode::Char('/') => Some(Action::BoardFind),
         KeyCode::Char('F') => Some(Action::BoardClearFilter),
+        KeyCode::Char('d') if !ctrl => Some(Action::BoardCycleHost),
         KeyCode::Enter => Some(Action::BoardEnter),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::BoardDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::BoardUp),
@@ -433,6 +437,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("enter", "board: dispatch a ready task"),
     ("f / F", "board: cycle the route filter / clear it"),
     ("/", "board: find as you type"),
+    ("d", "board: which device hosts the board"),
     ("?", "this help"),
     ("q, Ctrl-C", "detach — the engine keeps running"),
 ];

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use comet_doc::SessionMessageEntry;
-use comet_proto::view::board::TaskRow;
+use comet_proto::view::board::{self as board_view, TaskRow};
 use comet_proto::view::ConnectionStatus;
 use comet_proto::{AuthState, Chat, Device, Session, Space};
 use comet_rpc::{RpcClient, methods};
@@ -55,6 +55,14 @@ pub enum Update {
     /// engine without the board serves nothing and the app just shows an empty
     /// board.
     Board(Vec<TaskRow>),
+    /// Which device the board stream is pointed at, and whether it has actually
+    /// delivered rows (gh#55). The pane renders this in its header; the
+    /// supervisor owns the choice, so the two can never disagree about which
+    /// device a dispatch will land on.
+    BoardHostChanged {
+        device: Option<String>,
+        live: bool,
+    },
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
         chat_id: String,
@@ -110,15 +118,49 @@ pub enum Command {
     /// Release a board task from the TUI: the operator is dispatching, so there
     /// is no `via` — provenance is never fabricated. The reply names the chat
     /// that will hold the run; the identifier travels so the notice reads well.
+    /// The target device is stamped by the supervisor, which owns the board
+    /// host — a dispatch always lands on the device whose rows you are reading.
     Dispatch {
         task_id: String,
         identifier: String,
     },
+    /// Point the board pane at a device, or hand the choice back to the sweep
+    /// (gh#55). Survives reconnects, so a pinned box stays pinned across a
+    /// `comet daemon restart`.
+    BoardHost(BoardHost),
     /// Drop this connection and dial again now, skipping the backoff. What `r`
     /// does after the user has fixed whatever was wrong.
     Reconnect,
     /// Drop the connection and stop reconnecting (quit path).
     Shutdown,
+}
+
+/// Which device's board the pane reads and drives (gh#55).
+///
+/// The board store lives on exactly one device — usually the always-on box —
+/// and the board RPCs are relay-forwardable, so a laptop with no board of its
+/// own is not out of options: it asks the others. [`BoardHost::Auto`] is that
+/// sweep, and is right on every install where one box hosts the board;
+/// [`BoardHost::Pinned`] is the escape hatch for when two do, or when the guess
+/// is wrong.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BoardHost {
+    /// Ask each device in turn until one answers with rows.
+    #[default]
+    Auto,
+    /// Exactly this device; `None` is this one (no `targetDeviceId`).
+    Pinned(Option<String>),
+}
+
+impl BoardHost {
+    /// The device this choice starts at. `Auto` starts at this device — a local
+    /// board must always win over a remote one.
+    fn target(&self) -> Option<String> {
+        match self {
+            BoardHost::Auto => None,
+            BoardHost::Pinned(device) => device.clone(),
+        }
+    }
 }
 
 /// Everything needed to materialize a drafted session.
@@ -183,6 +225,10 @@ async fn supervise(
     // The transcript target survives reconnects: after the engine comes back we
     // resubscribe whatever the user is still looking at.
     let mut transcript_target: Option<String> = None;
+    // So does the board host: a pinned box stays pinned across a daemon
+    // restart, and an unpinned one starts its sweep over (the box may have been
+    // what restarted).
+    let mut board_pin = BoardHost::default();
     let mut attempt = 0usize;
 
     loop {
@@ -199,7 +245,15 @@ async fn supervise(
                 let _ = updates.send(Update::Attached(connection.attachment.clone()));
                 let _ = updates.send(Update::Connection(ConnectionStatus::Ready));
                 let client = Arc::new(connection.client);
-                match session(&client, &updates, &mut commands, &mut transcript_target).await {
+                match session(
+                    &client,
+                    &updates,
+                    &mut commands,
+                    &mut transcript_target,
+                    &mut board_pin,
+                )
+                .await
+                {
                     SessionEnd::Shutdown => return,
                     SessionEnd::AppGone => return,
                     SessionEnd::ConnectionLost => {
@@ -238,6 +292,9 @@ async fn supervise(
                         break;
                     }
                     Some(Command::WatchTranscript(target)) => transcript_target = target,
+                    // The board host is a choice, not a request: remember it so
+                    // the reconnect resubscribes where the operator pointed.
+                    Some(Command::BoardHost(choice)) => board_pin = choice,
                     Some(_) => {}
                 },
             }
@@ -260,17 +317,20 @@ async fn session(
     updates: &mpsc::UnboundedSender<Update>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     transcript_target: &mut Option<String>,
+    board_pin: &mut BoardHost,
 ) -> SessionEnd {
     let empty = || serde_json::json!({});
 
     // The engine's device id is a plain call, not a stream. Best-effort: an
     // engine that doesn't serve it yet just leaves space creation disabled.
+    let mut local_device: Option<String> = None;
     match client.call(methods::LOCAL_DEVICE, empty()).await {
         Ok(value) => {
-            if let Some(id) = value.get("deviceId").and_then(|v| v.as_str())
-                && updates.send(Update::LocalDevice(id.to_string())).is_err()
-            {
-                return SessionEnd::AppGone;
+            if let Some(id) = value.get("deviceId").and_then(|v| v.as_str()) {
+                local_device = Some(id.to_string());
+                if updates.send(Update::LocalDevice(id.to_string())).is_err() {
+                    return SessionEnd::AppGone;
+                }
             }
         }
         Err(err) => tracing::debug!(error = %err, "LocalDevice unavailable"),
@@ -299,17 +359,25 @@ async fn session(
 
     // The board is best-effort: an engine built without the board, or with
     // `COMET_BOARD=0`, refuses the stream and the chat viewport must keep
-    // working anyway.
-    let mut board = match client.subscribe(methods::WATCH_BOARD, empty()).await {
-        Ok(stream) => Some(stream),
-        Err(err) => {
-            tracing::debug!(error = %err, "WatchBoard unavailable");
-            if updates.send(Update::Board(Vec::new())).is_err() {
-                return SessionEnd::AppGone;
-            }
-            None
-        }
-    };
+    // working anyway. Which device we ask is [`BoardHost`]'s business (gh#55):
+    // `board_host` is where the current subscription points, `board_delivered`
+    // records whether that device ever answered — the engine refuses the
+    // subscription outright when it hosts no board, so silence IS the answer,
+    // and an unpinned host walks on to the next device.
+    let mut devices_seen: Vec<Device> = Vec::new();
+    let mut board_host = board_pin.target();
+    let mut board_delivered = false;
+    let mut board = open_board(client, board_host.as_deref()).await;
+    let mut board_retry: Option<tokio::time::Instant> = None;
+    if updates
+        .send(Update::BoardHostChanged {
+            device: board_host.clone(),
+            live: false,
+        })
+        .is_err()
+    {
+        return SessionEnd::AppGone;
+    }
 
     loop {
         tokio::select! {
@@ -353,8 +421,42 @@ async fn session(
                     task_id,
                     identifier,
                 }) => {
-                    spawn_dispatch(client.clone(), updates.clone(), task_id, identifier);
+                    // The release lands on the device whose board this is.
+                    spawn_dispatch(
+                        client.clone(),
+                        updates.clone(),
+                        task_id,
+                        identifier,
+                        board_host.clone(),
+                    );
                 }
+                Some(Command::BoardHost(choice)) => {
+                    *board_pin = choice;
+                    board_host = board_pin.target();
+                    board_delivered = false;
+                    board_retry = None;
+                    board = open_board(client, board_host.as_deref()).await;
+                    // Another device is another board: clear the rows rather
+                    // than leave one box's tasks under the other's name.
+                    if updates.send(Update::Board(Vec::new())).is_err()
+                        || updates
+                            .send(Update::BoardHostChanged {
+                                device: board_host.clone(),
+                                live: false,
+                            })
+                            .is_err()
+                    {
+                        return SessionEnd::AppGone;
+                    }
+                }
+            },
+
+            // The board's own backoff: a host that has nothing to say (or lost
+            // the stream) is re-asked here rather than in a tight loop.
+            _ = wait_until(board_retry) => {
+                board_retry = None;
+                board_delivered = false;
+                board = open_board(client, board_host.as_deref()).await;
             },
 
             frame = chats.recv() => match decode::<Vec<Chat>>(frame, "chats") {
@@ -368,7 +470,12 @@ async fn session(
                 Frame::Ended => return SessionEnd::ConnectionLost,
             },
             frame = devices.recv() => match decode::<Vec<Device>>(frame, "devices") {
-                Frame::Value(rows) => if updates.send(Update::Devices(rows)).is_err() { return SessionEnd::AppGone },
+                Frame::Value(rows) => {
+                    // Kept here too: the board's host sweep walks this list, and
+                    // a device that registers mid-session is a candidate.
+                    devices_seen.clone_from(&rows);
+                    if updates.send(Update::Devices(rows)).is_err() { return SessionEnd::AppGone }
+                }
                 Frame::Skip => {}
                 Frame::Ended => return SessionEnd::ConnectionLost,
             },
@@ -408,18 +515,113 @@ async fn session(
             },
 
             // An absent board stream pends forever, so it never fires.
-            frame = recv_maybe(&mut board) => if let Some(value) = frame {
-                match decode::<Vec<TaskRow>>(Some(value), "board") {
+            frame = recv_maybe(&mut board) => match frame {
+                Some(value) => match decode::<Vec<TaskRow>>(Some(value), "board") {
                     Frame::Value(rows) => {
+                        let first = !board_delivered;
+                        board_delivered = true;
                         if updates.send(Update::Board(rows)).is_err() {
+                            return SessionEnd::AppGone;
+                        }
+                        // This device really does host the board — say so once,
+                        // so the pane's header can stop hedging.
+                        if first && updates.send(Update::BoardHostChanged {
+                            device: board_host.clone(),
+                            live: true,
+                        }).is_err() {
                             return SessionEnd::AppGone;
                         }
                     }
                     Frame::Skip => {}
                     Frame::Ended => return SessionEnd::ConnectionLost,
+                },
+                // The board stream ended. NOT a lost connection: the engine ends
+                // it when it hosts no board, and a forwarded one ends when the
+                // peer link drops. Drop the slot (a closed receiver would spin
+                // this arm) and decide where to look next.
+                None => {
+                    board = None;
+                    let answered = board_delivered;
+                    board_delivered = false;
+                    // Only an unpinned host that said NOTHING is walked past: a
+                    // pinned one is the operator's answer, and one that had been
+                    // delivering rows does host the board — it just lost the
+                    // stream, and is re-asked in place.
+                    let sweep = matches!(board_pin, BoardHost::Auto) && !answered;
+                    let next = sweep.then(|| {
+                        let candidates = board_view::host_candidates(
+                            &devices_seen,
+                            local_device.as_deref(),
+                        );
+                        board_view::next_host_candidate(&candidates, board_host.as_deref())
+                    });
+                    match next {
+                        // Ask the next device now: the sweep already costs one
+                        // round-trip each, and a backoff per device would make
+                        // finding the box take a visible age.
+                        Some(Some(target)) => {
+                            board_host = target;
+                            board = open_board(client, board_host.as_deref()).await;
+                        }
+                        // Everyone was asked and nobody hosts a board: start the
+                        // sweep over after the backoff, since the box may be
+                        // booting. A pinned host (or one that dropped mid-
+                        // stream) simply waits and is re-asked where it is.
+                        Some(None) => {
+                            board_host = None;
+                            board_retry = Some(tokio::time::Instant::now() + BOARD_RETRY);
+                        }
+                        None => board_retry = Some(tokio::time::Instant::now() + BOARD_RETRY),
+                    }
+                    // Reported after the decision, so the header always names
+                    // the device actually being asked.
+                    if updates.send(Update::BoardHostChanged {
+                        device: board_host.clone(),
+                        live: false,
+                    }).is_err() {
+                        return SessionEnd::AppGone;
+                    }
                 }
             },
         }
+    }
+}
+
+/// How long before a board host that said nothing is asked again. Long enough
+/// that a device with no board costs nothing, short enough that a box finishing
+/// its boot is picked up while you are still looking at the pane.
+const BOARD_RETRY: Duration = Duration::from_secs(2);
+
+/// Subscribe `WatchBoard` at a device (`None` = this one). A refusal is not
+/// fatal — an engine with no board is a normal thing to be pointed at while the
+/// sweep is looking, and the caller reads "no stream" the same way it reads "a
+/// stream that ended without a frame".
+async fn open_board(
+    client: &Arc<RpcClient>,
+    target: Option<&str>,
+) -> Option<mpsc::UnboundedReceiver<serde_json::Value>> {
+    let mut params = serde_json::json!({});
+    if let (Some(device), Some(object)) = (target, params.as_object_mut()) {
+        object.insert(
+            "targetDeviceId".into(),
+            serde_json::Value::String(device.to_string()),
+        );
+    }
+    match client.subscribe(methods::WATCH_BOARD, params).await {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            tracing::debug!(?target, error = %err, "WatchBoard unavailable");
+            None
+        }
+    }
+}
+
+/// Sleep until an optional deadline, pending forever when there is none, so a
+/// backoff can sit in the `select!` unconditionally.
+async fn wait_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -692,9 +894,13 @@ fn spawn_dispatch(
     updates: mpsc::UnboundedSender<Update>,
     task_id: String,
     identifier: String,
+    target_device: Option<String>,
 ) {
     tokio::spawn(async move {
-        let params = serde_json::json!({ "taskId": task_id });
+        let mut params = serde_json::json!({ "taskId": task_id });
+        if let (Some(device), Some(object)) = (target_device, params.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::Value::String(device));
+        }
         match client.call(methods::DISPATCH_TASK, params).await {
             Ok(value) => {
                 let chat = value
