@@ -1403,6 +1403,7 @@ impl App {
             reasoning: draft.reasoning,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            account: None,
         });
         effects.push(Command::StartSession(Box::new(crate::link::StartSession {
             chat_id,
@@ -2310,6 +2311,7 @@ impl App {
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            account: None,
         });
         config.reasoning = Some(level);
         let Ok(value) = serde_json::to_value(&config) else {
@@ -2340,6 +2342,7 @@ impl App {
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            account: None,
         });
         config.model = Some(model.id.clone());
         // Keep the reasoning level only if the new model offers it.
@@ -3266,6 +3269,7 @@ mod tests {
             reopened: 0,
             updated_at: chrono::Utc::now().to_rfc3339(),
             started_at: None,
+            account: None,
         }
     }
 

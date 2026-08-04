@@ -143,7 +143,7 @@ comet-native/
     engine/       comet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
-                                 # agent accounts (cred swap), auth (WorkOS via edge),
+                                 # agent accounts (cred swap + per-run dirs), auth (WorkOS),
                                  # device-room host/peers, identity
     rpc/          comet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
@@ -231,7 +231,11 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace doc summary + DO diff
   sidecar.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
-  elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
+  elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows. Plus a
+  fork addition (gh#59): a slot also materializes into a config dir of its own
+  (`{data_dir}/accounts/{slotId}/`) that a run points its harness child at with
+  `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so several teammates' subscriptions coexist on one
+  box and no swap happens under a live run.
 - **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
   callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
 

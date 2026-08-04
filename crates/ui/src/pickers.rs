@@ -106,6 +106,9 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            // Composer-created chats run on the device's own CLI login; only a
+            // board dispatch picks an account (gh#59).
+            account: None,
         })
     }
 }

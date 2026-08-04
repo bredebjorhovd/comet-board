@@ -77,6 +77,12 @@ enum Command {
         /// Override the harness's default model for this dispatch.
         #[arg(long)]
         model: Option<String>,
+        /// Agent-account slot id to run under — whose Claude/Codex
+        /// subscription this dispatch spends. Defaults to the route's
+        /// `account`, and failing that the device's own CLI login.
+        /// `comet-board doctor` lists the ids this device has saved.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
@@ -205,6 +211,7 @@ fn main() -> Result<()> {
             via,
             runtime: runtime_flag,
             model,
+            account,
         } => {
             let via = ops::provenance(via);
             let d = runtime.block_on(async {
@@ -215,6 +222,7 @@ fn main() -> Result<()> {
                     via.as_deref(),
                     runtime_flag.as_deref(),
                     model.as_deref(),
+                    account.as_deref(),
                 )
                 .await
             })?;
@@ -225,12 +233,13 @@ fn main() -> Result<()> {
             if let Some(v) = &via {
                 println!("released by chat {v}");
             }
-            if runtime_flag.is_some() || model.is_some() {
+            if runtime_flag.is_some() || model.is_some() || account.is_some() {
                 println!(
                     "overrides: {}",
                     [
                         runtime_flag.as_deref().map(|r| format!("runtime={r}")),
                         model.as_deref().map(|m| format!("model={m}")),
+                        account.as_deref().map(|a| format!("account={a}")),
                     ]
                     .into_iter()
                     .flatten()
@@ -341,7 +350,7 @@ fn main() -> Result<()> {
                 let d = runtime.block_on(async {
                     let client = ops::attach(port).await?;
                     ops::await_row(&client, &id, pickup).await?;
-                    ops::dispatch(&client, &id, via.as_deref(), None, None).await
+                    ops::dispatch(&client, &id, via.as_deref(), None, None, None).await
                 })?;
                 println!("dispatched {id} → chat {} (attempt {})", d.chat_id, d.attempt);
             }
@@ -358,8 +367,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => {
-            let (engine, spaces) = match runtime.block_on(fetch_spaces(port)) {
-                Ok((device, spaces)) => (
+            let (engine, spaces, accounts) = match runtime.block_on(fetch_spaces(port)) {
+                Ok((device, spaces, accounts)) => (
                     EngineStatus {
                         reachable: true,
                         detail: format!(
@@ -368,6 +377,7 @@ fn main() -> Result<()> {
                         ),
                     },
                     Some(spaces),
+                    Some(accounts),
                 ),
                 Err(e) => (
                     EngineStatus {
@@ -378,16 +388,22 @@ fn main() -> Result<()> {
                         ),
                     },
                     None,
+                    None,
                 ),
             };
-            let checks = comet_board::doctor::doctor(&paths, &engine, spaces.as_deref())?;
+            let checks = comet_board::doctor::doctor(
+                &paths,
+                &engine,
+                spaces.as_deref(),
+                accounts.as_deref(),
+            )?;
             if !comet_board::doctor::print_doctor(&checks) {
                 std::process::exit(1);
             }
             Ok(())
         }
         Command::Init { force } => {
-            let (_, spaces) = runtime.block_on(fetch_spaces(port)).with_context(|| {
+            let (_, spaces, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
                 format!(
                     "listing spaces from the engine on 127.0.0.1:{port} — \
                      start `comet` or `comet headless` first"
@@ -408,7 +424,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let (_, spaces) = runtime.block_on(fetch_spaces(port)).with_context(|| {
+            let (_, spaces, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
                 format!(
                     "listing spaces from the engine on 127.0.0.1:{port} — \
                      start `comet` or `comet headless` first"
@@ -505,7 +521,9 @@ fn main() -> Result<()> {
 /// first `WatchSpaces` snapshot for the rows, filtered to spaces this device
 /// owns — a route's `repo =` is a local path, and another device's folders are
 /// not on this disk.
-async fn fetch_spaces(port: u16) -> Result<(String, Vec<Space>)> {
+async fn fetch_spaces(
+    port: u16,
+) -> Result<(String, Vec<Space>, Vec<comet_proto::AgentAccount>)> {
     let fetch = async {
         let client: RpcClient = connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
         let device = client
@@ -527,7 +545,17 @@ async fn fetch_spaces(port: u16) -> Result<(String, Vec<Space>)> {
             .into_iter()
             .filter(|s| s.device_id == device)
             .collect();
-        Ok::<_, anyhow::Error>((device, local))
+        // The saved agent logins, for the route `account` check. Offline list
+        // (no `forceUsage`): doctor wants the ids and who they belong to, not
+        // a round of rate-limit probes.
+        let accounts: Vec<comet_proto::AgentAccount> = client
+            .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
+            .await
+            .ok()
+            .and_then(|v| serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(v).ok())
+            .map(|s| s.accounts)
+            .unwrap_or_default();
+        Ok::<_, anyhow::Error>((device, local, accounts))
     };
     tokio::time::timeout(FETCH_TIMEOUT, fetch)
         .await

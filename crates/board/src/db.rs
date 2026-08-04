@@ -16,7 +16,7 @@ pub struct Db {
 const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktree, branch, \
      started_at, ended_at, outcome, missing_ticks, agent_status, \
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
-     settled_at, reopened, screen_print, screen_at, nudges, nudged_at";
+     settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -47,6 +47,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         screen_at: r.get(19)?,
         nudges: r.get(20)?,
         nudged_at: r.get(21)?,
+        account: r.get(22)?,
     })
 }
 
@@ -145,7 +146,13 @@ impl Db {
               -- Nudges sent into this pane for the stall it is currently in, and
               -- when the last one went (gh#40). Cleared once the pane comes back.
               nudges       INTEGER NOT NULL DEFAULT 0,
-              nudged_at    TEXT
+              nudged_at    TEXT,
+              -- The agent-account slot this attempt actually ran under, i.e.
+              -- whose subscription it spent (gh#59). NULL is the device's own
+              -- CLI login. Recorded per attempt rather than read back off the
+              -- route, because the route's default can change under a run that
+              -- is still going.
+              account      TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -242,6 +249,10 @@ impl Db {
                 // a stall that predates the feature as much as for a fresh one.
                 ("nudges", "INTEGER NOT NULL DEFAULT 0"),
                 ("nudged_at", "TEXT"),
+                // Whose subscription this attempt spent (gh#59). Existing rows
+                // keep NULL, which is exactly right: they ran before accounts
+                // could be chosen, on the device's own CLI login.
+                ("account", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -524,8 +535,8 @@ impl Db {
         let res = self.conn.execute(
             "INSERT INTO attempts
                (task_id, pane_id, workspace, runtime, worktree, branch,
-                dispatched_by, dispatched_by_pane, started_at, base_sha)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                dispatched_by, dispatched_by_pane, started_at, base_sha, account)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -536,7 +547,8 @@ impl Db {
                 a.dispatched_by,
                 a.dispatched_by_pane,
                 now(),
-                a.base_sha
+                a.base_sha,
+                a.account
             ],
         );
         match res {
@@ -913,6 +925,9 @@ pub struct NewAttempt {
     /// produce" can be measured against the attempt's own starting point
     /// rather than against the remote.
     pub base_sha: Option<String>,
+    /// The agent-account slot this attempt runs under — whose subscription it
+    /// spends (gh#59). `None` is the device's own CLI login.
+    pub account: Option<String>,
 }
 
 pub struct NewWriteback {
@@ -979,6 +994,7 @@ mod tests {
             dispatched_by: None,
             dispatched_by_pane: None,
             base_sha: None,
+            account: None,
         }
     }
 
@@ -1020,6 +1036,9 @@ mod tests {
         assert_eq!(tasks.len(), 1, "the existing row survives the upgrade");
         assert_eq!(tasks[0].attempts.len(), 1);
         assert_eq!(tasks[0].attempts[0].dispatched_by, None);
+        // An attempt recorded before accounts existed ran on the device's own
+        // CLI login, which is exactly what NULL means (gh#59).
+        assert_eq!(tasks[0].attempts[0].account, None);
         assert!(!tasks[0].local_done);
 
         // And it is idempotent — opening again must not try to add them twice.
@@ -1094,6 +1113,29 @@ mod tests {
         db.set_local_done("linear:LIN-142", true).unwrap();
         seed(&db, "linear:LIN-142");
         assert!(db.load_tasks().unwrap()[0].local_done);
+    }
+
+    /// Whose subscription an attempt spent, kept on the attempt (gh#59). The
+    /// chat row carries it too, but chats get archived and routes get edited —
+    /// the attempt is the record of what actually ran.
+    #[test]
+    fn an_attempt_records_the_account_it_ran_under() {
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let mut a = attempt("linear:LIN-142");
+        a.account = Some("8f2c1d0a7b6e4539".into());
+        let id = db.insert_attempt(&a).unwrap();
+        let stored = db.attempts_for("linear:LIN-142").unwrap();
+        assert_eq!(stored[0].id, id);
+        assert_eq!(stored[0].account.as_deref(), Some("8f2c1d0a7b6e4539"));
+        // …and it survives the attempt closing, which is when anyone asks.
+        db.close_attempt(id, Outcome::Done).unwrap();
+        assert_eq!(
+            db.attempts_for("linear:LIN-142").unwrap()[0]
+                .account
+                .as_deref(),
+            Some("8f2c1d0a7b6e4539")
+        );
     }
 
     #[test]

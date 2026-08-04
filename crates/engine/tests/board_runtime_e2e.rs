@@ -108,6 +108,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         core.workspace
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
+        core.agent_accounts.clone(),
         tokio::runtime::Handle::current(),
     ));
 
@@ -121,6 +122,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         worktree: true,
         harness: HarnessId::Mock,
         model: None,
+        account: None,
         prompt: "do the thing".into(),
     };
     let rt = runtime.clone();
@@ -200,6 +202,37 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     assert_eq!(
         runtime.last_run_end(&handle.chat_id).unwrap(),
         Some(RunEnd::Completed)
+    );
+
+    // ── an account that does not resolve refuses the dispatch (gh#59) ───────
+    //
+    // Before the chat exists, not at the first run: a chat holding an attempt
+    // whose login is unknown is a row somebody has to clean up, and the caller
+    // finds out either way.
+    let chats_before = core.workspace.doc().read_chats().unwrap().len();
+    let rt = runtime.clone();
+    let bogus = DispatchSpec {
+        identifier: "gh#2".into(),
+        space_id: "space-widget".into(),
+        device_id: core.device_id.clone(),
+        repo_path: repo.to_string_lossy().into_owned(),
+        branch: "board/gh-2-widget".into(),
+        worktree: true,
+        harness: HarnessId::ClaudeCode,
+        model: None,
+        account: Some("ffffffffffffffff".into()),
+        prompt: "should never be sent".into(),
+    };
+    let err = tokio::task::spawn_blocking(move || rt.dispatch(&bogus))
+        .await
+        .unwrap()
+        .expect_err("an unknown account refuses the dispatch");
+    let err = format!("{err:#}");
+    assert!(err.contains("ffffffffffffffff"), "{err}");
+    assert_eq!(
+        core.workspace.doc().read_chats().unwrap().len(),
+        chats_before,
+        "a refused dispatch leaves no chat behind"
     );
 
     // ── prompt (idle chat → a send, which runs a second turn) ───────────────

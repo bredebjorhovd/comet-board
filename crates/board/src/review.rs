@@ -717,6 +717,7 @@ mod tests {
             pane_id: Some(chat.into()),
             workspace: "offhand".into(),
             runtime: "claude-code".into(),
+            account: None,
             worktree: worktree.map(str::to_string),
             branch: Some(branch.into()),
             started_at: "2026-07-28T09:00:00Z".into(),
@@ -916,6 +917,7 @@ mod tests {
                 dispatched_by: None,
                 dispatched_by_pane: None,
                 base_sha: None,
+                account: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat).unwrap();

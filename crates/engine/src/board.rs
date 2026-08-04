@@ -442,6 +442,11 @@ fn handle_dispatch(
         dispatched_by: dispatcher.task().map(str::to_string),
         dispatched_by_pane: dispatcher.pane().map(str::to_string),
         base_sha: None,
+        // Whose subscription this attempt spends — the dispatch's choice, else
+        // the route's. Recorded even though the chat row carries it too: the
+        // route's default can change under a run that is still going, and the
+        // attempt is the record of what actually ran (gh#59).
+        account: spec.account.clone(),
     })?;
 
     match runtime.dispatch(&spec) {
@@ -721,6 +726,7 @@ mod tests {
                 dispatched_by: None,
                 dispatched_by_pane: None,
                 base_sha: None,
+                account: None,
             })
             .unwrap();
         db.set_attempt_pane(a, chat_id).unwrap();
@@ -961,6 +967,7 @@ runtime = "mock"
                 DispatchOverrides {
                     runtime: Some("opencode".into()),
                     model: Some("gpt-5.2".into()),
+                    account: None,
                 },
             )
             .await
@@ -1000,6 +1007,7 @@ runtime = "mock"
                 DispatchOverrides {
                     runtime: Some("nonesuch".into()),
                     model: None,
+                    account: None,
                 },
             )
             .await

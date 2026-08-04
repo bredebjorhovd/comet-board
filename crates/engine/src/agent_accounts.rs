@@ -23,6 +23,17 @@
 //!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
 //!    until its loopback callback lands.
 //!
+//! Per-run accounts (gh#59): a swap is engine-wide and mutates the dir a live
+//! run is reading, so a run that wants a *specific* account never swaps.
+//! [`AgentAccounts::materialize`] writes the slot into a config dir of its own
+//! (`{data_dir}/accounts/{slotId}/`) and the engine stamps `CLAUDE_CONFIG_DIR` /
+//! `CODEX_HOME` at it in the harness child's env — both CLIs already relocate
+//! wholesale on those variables (see [`AgentAccountsConfig::detect`], which
+//! reads the same two), so one box can run several teammates' subscriptions at
+//! once and each dispatch burns its owner's limits. The dir is the live copy
+//! from then on: refresh writebacks the CLI makes land there, `read_slots`
+//! absorbs them back into the slot file, and usage probes read the result.
+//!
 //! Usage probes: both providers expose the rate-limit view their own CLIs render
 //! (`/usage` in Claude Code, `/status` in Codex). Unlike comet (fetch on every
 //! list, 60s cache), native only hits the network when `force_usage` is set —
@@ -129,6 +140,14 @@ impl AgentAccountsConfig {
     fn root_dir(&self) -> PathBuf {
         self.data_dir.join("agent-accounts")
     }
+
+    /// Parent of the per-slot config dirs a run is pointed at (gh#59). Kept
+    /// beside the slot files rather than inside them: `root_dir` is swept for
+    /// `.login-*` leftovers at boot and holds only `{slotId}.json` records,
+    /// while these are live CLI homes the harness children write into.
+    fn accounts_dir(&self) -> PathBuf {
+        self.data_dir.join("accounts")
+    }
 }
 
 // ── slot storage ────────────────────────────────────────────────────────────
@@ -220,6 +239,12 @@ struct Inner {
     /// Slots with a token refresh in flight — a second refresh of the same
     /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
+    /// Slot id → how many live runs are pointed at its dir. A CLI holding a
+    /// token pair in memory is the owner of it; refreshing underneath one
+    /// rotates a token it will still try to use and can force a re-login, so
+    /// leased slots are skipped by the usage refresher exactly as the live
+    /// login is.
+    leases: Mutex<HashMap<String, usize>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -229,6 +254,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone)]
 pub struct AgentAccounts {
     inner: Arc<Inner>,
+}
+
+/// A live run's claim on an account slot, released on drop.
+pub struct AccountLease {
+    inner: Arc<Inner>,
+    account_id: String,
+}
+
+impl Drop for AccountLease {
+    fn drop(&mut self) {
+        let mut leases = lock(&self.inner.leases);
+        if let Some(count) = leases.get_mut(&self.account_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                leases.remove(&self.account_id);
+            }
+        }
+    }
 }
 
 impl AgentAccounts {
@@ -256,8 +299,136 @@ impl AgentAccounts {
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
+                leases: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    // ── per-run account dirs (gh#59) ────────────────────────────────────────
+
+    /// The config dir a run pointed at `account_id` should use — created and
+    /// seeded from the slot if it does not exist yet.
+    ///
+    /// The returned path is what `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are set to
+    /// for the harness child, so the CLI reads and refreshes *this* account's
+    /// tokens and never touches `~/.claude` or `~/.codex`. Seeding is one-way
+    /// and freshness-guarded: once the dir exists it is the live copy, and the
+    /// slot file is only re-stamped over it when the slot holds strictly newer
+    /// credentials (a re-login through the accounts UI).
+    pub fn materialize(
+        &self,
+        harness: HarnessId,
+        account_id: &str,
+    ) -> Result<PathBuf, EngineError> {
+        if !is_slot_id(account_id) {
+            return Err(EngineError::Other(format!(
+                "`{account_id}` is not an agent account id."
+            )));
+        }
+        let slot = self
+            .read_slots(harness)
+            .into_iter()
+            .find(|s| s.id == account_id)
+            .ok_or_else(|| {
+                EngineError::Other(format!(
+                    "no saved {} login with id `{account_id}` — sign it in under Agent \
+                     accounts first.",
+                    harness_slug(harness)
+                ))
+            })?;
+        let dir = self.account_dir(&slot.id);
+        std::fs::create_dir_all(&dir)?;
+        // Owner-only: every file below it is a live token set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        match harness {
+            HarnessId::ClaudeCode => {
+                let file = dir.join(".credentials.json");
+                if is_stale(&file, harness, &slot.credentials) {
+                    write_file_atomic(&file, slot.credentials.to_string().as_bytes(), true)?;
+                }
+                // `CLAUDE_CONFIG_DIR` relocates the identity file too, so the
+                // CLI reads the account out of this dir rather than the shared
+                // `~/.claude.json` — which is what makes the run's account
+                // independent of whatever is live engine-wide.
+                let identity = dir.join(".claude.json");
+                let existing = read_json(&identity);
+                let mut cfg = existing.clone().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(map) = cfg.as_object_mut() {
+                    map.insert("oauthAccount".into(), slot_oauth_account(&slot));
+                    match slot
+                        .claude_config
+                        .as_ref()
+                        .and_then(|c| c.get("userID"))
+                        .filter(|v| v.is_string())
+                    {
+                        Some(user_id) => {
+                            map.insert("userID".into(), user_id.clone());
+                        }
+                        None => {
+                            map.remove("userID");
+                        }
+                    }
+                }
+                // Only when the identity actually changed. The CLI writes its
+                // own state into this file (onboarding flags, project history)
+                // and a second run on the same account re-materializing over a
+                // write in flight would drop it.
+                if existing.as_ref() != Some(&cfg) {
+                    write_file_atomic(&identity, cfg.to_string().as_bytes(), false)?;
+                }
+            }
+            HarnessId::Codex => {
+                let file = dir.join("auth.json");
+                if is_stale(&file, harness, &slot.credentials) {
+                    let json = serde_json::to_string_pretty(&slot.credentials)
+                        .map_err(|e| EngineError::Other(format!("serialize codex auth: {e}")))?;
+                    write_file_atomic(&file, json.as_bytes(), true)?;
+                }
+            }
+            other => {
+                return Err(EngineError::Other(format!(
+                    "agent accounts are not supported for {other:?}"
+                )));
+            }
+        }
+        Ok(dir)
+    }
+
+    /// Hold `account_id` for the life of a run. While held, the usage refresher
+    /// leaves the slot's tokens alone — the CLI reading that dir owns them.
+    pub fn lease(&self, account_id: &str) -> AccountLease {
+        *lock(&self.inner.leases)
+            .entry(account_id.to_string())
+            .or_insert(0) += 1;
+        AccountLease {
+            inner: self.inner.clone(),
+            account_id: account_id.to_string(),
+        }
+    }
+
+    fn is_leased(&self, account_id: &str) -> bool {
+        lock(&self.inner.leases)
+            .get(account_id)
+            .is_some_and(|n| *n > 0)
+    }
+
+    fn account_dir(&self, slot_id: &str) -> PathBuf {
+        self.inner.config.accounts_dir().join(slot_id)
+    }
+
+    /// The live credentials file inside a materialized dir, when there is one.
+    fn materialized(&self, slot: &Slot) -> Option<serde_json::Value> {
+        let dir = self.account_dir(&slot.id);
+        let file = match slot.harness {
+            HarnessId::ClaudeCode => dir.join(".credentials.json"),
+            HarnessId::Codex => dir.join("auth.json"),
+            _ => return None,
+        };
+        read_json(&file)
     }
 
     // ── list ────────────────────────────────────────────────────────────────
@@ -410,21 +581,12 @@ impl AgentAccounts {
         let map = merged.as_object_mut().ok_or_else(|| {
             EngineError::Other("~/.claude.json is not a JSON object — not switching.".into())
         })?;
-        let (oauth_account, user_id) = match &slot.claude_config {
-            Some(cc) => (cc.get("oauthAccount").cloned(), cc.get("userID").cloned()),
-            None => (None, None),
-        };
-        map.insert(
-            "oauthAccount".into(),
-            oauth_account.unwrap_or_else(|| {
-                serde_json::json!({
-                    "accountUuid": slot.account_key,
-                    "emailAddress": slot.profile.email,
-                    "organizationName": slot.profile.organization,
-                    "displayName": slot.profile.display_name,
-                })
-            }),
-        );
+        let user_id = slot
+            .claude_config
+            .as_ref()
+            .and_then(|cc| cc.get("userID"))
+            .cloned();
+        map.insert("oauthAccount".into(), slot_oauth_account(slot));
         match user_id.filter(|v| v.is_string()) {
             Some(user_id) => {
                 map.insert("userID".into(), user_id);
@@ -455,11 +617,7 @@ impl AgentAccounts {
         // Reject anything that isn't a slot id (16 lowercase hex) BEFORE touching
         // the filesystem: `account_id` is a raw RPC string that becomes a path,
         // so a crafted id (`../../…`) must never reach `remove_file`.
-        if account_id.len() != 16
-            || !account_id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !is_slot_id(account_id) {
             return Err(EngineError::Other("Unknown account.".into()));
         }
         let snapshot = self.list(false).await?;
@@ -477,6 +635,13 @@ impl AgentAccounts {
         let file = self.slots_dir(harness)?.join(format!("{account_id}.json"));
         if file.exists() {
             std::fs::remove_file(&file)?;
+        }
+        // The materialized dir holds the same tokens the slot file did —
+        // forgetting an account has to take both, or the next dispatch naming
+        // that id would find a live login the accounts page says is gone.
+        let dir = self.account_dir(account_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
         }
         self.list(false).await
     }
@@ -1053,10 +1218,24 @@ impl AgentAccounts {
                 continue;
             }
             // One malformed slot file must skip THAT slot, not brick the page.
-            if let Some(slot) = std::fs::read_to_string(&path)
+            if let Some(mut slot) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|raw| serde_json::from_str::<Slot>(&raw).ok())
             {
+                // A materialized dir is the live copy: the CLI running against
+                // it rotates its own tokens there, and a slot file left at the
+                // seeding snapshot would hand every usage probe (and every
+                // future re-seed) a refresh token the provider has revoked.
+                if let Some(live) = self.materialized(&slot)
+                    && live != slot.credentials
+                    && freshness(harness, &live) >= freshness(harness, &slot.credentials)
+                {
+                    slot.credentials = live;
+                    slot.saved_at = now_ms();
+                    if let Err(err) = self.write_slot(&slot) {
+                        tracing::warn!(slot = %slot.id, error = %err, "absorbing account dir failed");
+                    }
+                }
                 slots.push(slot);
             }
         }
@@ -1198,10 +1377,14 @@ impl AgentAccounts {
     }
 
     /// Refresh a saved Claude slot's expired access token so its usage stays
-    /// queryable. NEVER called for the active login. Single-flight per slot:
-    /// OAuth refresh tokens are commonly single-use, and a concurrent second
-    /// POST of the same one would revoke the family and brick the slot.
+    /// queryable. NEVER called for the active login, nor for a slot a live run
+    /// is pointed at (same reason: that CLI owns the token pair). Single-flight
+    /// per slot: OAuth refresh tokens are commonly single-use, and a concurrent
+    /// second POST of the same one would revoke the family and brick the slot.
     async fn refresh_claude_slot(&self, slot: &Slot) -> Option<String> {
+        if self.is_leased(&slot.id) {
+            return None;
+        }
         if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
             return None;
         }
@@ -1252,6 +1435,14 @@ impl AgentAccounts {
         refreshed.saved_at = now_ms();
         if let Err(err) = self.write_slot(&refreshed) {
             tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
+        }
+        // Keep a materialized dir in step: it is what the next run reads, and
+        // leaving the rotated-out refresh token there would fail that run's
+        // first refresh.
+        if self.materialized(&refreshed).is_some()
+            && let Err(err) = self.materialize(refreshed.harness, &refreshed.id)
+        {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed account dir write failed");
         }
         Some(access_token)
     }
@@ -1387,6 +1578,64 @@ fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
         .or_else(|_| BASE64.decode(payload))
         .ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Is this a slot id (16 lowercase hex) — the only shape allowed to become a
+/// path segment? `account_id` reaches us as a raw RPC string.
+fn is_slot_id(id: &str) -> bool {
+    id.len() == 16
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The `oauthAccount` object for a slot's `.claude.json` — the stored one when
+/// the login was captured with it, rebuilt from the profile otherwise.
+fn slot_oauth_account(slot: &Slot) -> serde_json::Value {
+    slot.claude_config
+        .as_ref()
+        .and_then(|c| c.get("oauthAccount"))
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "accountUuid": slot.account_key,
+                "emailAddress": slot.profile.email,
+                "organizationName": slot.profile.organization,
+                "displayName": slot.profile.display_name,
+            })
+        })
+}
+
+/// How current a credential payload is, in epoch ms — Claude stamps the access
+/// token's expiry, Codex the time of its last refresh. `None` for a payload
+/// carrying neither (an API key, which never goes stale), which compares as
+/// older than anything dated: a dated payload IS newer news.
+fn freshness(harness: HarnessId, credentials: &serde_json::Value) -> Option<i64> {
+    match harness {
+        HarnessId::ClaudeCode => credentials
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("expiresAt"))
+            .and_then(|v| v.as_i64()),
+        HarnessId::Codex => credentials
+            .get("last_refresh")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.timestamp_millis()),
+        _ => None,
+    }
+}
+
+/// Should `file` be (re)written from a slot holding `credentials`? Missing is
+/// stale; present-and-at-least-as-fresh is not — once the dir exists the CLI
+/// owns it, and only a genuinely newer slot (a re-login) may stamp over it.
+fn is_stale(file: &Path, harness: HarnessId, credentials: &serde_json::Value) -> bool {
+    let Some(live) = read_json(file) else {
+        return true;
+    };
+    if live == *credentials {
+        return false;
+    }
+    freshness(harness, credentials) > freshness(harness, &live)
 }
 
 fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
@@ -1588,5 +1837,256 @@ mod tests {
             "org%3Acreate_api_key%20user%3Aprofile"
         );
         assert_eq!(urlencode("https://a/b"), "https%3A%2F%2Fa%2Fb");
+    }
+
+    // ── per-run account dirs (gh#59) ────────────────────────────────────────
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "comet-accounts-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An accounts service whose every path is inside `dir` — nothing in these
+    /// tests may see, let alone write, the developer's real `~/.claude`.
+    fn accounts(dir: &Path) -> AgentAccounts {
+        AgentAccounts::new(AgentAccountsConfig {
+            data_dir: dir.to_path_buf(),
+            claude_config_dir: dir.join("live-claude"),
+            claude_config_file: dir.join("live-claude").join(".claude.json"),
+            codex_home: dir.join("live-codex"),
+            opencode_auth_file: dir.join("live-opencode").join("auth.json"),
+        })
+    }
+
+    fn claude_creds(expires_at: i64, refresh: &str) -> serde_json::Value {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "at",
+                "refreshToken": refresh,
+                "expiresAt": expires_at,
+            }
+        })
+    }
+
+    fn claude_slot(id_key: &str, credentials: serde_json::Value) -> Slot {
+        Slot {
+            id: slot_id_for(HarnessId::ClaudeCode, id_key),
+            harness: HarnessId::ClaudeCode,
+            account_key: id_key.to_string(),
+            profile: SlotProfile {
+                email: format!("{id_key}@example.com"),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials,
+            claude_config: None,
+            saved_at: 1,
+            created_at: Some(1),
+        }
+    }
+
+    /// The whole point: a slot becomes a config dir of its own, holding both
+    /// files `CLAUDE_CONFIG_DIR` relocates.
+    #[test]
+    fn materializing_a_slot_seeds_its_own_config_dir() {
+        let tmp = TempDir::new("materialize");
+        let service = accounts(&tmp.0);
+        let slot = claude_slot("teammate-a", claude_creds(9_000, "r1"));
+        service.write_slot(&slot).unwrap();
+
+        let dir = service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+        assert_eq!(dir, tmp.0.join("accounts").join(&slot.id));
+        assert_eq!(
+            read_json(&dir.join(".credentials.json")).unwrap(),
+            slot.credentials
+        );
+        // The identity file too — without it the CLI in that dir has tokens
+        // but no account, and re-onboards.
+        let identity = read_json(&dir.join(".claude.json")).unwrap();
+        assert_eq!(
+            identity["oauthAccount"]["emailAddress"],
+            "teammate-a@example.com"
+        );
+        // And the live config dir is untouched: that is the swap this replaces.
+        assert!(!tmp.0.join("live-claude").exists());
+    }
+
+    /// Two teammates, two dirs. One box, two subscriptions.
+    #[test]
+    fn each_slot_gets_a_dir_of_its_own() {
+        let tmp = TempDir::new("two-slots");
+        let service = accounts(&tmp.0);
+        let a = claude_slot("teammate-a", claude_creds(9_000, "ra"));
+        let b = claude_slot("teammate-b", claude_creds(9_000, "rb"));
+        service.write_slot(&a).unwrap();
+        service.write_slot(&b).unwrap();
+
+        let dir_a = service.materialize(HarnessId::ClaudeCode, &a.id).unwrap();
+        let dir_b = service.materialize(HarnessId::ClaudeCode, &b.id).unwrap();
+        assert_ne!(dir_a, dir_b);
+        assert_eq!(
+            read_json(&dir_a.join(".credentials.json")).unwrap()["claudeAiOauth"]["refreshToken"],
+            "ra"
+        );
+        assert_eq!(
+            read_json(&dir_b.join(".credentials.json")).unwrap()["claudeAiOauth"]["refreshToken"],
+            "rb"
+        );
+    }
+
+    /// Once the dir exists the CLI owns it: re-materializing must not stamp a
+    /// stale refresh token over the one the CLI rotated to mid-run.
+    #[test]
+    fn re_materializing_does_not_clobber_the_clis_own_refresh() {
+        let tmp = TempDir::new("no-clobber");
+        let service = accounts(&tmp.0);
+        let slot = claude_slot("teammate-a", claude_creds(1_000, "old"));
+        service.write_slot(&slot).unwrap();
+        let dir = service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+
+        // The CLI refreshes: newer expiry, new refresh token.
+        let rotated = claude_creds(50_000, "rotated");
+        write_file_atomic(
+            &dir.join(".credentials.json"),
+            rotated.to_string().as_bytes(),
+            true,
+        )
+        .unwrap();
+
+        service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+        assert_eq!(read_json(&dir.join(".credentials.json")).unwrap(), rotated);
+
+        // …and the slot file absorbs it, so the next probe (and the next
+        // re-seed) uses the token that actually works.
+        let stored = service
+            .read_slots(HarnessId::ClaudeCode)
+            .into_iter()
+            .find(|s| s.id == slot.id)
+            .unwrap();
+        assert_eq!(stored.credentials, rotated);
+    }
+
+    /// A genuinely newer slot — a re-login through the accounts UI — does win.
+    #[test]
+    fn a_fresher_slot_re_seeds_the_dir() {
+        let tmp = TempDir::new("re-seed");
+        let service = accounts(&tmp.0);
+        let mut slot = claude_slot("teammate-a", claude_creds(1_000, "old"));
+        service.write_slot(&slot).unwrap();
+        let dir = service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+
+        slot.credentials = claude_creds(99_000, "fresh");
+        service.write_slot(&slot).unwrap();
+        service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+        assert_eq!(
+            read_json(&dir.join(".credentials.json")).unwrap()["claudeAiOauth"]["refreshToken"],
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_malformed_account_is_refused_by_name() {
+        let tmp = TempDir::new("unknown");
+        let service = accounts(&tmp.0);
+        let err = service
+            .materialize(HarnessId::ClaudeCode, "0123456789abcdef")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0123456789abcdef"), "{err}");
+        // A path traversal never reaches the filesystem.
+        let err = service
+            .materialize(HarnessId::ClaudeCode, "../../etc")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an agent account id"), "{err}");
+        assert!(!tmp.0.join("accounts").join("..").exists());
+    }
+
+    /// Forgetting an account has to take the live copy too, or the id keeps
+    /// working for dispatches after the page says it is gone.
+    #[tokio::test]
+    async fn forgetting_an_account_removes_its_dir() {
+        let tmp = TempDir::new("forget");
+        let service = accounts(&tmp.0);
+        let slot = claude_slot("teammate-a", claude_creds(9_000, "r1"));
+        service.write_slot(&slot).unwrap();
+        let dir = service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+        assert!(dir.exists());
+
+        service
+            .forget(HarnessId::ClaudeCode, &slot.id)
+            .await
+            .unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// A run holds its account: the usage refresher must not rotate a token
+    /// the CLI in that dir is still using.
+    #[test]
+    fn a_leased_account_is_left_alone_and_released_on_drop() {
+        let tmp = TempDir::new("lease");
+        let service = accounts(&tmp.0);
+        assert!(!service.is_leased("abc"));
+        {
+            let _lease = service.lease("abc");
+            assert!(service.is_leased("abc"));
+            // Two runs on one account: the first to finish must not release it.
+            let _second = service.lease("abc");
+            assert!(service.is_leased("abc"));
+        }
+        assert!(!service.is_leased("abc"));
+    }
+
+    #[test]
+    fn freshness_reads_both_providers_stamps() {
+        assert_eq!(
+            freshness(HarnessId::ClaudeCode, &claude_creds(42, "r")),
+            Some(42)
+        );
+        assert_eq!(
+            freshness(
+                HarnessId::Codex,
+                &serde_json::json!({ "last_refresh": "2026-08-04T10:00:00Z" })
+            ),
+            Some(1_785_837_600_000)
+        );
+        // An API key carries no stamp and never goes stale.
+        assert_eq!(
+            freshness(
+                HarnessId::Codex,
+                &serde_json::json!({ "OPENAI_API_KEY": "k" })
+            ),
+            None
+        );
     }
 }

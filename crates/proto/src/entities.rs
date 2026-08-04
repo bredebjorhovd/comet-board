@@ -81,6 +81,14 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// Agent-account slot id whose subscription this chat's runs spend
+    /// (comet-engine `agent_accounts`, gh#59). `None` = the CLI's own config
+    /// dir, which is every chat that predates the field and every one nobody
+    /// chose an account for. On the chat rather than the run because a login
+    /// is a property of the agent, not of one message: a steer must not change
+    /// credentials under a turn already in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

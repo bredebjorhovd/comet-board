@@ -340,6 +340,10 @@ pub struct Attempt {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub outcome: Option<Outcome>,
+    /// The agent-account slot this attempt ran under — whose Claude/Codex
+    /// subscription it spent (gh#59). `None` is the device's own CLI login,
+    /// and every attempt made before accounts could be chosen.
+    pub account: Option<String>,
     /// Consecutive reconciliation ticks where herdr did not know this pane.
     /// Orphaning waits for 2 to avoid flapping during a live handoff.
     pub missing_ticks: i64,

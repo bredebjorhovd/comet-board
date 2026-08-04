@@ -171,6 +171,7 @@ pub async fn dispatch(
     via: Option<&str>,
     runtime: Option<&str>,
     model: Option<&str>,
+    account: Option<&str>,
 ) -> Result<Dispatched> {
     let mut params = serde_json::json!({ "taskId": task_id, "via": via });
     if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
@@ -178,6 +179,12 @@ pub async fn dispatch(
     }
     if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
         object.insert("model".into(), serde_json::Value::String(model.to_string()));
+    }
+    if let (Some(account), Some(object)) = (account, params.as_object_mut()) {
+        object.insert(
+            "account".into(),
+            serde_json::Value::String(account.to_string()),
+        );
     }
     let reply = client.call(methods::DISPATCH_TASK, params).await?;
     serde_json::from_value(reply).context("parsing DispatchTask reply")
@@ -474,6 +481,9 @@ mod tests {
             last_outcome_at: None,
             attempts: 0,
             reopened: 0,
+            updated_at: String::new(),
+            started_at: None,
+            account: None,
         }
     }
 
