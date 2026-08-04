@@ -631,6 +631,13 @@ export class SessionRoom implements DurableObject {
       // A doc-only joiner still carries a device id, so its arrival changes the
       // answer for everyone already watching presence.
       this.publishPresence();
+      // A full join answer just exported cleanly — the wasm heap is healthy.
+      // Without this reset, occasional transient RangeErrors accumulated
+      // over an isolate's lifetime and the tripwire aborted HEALTHY
+      // isolates, each abort causing a reconnect herd that produced more
+      // transient errors (observed 2026-08-04: ~1 abort/min with all rooms
+      // already trimmed small). Poisoning is CONSECUTIVE failures.
+      wasmPoisonStrikes = 0;
       return;
     }
 
