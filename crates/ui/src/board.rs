@@ -2717,6 +2717,7 @@ mod tests {
             // section empty on every day but one.
             updated_at: Utc::now().to_rfc3339(),
             started_at: None,
+            account: None,
         }
     }
 

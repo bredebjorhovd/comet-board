@@ -111,15 +111,53 @@ nearly verbatim — it never depended on herdr:
   `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, runtime?, model?}` → `{chatId, cwd, attempt}`,
-`CancelTask {taskId}` — served in `crates/engine/src/rpc.rs` off the board
-service, which executes dispatch/cancel on its loop thread (`board.db` has one
-writer). `ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch
-can be pointed at (the canonical set `build_spec` validates an override
-against) for pickers in the desktop panel and the CLI. `runtime`/`model`
-override the route's configured runtime and the harness's default model for
-that one dispatch; the attempt row records whatever the agent actually ran
-under.
+`DispatchTask {taskId, via?, runtime?, model?, account?}` →
+`{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
+`crates/engine/src/rpc.rs` off the board service, which executes
+dispatch/cancel on its loop thread (`board.db` has one writer).
+`ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch can be
+pointed at (the canonical set `build_spec` validates an override against) for
+pickers in the desktop panel and the CLI. `runtime`/`model`/`account` override
+the route's configured runtime, the harness's default model, and the route's
+`account` for that one dispatch; the attempt row records whatever the agent
+actually ran under.
+
+### Per-run agent accounts (gh#59)
+
+Whose Claude/Codex subscription a dispatch spends is a per-run choice, not an
+engine-wide mode. Each teammate attaches their own login under Agent accounts;
+a route's `account` (or `DispatchTask {account}` / `comet-board dispatch
+--account`) names the slot, and that dispatch burns its owner's limits.
+
+The mechanism is env, not files. `crates/engine/src/agent_accounts.rs`
+materializes a slot into a config dir of its own — `{data_dir}/accounts/{slotId}/`,
+holding `.credentials.json` + `.claude.json` for Claude and `auth.json` for
+Codex — and the run stamps `CLAUDE_CONFIG_DIR` / `CODEX_HOME` at it in the
+harness child's env, exactly as `RunControls::chat_id` becomes
+`COMET_BOARD_CHAT_ID`. The alternative it replaces (`activate`, which overwrites
+`~/.claude/.credentials.json`) is engine-wide and mutates what a *live* run is
+reading — a footgun even for one user. `activate` remains, for choosing the
+device's own CLI login; a run naming an account never touches it.
+
+The dir is the live copy from then on: refresh writebacks the CLI makes land
+there, `read_slots` absorbs them back into the slot file, and usage probes read
+the result. A run holds a lease on its slot for its lifetime, which keeps the
+usage refresher from rotating a refresh token the CLI is still holding — the
+same rule that already applied to the active login.
+
+The account rides `ChatConfig`, not `RunRequest`: a login belongs to the agent,
+so every later turn in the chat (steers, review deliveries, an operator typing
+into the same session) keeps spending it, and a steer arriving mid-turn cannot
+change it. An account that will not resolve **refuses** the dispatch before the
+chat exists, and refuses a later run rather than falling back — a silent
+fallback bills whoever the device's own login belongs to.
+
+Deliberately not in v1: inferring an account from the WorkOS user who
+dispatched. `via` already records who released the work; guessing a login from
+it is the kind of clever that bills the wrong person. `comet-board doctor`
+checks each route's `account` against the device's saved logins, including the
+CLI it belongs to — a Claude slot on a codex route is not lendable, since the
+two config-dir variables are not interchangeable.
 
 All four are relay-forwardable (H9): `targetDeviceId` = the box, and a
 teammate's laptop reads and drives the box's board without hosting one.

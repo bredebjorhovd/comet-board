@@ -192,6 +192,7 @@ pub async fn dispatch_checked(
     via: Option<&str>,
     runtime: Option<&str>,
     model: Option<&str>,
+    account: Option<&str>,
 ) -> Result<Dispatched> {
     // A model with no runtime beside it runs under the row's — which is what
     // `list --json` shows as that row's `runtime`, and what `--runtime`'s help
@@ -205,7 +206,7 @@ pub async fn dispatch_checked(
         _ => None,
     };
     check_overrides(client, runtime, model, row_runtime.as_deref()).await?;
-    dispatch(client, task_id, via, runtime, model).await
+    dispatch(client, task_id, via, runtime, model, account).await
 }
 
 /// Refuse an override the dispatch would only choke on later.
@@ -321,6 +322,7 @@ pub async fn dispatch(
     via: Option<&str>,
     runtime: Option<&str>,
     model: Option<&str>,
+    account: Option<&str>,
 ) -> Result<Dispatched> {
     let mut params = serde_json::json!({ "taskId": task_id, "via": via });
     if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
@@ -331,6 +333,12 @@ pub async fn dispatch(
     }
     if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
         object.insert("model".into(), serde_json::Value::String(model.to_string()));
+    }
+    if let (Some(account), Some(object)) = (account, params.as_object_mut()) {
+        object.insert(
+            "account".into(),
+            serde_json::Value::String(account.to_string()),
+        );
     }
     let reply = client.call(methods::DISPATCH_TASK, params).await?;
     serde_json::from_value(reply).context("parsing DispatchTask reply")
@@ -641,6 +649,7 @@ mod tests {
             reopened: 0,
             updated_at: "2026-08-01T11:00:00Z".into(),
             started_at: None,
+            account: None,
         }
     }
 

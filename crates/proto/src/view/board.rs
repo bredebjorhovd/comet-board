@@ -185,6 +185,12 @@ pub struct TaskRow {
     /// working or blocked row. `None` when nothing is running.
     #[serde(default)]
     pub started_at: Option<String>,
+    /// The agent account whose subscription this row's attempt spends — the
+    /// slot id the attempt recorded, falling back to the route's default for a
+    /// row nothing has run on yet. `None` is the device's own CLI login, which
+    /// is also every row on a single-account box (gh#59).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +625,7 @@ mod tests {
             reopened: 0,
             updated_at: "2026-08-01T11:00:00Z".into(),
             started_at: None,
+            account: None,
         }
     }
 

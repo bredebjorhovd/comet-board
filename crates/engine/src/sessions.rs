@@ -101,6 +101,11 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    /// The device's saved agent logins (wired at engine assembly; absent in
+    /// bare tests). A chat carrying an `account` has its slot materialized
+    /// into a config dir of its own, and the harness child is pointed at that
+    /// instead of the shared `~/.claude` / `~/.codex` — gh#59.
+    accounts: OnceLock<crate::agent_accounts::AgentAccounts>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -132,6 +137,7 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                accounts: OnceLock::new(),
             }),
         }
     }
@@ -152,6 +158,13 @@ impl SessionsEngine {
     /// completed exchange the run task fires it for still-untitled chats.
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
+    }
+
+    /// Wire the agent-account store (called once at engine assembly). Without
+    /// it every run uses the CLI's own config dir, which is the single-account
+    /// behavior that predates gh#59.
+    pub fn set_accounts(&self, accounts: crate::agent_accounts::AgentAccounts) {
+        let _ = self.inner.accounts.set(accounts);
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -278,6 +291,16 @@ impl SessionsEngine {
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
+
+        // Whose subscription this run spends (gh#59). Resolved per run from the
+        // chat row, not carried on the request: the account is the agent's, and
+        // a steer arriving mid-turn must not be able to change it. A named
+        // account that will not resolve REFUSES the run — falling back to the
+        // shared login would quietly bill the wrong person. Before the user
+        // message is written, alongside harness resolution, so a refusal leaves
+        // no prompt sitting in the transcript with nothing answering it.
+        let (account, account_lease) = self.inner.account_for(chat_id, harness_id)?;
+
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -321,6 +344,7 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
             chat_id: Some(chat_id.to_string()),
+            account,
         };
 
         lock(&self.inner.runs).insert(
@@ -363,6 +387,7 @@ impl SessionsEngine {
                 user_message_id: user_id,
                 resume_injected,
             },
+            account_lease,
         ));
         Ok(run_id)
     }
@@ -691,6 +716,51 @@ impl Inner {
         self.doc_host.get().and_then(|host| host.workspace())
     }
 
+    /// The agent account a run in `chat_id` spends: the chat row's slot,
+    /// materialized into a config dir the harness child is pointed at, plus the
+    /// lease that keeps the usage refresher off its tokens while the run lives
+    /// (gh#59).
+    ///
+    /// `(None, None)` — the shared CLI login — for a chat that names no
+    /// account, and for one that does on an engine with no account store
+    /// wired (bare tests). A named account that will not materialize is an
+    /// error, never a fallback: this run would otherwise bill whoever the
+    /// device's own login belongs to.
+    #[allow(clippy::type_complexity)]
+    fn account_for(
+        &self,
+        chat_id: &str,
+        harness: HarnessId,
+    ) -> Result<
+        (
+            Option<comet_harness::AgentAccount>,
+            Option<crate::agent_accounts::AccountLease>,
+        ),
+        EngineError,
+    > {
+        let Some(accounts) = self.accounts.get() else {
+            return Ok((None, None));
+        };
+        let account_id = self
+            .workspace()
+            .and_then(|ws| ws.chat_config(chat_id))
+            .and_then(|c| c.account)
+            .filter(|a| !a.is_empty());
+        let Some(account_id) = account_id else {
+            return Ok((None, None));
+        };
+        let dir = accounts.materialize(harness, &account_id)?;
+        let lease = accounts.lease(&account_id);
+        Ok((
+            Some(comet_harness::AgentAccount {
+                id: account_id,
+                harness,
+                dir,
+            }),
+            Some(lease),
+        ))
+    }
+
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
@@ -902,6 +972,9 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    // Held, not read: dropping it at the end of the run releases the account
+    // for the usage refresher (gh#59). Nothing in here needs the value.
+    _account_lease: Option<crate::agent_accounts::AccountLease>,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).

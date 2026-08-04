@@ -203,6 +203,11 @@ pub fn build_spec(
         worktree: true,
         harness,
         model: overrides.model.clone(),
+        account: overrides
+            .account
+            .clone()
+            .or_else(|| route.account.clone())
+            .filter(|a| !a.is_empty()),
     })
 }
 
@@ -219,6 +224,12 @@ pub struct DispatchOverrides {
     pub runtime: Option<String>,
     /// Model id for the chosen harness. `None` = the harness default.
     pub model: Option<String>,
+    /// Agent-account slot id to spend. `None` = the route's `account`, and
+    /// failing that the device's own CLI login (gh#59). Validated by the
+    /// executor rather than here: the board core has no view of which logins
+    /// this device has saved, so a wrong id fails the dispatch with the
+    /// engine's message instead of a guess from this crate.
+    pub account: Option<String>,
 }
 
 /// Does `space` answer to the name a route's `workspace` key uses? Comet spaces
@@ -326,6 +337,7 @@ mod tests {
         let overrides = DispatchOverrides {
             runtime: Some("opencode".into()),
             model: None,
+            account: None,
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -345,6 +357,7 @@ mod tests {
         let overrides = DispatchOverrides {
             runtime: None,
             model: Some("sonnet-4".into()),
+            account: None,
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -364,6 +377,7 @@ mod tests {
         let overrides = DispatchOverrides {
             runtime: Some("nonesuch".into()),
             model: None,
+            account: None,
         };
         let err = build_spec(
             &RoutingConfig::default(),
@@ -376,6 +390,63 @@ mod tests {
         .to_string();
         assert!(err.contains("nonesuch"), "{err}");
         assert!(err.contains("claude-code"), "the known list is named: {err}");
+    }
+
+    /// Whose subscription pays: the dispatch's choice beats the route's, and
+    /// a route with none leaves the run on the device's own CLI login.
+    #[test]
+    fn the_account_falls_back_from_the_dispatch_to_the_route_to_nothing() {
+        let plain = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(plain.account, None);
+
+        let mut routed = route();
+        routed.account = Some("8f2c1d0a7b6e4539".into());
+        let from_route = build_spec(
+            &RoutingConfig::default(),
+            &routed,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(from_route.account.as_deref(), Some("8f2c1d0a7b6e4539"));
+
+        let overridden = build_spec(
+            &RoutingConfig::default(),
+            &routed,
+            &task(),
+            &space(),
+            &DispatchOverrides {
+                account: Some("0011223344556677".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(overridden.account.as_deref(), Some("0011223344556677"));
+    }
+
+    /// `account = ""` is somebody clearing the key, not naming a login called
+    /// empty string — and an empty id would fail every dispatch on the route.
+    #[test]
+    fn an_empty_account_is_no_account() {
+        let mut routed = route();
+        routed.account = Some(String::new());
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &routed,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.account, None);
     }
 
     #[test]
@@ -427,6 +498,7 @@ mod tests {
                 dispatched_by: None,
                 dispatched_by_pane: None,
                 base_sha: None,
+                account: None,
             })
             .unwrap();
         db.set_attempt_pane(a, chat).unwrap();

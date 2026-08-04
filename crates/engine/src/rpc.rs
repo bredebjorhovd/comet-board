@@ -864,6 +864,14 @@ impl RpcService for EngineRpc {
                     /// Model override for the chosen harness.
                     #[serde(default)]
                     model: Option<String>,
+                    /// Agent-account slot id to spend — whose Claude/Codex
+                    /// subscription pays for this run (gh#59). `None` = the
+                    /// route's `account`, and failing that the device's own
+                    /// CLI login. Explicit on purpose: the board does not
+                    /// infer an account from the WorkOS user who dispatched,
+                    /// it records `via` and does what it was told.
+                    #[serde(default)]
+                    account: Option<String>,
                     /// End the task's live attempt and release a fresh one — the
                     /// blocked row's Retry (gh#49). Off for ordinary dispatches,
                     /// which are refused on a live attempt.
@@ -875,6 +883,7 @@ impl RpcService for EngineRpc {
                 let overrides = DispatchOverrides {
                     runtime: p.runtime,
                     model: p.model,
+                    account: p.account,
                 };
                 let dispatched = if p.replace {
                     board.retry_task(&p.task_id, p.via, overrides).await

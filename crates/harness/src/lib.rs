@@ -34,6 +34,44 @@ pub struct SteerMessage {
     pub message_id: Option<String>,
 }
 
+/// The agent account a run is pointed at: a config dir of its own, holding one
+/// teammate's login (comet-engine's `agent_accounts`, gh#59).
+///
+/// Both CLIs relocate their whole config dir on one environment variable —
+/// `CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex — so pointing
+/// the child at a per-account dir is all it takes for a dispatch to burn its
+/// owner's subscription. The alternative the engine used to have (swapping the
+/// credential files under `~`) is engine-wide and mutates what a live run is
+/// reading; this is per-child and cannot.
+#[derive(Debug, Clone)]
+pub struct AgentAccount {
+    /// Slot id, for logging and the attempt row.
+    pub id: String,
+    /// The harness the slot's login belongs to. A run only applies an account
+    /// its own harness owns — a Claude slot says nothing about `CODEX_HOME`.
+    pub harness: HarnessId,
+    /// The materialized config dir the child is pointed at.
+    pub dir: std::path::PathBuf,
+}
+
+impl AgentAccount {
+    /// Stamp the child's env for `harness`, if this account is that harness's.
+    pub(crate) fn apply(&self, cmd: &mut tokio::process::Command, harness: HarnessId) {
+        if self.harness != harness {
+            return;
+        }
+        match harness {
+            HarnessId::ClaudeCode => {
+                cmd.env("CLAUDE_CONFIG_DIR", &self.dir);
+            }
+            HarnessId::Codex => {
+                cmd.env("CODEX_HOME", &self.dir);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     /// The run sends questions and awaits answers (blocks the agent, mirrors comet).
@@ -54,6 +92,9 @@ pub struct RunControls {
     /// never dispatched still names itself. `None` only for chat-less runs
     /// (title generation).
     pub chat_id: Option<String>,
+    /// Which login this run spends. `None` = whatever the CLI's own config dir
+    /// holds (the single-user default, and every run before gh#59).
+    pub account: Option<AgentAccount>,
 }
 
 #[async_trait]
@@ -206,3 +247,67 @@ pub(crate) fn crash_message(
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use opencode::OpencodeHarness;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The env a command would spawn with, as `(name, value)` pairs.
+    fn envs(cmd: &tokio::process::Command) -> Vec<(String, String)> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    fn account(harness: HarnessId) -> AgentAccount {
+        AgentAccount {
+            id: "8f2c1d0a7b6e4539".into(),
+            harness,
+            dir: std::path::PathBuf::from("/data/accounts/8f2c1d0a7b6e4539"),
+        }
+    }
+
+    #[test]
+    fn each_cli_gets_the_variable_that_relocates_its_config_dir() {
+        let mut claude = tokio::process::Command::new("claude");
+        account(HarnessId::ClaudeCode).apply(&mut claude, HarnessId::ClaudeCode);
+        assert_eq!(
+            envs(&claude),
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/data/accounts/8f2c1d0a7b6e4539".to_string()
+            )]
+        );
+
+        let mut codex = tokio::process::Command::new("codex");
+        account(HarnessId::Codex).apply(&mut codex, HarnessId::Codex);
+        assert_eq!(
+            envs(&codex),
+            vec![(
+                "CODEX_HOME".to_string(),
+                "/data/accounts/8f2c1d0a7b6e4539".to_string()
+            )]
+        );
+    }
+
+    /// A Claude login says nothing about `CODEX_HOME`. Pointing the wrong CLI
+    /// at a dir holding the other one's credentials is worse than not pointing
+    /// it anywhere: it would look configured and log in as nobody.
+    #[test]
+    fn an_account_is_never_applied_to_another_harness() {
+        let mut codex = tokio::process::Command::new("codex");
+        account(HarnessId::ClaudeCode).apply(&mut codex, HarnessId::Codex);
+        assert!(envs(&codex).is_empty());
+
+        // Nor to a harness with no account concept at all.
+        let mut opencode = tokio::process::Command::new("opencode");
+        account(HarnessId::Opencode).apply(&mut opencode, HarnessId::Opencode);
+        assert!(envs(&opencode).is_empty());
+    }
+}

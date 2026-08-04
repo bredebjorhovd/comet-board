@@ -2115,6 +2115,7 @@ fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_pro
         reopened: 0,
         updated_at: Utc::now().to_rfc3339(),
         started_at: None,
+        account: None,
     }
 }
 
