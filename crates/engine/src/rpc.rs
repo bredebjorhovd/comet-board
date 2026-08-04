@@ -34,7 +34,8 @@
 //!   rows (herdr-board's `list --json` shape), `DispatchTask {taskId, via?,
 //!   runtime?, model?}` → `{chatId, cwd, attempt}`, `CancelTask {taskId}` →
 //!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
-//!   engine-hosted board service; deliberately not relay-forwardable yet.
+//!   engine-hosted board service, and relay-forwardable (gh#55): one box hosts
+//!   the board, every teammate's device drives it with `targetDeviceId`.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -49,7 +50,9 @@
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
 //! handlers stay transport-agnostic. Currently routed: `ListHarnesses`, `ListModels`,
-//! `QueueCommand`, and `WatchDocMessages`.
+//! `QueueCommand`, `WatchDocMessages`, and the board four (`WatchBoard`,
+//! `DispatchTask`, `CancelTask`, `ListBoardRuntimes`) — see [`forwardable`] for the
+//! full list.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -611,6 +614,16 @@ fn forwardable(method: &str) -> bool {
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
+            // The board lives on whichever device hosts its store — usually the
+            // always-on box (gh#55). Forwarding is what turns "one box" into
+            // "one box, many users": teammates read and drive the same board
+            // from their own laptops instead of SSHing in. Authorization needs
+            // nothing per-method — the relay only carries frames between
+            // devices of one org, exactly as for every other forwardable call.
+            | methods::WATCH_BOARD
+            | methods::DISPATCH_TASK
+            | methods::CANCEL_TASK
+            | methods::LIST_BOARD_RUNTIMES
     )
 }
 
@@ -622,6 +635,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
+            | methods::WATCH_BOARD
     )
 }
 

@@ -455,6 +455,178 @@ async fn terminal_stream_proxies_over_the_relay() {
     core_b.shutdown().await;
 }
 
+/// gh#55: the board is device-addressable. One box hosts the board store;
+/// every other device drives that board over the relay — `WatchBoard` proxies
+/// its stream, and the verbs (`ListBoardRuntimes`, `DispatchTask`,
+/// `CancelTask`) forward as unary calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_rpcs_forward_to_the_device_hosting_the_board() {
+    use comet_board::config::Paths;
+    use comet_board::db::{Db, UpsertTask};
+    use comet_board::model::{Source, UpstreamState};
+
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    // Engine B is the box: it hosts the board service. Seed a task into its
+    // store first, so a forwarded frame is provably B's board and not an empty
+    // one A could have produced by itself.
+    let board_dir = dirs.path().join("board-b");
+    let paths = Paths::under(&board_dir).expect("board paths");
+    {
+        let db = Db::open(&paths.db()).expect("board store");
+        db.upsert_task(&UpsertTask {
+            id: "task-on-the-box".into(),
+            source: Source::Github,
+            source_id: "1".into(),
+            identifier: "gh#55".into(),
+            title: "relay-forward the board RPCs".into(),
+            body: None,
+            url: "https://github.com/o/r/issues/55".into(),
+            labels: vec![],
+            source_state: Some("open".into()),
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Unstarted,
+            updated_at: "2026-08-04T09:00:00Z".into(),
+        })
+        .expect("seed task");
+    }
+
+    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    let runtime_b = Arc::new(comet_engine::CometRuntime::new(
+        core_b.repos.clone(),
+        core_b.workspace.clone(),
+        core_b.doc_host.clone(),
+        core_b
+            .workspace
+            .merged_sessions_watch(core_b.sessions.watch_sessions()),
+        core_b.sessions.journal(),
+        tokio::runtime::Handle::current(),
+    ));
+    let board_b = comet_engine::BoardService::spawn_at(
+        paths,
+        core_b
+            .workspace
+            .merged_sessions_watch(core_b.sessions.watch_sessions()),
+        runtime_b,
+        core_b.workspace.watch_spaces(),
+        tokio::runtime::Handle::current(),
+    )
+    .expect("board service on B");
+    core_b.set_board(Arc::new(board_b));
+    let _host = core_b.start_host_relay(&relay_url);
+
+    // Engine A is a teammate's laptop: no board of its own.
+    let core_a = assemble(&dirs.path().join("a"), "device-a");
+    let mut link_config =
+        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
+    link_config.probe_timeout = Duration::from_secs(5);
+    // The production curve backs a failed dial off 5s→60s, which under a loaded
+    // test binary turns "the host relay hasn't finished joining" into minutes of
+    // refusals. Retry at test speed instead.
+    link_config.cooldown_base = Duration::from_millis(50);
+    link_config.cooldown_max = Duration::from_millis(200);
+    core_a.set_links(LinkCache::new(link_config));
+    let client = comet_rpc::memory_client(core_a.rpc_service());
+
+    // Locally, A has nothing to show: the engine refuses the subscription, so
+    // the stream closes without ever delivering a frame. That silence is
+    // exactly the signal a viewport sweeps on (`view::board::host_candidates`).
+    let mut local = client
+        .subscribe(methods::WATCH_BOARD, serde_json::json!({}))
+        .await
+        .expect("subscribe is accepted");
+    assert!(
+        local.recv().await.is_none(),
+        "a device with no board must deliver no rows"
+    );
+
+    // Wait for B's host relay to finish joining (it dials with backoff) on a
+    // unary call, where a failure is an error rather than a silent stream end.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Err(err) = client
+        .call(
+            methods::LIST_HARNESSES,
+            serde_json::json!({ "targetDeviceId": "device-b" }),
+        )
+        .await
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay never came up: {err}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Pointed at the box, the same subscription streams B's rows.
+    let mut stream = client
+        .subscribe(
+            methods::WATCH_BOARD,
+            serde_json::json!({ "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote subscribe");
+    let rows = loop {
+        let value = tokio::time::timeout_at(deadline, stream.recv())
+            .await
+            .expect("B's board reaches A before the timeout")
+            .expect("the proxied stream stays alive");
+        if value.to_string().contains("gh#55") {
+            break value;
+        }
+    };
+    assert_eq!(
+        rows[0]["id"].as_str(),
+        Some("task-on-the-box"),
+        "the rows are B's board: {rows}"
+    );
+
+    // The verbs forward too. `ListBoardRuntimes` is a static catalog, so its
+    // reply proves routing rather than board health.
+    let runtimes = client
+        .call(
+            methods::LIST_BOARD_RUNTIMES,
+            serde_json::json!({ "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote ListBoardRuntimes");
+    assert!(
+        runtimes.as_array().is_some_and(|r| !r.is_empty()),
+        "got: {runtimes}"
+    );
+
+    // Dispatch and cancel reach B's board loop: the task has no route, so B
+    // refuses it — from B, with B's reason. A alone would have said "board
+    // unavailable", which is what makes this an answer and not a local refusal.
+    let refused = client
+        .call(
+            methods::DISPATCH_TASK,
+            serde_json::json!({ "taskId": "task-on-the-box", "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect_err("an unroutable task is refused");
+    assert!(
+        !refused.to_string().contains("board unavailable"),
+        "the refusal must come from B's board, not A's absent one: {refused}"
+    );
+    let cancelled = client
+        .call(
+            methods::CANCEL_TASK,
+            serde_json::json!({ "taskId": "task-on-the-box", "targetDeviceId": "device-b" }),
+        )
+        .await;
+    if let Err(err) = &cancelled {
+        assert!(
+            !err.to_string().contains("board unavailable"),
+            "cancel must reach B's board: {err}"
+        );
+    }
+
+    core_a.shutdown().await;
+    core_b.shutdown().await;
+}
+
 #[tokio::test]
 async fn remote_target_without_links_fails_clearly() {
     let dirs = tempfile::tempdir().expect("tempdir");
