@@ -18,6 +18,7 @@ use comet_board::adopt::{git_remote, github_slug};
 use comet_board::config::{self, Paths, RoutingConfig};
 use comet_board::model::{BoardState, Source};
 use comet_board::rows::TaskRow;
+use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
 use comet_rpc::{RpcClient, connect_ws, methods};
 use serde::Deserialize;
 use std::time::Duration;
@@ -95,7 +96,10 @@ pub fn validate_filters(state: Option<&str>, source: Option<&str>) -> Result<()>
 }
 
 fn state_names() -> Vec<&'static str> {
-    BoardState::SECTION_ORDER.iter().map(|s| s.as_str()).collect()
+    BoardState::SECTION_ORDER
+        .iter()
+        .map(|s| s.as_str())
+        .collect()
 }
 
 pub fn filter_rows(rows: Vec<TaskRow>, state: Option<&str>, source: Option<&str>) -> Vec<TaskRow> {
@@ -165,6 +169,152 @@ fn provenance_from(flag: Option<String>, env: Option<String>) -> Option<String> 
     flag.or(env).filter(|s| !s.is_empty())
 }
 
+/// One model a dispatch can be pointed at, as `ListModels` reports it for a
+/// harness — `id` is exactly what the `DispatchTask` override sends, so it is
+/// the only field a check can be made against.
+#[derive(Debug, Deserialize)]
+struct ModelChoice {
+    id: String,
+}
+
+/// `dispatch`, with `--runtime` / `--model` checked against the engine's own
+/// catalogs first — the same two calls the desktop picker fills its rows from
+/// (`ListBoardRuntimes`, `ListModels { harness }`), so the CLI refuses exactly
+/// what the picker would not have offered.
+///
+/// Worth a round-trip before the verb: the engine rejects an unknown *runtime*
+/// on its own, but an unknown *model* is the harness's business, and by the
+/// time the harness sees it the dispatch has already cut a worktree, made a
+/// chat and started an agent. A typo should cost an error, not an attempt.
+pub async fn dispatch_checked(
+    client: &RpcClient,
+    task_id: &str,
+    via: Option<&str>,
+    runtime: Option<&str>,
+    model: Option<&str>,
+) -> Result<Dispatched> {
+    // A model with no runtime beside it runs under the row's — which is what
+    // `list --json` shows as that row's `runtime`, and what `--runtime`'s help
+    // points at. Only fetched when it is the missing half of the answer.
+    let row_runtime = match (model, runtime) {
+        (Some(_), None) => board_rows(client)
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|r| r.id == task_id))
+            .and_then(|r| r.runtime),
+        _ => None,
+    };
+    check_overrides(client, runtime, model, row_runtime.as_deref()).await?;
+    dispatch(client, task_id, via, runtime, model).await
+}
+
+/// Refuse an override the dispatch would only choke on later.
+///
+/// A catalog that cannot be read proves nothing either way, so it degrades to
+/// a note on stderr and lets the dispatch through — the same choice the desktop
+/// picker makes when `ListBoardRuntimes` fails (it dispatches with the route's
+/// rather than trapping the operator). Refusing there would ground a legitimate
+/// dispatch on the strength of a failed lookup.
+async fn check_overrides(
+    client: &RpcClient,
+    runtime: Option<&str>,
+    model: Option<&str>,
+    row_runtime: Option<&str>,
+) -> Result<()> {
+    if runtime.is_none() && model.is_none() {
+        return Ok(());
+    }
+
+    let mut chosen = runtime.or(row_runtime).map(str::to_string);
+    if let Some(want) = runtime {
+        match client
+            .call(methods::LIST_BOARD_RUNTIMES, serde_json::json!({}))
+            .await
+            .context("listing runtimes")
+            .and_then(|v| {
+                serde_json::from_value::<Vec<RuntimeOption>>(v).context("parsing runtimes")
+            }) {
+            Ok(options) => chosen = Some(resolve_runtime(&options, want)?),
+            Err(e) => eprintln!(
+                "note: could not list runtimes ({e:#}) — dispatching with `{want}` unchecked"
+            ),
+        }
+    }
+
+    let Some(want) = model else { return Ok(()) };
+    // Which harness's catalog to ask about. `ListModels` is keyed by harness
+    // id, and the canonical runtime name *is* that id — an alias spelling
+    // (`claude`, `openai-codex`) has to be resolved through the same table the
+    // engine's own `build_spec` uses, or the lookup asks about nothing.
+    let Some(harness) = chosen
+        .as_deref()
+        .and_then(harness_for_runtime)
+        .map(runtime_name)
+    else {
+        // No runtime to attribute the model to: an unrouted row, or one whose
+        // runtime is not a comet harness. The dispatch itself will say so.
+        return Ok(());
+    };
+
+    match client
+        .call(
+            methods::LIST_MODELS,
+            serde_json::json!({ "harness": harness }),
+        )
+        .await
+        .context("listing models")
+        .and_then(|v| serde_json::from_value::<Vec<ModelChoice>>(v).context("parsing models"))
+    {
+        Ok(models) => check_model(&models, want, harness),
+        Err(e) => {
+            eprintln!(
+                "note: could not list {harness} models ({e:#}) — dispatching with `{want}` unchecked"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The canonical runtime name for an override, or an error naming what the
+/// engine does offer.
+fn resolve_runtime(options: &[RuntimeOption], want: &str) -> Result<String> {
+    // The catalog offers one canonical name per harness; `routing.toml`'s alias
+    // spellings are valid input the picker has no reason to list twice, so an
+    // alias resolves to the canonical entry rather than being refused.
+    let canonical = harness_for_runtime(want).map(runtime_name);
+    options
+        .iter()
+        .find(|o| o.name.eq_ignore_ascii_case(want) || Some(o.name.as_str()) == canonical)
+        .map(|o| o.name.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown runtime `{want}`; the engine offers: {}",
+                options
+                    .iter()
+                    .map(|o| o.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn check_model(models: &[ModelChoice], want: &str, runtime: &str) -> Result<()> {
+    // An empty catalog is a harness that could not enumerate (opencode with no
+    // provider reachable, say), not a harness with no models — nothing to
+    // check the override against.
+    if models.is_empty() || models.iter().any(|m| m.id.eq_ignore_ascii_case(want)) {
+        return Ok(());
+    }
+    bail!(
+        "`{runtime}` has no model `{want}`; its catalog: {}",
+        models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 pub async fn dispatch(
     client: &RpcClient,
     task_id: &str,
@@ -174,7 +324,10 @@ pub async fn dispatch(
 ) -> Result<Dispatched> {
     let mut params = serde_json::json!({ "taskId": task_id, "via": via });
     if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
-        object.insert("runtime".into(), serde_json::Value::String(runtime.to_string()));
+        object.insert(
+            "runtime".into(),
+            serde_json::Value::String(runtime.to_string()),
+        );
     }
     if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
         object.insert("model".into(), serde_json::Value::String(model.to_string()));
@@ -229,7 +382,10 @@ pub async fn wait_for(
     // once, at the start: a task dispatched later is not what this call is
     // waiting for.
     let watching: Vec<String> = if tasks.is_empty() {
-        rows.iter().filter(|r| in_flight(r)).map(|r| r.id.clone()).collect()
+        rows.iter()
+            .filter(|r| in_flight(r))
+            .map(|r| r.id.clone())
+            .collect()
     } else {
         tasks.to_vec()
     };
@@ -246,13 +402,15 @@ pub async fn wait_for(
             return Ok(matched);
         }
         let next = match deadline {
-            Some(d) => tokio::time::timeout_at(d, stream.recv()).await.map_err(|_| {
-                anyhow!(
-                    "timed out after {:?} waiting for {} task(s) to reach {states:?}",
-                    started.elapsed(),
-                    watching.len()
-                )
-            })?,
+            Some(d) => tokio::time::timeout_at(d, stream.recv())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "timed out after {:?} waiting for {} task(s) to reach {states:?}",
+                        started.elapsed(),
+                        watching.len()
+                    )
+                })?,
             None => stream.recv().await,
         };
         rows = match next {
@@ -334,7 +492,11 @@ pub struct NewTask<'a> {
 /// review, closure. Work that does not is a wall of commits somebody has to
 /// reconstruct later. The difference in practice is almost entirely friction,
 /// so this exists to remove it.
-pub fn new_task(paths: &Paths, cfg: &RoutingConfig, spec: &NewTask<'_>) -> Result<(String, String)> {
+pub fn new_task(
+    paths: &Paths,
+    cfg: &RoutingConfig,
+    spec: &NewTask<'_>,
+) -> Result<(String, String)> {
     let source = spec
         .source
         .map(str::to_string)
@@ -442,7 +604,10 @@ fn github_repo(repos: &[String], flag: Option<&str>, here: Option<String>) -> Re
                  with --repo; configured: {}",
                 repos.join(", ")
             ),
-            None => anyhow!("name the repo with --repo; configured: {}", repos.join(", ")),
+            None => anyhow!(
+                "name the repo with --repo; configured: {}",
+                repos.join(", ")
+            ),
         })
 }
 
@@ -474,6 +639,8 @@ mod tests {
             last_outcome_at: None,
             attempts: 0,
             reopened: 0,
+            updated_at: String::new(),
+            started_at: None,
         }
     }
 
@@ -490,20 +657,33 @@ mod tests {
     fn filters_apply_by_state_and_source() {
         let mut linear_row = row("linear:AGE-1", "working");
         linear_row.source = "linear".into();
-        let rows = vec![row("gh:o/r#1", "ready"), row("gh:o/r#2", "working"), linear_row];
+        let rows = vec![
+            row("gh:o/r#1", "ready"),
+            row("gh:o/r#2", "working"),
+            linear_row,
+        ];
 
         let ready = filter_rows(rows.clone(), Some("ready"), None);
-        assert_eq!(ready.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["gh:o/r#1"]);
+        assert_eq!(
+            ready.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gh:o/r#1"]
+        );
 
         let linear = filter_rows(rows, None, Some("linear"));
-        assert_eq!(linear.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["linear:AGE-1"]);
+        assert_eq!(
+            linear.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["linear:AGE-1"]
+        );
     }
 
     #[test]
     fn in_flight_means_a_live_attempt_not_a_state_name() {
         let mut with_chat = row("a", "ready");
         with_chat.chat_id = Some("chat-1".into());
-        assert!(in_flight(&with_chat), "a chat holds a live attempt whatever the derived state");
+        assert!(
+            in_flight(&with_chat),
+            "a chat holds a live attempt whatever the derived state"
+        );
         assert!(in_flight(&row("b", "working")));
         assert!(in_flight(&row("c", "blocked")));
         assert!(!in_flight(&row("d", "ready")));
@@ -516,7 +696,10 @@ mod tests {
         let watching = vec!["a".to_string(), "c".into()];
         let states = vec!["review".to_string(), "failed".into(), "done".into()];
         let matched = settled(&rows, &watching, &states);
-        assert_eq!(matched.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(
+            matched.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a"]
+        );
     }
 
     #[test]
@@ -533,6 +716,58 @@ mod tests {
         assert_eq!(provenance_from(None, None), None);
     }
 
+    fn runtimes() -> Vec<RuntimeOption> {
+        comet_board::runtime::runtime_options()
+    }
+
+    fn models(ids: &[&str]) -> Vec<ModelChoice> {
+        ids.iter()
+            .map(|id| ModelChoice { id: (*id).into() })
+            .collect()
+    }
+
+    #[test]
+    fn runtime_override_resolves_aliases_and_refuses_the_rest() {
+        // Canonical, as the picker offers it.
+        assert_eq!(
+            resolve_runtime(&runtimes(), "opencode").unwrap(),
+            "opencode"
+        );
+        // `routing.toml` spellings the engine accepts but the catalog does not
+        // list twice — refusing these would refuse what a route already says.
+        assert_eq!(
+            resolve_runtime(&runtimes(), "claude").unwrap(),
+            "claude-code"
+        );
+        assert_eq!(
+            resolve_runtime(&runtimes(), "openai-codex").unwrap(),
+            "codex"
+        );
+
+        let err = resolve_runtime(&runtimes(), "claude-cod")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown runtime `claude-cod`"), "{err}");
+        // The error has to carry the answer; there is no picker to fall back on.
+        assert!(err.contains("claude-code"), "{err}");
+    }
+
+    #[test]
+    fn model_override_is_checked_against_the_catalog() {
+        let catalog = models(&["claude-opus-5", "claude-sonnet-5"]);
+        assert!(check_model(&catalog, "claude-opus-5", "claude-code").is_ok());
+
+        let err = check_model(&catalog, "opus", "claude-code")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no model `opus`"), "{err}");
+        assert!(err.contains("claude-opus-5"), "{err}");
+
+        // A harness that could not enumerate proves nothing — the override
+        // stands and the harness stays the authority.
+        assert!(check_model(&[], "anything", "opencode").is_ok());
+    }
+
     #[test]
     fn github_repo_resolution_in_order_of_explicitness() {
         let repos = vec!["owner/one".to_string(), "owner/two".into()];
@@ -542,7 +777,10 @@ mod tests {
             "owner/two"
         );
         // One configured repo is not a choice.
-        assert_eq!(github_repo(&["owner/only".to_string()], None, None).unwrap(), "owner/only");
+        assert_eq!(
+            github_repo(&["owner/only".to_string()], None, None).unwrap(),
+            "owner/only"
+        );
         // The checkout you are standing in, but only if the board polls it.
         assert_eq!(
             github_repo(&repos, None, Some("Owner/One".into())).unwrap(),
