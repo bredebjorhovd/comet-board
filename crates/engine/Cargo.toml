@@ -35,3 +35,6 @@ reqwest.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
+# `test-util` = the paused clock (`#[tokio::test(start_paused = true)]`), so the
+# stall-watchdog tests can cross a 10-minute window without waiting for one.
+tokio = { workspace = true, features = ["test-util"] }

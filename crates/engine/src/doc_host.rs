@@ -37,6 +37,13 @@ use crate::{EngineError, new_id, now_ms};
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
+/// How far back [`DocHost::warm_open_recent`] reaches (feature-inventory §3.3).
+const WARM_OPEN_WINDOW_DAYS: i64 = 14;
+
+/// Ceiling on boot-time warm opens — each one is a room socket and a live doc,
+/// so a device hosting hundreds of chats must not open all of them at boot.
+const WARM_OPEN_MAX: usize = 30;
+
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
 /// refreshes (~1h expiry) take effect without an engine restart. Dev bearers
@@ -273,6 +280,14 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// Chat ids with a live handle right now, sorted. Diagnostics — and the
+    /// observable of [`Self::warm_open_recent`].
+    pub fn open_chats(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.inner.handles).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -336,6 +351,64 @@ impl DocHost {
 
         tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         Ok(handle)
+    }
+
+    /// Boot-time warm-open of recent chats (feature-inventory §3.3): open every
+    /// chat THIS device hosts that has been active within [`WARM_OPEN_WINDOW_DAYS`],
+    /// newest first, capped at [`WARM_OPEN_MAX`]. Returns how many were opened.
+    ///
+    /// Opening a doc joins its room and runs the command drain, so this is what
+    /// makes a command queued while the device was down actually execute at
+    /// boot. Until now cold chats relied on the nudge alone — and a nudge fired
+    /// at a device that is off is delivered on rejoin at best and lost at
+    /// worst, which on an unattended box means a queued run that simply never
+    /// happens. This closes that on the one event that reliably follows a
+    /// restart: the restart itself.
+    ///
+    /// Best-effort throughout: an unreadable row or a failed open is logged and
+    /// skipped, never fatal — the engine boots either way.
+    pub fn warm_open_recent(&self) -> usize {
+        let Some(workspace) = self.workspace() else {
+            return 0; // bare-DocHost tests: no ownership rows to select on
+        };
+        let chats = match workspace.doc().read_chats() {
+            Ok(chats) => chats,
+            Err(err) => {
+                tracing::warn!(error = %err, "warm-open: workspace chat read failed");
+                return 0;
+            }
+        };
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(WARM_OPEN_WINDOW_DAYS);
+        let device_id = &self.inner.config.device_id;
+        // `last_message_at` is only stamped once a turn has run; fall back to
+        // `created_at` so a chat created remotely with a run already queued —
+        // exactly the cold-delivery case — is inside the window too.
+        let mut recent: Vec<(chrono::DateTime<chrono::Utc>, String)> = chats
+            .into_iter()
+            .filter(|chat| &chat.device_id == device_id && !chat.archived)
+            .map(|chat| (chat.last_message_at.unwrap_or(chat.created_at), chat.id))
+            .filter(|(at, _)| *at >= cutoff)
+            .collect();
+        recent.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let total = recent.len();
+        recent.truncate(WARM_OPEN_MAX);
+        let mut opened = 0usize;
+        for (_, chat_id) in &recent {
+            match self.open(chat_id) {
+                Ok(_) => opened += 1,
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "warm-open failed")
+                }
+            }
+        }
+        if total > 0 {
+            tracing::info!(
+                opened,
+                skipped = total.saturating_sub(recent.len()),
+                "warm-opened recent chats"
+            );
+        }
+        opened
     }
 
     /// Composer path: append an immutable pending command entry (rule 1). Durable by

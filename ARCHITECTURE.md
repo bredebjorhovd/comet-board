@@ -216,8 +216,10 @@ feature spec `docs/research/feature-inventory.md` §1.
 
 Direct ports of comet behaviors (spec: feature-inventory §3):
 - **Sessions engine**: per-session broadcast hub; on-disk run journal (resumable `seq` replay,
-  crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; idle
-  reaper; 10min stall watchdog); recovery stamps `aborted`.
+  crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; 30min
+  idle reaper; 10min stall watchdog, tiered — terminal only for a run that never emitted anything,
+  advisory once it has, since no timeout can bound a legitimate silent tool call); recovery stamps
+  `aborted`; crash shield (panic → bounded drain → exit) on the headless daemon.
 - **Doc host**: per-chat handle (join room, VV backfill, write user entries + stream assistant
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
@@ -285,8 +287,8 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: prefers-reduced-motion, engine hardening
-  (instance lock, watchdogs), edge production deploy.
+  not executed — needs a Mac). Gaps: prefers-reduced-motion, parent-PID watchdog,
+  edge production deploy.
 
 ## 9. Open questions (tracked, non-blocking)
 
