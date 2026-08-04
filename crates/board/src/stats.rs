@@ -248,6 +248,7 @@ mod tests {
             pane_id: None,
             workspace: "offhand".into(),
             runtime: "claude-code".into(),
+            account: None,
             worktree: None,
             branch: None,
             started_at: crate::db::rfc3339(start),

@@ -13,7 +13,7 @@ use crate::db::Db;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
-use comet_proto::Space;
+use comet_proto::{AgentAccount, Space};
 
 pub struct Check {
     pub name: String,
@@ -33,14 +33,15 @@ pub struct EngineStatus {
 
 /// Check the environment. Plain stdout — the report is the output.
 ///
-/// `spaces` is this device's space list, or `None` when the engine could not
-/// be asked. Route checks against a `None` say "not checked" rather than
-/// failing every route over one dead engine — the engine check itself is the
-/// one that fails loudly.
+/// `spaces` is this device's space list, and `accounts` its saved agent
+/// logins, or `None` when the engine could not be asked. Route checks against
+/// a `None` say "not checked" rather than failing every route over one dead
+/// engine — the engine check itself is the one that fails loudly.
 pub fn doctor(
     paths: &Paths,
     engine: &EngineStatus,
     spaces: Option<&[Space]>,
+    accounts: Option<&[AgentAccount]>,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
@@ -269,11 +270,91 @@ pub fn doctor(
                         None => format!("`{}` is not a comet harness", r.runtime),
                     },
                 });
+
+                // Only when the route names one: a board on one person's
+                // laptop has no accounts to check and should not be told about
+                // a feature it is not using (gh#59).
+                if let Some(account) = r.account.as_deref().filter(|a| !a.is_empty()) {
+                    checks.push(account_check(&name, account, r, accounts));
+                }
             }
         }
     }
 
     Ok(checks)
+}
+
+/// Does a route's `account` name a login this device has saved, for the
+/// harness the route dispatches to?
+///
+/// Both halves matter. An unknown id fails every dispatch on the route at the
+/// point the chat would be created; an id belonging to the *other* CLI is the
+/// subtler one — it resolves as a saved account and still cannot be handed to
+/// this route's harness, because `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not
+/// interchangeable.
+fn account_check(
+    name: &str,
+    account: &str,
+    route: &crate::config::Route,
+    accounts: Option<&[AgentAccount]>,
+) -> Check {
+    let check = |ok: bool, detail: String| Check {
+        name: format!("route {name}: account"),
+        ok,
+        detail,
+    };
+    let Some(accounts) = accounts else {
+        return check(
+            true,
+            format!("`{account}` not checked — the engine is not reachable"),
+        );
+    };
+    let Some(found) = accounts.iter().find(|a| a.id == account) else {
+        let known: Vec<String> = accounts
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} ({}, {})",
+                    a.id,
+                    a.email.as_deref().unwrap_or("unknown"),
+                    harness_name(a.harness)
+                )
+            })
+            .collect();
+        return check(
+            false,
+            if known.is_empty() {
+                format!(
+                    "`{account}` is not a saved login — this device has none; sign one                      in under Agent accounts first"
+                )
+            } else {
+                format!(
+                    "`{account}` is not a saved login (have: {})",
+                    known.join(", ")
+                )
+            },
+        );
+    };
+    match harness_for_runtime(&route.runtime) {
+        // A bad runtime is already its own failing check; not repeating it here.
+        None => check(true, format!("`{account}` — runtime unresolved")),
+        Some(harness) if harness == found.harness => check(
+            true,
+            format!(
+                "`{account}` — {} ({})",
+                found.email.as_deref().unwrap_or("unknown"),
+                harness_name(harness)
+            ),
+        ),
+        Some(harness) => check(
+            false,
+            format!(
+                "`{account}` is a {} login, but this route dispatches to {} — an                  account cannot be lent across CLIs",
+                harness_name(found.harness),
+                harness_name(harness)
+            ),
+        ),
+    }
 }
 
 /// Whether a dispatching agent is told its released work settled.
@@ -444,7 +525,7 @@ mod tests {
     #[test]
     fn doctor_reports_a_missing_routing_file_without_panicking() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
@@ -463,7 +544,7 @@ mod tests {
             reachable: false,
             detail: "connection refused".into(),
         };
-        let checks = doctor(&p, &down, None).unwrap();
+        let checks = doctor(&p, &down, None, Some(&[])).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
         // The route's space is "not checked", not failed: one dead engine must
         // not fail every route and bury its own report.
@@ -473,6 +554,105 @@ mod tests {
             .expect("the route is still reported");
         assert!(space.ok, "{}", space.detail);
         assert!(space.detail.contains("not checked"), "{}", space.detail);
+    }
+
+    fn account(id: &str, email: &str, harness: comet_proto::HarnessId) -> AgentAccount {
+        AgentAccount {
+            id: id.into(),
+            harness,
+            email: Some(email.into()),
+            plan_label: None,
+            active: false,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    fn routing_with_account(p: &Paths, runtime: &str, account: &str) {
+        std::fs::write(
+            p.routing(),
+            format!(
+                "[[route]]\nmatch = {{ label = \"x\" }}\nworkspace = \"w\"\n\
+                 repo = \"/tmp\"\nruntime = \"{runtime}\"\naccount = \"{account}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn account_check_in(checks: &[Check]) -> &Check {
+        checks
+            .iter()
+            .find(|c| c.name == "route w: account")
+            .expect("the route names an account, so it is checked")
+    }
+
+    /// The failure this catches is otherwise found at dispatch time, once per
+    /// task, by whoever released it (gh#59).
+    #[test]
+    fn a_routes_account_is_checked_against_the_saved_logins() {
+        let (_d, p) = tmp();
+        routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
+        let saved = [account(
+            "8f2c1d0a7b6e4539",
+            "sam@example.com",
+            comet_proto::HarnessId::ClaudeCode,
+        )];
+
+        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved)).unwrap();
+        let c = account_check_in(&ok);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("sam@example.com"), "{}", c.detail);
+
+        // An id this device has never saved: named, along with what it does have.
+        routing_with_account(&p, "claude-code", "ffffffffffffffff");
+        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved)).unwrap();
+        let c = account_check_in(&bad);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("ffffffffffffffff"), "{}", c.detail);
+        assert!(c.detail.contains("8f2c1d0a7b6e4539"), "{}", c.detail);
+    }
+
+    /// The subtle one: a real saved login, for the other CLI. It resolves as an
+    /// account and still cannot be handed to this route's harness.
+    #[test]
+    fn an_account_belonging_to_the_other_cli_fails_its_route() {
+        let (_d, p) = tmp();
+        routing_with_account(&p, "codex", "8f2c1d0a7b6e4539");
+        let saved = [account(
+            "8f2c1d0a7b6e4539",
+            "sam@example.com",
+            comet_proto::HarnessId::ClaudeCode,
+        )];
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved)).unwrap();
+        let c = account_check_in(&checks);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("claude-code"), "{}", c.detail);
+        assert!(c.detail.contains("codex"), "{}", c.detail);
+    }
+
+    /// A route with no `account` is the single-user default and says nothing —
+    /// and one dead engine must not fail every route that has one.
+    #[test]
+    fn accounts_are_silent_when_unused_and_unchecked_when_unreachable() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"w\"\n\
+             repo = \"/tmp\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        assert!(!checks.iter().any(|c| c.name == "route w: account"));
+
+        routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
+        let checks = doctor(&p, &engine_up(), Some(&[]), None).unwrap();
+        let c = account_check_in(&checks);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
     }
 
     #[test]
@@ -485,7 +665,7 @@ mod tests {
         )
         .unwrap();
         let spaces = [space("Tally")];
-        let checks = doctor(&p, &engine_up(), Some(&spaces)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[])).unwrap();
         // Case-insensitive, like every other name match on the board.
         let c = checks
             .iter()
@@ -493,7 +673,7 @@ mod tests {
             .unwrap();
         assert!(c.ok, "{}", c.detail);
 
-        let checks = doctor(&p, &engine_up(), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "route tally: space")
@@ -515,7 +695,7 @@ mod tests {
              runtime = \"gpt-piloted-typewriter\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
         let alias = checks
             .iter()
             .find(|c| c.name == "route w: runtime" && c.ok)
@@ -554,7 +734,7 @@ mod tests {
             "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "settle notice")

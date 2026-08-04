@@ -250,6 +250,9 @@ impl Harness for ClaudeHarness {
         if let Some(chat_id) = &controls.chat_id {
             cmd.env("COMET_BOARD_CHAT_ID", chat_id);
         }
+        if let Some(account) = &controls.account {
+            account.apply(&mut cmd, HarnessId::ClaudeCode);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -450,6 +453,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         chat_id: _,
+        account: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

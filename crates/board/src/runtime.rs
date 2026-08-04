@@ -188,6 +188,12 @@ pub struct DispatchSpec {
     pub harness: HarnessId,
     /// Model override, if the route names one; None = harness default.
     pub model: Option<String>,
+    /// Agent-account slot id the run spends (gh#59) — the dispatch's choice,
+    /// else the route's, else `None` for the device's own CLI login. The
+    /// executor materializes it into a config dir and points the harness child
+    /// at that instead of swapping the shared one; the board core only carries
+    /// the id, since which logins exist is engine knowledge.
+    pub account: Option<String>,
     /// The brief: task title, body, links, and the board conventions
     /// (commit as you go, open a PR, `comet-board list --json` to poll).
     /// `{worktree}` may still be unresolved — see [`DispatchSpec::prompt_at`].

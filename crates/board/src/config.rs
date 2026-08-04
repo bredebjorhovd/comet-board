@@ -466,6 +466,13 @@ pub struct Route {
     pub workspace: String,
     pub repo: String,
     pub runtime: String,
+    /// Agent-account slot id this route's dispatches run under — whose Claude
+    /// or Codex subscription pays for them (gh#59). Omitted means the device's
+    /// own CLI login, which is the whole story on a single-user box. A
+    /// dispatch's `--account` overrides it; `comet-board doctor` lists the ids
+    /// this device has saved.
+    #[serde(default)]
+    pub account: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
     /// Per-route override of `defaults.branch_template`.

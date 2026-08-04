@@ -90,9 +90,11 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    // Board (comet-board fork addition). The board store lives on one device —
-    // wherever `syncd` runs, usually the always-on engine — so these are served
-    // locally for now; making them relay-forwardable is a later, deliberate step.
+    // Board (comet-board fork addition, ControlRpc, relay-forwardable — gh#55).
+    // The board store lives on ONE device — wherever the board service runs,
+    // usually the always-on box — so every one of these targets that device:
+    // `targetDeviceId` = the box makes a teammate's laptop drive the same board
+    // over the relay instead of needing a board (or an SSH session) of its own.
     /// Stream: current board rows (tasks + attempts, board order), then every
     /// change. The `list --json` shape from herdr-board, one row per task.
     pub const WATCH_BOARD: &str = "WatchBoard";

@@ -1738,6 +1738,7 @@ mod tests {
                 dispatched_by: None,
                 dispatched_by_pane: None,
                 base_sha: None,
+                account: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();
@@ -1756,6 +1757,7 @@ mod tests {
             dispatched_by: None,
             dispatched_by_pane: None,
             base_sha: None,
+            account: None,
         })
         .unwrap()
     }

@@ -25,6 +25,7 @@ use comet_proto::{
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
+use crate::agent_accounts::AgentAccounts;
 use crate::doc_host::DocHost;
 use crate::repos::Repos;
 use crate::run_journal::RunJournal;
@@ -40,16 +41,21 @@ pub struct CometRuntime {
     /// The engine's run journal — the settle authority (docs/BOARD.md §H4):
     /// `last_run_end` reads a chat's final journaled event off it.
     journal: Arc<RunJournal>,
+    /// The device's saved agent logins — a dispatch naming one materializes it
+    /// into its own config dir here, before the chat exists (gh#59).
+    accounts: AgentAccounts,
     handle: Handle,
 }
 
 impl CometRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repos: Repos,
         workspace: WorkspaceHost,
         doc_host: DocHost,
         sessions: watch::Receiver<Vec<Session>>,
         journal: Arc<RunJournal>,
+        accounts: AgentAccounts,
         handle: Handle,
     ) -> Self {
         Self {
@@ -58,6 +64,7 @@ impl CometRuntime {
             doc_host,
             sessions,
             journal,
+            accounts,
             handle,
         }
     }
@@ -81,6 +88,17 @@ impl Runtime for CometRuntime {
             spec.repo_path.clone()
         };
 
+        // Fail the dispatch here if the account does not resolve, rather than
+        // at the first run: an attempt whose chat exists but whose login does
+        // not is a row somebody has to clean up, and the operator finds out
+        // either way. Materializing now also means the dir is seeded before
+        // the brief is queued, so the run never races the seeding.
+        if let Some(account) = spec.account.as_deref() {
+            self.accounts
+                .materialize(spec.harness, account)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
         let chat_id = crate::new_id();
         let config = ChatConfig {
             harness: spec.harness,
@@ -88,6 +106,10 @@ impl Runtime for CometRuntime {
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            // On the chat, so every later turn in it — steers, review
+            // deliveries, the operator typing into the same session — keeps
+            // spending the account the dispatch chose.
+            account: spec.account.clone(),
         };
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;

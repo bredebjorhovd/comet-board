@@ -61,6 +61,7 @@ fn fake_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         steering: steer_rx,
         interrupt: token.clone(),
         chat_id: None,
+        account: None,
     };
     (controls, steer_tx, token)
 }
@@ -332,6 +333,7 @@ fn real_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         steering: steer_rx,
         interrupt: token.clone(),
         chat_id: None,
+        account: None,
     };
     (controls, steer_tx, token)
 }

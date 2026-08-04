@@ -111,15 +111,56 @@ nearly verbatim — it never depended on herdr:
   `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, runtime?, model?}` → `{chatId, cwd, attempt}`,
-`CancelTask {taskId}` — served in `crates/engine/src/rpc.rs` off the board
-service, which executes dispatch/cancel on its loop thread (`board.db` has one
-writer). `ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch
-can be pointed at (the canonical set `build_spec` validates an override
-against) for pickers in the desktop panel and the CLI. `runtime`/`model`
-override the route's configured runtime and the harness's default model for
-that one dispatch; the attempt row records whatever the agent actually ran
-under.
+`DispatchTask {taskId, via?, runtime?, model?, account?}` →
+`{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
+`crates/engine/src/rpc.rs` off the board service, which executes
+dispatch/cancel on its loop thread (`board.db` has one writer).
+`ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch can be
+pointed at (the canonical set `build_spec` validates an override against) for
+pickers in the desktop panel and the CLI. `runtime`/`model`/`account` override
+the route's configured runtime, the harness's default model, and the route's
+`account` for that one dispatch; the attempt row records whatever the agent
+actually ran under.
+
+### Per-run agent accounts (gh#59)
+
+Whose Claude/Codex subscription a dispatch spends is a per-run choice, not an
+engine-wide mode. Each teammate attaches their own login under Agent accounts;
+a route's `account` (or `DispatchTask {account}` / `comet-board dispatch
+--account`) names the slot, and that dispatch burns its owner's limits.
+
+The mechanism is env, not files. `crates/engine/src/agent_accounts.rs`
+materializes a slot into a config dir of its own — `{data_dir}/accounts/{slotId}/`,
+holding `.credentials.json` + `.claude.json` for Claude and `auth.json` for
+Codex — and the run stamps `CLAUDE_CONFIG_DIR` / `CODEX_HOME` at it in the
+harness child's env, exactly as `RunControls::chat_id` becomes
+`COMET_BOARD_CHAT_ID`. The alternative it replaces (`activate`, which overwrites
+`~/.claude/.credentials.json`) is engine-wide and mutates what a *live* run is
+reading — a footgun even for one user. `activate` remains, for choosing the
+device's own CLI login; a run naming an account never touches it.
+
+The dir is the live copy from then on: refresh writebacks the CLI makes land
+there, `read_slots` absorbs them back into the slot file, and usage probes read
+the result. A run holds a lease on its slot for its lifetime, which keeps the
+usage refresher from rotating a refresh token the CLI is still holding — the
+same rule that already applied to the active login.
+
+The account rides `ChatConfig`, not `RunRequest`: a login belongs to the agent,
+so every later turn in the chat (steers, review deliveries, an operator typing
+into the same session) keeps spending it, and a steer arriving mid-turn cannot
+change it. An account that will not resolve **refuses** the dispatch before the
+chat exists, and refuses a later run rather than falling back — a silent
+fallback bills whoever the device's own login belongs to.
+
+Deliberately not in v1: inferring an account from the WorkOS user who
+dispatched. `via` already records who released the work; guessing a login from
+it is the kind of clever that bills the wrong person. `comet-board doctor`
+checks each route's `account` against the device's saved logins, including the
+CLI it belongs to — a Claude slot on a codex route is not lendable, since the
+two config-dir variables are not interchangeable.
+
+All four are relay-forwardable (H9): `targetDeviceId` = the box, and a
+teammate's laptop reads and drives the box's board without hosting one.
 
 ## What was deliberately NOT ported
 
@@ -204,17 +245,41 @@ single bounce. The author check survives as `Runtime::chat_alive` plus a new
 `Runtime::chat_cwd` — the chat row's cwd must still be the attempt's
 checkout.
 
-### H6 — `comet-board` CLI (M, needs H2; agents' entry point)
-Grow `apps/board-cli` (the `comet-board` binary, created by H8 with
-`doctor`/`init`/`adopt`) into the full surface, speaking the existing typed
-RPC to the local IPC port, exactly as `comet-tui` attaches:
-`list [--state --json]`, `dispatch --task`, `cancel --task`, `wait`, `new`,
-`stats`. JSON shapes: keep herdr-board's `list --json` contract
-verbatim (documented in herdr-board's README §"Driving the board from an
-agent") — the agent conventions text depends on it. `wait` becomes a
-`WatchBoard` subscription rather than a poll loop. Port
-`agent-conventions.md` with names swapped (herdr-board → comet-board,
-pane → chat).
+### H6 — `comet-board` CLI — **done**
+Landed as `apps/board-cli` (the `comet-board` binary H8 started with
+`doctor`/`init`/`adopt`), grown into the full surface — `list [--state
+--source --json]`, `dispatch --task`, `cancel --task`, `wait`, `new`, `stats`
+— speaking the existing typed RPC to the local IPC port exactly as `comet-tui`
+attaches. `apps/board-cli/src/ops.rs` is the agent-facing half:
+- `list --json` prints herdr-board's contract verbatim, modulo the two renames
+  the port dictates (`pane_id` → `chat_id`, `dispatched_by_pane` →
+  `dispatched_by_chat`). The shape lives in `comet_proto::view::board::TaskRow`
+  and is re-exported by `crates/board/src/rows.rs`, which owns it; the CLI only
+  serializes what `WatchBoard` streamed. `docs/agent-conventions.md` teaches it,
+  so it is not the CLI's to bend.
+- `wait` is a `WatchBoard` subscription, not a poll loop: it answers as soon as
+  a watched row reaches a settled state, and with no `--task` watches whatever
+  was in flight when it was called (resolved once — work dispatched later is
+  not what that call is waiting for). Unknown filters and states are refused
+  rather than answered with `[]`, which a caller cannot tell from "nothing is
+  ready".
+- `dispatch` inherits `via` provenance from `COMET_BOARD_CHAT_ID` (H3 exports
+  it into the harness child env), so a dispatch from inside a board-dispatched
+  chat records its parent without being told. `--via` is for releasing on
+  behalf of a chat that is not you; the operator's dispatch has neither.
+- `--runtime` / `--model` override the route's runtime and the harness's
+  default model for one dispatch, checked first against `ListBoardRuntimes` /
+  `ListModels {harness}` — the same two calls the desktop picker fills its rows
+  from, so the CLI refuses what the picker would not have offered. The engine
+  validates the runtime on its own, but an unknown *model* is only the
+  harness's business, and by the time the harness sees it the dispatch has cut
+  a worktree, made a chat and started an agent. A catalog that cannot be read
+  proves nothing: it degrades to a note on stderr and lets the dispatch
+  through, as the panel degrades to the route's runtime.
+- `new` is the one command that does not ask the engine — it writes to the
+  trackers, which sit upstream of it, with the same clients the sync loop uses.
+  `--dispatch` then waits for the engine's next poll to put the row on the
+  board before releasing it, rather than failing on the race.
 
 ### H7 — Board view in `comet-tui` — **done**
 Landed as a board pane in `comet-tui` (`crates/tui/src/board.rs` + the board
@@ -256,16 +321,39 @@ that need only H1):
   label-picker survives as `--labels`/`--all-issues` on the CLI (H7's screen
   can reuse `preview` + `adopt_with` as-is).
 
+### H9 — Relay-forward the board RPCs — **done** (gh#55)
+The four board methods joined `forwardable` in `crates/engine/src/rpc.rs`
+(`WatchBoard` also joined `is_stream_method`, so its stream is proxied
+item-by-item). Nothing else on the engine changed: the handlers were already
+transport-agnostic, and authorization falls out of org membership plus relay
+auth exactly as it does for terminals or agent accounts. `crates/engine/tests/
+device_routing.rs` covers it end to end — a box hosting the board, a laptop
+hosting none, and the laptop reading the box's rows and being refused by the
+box's own dispatch guard.
+
+Finding the host needs no configuration. The engine refuses `WatchBoard`
+outright when it hosts no board, so a device whose stream ends without ever
+delivering a frame has said "not me"; both viewports sweep the candidates from
+`comet_proto::view::board::host_candidates` (this device first, then every
+registered device in registration order) until one answers. Pinning is there
+for when the guess is wrong or two boxes both host a board: the desktop panel's
+header chip (with "Automatic" to hand the sweep back) and the TUI's `d`, which
+cycles automatic → this device → each device → automatic. Every board call
+carries the host, `ListModels` included — the run executes on the host, so the
+model catalog a dispatch picks from has to be the host's.
+
+Still one host device by design: moving board rows into the workspace doc is a
+different decision, and one host is correct while one box hosts the board.
+
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from
   upstream + live attempt; nothing here changes that.
 - **Writeback discipline**: dispatch/outcome comments and closes are queued in
   `board.db` and drained by H1's loop; per-repo `writeback` decides at
   delivery. Already ported; just needs the loop.
-- **Multi-device later.** Everything above is one engine hosting the board.
-  The RPC methods are deliberately not relay-forwardable yet; forwarding (or
-  moving board rows into the workspace doc) is a decision to make once
-  single-device works.
+- **Multi-device.** One engine hosts the board; every other device drives it
+  over the relay (H9 above). Moving board rows into the workspace doc stays
+  deferred — one host device is correct while one box hosts the board.
 - **Upstream tracking**: `git fetch upstream && git merge upstream/main`
   (upstream = zeronsh/comet). Keep board changes additive — new crate, new
   files, short diffs in `rpc/lib.rs` + `engine/rpc.rs` — so merges stay cheap.

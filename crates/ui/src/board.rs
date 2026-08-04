@@ -23,6 +23,23 @@
 //!   find field (live substring matching), `esc` closes the panel;
 //! - the panel is lazy: no RPC until it is first opened, and the stream
 //!   reconnects with a 2 s backoff if the engine drops it.
+//!
+//! ## Which device's board (gh#55)
+//!
+//! The board store lives on ONE device — usually the always-on box — and every
+//! board RPC is relay-forwardable, so this panel is not limited to a device
+//! that hosts a board itself. It carries a *host*: `None` for this device, a
+//! device id otherwise, merged into every board call as `targetDeviceId`
+//! (`ListModels` included — the run executes on the host, so the catalog has to
+//! be the host's).
+//!
+//! Finding the host needs no configuration. The engine refuses `WatchBoard`
+//! outright when it hosts no board, so a candidate that ends its stream without
+//! ever delivering a frame has answered "not me", and the watch loop walks the
+//! candidates from `comet_proto::view::board::host_candidates` until one
+//! answers. The header's host chip pins a device explicitly when the guess is
+//! wrong (or when two boxes both host a board), and offers "Automatic" to hand
+//! the sweep back.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -162,6 +179,17 @@ fn override_model_id(models: &[BoardModelInfo], active: usize) -> Option<&str> {
         0 => None,
         k => models.get(k).map(|m| m.id.as_str()),
     }
+}
+
+/// Merge the board host's `targetDeviceId` passthrough into a call's params
+/// (gh#55). `None` — the board is this device's — leaves the params untouched,
+/// so a single-device install sends exactly the shape it always did.
+fn host_params(host: Option<&str>, value: serde_json::Value) -> serde_json::Value {
+    let mut value = value;
+    if let (Some(host), Some(object)) = (host, value.as_object_mut()) {
+        object.insert("targetDeviceId".into(), serde_json::json!(host));
+    }
+    value
 }
 
 /// Whether the dispatch picker consumes a keystroke instead of letting it
@@ -472,6 +500,20 @@ pub struct BoardPanel {
     model_scroll: ScrollHandle,
     /// A transient dispatch/cancel message for the footer.
     notice: Option<SharedString>,
+    /// Which device's board this is: `None` = this device (no passthrough).
+    /// Walked by the watch loop until a device answers, unless pinned.
+    host: Option<String>,
+    /// The operator picked the host from the chip — the sweep stops guessing
+    /// and a silent device stays selected (with a banner) instead of being
+    /// walked past.
+    host_pinned: bool,
+    /// The current host has delivered at least one frame, so it really does
+    /// host the board. Drives the chip's presence dot.
+    host_confirmed: bool,
+    host_menu_open: bool,
+    /// Outside-click dismissal instant — suppresses the trigger click that
+    /// follows the same mouse-down from instantly reopening the menu.
+    host_menu_dismissed_at: Option<std::time::Instant>,
     /// An open runtime picker for a dispatch (ready row → enter). `None` =
     /// no dispatch is being confirmed.
     dispatch: Option<DispatchDraft>,
@@ -542,6 +584,11 @@ impl BoardPanel {
             scroll: ScrollHandle::new(),
             model_scroll: ScrollHandle::new(),
             notice: None,
+            host: None,
+            host_pinned: false,
+            host_confirmed: false,
+            host_menu_open: false,
+            host_menu_dismissed_at: None,
             dispatch: None,
             _ticker: ticker,
             _observe: observe,
@@ -566,6 +613,100 @@ impl BoardPanel {
         self.state.read(cx).engine().cloned()
     }
 
+    // ---- which device's board (gh#55) ----
+
+    /// Merge the `targetDeviceId` passthrough into a board call's params. A
+    /// no-op while the board is this device's, so a single-device install
+    /// sends exactly what it always did.
+    fn host_params(&self, value: serde_json::Value) -> serde_json::Value {
+        host_params(self.host.as_deref(), value)
+    }
+
+    /// The host's display name, for the chip and the banners.
+    fn host_label(&self, cx: &App) -> SharedString {
+        let Some(host) = self.host.as_deref() else {
+            return "This device".into();
+        };
+        self.state
+            .read(cx)
+            .devices
+            .iter()
+            .find(|d| d.id == host)
+            .map(|d| SharedString::from(d.name.clone()))
+            // A host id with no device row (the row has not synced yet) is
+            // still worth naming — the id is what the call carries.
+            .unwrap_or_else(|| SharedString::from(host.to_string()))
+    }
+
+    /// Point the panel at a device, explicitly. `pinned` stops the automatic
+    /// sweep — an operator who chose a device wants that device's board, or a
+    /// clear reason it has none, not a silent hop to another one.
+    fn set_host(&mut self, host: Option<String>, pinned: bool, cx: &mut Context<Self>) {
+        self.host_menu_open = false;
+        if self.host == host && self.host_pinned == pinned {
+            cx.notify();
+            return;
+        }
+        self.host = host;
+        self.host_pinned = pinned;
+        self.host_confirmed = false;
+        self.error = None;
+        // A different device is a different board: drop the rows rather than
+        // leave another box's tasks on screen under the new host's name.
+        self.model.set_rows(Vec::new());
+        self.dispatch = None;
+        if let Some(engine) = self.engine(cx) {
+            self.started = true;
+            // Replacing the task drops (and so cancels) the old subscription.
+            self.watch_task = Some(Self::spawn_watch(engine, cx));
+        }
+        cx.notify();
+    }
+
+    /// The watch loop's verdict on a host whose stream just ended. Returns
+    /// whether to try the next candidate immediately (no backoff — the sweep
+    /// should not take one round-trip per device *plus* two seconds each).
+    fn host_stream_ended(&mut self, delivered: bool, cx: &mut Context<Self>) -> bool {
+        if delivered {
+            // It does host the board; the stream dropped under it (engine
+            // restart, relay blip). Stay put — the rows stay on screen under
+            // the banner and the same host is re-subscribed after the backoff.
+            self.error = Some("Board stream interrupted — retrying".into());
+            cx.notify();
+            return false;
+        }
+        self.host_confirmed = false;
+        if self.host_pinned {
+            let label = self.host_label(cx);
+            self.error = Some(format!("{label} hosts no board").into());
+            cx.notify();
+            return false;
+        }
+        let (devices, local) = {
+            let state = self.state.read(cx);
+            (state.devices.clone(), state.local_device_id.clone())
+        };
+        let candidates = board::host_candidates(&devices, local.as_deref());
+        match board::next_host_candidate(&candidates, self.host.as_deref()) {
+            Some(next) => {
+                self.host = next;
+                self.error = None;
+                cx.notify();
+                true
+            }
+            None => {
+                // Everyone has been asked and nobody hosts a board. Start over
+                // from this device after the backoff: the box may be booting,
+                // and a panel that gave up would need a restart to notice.
+                self.host = None;
+                self.error =
+                    Some("No device here hosts a board — open the host chip to pick one".into());
+                cx.notify();
+                false
+            }
+        }
+    }
+
     // ---- watch lifecycle ----
 
     /// Start the `WatchBoard` subscription (idempotent). Retries with a flat
@@ -584,18 +725,27 @@ impl BoardPanel {
         self.watch_task = Some(Self::spawn_watch(engine, cx));
     }
 
+    /// The watch loop. Each pass asks the panel which device to try, subscribes
+    /// there, and pumps frames; a stream that ends hands the verdict back to
+    /// [`BoardPanel::host_stream_ended`], which either advances the sweep (and
+    /// we re-subscribe at once) or keeps the host and backs off 2 s.
     fn spawn_watch(engine: EngineHandle, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let subscribed = engine
-                    .client()
-                    .subscribe(methods::WATCH_BOARD, serde_json::json!({}))
-                    .await;
-                match subscribed {
+                // The sweep's current position, read fresh — the operator may
+                // have pinned a device while the last stream was running.
+                let Ok(params) = this.update(cx, |panel, _| panel.host_params(serde_json::json!({})))
+                else {
+                    return;
+                };
+                let mut delivered = false;
+                match engine.client().subscribe(methods::WATCH_BOARD, params).await {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
+                            delivered = true;
                             let alive = this.update(cx, |panel, cx| {
                                 panel.error = None;
+                                panel.host_confirmed = true;
                                 match serde_json::from_value::<Vec<TaskRow>>(value) {
                                     Ok(rows) => {
                                         panel.model.set_rows(rows);
@@ -611,19 +761,10 @@ impl BoardPanel {
                                 return;
                             }
                         }
-                        // Stream ended (engine restart / reconnect): banner +
-                        // retry, with the last content still visible.
-                        if this
-                            .update(cx, |panel, cx| {
-                                panel.error = Some("Board stream interrupted — retrying".into());
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
                     }
                     Err(err) => {
+                        // The subscribe itself was refused — the transport is
+                        // down, not the board. Say so and keep the host.
                         if this
                             .update(cx, |panel, cx| {
                                 panel.error = Some(format!("Board unavailable: {err}").into());
@@ -633,7 +774,16 @@ impl BoardPanel {
                         {
                             return;
                         }
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        continue;
                     }
+                }
+                match this.update(cx, |panel, cx| panel.host_stream_ended(delivered, cx)) {
+                    // Next candidate: ask now, the sweep is already one
+                    // round-trip per device.
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(_) => return,
                 }
                 cx.background_executor().timer(Duration::from_secs(2)).await;
             }
@@ -688,10 +838,13 @@ impl BoardPanel {
         let Some(task_id) = self.dispatch.as_ref().map(|d| d.task_id.clone()) else {
             return;
         };
+        // The host validates a dispatch's runtime override against its own
+        // harness set, so the catalog has to come from there too.
+        let params = self.host_params(serde_json::json!({}));
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::LIST_BOARD_RUNTIMES, serde_json::json!({}))
+                .call(methods::LIST_BOARD_RUNTIMES, params)
                 .await;
             this.update(cx, |panel, cx| {
                 // A newer pick (or a cancel) replaced this one while the load
@@ -749,13 +902,16 @@ impl BoardPanel {
         *slot = ModelCatalog::Loading;
         let task_id = draft.task_id.clone();
         let runtime_for_landing = runtime.clone();
+        // The run happens on the host device, so its harness is the one whose
+        // model catalog a dispatch can pick from.
+        let params = host_params(
+            self.host.as_deref(),
+            serde_json::json!({ "harness": runtime }),
+        );
         cx.spawn(async move |this, cx| {
             // The canonical runtime name IS the harness's kebab-case id, so it
             // deserializes straight into `ListModels { harness }`.
-            let result = engine
-                .client()
-                .call(methods::LIST_MODELS, serde_json::json!({ "harness": runtime }))
-                .await;
+            let result = engine.client().call(methods::LIST_MODELS, params).await;
             this.update(cx, |panel, cx| {
                 // A newer pick (or a cancel) replaced this one mid-flight.
                 let Some(draft) = panel.dispatch.as_mut() else { return };
@@ -914,6 +1070,9 @@ impl BoardPanel {
         let runtime = runtime.map(str::to_string);
         let model = model.map(str::to_string);
         let effective = effective_model.map(str::to_string);
+        // The dispatch runs where the board is: the worktree, the chat and the
+        // agent all land on the host device.
+        let host = self.host.clone();
         // Computed before the params consume `runtime`/`model`.
         let detail = match (&runtime, &effective) {
             (Some(runtime), Some(model)) => format!(" · {runtime} / {model}"),
@@ -921,7 +1080,7 @@ impl BoardPanel {
             _ => String::new(),
         };
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "taskId": task_id });
+            let mut params = host_params(host.as_deref(), serde_json::json!({ "taskId": task_id }));
             if replace {
                 params["replace"] = serde_json::Value::Bool(true);
             }
@@ -963,11 +1122,9 @@ impl BoardPanel {
         let Some(row) = self.model.task(id) else { return };
         let identifier = row.identifier.clone();
         let task_id = row.id.clone();
+        let params = self.host_params(serde_json::json!({ "taskId": task_id }));
         cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::CANCEL_TASK, serde_json::json!({ "taskId": task_id }))
-                .await;
+            let result = engine.client().call(methods::CANCEL_TASK, params).await;
             this.update(cx, |panel, cx| match result {
                 Ok(_) => panel.set_notice(format!("Cancelled {identifier}"), cx),
                 Err(err) => panel.set_notice(format!("Couldn't cancel {identifier}: {err}"), cx),
@@ -1433,6 +1590,12 @@ impl BoardPanel {
                         .text_color(label_color)
                         .child(label),
                 );
+            // The host chip earns its space only when there is something to
+            // say: one device serving its own board is the ordinary case.
+            let one_device = self.state.read(cx).devices.len() <= 1;
+            if !(one_device && self.host.is_none() && self.host_confirmed) {
+                header = header.child(self.render_host_chip(&theme, cx));
+            }
             header = header.child(filter_chip);
             if filter_active {
                 let clear_id = "board-filter-clear";
@@ -1502,6 +1665,130 @@ impl BoardPanel {
         }
 
         header.into_any_element()
+    }
+
+    /// The host chip: which device's board this is, and a menu to pin another
+    /// one (gh#55). The dot is lit once that device has actually delivered
+    /// rows — while the sweep is still asking, the chip says who it is asking.
+    fn render_host_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (mut devices, local_id) = {
+            let state = self.state.read(cx);
+            (state.devices.clone(), state.local_device_id.clone())
+        };
+        // Registration order, matching the sweep and the settings switcher, so
+        // rows never reshuffle on a heartbeat.
+        devices.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        let label = self.host_label(cx);
+        let open = self.host_menu_open;
+        let confirmed = self.host_confirmed;
+        let pinned = self.host_pinned;
+        let host = self.host.clone();
+        let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+
+        let mut chip = div()
+            .id("board-host")
+            .h(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(if open {
+                theme.wash(0.14)
+            } else {
+                theme.wash(0.0)
+            })
+            .when(!open, |el| el.hover(|s| s.bg(theme.wash(0.1))))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let just_dismissed = this
+                    .host_menu_dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                this.host_menu_open = !this.host_menu_open && !just_dismissed;
+                this.host_menu_dismissed_at = None;
+                cx.notify();
+            }))
+            .text_size(px(11.0))
+            .child(
+                icon(icons::MONITOR)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
+                div()
+                    .max_w(px(120.0))
+                    .truncate()
+                    .text_color(if confirmed {
+                        theme.text_muted
+                    } else {
+                        theme.text_muted.opacity(0.6)
+                    })
+                    .child(label),
+            )
+            .child(
+                div()
+                    .size(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(if confirmed {
+                        emerald
+                    } else {
+                        theme.white_alpha(0.2)
+                    }),
+            );
+
+        if open {
+            let menu = popover::popover_card(theme)
+                .w(px(220.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.host_menu_open = false;
+                    this.host_menu_dismissed_at = Some(std::time::Instant::now());
+                    cx.notify();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(popover::menu_heading(theme, "Board host"))
+                // Hand the sweep back: the panel finds whichever device hosts
+                // a board, which is the right answer on almost every install.
+                .child(
+                    popover::menu_row(theme, !pinned, "board-host-auto")
+                        .id("board-host-auto")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_host(None, false, cx)))
+                        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
+                            "Automatic",
+                        )))
+                        .when(!pinned, |el| el.child(popover::menu_check(theme))),
+                )
+                .children(devices.into_iter().enumerate().map(|(ix, d)| {
+                    let is_local = local_id.as_deref() == Some(d.id.as_str());
+                    // "This device" is the absent passthrough, so a pinned
+                    // local host and an unpinned one address the same engine.
+                    let target = (!is_local).then(|| d.id.clone());
+                    let is_active = pinned && host == target;
+                    let name: SharedString = d.name.clone().into();
+                    popover::menu_row(theme, is_active, format!("board-host-row-{ix}"))
+                        .id(("board-host-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_host(target.clone(), true, cx);
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                        .when(is_local, |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_muted.opacity(0.35))
+                                    .child(SharedString::from("You")),
+                            )
+                        })
+                        .when(is_active, |el| el.child(popover::menu_check(theme)))
+                }))
+                .into_any_element();
+            chip = chip.child(popover::anchored_menu("board-host-menu", menu));
+        }
+        chip.into_any_element()
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2425,8 +2712,12 @@ mod tests {
             last_outcome_at: None,
             attempts: 0,
             reopened: 0,
-            updated_at: "2026-08-01T11:00:00Z".into(),
+            // Stamped now, not on a fixed date: `done` is bounded to today by
+            // the shared derivation, so a frozen timestamp makes the done
+            // section empty on every day but one.
+            updated_at: Utc::now().to_rfc3339(),
             started_at: None,
+            account: None,
         }
     }
 
@@ -2482,6 +2773,19 @@ mod tests {
         // A frame where the row left the board re-clamps.
         m.set_rows(vec![row("1", BoardState::Ready)]);
         assert_eq!(m.selected.as_deref(), Some("1"));
+    }
+
+    /// gh#55: the host rides on every board call as `targetDeviceId`, and a
+    /// local board sends exactly the shape it always did.
+    #[test]
+    fn the_host_passthrough_is_added_only_when_the_board_is_elsewhere() {
+        let local = host_params(None, serde_json::json!({ "taskId": "t" }));
+        assert_eq!(local, serde_json::json!({ "taskId": "t" }));
+        let remote = host_params(Some("box"), serde_json::json!({ "taskId": "t" }));
+        assert_eq!(
+            remote,
+            serde_json::json!({ "taskId": "t", "targetDeviceId": "box" })
+        );
     }
 
     #[test]

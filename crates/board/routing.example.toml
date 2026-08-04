@@ -40,6 +40,29 @@ workspace = "scratch"
 repo = "~/code/scratch"
 runtime = "codex"
 
+# `account` names which saved Claude/Codex login a route's dispatches run
+# under — i.e. whose subscription pays for them. One box, several teammates:
+# each attaches their own sub under Agent accounts, routes point at it, and a
+# dispatch burns its owner's limits rather than everyone sharing one login.
+#
+# The value is a slot id; `comet-board doctor` lists the ids this device has
+# saved, with the email and CLI each belongs to, and fails a route naming one
+# it does not have (or a Claude login on a codex route — the two CLIs' config
+# dirs are not interchangeable). `comet-board dispatch --account <id>`
+# overrides it per dispatch.
+#
+# Omit it on a single-user box: the run then uses the CLI's own config dir,
+# exactly as it did before accounts existed. Nothing infers an account from
+# who dispatched — `via` records that, and guessing a login from it is the
+# kind of clever that bills the wrong person.
+#
+# [[route]]
+# match = { linear_team = "PLT" }
+# workspace = "platform"
+# repo = "~/code/platform"
+# runtime = "claude-code"
+# account = "8f2c1d0a7b6e4539"
+
 # A route with no `match` is a catch-all and must come last.
 
 [defaults]

@@ -230,6 +230,9 @@ impl Harness for CodexHarness {
         if let Some(chat_id) = &controls.chat_id {
             cmd.env("COMET_BOARD_CHAT_ID", chat_id);
         }
+        if let Some(account) = &controls.account {
+            account.apply(&mut cmd, HarnessId::Codex);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -396,6 +399,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         chat_id: _,
+        account: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

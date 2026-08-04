@@ -50,8 +50,11 @@ nothing is in flight.
 Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
 `dispatched_by`, `dispatched_by_chat`, `last_outcome`, `last_outcome_at`,
-`attempts`, `dispatchable`, `gone`, `reopened`. `workspace` names a comet
-*space* — the field keeps herdr-board's spelling so ported tooling reads it.
+`attempts`, `dispatchable`, `gone`, `reopened`, `account`. `workspace` names a
+comet *space* — the field keeps herdr-board's spelling so ported tooling reads
+it. `account` is the agent login whose subscription the row's attempt spends
+(the route's default before anything has run); null is the device's own CLI
+login, which is every row on a single-account box.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.
@@ -74,26 +77,35 @@ is this board's `review`.
 2. **Release work** with `comet-board dispatch --task <id>`. This cuts a git
    worktree, creates a chat in the routed space, starts the agent and queues
    the route's brief through the command ledger. It returns once the chat
-   exists; the engine takes it from there.
-3. **Provenance is automatic.** A board-dispatched chat carries its own id as
+   exists; the engine takes it from there. `--runtime` and `--model` override
+   the route's runtime and that harness's default model for the one dispatch;
+   both are checked against the engine's catalogs first, and an unknown value
+   is refused naming the valid set, so a typo costs an error rather than an
+   attempt. The row's default runtime is on the row (`runtime`).
+3. **Accounts are the operator's choice, not yours.** `routing.toml` decides
+   which teammate's Claude/Codex subscription a route's work is billed to.
+   `dispatch --account <id>` overrides it; do not pass it unless you were told
+   which account to use. Spending someone else's limits is not yours to
+   decide, and the board deliberately does not infer one from who dispatched.
+4. **Provenance is automatic.** A board-dispatched chat carries its own id as
    `COMET_BOARD_CHAT_ID`, and `dispatch` passes it along — the board records
    your chat as the parent of what you release. Never pass `--via` unless
    releasing work on behalf of a chat that is not you.
-4. **One live attempt per task.** A second dispatch fails cleanly rather than
+5. **One live attempt per task.** A second dispatch fails cleanly rather than
    spawning a second agent. Concurrency caps also refuse at capacity — report
    the refusal, do not cancel someone else's work to make room.
-5. **Cancel** with `comet-board cancel --task <id>`. This ends the *attempt*,
+6. **Cancel** with `comet-board cancel --task <id>`. This ends the *attempt*,
    not the issue: the row returns to `ready` with its history intact. It does
    not notify a parent agent that may be waiting on it — say so if one exists.
-6. **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes
+7. **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes
    after every sync cycle, status refresh and dispatch, so there is no sync
    command to run first. `wait` holds the same subscription open, so it answers
    as soon as the answer is true.
-7. **After releasing work, do not fall silent about it.** That leaves the human
+8. **After releasing work, do not fall silent about it.** That leaves the human
    to notice the agent finished and to prompt you. Either `wait` for it, or say
    plainly that you are leaving it running and that nothing will tell you when
    it is done.
-8. **Never dispatch speculatively.** Releasing work starts a real agent in a
+9. **Never dispatch speculatively.** Releasing work starts a real agent in a
    real repo that commits and opens PRs. A human keypress — or an explicit
    instruction — releases tasks. Reading the board is always safe; dispatching
    is not.

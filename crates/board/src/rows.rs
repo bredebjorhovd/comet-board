@@ -61,6 +61,13 @@ pub fn task_row(task: &Task, route: Option<&Route>) -> TaskRow {
         reopened: live.or(last).map(|a| a.reopened).unwrap_or(0),
         updated_at: task.updated_at.clone(),
         started_at: live.map(|a| a.started_at.clone()),
+        // Same shape as `runtime` above: what the attempt actually ran under,
+        // falling back to what the route would use for a row nothing has run
+        // on yet.
+        account: live
+            .or(last)
+            .map(|a| a.account.clone())
+            .unwrap_or_else(|| route.and_then(|r| r.account.clone())),
     }
 }
 
@@ -121,6 +128,7 @@ mod tests {
                 dispatched_by: None,
                 dispatched_by_pane: Some("chat-parent".into()),
                 base_sha: None,
+                account: None,
             })
             .unwrap();
         db.set_attempt_pane(a, "chat-1").unwrap();
@@ -149,6 +157,7 @@ mod tests {
                 dispatched_by: None,
                 dispatched_by_pane: None,
                 base_sha: None,
+                account: None,
             })
             .unwrap();
         db.close_attempt(first, Outcome::Cancelled).unwrap();
@@ -162,6 +171,7 @@ mod tests {
             dispatched_by: None,
             dispatched_by_pane: None,
             base_sha: None,
+            account: None,
         })
         .unwrap();
 
@@ -182,5 +192,80 @@ mod tests {
         let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
         assert_eq!(rows[0].state, "ready");
         assert_eq!(rows[1].state, "done");
+    }
+
+    /// Whose subscription a row is spending: the attempt's recorded account
+    /// once there is one, the route's default before that (gh#59). Same shape
+    /// as `runtime`, and for the same reason — the row should say what will
+    /// happen as well as what did.
+    #[test]
+    fn rows_report_the_account_the_attempt_ran_under() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#5", "gh#5");
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [[route]]
+            workspace = "r"
+            repo = "/tmp/r"
+            runtime = "claude-code"
+            account = "0011223344556677"
+            "#,
+        )
+        .unwrap();
+
+        // Nothing dispatched yet: the route's default is what a dispatch would
+        // spend.
+        let rows = board_rows(&db, &cfg).unwrap();
+        assert_eq!(rows[0].account.as_deref(), Some("0011223344556677"));
+
+        // Once an attempt exists, the row reports what it actually ran under —
+        // here a per-dispatch override of the route's default.
+        db.insert_attempt(&NewAttempt {
+            task_id: "gh:o/r#5".into(),
+            pane_id: None,
+            workspace: "r".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: Some("8f2c1d0a7b6e4539".into()),
+        })
+        .unwrap();
+        let rows = board_rows(&db, &cfg).unwrap();
+        assert_eq!(rows[0].account.as_deref(), Some("8f2c1d0a7b6e4539"));
+    }
+
+    /// An attempt from before the route named an account keeps saying so: the
+    /// route's default must not be back-filled onto a run that did not use it.
+    #[test]
+    fn an_accountless_attempt_is_not_relabelled_by_the_route() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#6", "gh#6");
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [[route]]
+            workspace = "r"
+            repo = "/tmp/r"
+            runtime = "claude-code"
+            account = "0011223344556677"
+            "#,
+        )
+        .unwrap();
+        db.insert_attempt(&NewAttempt {
+            task_id: "gh:o/r#6".into(),
+            pane_id: None,
+            workspace: "r".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: None,
+        })
+        .unwrap();
+        assert_eq!(board_rows(&db, &cfg).unwrap()[0].account, None);
     }
 }

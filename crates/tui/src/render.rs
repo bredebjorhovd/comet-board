@@ -652,6 +652,23 @@ fn draw_board_header(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
         },
     );
     x += wrap::width_of(title) as u16 + 2;
+    // Which device's board this is (gh#55), beside the pane's name. Silent on
+    // the ordinary case — this device found its own board — because there is
+    // nothing to say when there is only one answer.
+    if let Some(note) = app.board_host_note() {
+        let note = wrap::truncate(&note, area.width.saturating_sub(x - area.x + 2) as usize);
+        let w = wrap::width_of(&note) as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(note, theme.hint())),
+            Rect {
+                x,
+                width: w,
+                height: 1,
+                ..area
+            },
+        );
+        x += w + 2;
+    }
     if !app.board.typing
         && let Some(label) = app.board.filter.label()
     {
@@ -808,6 +825,11 @@ fn board_footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     hints.push(("/", "find", '/'));
     if app.board.filter.active() {
         hints.push(("F", "clear the filter", 'F'));
+    }
+    // Only worth a hint once there is more than one device to point at — on a
+    // single-device install `d` has nothing to cycle to.
+    if app.devices.len() > 1 {
+        hints.push(("d", "board host", 'd'));
     }
     hints.push(("B", "back", 'B'));
     hints

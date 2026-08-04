@@ -222,6 +222,10 @@ impl EngineCore {
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        // Per-run agent accounts (gh#59): a chat naming a slot has it
+        // materialized into its own config dir and stamped into the harness
+        // child's env, instead of the engine swapping the shared one.
+        sessions.set_accounts(agent_accounts.clone());
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -571,6 +575,7 @@ impl Engine {
                 core.doc_host.clone(),
                 sessions_watch.clone(),
                 core.sessions.journal(),
+                core.agent_accounts.clone(),
                 tokio::runtime::Handle::current(),
             ));
             match board::BoardService::spawn(
