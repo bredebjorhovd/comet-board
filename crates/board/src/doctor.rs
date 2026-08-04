@@ -8,7 +8,7 @@
 //! herdr needed against a mux it distrusted (manifest overrides, daemon
 //! pidfiles) have no equivalent and are gone.
 
-use crate::config::{Paths, RoutingConfig, github_token, linear_api_key};
+use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
 use crate::db::Db;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
@@ -99,24 +99,16 @@ pub fn doctor(
                     Err(e) => format!("{e:#}"),
                 },
             });
-            // The token is only optional until repos are configured: GitHub
+            // A credential is only optional until repos are configured: GitHub
             // answers 404 (not 401) for a private repo you cannot see, so
             // without this check the first symptom is a mystery 404 in the log.
             let repos = &cfg.github.repos;
-            checks.push(Check {
-                name: "GITHUB_TOKEN".into(),
-                ok: repos.is_empty() || github_token(paths).is_some(),
-                detail: match (github_token(paths).is_some(), repos.is_empty()) {
-                    (true, _) => "present".into(),
-                    (false, true) => "not needed — no repos under [github]".into(),
-                    (false, false) => format!(
-                        "missing, but {} repo(s) are configured — private repos \
-                         answer 404 without it. Add it to {}",
-                        repos.len(),
-                        paths.env_file().display()
-                    ),
-                },
-            });
+            let rest = crate::sources::github::HttpRest::from_paths(paths);
+            checks.extend(github_auth_checks(
+                paths,
+                repos,
+                rest.as_ref().map_err(|e| format!("{e:#}")),
+            ));
 
             checks.push(Check {
                 name: "github writeback".into(),
@@ -150,12 +142,13 @@ pub fn doctor(
             checks.push(review_state_check(paths, &cfg));
 
             for repo in repos {
-                let reachable = crate::sources::github::HttpRest::new(github_token(paths))
-                    .ok()
-                    .map(|r| {
-                        use crate::sources::github::Rest;
-                        r.get(&format!("/repos/{repo}"))
-                    });
+                // The same client for every repo, deliberately: under an App
+                // that shares one token cache, so a box watching six repos
+                // behind one installation mints once here rather than six times.
+                let reachable = rest.as_ref().ok().map(|r| {
+                    use crate::sources::github::Rest;
+                    r.get(&format!("/repos/{repo}"))
+                });
                 // Which issues this repo actually contributes, and which key
                 // decided that. `labels = []` means every open issue, and a
                 // repo whose backlog is its roadmap will fill the board with
@@ -189,7 +182,9 @@ pub fn doctor(
                     Some(Ok(_)) => (true, format!("reachable{filter}")),
                     Some(Err(e)) if e.to_string().contains("404") => (
                         false,
-                        "404 — either it does not exist, or the token cannot see it".to_string(),
+                        "404 — either it does not exist, or the credential cannot \
+                         see it (under an App: it is not installed here)"
+                            .to_string(),
                     ),
                     Some(Err(e)) => (false, format!("{e}")),
                     None => (false, "could not build an HTTP client".to_string()),
@@ -200,6 +195,11 @@ pub fn doctor(
                     detail,
                 });
             }
+
+            // After the repo loop on purpose: those calls are what mint the
+            // installation tokens, so this reports what the board is actually
+            // holding rather than what it would hold if it ever asked.
+            checks.extend(app_token_checks(repos, rest.as_ref().ok()));
 
             // A repo whose space exists but whose config does not is silent,
             // not broken — `ok` stays true, or a repo you are only reading
@@ -282,6 +282,184 @@ pub fn doctor(
     }
 
     Ok(checks)
+}
+
+/// Which GitHub credential is live, and what it can reach (gh#58).
+///
+/// Two facts an operator cannot get anywhere else. "GITHUB_TOKEN present" was
+/// enough while there was one way to authenticate; with an App in the picture
+/// the questions are *which* identity the board writes as and *whose* repos it
+/// was granted — and under an App the answer is set by the installer, not by
+/// anything in this config directory.
+fn github_auth_checks(
+    paths: &Paths,
+    repos: &[String],
+    rest: Result<&crate::sources::github::HttpRest, String>,
+) -> Vec<Check> {
+    let credentials = Credentials::load(paths);
+    let mut checks = Vec::new();
+
+    // Half an App is the failure with no symptom: the board falls back to the
+    // token and keeps working, writing as a person rather than as the bot.
+    if let Some(missing) = credentials.github_app_half_configured() {
+        checks.push(Check {
+            name: "github app".into(),
+            ok: false,
+            detail: format!(
+                "half configured — {missing} is not set, so the App is ignored and \
+                 the board is running on GITHUB_TOKEN. Set both in {}, or neither",
+                paths.env_file().display()
+            ),
+        });
+    }
+
+    match credentials.github_auth() {
+        GithubAuth::None => checks.push(Check {
+            name: "github auth".into(),
+            ok: repos.is_empty(),
+            detail: if repos.is_empty() {
+                "none — not needed, no repos under [github]".into()
+            } else {
+                format!(
+                    "none, but {} repo(s) are configured — private repos answer 404 \
+                     without a credential. Add GITHUB_TOKEN, or a GITHUB_APP_ID and \
+                     GITHUB_APP_PRIVATE_KEY_PATH pair, to {}",
+                    repos.len(),
+                    paths.env_file().display()
+                )
+            },
+        }),
+        GithubAuth::Token(_) => checks.push(Check {
+            name: "github auth".into(),
+            ok: true,
+            detail: "GITHUB_TOKEN — a personal access token, so writes are \
+                     attributed to whoever owns it"
+                .into(),
+        }),
+        GithubAuth::App { app_id, key_path } => {
+            checks.push(key_permissions_check(&key_path));
+            // The reason, not just the fact: the usual way to get here is a
+            // GITHUB_APP_PRIVATE_KEY_PATH pointing at something that is not the
+            // PEM, and "could not be built" alone sends nobody anywhere.
+            let (ok, detail) = match rest.map(|r| r.auth().app()) {
+                Err(e) => (false, format!("app {app_id} — {e}")),
+                Ok(None) => (
+                    false,
+                    format!("app {app_id} — configured, but the client is not on the App"),
+                ),
+                Ok(Some(app)) => match (app.app_slug(), app.installations()) {
+                    (Err(e), _) | (_, Err(e)) => (false, format!("app {app_id} — {e:#}")),
+                    (Ok(slug), Ok(installs)) if installs.is_empty() => (
+                        false,
+                        format!(
+                            "app {app_id} (@{slug}) — registered, but installed nowhere. \
+                             Install it on the repos you want polled"
+                        ),
+                    ),
+                    (Ok(slug), Ok(installs)) => (
+                        true,
+                        format!(
+                            "app {app_id} (@{slug}) — {}",
+                            installs
+                                .iter()
+                                .map(|i| format!(
+                                    "{} (installation {}, {} repos)",
+                                    i.account, i.id, i.selection
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ),
+                },
+            };
+            checks.push(Check {
+                name: "github auth".into(),
+                ok,
+                detail,
+            });
+        }
+    }
+    checks
+}
+
+/// The private key is the App. A PEM anyone else on the box can read is a
+/// credential anyone else on the box has — which matters more since #55 let
+/// several people drive it.
+fn key_permissions_check(key_path: &std::path::Path) -> Check {
+    let name = "github app key".into();
+    let Ok(meta) = std::fs::metadata(key_path) else {
+        return Check {
+            name,
+            ok: false,
+            detail: format!("{} cannot be read", key_path.display()),
+        };
+    };
+    // Windows has no mode bits to read; there the check is only that the file
+    // is there, which the metadata call above already answered.
+    #[cfg(not(unix))]
+    let (ok, detail) = {
+        let _ = &meta;
+        (true, key_path.display().to_string())
+    };
+    #[cfg(unix)]
+    let (ok, detail) = {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        let private = mode & 0o077 == 0;
+        (
+            private,
+            if private {
+                format!("{} ({mode:04o})", key_path.display())
+            } else {
+                format!(
+                    "{} is {mode:04o} — readable beyond its owner. `chmod 600` it",
+                    key_path.display()
+                )
+            },
+        )
+    };
+    Check { name, ok, detail }
+}
+
+/// What the App is actually holding for each configured repo: the installation
+/// serving it, and how long its token has left.
+///
+/// Empty under a personal access token, which has no installation and no
+/// expiry to report.
+fn app_token_checks(
+    repos: &[String],
+    rest: Option<&crate::sources::github::HttpRest>,
+) -> Vec<Check> {
+    let Some(app) = rest.and_then(|r| r.auth().app()) else {
+        return Vec::new();
+    };
+    repos
+        .iter()
+        .map(
+            |repo| match (app.cached_installation(repo), app.cached_ttl(repo)) {
+                (Some(id), Some(ttl)) => Check {
+                    name: format!("github {repo} token"),
+                    ok: ttl > 0,
+                    detail: format!("installation {id} · expires in {}", minutes(ttl)),
+                },
+                // Reached the repo but never needed a token, or never reached it at
+                // all — the per-repo check above already said which.
+                _ => Check {
+                    name: format!("github {repo} token"),
+                    ok: false,
+                    detail: "no installation token — the App is not installed on this repo".into(),
+                },
+            },
+        )
+        .collect()
+}
+
+fn minutes(secs: i64) -> String {
+    match secs {
+        s if s <= 0 => "already expired".into(),
+        s if s < 120 => format!("{s}s"),
+        s => format!("{}m", s / 60),
+    }
 }
 
 /// Does a route's `account` name a login this device has saved, for the
@@ -492,6 +670,8 @@ pub fn print_doctor(checks: &[Check]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::github::HttpRest;
+    use crate::sources::github_app::{TokenProvider, test_app};
 
     fn tmp() -> (tempfile::TempDir, Paths) {
         let dir = tempfile::tempdir().unwrap();
@@ -787,5 +967,146 @@ mod tests {
         let c = review_state_check(&p, &cfg);
         assert!(c.ok);
         assert!(c.detail.contains("review_state"), "{}", c.detail);
+    }
+
+    // ── github auth (gh#58) ─────────────────────────────────────────────────
+
+    /// A `.env` naming an App, plus the PEM file it points at (contents
+    /// irrelevant — the App itself is built from the fake below).
+    fn app_env(p: &Paths, mode: u32) -> std::path::PathBuf {
+        let pem = p.config_dir.join("app.pem");
+        std::fs::write(&pem, "not really a key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::fs::write(
+            p.env_file(),
+            format!(
+                "GITHUB_APP_ID=123456\nGITHUB_APP_PRIVATE_KEY_PATH={}\n",
+                pem.display()
+            ),
+        )
+        .unwrap();
+        pem
+    }
+
+    /// A REST client whose credential is a fake App. The checks read the
+    /// provider and never the wire, so the transport is one that refuses to be
+    /// called.
+    fn rest_on(app: std::rc::Rc<crate::sources::github_app::AppAuth>) -> HttpRest {
+        HttpRest::over(Box::new(NoWire), TokenProvider::App(app))
+    }
+
+    #[test]
+    fn doctor_names_the_app_its_slug_and_who_installed_it() {
+        // "GITHUB_TOKEN present" answered the only question there used to be.
+        // With an App the questions are which identity the board writes as and
+        // whose repos it was granted — and the second is set by the installer,
+        // not by anything in this config directory.
+        let (_d, p) = tmp();
+        app_env(&p, 0o600);
+        let rest = rest_on(test_app(&[("o/r", 42)]).0);
+        let checks = github_auth_checks(&p, &["o/r".to_string()], Ok(&rest));
+        let auth = checks.iter().find(|c| c.name == "github auth").unwrap();
+        assert!(auth.detail.contains("app 123456"), "{}", auth.detail);
+        // Slug and installations come off the App endpoints under the JWT.
+        assert!(auth.detail.contains('@'), "{}", auth.detail);
+    }
+
+    #[test]
+    fn a_world_readable_private_key_fails_its_own_check() {
+        // The private key *is* the App. Since #55 the box can have several
+        // people on it, and a 0644 PEM is a credential all of them hold.
+        let (_d, p) = tmp();
+        app_env(&p, 0o644);
+        let rest = rest_on(test_app(&[]).0);
+        let checks = github_auth_checks(&p, &[], Ok(&rest));
+        let key = checks.iter().find(|c| c.name == "github app key").unwrap();
+        assert!(!key.ok, "{}", key.detail);
+        assert!(key.detail.contains("chmod 600"), "{}", key.detail);
+    }
+
+    #[test]
+    fn half_an_app_is_reported_rather_than_silently_ignored() {
+        let (_d, p) = tmp();
+        std::fs::write(p.env_file(), "GITHUB_TOKEN=ghp_x\nGITHUB_APP_ID=123456\n").unwrap();
+        let checks = github_auth_checks(&p, &["o/r".to_string()], Err("no client".into()));
+        let half = checks.iter().find(|c| c.name == "github app").unwrap();
+        assert!(!half.ok, "{}", half.detail);
+        assert!(
+            half.detail.contains("GITHUB_APP_PRIVATE_KEY_PATH"),
+            "{}",
+            half.detail
+        );
+        // And the board is still running, on the token — said out loud.
+        let auth = checks.iter().find(|c| c.name == "github auth").unwrap();
+        assert!(auth.ok, "{}", auth.detail);
+        assert!(auth.detail.contains("GITHUB_TOKEN"), "{}", auth.detail);
+    }
+
+    #[test]
+    fn a_missing_credential_only_fails_once_repos_are_configured() {
+        let (_d, p) = tmp();
+        std::fs::write(p.env_file(), "").unwrap();
+        let none = github_auth_checks(&p, &[], Err("no client".into()));
+        assert!(none.iter().find(|c| c.name == "github auth").unwrap().ok);
+
+        let some = github_auth_checks(&p, &["o/r".to_string()], Err("no client".into()));
+        let auth = some.iter().find(|c| c.name == "github auth").unwrap();
+        assert!(!auth.ok, "{}", auth.detail);
+        assert!(auth.detail.contains("GITHUB_APP_ID"), "{}", auth.detail);
+    }
+
+    #[test]
+    fn the_token_report_names_the_installation_and_how_long_it_has_left() {
+        let (app, _api, _clock) = test_app(&[("o/a", 42), ("o/b", 42)]);
+        // Two repos, one installation: what the board would hold after a cycle.
+        app.token_for_repo("o/a").unwrap();
+        app.token_for_repo("o/b").unwrap();
+        let rest = rest_on(app);
+        let checks = app_token_checks(&["o/a".into(), "o/b".into()], Some(&rest));
+        assert_eq!(checks.len(), 2);
+        for c in &checks {
+            assert!(c.ok, "{}", c.detail);
+            assert!(c.detail.contains("installation 42"), "{}", c.detail);
+            assert!(c.detail.contains("expires in 60m"), "{}", c.detail);
+        }
+    }
+
+    #[test]
+    fn a_repo_the_app_never_reached_is_reported_as_having_no_token() {
+        let (app, _, _) = test_app(&[("o/a", 42)]);
+        let rest = rest_on(app);
+        let checks = app_token_checks(&["o/unreachable".into()], Some(&rest));
+        assert!(!checks[0].ok, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("not installed"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn a_personal_access_token_has_no_token_checks_to_report() {
+        let rest = HttpRest::new(Some("ghp_x".into())).unwrap();
+        assert!(app_token_checks(&["o/r".into()], Some(&rest)).is_empty());
+    }
+
+    /// These checks read the provider, never the wire. Answering at all would
+    /// only hide a call that should not be happening.
+    struct NoWire;
+
+    impl crate::sources::github::Transport for NoWire {
+        fn send(
+            &self,
+            _: reqwest::Method,
+            path: &str,
+            _: Option<&serde_json::Value>,
+            _: Option<&str>,
+        ) -> Result<crate::sources::github::Reply> {
+            panic!("the auth checks must not make a REST call ({path})")
+        }
     }
 }

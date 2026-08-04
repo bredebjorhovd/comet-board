@@ -7,7 +7,7 @@
 //! not projects to route to.
 
 use crate::adopt::{SpaceRepo, github_slug};
-use crate::config::{Paths, github_token, linear_api_key, shorten_home};
+use crate::config::{GithubAuth, Paths, github_auth, linear_api_key, shorten_home};
 use anyhow::Result;
 use comet_proto::Space;
 use std::path::Path;
@@ -138,8 +138,12 @@ where
     if linear_api_key(paths).is_none() {
         missing.push("LINEAR_API_KEY");
     }
-    if !repos.is_empty() && github_token(paths).is_none() {
-        missing.push("GITHUB_TOKEN");
+    // Either credential answers for GitHub (gh#58) — the App is the one that
+    // survives somebody else installing the board on their own repos, and the
+    // token is the one that needs nothing registering. Naming both here is the
+    // only place most people will meet the choice.
+    if !repos.is_empty() && matches!(github_auth(paths), GithubAuth::None) {
+        missing.push("GITHUB_TOKEN (or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY_PATH)");
     }
     if missing.is_empty() {
         println!("\nnext: comet-board doctor");
@@ -187,8 +191,13 @@ branch_template = "board/{{identifier_lower}}"
 # means review. `doctor` checks whatever you write here resolves.
 # review_state = "In Review"
 
-# Repos polled for issues and pull requests. Needs GITHUB_TOKEN in .env for
-# private repos. Remove the label filter to see every open issue.
+# Repos polled for issues and pull requests. Private repos need a credential in
+# .env — either GITHUB_TOKEN (a personal access token: simplest, and writes are
+# attributed to you), or a GitHub App: GITHUB_APP_ID plus
+# GITHUB_APP_PRIVATE_KEY_PATH pointing at the PEM, chmod 600. The App is what
+# lets somebody else install the board on their own repos without handing over a
+# credential, and its writes land as `[bot]`. `comet-board doctor` says which
+# one is live. Remove the label filter to see every open issue.
 [github]
 repos = [{repo_list}]
 labels = []

@@ -167,6 +167,17 @@ enum Command {
         #[arg(long, requires = "slug")]
         ignore: bool,
     },
+    /// git's askpass helper: print the credential for pushing to the repo named
+    /// by COMET_BOARD_ASKPASS_REPO (gh#58).
+    ///
+    /// Not for people. `git` runs this itself when `GIT_ASKPASS` points at it,
+    /// which is how an App's installation token reaches a push without being
+    /// written into `.git/config`, argv, or the environment.
+    #[command(hide = true)]
+    GitAskpass {
+        /// The prompt git is asking — "Username for …" or "Password for …".
+        prompt: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -194,6 +205,20 @@ fn main() -> Result<()> {
         .build()?;
 
     match cli.command {
+        // Answered before anything else touches the engine: git runs this
+        // synchronously in the middle of a push, and it has no business dialling
+        // an IPC port to print one line.
+        Command::GitAskpass { prompt } => {
+            let repo = std::env::var(comet_board::git_credentials::ASKPASS_REPO_ENV).ok();
+            let secret = comet_board::git_credentials::askpass(
+                &paths,
+                prompt.as_deref().unwrap_or_default(),
+                repo.as_deref(),
+            )?;
+            // Straight to stdout, which is the pipe git is holding. Nowhere else.
+            println!("{secret}");
+            Ok(())
+        }
         Command::List {
             state,
             source,
@@ -465,13 +490,11 @@ fn main() -> Result<()> {
             };
 
             // What this is about to pull, before it pulls it. Best-effort: no
-            // token or no network degrades to adopting without the numbers.
-            let preview = comet_board::sources::github::HttpRest::new(
-                comet_board::config::github_token(&paths),
-            )
-            .ok()
-            .map(comet_board::sources::github::Github::new)
-            .and_then(|gh| adopt::preview(&gh, &u.slug).ok());
+            // credential or no network degrades to adopting without the numbers.
+            let preview = comet_board::sources::github::HttpRest::from_paths(&paths)
+                .ok()
+                .map(comet_board::sources::github::Github::new)
+                .and_then(|gh| adopt::preview(&gh, &u.slug).ok());
             if let Some(p) = &preview {
                 println!("{}: {}", u.slug, p.count_phrase());
                 for (label, n) in p.labels.iter().take(8) {

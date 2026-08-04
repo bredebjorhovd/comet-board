@@ -513,10 +513,14 @@ pub fn new_task(
     if source == "github" {
         let here = git_remote(".").as_deref().and_then(github_slug);
         let repo = github_repo(&cfg.github.repos, spec.repo, here)?;
-        let token = config::github_token(paths)
-            .ok_or_else(|| anyhow!("no GITHUB_TOKEN; see `comet-board doctor`"))?;
+        if matches!(config::github_auth(paths), config::GithubAuth::None) {
+            bail!(
+                "no GitHub credential — set GITHUB_TOKEN, or GITHUB_APP_ID and \
+                 GITHUB_APP_PRIVATE_KEY_PATH; see `comet-board doctor`"
+            );
+        }
         let gh = comet_board::sources::github::Github::new(
-            comet_board::sources::github::HttpRest::new(Some(token))?,
+            comet_board::sources::github::HttpRest::from_paths(paths)?,
         );
         let (number, url) = gh.create_issue(&repo, spec.title, spec.body, spec.labels)?;
         return Ok((format!("{repo}#{number}"), url));
