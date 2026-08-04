@@ -2,12 +2,36 @@
 //! record; GitHub contributes issues and, more importantly, the pull requests
 //! that flip a task to `review`.
 
+use crate::config::{Credentials, Paths};
 use crate::db::UpsertTask;
 use crate::model::{Source, UpstreamState};
+use crate::sources::github_app::{HttpAppApi, TokenProvider};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
 pub const API: &str = "https://api.github.com";
+
+/// The HTTP client every GitHub call shares — the board's REST calls and the
+/// App's minting calls alike. `reqwest::blocking::Client` is a handle over a
+/// pooled inner, so cloning it hands out the same connections rather than a
+/// second pool.
+pub fn client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("herdr-board/0.1")
+        .build()?)
+}
+
+/// The credential `.env` configures, built and ready to stamp requests.
+///
+/// One function rather than one per caller, because an App carries a *cache*:
+/// the REST client and the git credential path have to share one provider or
+/// they mint two tokens for one installation and each keeps half the picture.
+pub fn provider(credentials: &Credentials) -> Result<TokenProvider> {
+    TokenProvider::from_auth(credentials.github_auth(), || {
+        Ok(Box::new(HttpAppApi::new(client()?, API)))
+    })
+}
 
 /// GitHub's maximum page size. `issues` walks pages until one comes back short;
 /// `open_issues` deliberately reads only the first, because it exists to preview
@@ -33,51 +57,148 @@ pub trait Rest {
     fn put(&self, path: &str, body: &Value) -> Result<Value>;
 }
 
-pub struct HttpRest {
+/// One authorized round trip, already carrying whichever bearer the caller
+/// resolved.
+///
+/// A seam under [`HttpRest`], separate from [`Rest`]: `Rest` is the *endpoint*
+/// surface tests fake, this is the *wire*. Splitting them is what makes the 401
+/// → re-mint → retry-once rule testable, because that rule lives between the
+/// two and needs a 401 that no fixture-level fake can produce.
+pub trait Transport {
+    fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+        bearer: Option<&str>,
+    ) -> Result<Reply>;
+}
+
+/// A status and a body — everything the retry rule reads.
+pub struct Reply {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// The [`Transport`] against real GitHub.
+pub struct HttpTransport {
     client: reqwest::blocking::Client,
-    token: Option<String>,
     base: String,
 }
 
-impl HttpRest {
-    pub fn new(token: Option<String>) -> Result<HttpRest> {
-        Ok(HttpRest {
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
-                .user_agent("herdr-board/0.1")
-                .build()?,
-            token,
-            base: API.to_string(),
-        })
-    }
-}
-
-impl HttpRest {
-    fn request(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
+impl Transport for HttpTransport {
+    fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+        bearer: Option<&str>,
+    ) -> Result<Reply> {
         let mut req = self
             .client
             .request(method, format!("{}{}", self.base, path))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(t) = &self.token {
+        if let Some(t) = bearer {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
         if let Some(b) = body {
             req = req.json(b);
         }
         let resp = req.send()?;
-        let status = resp.status();
-        if status.as_u16() == 403 || status.as_u16() == 429 {
-            bail!("github rate limited ({status})");
+        let status = resp.status().as_u16();
+        Ok(Reply {
+            status,
+            // A 204 has no body; treat that as success rather than a parse error.
+            body: resp.json().unwrap_or(Value::Null),
+        })
+    }
+}
+
+pub struct HttpRest {
+    transport: Box<dyn Transport>,
+    /// What stamps `Authorization`: a personal access token, a GitHub App
+    /// minting per-installation tokens, or nothing at all (gh#58).
+    auth: TokenProvider,
+}
+
+impl HttpRest {
+    /// A personal access token, or none — the constructor that existed before
+    /// gh#58, kept so every call site that only has a token keeps working.
+    pub fn new(token: Option<String>) -> Result<HttpRest> {
+        Self::with_auth(match token {
+            Some(t) => TokenProvider::Static(t),
+            None => TokenProvider::Anonymous,
+        })
+    }
+
+    /// Whichever credential `.env` configures: the App when one is set up, the
+    /// personal access token otherwise. Nobody self-hosting on a PAT is forced
+    /// onto an App.
+    pub fn from_credentials(credentials: &Credentials) -> Result<HttpRest> {
+        Self::with_auth(provider(credentials)?)
+    }
+
+    /// As [`HttpRest::from_credentials`], reading `.env` itself — the shape the
+    /// one-shot CLI paths want.
+    pub fn from_paths(paths: &Paths) -> Result<HttpRest> {
+        Self::from_credentials(&Credentials::load(paths))
+    }
+
+    pub fn with_auth(auth: TokenProvider) -> Result<HttpRest> {
+        Ok(HttpRest {
+            transport: Box::new(HttpTransport {
+                client: client()?,
+                base: API.to_string(),
+            }),
+            auth,
+        })
+    }
+
+    /// Over an arbitrary transport. The seam the retry tests sit on.
+    pub fn over(transport: Box<dyn Transport>, auth: TokenProvider) -> HttpRest {
+        HttpRest { transport, auth }
+    }
+
+    /// The credential in force, for `doctor` and the git credential path.
+    pub fn auth(&self) -> &TokenProvider {
+        &self.auth
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        // A 401 against an App is usually a token that went stale under us — an
+        // installation token lives an hour and the world can change inside it.
+        // So: drop what we cached, mint once more, and try again. Exactly once.
+        // A genuinely revoked installation answers 401 to the fresh token too,
+        // and a board that kept re-minting through that would spin against
+        // GitHub forever rather than fail and be fixed. A personal access token
+        // never takes this path at all — `invalidate` has nothing to drop, so
+        // its 401 is final, as it always was.
+        let mut re_minted = false;
+        loop {
+            let bearer = self.auth.bearer(path)?;
+            let reply = self
+                .transport
+                .send(method.clone(), path, body, bearer.as_deref())?;
+            if reply.status == 401 && !re_minted && self.auth.invalidate(path) {
+                re_minted = true;
+                continue;
+            }
+            return Self::interpret(reply, path, &self.auth);
         }
-        if status.as_u16() == 401 {
-            bail!("github rejected the token (401) — check GITHUB_TOKEN scopes");
+    }
+
+    fn interpret(reply: Reply, path: &str, auth: &TokenProvider) -> Result<Value> {
+        if reply.status == 403 || reply.status == 429 {
+            bail!("github rate limited ({})", reply.status);
         }
-        if !status.is_success() {
-            bail!("github HTTP {status} for {path}");
+        if reply.status == 401 {
+            bail!("github rejected the credential (401) — {}", auth.hint());
         }
-        // A 204 has no body; treat that as success rather than a parse error.
-        Ok(resp.json().unwrap_or(Value::Null))
+        if !(200..300).contains(&reply.status) {
+            bail!("github HTTP {} for {path}", reply.status);
+        }
+        Ok(reply.body)
     }
 }
 
@@ -653,6 +774,147 @@ impl Rest for FixtureRest {
             .borrow_mut()
             .push(("PUT".into(), path.into(), body.clone()));
         Ok(serde_json::json!({ "merged": true }))
+    }
+}
+
+/// Records every round trip and answers from a canned script of statuses. The
+/// seam the re-mint rule is tested on: a fixture-level fake cannot produce a
+/// 401, because a 401 is a fact about the wire and not about an endpoint.
+#[cfg(test)]
+struct ScriptedTransport {
+    /// One status per call, in order; the last repeats once exhausted.
+    statuses: Vec<u16>,
+    /// `(path, bearer)` for every call made.
+    seen: std::cell::RefCell<Vec<(String, Option<String>)>>,
+}
+
+#[cfg(test)]
+impl ScriptedTransport {
+    fn new(statuses: &[u16]) -> ScriptedTransport {
+        ScriptedTransport {
+            statuses: statuses.to_vec(),
+            seen: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Transport for std::rc::Rc<ScriptedTransport> {
+    fn send(
+        &self,
+        _method: reqwest::Method,
+        path: &str,
+        _body: Option<&Value>,
+        bearer: Option<&str>,
+    ) -> Result<Reply> {
+        let n = self.seen.borrow().len();
+        self.seen
+            .borrow_mut()
+            .push((path.to_string(), bearer.map(str::to_string)));
+        let status = *self
+            .statuses
+            .get(n)
+            .or_else(|| self.statuses.last())
+            .unwrap_or(&200);
+        Ok(Reply {
+            status,
+            body: serde_json::json!([]),
+        })
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::sources::github_app::test_app;
+    use std::rc::Rc;
+
+    fn scripted(statuses: &[u16], auth: TokenProvider) -> (HttpRest, Rc<ScriptedTransport>) {
+        let t = Rc::new(ScriptedTransport::new(statuses));
+        (HttpRest::over(Box::new(t.clone()), auth), t)
+    }
+
+    #[test]
+    fn a_401_under_an_app_re_mints_once_and_retries() {
+        // An installation token lives an hour; the world can change inside one.
+        // A stale token is worth exactly one re-mint before believing GitHub.
+        let (app, api, _) = test_app(&[("o/r", 42)]);
+        let (rest, wire) = scripted(&[401, 200], TokenProvider::App(app));
+        rest.get("/repos/o/r/issues").unwrap();
+
+        let seen = wire.seen.borrow();
+        assert_eq!(seen.len(), 2, "one retry, not none");
+        assert_eq!(seen[0].1.as_deref(), Some("ghs_token_1"));
+        assert_eq!(
+            seen[1].1.as_deref(),
+            Some("ghs_token_2"),
+            "the retry must carry a freshly minted token, not the refused one"
+        );
+        assert_eq!(api.mints(), 2);
+    }
+
+    #[test]
+    fn a_revoked_installation_gives_up_after_one_re_mint_rather_than_spinning() {
+        // The failure mode this guards: an uninstalled App answering 401 to
+        // every token it can mint, and a board minting forever against it.
+        let (app, api, _) = test_app(&[("o/r", 42)]);
+        let (rest, wire) = scripted(&[401, 401, 401], TokenProvider::App(app));
+        let err = rest.get("/repos/o/r/issues").unwrap_err().to_string();
+
+        assert_eq!(wire.seen.borrow().len(), 2, "exactly one retry");
+        assert_eq!(api.mints(), 2, "exactly one re-mint");
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("installation may have been removed"), "{err}");
+    }
+
+    #[test]
+    fn a_personal_access_token_does_not_retry_a_401() {
+        // Byte-for-byte the old behaviour: a PAT's 401 means the token is wrong,
+        // not stale, and retrying it is a wasted call and a wasted rate limit.
+        let (rest, wire) = scripted(&[401, 200], TokenProvider::Static("ghp_x".into()));
+        let err = rest.get("/repos/o/r/issues").unwrap_err().to_string();
+        assert_eq!(wire.seen.borrow().len(), 1);
+        assert!(err.contains("check GITHUB_TOKEN scopes"), "{err}");
+    }
+
+    #[test]
+    fn a_personal_access_token_stamps_the_same_bearer_on_every_path() {
+        let (rest, wire) = scripted(&[200], TokenProvider::Static("ghp_x".into()));
+        rest.get("/repos/o/r/issues").unwrap();
+        rest.get("/repos/other/repo/pulls").unwrap();
+        let seen = wire.seen.borrow();
+        assert!(seen.iter().all(|(_, b)| b.as_deref() == Some("ghp_x")));
+    }
+
+    #[test]
+    fn several_repos_behind_one_installation_share_one_minted_token() {
+        // The rate-limit consequence of keying the cache on the installation:
+        // the board polls six repos a cycle, and this is why that is one mint.
+        let (app, api, _) = test_app(&[("o/a", 7), ("o/b", 7), ("o/c", 7)]);
+        let (rest, wire) = scripted(&[200], TokenProvider::App(app));
+        for repo in ["o/a", "o/b", "o/c"] {
+            rest.get(&format!("/repos/{repo}/issues")).unwrap();
+        }
+        assert_eq!(api.mints(), 1);
+        let seen = wire.seen.borrow();
+        assert!(
+            seen.iter()
+                .all(|(_, b)| b.as_deref() == Some("ghs_token_1"))
+        );
+    }
+
+    #[test]
+    fn an_anonymous_client_sends_no_authorization_header_at_all() {
+        let (rest, wire) = scripted(&[200], TokenProvider::Anonymous);
+        rest.get("/repos/o/r/issues").unwrap();
+        assert_eq!(wire.seen.borrow()[0].1, None);
+    }
+
+    #[test]
+    fn rate_limiting_still_reads_as_rate_limiting_rather_than_as_auth() {
+        let (rest, _) = scripted(&[403], TokenProvider::Static("ghp_x".into()));
+        let err = rest.get("/repos/o/r/issues").unwrap_err().to_string();
+        assert!(err.contains("rate limited"), "{err}");
     }
 }
 

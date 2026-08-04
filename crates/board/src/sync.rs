@@ -149,7 +149,7 @@ impl SyncEngine {
         let github = if cfg.github.repos.is_empty() {
             None
         } else {
-            HttpRest::new(credentials.github_token.clone())
+            HttpRest::from_credentials(&credentials)
                 .ok()
                 .map(|r| Github::new(Box::new(r) as Box<dyn Rest>))
         };
@@ -174,7 +174,11 @@ impl SyncEngine {
         let cfg = RoutingConfig::load_or_default(&self.paths.routing());
 
         let linear_changed = credentials.linear_api_key != self.credentials.linear_api_key;
-        let github_changed = credentials.github_token != self.credentials.github_token;
+        // The whole GitHub credential, not just the token: registering an App
+        // over a running board is exactly the change this exists to notice, and
+        // comparing only `github_token` would leave it polling as the old
+        // identity until somebody restarted the engine (gh#58).
+        let github_changed = credentials.github_auth() != self.credentials.github_auth();
         let repos_changed = cfg.github.repos != self.cfg.github.repos;
         let routes_changed = cfg.routes.len() != self.cfg.routes.len();
         if !(linear_changed || github_changed || repos_changed || routes_changed) {

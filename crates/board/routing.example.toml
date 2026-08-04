@@ -98,7 +98,22 @@ branch_template = "board/{identifier_lower}"
 # review_state = "In Review"
 
 # GitHub is entirely optional. With no repos listed it is never polled, the
-# header omits it, and GITHUB_TOKEN is not needed at all.
+# header omits it, and no GitHub credential is needed at all.
+#
+# With repos listed, the credential goes in `.env`, and there are two:
+#
+#   GITHUB_TOKEN=ghp_…                       a personal access token
+#
+#   GITHUB_APP_ID=123456                     a GitHub App
+#   GITHUB_APP_PRIVATE_KEY_PATH=/…/app.pem   (chmod 600)
+#
+# The token is simplest and stays supported — it belongs to an account and
+# carries that account's whole reach, which is fine for a board watching your
+# own repos. An App is installed by whoever owns the repos, on the repos they
+# pick, with no credential ever handed over; rate limits are per installation,
+# offboarding is an uninstall, and its comments land as `[bot]` rather than as a
+# person. The App wins when both are set. `comet-board doctor` reports which one
+# is live, which repos it reaches, and when its token expires.
 [github]
 repos = []
 # The fallback filter, not the law — an empty list means every open issue.
@@ -110,7 +125,8 @@ labels = ["herd"]
 # nobody dispatched. A PR from a board dispatch attaches to its task instead.
 pull_requests = true
 # Leave the same trail on GitHub that Linear gets: a comment on dispatch and on
-# outcome, and close the issue on done. Needs a token with `repo` scope.
+# outcome, and close the issue on done. Needs a token with `repo` scope, or an
+# App with Issues: read & write.
 # Off by default: the board should not start writing to your issues just
 # because you pointed it at a repo.
 #

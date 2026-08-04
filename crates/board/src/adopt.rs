@@ -429,7 +429,7 @@ pub fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-const NEW_GITHUB_TABLE: &str = "\n# Repos polled for issues and pull requests. Needs GITHUB_TOKEN in .env for\n# private ones.\n[github]\n";
+const NEW_GITHUB_TABLE: &str = "\n# Repos polled for issues and pull requests. Private ones need a credential in\n# .env: GITHUB_TOKEN, or a GitHub App (GITHUB_APP_ID +\n# GITHUB_APP_PRIVATE_KEY_PATH). `comet-board doctor` says which is live.\n[github]\n";
 
 const NEW_ADOPT_TABLE: &str = "\n# Repos with a comet space that the board should stop offering to adopt —\n# ones you are only reading rather than working in. Written by\n# `comet-board adopt --ignore`; delete a line to be offered it again.\n[adopt]\n";
 

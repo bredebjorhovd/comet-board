@@ -84,6 +84,26 @@ impl Paths {
 pub struct Credentials {
     pub(crate) linear_api_key: Option<String>,
     pub(crate) github_token: Option<String>,
+    /// The GitHub App's numeric id, and the PEM of its private key on disk
+    /// (gh#58). Both or neither: one alone is a half-configured App, which
+    /// leaves the board silently on whatever `GITHUB_TOKEN` says.
+    pub(crate) github_app_id: Option<String>,
+    pub(crate) github_app_key_path: Option<String>,
+}
+
+/// Which GitHub credential is in force.
+///
+/// The App wins when it is configured, and `GITHUB_TOKEN` keeps working when it
+/// is not — a single-owner self-host should not be pushed onto registering an
+/// App, and every board already running has to survive this change untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubAuth {
+    /// Nothing configured. Public repos, anonymously.
+    None,
+    /// A personal access token.
+    Token(String),
+    /// A GitHub App, minting one token per installation.
+    App { app_id: String, key_path: PathBuf },
 }
 
 impl Credentials {
@@ -98,6 +118,33 @@ impl Credentials {
         Credentials {
             linear_api_key: credential(paths, "LINEAR_API_KEY", &inherited),
             github_token: credential(paths, "GITHUB_TOKEN", &inherited),
+            github_app_id: credential(paths, "GITHUB_APP_ID", &inherited),
+            github_app_key_path: credential(paths, "GITHUB_APP_PRIVATE_KEY_PATH", &inherited),
+        }
+    }
+
+    /// The GitHub credential to authenticate with, App first.
+    pub fn github_auth(&self) -> GithubAuth {
+        match (&self.github_app_id, &self.github_app_key_path) {
+            (Some(app_id), Some(key_path)) => GithubAuth::App {
+                app_id: app_id.clone(),
+                key_path: PathBuf::from(key_path),
+            },
+            _ => match &self.github_token {
+                Some(t) => GithubAuth::Token(t.clone()),
+                None => GithubAuth::None,
+            },
+        }
+    }
+
+    /// Set one App key and not the other and the board quietly stays on the
+    /// personal access token — no error, no log line, just writes attributed to
+    /// a person instead of a `[bot]`. Named here so `doctor` can say it out loud.
+    pub fn github_app_half_configured(&self) -> Option<&'static str> {
+        match (&self.github_app_id, &self.github_app_key_path) {
+            (Some(_), None) => Some("GITHUB_APP_PRIVATE_KEY_PATH"),
+            (None, Some(_)) => Some("GITHUB_APP_ID"),
+            _ => None,
         }
     }
 }
@@ -126,6 +173,11 @@ pub fn linear_api_key(paths: &Paths) -> Option<String> {
 
 pub fn github_token(paths: &Paths) -> Option<String> {
     Credentials::load(paths).github_token
+}
+
+/// The GitHub credential mode in force, read off `.env`.
+pub fn github_auth(paths: &Paths) -> GithubAuth {
+    Credentials::load(paths).github_auth()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1235,5 +1287,70 @@ labels = ["release-a"]
         assert_eq!(credentials.github_token, None);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn creds(env: &str) -> Credentials {
+        let dir = std::env::temp_dir().join(format!(
+            "hb-gh-auth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+        };
+        std::fs::write(paths.env_file(), env).unwrap();
+        let c = Credentials::load_with(&paths, |_| Err(std::env::VarError::NotPresent));
+        let _ = std::fs::remove_dir_all(dir);
+        c
+    }
+
+    #[test]
+    fn a_configured_app_wins_over_a_personal_access_token() {
+        // Both present is the migration state: the App is registered and the
+        // old token is still in the file. The App is the newer intent.
+        let c = creds(
+            "GITHUB_TOKEN=ghp_old\nGITHUB_APP_ID=123456\n\
+             GITHUB_APP_PRIVATE_KEY_PATH=/etc/comet/app.pem\n",
+        );
+        assert_eq!(
+            c.github_auth(),
+            GithubAuth::App {
+                app_id: "123456".into(),
+                key_path: PathBuf::from("/etc/comet/app.pem"),
+            }
+        );
+        assert_eq!(c.github_app_half_configured(), None);
+    }
+
+    #[test]
+    fn a_personal_access_token_keeps_working_with_no_app_configured() {
+        // The regression guard for every board already deployed: nobody is
+        // pushed onto registering an App by this change.
+        assert_eq!(
+            creds("GITHUB_TOKEN=ghp_only\n").github_auth(),
+            GithubAuth::Token("ghp_only".into())
+        );
+        assert_eq!(creds("").github_auth(), GithubAuth::None);
+    }
+
+    #[test]
+    fn half_an_app_falls_back_to_the_token_and_is_named_as_a_mistake() {
+        // The quiet failure: the board keeps working, on the wrong identity,
+        // with no error anywhere. `doctor` reads this to say so.
+        let c = creds("GITHUB_TOKEN=ghp_old\nGITHUB_APP_ID=123456\n");
+        assert_eq!(c.github_auth(), GithubAuth::Token("ghp_old".into()));
+        assert_eq!(
+            c.github_app_half_configured(),
+            Some("GITHUB_APP_PRIVATE_KEY_PATH")
+        );
+
+        let c = creds("GITHUB_APP_PRIVATE_KEY_PATH=/etc/comet/app.pem\n");
+        assert_eq!(c.github_auth(), GithubAuth::None);
+        assert_eq!(c.github_app_half_configured(), Some("GITHUB_APP_ID"));
     }
 }

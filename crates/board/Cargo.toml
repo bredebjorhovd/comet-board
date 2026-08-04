@@ -16,6 +16,16 @@ rusqlite = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 toml = "1.1"
 dotenvy = "0.15"
+# The first crypto dependency in this crate (gh#58): a GitHub App authenticates
+# by signing an RS256 JWT with its private key, and nothing else here needs to
+# sign anything. Pinned to 9.x deliberately — that line signs through `ring`,
+# which rustls already builds into this workspace, so the only genuinely new
+# code is the PEM/ASN.1 parsing. jsonwebtoken 10+ dropped the ring backend for
+# `aws-lc-rs` (a cmake/NASM build dependency in the release pipeline) or
+# `rust_crypto` (pulls the `rsa` crate, which carries RUSTSEC-2023-0071).
+jsonwebtoken = { version = "9.3", default-features = false, features = [
+    "use_pem",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
