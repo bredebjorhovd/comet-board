@@ -31,7 +31,7 @@ use crate::board::Board;
 use crate::composer::Composer;
 use crate::daemon::Attachment;
 use crate::keys::{Action, Edit, Focus};
-use crate::link::{Command, Update};
+use crate::link::{BoardHost, Command, Update};
 use crate::transcript::Transcript;
 
 /// RPC work an action produced. Returned rather than performed so the reducer
@@ -393,6 +393,16 @@ pub struct App {
     /// pane is the board at all.
     pub board: Board,
     pub board_open: bool,
+    /// Which device's board is on screen (gh#55): `None` = this device. Owned
+    /// by the supervisor — the board RPCs are relay-forwardable, so a laptop
+    /// hosting no board still reads and drives the box's.
+    pub board_host: Option<String>,
+    /// That device has actually delivered rows. Until it does, the header says
+    /// who it is asking rather than claiming an answer.
+    pub board_host_live: bool,
+    /// What the operator chose with `d`; the supervisor sweeps when this is
+    /// [`BoardHost::Auto`].
+    pub board_pin: BoardHost,
     /// The one floating panel, if any.
     pub overlay: Option<Overlay>,
     pub notice: Option<Notice>,
@@ -462,6 +472,9 @@ impl App {
             help_scroll: 0,
             board: Board::new(),
             board_open: false,
+            board_host: None,
+            board_host_live: false,
+            board_pin: BoardHost::Auto,
             overlay: None,
             notice: None,
             started: std::time::Instant::now(),
@@ -585,6 +598,11 @@ impl App {
             }
             Update::Board(rows) => {
                 self.board.set_rows(rows);
+                Vec::new()
+            }
+            Update::BoardHostChanged { device, live } => {
+                self.board_host = device;
+                self.board_host_live = live;
                 Vec::new()
             }
             Update::SendFailed {
@@ -794,6 +812,7 @@ impl App {
                 self.board.clear_filter();
                 Vec::new()
             }
+            Action::BoardCycleHost => self.cycle_board_host(),
             Action::BoardFindType(ch) => {
                 self.board.find_type(ch);
                 Vec::new()
@@ -899,6 +918,55 @@ impl App {
             } else {
                 Focus::Transcript
             };
+        }
+    }
+
+    /// `d` — the next board host: automatic, then this device, then each
+    /// registered device, then back to automatic (gh#55).
+    ///
+    /// One key, one direction, and one more press always gets you back to the
+    /// default — the same shape `f` gives the filter, and for the same reason:
+    /// there is no mode to escape and nothing to undo.
+    fn cycle_board_host(&mut self) -> Effects {
+        let cycle = self.board_host_cycle();
+        let here = cycle.iter().position(|choice| *choice == self.board_pin);
+        let next = cycle
+            .get(here.map_or(0, |i| i + 1))
+            .cloned()
+            .unwrap_or(BoardHost::Auto);
+        self.board_pin = next.clone();
+        self.notify(match &next {
+            BoardHost::Auto => "Board host: automatic".to_string(),
+            BoardHost::Pinned(None) => "Board host: this device".to_string(),
+            BoardHost::Pinned(Some(id)) => format!("Board host: {}", self.device_label(id)),
+        });
+        vec![Command::BoardHost(next)]
+    }
+
+    /// The positions `d` steps through: automatic, this device, then every
+    /// registered device in registration order (the order the supervisor's
+    /// sweep uses, so the two never disagree about what "next" means).
+    fn board_host_cycle(&self) -> Vec<BoardHost> {
+        let mut others: Vec<&Device> = self
+            .devices
+            .iter()
+            .filter(|d| Some(d.id.as_str()) != self.local_device_id.as_deref())
+            .collect();
+        others.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        let mut cycle = vec![BoardHost::Auto, BoardHost::Pinned(None)];
+        cycle.extend(others.into_iter().map(|d| BoardHost::Pinned(Some(d.id.clone()))));
+        cycle
+    }
+
+    /// What the board header says about where its rows come from. `None` on a
+    /// single-device install that found its own board — there is nothing to
+    /// tell the operator when there is only one answer.
+    pub fn board_host_note(&self) -> Option<String> {
+        match (&self.board_host, self.board_host_live) {
+            (None, true) => None,
+            (None, false) => Some("looking for a board…".to_string()),
+            (Some(id), true) => Some(format!("on {}", self.device_label(id))),
+            (Some(id), false) => Some(format!("asking {}…", self.device_label(id))),
         }
     }
 
@@ -3342,6 +3410,88 @@ mod tests {
             app.notice.as_ref().is_some_and(|n| n.text.contains("no route")),
             "the reason must be said"
         );
+    }
+
+    fn board_device(id: &str, name: &str, created: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "linux".into(),
+            last_seen_at: None,
+            created_at: Some(
+                DateTime::parse_from_rfc3339(created)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            version: None,
+        }
+    }
+
+    /// gh#55: `d` walks automatic → this device → each other device → back,
+    /// and every step is a command the supervisor acts on.
+    #[test]
+    fn d_cycles_which_device_hosts_the_board() {
+        let mut app = seeded();
+        app.apply(Update::LocalDevice("laptop".into()));
+        app.apply(Update::Devices(vec![
+            board_device("box", "the-box", "2026-01-02T00:00:00Z"),
+            board_device("laptop", "laptop", "2026-01-01T00:00:00Z"),
+        ]));
+        app.act(Action::ToggleBoard);
+        assert_eq!(app.board_pin, BoardHost::Auto, "automatic is the default");
+
+        let effects = app.act(Action::BoardCycleHost);
+        assert_eq!(app.board_pin, BoardHost::Pinned(None));
+        assert!(matches!(
+            effects.first(),
+            Some(Command::BoardHost(BoardHost::Pinned(None)))
+        ));
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.text.contains("this device")),
+            "the step has to say where it landed"
+        );
+
+        app.act(Action::BoardCycleHost);
+        assert_eq!(app.board_pin, BoardHost::Pinned(Some("box".into())));
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.text.contains("the-box")),
+            "a device is named, not id'd"
+        );
+
+        // One more press always gets you back out — the same promise `f` makes.
+        app.act(Action::BoardCycleHost);
+        assert_eq!(app.board_pin, BoardHost::Auto);
+    }
+
+    /// The header only speaks up when there is something to say: this device
+    /// serving its own board is the ordinary case and stays silent.
+    #[test]
+    fn the_board_header_names_a_remote_host_and_nothing_else() {
+        let mut app = seeded();
+        app.apply(Update::LocalDevice("laptop".into()));
+        app.apply(Update::Devices(vec![board_device(
+            "box",
+            "the-box",
+            "2026-01-02T00:00:00Z",
+        )]));
+        app.apply(Update::BoardHostChanged {
+            device: None,
+            live: true,
+        });
+        assert_eq!(app.board_host_note(), None);
+
+        // Still sweeping: say who is being asked, do not claim an answer.
+        app.apply(Update::BoardHostChanged {
+            device: Some("box".into()),
+            live: false,
+        });
+        assert_eq!(app.board_host_note().as_deref(), Some("asking the-box…"));
+
+        app.apply(Update::BoardHostChanged {
+            device: Some("box".into()),
+            live: true,
+        });
+        assert_eq!(app.board_host_note().as_deref(), Some("on the-box"));
     }
 
     #[test]

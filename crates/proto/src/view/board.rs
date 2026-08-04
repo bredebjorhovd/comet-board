@@ -544,6 +544,52 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Which device hosts the board (gh#55)
+// ---------------------------------------------------------------------------
+
+/// The devices a board pane tries, in order, when the operator has pinned none.
+/// `None` means this device — no `targetDeviceId` passthrough.
+///
+/// The board store lives on exactly ONE device (docs/BOARD.md: one host device
+/// is correct while one box hosts the board), and the board RPCs are
+/// relay-forwardable, so a viewport that finds no board locally is not out of
+/// options — it just has to ask the other devices. This device comes first
+/// because a local board must always win over a remote one; the rest follow in
+/// registration order, which is stable across heartbeats (the same order the
+/// device switcher lists them in), so the sweep visits them the same way twice.
+///
+/// A candidate is ruled out by its `WatchBoard` stream ending without ever
+/// delivering a frame — the engine refuses the subscription outright when it
+/// hosts no board, so "said nothing at all" IS the answer.
+pub fn host_candidates(devices: &[crate::Device], local_device_id: Option<&str>) -> Vec<Option<String>> {
+    let mut others: Vec<&crate::Device> = devices
+        .iter()
+        .filter(|d| Some(d.id.as_str()) != local_device_id)
+        .collect();
+    others.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+    std::iter::once(None)
+        .chain(others.into_iter().map(|d| Some(d.id.clone())))
+        .collect()
+}
+
+/// The candidate after `current` in the sweep, or `None` when the sweep is
+/// exhausted (every device has been asked and none hosts a board).
+///
+/// Returns `Some(next)` where `next` is itself the target — `Some(None)` is
+/// "try this device", `Some(Some(id))` is "try that device". A `current` that
+/// has left the list (a device deregistered mid-sweep) restarts the sweep at
+/// the top rather than ending it on a stale position.
+pub fn next_host_candidate(
+    candidates: &[Option<String>],
+    current: Option<&str>,
+) -> Option<Option<String>> {
+    match candidates.iter().position(|c| c.as_deref() == current) {
+        Some(here) => candidates.get(here + 1).cloned(),
+        None => candidates.first().cloned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +851,63 @@ mod tests {
         assert_eq!(format_age(12), "12s");
         assert_eq!(format_age(240), "4m");
         assert_eq!(format_age(3 * 3600), "3h");
+    }
+
+    fn device(id: &str, created: &str) -> crate::Device {
+        crate::Device {
+            id: id.into(),
+            name: id.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: Some(
+                DateTime::parse_from_rfc3339(created)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            version: None,
+        }
+    }
+
+    #[test]
+    fn host_sweep_asks_this_device_first_then_the_rest_in_registration_order() {
+        let devices = vec![
+            device("box", "2026-01-02T00:00:00Z"),
+            device("laptop", "2026-01-01T00:00:00Z"),
+            device("phone", "2026-01-03T00:00:00Z"),
+        ];
+        let candidates = host_candidates(&devices, Some("laptop"));
+        assert_eq!(
+            candidates,
+            vec![None, Some("box".into()), Some("phone".into())],
+            "this device first, then the others oldest-registered first"
+        );
+        // The sweep walks the list once and then stops: a board that is
+        // nowhere must read as "nowhere", not loop forever.
+        assert_eq!(next_host_candidate(&candidates, None), Some(Some("box".into())));
+        assert_eq!(
+            next_host_candidate(&candidates, Some("box")),
+            Some(Some("phone".into()))
+        );
+        assert_eq!(next_host_candidate(&candidates, Some("phone")), None);
+    }
+
+    #[test]
+    fn a_device_that_left_mid_sweep_restarts_the_sweep() {
+        let devices = vec![device("box", "2026-01-02T00:00:00Z")];
+        let candidates = host_candidates(&devices, Some("laptop"));
+        assert_eq!(next_host_candidate(&candidates, Some("gone")), Some(None));
+    }
+
+    #[test]
+    fn a_lone_device_still_asks_itself() {
+        assert_eq!(host_candidates(&[], None), vec![None]);
+        // Even when the local id is unknown (LocalDevice hasn't answered yet),
+        // every registered device is a candidate — asking the box twice under
+        // two names is harmless; never asking it is not.
+        let devices = vec![device("box", "2026-01-02T00:00:00Z")];
+        assert_eq!(
+            host_candidates(&devices, None),
+            vec![None, Some("box".into())]
+        );
     }
 }

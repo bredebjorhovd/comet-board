@@ -71,10 +71,13 @@ enum Command {
         via: Option<String>,
         /// Override the route's configured runtime for this dispatch — e.g.
         /// claude-code, opencode, codex, cursor. `comet-board list --json`
-        /// shows each row's default.
+        /// shows each row's default. An unknown one is refused, naming the
+        /// set the engine offers.
         #[arg(long)]
         runtime: Option<String>,
-        /// Override the harness's default model for this dispatch.
+        /// Override the harness's default model for this dispatch. Checked
+        /// against that runtime's catalog before anything is dispatched; an
+        /// unknown one is refused, naming the catalog.
         #[arg(long)]
         model: Option<String>,
         /// Agent-account slot id to run under — whose Claude/Codex
@@ -216,7 +219,7 @@ fn main() -> Result<()> {
             let via = ops::provenance(via);
             let d = runtime.block_on(async {
                 let client = ops::attach(port).await?;
-                ops::dispatch(
+                ops::dispatch_checked(
                     &client,
                     &task,
                     via.as_deref(),
@@ -285,13 +288,7 @@ fn main() -> Result<()> {
             };
             let rows = runtime.block_on(async {
                 let client = ops::attach(port).await?;
-                ops::wait_for(
-                    &client,
-                    &task,
-                    &states,
-                    timeout.map(Duration::from_secs),
-                )
-                .await
+                ops::wait_for(&client, &task, &states, timeout.map(Duration::from_secs)).await
             })?;
             ops::print_tasks(&rows, json)
         }
@@ -352,7 +349,10 @@ fn main() -> Result<()> {
                     ops::await_row(&client, &id, pickup).await?;
                     ops::dispatch(&client, &id, via.as_deref(), None, None, None).await
                 })?;
-                println!("dispatched {id} → chat {} (attempt {})", d.chat_id, d.attempt);
+                println!(
+                    "dispatched {id} → chat {} (attempt {})",
+                    d.chat_id, d.attempt
+                );
             }
             Ok(())
         }

@@ -77,7 +77,11 @@ is this board's `review`.
 2. **Release work** with `comet-board dispatch --task <id>`. This cuts a git
    worktree, creates a chat in the routed space, starts the agent and queues
    the route's brief through the command ledger. It returns once the chat
-   exists; the engine takes it from there.
+   exists; the engine takes it from there. `--runtime` and `--model` override
+   the route's runtime and that harness's default model for the one dispatch;
+   both are checked against the engine's catalogs first, and an unknown value
+   is refused naming the valid set, so a typo costs an error rather than an
+   attempt. The row's default runtime is on the row (`runtime`).
 3. **Accounts are the operator's choice, not yours.** `routing.toml` decides
    which teammate's Claude/Codex subscription a route's work is billed to.
    `dispatch --account <id>` overrides it; do not pass it unless you were told
