@@ -296,11 +296,6 @@ export default {
       if (parts[3] === "reset-log" && request.method === "POST") {
         return forward(env.SESSION_ROOMS, room, request, auth, "/reset-log", "", "workspace");
       }
-      // Merge-safe repair write (the chat rooms' /append, for the workspace
-      // doc): lets an operator seed a reset room with ONE compact
-      // locally-exported history blob instead of waiting for every device to
-      // re-upload its whole doc — the N-way redundant re-seed is what kept
-      // ballooning the update log after the 2026-08-05 wedge breaks.
     }
 
     // ── device rooms ────────────────────────────────────────────────────────

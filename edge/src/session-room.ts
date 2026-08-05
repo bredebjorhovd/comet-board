@@ -16,7 +16,8 @@
  * Persistence model:
  * - `updates` — append-only incoming update log, buffered in memory during
  *   active streams and flushed every ~DO_FLUSH_MS (a crash losing buffered
- *   ops is healed by normal CRDT resync from the host on reconnect).
+ *   ops is healed by normal CRDT resync from the host on reconnect). Updates
+ *   above the ~2MB SQL row cap span chunked continuation rows (update-log.ts).
  * - `snapshot` blob — the doc's current snapshot. Two-level compaction:
  *   LOG FOLD (whenever the update log passes COMPACT_LOG_BYTES): re-export a
  *   full snapshot and clear the log — loses nothing. HISTORY TRIM (daily
@@ -70,6 +71,7 @@ import {
   materializeTail
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
+import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -79,6 +81,12 @@ const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
+/** Reject inbound fragment batches above these at the HEADER, before any
+ * reassembly buffer exists — bounds DO memory against a runaway or hostile
+ * sender. Comfortably above the 25MB session soft ceiling; the Rust client
+ * applies the same discipline inbound (crates/sync MAX_FRAGMENT_COUNT). */
+const MAX_REASSEMBLED_BYTES = 32 * 1024 * 1024;
+const MAX_FRAGMENT_COUNT = 4096;
 /** Keep a rolling ~5 weeks of daily frontier checkpoints. */
 const MAX_CHECKPOINTS = 36;
 /** Isolate-wide poisoned-wasm strike counter — MODULE state on purpose: every
@@ -271,9 +279,7 @@ export class SessionRoom implements DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.env = env;
-    ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS updates (seq INTEGER PRIMARY KEY AUTOINCREMENT, bytes BLOB NOT NULL, received_at INTEGER NOT NULL)"
-    );
+    ensureUpdateLog(ctx.storage.sql);
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -371,38 +377,46 @@ export class SessionRoom implements DurableObject {
       // Observability: what this room holds and who's on it. Owner-gated like
       // every other read (org-membership-gated for workspace and shared rooms).
       if (!mayRead) return refuse();
-      await this.flush();
-      const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
-        ?.n as number;
-      const snapshot = this.blobs.get("snapshot");
-      return json({
-        chatId: this.getMeta("chatId") ?? null,
-        connectedSockets: this.ctx.getWebSockets().length,
-        // Derived presence (gh#145) — how many devices this room would report
-        // present if asked right now.
-        presentDevices: Object.keys(this.socketPresence()).length,
-        updateRows,
-        updateLogBytes: Number(this.getMeta("updateBytes") ?? "0"),
-        snapshotBytes: snapshot?.length ?? 0,
-        // Cold-start cost of the LAST materialization — the wedge-risk gauge
-        // (2026-07-30: this creeping toward the CPU limit was invisible).
-        lastReplayMs: Number(this.getMeta("lastReplayMs") ?? "0"),
-        lastReplayRows: Number(this.getMeta("lastReplayRows") ?? "0"),
-        // True between a wedge-break log drop and the first re-uploaded state
-        // (the nightly backup is paused in that window).
-        postReset: this.getMeta("postReset") === "1",
-        tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.get("tail") !== undefined,
-        diffPublished: this.blobs.get("diff") !== undefined,
-        checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
-        lastTrimAt: this.getMeta("lastTrimAt") ?? null,
-        backupDirty: this.getMeta("backupDirty") === "1",
-        // Non-zero while a cold replay is in flight or has been dying — the
-        // wedge signature ensureDoc's automated reset watches for.
-        replayAttempts: Number(this.getMeta("replayAttempts") ?? "0"),
-        // Per-device %LOR attribution (in-memory: since this instance woke).
-        importPenalty: [...this.importPenalty].map(([device, e]) => ({ device, ...e })),
-        pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e }))
-      });
+      try {
+        await this.flush();
+        const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
+          ?.n as number;
+        const snapshot = this.blobs.get("snapshot");
+        return json({
+          chatId: this.getMeta("chatId") ?? null,
+          connectedSockets: this.ctx.getWebSockets().length,
+          // Derived presence (gh#145) — how many devices this room would report
+          // present if asked right now.
+          presentDevices: Object.keys(this.socketPresence()).length,
+          updateRows,
+          updateLogBytes: Number(this.getMeta("updateBytes") ?? "0"),
+          snapshotBytes: snapshot?.length ?? 0,
+          // Cold-start cost of the LAST materialization — the wedge-risk gauge
+          // (2026-07-30: this creeping toward the CPU limit was invisible).
+          lastReplayMs: Number(this.getMeta("lastReplayMs") ?? "0"),
+          lastReplayRows: Number(this.getMeta("lastReplayRows") ?? "0"),
+          // True between a wedge-break log drop and the first re-uploaded state
+          // (the nightly backup is paused in that window).
+          postReset: this.getMeta("postReset") === "1",
+          tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.get("tail") !== undefined,
+          diffPublished: this.blobs.get("diff") !== undefined,
+          checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
+          lastTrimAt: this.getMeta("lastTrimAt") ?? null,
+          backupDirty: this.getMeta("backupDirty") === "1",
+          // Non-zero while a cold replay is in flight or has been dying — the
+          // wedge signature ensureDoc's automated reset watches for.
+          replayAttempts: Number(this.getMeta("replayAttempts") ?? "0"),
+          // Per-device %LOR attribution (in-memory: since this instance woke).
+          importPenalty: [...this.importPenalty].map(([device, e]) => ({ device, ...e })),
+          pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e }))
+        });
+      } catch (e) {
+        // The one observability surface must never die as a bare 1101/500 —
+        // /stats is how an operator sees a room mid-incident (see /tail).
+        console.error("stats failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "stats_failed", message: String(e) }, 500);
+      }
     }
     if (url.pathname === "/presence" && request.method === "GET") {
       // THE ASK (gh#145). Presence is no longer pushed on a timer, so this is
@@ -680,7 +694,29 @@ export class SessionRoom implements DurableObject {
         let from: VersionVector | undefined;
         try {
           from = VersionVector.decode(message.version);
-          backfill = doc.export({ mode: "update", from });
+          // A shallow doc cannot diff across its trimmed root, and loro does
+          // NOT throw for a `from` behind the shallow start — it silently
+          // exports only the post-root ops (~90 bytes of nothing for a fresh
+          // reader), which import client-side as forever-pending deps: zero
+          // messages, zero errors anywhere (found 2026-08-05 — every fresh
+          // device joining a force-trimmed whale room got an empty
+          // transcript). An encoded EMPTY version vector is 1 byte, so
+          // `version.length > 0` does not mean "has state" — detect
+          // behind-the-root explicitly and serve the §3.1 stale-peer full
+          // snapshot instead of trusting the export.
+          let stale = false;
+          if (doc.isShallow()) {
+            const since = doc.shallowSinceVV();
+            try {
+              const cmp = from.compare(since);
+              stale = cmp === undefined || cmp < 0;
+            } finally {
+              since.free();
+            }
+          }
+          backfill = stale
+            ? doc.export({ mode: "snapshot" })
+            : doc.export({ mode: "update", from });
         } catch {
           // Unknown/garbled client version — fall back to a full snapshot.
           backfill = doc.export({ mode: "snapshot" });
@@ -900,6 +936,20 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
       return;
     }
+    if (
+      message.totalSizeBytes > MAX_REASSEMBLED_BYTES ||
+      message.fragmentCount > MAX_FRAGMENT_COUNT
+    ) {
+      console.warn(
+        "rejecting oversized fragment batch",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${state.deviceId ?? "unattributed"}`,
+        `totalSizeBytes=${message.totalSizeBytes}`,
+        `fragmentCount=${message.fragmentCount}`
+      );
+      this.ack(ws, message, UpdateStatusCode.PayloadTooLarge, message.batchId);
+      return;
+    }
     // Penalized devices get rejected at the HEADER — before any reassembly
     // buffers exist. Their doomed multi-megabyte re-uploads are what pressed
     // the wasm heap into the 2026-08-04 abort loop. Small totals fall through
@@ -1014,12 +1064,12 @@ export class SessionRoom implements DurableObject {
     const snapshot = this.blobs.get("snapshot");
     if (snapshot && snapshot.length > 0) doc.import(snapshot);
     let rows = 0;
-    for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
+    for (const update of readUpdateRows(this.ctx.storage.sql)) {
       rows++;
       try {
-        doc.import(new Uint8Array(row.bytes as ArrayBuffer));
+        doc.import(update);
       } catch {
-        // A poisoned row cannot be applied; skip it rather than brick the room.
+        // A poisoned update cannot be applied; skip it rather than brick the room.
       }
     }
     for (const update of this.pending) {
@@ -1194,7 +1244,15 @@ export class SessionRoom implements DurableObject {
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      void this.flush();
+      // Not `void`: this is the ONLY flush call site with no handler above it,
+      // so a throw here (a fold export dying, a storage error) used to vanish
+      // as an unhandled rejection — the 2026-08-05 whale rooms failed every
+      // debounced flush for days with zero log lines. Same discipline as the
+      // socket-close flush.
+      this.flush().catch((e) => {
+        console.error("debounced flush failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+      });
     }, DO_FLUSH_MS);
   }
 
@@ -1206,11 +1264,11 @@ export class SessionRoom implements DurableObject {
     if (this.pending.length === 0) return;
     const now = Date.now();
     for (const update of this.pending) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO updates (bytes, received_at) VALUES (?, ?)",
-        update.buffer.slice(update.byteOffset, update.byteOffset + update.byteLength),
-        now
-      );
+      // Chunked rows (update-log.ts): a single update above the ~2MB SQL row
+      // cap — a bulk import, a whale session's full re-upload span — used to
+      // throw SQLITE_TOOBIG here on every flush forever, freezing the room's
+      // persistence while acks kept reading Ok (2026-08-05).
+      appendUpdateRow(this.ctx.storage.sql, update, now);
     }
     const logBytes = Number(this.getMeta("updateBytes") ?? "0") + this.pendingBytes;
     this.setMeta("updateBytes", String(logBytes));
