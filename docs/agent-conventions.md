@@ -103,8 +103,13 @@ is this board's `review`.
    as soon as the answer is true.
 8. **After releasing work, do not fall silent about it.** That leaves the human
    to notice the agent finished and to prompt you. Either `wait` for it, or say
-   plainly that you are leaving it running and that nothing will tell you when
-   it is done.
+   plainly that you are leaving it running. A board configured with
+   `notify_dispatcher` will prompt you in this chat when work you released
+   settles — but it is off by default and you cannot tell from here, so never
+   promise that you will be woken. Note also that `wait` does **not** return on
+   `blocked`: an agent that stops to ask a question holds its attempt open, and
+   a `wait` on it hangs until somebody answers. It comments on its own issue
+   when that happens, which is the human's signal, not yours.
 9. **Never dispatch speculatively.** Releasing work starts a real agent in a
    real repo that commits and opens PRs. A human keypress — or an explicit
    instruction — releases tasks. Reading the board is always safe; dispatching

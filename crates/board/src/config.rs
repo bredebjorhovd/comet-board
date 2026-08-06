@@ -283,13 +283,32 @@ pub struct Defaults {
     /// whatever was last checked out in it, and that is nobody's intended base.
     #[serde(default = "default_base")]
     pub base: String,
-    /// Surface a notification when released work settles.
+    /// Surface a notification, out of band, when work blocks or settles.
     ///
     /// A conversational orchestrator cannot be woken — it only gets a turn when
-    /// something prompts it — so the operator is the one who has to notice.
-    /// Off means noticing is entirely on you.
+    /// something prompts it — so the operator is the one who has to notice, and
+    /// an agent that stops to ask at 02:00 is invisible until somebody looks at
+    /// the board. This is the switch for the channel that reaches them anyway;
+    /// [`notify_webhook`](Self::notify_webhook) is where it goes. On with
+    /// nothing configured is a channel with no address, which `doctor` says
+    /// plainly rather than reporting a notice that cannot fire.
+    ///
+    /// It does not gate the upstream comments — a blocked attempt comments on
+    /// its own issue regardless, because that trail belongs to the task and not
+    /// to whoever is watching tonight.
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Where [`notify`](Self::notify) sends: one URL, POSTed a small JSON body
+    /// (`{"event": "on_blocked" | "on_settled", …}`) when a dispatched attempt
+    /// blocks or settles.
+    ///
+    /// One URL and no per-service integration on purpose. Slack, email and
+    /// pagers all already accept a webhook — via their own incoming-webhook
+    /// endpoint, or the two lines of glue an operator already has — and the
+    /// board carrying a client per destination would be the board maintaining
+    /// three credentials it never reads.
+    #[serde(default)]
+    pub notify_webhook: Option<String>,
     /// Also tell the *agent* that released a task when its work settles, by
     /// queueing a message into the chat it dispatched from (AGE-25).
     ///
@@ -339,6 +358,7 @@ impl Default for Defaults {
             branch_template: default_branch_template(),
             base: default_base(),
             notify: true,
+            notify_webhook: None,
             notify_dispatcher: false,
             new_source: default_new_source(),
         }

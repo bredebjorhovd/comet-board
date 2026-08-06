@@ -16,7 +16,8 @@ pub struct Db {
 const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktree, branch, \
      started_at, ended_at, outcome, missing_ticks, agent_status, \
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
-     settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account";
+     settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
+     blocked_count";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -48,6 +49,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         nudges: r.get(20)?,
         nudged_at: r.get(21)?,
         account: r.get(22)?,
+        blocked_count: r.get(23)?,
     })
 }
 
@@ -152,7 +154,13 @@ impl Db {
               -- CLI login. Recorded per attempt rather than read back off the
               -- route, because the route's default can change under a run that
               -- is still going.
-              account      TEXT
+              account      TEXT,
+              -- How many times this attempt has *entered* blocked — the agent
+              -- stopped to ask, or its run died (gh#71). The notice upstream is
+              -- keyed on this count, so a block that is answered and happens
+              -- again is a second notice, and a hundred ticks of the same block
+              -- are still one.
+              blocked_count INTEGER NOT NULL DEFAULT 0
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -253,6 +261,10 @@ impl Db {
                 // keep NULL, which is exactly right: they ran before accounts
                 // could be chosen, on the device's own CLI login.
                 ("account", "TEXT"),
+                // Times this attempt entered blocked (gh#71). Existing rows
+                // keep 0: a block they are *currently* in was never noticed
+                // upstream, so the next tick that sees it is its first notice.
+                ("blocked_count", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )?;
         self.add_missing_columns(
@@ -632,6 +644,24 @@ impl Db {
             params![attempt_id],
         )?;
         Ok(())
+    }
+
+    /// Record that this attempt has entered blocked once more, and say which
+    /// block that is (1 for the first).
+    ///
+    /// The counter is what makes the upstream notice "once per block" rather
+    /// than once per attempt or once per tick: it goes into the writeback's
+    /// idempotency key, so a block that is answered and then happens again
+    /// earns a second comment while the ticks in between earn none. Bumped in
+    /// the same statement it is read back from, so two reconcile paths racing
+    /// the same transition cannot both claim block 1 (gh#71).
+    pub fn bump_blocked_count(&self, attempt_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "UPDATE attempts SET blocked_count = blocked_count + 1
+              WHERE id = ?1 RETURNING blocked_count",
+            params![attempt_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn set_missing_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {

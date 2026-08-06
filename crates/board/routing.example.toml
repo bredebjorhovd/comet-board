@@ -88,10 +88,28 @@ branch_template = "board/{identifier_lower}"
 # retry is unaffected either way: it reuses the branch the first attempt cut,
 # with its commits, and never rebases it onto a newer base.
 base = "origin/HEAD"
-# Surface a notification when released work settles. A conversational
-# orchestrator cannot be woken, so somebody has to notice — this is how you do,
-# without watching the board.
+# Notifications. Three audiences, and they are genuinely different:
+#
+#   the issue    A blocked attempt — the agent stopped to ask, or its run died
+#                — leaves one comment on its own issue, per block. Not
+#                configurable here and not conditional on who is watching: it
+#                is the task's trail, and it is the only one that survives the
+#                night. (GitHub still obeys `[github] writeback` per repo.)
+#   the agent    `notify_dispatcher`, below — a dispatching orchestrator gets
+#                a prompt in its own chat when the work it released settles.
+#   you          `notify` + `notify_webhook`, here. The only channel that
+#                reaches somebody looking at neither the board nor the tracker.
+#
+# `notify` is the switch, `notify_webhook` the address; either alone is
+# silence, and `comet-board doctor` says so rather than reporting a notice that
+# cannot fire. The body is JSON — `{"event": "on_blocked"|"on_settled", "text":
+# …, "task": {…}, "attempt": {…}}` — POSTed once, with a five-second timeout
+# and no retry: a notification delivered forty minutes late reads as current,
+# which is worse than one that never came. One URL and no per-service
+# integrations: Slack, ntfy, a pager and a two-line relay all already accept a
+# POST.
 # notify = true
+# notify_webhook = "https://hooks.example.com/comet-board"
 # Which tracker `comet-board new` writes to: "linear" or "github". This is not
 # inferable — a label routes work to a repo and says nothing about where that
 # project's tickets live. This board's own backlog may be in Linear while its
