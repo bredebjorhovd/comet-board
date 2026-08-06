@@ -127,16 +127,24 @@ Three things follow from how the loop is kept closed:
   delivered and nothing is re-dispatched. The review then waits on the pull
   request for whoever opens it, and the board log says so once.
 
-**If you were dispatched by the board, commit your work.** The board has no
-callback: it decides an attempt is finished by seeing your run end with either
-an open PR or commits on the attempt branch. Work left uncommitted in the
-worktree when you stop reads as an agent that did nothing, and the row sits in
-`working` until a human notices. Commit even when you are not opening a PR.
+**If you were dispatched by the board, commit your work and push it.** The
+board has no callback: it decides an attempt is finished by seeing your run end
+with either an open PR or commits *on origin* for the attempt branch. Work left
+uncommitted, or committed and never pushed, reads as an agent that is still
+going — the row sits in `working` until the clock cap takes it or a human
+notices. Commit and push even when you are not opening a PR.
+
+Pushing is the part that is easy to skip and the part that matters: a commit in
+your worktree is on one box, and a row that said `review` about it would send
+somebody to read a branch that is not there. The board log names the branch when
+it finds an attempt in that state. If `git push` fails, say so in the chat
+rather than stopping quietly — a push nobody can make is a board problem, not
+yours (`comet-board doctor` reports the credential).
 
 The two artifacts are not weighed the same. A pull request is your own
 statement that you are finished, so it settles the attempt promptly. Commits
-are not — you were told to make them mid-flight — so the board waits longer
-before settling on them. Open the PR when you want the row to move promptly.
+are not — you were told to make them mid-flight — so they settle it only once
+the run has genuinely ended. Open the PR when you want the row to move promptly.
 
 **A settle is not final.** If the board closes your attempt while you are still
 working, it notices: a closed attempt whose chat is still working is re-opened,

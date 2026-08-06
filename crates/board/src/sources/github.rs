@@ -519,6 +519,26 @@ impl<T: Rest> Github<T> {
             .filter(|s| s != "unknown")
     }
 
+    /// The commit a branch points at on GitHub, or `None` if there is no such
+    /// branch (gh#69).
+    ///
+    /// `None` covers "GitHub says there is no such branch" and "GitHub could
+    /// not be asked" alike, the way [`Github::mergeable_state`] does, and for
+    /// the same reason: the one caller — the settle's push check — treats an
+    /// unproven push as an unpushed one, so an outage costs an attempt that
+    /// stays live a while longer rather than a row that claims work is
+    /// reviewable. The branch is a path segment and GitHub takes slashes in it
+    /// verbatim, which is what a `board/gh-69-comet-board` name needs.
+    pub fn branch_head(&self, repo: &str, branch: &str) -> Option<String> {
+        self.rest
+            .get(&format!("/repos/{repo}/branches/{branch}"))
+            .ok()?
+            .get("commit")?
+            .get("sha")?
+            .as_str()
+            .map(str::to_string)
+    }
+
     /// Merge a pull request.
     ///
     /// Only ever from an explicit keypress with a confirmation — this is the
