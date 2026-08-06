@@ -60,7 +60,7 @@ enum DaemonCommand {
 /// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
 /// `COMET_EDGE_URL` overrides (local dev / self-hosting); `COMET_EDGE_URL=off`
 /// disables the edge entirely (local mode — single-box deployments).
-const DEFAULT_EDGE_URL: &str = "https://edge.comet.zeron.sh";
+const DEFAULT_EDGE_URL: &str = "https://edge.comet.offhand.dev";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
 /// authorize URL), so baking it in is safe. Overridden by `COMET_WORKOS_CLIENT_ID`;
