@@ -220,6 +220,21 @@ pub struct TaskRow {
     /// as permission to do anything.
     #[serde(default)]
     pub dispatched_by_user: Option<String>,
+    /// Whose subscription this row's attempt actually spends, as an email
+    /// (gh#101): the [`account`](Self::account) slot's login, or the box's own
+    /// CLI login when the dispatch named no slot.
+    ///
+    /// Resolved once, at dispatch, and recorded on the attempt — the slot id in
+    /// `account` means nothing to a reader who has not saved that login, and
+    /// the box's own login can change under a run that is still going. `None`
+    /// on a row nothing has run on yet, and on attempts from before this
+    /// existed.
+    ///
+    /// Compared against [`dispatched_by_user`](Self::dispatched_by_user), this
+    /// is what makes a cross-billed run visible for its whole life — see
+    /// [`cross_billed`].
+    #[serde(default)]
+    pub billed_to: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +488,20 @@ pub fn row_metadata(row: &TaskRow, selected: bool, width: u16, now: DateTime<Utc
     if width < NARROW_LIMIT {
         return String::new();
     }
+    // Whose subscription this row is spending, when it is not the releaser's
+    // (gh#101). Appended rather than folded into the per-state arms: it is true
+    // of an attempt for its whole life — working, blocked, in review, long
+    // closed — and a fact that survives the row changing section does not
+    // belong inside the match on which section it is in.
+    let base = state_metadata(row, selected, now);
+    match billing_note(row) {
+        Some(note) if base.trim().is_empty() => note,
+        Some(note) => format!("{} · {note}", base.trim_end()),
+        None => base,
+    }
+}
+
+fn state_metadata(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
     match row.state() {
         BoardState::Working | BoardState::Blocked => {
             let elapsed = row
@@ -544,6 +573,118 @@ pub fn row_metadata(row: &TaskRow, selected: bool, width: u16, now: DateTime<Utc
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Whose subscription a run spends (gh#101)
+// ---------------------------------------------------------------------------
+//
+// The billing guard's whole vocabulary lives here, for the same reason the
+// section order does: four surfaces say it — the desktop picker, the TUI
+// picker, the `comet-board` CLI and the upstream comment the board writes — and
+// a warning worded three ways is three warnings nobody recognises as the same
+// one. `comet-board` owns the *policy* (the `billing_guard` mode and the
+// refusal); these are the words and the comparison.
+
+/// The email whose subscription a dispatch would spend, out of the logins a
+/// device has saved.
+///
+/// `slot` is the agent-account id the dispatch names — the route's, or the
+/// picker's override. `None` is the box's own CLI login, which is the *active*
+/// account for that harness: the same login a run with no slot at all would
+/// reach, so naming it is describing what will happen rather than guessing.
+///
+/// `None` back means the device cannot name one — no such slot, no live login,
+/// or a login whose credentials it could not read far enough to find an email.
+/// Nothing accuses anybody on the strength of that: [`cross_billed`] is false
+/// whenever this is `None`.
+pub fn billed_email<'a>(
+    accounts: &'a [crate::AgentAccount],
+    harness: crate::HarnessId,
+    slot: Option<&str>,
+) -> Option<&'a str> {
+    let account = match slot.filter(|s| !s.is_empty()) {
+        Some(slot) => accounts
+            .iter()
+            .find(|a| a.harness == harness && a.id == slot)?,
+        None => accounts.iter().find(|a| a.harness == harness && a.active)?,
+    };
+    account.email.as_deref().filter(|e| !e.is_empty())
+}
+
+/// Is this run spending somebody else's subscription?
+///
+/// The match is claim-vs-slot-email and nothing more: `dispatcher` is the
+/// `viaUser` the dispatching frontend sent, which the box cannot verify (see
+/// [`TaskRow::dispatched_by_user`]). Two unknowns therefore read as "not
+/// cross-billed" rather than as an accusation — an unattributed dispatch (the
+/// bare CLI, an orchestrating agent) names nobody to have wronged.
+pub fn cross_billed(billed_to: Option<&str>, dispatcher: Option<&str>) -> bool {
+    let (Some(billed), Some(by)) = (email(billed_to), email(dispatcher)) else {
+        return false;
+    };
+    !billed.eq_ignore_ascii_case(by)
+}
+
+/// The phrase a `require-own` refusal carries, so a frontend can tell "the box
+/// minds who pays for this" from every other reason a dispatch failed and offer
+/// the confirm instead of a dead end.
+///
+/// A shared constant rather than each side's own substring: the refusal is
+/// written by `comet-board` and read by the desktop panel, and a reworded
+/// message that quietly stopped matching would turn the confirm into an error
+/// nobody could act on.
+pub const REQUIRE_OWN_REFUSAL: &str = "billing_guard = \"require-own\"";
+
+/// A non-empty, trimmed email, or nothing.
+fn email(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// What a picker row says about a selection that bills somebody else — the
+/// short form, because it rides beside a chip that is already naming a login.
+pub fn bills_label(billed_to: &str) -> String {
+    format!("bills {}", billed_to.trim())
+}
+
+/// The one line a CLI prints, and a refusal leads with, before a cross-billed
+/// release. Names the subscription (`Claude`, `Codex`) rather than the harness
+/// id, because the person about to be charged thinks of it by the product's
+/// name and not by comet's runtime spelling.
+pub fn bills_warning(billed_to: &str, harness: crate::HarnessId) -> String {
+    format!(
+        "this run bills {}'s {} — pass --account <your slot>",
+        billed_to.trim(),
+        subscription_noun(harness)
+    )
+}
+
+/// What the upstream dispatch comment appends when the run is cross-billed, so
+/// the record is public to both parties rather than living on one usage page.
+pub fn bills_comment_suffix(billed_to: &str) -> String {
+    format!(" · on {}'s subscription", billed_to.trim())
+}
+
+/// The subscription a harness spends, named the way its owner would.
+pub fn subscription_noun(harness: crate::HarnessId) -> &'static str {
+    match harness {
+        crate::HarnessId::ClaudeCode => "Claude",
+        crate::HarnessId::Codex => "Codex",
+        crate::HarnessId::Cursor => "Cursor",
+        crate::HarnessId::Opencode => "OpenCode",
+        crate::HarnessId::Mock => "mock",
+    }
+}
+
+/// What a board row says about who it is charging, for the life of the attempt
+/// — `None` when nobody is being charged for somebody else.
+///
+/// Derived from the row alone, which is what lets both viewports show it
+/// without asking the box anything: the attempt recorded whose subscription it
+/// spends, and it recorded who said they released it.
+pub fn billing_note(row: &TaskRow) -> Option<String> {
+    let billed = row.billed_to.as_deref()?;
+    cross_billed(Some(billed), row.dispatched_by_user.as_deref()).then(|| bills_label(billed))
 }
 
 fn ws(row: &TaskRow) -> String {
@@ -656,6 +797,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            billed_to: None,
         }
     }
 
@@ -881,6 +1023,119 @@ mod tests {
         assert_eq!(format_age(12), "12s");
         assert_eq!(format_age(240), "4m");
         assert_eq!(format_age(3 * 3600), "3h");
+    }
+
+    // ---- whose subscription (gh#101) ------------------------------------
+
+    fn login(id: &str, email: &str, harness: crate::HarnessId, active: bool) -> crate::AgentAccount {
+        crate::AgentAccount {
+            id: id.into(),
+            harness,
+            email: Some(email.into()),
+            plan_label: None,
+            active,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    /// A named slot resolves to its own login; naming none resolves to the
+    /// box's live one, which is what a dispatch with no `account` really
+    /// spends. Both are per harness — a Claude slot cannot pay for a codex run.
+    #[test]
+    fn billed_email_names_the_slot_or_the_boxs_own_login() {
+        use crate::HarnessId::{ClaudeCode, Codex};
+        let accounts = vec![
+            login("slot-box", "brede@tally.no", ClaudeCode, true),
+            login("slot-ana", "ana@example.com", ClaudeCode, false),
+            login("slot-cod", "cod@example.com", Codex, true),
+        ];
+        assert_eq!(
+            billed_email(&accounts, ClaudeCode, Some("slot-ana")),
+            Some("ana@example.com")
+        );
+        assert_eq!(
+            billed_email(&accounts, ClaudeCode, None),
+            Some("brede@tally.no"),
+            "no slot named is the box's own login, not nothing"
+        );
+        assert_eq!(
+            billed_email(&accounts, Codex, None),
+            Some("cod@example.com")
+        );
+        // A slot saved for another harness is not this run's to spend.
+        assert_eq!(billed_email(&accounts, Codex, Some("slot-ana")), None);
+        // Nothing saved at all: the box cannot name whose it is, and says so.
+        assert_eq!(billed_email(&[], ClaudeCode, None), None);
+    }
+
+    /// The seatbelt's whole comparison. Two unknowns must never read as an
+    /// accusation: an unattributed dispatch names nobody to have wronged.
+    #[test]
+    fn cross_billed_is_a_claim_against_a_slot_email_and_nothing_else() {
+        assert!(cross_billed(
+            Some("brede@tally.no"),
+            Some("ana@example.com")
+        ));
+        assert!(!cross_billed(
+            Some("brede@tally.no"),
+            Some("BREDE@Tally.no")
+        ));
+        assert!(!cross_billed(Some("brede@tally.no"), None));
+        assert!(!cross_billed(None, Some("ana@example.com")));
+        assert!(!cross_billed(None, None));
+        // Empty strings are absence, not a name that differs from everything.
+        assert!(!cross_billed(Some("brede@tally.no"), Some("  ")));
+    }
+
+    /// A cross-billed attempt says so for its whole life, in the metadata both
+    /// viewports draw — working, in review, and long closed.
+    #[test]
+    fn a_cross_billed_row_says_whose_subscription_it_spends() {
+        for state in [BoardState::Working, BoardState::Review, BoardState::Done] {
+            let mut r = row("b", state);
+            r.billed_to = Some("brede@tally.no".into());
+            r.dispatched_by_user = Some("ana@example.com".into());
+            r.started_at = Some("2026-08-01T11:59:30Z".into());
+            let meta = row_metadata(&r, false, 120, now());
+            assert!(
+                meta.contains("bills brede@tally.no"),
+                "{state:?} row must name the payer: {meta}"
+            );
+        }
+
+        // The owner releasing their own work is not cross-billed and says
+        // nothing extra — the warning has to stay rare enough to mean something.
+        let mut own = row("o", BoardState::Working);
+        own.billed_to = Some("brede@tally.no".into());
+        own.dispatched_by_user = Some("brede@tally.no".into());
+        assert_eq!(billing_note(&own), None);
+        assert!(!row_metadata(&own, false, 120, now()).contains("bills"));
+
+        // And a row nothing has run on carries no verdict at all.
+        assert_eq!(billing_note(&row("r", BoardState::Ready)), None);
+    }
+
+    #[test]
+    fn the_billing_words_are_the_same_words_everywhere() {
+        assert_eq!(bills_label("brede@tally.no"), "bills brede@tally.no");
+        assert_eq!(
+            bills_warning("brede@tally.no", crate::HarnessId::ClaudeCode),
+            "this run bills brede@tally.no's Claude — pass --account <your slot>"
+        );
+        assert_eq!(
+            bills_comment_suffix("brede@tally.no"),
+            " · on brede@tally.no's subscription"
+        );
+        assert_eq!(
+            subscription_noun(crate::HarnessId::Codex),
+            "Codex",
+            "named as its owner thinks of it, not as comet spells the runtime"
+        );
     }
 
     fn device(id: &str, created: &str) -> crate::Device {

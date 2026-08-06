@@ -742,6 +742,7 @@ mod tests {
             collected_at: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         }
     }
 
@@ -929,6 +930,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat).unwrap();

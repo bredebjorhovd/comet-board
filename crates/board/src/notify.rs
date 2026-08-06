@@ -397,6 +397,7 @@ mod tests {
             collected_at: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         }
     }
 
