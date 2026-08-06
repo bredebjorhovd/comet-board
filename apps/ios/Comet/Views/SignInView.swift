@@ -11,7 +11,7 @@ import SwiftUI
 /// Production cloud endpoints — mirrors edge/wrangler.jsonc.
 enum Endpoints {
     static let edgeURL = URL(string: "https://edge.comet.offhand.dev")!
-    static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
+    static let workosClientId = "client_01KZ7CN5488CRQF7P0H7C12E8D"
     static let workosAPIBase = "https://api.workos.com"
     static let callbackScheme = "comet"
 
