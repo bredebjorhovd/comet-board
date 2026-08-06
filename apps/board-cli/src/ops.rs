@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use comet_board::adopt::{Unadopted, git_remote, github_slug};
 use comet_board::config::{self, Paths, RoutingConfig};
 use comet_board::model::{BoardState, Source};
+use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
 use comet_board::rows::TaskRow;
 use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
@@ -810,6 +811,135 @@ pub fn print_config(cfg: &BoardConfig, host: Option<&str>, json: bool) -> Result
         }
         println!("  add one:  comet-board routes add <owner/repo>");
     }
+    Ok(())
+}
+
+// ---- onboard (gh#97) ----------------------------------------------------
+
+/// Clone, space, adopt — one round trip, all of it on the board's device.
+///
+/// Nothing here is done locally, deliberately: the checkout has to be where the
+/// agents run, the space has to be owned by that device, and the GitHub
+/// credential that decides whether the repo is reachable lives with the board.
+/// A laptop driving this needs no credential and no shell on the box.
+pub async fn onboard(
+    board: &Board,
+    slug: &str,
+    dir: Option<&str>,
+    labels: Option<&[String]>,
+) -> Result<Onboarded> {
+    let mut params = serde_json::json!({ "slug": slug });
+    if let Some(object) = params.as_object_mut() {
+        if let Some(dir) = dir {
+            object.insert("dir".into(), serde_json::json!(dir));
+        }
+        // Absent and `[]` are different instructions — see `label_filter`.
+        if let Some(labels) = labels {
+            object.insert("labels".into(), serde_json::json!(labels));
+        }
+    }
+    let reply = board
+        .client
+        .call(methods::ONBOARD_REPO, board.params(params))
+        .await?;
+    serde_json::from_value(reply).context("parsing OnboardRepo reply")
+}
+
+/// What the board's GitHub App can see, and which of it is already on the board.
+pub async fn app_repos(board: &Board) -> Result<Vec<Candidate>> {
+    let reply = board
+        .client
+        .call(methods::LIST_APP_REPOS, board.params(serde_json::json!({})))
+        .await?;
+    serde_json::from_value(reply).context("parsing ListAppRepos reply")
+}
+
+/// The onboarding offer, as `comet-board onboard` with no repo prints it.
+pub fn print_candidates(repos: &[Candidate], host: Option<&str>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(repos)?);
+        return Ok(());
+    }
+    let where_ = match host {
+        Some(h) => format!(" on {h}"),
+        None => String::new(),
+    };
+    if repos.is_empty() {
+        println!("the board's GitHub App is installed nowhere{where_}");
+        return Ok(());
+    }
+    println!("repos the board's App can see{where_}:");
+    for r in repos {
+        // The ones already on the board are shown, not hidden: "is this one set
+        // up?" is half of why anybody runs this.
+        println!("  {:<44} {}", r.slug, r.note());
+    }
+    println!(
+        "\nput one on the board:  comet-board onboard <owner/repo> [--dir <path>] [--labels a,b | --all-issues]"
+    );
+    Ok(())
+}
+
+/// What one onboard did, step by step.
+///
+/// Per step rather than as one line, because re-running after a half-finished
+/// first go is the intended repair and the operator has to see which half was
+/// missing to believe it is now whole.
+pub fn print_onboarded(done: &Onboarded, host: Option<&str>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(done)?);
+        return Ok(());
+    }
+    println!(
+        "onboarded {} on {}",
+        done.slug,
+        host.unwrap_or("this device")
+    );
+    println!("  clone    {:<8} {}", done.clone.as_str(), done.path);
+    println!("  space    {:<8} {}", done.space.as_str(), done.space_name);
+    match &done.adopted {
+        None => println!("  routing  unchanged  already polled and routed"),
+        Some(a) => {
+            let mut wrote = Vec::new();
+            if a.wrote_route {
+                wrote.push("a [[route]]".to_string());
+            }
+            if a.wrote_repo {
+                wrote.push("[github] repos".to_string());
+            }
+            if let Some(l) = &a.labels {
+                wrote.push(if l.is_empty() {
+                    "a [[github.repo]] polling every open issue".to_string()
+                } else {
+                    format!("a [[github.repo]] filter: {}", l.join(", "))
+                });
+            }
+            println!("  routing  wrote    {}", wrote.join(" + "));
+            println!(
+                "           a commented `label = \"{}\"` route was left for Linear issues",
+                a.suggested_label
+            );
+        }
+    }
+    if let Some(p) = &done.preview {
+        println!("  issues   {}", p.count_phrase());
+        for (label, n) in p.labels.iter().take(8) {
+            println!("             {n:>4}  {label}");
+        }
+        // The failure this warns about is real and quiet: pointing the board at
+        // one repo put 83 rows on it in a single poll.
+        if done.adopted.as_ref().is_some_and(|a| a.labels.is_none()) && p.open_issues > 20 {
+            println!(
+                "  note     the global [github] labels filter applies — {} would arrive \
+                 unfiltered; narrow it with `comet-board routes edit`",
+                p.count_phrase()
+            );
+        }
+    }
+    for note in done.notes() {
+        println!("  note     {note}");
+    }
+    println!("\nthe board polls on its next cycle: comet-board list --state ready");
     Ok(())
 }
 

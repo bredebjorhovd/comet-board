@@ -385,6 +385,21 @@ impl Feedback {
     }
 }
 
+/// What onboarding needs to know about a repo before it clones it (gh#97).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoFacts {
+    /// `owner/repo` as GitHub spells it — the canonical casing.
+    pub slug: String,
+    pub clone_url: String,
+    pub default_branch: String,
+    pub private: bool,
+    pub archived: bool,
+    /// Issues can be switched off on a repo, and then polling it is polling
+    /// nothing. Worth a line in the report rather than a silent empty board.
+    pub has_issues: bool,
+}
+
 pub struct Github<T: Rest> {
     pub rest: T,
 }
@@ -392,6 +407,44 @@ pub struct Github<T: Rest> {
 impl<T: Rest> Github<T> {
     pub fn new(rest: T) -> Github<T> {
         Github { rest }
+    }
+
+    /// What GitHub says about one repo, under whatever credential is in force
+    /// (gh#97).
+    ///
+    /// The onboarding gate. A repo the board's credential cannot see answers 404
+    /// here — GitHub does not distinguish "no such repo" from "not yours", and
+    /// neither can we — so the *caller* supplies what to say about it, because
+    /// only it knows whether the credential is an App (somebody has to install
+    /// it) or a personal access token (somebody has to widen its scopes).
+    ///
+    /// Called before anything is cloned: a clone that fails halfway leaves a
+    /// directory behind, and the answer was available for one round trip.
+    pub fn repo(&self, repo: &str) -> Result<RepoFacts> {
+        let v = self.rest.get(&format!("/repos/{repo}"))?;
+        Ok(RepoFacts {
+            // GitHub's own casing, not the caller's: `Florin-AS/Tripletex-MCP`
+            // typed as `florin-as/tripletex-mcp` should land in routing.toml the
+            // way the repo is actually spelled.
+            slug: v
+                .get("full_name")
+                .and_then(Value::as_str)
+                .unwrap_or(repo)
+                .to_string(),
+            clone_url: v
+                .get("clone_url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("https://github.com/{repo}.git")),
+            default_branch: v
+                .get("default_branch")
+                .and_then(Value::as_str)
+                .unwrap_or("main")
+                .to_string(),
+            private: v.get("private").and_then(Value::as_bool).unwrap_or(false),
+            archived: v.get("archived").and_then(Value::as_bool).unwrap_or(false),
+            has_issues: v.get("has_issues").and_then(Value::as_bool).unwrap_or(true),
+        })
     }
 
     /// Issues for a repo. GitHub's issues endpoint also returns pull requests;

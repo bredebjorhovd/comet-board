@@ -26,6 +26,7 @@ use gpui::{
 
 use comet_board::adopt::Unadopted;
 use comet_board::config::Route;
+use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
 use comet_proto::view::board;
 use comet_rpc::methods;
@@ -102,6 +103,29 @@ struct FieldDialog {
     _events: Subscription,
 }
 
+/// The "Onboard a repo…" panel (gh#97).
+///
+/// The list is the board App's *grant*, fetched from the host — not the
+/// operator's repos, and not this device's folders. That is the honest set:
+/// every repo in it is one the box can clone and the sync loop can poll, and a
+/// repo missing from it needs somebody to install the App, which is not a thing
+/// this page could do for them.
+///
+/// The free-text field is not a fallback for a broken list, it is the other half
+/// of the surface: a board authenticating with `GITHUB_TOKEN` has no
+/// installations to enumerate at all, and the picker would otherwise be empty
+/// for it forever.
+struct OnboardFlow {
+    /// `None` while the list is in flight.
+    repos: Option<Vec<Candidate>>,
+    /// Why there is no list. Not an error on the page — a board on a personal
+    /// access token is a supported board, and it just types the repo instead.
+    list_note: Option<SharedString>,
+    slug: Entity<ComposerInput>,
+    dir: Entity<ComposerInput>,
+    _events: Subscription,
+}
+
 pub struct RoutingPage {
     state: Entity<AppState>,
     /// Which device's board — `None` is this one. Resolved by the same sweep
@@ -109,12 +133,24 @@ pub struct RoutingPage {
     host: Option<String>,
     config: Option<BoardConfig>,
     dialog: Option<FieldDialog>,
+    onboard: Option<OnboardFlow>,
+    /// What the last onboard did, kept on screen until the panel is closed —
+    /// it is the only record of a clone that happened on a machine the reader
+    /// may have no other view of.
+    onboarded: Option<Onboarded>,
     error: Option<SharedString>,
     /// A write is in flight; the page's buttons go quiet rather than queueing a
     /// second edit against a file the first one is still rewriting.
     busy: bool,
+    /// What the busy state is waiting on. An onboard is a `git clone` on another
+    /// machine — seconds to minutes — and a page that only greys out says
+    /// nothing about whether it is working or wedged.
+    busy_note: Option<SharedString>,
     loaded: bool,
     task: Option<Task<()>>,
+    /// Onboarding runs on its own slot: dropping a gpui `Task` cancels it, and a
+    /// config reload landing mid-clone must not look like a cancelled clone.
+    onboard_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -126,10 +162,14 @@ impl RoutingPage {
             host: None,
             config: None,
             dialog: None,
+            onboard: None,
+            onboarded: None,
             error: None,
             busy: false,
+            busy_note: None,
             loaded: false,
             task: None,
+            onboard_task: None,
             _observe: observe,
         };
         page.reload(cx);
@@ -310,6 +350,124 @@ impl RoutingPage {
         self.write(serde_json::json!({ "op": "adopt", "slug": slug }), cx);
     }
 
+    // ---- onboarding a repo the board has never seen (gh#97) ----
+
+    /// Open the panel and ask the host what its App can see.
+    fn open_onboard(&mut self, cx: &mut Context<Self>) {
+        let slug = cx.new(|cx| ComposerInput::new("owner/repo", cx));
+        let dir = cx.new(|cx| ComposerInput::new("Folder on the board's device (optional)", cx));
+        let events = cx.subscribe(&slug, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_onboard(None, cx);
+            }
+        });
+        self.onboard = Some(OnboardFlow {
+            repos: None,
+            list_note: None,
+            slug,
+            dir,
+            _events: events,
+        });
+        self.onboarded = None;
+        self.error = None;
+        cx.notify();
+
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.host_params(serde_json::json!({}));
+        self.onboard_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::LIST_APP_REPOS, params).await;
+            this.update(cx, |page, cx| {
+                let Some(flow) = page.onboard.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<Candidate>>(value) {
+                        Ok(repos) => flow.repos = Some(repos),
+                        Err(err) => {
+                            flow.repos = Some(Vec::new());
+                            flow.list_note = Some(format!("Unreadable reply: {err}").into());
+                        }
+                    },
+                    // Not the page's error strip: the commonest cause is a board
+                    // on a personal access token, which has no installations to
+                    // list and is not broken.
+                    Err(err) => {
+                        flow.repos = Some(Vec::new());
+                        flow.list_note = Some(format!("{err}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Onboard `slug` — from a picker row, or from the typed field when `None`.
+    fn submit_onboard(&mut self, slug: Option<String>, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(flow) = self.onboard.as_ref() else {
+            return;
+        };
+        let typed = flow.slug.read(cx).text().trim().to_string();
+        let dir = flow.dir.read(cx).text().trim().to_string();
+        let raw = slug.unwrap_or(typed);
+        // Parsed here rather than on the box: a typo should cost a message, not
+        // a round trip that comes back with the same news.
+        let slug = match comet_board::onboard::parse_slug(&raw) {
+            Ok(slug) => slug,
+            Err(err) => {
+                self.error = Some(format!("{err}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+
+        let mut params = serde_json::json!({ "slug": slug });
+        if let (false, Some(object)) = (dir.is_empty(), params.as_object_mut()) {
+            object.insert("dir".into(), serde_json::json!(dir));
+        }
+        let params = self.host_params(params);
+        self.busy = true;
+        self.busy_note = Some(format!("Cloning {slug} on the board's device…").into());
+        self.error = None;
+        self.onboarded = None;
+        cx.notify();
+
+        self.onboard_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::ONBOARD_REPO, params).await;
+            this.update(cx, |page, cx| {
+                page.busy = false;
+                page.busy_note = None;
+                match result {
+                    Ok(value) => match serde_json::from_value::<Onboarded>(value) {
+                        Ok(done) => {
+                            page.onboarded = Some(done);
+                            // The routes list is now stale by exactly the route
+                            // this wrote; re-read rather than patch it in.
+                            page.reload(cx);
+                        }
+                        Err(err) => page.error = Some(format!("Unreadable reply: {err}").into()),
+                    },
+                    // These refusals are written to be read: "cannot onboard
+                    // acme/thing: the board's GitHub App (id 123) cannot see it
+                    // … install it on acme".
+                    Err(err) => page.error = Some(format!("{err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn ignore(&mut self, slug: String, cx: &mut Context<Self>) {
         self.write(serde_json::json!({ "op": "ignore", "slug": slug }), cx);
     }
@@ -351,6 +509,10 @@ impl Render for RoutingPage {
                     })),
             );
         }
+
+        // Before the routes: this is the thing somebody came here to do that a
+        // list of existing routes cannot help them with.
+        column = column.child(self.render_onboard(&theme, busy, cx));
 
         if let Some(config) = &config {
             // What is wrong with the file, before what is in it: this is the
@@ -503,6 +665,231 @@ impl RoutingPage {
             )
             .child(widgets::badge(theme, format!("{}", ix + 1)))
             .into_any_element()
+    }
+
+    /// The "Onboard a repo…" affordance (gh#97): closed it is one button, open
+    /// it is the App's repo list plus a field for naming one directly.
+    ///
+    /// Distinct from "Not on the board yet" below, and the difference is the
+    /// whole point of the ticket: that list is repos with a *checkout already on
+    /// the box*, which somebody had to make by hand. This one starts from repos
+    /// the box has never seen.
+    fn render_onboard(&self, theme: &Theme, busy: bool, cx: &mut Context<Self>) -> AnyElement {
+        let Some(flow) = &self.onboard else {
+            return widgets::section_card(theme)
+                .child(
+                    widgets::card_row(theme, true)
+                        .child(widgets::row_tile(theme, crate::icons::FOLDER))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(widgets::row_title(theme, "Onboard a repo…"))
+                                .child(widgets::meta_line(
+                                    theme,
+                                    vec![
+                                        div()
+                                            .min_w_0()
+                                            .child(SharedString::from(
+                                                "Clone it on the board's device, give it a \
+                                                 space, and route it — in one step",
+                                            ))
+                                            .into_any_element(),
+                                    ],
+                                )),
+                        )
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("onboard-open")
+                                .hover(widgets::ghost_hover(theme))
+                                .when(busy, |el| el.opacity(0.4))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.busy {
+                                        return;
+                                    }
+                                    this.open_onboard(cx);
+                                }))
+                                .child(SharedString::from("Onboard")),
+                        ),
+                )
+                .into_any_element();
+        };
+
+        let mut card = widgets::section_card(theme).child(
+            widgets::card_row(theme, true)
+                .flex_col()
+                .items_start()
+                .gap(px(8.0))
+                .child(widgets::row_title(theme, "Onboard a repo"))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted.opacity(0.65))
+                        .child(SharedString::from(
+                            "The repos the board's GitHub App can see. Onboarding clones on \
+                             the board's device with the board's own credential — this \
+                             machine needs neither a checkout nor a GitHub login.",
+                        )),
+                )
+                .child(div().w_full().child(flow.slug.clone()))
+                .child(div().w_full().child(flow.dir.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(6.0))
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("onboard-submit")
+                                .hover(widgets::ghost_hover(theme))
+                                .when(busy, |el| el.opacity(0.4))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_onboard(None, cx);
+                                }))
+                                .child(SharedString::from("Onboard")),
+                        )
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("onboard-close")
+                                .hover(widgets::ghost_hover(theme))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.onboard = None;
+                                    this.onboarded = None;
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from("Close")),
+                        ),
+                ),
+        );
+
+        if let Some(note) = self.busy_note.clone() {
+            card = card.child(
+                widgets::card_row(theme, false).child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(note),
+                ),
+            );
+        }
+
+        match &flow.repos {
+            None => {
+                card = card.child(
+                    widgets::card_row(theme, false).child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Asking the board what its App can see…")),
+                    ),
+                );
+            }
+            Some(repos) => {
+                if let Some(note) = flow.list_note.clone() {
+                    card = card.child(
+                        widgets::card_row(theme, false).child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .child(note),
+                        ),
+                    );
+                }
+                for (ix, repo) in repos.iter().enumerate() {
+                    card = card.child(self.render_candidate(theme, ix, repo, busy, cx));
+                }
+            }
+        }
+
+        if let Some(done) = &self.onboarded {
+            card = card.child(self.render_onboarded(theme, done));
+        }
+        card.into_any_element()
+    }
+
+    fn render_candidate(
+        &self,
+        theme: &Theme,
+        ix: usize,
+        repo: &Candidate,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let slug: SharedString = repo.slug.clone().into();
+        let note: SharedString = repo.note().into();
+        let on_board = repo.on_board();
+        let pick = repo.slug.clone();
+        widgets::card_row(theme, false)
+            .id(("candidate", ix))
+            .child(widgets::row_tile(theme, crate::icons::GIT_BRANCH))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(widgets::row_title(theme, slug))
+                    .child(widgets::meta_line(
+                        theme,
+                        vec![div().min_w_0().truncate().child(note).into_any_element()],
+                    )),
+            )
+            // A repo already polled and routed keeps its row — "is this one set
+            // up?" is half of why the panel gets opened — but nothing to press.
+            .when(on_board, |el| {
+                el.child(widgets::badge_active(SharedString::from("On the board")))
+            })
+            .when(!on_board, |el| {
+                el.child(
+                    widgets::ghost_action(theme)
+                        .id(("onboard-pick", ix))
+                        .hover(widgets::ghost_hover(theme))
+                        .when(busy, |el| el.opacity(0.4))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.submit_onboard(Some(pick.clone()), cx);
+                        }))
+                        .child(SharedString::from("Onboard")),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// What the last onboard did, step by step — the only record of work that
+    /// happened on a machine the reader may have no other view of.
+    fn render_onboarded(&self, theme: &Theme, done: &Onboarded) -> AnyElement {
+        let mut lines: Vec<String> = vec![
+            format!("clone {} — {}", done.clone.as_str(), done.path),
+            format!("space {} — {}", done.space.as_str(), done.space_name),
+            match &done.adopted {
+                None => "routing unchanged — already polled and routed".to_string(),
+                Some(a) => format!(
+                    "routing wrote{}{}",
+                    if a.wrote_route { " a [[route]]" } else { "" },
+                    if a.wrote_repo { " [github] repos" } else { "" },
+                ),
+            },
+        ];
+        if let Some(p) = &done.preview {
+            lines.push(format!("{} to poll", p.count_phrase()));
+        }
+        lines.extend(done.notes());
+
+        let mut row = widgets::card_row(theme, false)
+            .flex_col()
+            .items_start()
+            .gap(px(4.0))
+            .child(widgets::row_title(theme, done.slug.clone()));
+        for line in lines {
+            row = row.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.65))
+                    .child(SharedString::from(line)),
+            );
+        }
+        row.into_any_element()
     }
 
     fn render_unadopted(

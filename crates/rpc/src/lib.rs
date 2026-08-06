@@ -136,6 +136,30 @@ pub mod methods {
     /// break the config is refused, naming what it would have broken, and the
     /// file is untouched.
     pub const WRITE_BOARD_CONFIG: &str = "WriteBoardConfig";
+    /// Put a repo the board has never seen on the board, in one call (gh#97):
+    /// resolve it against the board's GitHub credential, clone it on *this*
+    /// device with that credential, create the space, and adopt it. Params:
+    /// `{slug, dir?, labels?}` → `Onboarded`.
+    ///
+    /// Forwardable, and that is the whole point: the clone, the space and the
+    /// config all belong to the board's host, and the person onboarding a repo
+    /// is usually sitting at a laptop that is not it — with no GitHub credential
+    /// of its own, which is why even the *resolution* happens over there.
+    ///
+    /// Idempotent at every step: an existing checkout of the same repo is
+    /// reused, an existing space for that path is reused, and a repo already
+    /// polled and routed is left alone. A directory holding something else is
+    /// refused rather than cloned over.
+    pub const ONBOARD_REPO: &str = "OnboardRepo";
+    /// The repos the board's GitHub App can see, and which of them are already
+    /// on the board (gh#97). Params: `{}` → `[{slug, private, archived,
+    /// onBoard, …}]`.
+    ///
+    /// What an "Onboard a repo…" picker offers. Deliberately the App's grant
+    /// rather than the operator's repos: it is exactly the set a clone can
+    /// authenticate for and the sync loop can poll, so a repo missing from it is
+    /// a repo somebody has to go and install the App on.
+    pub const LIST_APP_REPOS: &str = "ListAppRepos";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
