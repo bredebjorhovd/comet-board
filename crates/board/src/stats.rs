@@ -268,6 +268,9 @@ mod tests {
             nudges: 0,
             nudged_at: None,
             overrun_warned_at: None,
+            repo_path: Some("/repo/r".into()),
+            collectable_at: None,
+            collected_at: None,
         }
     }
 

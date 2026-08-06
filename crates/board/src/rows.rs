@@ -129,6 +129,7 @@ mod tests {
                 dispatched_by_pane: Some("chat-parent".into()),
                 base_sha: None,
                 account: None,
+                repo_path: None,
             })
             .unwrap();
         db.set_attempt_pane(a, "chat-1").unwrap();
@@ -158,6 +159,7 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                repo_path: None,
             })
             .unwrap();
         db.close_attempt(first, Outcome::Cancelled).unwrap();
@@ -172,6 +174,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
         })
         .unwrap();
 
@@ -231,6 +234,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: Some("8f2c1d0a7b6e4539".into()),
+            repo_path: None,
         })
         .unwrap();
         let rows = board_rows(&db, &cfg).unwrap();
@@ -264,6 +268,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
         })
         .unwrap();
         assert_eq!(board_rows(&db, &cfg).unwrap()[0].account, None);

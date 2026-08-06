@@ -27,6 +27,7 @@
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
+use crate::gc;
 use crate::log::Logger;
 use crate::model::*;
 use crate::overrun;
@@ -233,6 +234,10 @@ impl SyncEngine {
             self.reconcile_sessions_with(statuses, runtime)?;
         }
         self.rederive_all()?;
+        // After reconciliation, so a checkout freed this cycle starts its
+        // retention clock this cycle; on the interval only, like every other
+        // clocked decision (gh#72).
+        self.collect_worktrees(runtime);
         self.drain_writebacks();
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
         Ok(pulls)
@@ -971,6 +976,131 @@ impl SyncEngine {
         self.enqueue_outcome_note(task, Outcome::Failed, None, Some(&note))?;
         self.log
             .warn(format!("{}: attempt failed — {note}", task.identifier));
+        Ok(())
+    }
+
+    // ---- reclaiming checkouts (gh#72) ------------------------------------
+
+    /// Delete the checkout and local branch of every attempt nobody is coming
+    /// back for, once it has sat unclaimed for `[defaults] retain_worktrees`.
+    ///
+    /// Every dispatch cuts a worktree and a branch, and until this landed
+    /// nothing removed either: settle, orphan, cancel and retry-replace all
+    /// close the attempt row and leave the checkout, so a box running a few
+    /// tasks a day filled up with a full copy of the repo per attempt. The
+    /// decisions are [`gc::standing`] and [`gc::decide`]; this is the sweep
+    /// around them.
+    ///
+    /// Three properties, in the order they matter:
+    ///
+    /// - **Never a live checkout.** A task with any live attempt is skipped
+    ///   whole — retries reuse the branch, so a closed attempt's directory is
+    ///   very often the live one's — and so is a task in review, whose branch a
+    ///   reviewer may check out and whose chat review delivery still matches
+    ///   against this path ([`crate::review`]).
+    /// - **Wall time from when it was freed**, not from when the attempt ended:
+    ///   a pull request open for a fortnight would otherwise be collected the
+    ///   instant it merged. The mark is stamped on one sweep and read on a
+    ///   later one, and a task that comes back to life clears it.
+    /// - **Never silent.** The mark and the collection are both log lines
+    ///   naming the path, so the week between them is visible to somebody who
+    ///   wants the checkout kept — `retain_worktrees = "off"` is the answer,
+    ///   and `doctor` reports the cost of choosing it.
+    ///
+    /// Collecting cannot strand a re-opened attempt, and the two rules are the
+    /// same rule: [`settled::should_reopen`] refuses to re-open on an upstream
+    /// that is final or a task marked done, which is exactly what
+    /// [`gc::Standing::Spent`] requires. A checkout is only ever deleted from
+    /// under an attempt that can no longer come back to life.
+    ///
+    /// Failure is never fatal to the cycle: an error is logged and the attempt
+    /// is left unmarked as collected, so the next sweep tries again.
+    fn collect_worktrees(&self, runtime: Option<&dyn Runtime>) {
+        let Some(retain) = self.cfg.retain_worktrees_secs() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let tasks = match self.db.load_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .error(format!("worktree gc: reading the board: {e}"));
+                return;
+            }
+        };
+        for task in &tasks {
+            for attempt in &task.attempts {
+                if attempt.collected_at.is_some() || attempt.worktree.is_none() {
+                    continue;
+                }
+                let spent = attempt
+                    .collectable_at
+                    .as_deref()
+                    .map(|t| secs_since(t, now).unwrap_or(0));
+                let standing = gc::standing(task, attempt);
+                if let Err(e) = match gc::decide(standing, spent, retain) {
+                    gc::Verdict::Keep => Ok(()),
+                    gc::Verdict::Mark => self.mark_collectable(task, attempt, retain),
+                    gc::Verdict::Unmark => self.db.set_attempt_collectable(attempt.id, false),
+                    gc::Verdict::Collect => self.collect_one(runtime, task, attempt),
+                } {
+                    self.log.warn(format!(
+                        "{}: worktree gc on attempt {}: {e:#}",
+                        task.identifier, attempt.id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Start the retention clock, and say so — the one warning anybody gets
+    /// before a checkout is deleted a week later.
+    fn mark_collectable(&self, task: &Task, attempt: &Attempt, retain: u64) -> Result<()> {
+        self.db.set_attempt_collectable(attempt.id, true)?;
+        self.log.info(format!(
+            "{}: {} is finished with — its checkout {} goes in {}",
+            task.identifier,
+            attempt
+                .branch
+                .as_deref()
+                .unwrap_or("the attempt's own branch"),
+            attempt.worktree.as_deref().unwrap_or("(none)"),
+            gc::human_window(retain),
+        ));
+        Ok(())
+    }
+
+    /// The window ran out: hand the checkout back to the engine, which owns
+    /// worktrees, and record that it is gone.
+    ///
+    /// A cycle run without a runtime marks and unmarks but deletes nothing —
+    /// the same split the duration cap makes, and the deliberate one here: only
+    /// the process that owns the worktrees may remove one, and everything else
+    /// is welcome to keep the clock.
+    fn collect_one(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+    ) -> Result<()> {
+        let Some(worktree) = attempt.worktree.as_deref() else {
+            return Ok(());
+        };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+        runtime.reclaim_worktree(
+            attempt.repo_path.as_deref(),
+            worktree,
+            attempt.branch.as_deref(),
+        )?;
+        self.db.set_attempt_collected(attempt.id)?;
+        self.log.info(format!(
+            "{}: reclaimed {} and branch {}",
+            task.identifier,
+            worktree,
+            attempt.branch.as_deref().unwrap_or("(none recorded)"),
+        ));
         Ok(())
     }
 
@@ -1947,6 +2077,7 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                repo_path: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();
@@ -1966,6 +2097,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
         })
         .unwrap()
     }
@@ -4246,6 +4378,240 @@ max_duration = "{max_duration}"
             "the remote-relative count is fooled by unpushed work — this is the bug"
         );
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- reclaiming checkouts (gh#72) ------------------------------------
+
+    /// A runtime that records what the sweep asked it to delete, and can be
+    /// told to refuse — the two things the gc does to the world outside the
+    /// database.
+    /// One reclaim call, as the sweep made it: repo, checkout, branch.
+    type Reclaimed = (Option<String>, String, Option<String>);
+
+    #[derive(Default)]
+    struct Collector {
+        reclaimed: std::cell::RefCell<Vec<Reclaimed>>,
+        refuse: bool,
+    }
+
+    impl Runtime for Collector {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("the gc never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!("the gc never talks to a chat")
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("the gc never cancels")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+        fn reclaim_worktree(
+            &self,
+            repo_path: Option<&str>,
+            worktree: &str,
+            branch: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.reclaimed.borrow_mut().push((
+                repo_path.map(str::to_string),
+                worktree.to_string(),
+                branch.map(str::to_string),
+            ));
+            if self.refuse {
+                anyhow::bail!("git said no");
+            }
+            Ok(())
+        }
+    }
+
+    /// A closed attempt with a checkout, on a task whose issue is closed
+    /// upstream — the shape everything below varies from.
+    fn spent_attempt(e: &SyncEngine) -> i64 {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        let a = dispatch(e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET repo_path = '/repo/widget' WHERE id = ?1",
+                rusqlite::params![a],
+            )
+            .unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        a
+    }
+
+    /// Move the retention clock back, as wall time would have.
+    fn age_mark(e: &SyncEngine, attempt_id: i64, secs: i64) {
+        let stamp = crate::db::rfc3339(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET collectable_at = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, stamp],
+            )
+            .unwrap();
+    }
+
+    fn attempt_row(e: &SyncEngine, id: i64) -> Attempt {
+        e.db.attempts_for("linear:LIN-142")
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_finished_attempts_checkout_is_marked_then_collected_a_week_later() {
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+
+        // The sweep that finds it finished only starts the clock.
+        e.collect_worktrees(Some(&gc));
+        let row = attempt_row(&e, a);
+        assert!(row.collectable_at.is_some(), "the clock has to start");
+        assert!(row.collected_at.is_none());
+        assert!(gc.reclaimed.borrow().is_empty(), "nothing goes on day one");
+
+        // Six days in, still nothing.
+        age_mark(&e, a, 6 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty(), "the window is a week");
+
+        age_mark(&e, a, 7 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(
+            gc.reclaimed.borrow().as_slice(),
+            [(
+                Some("/repo/widget".to_string()),
+                "/wt/board-lin-142".to_string(),
+                Some("board/lin-142".to_string()),
+            )],
+            "the repo, the checkout and the branch the board cut"
+        );
+        assert!(attempt_row(&e, a).collected_at.is_some());
+
+        // And it is not offered again — the row says it is gone.
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(gc.reclaimed.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_live_attempt_is_never_collected_however_finished_the_task_looks() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
+        let gc = Collector::default();
+
+        // However long the board has been up, an agent's checkout is untouched
+        // and its clock never even starts.
+        for _ in 0..3 {
+            e.collect_worktrees(Some(&gc));
+            age_mark(&e, a, 30 * 86_400);
+        }
+        assert!(gc.reclaimed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_retry_dispatched_beside_a_marked_attempt_stops_the_clock() {
+        // The retry reuses the branch and lands in the same directory, so the
+        // closed attempt's checkout is the live one's. Deleting it would throw
+        // away the commits the retry is meant to continue.
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        e.collect_worktrees(Some(&gc));
+        age_mark(&e, a, 30 * 86_400);
+
+        dispatch(&e, "linear:LIN-142", "chat-10");
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty(), "a live retry holds it");
+        assert!(
+            attempt_row(&e, a).collectable_at.is_none(),
+            "and the window starts over when the retry ends"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_back_in_review_stops_the_clock() {
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        e.collect_worktrees(Some(&gc));
+        assert!(attempt_row(&e, a).collectable_at.is_some());
+
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET pr_open = 1 WHERE id = 'linear:LIN-142'",
+                [],
+            )
+            .unwrap();
+        age_mark(&e, a, 30 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(
+            gc.reclaimed.borrow().is_empty(),
+            "review holds the checkout"
+        );
+        assert!(attempt_row(&e, a).collectable_at.is_none());
+    }
+
+    #[test]
+    fn retention_off_keeps_every_checkout() {
+        let mut e = engine(None);
+        e.cfg.defaults.retain_worktrees = "off".into();
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        e.collect_worktrees(Some(&gc));
+        assert!(
+            attempt_row(&e, a).collectable_at.is_none(),
+            "the clock never starts"
+        );
+        // Not even one left over from before the operator turned it off.
+        age_mark(&e, a, 365 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_removal_that_fails_is_tried_again_next_cycle() {
+        // The stamp is what says the disk space is back. A `git worktree
+        // remove` that failed must leave the row uncollected, or the board
+        // would report space it never reclaimed.
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector {
+            refuse: true,
+            ..Default::default()
+        };
+        e.collect_worktrees(Some(&gc));
+        age_mark(&e, a, 30 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(attempt_row(&e, a).collected_at.is_none());
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(gc.reclaimed.borrow().len(), 2, "and again the cycle after");
+    }
+
+    #[test]
+    fn a_cycle_without_a_runtime_marks_but_never_deletes() {
+        // Only the process that owns the worktrees may remove one; anything
+        // else running the cycle is welcome to keep the clock.
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        e.collect_worktrees(None);
+        age_mark(&e, a, 30 * 86_400);
+        e.collect_worktrees(None);
+        assert!(attempt_row(&e, a).collectable_at.is_some());
+        assert!(attempt_row(&e, a).collected_at.is_none());
     }
 
     // ---- the full cycle --------------------------------------------------

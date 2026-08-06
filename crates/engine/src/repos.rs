@@ -65,11 +65,12 @@ pub(crate) fn home_dir() -> PathBuf {
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
 /// worktrees are user-facing working checkouts. `COMET_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
+///
+/// The rule itself lives in `comet_board::config` because the board reclaims
+/// and reports on these directories (gh#72) and a second copy of it would mean
+/// `doctor` measuring a directory nothing writes to.
 fn default_worktrees_root() -> PathBuf {
-    std::env::var_os("COMET_WORKTREES_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".comet-native").join("worktrees"))
+    comet_board::config::worktrees_root()
 }
 
 struct ReposInner {
@@ -750,14 +751,29 @@ impl Repos {
     }
 
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when comet created it (`comet/…`) — the
-    /// user may have checked out their own branch inside the worktree.
+    ///
+    /// The branch goes only when it is ours to delete, which is two cases:
+    ///
+    /// - the worktree is on a `comet/…` branch — one this module generated, so
+    ///   nothing else named it;
+    /// - `branch` names the branch whose creator vouches for it, and the
+    ///   worktree is still on that branch. This is the board's case (gh#72):
+    ///   its branches come from `routing.toml`'s `branch_template` and are
+    ///   `board/…` by default, so the `comet/` test alone left every dispatched
+    ///   branch behind forever.
+    ///
+    /// Anything else is left alone — the user may have checked out their own
+    /// branch inside the worktree, and that one is not ours. A checkout that is
+    /// already gone cannot be asked what it was on, so a vouched-for `branch`
+    /// is taken at its word there: the caller created it, and git still refuses
+    /// to delete a branch checked out in some other worktree.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
+        branch: Option<&str>,
     ) -> Result<(), EngineError> {
-        let branch = if worktree_path.exists() {
+        let current = if worktree_path.exists() {
             self.current_branch(worktree_path).await.unwrap_or_default()
         } else {
             String::new()
@@ -780,8 +796,15 @@ impl Repos {
             }
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("comet/") {
-            let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
+        // `current` is empty when the checkout was already gone (or sat on a
+        // detached HEAD), which is the case the vouched-for branch exists for.
+        let ours = if current.starts_with("comet/") {
+            Some(current.as_str())
+        } else {
+            branch.filter(|b| current.is_empty() || current == *b)
+        };
+        if let Some(ours) = ours {
+            let _ = self.git(&["branch", "-D", ours], Some(repo_path)).await;
         }
         Ok(())
     }

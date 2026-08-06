@@ -10,6 +10,7 @@
 
 use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
 use crate::db::Db;
+use crate::gc;
 use crate::git_credentials;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
@@ -61,6 +62,15 @@ pub fn doctor(
             Err(e) => format!("{e:#}"),
         },
     });
+
+    // What the attempts have left on the disk (gh#72). Beside the database
+    // check because it is the same question — what is this box holding — and
+    // the answer is read partly out of that database.
+    checks.push(worktrees_check(
+        paths,
+        &crate::config::worktrees_root(),
+        db_ok.as_ref().ok(),
+    ));
 
     checks.push(Check {
         name: "LINEAR_API_KEY".into(),
@@ -317,6 +327,64 @@ pub fn doctor(
     checks.push(dispatched_push_check(paths));
 
     Ok(checks)
+}
+
+/// What the attempts have left on the disk, and what will reclaim it (gh#72).
+///
+/// The check exists because the failure it reports is invisible until it is
+/// terminal: every dispatch cuts a full checkout plus a branch, nothing removed
+/// either before gh#72, and the first symptom on a busy box is a disk with no
+/// space left in the middle of somebody's run. Three numbers answer it — how
+/// many checkouts, how much disk, and how many of them the board is still
+/// holding open (a live attempt, a pull request in review, an issue still
+/// owed).
+///
+/// `ok` is false only when the root is genuinely large ([`gc::WARN_BYTES`] /
+/// [`gc::WARN_CHECKOUTS`]); a board holding a week of checkouts on purpose is
+/// working exactly as configured and must not fail the report for it. The
+/// retention window is named either way, because `off` is a choice whose cost
+/// is this line.
+fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Check {
+    let usage = gc::usage(root);
+    let about = format!(
+        "{} checkout(s), {}{} in {}",
+        usage.checkouts,
+        if usage.truncated { "≥ " } else { "" },
+        gc::human_bytes(usage.bytes),
+        root.display(),
+    );
+    // What the board still has a claim on. Not the same as "on disk": a
+    // checkout cut by comet itself, or one left by an attempt whose row has
+    // been reaped, is on the disk and in nobody's records.
+    let held = db.and_then(|db| db.collectable_attempts().ok()).map(|a| {
+        let marked = a.iter().filter(|a| a.collectable_at.is_some()).count();
+        format!(
+            "{} tracked by the board, {marked} on the retention clock",
+            a.len()
+        )
+    });
+    let retention = match RoutingConfig::load_unvalidated(&paths.routing()) {
+        Ok(cfg) => match cfg.retain_worktrees_secs() {
+            Some(secs) => format!(
+                "collected {} after their task leaves the board",
+                gc::human_window(secs)
+            ),
+            None => "retain_worktrees = off — nothing here is ever collected".to_string(),
+        },
+        // A routing.toml that will not parse is the loud check above; here it
+        // only means the window cannot be quoted.
+        Err(_) => "retention unknown — routing.toml did not parse".to_string(),
+    };
+    let detail = [Some(about), held, Some(retention)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Check {
+        name: "worktrees".into(),
+        ok: !usage.alarming(),
+        detail,
+    }
 }
 
 /// Can a dispatched agent on this box push and open a pull request (gh#68)?
@@ -1197,6 +1265,38 @@ mod tests {
     /// called.
     fn rest_on(app: std::rc::Rc<crate::sources::github_app::AppAuth>) -> HttpRest {
         HttpRest::over(Box::new(NoWire), TokenProvider::App(app))
+    }
+
+    /// The disk report exists to make gh#72's leak visible before it is
+    /// terminal, so it has to say all three things: what is there, what the
+    /// board still tracks, and what will ever remove it.
+    #[test]
+    fn the_worktree_check_counts_the_disk_and_names_the_retention() {
+        let (_d, p) = tmp();
+        let root = _d.path().join("worktrees");
+        for name in ["board-gh-7-widget", "board-lin-1-widget"] {
+            let dir = root.join("widget").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("big"), vec![b'x'; 2048]).unwrap();
+        }
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
+
+        let check = worktrees_check(&p, &root, None);
+        assert!(check.ok, "two checkouts is not a problem: {}", check.detail);
+        assert!(check.detail.contains("2 checkout(s)"), "{}", check.detail);
+        assert!(check.detail.contains("4.0 KiB"), "{}", check.detail);
+        assert!(check.detail.contains("7d"), "{}", check.detail);
+    }
+
+    /// Turning collection off is a choice; the check is where its cost shows.
+    #[test]
+    fn retention_off_is_said_out_loud() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"off\"\n").unwrap();
+        let check = worktrees_check(&p, &_d.path().join("nothing-here"), None);
+        assert!(check.detail.contains("ever collected"), "{}", check.detail);
+        // An empty root is still not a failure — nothing has been dispatched.
+        assert!(check.ok);
     }
 
     #[test]
