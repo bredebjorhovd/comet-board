@@ -234,6 +234,38 @@ impl Runtime for CometRuntime {
         Ok(self.workspace.doc().chat(chat_id)?.and_then(|c| c.cwd))
     }
 
+    /// Hand a finished attempt's checkout back (gh#72): remove the worktree,
+    /// prune the registration, delete the branch the board cut.
+    ///
+    /// The repo is what the board recorded at dispatch. An attempt from before
+    /// that column existed has none, so it is derived from the checkout's own
+    /// common git dir — which works precisely while the checkout is still
+    /// there, and that is the case worth reclaiming. A checkout that is gone
+    /// *and* whose repo is unknown leaves nothing to do but say so: there is no
+    /// repo to run `branch -D` in.
+    fn reclaim_worktree(
+        &self,
+        repo_path: Option<&str>,
+        worktree: &str,
+        branch: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let worktree = Path::new(worktree);
+        let repo = repo_path
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.join(".git").exists())
+            .or_else(|| repo_of_checkout(worktree))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no repo recorded for {} and none derivable from it — \
+                     nothing to remove it from",
+                    worktree.display()
+                )
+            })?;
+        self.handle
+            .block_on(self.repos.delete_worktree(&repo, worktree, branch))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>> {
         // The journal's last event is a `Done` exactly when no run is live in
         // the chat — every teardown path writes one (including boot recovery,
@@ -248,4 +280,28 @@ impl Runtime for CometRuntime {
             _ => None,
         })
     }
+}
+
+/// The repo a linked worktree belongs to, asked of the checkout itself.
+///
+/// The fallback for attempts dispatched before the board recorded the repo
+/// (gh#72). A linked worktree's *common* git dir is the primary checkout's
+/// `.git`, so its parent is the repo root — the same relationship
+/// `crate::adopt`-side code reads to tell a worktree from a project.
+fn repo_of_checkout(worktree: &Path) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            &worktree.to_string_lossy(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    common.parent().map(|p| p.to_path_buf())
 }

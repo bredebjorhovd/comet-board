@@ -183,6 +183,14 @@ branch_template = "board/{{identifier_lower}}"
 # `origin/develop`) to pin one, or `HEAD` to branch from the checkout without
 # fetching — which is what a repo with no remote needs.
 base = "origin/HEAD"
+# How long a finished attempt's checkout — and the branch under it — is kept
+# before the board deletes both. The clock starts when the task leaves the board
+# (merged, closed upstream, marked done), never while an attempt is live or a
+# pull request is open, so a week here is a week to go and look at what an agent
+# actually did. `off` keeps every checkout forever, which is what a box does
+# until somebody notices the disk; `comet-board doctor` reports the running cost
+# either way.
+retain_worktrees = "7d"
 # When an agent releases work through the board, prompt it in its own chat once
 # that work settles. Off, because an orchestrator woken by every child it
 # released cannot hold a train of thought. Turn it on if you dispatch from
