@@ -1225,6 +1225,10 @@ impl Shell {
                     self.members_page = Some(cx.new(|cx| MembersPage::new(state, cx)));
                 }
                 match &self.members_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Routing => {
                 if self.routing_page.is_none() {
                     let state = self.state.clone();
