@@ -66,7 +66,22 @@ comet tui         # terminal UI, attaches to the daemon
 comet daemon start|stop|restart|status
 ```
 
-On macOS: build `comet` from source, then `comet daemon install` (launchd).
+## macOS
+
+Download the `.dmg` from [the latest release](https://github.com/bredebjorhovd/comet-board/releases),
+drag `Comet.app` to Applications, then — because the build is not yet signed
+with an Apple Developer ID — clear the download quarantine once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Comet.app
+```
+
+Without that step macOS refuses to open the app and says nothing useful about
+why. [docs/macos-install.md](docs/macos-install.md) explains what is going on
+and what removes the step for good.
+
+To run the engine as a background service instead, build `comet` from source
+and `comet daemon install` (launchd).
 
 ---
 

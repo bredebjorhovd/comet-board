@@ -310,9 +310,12 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   attachment UI (engine upload RPCs exist), Cursor harness.
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
-  (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: prefers-reduced-motion, parent-PID watchdog,
-  edge production deploy.
+  (`scripts/package-linux.sh` + release profile), macOS packaging (`scripts/package-macos.sh`
+  + `dist/macos/`, executed — dmg with app bundle, icns, `/Applications` symlink).
+  Gaps: prefers-reduced-motion, parent-PID watchdog, edge production deploy, and a
+  Developer ID for macOS — releases are ad-hoc signed, so a downloaded `Comet.app` is
+  Gatekeeper-rejected until the user clears quarantine ([docs/macos-install.md](docs/macos-install.md));
+  the signing + notarization path in `release.yml` is written and waits only on the cert.
 
 ## 9. Open questions (tracked, non-blocking)
 
