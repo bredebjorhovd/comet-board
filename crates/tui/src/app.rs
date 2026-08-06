@@ -798,6 +798,7 @@ impl App {
                 Vec::new()
             }
             Action::BoardEnter => self.board_enter(),
+            Action::BoardRetry => self.board_retry(),
             Action::BoardCycleFilter => {
                 if let Some(message) = self.board.cycle_filter() {
                     self.notify(message);
@@ -970,8 +971,8 @@ impl App {
         }
     }
 
-    /// `enter` on the board: dispatch a ready task, fold a section header, or
-    /// open a running task's chat.
+    /// `enter` on the board: dispatch a ready task, retry a failed one, fold a
+    /// section header, or open a running task's chat.
     fn board_enter(&mut self) -> Effects {
         if let Some(state) = self.board.on_section() {
             self.board.toggle_collapsed(state);
@@ -981,20 +982,12 @@ impl App {
             return Vec::new();
         };
         match row.state() {
-            BoardState::Ready => {
-                if row.dispatchable {
-                    vec![Command::Dispatch {
-                        task_id: row.id.clone(),
-                        identifier: row.identifier.clone(),
-                    }]
-                } else {
-                    self.notify(format!(
-                        "{} has no route — it cannot be dispatched",
-                        row.identifier
-                    ));
-                    Vec::new()
-                }
-            }
+            // A failed attempt is already closed, so retrying one is an
+            // ordinary release — which is why `enter` may do it (gh#73), the
+            // same rule the desktop panel follows. A *blocked* row's retry
+            // kills a live agent, and that is `R`, not something enter should
+            // do by accident.
+            BoardState::Ready | BoardState::Failed => self.board_release(false),
             // herdr-board's `g`: a running task's chat is where the work is,
             // and comet's answer to a pane is a chat.
             BoardState::Working | BoardState::Blocked => {
@@ -1016,6 +1009,56 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// `R` on the board: retry the selected row (gh#73) — the desktop panel's
+    /// Retry chip, which the pane had no answer to.
+    ///
+    /// On a blocked row this replaces the live attempt: the agent is alive and
+    /// waiting on input, so the one-live-attempt rule would refuse a plain
+    /// release, and ending it is what a retry means. On a failed or ready row
+    /// nothing is live and it is an ordinary dispatch. Anything else keeps its
+    /// attempt and says so rather than quietly cancelling someone's work.
+    fn board_retry(&mut self) -> Effects {
+        if self.board.on_section().is_some() {
+            return Vec::new();
+        }
+        let Some(row) = self.board.selected_task() else {
+            return Vec::new();
+        };
+        match row.state() {
+            BoardState::Blocked => self.board_release(true),
+            BoardState::Ready | BoardState::Failed => self.board_release(false),
+            state => {
+                self.notify(format!(
+                    "{} — {}; R retries a blocked or failed task",
+                    row.identifier,
+                    state.as_str()
+                ));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Release the selected row, replacing its live attempt or not. The route
+    /// check is here rather than at each caller: an unrouted row cannot be
+    /// dispatched however you asked for it.
+    fn board_release(&mut self, replace: bool) -> Effects {
+        let Some(row) = self.board.selected_task() else {
+            return Vec::new();
+        };
+        if !row.dispatchable {
+            let identifier = row.identifier.clone();
+            self.notify(format!(
+                "{identifier} has no route — it cannot be dispatched"
+            ));
+            return Vec::new();
+        }
+        vec![Command::Dispatch {
+            task_id: row.id.clone(),
+            identifier: row.identifier.clone(),
+            replace,
+        }]
     }
 
     // -----------------------------------------------------------------------
@@ -1472,6 +1515,7 @@ impl App {
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
             account: None,
+            push_repo: None,
         });
         effects.push(Command::StartSession(Box::new(crate::link::StartSession {
             chat_id,
@@ -2380,6 +2424,7 @@ impl App {
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
             account: None,
+            push_repo: None,
         });
         config.reasoning = Some(level);
         let Ok(value) = serde_json::to_value(&config) else {
@@ -2411,6 +2456,7 @@ impl App {
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
             account: None,
+            push_repo: None,
         });
         config.model = Some(model.id.clone());
         // Keep the reasoning level only if the new model offers it.
@@ -3396,9 +3442,14 @@ mod tests {
         app.board.selected = Some("1".into());
         let effects = app.act(Action::BoardEnter);
         match effects.first() {
-            Some(Command::Dispatch { task_id, identifier }) => {
+            Some(Command::Dispatch {
+                task_id,
+                identifier,
+                replace,
+            }) => {
                 assert_eq!(task_id, "1");
                 assert_eq!(identifier, "gh#1");
+                assert!(!replace, "a ready row holds no attempt to replace");
             }
             other => panic!("expected a dispatch, got {other:?}"),
         }
@@ -3409,6 +3460,55 @@ mod tests {
         assert!(
             app.notice.as_ref().is_some_and(|n| n.text.contains("no route")),
             "the reason must be said"
+        );
+    }
+
+    /// `R` is the pane's answer to the desktop panel's Retry chip (gh#73): on a
+    /// blocked row it replaces the live attempt, which is the one thing
+    /// cancel-then-dispatch cannot do atomically.
+    #[test]
+    fn r_retries_and_only_a_blocked_row_replaces_its_live_attempt() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        let mut blocked = board_row("1", BoardState::Blocked);
+        blocked.chat_id = Some("chat-1".into());
+        app.apply(Update::Board(vec![
+            blocked,
+            board_row("2", BoardState::Failed),
+            board_row("3", BoardState::Working),
+        ]));
+
+        app.board.selected = Some("1".into());
+        match app.act(Action::BoardRetry).first() {
+            Some(Command::Dispatch { task_id, replace, .. }) => {
+                assert_eq!(task_id, "1");
+                assert!(replace, "the blocked row's live attempt has to end first");
+            }
+            other => panic!("expected a replacing dispatch, got {other:?}"),
+        }
+
+        // A failed attempt is already closed — replacing nothing would be a lie.
+        app.board.selected = Some("2".into());
+        match app.act(Action::BoardRetry).first() {
+            Some(Command::Dispatch { task_id, replace, .. }) => {
+                assert_eq!(task_id, "2");
+                assert!(!replace);
+            }
+            other => panic!("expected a plain dispatch, got {other:?}"),
+        }
+
+        // `enter` retries a failed row too, as the desktop panel's does.
+        assert!(matches!(
+            app.act(Action::BoardEnter).first(),
+            Some(Command::Dispatch { replace: false, .. })
+        ));
+
+        // A working row keeps its agent: retrying it is not `R`'s to decide.
+        app.board.selected = Some("3".into());
+        assert!(app.act(Action::BoardRetry).is_empty());
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.text.contains("working")),
+            "the refusal names the state"
         );
     }
 

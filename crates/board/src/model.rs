@@ -396,6 +396,11 @@ pub struct Attempt {
     /// transition only, which is what lets the upstream notice be one comment
     /// per block rather than one per attempt or one every thirty seconds.
     pub blocked_count: i64,
+    /// When the board told this attempt's chat it had run past its route's
+    /// `max_duration` (gh#70). `None` is "not warned" — every attempt gets one
+    /// warning and a grace period before the cap closes it, so this is also
+    /// what says whether the grace clock has started. Cleared by a re-open.
+    pub overrun_warned_at: Option<String>,
 }
 
 impl Attempt {

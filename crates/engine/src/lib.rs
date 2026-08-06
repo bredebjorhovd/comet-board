@@ -20,6 +20,8 @@ pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod org_devices;
+pub mod push_credentials;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -38,6 +40,7 @@ pub use board_runtime::CometRuntime;
 pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
+pub use org_devices::{ORG_DEVICES_DOC_ID, OrgDevices, OrgDevicesConfig};
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -578,6 +581,20 @@ impl Engine {
                 core.agent_accounts.clone(),
                 tokio::runtime::Handle::current(),
             ));
+            // A dispatched agent pushes as the board's GitHub App rather than
+            // as the box user (gh#68) — wired here rather than in the core
+            // because it is the board's credential, and a device with no board
+            // has none of this. Resolving the paths is the only fallible part,
+            // and it fails the same way the board itself does.
+            match comet_board::config::Paths::under(&config.data_dir) {
+                Ok(paths) => core.sessions.set_push_credentials(Arc::new(
+                    push_credentials::PushCredentials::detect(paths),
+                )),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "board directories unreadable — dispatched agents will push with this device's git credentials"
+                ),
+            }
             match board::BoardService::spawn(
                 &config.data_dir,
                 sessions_watch,

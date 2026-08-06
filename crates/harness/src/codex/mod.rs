@@ -233,6 +233,9 @@ impl Harness for CodexHarness {
         if let Some(account) = &controls.account {
             account.apply(&mut cmd, HarnessId::Codex);
         }
+        if let Some(push) = &controls.push {
+            push.apply(&mut cmd);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -400,6 +403,9 @@ async fn run_session(session: Session) {
         interrupt,
         chat_id: _,
         account: _,
+        // Both are spent at spawn: the account picked the config dir, the
+        // credentials are already on the child.
+        push: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

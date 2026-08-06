@@ -268,6 +268,7 @@ mod tests {
             nudges: 0,
             nudged_at: None,
             blocked_count: 0,
+            overrun_warned_at: None,
         }
     }
 

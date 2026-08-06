@@ -62,6 +62,7 @@ fn fake_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         interrupt: token.clone(),
         chat_id: None,
         account: None,
+        push: None,
     };
     (controls, steer_tx, token)
 }
@@ -168,6 +169,43 @@ async fn serve_exit_mid_run_still_reports_errored_and_reaps() {
             assert!(
                 error.contains("exit code 1"),
                 "crash message should carry the real exit status: {error}"
+            );
+        }
+        other => panic!("expected Errored Done with crash message, got {other:?}"),
+    }
+    assert_serve_reaped(&dir).await;
+}
+
+/// Regression for gh#79: a dying serve's session goes idle without settling its
+/// assistant message, and the exit lands in the same instant — the stall path
+/// (gh#37) and the child-exit path race, and the stall usually wins on a fast
+/// host. The status is Errored either way, but the message is the diagnosis a
+/// human reads: it must carry the real exit status, not "went idle" (which
+/// sends them after a live-but-stuck server that isn't there).
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_racing_serve_exit_reports_the_exit_status_not_the_stall() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, steer, _token) = fake_controls();
+    drop(steer); // close the mailbox so the run settles after its turn
+    let events = run_to_end(
+        &harness(),
+        fake_request("scenario:idle-then-crash", &dir),
+        controls,
+    )
+    .await;
+
+    let done = events.last().expect("terminal Done");
+    match done {
+        AgentEvent::Done {
+            status,
+            error: Some(error),
+            ..
+        } => {
+            assert_eq!(*status, DoneStatus::Errored, "{events:?}");
+            assert!(
+                error.contains("exit code 1"),
+                "the dead serve's exit status beats the stall wording: {error}"
             );
         }
         other => panic!("expected Errored Done with crash message, got {other:?}"),
@@ -334,6 +372,7 @@ fn real_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         interrupt: token.clone(),
         chat_id: None,
         account: None,
+        push: None,
     };
     (controls, steer_tx, token)
 }

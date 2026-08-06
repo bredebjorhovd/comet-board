@@ -61,6 +61,10 @@ nearly verbatim — it never depended on herdr:
   on a chat that was *seen working* — a chat with no session row yet is
   indistinguishable from a dispatch whose first run has not started, and the
   verdict on those waits for H2's `chat_alive`.
+- `crates/board/src/overrun.rs` — **new** (H10, gh#70): the wall-clock cap on
+  a live attempt, pure. Within / warn / cancel, plus the grace the warning
+  buys. The machinery is `sync.rs`'s `enforce_duration_cap`, on the interval
+  reconcile — the same clock orphaning rides.
 - `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
@@ -176,6 +180,26 @@ two config-dir variables are not interchangeable.
 All four are relay-forwardable (H9): `targetDeviceId` = the box, and a
 teammate's laptop reads and drives the box's board without hosting one.
 
+### A teammate's view of the board (gh#66)
+
+A second person in the org gets there through three org gates, all at the edge:
+
+1. **They see the box.** Device rows are published to an org-wide registry
+   (`orgdev1/{orgId}`) alongside the per-user workspace doc, so `WatchDevices`
+   on a teammate's laptop lists the box — which is what the pane's host sweep
+   walks to find a board at all.
+2. **They may relay to it.** A device room admits any member of the org that
+   claimed it (as a client; only the box's own backend may host it), so the
+   forwarded board RPCs reach it.
+3. **They may open its chats.** A dispatch marks its chat shared with the org
+   (`POST /share/{chatId}`), which is what lets a teammate open the transcript
+   and steer the agent. Chats nobody shared stay private to their owner, board
+   or not — being in the org does not make someone's own sessions readable.
+
+The chat still RUNS on the box: its session doc names the hosting device, so a
+teammate's engine syncs and writes the doc (a steer is a command entry in it)
+without ever executing the work itself.
+
 ### GitHub App auth (gh#58)
 
 The board takes **either** a personal access token or a GitHub App, and prefers
@@ -232,10 +256,8 @@ written into `.git/config` — it expires in an hour and the checkout does not.
 the token to the pipe git is holding. Nothing lands in argv, in `.git/config`,
 or in the environment — all three are readable by other processes on a box that,
 since #55, several people drive. The box's own credential helper is switched off
-for the push, so an hourly token cannot end up cached in the keychain. Nothing
-the board owns runs `git push` today (the agent in the pane does, with the
-device's git credentials); handing this to a dispatched agent means threading it
-through the harness env and is its own change.
+for the push, so an hourly token cannot end up cached in the keychain. Who runs
+that push is H10 below.
 
 Operator work, not the agent's: register the App, set **Issues: RW, Pull
 requests: RW, Contents: RW, Metadata: R** (Contents write is what `merge_pr`'s
@@ -333,9 +355,10 @@ checkout.
 ### H6 — `comet-board` CLI — **done**
 Landed as `apps/board-cli` (the `comet-board` binary H8 started with
 `doctor`/`init`/`adopt`), grown into the full surface — `list [--state
---source --json]`, `dispatch --task`, `cancel --task`, `wait`, `new`, `stats`
-— speaking the existing typed RPC to the local IPC port exactly as `comet-tui`
-attaches. `apps/board-cli/src/ops.rs` is the agent-facing half:
+--source --json]`, `dispatch --task`, `retry --task` (H11), `cancel --task`,
+`wait`, `new`, `stats` — speaking the existing typed RPC to the local IPC port
+exactly as `comet-tui` attaches, at the board host named by `--device` (H11).
+`apps/board-cli/src/ops.rs` is the agent-facing half:
 - `list --json` prints herdr-board's contract verbatim, modulo the two renames
   the port dictates (`pane_id` → `chat_id`, `dispatched_by_pane` →
   `dispatched_by_chat`). The shape lives in `comet_proto::view::board::TaskRow`
@@ -375,8 +398,9 @@ section of `render.rs`) plus the shared derivations in `crates/proto/src/view/bo
 - Glyph-carried state — `▲ ● ▸ ✓ ✕ ·` — with the herdr-board colour mapping
   (blocked/failed share red, working amber, review the accent) carried on
   `Theme::board_state`, which survives `NO_COLOR` exactly as herdr's did.
-- `enter` dispatches a ready row (the operator's dispatch, so no `via`), opens
-  a working/blocked row's chat, and folds section headers.
+- `enter` dispatches a ready row (the operator's dispatch, so no `via`), retries
+  a failed one (H11), opens a working/blocked row's chat, and folds section
+  headers. `R` retries, replacing a blocked row's live attempt (H11).
 - The `f` / `/` / `F` filter cycle, with the `/` field replacing the footer and
   the filter's label holding the header corner.
 - The derivations live in `comet_proto::view::board` — `Filter`, `sections`,
@@ -430,7 +454,135 @@ model catalog a dispatch picks from has to be the host's.
 Still one host device by design: moving board rows into the workspace doc is a
 different decision, and one host is correct while one box hosts the board.
 
-### H10 — Notifications: blocked has to reach a human — **done** (gh#71)
+### H10 — Wall-clock cap on an attempt — **done** (gh#70)
+Landed as `crates/board/src/overrun.rs` (the pure decision) plus
+`SyncEngine::enforce_duration_cap` in `sync.rs`, with `max_duration` on
+`[defaults]` (2h) and per `[[route]]`.
+
+Nothing bounded a *running* attempt before this. No run-duration, token or
+cost cap existed anywhere; `attempts.started_at` was stored and read by
+nobody. The engine's stall watchdog (`sessions.rs`) hard-stops only a run that
+emits nothing — its silence-after-output tier is advisory by design — so an
+agent looping and talking ran until somebody looked. The same clock closes the
+stranded-`working` row at the other end: an engine crash past its revival
+budget settles the chat `Idle`, and with no commits `settled::decide` returns
+`StayLive(NoArtifacts)`; orphaning fires only on a *missing* session row, and
+that one exists. A dispatch whose brief never reached a chat (no session, no
+`saw_working`, deliberately left alone by H2) is closed by the same clock.
+
+The shape:
+- **Warn, then cancel.** Past the cap, one prompt into the chat naming the age,
+  the cap and the deadline, plus a log line — the stamp goes on the attempt
+  whether or not delivery succeeded, so a dead chat cannot buy an eternal
+  reprieve. When the grace expires, the chat is interrupted and archived and
+  the attempt closes `failed` with an upstream comment naming the timeout
+  (`enqueue_outcome_note` — `failed` alone reads as a dispatch that never
+  produced an agent). `failed`, not `cancelled`: nobody chose this, and
+  `cancelled` would derive the issue back to `ready` as if nothing had run.
+- **Grace** is a sixth of the cap, capped at ten minutes and floored at two
+  sync intervals — long enough to commit and open a PR, and never shorter than
+  the interval that has to notice it.
+- **Settle beats cap.** The check runs after `maybe_settle`, so an agent that
+  takes the warning and finishes inside its grace closes `done` on its
+  artifacts.
+- **Wall time.** On the interval reconcile only, exactly as orphaning is: a
+  burst of watch events must not age an attempt faster than the clock.
+- **Every live attempt, whatever its status.** `blocked` holds a chat and a
+  concurrency slot as surely as `working`. The cap bounds the attempt; which
+  way it got stuck is the log line's business.
+
+Deliberately not here: token and cost caps. Those need per-run accounting the
+board does not have (the engine knows; the board sees sessions), and wall time
+is the bound that was actually missing.
+
+### H11 — Dispatched agents push with the board's credential — **done** (gh#68)
+#58 built the askpass machinery and left it with no caller, so a dispatched
+agent pushed with whatever git credentials the box user had: fine on a Mac
+somebody set up by hand, nothing at all on a clean headless box. This is the
+caller, threaded through the same harness-env seam `COMET_BOARD_CHAT_ID` and
+`CLAUDE_CONFIG_DIR` already use (`RunControls.push` →
+`comet_harness::PushCredentials::apply`).
+
+The repo is resolved at dispatch (`DispatchSpec.push_repo`: the task id for a
+GitHub ticket, the checkout's `origin` remote for anything else) and stored on
+the chat as `ChatConfig.push_repo` — on the chat rather than the run for the
+same reason `account` is, since the fix for a review comment next week is a new
+run in the same chat and has to reach the same branch. `crates/engine/
+push_credentials.rs` turns that repo into an environment, per run.
+
+**Late minting, twice.** `git push` goes through askpass, which mints inside the
+push. `gh` has no askpass — it reads `GH_TOKEN` once, at startup — and an
+installation token lives an hour while a run does not, so exporting one at spawn
+would hand a three-hour run an expired credential exactly when it goes to open
+its pull request. Instead a generated `gh` wrapper goes on the front of the
+child's PATH and mints per invocation (`comet-board gh-token`, the `gh` twin of
+`git-askpass`). The token reaches that one `gh` process's environment, which is
+gh's only interface; it is never in the agent's own.
+
+**Scoping.** One repo per run, and it is the attempt's. Because the helper now
+answers for every `git` the agent runs rather than for one push the board
+issued, `askpass` refuses any prompt naming a host other than github.com — an
+installation token answered to a `git fetch https://gitlab.com/…` would be a
+credential handed to a stranger. The wrapper defers to a `GH_TOKEN`/
+`GITHUB_TOKEN` the operator set and to a non-github.com `GH_HOST`, for the same
+reason.
+
+**Every part is optional and fails back to what happened before.** No board
+credential, no `comet-board` binary, no `gh`, no repo on the chat: the child is
+spawned untouched and the agent pushes as the box user. The PAT path is
+unchanged — `token_for_push` hands back the static token, which is what a
+self-hosted board on a PAT already pushes with. `comet-board doctor` answers the
+question directly with a `dispatched pushes` check.
+
+### H12 — CLI parity once the box is remote — **done** (gh#73)
+Three gaps that only bite when the board is not on the machine you are typing
+on, and the desktop app is not the only frontend. All three are in
+`apps/board-cli` (the third also in `crates/tui`):
+
+- **`--device`.** H9 relay-forwarded the *frontends*; the CLI still hardcoded
+  `ws://127.0.0.1:{port}` with no passthrough, so a laptop's `comet-board list`
+  could only ever say "this device's board is disabled". It now dials the same
+  localhost port — the transport was never the problem, the local engine
+  forwards — and carries `targetDeviceId` on every board call, `ListModels`
+  included (the run executes on the host, so the catalog a dispatch is checked
+  against has to be the host's). `ops::Board` owns the host, so a call that
+  forgets it does not typecheck into existence. The flag takes a device *name*
+  or id, resolved against `WatchDevices` before anything is sent: a typo costs
+  an error naming the fleet, not a call forwarded into nothing, and an
+  ambiguous name asks for the id rather than picking a device the operator did
+  not choose. `COMET_BOARD_DEVICE` carries it for a whole shell, which is what
+  an orchestrator wants — the alternative is threading a flag through every
+  call it makes. Deliberately no auto-sweep: the viewports hold a connection
+  open and can afford to probe candidates, a one-shot command would pay for it
+  on every invocation, and a laptop with no board is a *configuration*, said
+  once. The setup commands (doctor, init, adopt) still read this device's own
+  config — a route's `repo =` is a local path, which is #66's problem.
+- **`retry --task`.** The verbs were list/dispatch/cancel/wait/new/stats/doctor
+  and `ops::dispatch` never sent `replace`, so retrying a blocked row from a
+  shell meant cancel-then-dispatch — and between the two the row is `ready`,
+  where a concurrency cap or another agent can take the slot the retry was
+  trying to keep. `retry` reads the row and decides: `blocked` replaces (the
+  engine ends the live attempt and releases in one call — `handle_dispatch`'s
+  deliberate breach of the one-live-attempt rule), `failed` and `ready` are
+  ordinary dispatches, and anything else is left to the engine's own refusal,
+  which names the chat. Reading the row is not optional: sending `replace`
+  unconditionally would let `retry` end a *working* agent nobody asked to
+  interrupt. Same rule as the desktop panel (`crates/ui/src/board.rs`), so a
+  row retried from a shell and from the panel takes the same path.
+  `crates/tui` gained the pane's half: `R` retries (replacing on blocked), and
+  `enter` now retries a `failed` row as the panel's does.
+- **`wait --blocked-is-settled`.** `wait`'s default settle set is
+  review/failed/done, which is right — an agent pausing for an approval is not
+  a result. But a child that asks a question and is never answered reaches none
+  of those, so an orchestrator waited until its timeout or forever. `--state
+  blocked` was already accepted and always had been; what it could not do is
+  *add* blocked, since naming any state replaces the default trio, and
+  respelling the whole set to say "call me back on a question OR a finish" is
+  the kind of thing nobody does twice. The flag tops up whichever set is in
+  play. Not in the default set: `wait` returning on every permission prompt
+  would break the contract `docs/agent-conventions.md` teaches.
+
+### H13 — Notifications: blocked has to reach a human — **done** (gh#71)
 Landed as `crates/board/src/notify.rs` (who is told what, and the wording)
 plus the effects in `sync.rs`. Before it, `notify`/`notify_dispatcher` were
 parsed, documented and reported by `doctor` — and read nowhere. Worse, the

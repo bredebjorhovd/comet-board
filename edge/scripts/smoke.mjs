@@ -10,7 +10,10 @@
  *   7. R2 attachments: PUT (hash verified) then GET
  *   8. workspace room (`ws3/{orgId}/{userId}`): one user's devices converge;
  *      teammates in the same org are isolated (per-user docs); wrong org 403
- *   9. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
+ *   9. org-shared visibility (gh#66): the org device registry is org-wide, a
+ *      teammate relays through the box's device room, and a chat the owner
+ *      shared is readable + writable by the org (and by nobody else)
+ *  10. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
  *
  * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
  */
@@ -299,6 +302,159 @@ await new Promise((r) => setTimeout(r, 100));
   );
   ok("nudge queued offline and replayed on host join");
   host2.close();
+}
+
+// ── org-shared visibility (gh#66): the three gates a second user hits ─────
+//    1. the org device registry — a teammate can SEE the box at all
+//    2. the device room — a teammate may relay through it
+//    3. a shared chat — a teammate may open and write to a board-dispatched chat
+{
+  const { encodeDeviceFrame, decodeDeviceFrame } = await import("./device-frame.mjs");
+  const alice = `alice@${orgId}`;
+  const bob = `bob@${orgId}`;
+  const outsider = `mallory@org-other-${randomUUID().slice(0, 8)}`;
+  const boxId = `smokebox-${randomUUID().slice(0, 8)}`;
+  const boardChat = `smokeboard-${randomUUID().slice(0, 8)}`;
+
+  // ── gate 1: the org device registry is ONE room per org ────────────────
+  const regA = new LoroWebsocketClient({
+    url: `${wsBase}/org/${orgId}/devices/ws?token=${alice}`
+  });
+  await regA.waitConnected();
+  const regAdaptorA = new LoroAdaptor();
+  await regA.join({ roomId: `orgdev1/${orgId}`, crdtAdaptor: regAdaptorA });
+  regAdaptorA.getDoc().getMap("devices").set(boxId, { id: boxId, name: "the box" });
+  regAdaptorA.getDoc().commit();
+
+  const regB = new LoroWebsocketClient({
+    url: `${wsBase}/org/${orgId}/devices/ws?token=${bob}`
+  });
+  await regB.waitConnected();
+  const regAdaptorB = new LoroAdaptor();
+  await regB.join({ roomId: `orgdev1/${orgId}`, crdtAdaptor: regAdaptorB });
+  await until(
+    () => regAdaptorB.getDoc().getMap("devices").get(boxId) !== undefined,
+    "teammate sees the org's device row"
+  );
+  ok("org devices: a teammate sees the box (gate 1)");
+
+  {
+    const wrongOrg = await fetch(`${base}/org/${orgId}/devices/tail?token=${outsider}`);
+    if (wrongOrg.status !== 403) fail(`outsider devices tail expected 403, got ${wrongOrg.status}`);
+    const noOrg = await fetch(`${base}/org/${orgId}/devices/tail?token=${token}`);
+    if (noOrg.status !== 403) fail(`org-less devices tail expected 403, got ${noOrg.status}`);
+    ok("org devices: outsiders and org-less callers 403");
+  }
+  regA.close();
+  regB.close();
+
+  // ── gate 2: the box's device room admits the org, not just its owner ───
+  const boxHost = new WebSocket(`${wsBase}/device/${boxId}/ws?token=${alice}&role=host`);
+  boxHost.binaryType = "arraybuffer";
+  await new Promise((resolve, reject) => {
+    boxHost.onopen = resolve;
+    boxHost.onerror = reject;
+  });
+  boxHost.onmessage = (e) => {
+    if (typeof e.data === "string") return;
+    const frame = decodeDeviceFrame(new Uint8Array(e.data));
+    if (frame.header.k === "rpc" && frame.header.from) {
+      boxHost.send(
+        encodeDeviceFrame({ s: frame.header.s, k: "rpc", to: frame.header.from }, frame.payload)
+      );
+    }
+  };
+
+  const mate = new WebSocket(`${wsBase}/device/${boxId}/ws?token=${bob}&role=client&connId=mate-1`);
+  mate.binaryType = "arraybuffer";
+  const mateJoin = await new Promise((resolve) => {
+    mate.onopen = () => resolve("open");
+    mate.onerror = () => resolve("error");
+    setTimeout(() => resolve("timeout"), 3000);
+  });
+  if (mateJoin !== "open") fail(`teammate device-room join: ${mateJoin}`);
+  const mateFrames = [];
+  mate.onmessage = (e) => {
+    if (typeof e.data === "string") return;
+    mateFrames.push(decodeDeviceFrame(new Uint8Array(e.data)));
+  };
+  mate.send(encodeDeviceFrame({ s: "rpc-1", k: "rpc" }, new TextEncoder().encode("board-rpc")));
+  await until(() => mateFrames.length > 0, "teammate rpc echo through the box");
+  if (new TextDecoder().decode(mateFrames[0].payload) !== "board-rpc") fail("teammate echo bytes");
+  ok("device room: a teammate relays through the box (gate 2)");
+
+  {
+    const evil = new WebSocket(`${wsBase}/device/${boxId}/ws?token=${outsider}&role=client`);
+    const result = await new Promise((resolve) => {
+      evil.onopen = () => resolve("open");
+      evil.onerror = () => resolve("error");
+      setTimeout(() => resolve("timeout"), 3000);
+    });
+    if (result === "open") fail("another org joined the box's device room");
+    // Hosting is owner-only even inside the org: the host socket IS the device.
+    const usurper = new WebSocket(`${wsBase}/device/${boxId}/ws?token=${bob}&role=host`);
+    const usurped = await new Promise((resolve) => {
+      usurper.onopen = () => resolve("open");
+      usurper.onerror = () => resolve("error");
+      setTimeout(() => resolve("timeout"), 3000);
+    });
+    if (usurped === "open") fail("a teammate hosted someone else's device room");
+    ok("device room: other orgs refused, hosting stays owner-only");
+  }
+  boxHost.close();
+  mate.close();
+
+  // ── gate 3: chat rooms are private until the owner shares them ─────────
+  const chatOwner = new LoroWebsocketClient({
+    url: `${wsBase}/session/${boardChat}/ws?token=${alice}`
+  });
+  await chatOwner.waitConnected();
+  const chatAdaptorA = new LoroAdaptor();
+  await chatOwner.join({ roomId: boardChat, crdtAdaptor: chatAdaptorA });
+  chatAdaptorA.getDoc().getMap("meta").set("chatId", boardChat);
+  chatAdaptorA.getDoc().commit();
+
+  {
+    const before = await fetch(`${base}/tail/${boardChat}?token=${bob}`);
+    if (before.status !== 403) fail(`unshared chat expected 403 for teammate, got ${before.status}`);
+    ok("chat rooms stay private to their owner until shared");
+  }
+
+  const share = await fetch(`${base}/share/${boardChat}?token=${alice}`, { method: "POST" });
+  if (share.status !== 200) fail(`share ${share.status}: ${await share.text()}`);
+  if ((await share.json()).org !== orgId) fail("share did not record the caller's org");
+  const notMine = await fetch(`${base}/share/${boardChat}?token=${bob}`, { method: "POST" });
+  if (notMine.status !== 403) fail(`teammate share expected 403, got ${notMine.status}`);
+  ok("chat sharing is the owner's call (POST /share)");
+
+  {
+    const after = await fetch(`${base}/tail/${boardChat}?token=${bob}`);
+    if (after.status !== 200) fail(`shared chat expected 200 for teammate, got ${after.status}`);
+    const outsiderTail = await fetch(`${base}/tail/${boardChat}?token=${outsider}`);
+    if (outsiderTail.status !== 403) fail(`shared chat expected 403 for other org, got ${outsiderTail.status}`);
+  }
+
+  // The teammate joins the room itself and WRITES — steering a board-dispatched
+  // run is a command entry in this doc, so read-only would not be enough.
+  const chatMate = new LoroWebsocketClient({
+    url: `${wsBase}/session/${boardChat}/ws?token=${bob}`
+  });
+  await chatMate.waitConnected();
+  const chatAdaptorB = new LoroAdaptor();
+  await chatMate.join({ roomId: boardChat, crdtAdaptor: chatAdaptorB });
+  await until(
+    () => chatAdaptorB.getDoc().getMap("meta").get("chatId") === boardChat,
+    "teammate backfills the shared chat"
+  );
+  chatAdaptorB.getDoc().getMap("commands").set("cmd-1", { issuedBy: "bobs-laptop" });
+  chatAdaptorB.getDoc().commit();
+  await until(
+    () => chatAdaptorA.getDoc().getMap("commands").get("cmd-1") !== undefined,
+    "teammate's command reaches the host"
+  );
+  ok("shared chat: a teammate reads AND steers it (gate 3)");
+  chatOwner.close();
+  chatMate.close();
 }
 
 // ── attachments ───────────────────────────────────────────────────────────

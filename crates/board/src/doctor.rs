@@ -10,6 +10,7 @@
 
 use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
 use crate::db::Db;
+use crate::git_credentials;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
@@ -292,6 +293,29 @@ pub fn doctor(
                     },
                 });
 
+                // Always reported, unlike `account` below, because here it is
+                // the *absence* that is the risk: `off` and "never configured"
+                // look identical on the board, and one of them means an agent
+                // on this route runs until somebody looks (gh#70).
+                let cap = cfg.max_duration_secs(Some(r));
+                checks.push(Check {
+                    name: format!("route {name}: duration cap"),
+                    ok: true,
+                    detail: match (cap, r.max_duration.is_some()) {
+                        (Some(secs), true) => {
+                            format!("{} per attempt", crate::overrun::human_secs(secs as i64))
+                        }
+                        (Some(secs), false) => format!(
+                            "{} per attempt (from [defaults])",
+                            crate::overrun::human_secs(secs as i64)
+                        ),
+                        // Not a failure — turning the cap off is a choice, and
+                        // it was every board's behaviour before gh#70. Named
+                        // out loud so it stays a choice.
+                        (None, _) => "off — attempts here run until somebody cancels them".into(),
+                    },
+                });
+
                 // Only when the route names one: a board on one person's
                 // laptop has no accounts to check and should not be told about
                 // a feature it is not using (gh#59).
@@ -302,7 +326,49 @@ pub fn doctor(
         }
     }
 
+    checks.push(dispatched_push_check(paths));
+
     Ok(checks)
+}
+
+/// Can a dispatched agent on this box push and open a pull request (gh#68)?
+///
+/// The question this exists for is a headless one: a box with no keychain, no
+/// stored https credential and nobody to run `gh auth login` pushes with
+/// nothing at all, and finds out at the end of a run. The parts are the
+/// credential (checked above, as the board's own), the `comet-board` binary
+/// the engine points `GIT_ASKPASS` at, and a `gh` for the wrapper to wrap.
+///
+/// A missing `gh` is not a failure: `git push` still works, and a PR opened by
+/// hand from the branch is a normal way to finish. A missing binary is, because
+/// then nothing was handed to the agent at all.
+fn dispatched_push_check(paths: &Paths) -> Check {
+    let credential = !matches!(Credentials::load(paths).github_auth(), GithubAuth::None);
+    let exe = git_credentials::resolve_board_exe();
+    let gh = git_credentials::resolve_gh(None);
+    let detail = match (&exe, credential) {
+        (None, _) => format!(
+            "no comet-board binary found beside the engine or on PATH — agents push with \
+             this box's own git credentials (set {})",
+            git_credentials::BOARD_EXE_ENV
+        ),
+        (Some(_), false) => "no GitHub credential — agents push with this box's own git \
+             credentials"
+            .to_string(),
+        (Some(exe), true) => format!(
+            "{} git-askpass mints per push{}",
+            exe.display(),
+            match &gh {
+                Some(gh) => format!("; `gh` at {} is wrapped to mint per call", gh.display()),
+                None => "; no `gh` installed, so pull requests are opened by hand".into(),
+            }
+        ),
+    };
+    Check {
+        name: "dispatched pushes".into(),
+        ok: exe.is_some() && credential,
+        detail,
+    }
 }
 
 /// Which GitHub credential is live, and what it can reach (gh#58).
@@ -1072,6 +1138,46 @@ mod tests {
                 && !c.ok
                 && c.detail.contains("not a comet harness")),
             "the typo is named"
+        );
+    }
+
+    /// The cap is reported whether or not the route sets one: `off` and
+    /// "never thought about it" look identical on the board, and one of them
+    /// means an agent on this route runs until somebody looks (gh#70).
+    #[test]
+    fn every_route_says_what_bounds_its_attempts() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"inherits\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\n\n\
+             [[route]]\nmatch = { label = \"y\" }\nworkspace = \"long\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"6h\"\n\n\
+             [[route]]\nmatch = { label = \"z\" }\nworkspace = \"unbounded\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"off\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let detail = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == format!("route {name}: duration cap"))
+                .unwrap_or_else(|| panic!("{name} has no cap line"))
+                .detail
+                .clone()
+        };
+        assert_eq!(detail("inherits"), "2h per attempt (from [defaults])");
+        assert_eq!(detail("long"), "6h per attempt");
+        assert!(
+            detail("unbounded").starts_with("off —"),
+            "{}",
+            detail("unbounded")
+        );
+        // Off is a choice, not a broken route: it must not fail the report.
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.name != "route unbounded: duration cap" || c.ok)
         );
     }
 

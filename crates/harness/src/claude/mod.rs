@@ -253,6 +253,9 @@ impl Harness for ClaudeHarness {
         if let Some(account) = &controls.account {
             account.apply(&mut cmd, HarnessId::ClaudeCode);
         }
+        if let Some(push) = &controls.push {
+            push.apply(&mut cmd);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -454,6 +457,9 @@ async fn run_session(session: Session) {
         interrupt,
         chat_id: _,
         account: _,
+        // Both are spent at spawn: the account picked the config dir, the
+        // credentials are already on the child.
+        push: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

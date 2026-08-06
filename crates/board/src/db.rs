@@ -17,7 +17,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      started_at, ended_at, outcome, missing_ticks, agent_status, \
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
      settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
-     blocked_count";
+     blocked_count,
+     overrun_warned_at";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -50,6 +51,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         nudged_at: r.get(21)?,
         account: r.get(22)?,
         blocked_count: r.get(23)?,
+        overrun_warned_at: r.get(24)?,
     })
 }
 
@@ -160,7 +162,11 @@ impl Db {
               -- keyed on this count, so a block that is answered and happens
               -- again is a second notice, and a hundred ticks of the same block
               -- are still one.
-              blocked_count INTEGER NOT NULL DEFAULT 0
+              blocked_count INTEGER NOT NULL DEFAULT 0,
+              -- When the board told this attempt's chat it was past its
+              -- wall-clock cap (gh#70). Stamped once; the grace that follows is
+              -- measured from here.
+              overrun_warned_at TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -265,6 +271,12 @@ impl Db {
                 // keep 0: a block they are *currently* in was never noticed
                 // upstream, so the next tick that sees it is its first notice.
                 ("blocked_count", "INTEGER NOT NULL DEFAULT 0"),
+                // When this attempt was told it had run past its cap (gh#70).
+                // Existing rows keep NULL, which reads as "not warned yet" —
+                // right for an attempt already hours over when the cap landed,
+                // because it gets its warning and its grace before anything
+                // closes it.
+                ("overrun_warned_at", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -730,6 +742,22 @@ impl Db {
         Ok(())
     }
 
+    /// Stamp that this attempt has been warned about its wall-clock cap, and
+    /// start the grace clock (gh#70).
+    ///
+    /// Guarded to a row with no stamp, so the interval reconcile cannot push
+    /// the deadline out by re-stamping every cycle — an ageless warning is a
+    /// cancel that never arrives, which is the failure mode this whole check
+    /// exists to fix.
+    pub fn set_overrun_warned(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET overrun_warned_at = ?2
+              WHERE id = ?1 AND overrun_warned_at IS NULL",
+            params![attempt_id, now()],
+        )?;
+        Ok(())
+    }
+
     /// Start or stop the clock on an attempt that looks finished.
     ///
     /// `Some` only ever on the first sample of a run — restamping it on every
@@ -758,6 +786,12 @@ impl Db {
     /// the attempt is over (`gc` prunes by it, `stats` measures durations with
     /// it), so a live row carrying one would lie to all of them.
     ///
+    /// The overrun warning goes too (gh#70). `started_at` is not reset — the
+    /// cap bounds the attempt, and a re-opened one has been live the whole time
+    /// — but a row that comes back to work is owed the same warning and the
+    /// same grace as any other, not a cancel on the next tick from a stamp it
+    /// collected before the board called it finished.
+    ///
     /// Returns `false` when the task already has a live attempt — somebody
     /// re-dispatched it, that attempt is the current one, and the partial unique
     /// index would refuse this anyway. Checked in the same statement rather than
@@ -767,6 +801,7 @@ impl Db {
             "UPDATE attempts SET outcome = NULL, ended_at = NULL, settled_at = NULL,
                     missing_ticks = 0, screen_print = NULL, screen_at = NULL,
                     nudges = 0, nudged_at = NULL,
+                    overrun_warned_at = NULL,
                     reopened = reopened + 1
              WHERE id = ?1 AND outcome IS NOT NULL
                AND NOT EXISTS (
