@@ -53,6 +53,11 @@ pub fn task_row(task: &Task, route: Option<&Route>) -> TaskRow {
         branch: live.or(last).and_then(|a| a.branch.clone()),
         dispatched_by: live.or(last).and_then(|a| a.dispatched_by.clone()),
         dispatched_by_chat: live.or(last).and_then(|a| a.dispatched_by_pane.clone()),
+        // Who pressed enter, as their frontend said (gh#74). Unlike the two
+        // above it is nobody's address — a name for the row, not somewhere to
+        // deliver to. The device id stays off the wire: it identifies a laptop,
+        // not a person, and a reader has no way to resolve one.
+        dispatched_by_user: live.or(last).and_then(|a| a.dispatched_by_user.clone()),
         last_outcome: closed
             .and_then(|a| a.outcome)
             .map(|o| o.as_str().to_string()),
@@ -129,6 +134,8 @@ mod tests {
                 dispatched_by_pane: Some("chat-parent".into()),
                 base_sha: None,
                 account: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         db.set_attempt_pane(a, "chat-1").unwrap();
@@ -140,6 +147,39 @@ mod tests {
         assert_eq!(rows[0].branch.as_deref(), Some("board/gh-1-r"));
         // No route configured: on the board, not dispatchable.
         assert!(!rows[0].dispatchable);
+    }
+
+    /// gh#74: the row names the human who released it, so a reader of
+    /// `list --json` can tell two teammates' work apart.
+    #[test]
+    fn rows_name_the_human_who_released_the_attempt() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#74", "gh#74");
+        db.insert_attempt(&NewAttempt {
+            task_id: "gh:o/r#74".into(),
+            pane_id: None,
+            workspace: "ws".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: None,
+            dispatched_by_device: Some("laptop-ana".into()),
+            dispatched_by_user: Some("ana@example.com".into()),
+        })
+        .unwrap();
+
+        let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
+        assert_eq!(
+            rows[0].dispatched_by_user.as_deref(),
+            Some("ana@example.com")
+        );
+        // The device stays off the contract: it names a laptop, not a person,
+        // and no reader can resolve one.
+        let wire = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!wire.contains("laptop-ana"), "{wire}");
     }
 
     #[test]
@@ -158,6 +198,8 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         db.close_attempt(first, Outcome::Cancelled).unwrap();
@@ -172,6 +214,8 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         })
         .unwrap();
 
@@ -231,6 +275,8 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: Some("8f2c1d0a7b6e4539".into()),
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         })
         .unwrap();
         let rows = board_rows(&db, &cfg).unwrap();
@@ -264,6 +310,8 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         })
         .unwrap();
         assert_eq!(board_rows(&db, &cfg).unwrap()[0].account, None);

@@ -111,6 +111,24 @@ impl fmt::Display for BoardState {
     }
 }
 
+/// One runtime a dispatch can be pointed at, as `ListBoardRuntimes` reports it.
+///
+/// `name` is exactly what `routing.toml` and the `DispatchTask` override
+/// accept; `label` is the human spelling a picker shows; `harness` is what the
+/// board resolves the name to, which is how an account picker knows which saved
+/// logins a runtime could spend (gh#74).
+///
+/// Here rather than in `comet-board` for the same reason [`TaskRow`] is: both
+/// viewports deserialize it, and neither depends on the board crate.
+/// `comet_board::runtime` re-exports it and owns what the list contains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOption {
+    pub name: String,
+    pub label: String,
+    pub harness: crate::HarnessId,
+}
+
 /// One task, in the shape callers are promised: herdr-board's `list --json`
 /// contract with the pane→chat rename applied.
 ///
@@ -191,6 +209,17 @@ pub struct TaskRow {
     /// is also every row on a single-account box (gh#59).
     #[serde(default)]
     pub account: Option<String>,
+    /// The human whose frontend released this row's attempt, as that frontend
+    /// named them — an email when it knows one, else the user id (gh#74). Null
+    /// where nobody said: a `comet-board` dispatch, an agent's, and every
+    /// attempt from before the frontends sent it.
+    ///
+    /// A claim, not a credential. Board calls relay as the device room's owner,
+    /// so the box cannot check who really pressed enter; #66's identity work is
+    /// what will make this checkable. Read it as "who says they did", and never
+    /// as permission to do anything.
+    #[serde(default)]
+    pub dispatched_by_user: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +655,7 @@ mod tests {
             updated_at: "2026-08-01T11:00:00Z".into(),
             started_at: None,
             account: None,
+            dispatched_by_user: None,
         }
     }
 

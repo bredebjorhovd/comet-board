@@ -1947,6 +1947,8 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();
@@ -1966,6 +1968,8 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         })
         .unwrap()
     }

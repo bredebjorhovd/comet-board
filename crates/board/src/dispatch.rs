@@ -98,6 +98,44 @@ pub fn check_capacity(db: &Db, cfg: &RoutingConfig, route: &Route) -> Result<()>
     Ok(())
 }
 
+/// Where a dispatch came from, as the caller reports it (gh#74).
+///
+/// One struct rather than three parameters because the three answer one
+/// question — who released this — at three different strengths:
+///
+/// - `chat` is the only one the board can *check*: it looks the chat up in its
+///   own records, which is what [`dispatcher_for`] does below;
+/// - `device` and `user` are claims. A relayed board call arrives as the room
+///   owner (docs/BOARD.md §H9), so the box has no per-call identity to compare
+///   them against; establishing one is #66's territory. They are recorded
+///   anyway, because the alternative for a teammate's dispatch is the
+///   anonymous [`Dispatcher::Operator`] — an unverified name is a worse
+///   credential than none and a far better record.
+///
+/// Never authorize on `device`/`user`. Whose subscription a run spends is the
+/// explicit `account` (gh#59), never inferred from these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchOrigin {
+    /// The dispatching chat's id — provenance, never authority.
+    pub chat: Option<String>,
+    /// The device the dispatch was issued from.
+    pub device: Option<String>,
+    /// Who the dispatching frontend says is signed in there: an email when it
+    /// knows one, else the user id.
+    pub user: Option<String>,
+}
+
+impl DispatchOrigin {
+    /// A dispatch on behalf of a chat, with no device or user named — what the
+    /// CLI sends, and what the tests mean by "an agent released it".
+    pub fn via(chat: impl Into<String>) -> DispatchOrigin {
+        DispatchOrigin {
+            chat: Some(chat.into()),
+            ..DispatchOrigin::default()
+        }
+    }
+}
+
 /// Who released a task, resolved from the dispatching chat id (`via`) — the
 /// provenance decision, herdr-board's `dispatcher_from` minus panes.
 ///
@@ -602,6 +640,8 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         db.set_attempt_pane(a, chat).unwrap();

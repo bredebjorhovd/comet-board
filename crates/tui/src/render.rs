@@ -1815,6 +1815,50 @@ fn draw_overlay(
             )
         }
 
+        Overlay::DispatchAccount {
+            identifier,
+            accounts,
+            route_account,
+            active,
+            ..
+        } => {
+            // Row 0 is the route's own account — no override, which is what
+            // enter alone did before this picker existed. It names the account
+            // when the row knows one, so "default" is a fact rather than a
+            // shrug.
+            let default = (
+                "Route default".to_string(),
+                Some(match route_account.as_deref() {
+                    Some(account) => account.to_string(),
+                    None => "the box's own login".to_string(),
+                }),
+            );
+            let rows: Vec<(String, Option<String>)> = match accounts {
+                Some(list) => std::iter::once(default)
+                    .chain(list.iter().map(|account| {
+                        (
+                            account
+                                .email
+                                .clone()
+                                .or_else(|| account.display_name.clone())
+                                .unwrap_or_else(|| account.id.clone()),
+                            account.plan_label.clone(),
+                        )
+                    }))
+                    .collect(),
+                None => vec![("Loading…".into(), None)],
+            };
+            list_card(
+                frame,
+                body,
+                theme,
+                &format!("Dispatch {identifier} on"),
+                &rows,
+                accounts.is_some(),
+                *active,
+            )
+        }
+
         Overlay::Prompt { title, input, .. } => {
             let width = 52u16.min(body.width.saturating_sub(4));
             let panel = centred(body, width, 4);

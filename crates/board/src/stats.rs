@@ -268,6 +268,8 @@ mod tests {
             nudges: 0,
             nudged_at: None,
             overrun_warned_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
     }
 

@@ -284,6 +284,21 @@ pub enum Overlay {
         models: Option<Vec<comet_proto::Model>>,
         active: usize,
     },
+    /// Whose agent account a board dispatch should spend (gh#74). Opened by
+    /// `enter` on a ready row, ahead of the release itself: row 0 is the
+    /// route's own account (no override — what enter always did), and the rest
+    /// are the host's saved logins for that row's harness.
+    DispatchAccount {
+        task_id: String,
+        identifier: String,
+        /// `None` until `ListAgentAccounts` answers; already filtered to the
+        /// logins the row's runtime can spend.
+        accounts: Option<Vec<comet_proto::AgentAccount>>,
+        /// What row 0 will spend when nothing is picked — the route's account,
+        /// when the row names one.
+        route_account: Option<String>,
+        active: usize,
+    },
     /// A single-line text prompt (rename).
     Prompt {
         title: String,
@@ -587,10 +602,30 @@ impl App {
                 }
                 Vec::new()
             }
+            Update::DispatchAccounts {
+                task_id: for_task,
+                accounts,
+            } => {
+                // Only fills the picker it was asked for: a slow reply must not
+                // land the wrong row's logins under a newer pick.
+                if let Some(Overlay::DispatchAccount {
+                    task_id, accounts: slot, ..
+                }) = &mut self.overlay
+                    && *task_id == for_task
+                {
+                    *slot = Some(accounts);
+                }
+                Vec::new()
+            }
             Update::Notice(text) => {
-                // A notice while the picker is waiting means the fetch failed;
+                // A notice while a picker is waiting means the fetch failed;
                 // close it rather than leaving a spinner forever.
-                if matches!(self.overlay, Some(Overlay::Models { models: None, .. })) {
+                if matches!(self.overlay, Some(Overlay::Models { models: None, .. }))
+                    || matches!(
+                        self.overlay,
+                        Some(Overlay::DispatchAccount { accounts: None, .. })
+                    )
+                {
                     self.overlay = None;
                 }
                 self.notify(text);
@@ -970,6 +1005,30 @@ impl App {
         }
     }
 
+    /// The release itself, with who is releasing it attached (gh#74): this
+    /// device, and the user the engine says is signed in here. The board cannot
+    /// verify either — a relayed dispatch reaches the box as the device room's
+    /// owner — so they are recorded as the claims they are, and nothing is
+    /// authorized on them. Which subscription the run spends is `account`,
+    /// always the explicit pick.
+    fn dispatch_command(
+        &self,
+        task_id: String,
+        identifier: String,
+        account: Option<String>,
+    ) -> Command {
+        Command::Dispatch {
+            task_id,
+            identifier,
+            account,
+            via_device: self.local_device_id.clone(),
+            via_user: self
+                .auth_user()
+                .map(|user| user.email.clone())
+                .filter(|email| !email.is_empty()),
+        }
+    }
+
     /// `enter` on the board: dispatch a ready task, fold a section header, or
     /// open a running task's chat.
     fn board_enter(&mut self) -> Effects {
@@ -983,10 +1042,22 @@ impl App {
         match row.state() {
             BoardState::Ready => {
                 if row.dispatchable {
-                    vec![Command::Dispatch {
-                        task_id: row.id.clone(),
-                        identifier: row.identifier.clone(),
-                    }]
+                    // Ask whose subscription this run spends before releasing
+                    // it (gh#74). The desktop panel has asked which runtime and
+                    // model since it grew a picker; this is the same shape, cut
+                    // to the choice that bills someone. Row 0 is the route's own
+                    // account, so enter-enter is exactly the old behaviour.
+                    let task_id = row.id.clone();
+                    let identifier = row.identifier.clone();
+                    let runtime = row.runtime.clone();
+                    self.overlay = Some(Overlay::DispatchAccount {
+                        task_id: task_id.clone(),
+                        identifier,
+                        accounts: None,
+                        route_account: row.account.clone(),
+                        active: 0,
+                    });
+                    vec![Command::ListDispatchAccounts { task_id, runtime }]
                 } else {
                     self.notify(format!(
                         "{} has no route — it cannot be dispatched",
@@ -2209,6 +2280,10 @@ impl App {
             Some(Overlay::Models { active, models }) => {
                 (active, models.as_ref().map_or(0, Vec::len))
             }
+            // One longer than the logins: row 0 is the route's own account.
+            Some(Overlay::DispatchAccount {
+                active, accounts, ..
+            }) => (active, accounts.as_ref().map_or(0, |list| list.len() + 1)),
             _ => return,
         };
         if count == 0 {
@@ -2266,6 +2341,33 @@ impl App {
                     return Vec::new();
                 }
                 self.set_model(model)
+            }
+            Some(Overlay::DispatchAccount {
+                task_id,
+                identifier,
+                accounts,
+                route_account,
+                active,
+            }) => {
+                // Still loading: enter would be a release nobody aimed. Put the
+                // picker back, exactly as it was, and wait for the list.
+                let Some(accounts) = accounts else {
+                    self.overlay = Some(Overlay::DispatchAccount {
+                        task_id,
+                        identifier,
+                        accounts: None,
+                        route_account,
+                        active,
+                    });
+                    return Vec::new();
+                };
+                // Row 0 sends no override — the route's account, which is what
+                // every dispatch spent before this picker existed.
+                let account = active
+                    .checked_sub(1)
+                    .and_then(|ix| accounts.get(ix))
+                    .map(|a| a.id.clone());
+                vec![self.dispatch_command(task_id, identifier, account)]
             }
             Some(Overlay::Reasoning { levels, active }) => {
                 let Some(level) = levels.get(active).copied() else {
@@ -3341,6 +3443,7 @@ mod tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
             started_at: None,
             account: None,
+            dispatched_by_user: None,
         }
     }
 
@@ -3386,11 +3489,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_dispatches_a_ready_row_and_not_an_unrouted_one() {
+    fn enter_asks_which_account_for_a_ready_row_and_not_an_unrouted_one() {
         let mut app = seeded();
         app.act(Action::ToggleBoard);
         let mut ready = board_row("1", BoardState::Ready);
         ready.route = Some("offhand".into());
+        ready.runtime = Some("claude-code".into());
         let mut unrouted = board_row("2", BoardState::Ready);
         unrouted.dispatchable = false;
         app.apply(Update::Board(vec![ready, unrouted]));
@@ -3399,20 +3503,115 @@ mod tests {
         app.board.selected = Some("1".into());
         let effects = app.act(Action::BoardEnter);
         match effects.first() {
-            Some(Command::Dispatch { task_id, identifier }) => {
+            Some(Command::ListDispatchAccounts { task_id, runtime }) => {
                 assert_eq!(task_id, "1");
-                assert_eq!(identifier, "gh#1");
+                assert_eq!(runtime.as_deref(), Some("claude-code"));
             }
-            other => panic!("expected a dispatch, got {other:?}"),
+            other => panic!("expected an account fetch, got {other:?}"),
         }
+        assert!(
+            matches!(app.overlay, Some(Overlay::DispatchAccount { .. })),
+            "the picker is up while the logins load"
+        );
 
         // A row nothing routes dispatches nowhere and says why.
+        app.overlay = None;
         app.board.selected = Some("2".into());
         assert!(app.act(Action::BoardEnter).is_empty());
         assert!(
             app.notice.as_ref().is_some_and(|n| n.text.contains("no route")),
             "the reason must be said"
         );
+    }
+
+    fn agent_account(id: &str, email: &str) -> comet_proto::AgentAccount {
+        comet_proto::AgentAccount {
+            id: id.into(),
+            harness: comet_proto::HarnessId::ClaudeCode,
+            email: Some(email.into()),
+            plan_label: None,
+            active: false,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    /// gh#74: the picker's first row is the route's account (no override), and
+    /// every row sends who released it.
+    #[test]
+    fn the_account_picker_releases_on_the_route_or_on_the_picked_slot() {
+        let mut app = seeded();
+        app.local_device_id = Some("laptop".into());
+        app.act(Action::ToggleBoard);
+        let mut ready = board_row("1", BoardState::Ready);
+        ready.route = Some("offhand".into());
+        app.apply(Update::Board(vec![ready]));
+        app.board.selected = Some("1".into());
+
+        // Row 0: no account override — what enter alone always did.
+        app.act(Action::BoardEnter);
+        app.apply(Update::DispatchAccounts {
+            task_id: "1".into(),
+            accounts: vec![agent_account("slot-ana", "ana@example.com")],
+        });
+        match app.act(Action::OverlayConfirm).first() {
+            Some(Command::Dispatch {
+                task_id,
+                account,
+                via_device,
+                ..
+            }) => {
+                assert_eq!(task_id, "1");
+                assert_eq!(*account, None, "the route's account needs no override");
+                assert_eq!(via_device.as_deref(), Some("laptop"));
+            }
+            other => panic!("expected a dispatch, got {other:?}"),
+        }
+
+        // Row 1: that slot, sent as the override.
+        app.act(Action::BoardEnter);
+        app.apply(Update::DispatchAccounts {
+            task_id: "1".into(),
+            accounts: vec![agent_account("slot-ana", "ana@example.com")],
+        });
+        app.act(Action::OverlayStep(1));
+        match app.act(Action::OverlayConfirm).first() {
+            Some(Command::Dispatch { account, .. }) => {
+                assert_eq!(account.as_deref(), Some("slot-ana"));
+            }
+            other => panic!("expected a dispatch, got {other:?}"),
+        }
+    }
+
+    /// A reply for a row the operator has moved off must not fill the picker
+    /// that replaced it.
+    #[test]
+    fn a_stale_account_reply_is_dropped() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        let mut ready = board_row("1", BoardState::Ready);
+        ready.route = Some("offhand".into());
+        app.apply(Update::Board(vec![ready]));
+        app.board.selected = Some("1".into());
+        app.act(Action::BoardEnter);
+        app.apply(Update::DispatchAccounts {
+            task_id: "9".into(),
+            accounts: vec![agent_account("slot-ana", "ana@example.com")],
+        });
+        assert!(
+            matches!(
+                app.overlay,
+                Some(Overlay::DispatchAccount { accounts: None, .. })
+            ),
+            "another row's logins are not this row's"
+        );
+        // And enter while nothing has landed releases nothing.
+        assert!(app.act(Action::OverlayConfirm).is_empty());
+        assert!(matches!(app.overlay, Some(Overlay::DispatchAccount { .. })));
     }
 
     fn board_device(id: &str, name: &str, created: &str) -> Device {

@@ -125,16 +125,19 @@ nearly verbatim — it never depended on herdr:
   `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, runtime?, model?, account?}` →
+`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
-`ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch can be
-pointed at (the canonical set `build_spec` validates an override against) for
-pickers in the desktop panel and the CLI. `runtime`/`model`/`account` override
-the route's configured runtime, the harness's default model, and the route's
-`account` for that one dispatch; the attempt row records whatever the agent
-actually ran under.
+`ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
+can be pointed at (the canonical set `build_spec` validates an override against)
+for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
+name resolves to, so a picker can tell which agent accounts a runtime could
+spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
+override the route's configured runtime, the harness's default model, and the
+route's `account` for that one dispatch; the attempt row records whatever the
+agent actually ran under. `via`/`viaDevice`/`viaUser` are provenance, never
+authority — see §H12.
 
 ### Per-run agent accounts (gh#59)
 
@@ -166,9 +169,11 @@ change it. An account that will not resolve **refuses** the dispatch before the
 chat exists, and refuses a later run rather than falling back — a silent
 fallback bills whoever the device's own login belongs to.
 
-Deliberately not in v1: inferring an account from the WorkOS user who
-dispatched. `via` already records who released the work; guessing a login from
-it is the kind of clever that bills the wrong person. `comet-board doctor`
+Deliberately not in v1, and still not: inferring an account from the WorkOS user
+who dispatched. §H12 now records who released the work by name as well as by
+chat, and that changes nothing here — guessing a login from either is the kind
+of clever that bills the wrong person, and the identity it would guess from is
+unverified. `comet-board doctor`
 checks each route's `account` against the device's saved logins, including the
 CLI it belongs to — a Claude slot on a codex route is not lendable, since the
 two config-dir variables are not interchangeable.
@@ -393,8 +398,10 @@ section of `render.rs`) plus the shared derivations in `crates/proto/src/view/bo
 - Glyph-carried state — `▲ ● ▸ ✓ ✕ ·` — with the herdr-board colour mapping
   (blocked/failed share red, working amber, review the accent) carried on
   `Theme::board_state`, which survives `NO_COLOR` exactly as herdr's did.
-- `enter` dispatches a ready row (the operator's dispatch, so no `via`), opens
-  a working/blocked row's chat, and folds section headers.
+- `enter` releases a ready row (the operator's dispatch, so no `via`) — through
+  the account picker H12 added, whose first row is the route's own account and
+  so is the behaviour this line described before it; opens a working/blocked
+  row's chat, and folds section headers.
 - The `f` / `/` / `F` filter cycle, with the `/` field replacing the footer and
   the filter's label holding the header corner.
 - The derivations live in `comet_proto::view::board` — `Filter`, `sections`,
@@ -527,6 +534,52 @@ spawned untouched and the agent pushes as the box user. The PAT path is
 unchanged — `token_for_push` hands back the static token, which is what a
 self-hosted board on a PAT already pushes with. `comet-board doctor` answers the
 question directly with a `dispatched pushes` check.
+
+### H12 — The frontends send an account, and say who dispatched — **done** (gh#74)
+`DispatchTask` has taken an `account` since gh#59 and no frontend sent one, so
+a dispatch from the panel spent whatever the route said — which on a shared box
+means the owner's subscription, whoever pressed enter. Nothing recorded who that
+was either: `Dispatcher::Operator` is anonymous by construction.
+
+**The account picker.** The desktop panel's dispatch picker grew a third strip
+between runtime and model; the TUI, which had no picker at all, opens one on
+`enter` over a ready row. Both are fed by `ListAgentAccounts` **on the board's
+host** — the run executes there, and a slot id means nothing on the device that
+did not save it, the same reason `ListModels` is fetched with the host
+passthrough. Both filter the slots to the harness the row's runtime resolves to,
+which is why `ListBoardRuntimes` now carries `harness`: a Claude slot cannot pay
+for a codex run (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not interchangeable),
+and offering one would be offering a dispatch that refuses itself.
+
+Row 0 in both is **the route's own account**, and sends no override — so
+enter-enter is exactly what enter did before, and the strip costs a keystroke
+rather than a decision. It names the route's account where the row knows one, so
+the default is a fact rather than a shrug. Picking a slot is one click and never
+itself the release: whose limits a run burns is too consequential to happen by
+accident, so the model row (or enter) still does the releasing.
+
+**Attribution, at the strength the transport allows.** Every dispatch from
+either frontend now carries `viaDevice` (this device's id) and `viaUser` (the
+signed-in email), recorded on the attempt as `dispatched_by_device` /
+`dispatched_by_user`. `dispatched_by_user` joins the `TaskRow` contract, so
+`list --json` and both viewports can say who released a row; the device id
+deliberately stays off the wire, since it names a laptop, not a person. With no
+agent in the chain the upstream dispatch comment names the human — "dispatched
+by ana@example.com" — where it previously said nothing at all.
+
+These are **claims, not credentials**, and `DispatchOrigin` says so where the
+code is: relayed board calls arrive as the device room's owner (§H9), so the box
+has no per-call identity to check them against. #66 established that a teammate
+may reach the box at all; establishing *which* teammate is the next step, and
+these two columns are where a verified identity will land. Until then nothing is
+authorized on them, and in particular no account is inferred from them — which
+subscription a run spends stays the explicit `account` (gh#59).
+
+Deliberately not here: a per-user default account (that is a preference, and
+preferences want a home and a settings surface), and any UI for reading the
+attribution back beyond the row field — the panel's dispatch notice names the
+account it spent, and the issue comment names the human, which is where people
+were already looking.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

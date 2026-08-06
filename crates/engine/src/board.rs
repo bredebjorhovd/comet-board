@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use comet_board::config::Paths;
 use comet_board::db::NewAttempt;
 use comet_board::dispatch::{
-    DispatchOverrides, SpaceRef, build_spec, check_capacity, dispatcher_for, dispatcher_name,
-    route_for, space_matches,
+    DispatchOrigin, DispatchOverrides, SpaceRef, build_spec, check_capacity, dispatcher_for,
+    dispatcher_name, route_for, space_matches,
 };
 use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
@@ -56,7 +56,7 @@ enum Msg {
     Sessions(Vec<Session>),
     Dispatch {
         task_id: String,
-        via: Option<String>,
+        origin: DispatchOrigin,
         overrides: DispatchOverrides,
         /// End the task's live attempt and release a fresh one — the blocked
         /// row's Retry (gh#49), the deliberate exception to the one-live-attempt
@@ -148,16 +148,17 @@ impl BoardService {
     }
 
     /// Release a task: resolve its route, cut the checkout, create the chat,
-    /// queue the brief. `via` is the dispatching chat's id when an agent
-    /// released it — provenance, never authority. `overrides` are the
-    /// per-dispatch runtime/model choices that replace the route's defaults.
+    /// queue the brief. `origin` is who the caller says released it — the
+    /// dispatching chat, device and human (gh#74) — provenance, never
+    /// authority. `overrides` are the per-dispatch runtime/model/account
+    /// choices that replace the route's defaults.
     pub async fn dispatch_task(
         &self,
         task_id: &str,
-        via: Option<String>,
+        origin: DispatchOrigin,
         overrides: DispatchOverrides,
     ) -> anyhow::Result<Dispatched> {
-        self.dispatch_with(task_id, via, overrides, false).await
+        self.dispatch_with(task_id, origin, overrides, false).await
     }
 
     /// Retry a task: end the live attempt the row is stuck on and start a new
@@ -168,16 +169,16 @@ impl BoardService {
     pub async fn retry_task(
         &self,
         task_id: &str,
-        via: Option<String>,
+        origin: DispatchOrigin,
         overrides: DispatchOverrides,
     ) -> anyhow::Result<Dispatched> {
-        self.dispatch_with(task_id, via, overrides, true).await
+        self.dispatch_with(task_id, origin, overrides, true).await
     }
 
     async fn dispatch_with(
         &self,
         task_id: &str,
-        via: Option<String>,
+        origin: DispatchOrigin,
         overrides: DispatchOverrides,
         replace: bool,
     ) -> anyhow::Result<Dispatched> {
@@ -185,7 +186,7 @@ impl BoardService {
         self.tx
             .send(Msg::Dispatch {
                 task_id: task_id.to_string(),
-                via,
+                origin,
                 overrides,
                 replace,
                 reply,
@@ -287,7 +288,7 @@ fn run_loop(
             }
             Ok(Msg::Dispatch {
                 task_id,
-                via,
+                origin,
                 overrides,
                 replace,
                 reply,
@@ -297,7 +298,7 @@ fn run_loop(
                     runtime.as_ref(),
                     &spaces,
                     &task_id,
-                    via,
+                    &origin,
                     &overrides,
                     replace,
                 );
@@ -366,7 +367,7 @@ fn handle_dispatch(
     runtime: &(dyn Runtime + Send + Sync),
     spaces: &watch::Receiver<Vec<Space>>,
     task_id: &str,
-    via: Option<String>,
+    origin: &DispatchOrigin,
     overrides: &DispatchOverrides,
     replace: bool,
 ) -> anyhow::Result<Dispatched> {
@@ -425,7 +426,7 @@ fn handle_dispatch(
     // Provenance: a `via` chat with a live attempt names its task as the
     // parent; one without is still an agent if the chat is alive. The
     // `chat_alive` lookup runs only when it is the deciding fact.
-    let dispatcher = dispatcher_for(&engine.db, via.as_deref(), |chat| {
+    let dispatcher = dispatcher_for(&engine.db, origin.chat.as_deref(), |chat| {
         runtime.chat_alive(chat).unwrap_or(false)
     });
 
@@ -447,6 +448,10 @@ fn handle_dispatch(
         // route's default can change under a run that is still going, and the
         // attempt is the record of what actually ran (gh#59).
         account: spec.account.clone(),
+        // Which device released it, and who its frontend said was signed in
+        // there (gh#74) — recorded exactly as claimed, see [`DispatchOrigin`].
+        dispatched_by_device: origin.device.clone(),
+        dispatched_by_user: origin.user.clone(),
     })?;
 
     match runtime.dispatch(&spec) {
@@ -466,13 +471,17 @@ fn handle_dispatch(
             }
             // The upstream comment names the parent legibly: the issue
             // identifier when the board dispatched it too, the chat id
-            // otherwise — not the raw task id.
+            // otherwise — not the raw task id. With no agent in the chain it
+            // falls back to the human the dispatching frontend named (gh#74),
+            // which is the difference between "dispatched by ana@example.com"
+            // and a comment that says nothing about who released the work.
+            let by = dispatcher_name(&engine.db, &dispatcher).or_else(|| origin.user.clone());
             engine.enqueue_dispatch(
                 &task,
                 &route.runtime,
                 &route.workspace,
                 attempt_no,
-                dispatcher_name(&engine.db, &dispatcher).as_deref(),
+                by.as_deref(),
             )?;
             engine.rederive_all()?;
             Ok(Dispatched {
@@ -727,6 +736,8 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         db.set_attempt_pane(a, chat_id).unwrap();
@@ -860,7 +871,7 @@ runtime = "mock"
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let d = service
-            .dispatch_task("gh:owner/widget#7", Some("chat-parent".into()), DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#7", DispatchOrigin::via("chat-parent"), DispatchOverrides::default())
             .await
             .unwrap();
         assert_eq!(d.chat_id, "chat-for-gh#7");
@@ -884,7 +895,7 @@ runtime = "mock"
 
         // A second dispatch is refused while the first attempt is live.
         let err = service
-            .dispatch_task("gh:owner/widget#7", None, DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#7", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
@@ -924,7 +935,7 @@ runtime = "mock"
         let d = std::thread::spawn(move || {
             handle.block_on(async {
                 dispatch
-                    .dispatch_task("gh:owner/widget#60", None, DispatchOverrides::default())
+                    .dispatch_task("gh:owner/widget#60", DispatchOrigin::default(), DispatchOverrides::default())
                     .await
                     .expect("dispatch succeeds")
             })
@@ -938,7 +949,7 @@ runtime = "mock"
         // The loop survived: a second dispatch is refused on the live attempt
         // with a real answer, not "board loop is not running".
         let err = service
-            .dispatch_task("gh:owner/widget#60", None, DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#60", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
@@ -963,7 +974,7 @@ runtime = "mock"
         service
             .dispatch_task(
                 "gh:owner/widget#50",
-                None,
+                DispatchOrigin::default(),
                 DispatchOverrides {
                     runtime: Some("opencode".into()),
                     model: Some("gpt-5.2".into()),
@@ -991,6 +1002,63 @@ runtime = "mock"
         service.shutdown();
     }
 
+    /// gh#74: a teammate's dispatch is recorded as theirs. The device and the
+    /// human ride along as claims, land on the attempt row and the board row,
+    /// and name the releaser in the upstream comment — where the row would
+    /// otherwise say nothing about who released it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_records_the_device_and_human_that_released_it() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#74", "gh#74");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#74",
+                DispatchOrigin {
+                    chat: None,
+                    device: Some("laptop-ana".into()),
+                    user: Some("ana@example.com".into()),
+                },
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#74").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        assert_eq!(attempt.dispatched_by_device.as_deref(), Some("laptop-ana"));
+        assert_eq!(attempt.dispatched_by_user.as_deref(), Some("ana@example.com"));
+        // No agent in the chain: the operator is a person now, not an anonymous
+        // `Dispatcher::Operator`.
+        assert!(!attempt.dispatcher().is_agent());
+
+        // The board row names the human; the device id stays off the wire.
+        let rows = service.watch_rows().borrow().clone();
+        assert_eq!(
+            rows[0].dispatched_by_user.as_deref(),
+            Some("ana@example.com")
+        );
+
+        // …and so does the comment queued for the issue.
+        let queued = db.pending_writebacks(10).unwrap();
+        let dispatch = queued
+            .iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        assert!(
+            dispatch.payload.contains("ana@example.com"),
+            "the comment says who released it: {}",
+            dispatch.payload
+        );
+
+        service.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bad_dispatch_runtime_override_is_refused_and_leaves_no_attempt() {
         let paths = scratch_paths();
@@ -1003,7 +1071,7 @@ runtime = "mock"
         let err = service
             .dispatch_task(
                 "gh:owner/widget#51",
-                None,
+                DispatchOrigin::default(),
                 DispatchOverrides {
                     runtime: Some("nonesuch".into()),
                     model: None,
@@ -1048,7 +1116,7 @@ max_concurrent_per_workspace = 1
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let err = service
-            .dispatch_task("gh:owner/widget#21", None, DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#21", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cancel one first"), "{err}");
@@ -1077,7 +1145,7 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         service
-            .dispatch_task("gh:owner/widget#31", Some("chat-parent-30".into()), DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#31", DispatchOrigin::via("chat-parent-30"), DispatchOverrides::default())
             .await
             .unwrap();
 
@@ -1108,7 +1176,7 @@ max_concurrent_per_workspace = 1
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         service
-            .dispatch_task("gh:owner/widget#40", Some("chat-gone".into()), DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#40", DispatchOrigin::via("chat-gone"), DispatchOverrides::default())
             .await
             .unwrap();
 
@@ -1131,7 +1199,7 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![]);
 
         let err = service
-            .dispatch_task("gh:owner/widget#8", None, DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#8", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no comet space"), "{err}");
@@ -1235,7 +1303,7 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let dispatched = service
-            .dispatch_task("gh:owner/widget#62", None, DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#62", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap();
         assert_eq!(dispatched.attempt, 2);
@@ -1269,14 +1337,14 @@ max_concurrent_per_workspace = 1
         // A plain dispatch is still refused while the attempt is live — only
         // the retry is allowed past the guard.
         let err = service
-            .dispatch_task("gh:owner/widget#63", None, DispatchOverrides::default())
+            .dispatch_task("gh:owner/widget#63", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
 
         // The retry interrupts the stuck chat and archives it…
         let dispatched = service
-            .retry_task("gh:owner/widget#63", None, DispatchOverrides::default())
+            .retry_task("gh:owner/widget#63", DispatchOrigin::default(), DispatchOverrides::default())
             .await
             .unwrap();
         assert_eq!(dispatched.attempt, 2);
