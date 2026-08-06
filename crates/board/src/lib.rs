@@ -14,6 +14,7 @@
 //! delivery verification) is documented in `docs/BOARD.md`.
 
 pub mod adopt;
+pub mod billing;
 pub mod config;
 pub mod db;
 pub mod dispatch;
@@ -24,6 +25,7 @@ pub mod init;
 pub mod log;
 pub mod model;
 pub mod notify;
+pub mod onboard;
 pub mod overrun;
 pub mod review;
 pub mod routes;

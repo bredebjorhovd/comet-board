@@ -1878,6 +1878,7 @@ impl SyncEngine {
         workspace: &str,
         attempt_no: usize,
         via: Option<&str>,
+        billed_to: Option<&str>,
     ) -> Result<()> {
         // Name the parent upstream too: reading the Linear issue should tell you
         // an agent released this, not a person.
@@ -1889,6 +1890,12 @@ impl SyncEngine {
                 "workspace": workspace,
                 "attempt": attempt_no,
                 "via": via,
+                // Whose subscription this run spends, when it is not the
+                // releaser's (gh#101). Present only then, and on purpose: the
+                // trail belongs on the issue where both parties can see it, and
+                // a line that named the payer on every dispatch would say
+                // nothing on the one dispatch where it matters.
+                "billed_to": billed_to,
             })
             .to_string(),
             idem_key: format!("{}:dispatch:{}", task.id, attempt_no),
@@ -2048,14 +2055,16 @@ impl SyncEngine {
                             Some(v) => format!(" · dispatched by {v}"),
                             None => String::new(),
                         };
+                        let billed = dispatch_billing_suffix(&payload);
                         linear.comment(
                             &task.source_id,
                             &format!(
-                                "Dispatched to comet · {} · space:{} · attempt {}{}",
+                                "Dispatched to comet · {} · space:{} · attempt {}{}{}",
                                 payload["runtime"].as_str().unwrap_or("?"),
                                 payload["workspace"].as_str().unwrap_or("?"),
                                 payload["attempt"].as_u64().unwrap_or(1),
                                 via,
+                                billed,
                             ),
                         )?;
                     }
@@ -2168,15 +2177,17 @@ impl SyncEngine {
                             Some(v) => format!(" · dispatched by {v}"),
                             None => String::new(),
                         };
+                        let billed = dispatch_billing_suffix(&payload);
                         gh.comment(
                             &repo,
                             number,
                             &format!(
-                                "Dispatched to comet · {} · space:{} · attempt {}{}",
+                                "Dispatched to comet · {} · space:{} · attempt {}{}{}",
                                 payload["runtime"].as_str().unwrap_or("?"),
                                 payload["workspace"].as_str().unwrap_or("?"),
                                 payload["attempt"].as_u64().unwrap_or(1),
                                 via,
+                                billed,
                             ),
                         )?;
                     }
@@ -2347,6 +2358,19 @@ fn blocked_comment(payload: &Value) -> String {
         Stopped::parse(payload["reason"].as_str().unwrap_or("")),
         payload["log"].as_str().unwrap_or("(none)"),
     )
+}
+
+/// What a dispatch comment appends when the run spends somebody else's
+/// subscription (gh#101) — empty when it does not, which is most of them.
+///
+/// The record is written upstream rather than kept on the box on purpose: the
+/// two people it concerns are the teammate who released the work and the owner
+/// whose plan pays for it, and the issue is the one place both of them look.
+fn dispatch_billing_suffix(payload: &Value) -> String {
+    match payload["billed_to"].as_str().filter(|b| !b.is_empty()) {
+        Some(billed) => comet_proto::view::board::bills_comment_suffix(billed),
+        None => String::new(),
+    }
 }
 
 /// The branches the board has dispatched onto, and where.
@@ -2574,6 +2598,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();
@@ -2596,6 +2621,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         })
         .unwrap()
     }
@@ -3259,6 +3285,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();

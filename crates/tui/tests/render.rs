@@ -2117,6 +2117,7 @@ fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_pro
         started_at: None,
         account: None,
         dispatched_by_user: None,
+        billed_to: None,
         max_duration_secs: None,
     }
 }
@@ -2195,6 +2196,7 @@ fn a_selected_ready_row_offers_dispatch_in_the_footer() {
         other => panic!("expected an account fetch, got {other:?}"),
     }
     app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
         task_id: "1".into(),
         accounts: vec![comet_proto::AgentAccount {
             id: "slot-ana".into(),
@@ -2215,6 +2217,63 @@ fn a_selected_ready_row_offers_dispatch_in_the_footer() {
     assert!(screen.contains("Dispatch gh#1 on"), "{screen}");
     assert!(screen.contains("Route default"), "{screen}");
     assert!(screen.contains("ana@example.com"), "{screen}");
+}
+
+/// gh#101's exit criterion in the TUI: a teammate's enter over a row whose
+/// route names no account lands on **row 0**, which spends the box's own login
+/// — the owner's. The picker has to say so there, on the row nobody chose,
+/// before enter-enter releases it.
+#[test]
+fn the_account_picker_says_when_row_zero_spends_someone_elses_plan() {
+    fn login(id: &str, email: &str, active: bool) -> comet_proto::AgentAccount {
+        comet_proto::AgentAccount {
+            id: id.into(),
+            harness: comet_proto::HarnessId::ClaudeCode,
+            email: Some(email.into()),
+            plan_label: Some("Max".into()),
+            active,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    // `populated()` signs in as w@example.com — the teammate at the keyboard.
+    // The box's live login is the owner's.
+    let mut app = boarded();
+    app.board.selected = Some("1".into());
+    app.act(Action::BoardEnter);
+    app.apply(Update::DispatchAccounts {
+        harness: Some(comet_proto::HarnessId::ClaudeCode),
+        task_id: "1".into(),
+        accounts: vec![
+            login("slot-box", "brede@tally.no", true),
+            login("slot-me", "w@example.com", false),
+        ],
+    });
+    let screen = joined(&snapshot(&mut app, 100, 26));
+
+    assert!(
+        screen.contains("bills brede@tally.no"),
+        "row 0 is the one an enter-enter release lands on:\n{screen}"
+    );
+    // The teammate's own slot is not a warning — it keeps its plan label.
+    assert!(screen.contains("w@example.com"), "{screen}");
+    assert!(
+        screen.contains("Max"),
+        "a row that bills you keeps its plan label:\n{screen}"
+    );
+    // Two rows charge the owner — the route default and his slot picked
+    // explicitly — and both say so. Only those two: the warning is worth
+    // nothing if it is on every row.
+    assert_eq!(
+        screen.matches("bills ").count(),
+        2,
+        "exactly the rows that charge somebody else say it:\n{screen}"
+    );
 }
 
 #[test]

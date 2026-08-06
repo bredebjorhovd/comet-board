@@ -198,6 +198,7 @@ const ROUTE_KEYS: &[(&str, Kind)] = &[
     ("base", Kind::Str),
     ("max_concurrent", Kind::Int),
     ("max_duration", Kind::Str),
+    ("billing_guard", Kind::Str),
 ];
 
 /// The keys [`Edit::Default`] may set.
@@ -209,6 +210,7 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("notify_dispatcher", Kind::Bool),
     ("new_source", Kind::Str),
     ("max_duration", Kind::Str),
+    ("billing_guard", Kind::Str),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

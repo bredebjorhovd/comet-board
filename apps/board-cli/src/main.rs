@@ -53,10 +53,11 @@ struct Cli {
     /// The board store lives on exactly one device, usually the always-on box,
     /// and the board RPCs are relay-forwarded: this still dials the local
     /// engine, which passes the call on. Applies to the verbs that ask the
-    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`, and
-    /// `routes`, which reads and writes the host's routing.toml (gh#75). The
-    /// rest (doctor, init, adopt, stats) read this device's own files either
-    /// way, and are unaffected.
+    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`,
+    /// `routes`, which reads and writes the host's routing.toml (gh#75), and
+    /// `onboard`, whose clone, space and route all land on the host (gh#97).
+    /// The rest (doctor, init, adopt, stats) read this device's own files
+    /// either way, and are unaffected.
     #[arg(long, global = true)]
     device: Option<String>,
     #[command(subcommand)]
@@ -103,6 +104,17 @@ enum Command {
         /// `comet-board doctor` lists the ids this device has saved.
         #[arg(long)]
         account: Option<String>,
+        /// Spend an account that is not yours, on purpose (gh#101).
+        ///
+        /// Under `[defaults] billing_guard = "require-own"` a dispatch that
+        /// would charge somebody else's subscription is refused; this is the
+        /// acknowledgement that releases it, and it has to NAME the payer —
+        /// the agent-account slot id (which also selects it, so `--account` is
+        /// then redundant) or the email on the login being spent, which is the
+        /// only spelling there is when that login is the box's own. Under
+        /// `warn` and `off` it changes nothing but which slot is picked.
+        #[arg(long)]
+        bill: Option<String>,
     },
     /// Release a task again — the desktop panel's Retry, from a shell.
     ///
@@ -126,6 +138,17 @@ enum Command {
         /// Agent-account slot id to run under.
         #[arg(long)]
         account: Option<String>,
+        /// Spend an account that is not yours, on purpose (gh#101).
+        ///
+        /// Under `[defaults] billing_guard = "require-own"` a dispatch that
+        /// would charge somebody else's subscription is refused; this is the
+        /// acknowledgement that releases it, and it has to NAME the payer —
+        /// the agent-account slot id (which also selects it, so `--account` is
+        /// then redundant) or the email on the login being spent, which is the
+        /// only spelling there is when that login is the box's own. Under
+        /// `warn` and `off` it changes nothing but which slot is picked.
+        #[arg(long)]
+        bill: Option<String>,
     },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
@@ -202,6 +225,44 @@ enum Command {
     Routes {
         #[command(subcommand)]
         command: RoutesCommand,
+    },
+    /// Put a repo the board has never seen on the board: clone it, give it a
+    /// space, and route it — one verb (gh#97).
+    ///
+    /// Everything happens on the board's device, which is what makes this
+    /// runnable from a laptop that is not the box and has no GitHub credential
+    /// of its own: the checkout has to be where the agents run, the space has to
+    /// belong to that device, and the credential that decides whether the repo
+    /// is reachable at all is the board's App.
+    ///
+    /// Idempotent at every step, because the failure it exists to remove is a
+    /// half-onboarded repo. Re-running is the repair: an existing checkout of
+    /// the same repo is reused, an existing space is reused, and a repo already
+    /// polled and routed is left alone. A directory holding something else is
+    /// refused rather than cloned over.
+    ///
+    /// With no repo: list what the board's App can see.
+    Onboard {
+        /// `owner/repo`, or the repository's github.com URL.
+        slug: Option<String>,
+        /// Where the checkout goes **on the board's device** — the folder that
+        /// ends up holding the repo, not a parent to clone into. Defaults to the
+        /// engine's own clone root. Quote a `~` so it means the box's home
+        /// rather than your shell's.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Poll only issues carrying one of these labels (comma-separated), so a
+        /// roadmap-sized backlog does not land on the board whole.
+        #[arg(long, value_delimiter = ',')]
+        labels: Option<Vec<String>>,
+        /// Poll every open issue, said out loud (writes `labels = []`,
+        /// overriding a narrower global filter).
+        #[arg(long, conflicts_with = "labels")]
+        all_issues: bool,
+        /// The whole result as JSON — every step's outcome, for an orchestrating
+        /// agent that has to decide what to do next.
+        #[arg(long)]
+        json: bool,
     },
     /// Offer git-detected spaces the board is not watching; adopt one by slug.
     ///
@@ -281,7 +342,7 @@ enum RoutesCommand {
         /// Route number, as printed by `routes list` (1-based).
         route: usize,
         /// One of: name, workspace, repo, runtime, account, branch_template,
-        /// base, max_concurrent, max_duration.
+        /// base, max_concurrent, max_duration, billing_guard.
         key: String,
         /// The new value. Omit with `--unset` to remove the key, which falls
         /// the route back to `[defaults]`.
@@ -293,7 +354,8 @@ enum RoutesCommand {
     /// Set one key under `[defaults]`: `routes defaults max_duration 4h`.
     Defaults {
         /// One of: max_concurrent_per_workspace, branch_template, base,
-        /// notify, notify_dispatcher, new_source, max_duration.
+        /// notify, notify_dispatcher, new_source, max_duration,
+        /// billing_guard.
         key: String,
         value: Option<String>,
         #[arg(long, conflicts_with = "value")]
@@ -393,6 +455,7 @@ fn main() -> Result<()> {
             runtime: runtime_flag,
             model,
             account,
+            bill,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -400,10 +463,23 @@ fn main() -> Result<()> {
                 runtime: runtime_flag.as_deref(),
                 model: model.as_deref(),
                 account: account.as_deref(),
+                bill: bill.as_deref(),
+                // Filled in from the engine below — this shell has no way to
+                // know who is signed in without asking.
+                via_user: None,
                 replace: false,
             };
             let d = runtime.block_on(async {
                 let board = ops::attach(port, device).await?;
+                // Who this shell is, before anything else: it rides on the
+                // dispatch as `viaUser` (gh#74) and is the other half of the
+                // billing comparison (gh#101).
+                let me = ops::signed_in_email(&board).await;
+                let opts = ops::DispatchOpts {
+                    via_user: me.as_deref(),
+                    ..opts
+                };
+                warn_if_cross_billed(&board, &task, opts).await;
                 ops::dispatch_checked(&board, &task, opts).await
             })?;
             println!(
@@ -422,6 +498,7 @@ fn main() -> Result<()> {
             runtime: runtime_flag,
             model,
             account,
+            bill,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -429,6 +506,7 @@ fn main() -> Result<()> {
                 runtime: runtime_flag.as_deref(),
                 model: model.as_deref(),
                 account: account.as_deref(),
+                bill: bill.as_deref(),
                 // `replace` is not set here: `retry` reads the row and decides,
                 // because ending a live attempt is not something a verb should
                 // do without looking at what it is ending.
@@ -436,6 +514,15 @@ fn main() -> Result<()> {
             };
             let r = runtime.block_on(async {
                 let board = ops::attach(port, device).await?;
+                let me = ops::signed_in_email(&board).await;
+                let opts = ops::DispatchOpts {
+                    via_user: me.as_deref(),
+                    ..opts
+                };
+                // A retry bills someone too — it is a fresh attempt on the same
+                // account, and the one that ends a live agent is exactly the
+                // one nobody wants to have spent on the wrong plan.
+                warn_if_cross_billed(&board, &task, opts).await;
                 ops::retry(&board, &task, opts).await
             })?;
             println!(
@@ -545,15 +632,17 @@ fn main() -> Result<()> {
                 let d = runtime.block_on(async {
                     let board = ops::attach(port, device).await?;
                     ops::await_row(&board, &id, pickup).await?;
-                    ops::dispatch(
-                        &board,
-                        &id,
-                        ops::DispatchOpts {
-                            via: via.as_deref(),
-                            ..Default::default()
-                        },
-                    )
-                    .await
+                    let me = ops::signed_in_email(&board).await;
+                    let opts = ops::DispatchOpts {
+                        via: via.as_deref(),
+                        via_user: me.as_deref(),
+                        ..Default::default()
+                    };
+                    // The route's own account, on a ticket that did not exist a
+                    // second ago — the case where nobody has had a chance to
+                    // notice whose plan it lands on (gh#101).
+                    warn_if_cross_billed(&board, &id, opts).await;
+                    ops::dispatch(&board, &id, opts).await
                 })?;
                 println!(
                     "dispatched {id} → chat {} (attempt {})",
@@ -621,6 +710,31 @@ fn main() -> Result<()> {
             let board = ops::attach(port, device).await?;
             routes(&board, command).await
         }),
+        Command::Onboard {
+            slug,
+            dir,
+            labels,
+            all_issues,
+            json,
+        } => {
+            // Parsed before the round trip: a typo costs an error naming what to
+            // type, not a call to the box that comes back with the same news.
+            let slug = slug
+                .as_deref()
+                .map(comet_board::onboard::parse_slug)
+                .transpose()?;
+            let labels = comet_board::onboard::label_filter(labels, all_issues);
+            let dir = dir.map(|d| d.to_string_lossy().to_string());
+            runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                let Some(slug) = slug else {
+                    let repos = ops::app_repos(&board).await?;
+                    return ops::print_candidates(&repos, board.host(), json);
+                };
+                let done = ops::onboard(&board, &slug, dir.as_deref(), labels.as_deref()).await?;
+                ops::print_onboarded(&done, board.host(), json)
+            })
+        }
         Command::Adopt {
             slug,
             labels,
@@ -867,6 +981,19 @@ async fn edit_routing(board: &ops::Board) -> Result<()> {
     Ok(())
 }
 
+/// Say who a release is about to charge, before it charges them (gh#101).
+///
+/// On stderr, and never fatal: the engine applies the guard itself — it is the
+/// only side that can refuse under `require-own` — so this is the line that
+/// makes the spend visible in the surface the operator is actually looking at.
+/// A release the engine then refuses has said it twice, which is the right
+/// number of times for the sentence "somebody else is paying for this".
+async fn warn_if_cross_billed(board: &ops::Board, task: &str, opts: ops::DispatchOpts<'_>) {
+    if let Some(warning) = ops::cross_billing_warning(board, task, opts).await {
+        eprintln!("{warning}");
+    }
+}
+
 /// Echo the overrides a release was given, so the confirmation says what the
 /// attempt is actually running under and not just that it started.
 fn print_overrides(opts: &ops::DispatchOpts<'_>) {
@@ -874,6 +1001,7 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
         opts.runtime.map(|r| format!("runtime={r}")),
         opts.model.map(|m| format!("model={m}")),
         opts.account.map(|a| format!("account={a}")),
+        opts.bill.map(|b| format!("bill={b}")),
     ]
     .into_iter()
     .flatten()

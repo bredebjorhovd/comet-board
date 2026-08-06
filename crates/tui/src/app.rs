@@ -335,6 +335,12 @@ pub enum Overlay {
         /// What row 0 will spend when nothing is picked — the route's account,
         /// when the row names one.
         route_account: Option<String>,
+        /// The harness the row's runtime resolves to, as the host's
+        /// `ListBoardRuntimes` reported it. `None` when that lookup failed, and
+        /// then the picker says nothing about who pays: an unfiltered list has
+        /// no reliable "the box's own login" in it, and a wrong guess about
+        /// whose subscription a row spends is worse than no guess (gh#101).
+        harness: Option<comet_proto::HarnessId>,
         active: usize,
     },
     /// A single-line text prompt (rename).
@@ -643,15 +649,20 @@ impl App {
             Update::DispatchAccounts {
                 task_id: for_task,
                 accounts,
+                harness: for_harness,
             } => {
                 // Only fills the picker it was asked for: a slow reply must not
                 // land the wrong row's logins under a newer pick.
                 if let Some(Overlay::DispatchAccount {
-                    task_id, accounts: slot, ..
+                    task_id,
+                    accounts: slot,
+                    harness,
+                    ..
                 }) = &mut self.overlay
                     && *task_id == for_task
                 {
                     *slot = Some(accounts);
+                    *harness = for_harness;
                 }
                 Vec::new()
             }
@@ -1102,6 +1113,7 @@ impl App {
                         identifier,
                         accounts: None,
                         route_account: row.account.clone(),
+                        harness: None,
                         active: 0,
                     });
                     vec![Command::ListDispatchAccounts { task_id, runtime }]
@@ -2510,6 +2522,7 @@ impl App {
                 identifier,
                 accounts,
                 route_account,
+                harness,
                 active,
             }) => {
                 // Still loading: enter would be a release nobody aimed. Put the
@@ -2520,6 +2533,7 @@ impl App {
                         identifier,
                         accounts: None,
                         route_account,
+                        harness,
                         active,
                     });
                     return Vec::new();
@@ -3607,6 +3621,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            billed_to: None,
             max_duration_secs: None,
         }
     }
@@ -3719,6 +3734,7 @@ mod tests {
         // Row 0: no account override — what enter alone always did.
         app.act(Action::BoardEnter);
         app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
             task_id: "1".into(),
             accounts: vec![agent_account("slot-ana", "ana@example.com")],
         });
@@ -3739,6 +3755,7 @@ mod tests {
         // Row 1: that slot, sent as the override.
         app.act(Action::BoardEnter);
         app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
             task_id: "1".into(),
             accounts: vec![agent_account("slot-ana", "ana@example.com")],
         });
@@ -3763,6 +3780,7 @@ mod tests {
         app.board.selected = Some("1".into());
         app.act(Action::BoardEnter);
         app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
             task_id: "9".into(),
             accounts: vec![agent_account("slot-ana", "ana@example.com")],
         });

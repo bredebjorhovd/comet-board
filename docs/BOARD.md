@@ -139,7 +139,8 @@ nearly verbatim — it never depended on herdr:
   `Shell::render_agents_section` in `crates/ui/src/shell/spaces.rs` — §H17).
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?}` →
+`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?,
+bill?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
@@ -150,8 +151,10 @@ name resolves to, so a picker can tell which agent accounts a runtime could
 spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
 override the route's configured runtime, the harness's default model, and the
 route's `account` for that one dispatch; the attempt row records whatever the
-agent actually ran under. `via`/`viaDevice`/`viaUser` are provenance, never
-authority — see §H12.
+agent actually ran under. `bill` is the acknowledgement that a run spends
+somebody else's subscription, which `billing_guard = "require-own"` wants
+instead of a refusal — see §H17. `via`/`viaDevice`/`viaUser` are provenance,
+never authority — see §H12.
 
 ### Per-run agent accounts (gh#59)
 
@@ -474,7 +477,9 @@ that need only H1):
   `.bak` backup, ignore list, and backlog preview came over verbatim. The
   label-picker survives as `--labels`/`--all-issues` on the CLI. H13 took that
   reuse: `WriteBoardConfig {op: adopt}` calls `adopt_with` unchanged, and the
-  settings page's Add is that call.
+  settings page's Add is that call. H16 took it again, from the other end: what
+  `adopt` offers is repos with a checkout *already on the box*, and `onboard`
+  (gh#97) is the same writer reached from a repo the box has never seen.
 
 ### H9 — Relay-forward the board RPCs — **done** (gh#55)
 The four board methods joined `forwardable` in `crates/engine/src/rpc.rs`
@@ -855,6 +860,151 @@ both the shell and the file — now with a test that says why: the box wizard
 writes `LINEAR_API_KEY=` when the stage is skipped with Enter, and a skipped
 stage has to look exactly like a board nobody configured. Same for the App pair,
 where an empty `GITHUB_APP_ID` would otherwise read as "half configured".
+
+### H17 — `onboard`: clone, space, adopt in one verb — **done** (gh#97)
+Putting a repo on the board took three mechanisms that knew nothing about each
+other: a clone somebody made on the box by hand, a `createSpace` from the
+desktop (or, the night before this landed, a hand-built RPC seeder), and
+`comet-board adopt`. The App side had already stopped needing a human —
+all-repos installations — and #75 made routing remote. The clone and the space
+were the last thing that still wanted a shell on the box.
+
+`comet-board onboard <owner/repo> [--dir <path>] [--labels a,b | --all-issues]`,
+and every step of it happens **on the device that hosts the board**:
+
+1. **Resolve** against GitHub under the board's own credential. Not a
+   formality — the laptop running the command usually has no GitHub credential
+   at all, so resolving locally would answer about the wrong world; and a repo
+   the App cannot see is one that would clone, get a space, get a route, and
+   then poll nothing forever. A refusal names whoever can fix it, which under an
+   App is the *installer* and not the operator: nothing on the box can grant an
+   installation, so sending them to `.env` would be sending them nowhere.
+2. **Clone**, with the askpass minting #68 built (`clone_env` →
+   `git_credentials::agent_env`). The board's App is the credential that will
+   push this repo's branches; it should be the one that fetched it. The URL that
+   authenticates carries `x-access-token@`, so the remote is rewritten to the
+   canonical one afterwards — a checkout outlives the clone that made it, and
+   the human who opens that folder should find the remote they would have typed.
+   `adopt::github_slug` learned to read the userinfo form anyway, because an
+   interrupted onboard must not leave a checkout that detection cannot see.
+3. **`createSpace`** — the same op the desktop picker sends, with
+   `git_detected` stated rather than guessed (we just cloned it).
+4. **Adopt** — `adopt_with` unchanged, through the same validating writer.
+   Deliberately *not* via `WriteBoardConfig {op: adopt}`: that path detects
+   through the spaces **watch**, which has not necessarily observed the row
+   created three lines earlier, and an onboard that raced its own space would
+   report "not on the unadopted list" about a repo it had just cloned. The
+   polled/routed decision itself is shared — `adopt::missing_for`, factored out
+   of `detect` — so the two surfaces cannot disagree about what "on the board"
+   means.
+
+**Idempotent at every step**, because the failure it exists to remove is a
+*half*-onboarded repo: a clone with no space, a space with no route, a route
+for a repo nothing polls. Re-running has to be the repair, not a second mess.
+An existing checkout of the same repo is reused, an existing space for that path
+is reused (`create_space` dedupes on `(device, path)` anyway, but silently —
+reading the row back is what keeps the reply's `spaceId` honest), and a repo
+already both polled and routed says so and writes nothing. What is *not* reused:
+a directory holding something else. A checkout of a different repo is the
+dangerous case — every step downstream would succeed, and the board would
+dispatch this repo's issues into another repo's code — so it is refused.
+
+- **`crates/board/src/onboard.rs`** holds the decisions and the report; the
+  engine holds the effects, because the clone is `repos.rs`'s and the space is
+  the workspace doc's. `Repos` gained `clone_to` (exact path, credential
+  environment, canonical remote, and a failed clone cleaned up so a retry is a
+  clean retry) and `origin_url`.
+- **`OnboardRepo` / `ListAppRepos`**, both forwardable for the reason the
+  config pair is: all of it belongs to the host. Two blocking phases inside the
+  handler rather than one — the GitHub clients hold `Rc`s and cannot cross the
+  await the clone needs — which costs one extra installation-token mint per
+  onboard and is the right price for not holding a `!Send` value across a
+  `git clone`.
+- **`ListAppRepos` is the App's grant**, not the operator's repos: exactly the
+  set the box can clone and the loop can poll, gathered across every
+  installation under installation tokens (`/installation/repositories` is the
+  one endpoint that answers *about* an installation and so names no repo to
+  derive its credential from — hence `AppAuth::token_for_installation`). Repos
+  already on the board stay in the list rather than being filtered out; "is this
+  one already set up?" is half of why anybody opens the picker.
+- **Settings → Board routing** grew the "Onboard a repo…" panel: the App's list
+  with a button per row, plus a free-text field, which is not a fallback for a
+  broken list — a board on `GITHUB_TOKEN` has no installations to enumerate at
+  all, and the picker would otherwise be empty for it forever. A `--dir` field
+  beside it, expanded against the *box's* home.
+- **Writeback is reported, never set.** It is off by default on purpose —
+  writing to somebody's issues is not a thing to start doing because a repo was
+  pointed at the board — so onboarding says where it stands and leaves the
+  decision where it was. Same for an archived repo and one with issues disabled:
+  both would otherwise be discovered as a board that stays empty.
+
+### H18 — Never spend someone's subscription silently — **done** (gh#101)
+gh#59 made *which* account a dispatch spends explicit and gh#74 made every
+frontend send one, and between them they left the case they had just made
+visible unaddressed: a dispatch that names no account runs on the box's own CLI
+login. On a shared box that is the owner's subscription, whoever pressed enter.
+The teammate did not know they were spending it; the owner found out on their
+usage page.
+
+**Who a run bills** is resolved at dispatch: the named slot's
+`AgentAccount.email`, or — when no slot is named — the box's own login, which is
+the *active* account for that harness and is displayed as the operator's. It is
+recorded on the attempt (`attempts.billed_to`) and joins the `TaskRow` contract
+as `billed_to`, rather than being looked up from `account` on demand: a slot id
+means nothing to a reader who has not saved that login, and the box's own login
+can be switched under a run that is still going. A run is **cross-billed** when
+that email differs from the dispatcher's `viaUser` claim; two unknowns read as
+"not cross-billed", because an unattributed dispatch names nobody to have
+wronged.
+
+**`[defaults] billing_guard = "warn" | "require-own" | "off"`**, per-route
+override, parsed like `max_duration` — an unrecognised value is refused by
+`validate` rather than falling back silently, since a typo would read exactly
+like the default and un-arm a route somebody deliberately set to `require-own`.
+
+`warn` (the default) says so everywhere and releases anyway:
+- both pickers mark a selection that cross-bills with a warning treatment and
+  the text *bills brede@tally.no* — **including row 0**, which is exactly the
+  chip an enter-enter release lands on without anybody having chosen it. Row 0's
+  effective slot is the route's account, resolved against the host's own
+  `ListAgentAccounts`, because `Route default · 8f2c1d0a` answers nothing;
+- `comet-board dispatch` / `retry` print one line before releasing — *this run
+  bills brede@tally.no's Claude — pass --account <your slot>*. The CLI resolves
+  it itself rather than reading it back off the reply: by the time `DispatchTask`
+  answers, the worktree is cut and the agent is running on that account. This is
+  also why the CLI now sends `viaUser` (from the local `AuthStatus`) — it is a
+  frontend like the other two, and without it the guard has nothing to compare;
+- the upstream dispatch comment appends *· on brede@tally.no's subscription*, so
+  the record is public to both parties instead of living on one usage page;
+- `row_metadata` appends *· bills brede@tally.no* for the attempt's whole life —
+  outside the per-state arms, because a fact that survives the row changing
+  section does not belong inside the match on which section it is in.
+
+`require-own` refuses instead, in `handle_dispatch` **beside the concurrency
+cap** — before any attempt row exists, because a refusal that left a `failed`
+attempt behind would cost the operator exactly the cleanup this mode exists to
+avoid. The override has to *name* the payer: `--bill <slot>` (which also selects
+the account) or `--bill <email>` (the only spelling available when the login is
+the box's own and has no slot id). In the panel the confirm is reactive — the
+mode lives in the host's `routing.toml`, which the panel does not read, so the
+only honest way to ask "do you mean it" is to ask after the box has said it
+minds. The refusal carries `view::board::REQUIRE_OWN_REFUSAL` so the panel can
+tell it from every other dispatch failure without parsing prose.
+
+**This is a seatbelt, not a lock**, and every surface says so in the words that
+stay true afterwards. The match is claim-vs-slot-email: a frontend willing to
+misreport its signed-in user walks straight through `require-own`, because
+relayed board calls arrive as the device room's owner (§H9) and #66's verified
+identity is what will change that. It is worth having anyway — the failure it
+exists for is nobody noticing, not somebody attacking. `doctor` reports the mode
+the way it reports the notices, never failing, and worded so `off` reads as the
+choice it is on a box where one person's plan pays for everything.
+
+Deliberately not here: token or cost caps (§H10's note still stands — those need
+per-run accounting the harnesses do not expose), and inferring an account from
+the WorkOS user who dispatched. The guard *compares* the claim; it still never
+authorizes on it, and which subscription a run spends stays the explicit
+`account`.
 
 ### H17 — Live agents in the sidebar — **done** (gh#103)
 In herdr every working agent was a pane, so the pane list *was* the presence

@@ -69,6 +69,11 @@ pub enum Update {
     DispatchAccounts {
         task_id: String,
         accounts: Vec<comet_proto::AgentAccount>,
+        /// The harness the row's runtime resolved to, when `ListBoardRuntimes`
+        /// answered. What lets the picker say whose subscription row 0 spends:
+        /// the box's own login is the *active* account for a harness, and
+        /// without one there is no reliable way to pick it out (gh#101).
+        harness: Option<comet_proto::HarnessId>,
     },
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
@@ -1079,6 +1084,10 @@ fn spawn_dispatch_accounts(
                 .collect(),
             None => snapshot.accounts,
         };
-        let _ = updates.send(Update::DispatchAccounts { task_id, accounts });
+        let _ = updates.send(Update::DispatchAccounts {
+            task_id,
+            accounts,
+            harness,
+        });
     });
 }

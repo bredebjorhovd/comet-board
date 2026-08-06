@@ -13,6 +13,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
+use crate::billing::Billing;
 use crate::config::{Route, RoutingConfig, interpolate, slugify};
 use crate::db::Db;
 use crate::model::{Dispatcher, Task, UpstreamState, gh_repo_name};
@@ -99,6 +100,48 @@ pub fn check_capacity(db: &Db, cfg: &RoutingConfig, route: &Route) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// Who a dispatch will bill, and the refusal the route's `billing_guard` owes
+/// it (gh#101).
+///
+/// Sits beside [`check_capacity`] in `handle_dispatch` and for the same reason:
+/// both are refusals a dispatch owes its caller *before* anything is created,
+/// and a `require-own` refusal that left a `failed` attempt row behind would
+/// cost the operator exactly the cleanup this guard exists to spare them.
+///
+/// `account_email` is the engine's answer to "whose login is this slot" —
+/// taken as a closure because which logins a device has saved is engine
+/// knowledge and this crate has no view of them. It is asked at most once, and
+/// only when the run has a harness to spend a subscription on.
+///
+/// Returns the verdict even when it releases: the caller records `billed_to` on
+/// the attempt and prints [`Billing::warning`] under `warn`.
+pub fn check_billing(
+    cfg: &RoutingConfig,
+    route: &Route,
+    origin: &DispatchOrigin,
+    overrides: &DispatchOverrides,
+    account_email: impl FnOnce(comet_proto::HarnessId, Option<&str>) -> Option<String>,
+) -> Result<Option<Billing>> {
+    // No harness means a runtime that maps to none, which `build_spec` refuses
+    // by name a moment later; there is no subscription to reason about.
+    let Some(harness) = effective_harness(route, overrides) else {
+        return Ok(None);
+    };
+    let slot = effective_account(route, overrides);
+    let billing = Billing {
+        billed_to: account_email(harness, slot),
+        dispatcher: origin.user.clone(),
+        harness,
+    };
+    let acknowledged = crate::billing::acknowledges(
+        overrides.bill.as_deref(),
+        slot,
+        billing.billed_to.as_deref(),
+    );
+    crate::billing::guard(cfg.billing_guard(Some(route)), &billing, acknowledged)?;
+    Ok(Some(billing))
 }
 
 /// Where a dispatch came from, as the caller reports it (gh#74).
@@ -253,11 +296,7 @@ pub fn build_spec(
         worktree: true,
         harness,
         model: overrides.model.clone(),
-        account: overrides
-            .account
-            .clone()
-            .or_else(|| route.account.clone())
-            .filter(|a| !a.is_empty()),
+        account: effective_account(route, overrides).map(str::to_string),
     })
 }
 
@@ -280,6 +319,58 @@ pub struct DispatchOverrides {
     /// this device has saved, so a wrong id fails the dispatch with the
     /// engine's message instead of a guess from this crate.
     pub account: Option<String>,
+    /// An explicit "yes, bill that account" — `comet-board dispatch --bill`,
+    /// or a frontend's confirm dialog (gh#101). What `billing_guard =
+    /// "require-own"` accepts instead of refusing a cross-billed release.
+    ///
+    /// Does double duty, because a consent that does not say *what* it
+    /// consents to is a flag people set once: a slot id here also selects the
+    /// account (ahead of [`account`](Self::account) and the route's), and an
+    /// email acknowledges the login the run was going to reach anyway — the
+    /// only spelling available when that login is the box's own and has no slot
+    /// id. Either way it has to name the account actually billed, or it is a
+    /// typo rather than consent (see [`crate::billing::acknowledges`]).
+    pub bill: Option<String>,
+}
+
+impl DispatchOverrides {
+    /// The agent-account slot this dispatch will spend, before the route is
+    /// consulted: an explicit `--bill <slot>` first (it names the payer, which
+    /// is the strongest statement available), then `--account`. An email in
+    /// `bill` selects nothing — it acknowledges a login the dispatch was
+    /// already headed for.
+    pub fn account_override(&self) -> Option<&str> {
+        self.bill
+            .as_deref()
+            .filter(|b| crate::billing::bill_names_a_slot(b))
+            .or(self.account.as_deref())
+            .filter(|a| !a.is_empty())
+    }
+}
+
+/// The agent-account slot a dispatch of `route` under `overrides` will spend —
+/// the same fallback chain [`build_spec`] applies, available before a space has
+/// been resolved so the billing guard can run beside the concurrency cap.
+///
+/// `None` is the device's own CLI login.
+pub fn effective_account<'a>(
+    route: &'a Route,
+    overrides: &'a DispatchOverrides,
+) -> Option<&'a str> {
+    overrides
+        .account_override()
+        .or(route.account.as_deref())
+        .filter(|a| !a.is_empty())
+}
+
+/// The harness a dispatch of `route` under `overrides` will run on, and so
+/// which subscription it spends. `None` for a runtime that maps to no harness,
+/// which [`build_spec`] refuses by name a moment later.
+pub fn effective_harness(
+    route: &Route,
+    overrides: &DispatchOverrides,
+) -> Option<comet_proto::HarnessId> {
+    harness_for_runtime(overrides.runtime.as_deref().unwrap_or(&route.runtime))
 }
 
 /// Does `space` answer to the name a route's `workspace` key uses? Comet spaces
@@ -439,6 +530,7 @@ mod tests {
             runtime: Some("opencode".into()),
             model: None,
             account: None,
+            bill: None,
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -459,6 +551,7 @@ mod tests {
             runtime: None,
             model: Some("sonnet-4".into()),
             account: None,
+            bill: None,
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -479,6 +572,7 @@ mod tests {
             runtime: Some("nonesuch".into()),
             model: None,
             account: None,
+            bill: None,
         };
         let err = build_spec(
             &RoutingConfig::default(),
@@ -646,6 +740,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         db.set_attempt_pane(a, chat).unwrap();

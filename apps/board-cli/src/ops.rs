@@ -21,10 +21,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use comet_board::adopt::{Unadopted, git_remote, github_slug};
 use comet_board::config::{self, Paths, RoutingConfig};
 use comet_board::model::{BoardState, Source};
+use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
 use comet_board::rows::TaskRow;
 use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
 use comet_proto::Device;
+use comet_proto::view::board as view;
 use comet_rpc::{RpcClient, connect_ws, methods};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -297,6 +299,16 @@ pub struct DispatchOpts<'a> {
     pub model: Option<&'a str>,
     /// Agent-account slot whose subscription this run spends.
     pub account: Option<&'a str>,
+    /// `--bill`: "spend that account, I know whose it is" (gh#101). Names the
+    /// payer — a slot id, which also selects it, or the email on the login
+    /// being spent. What `billing_guard = "require-own"` accepts instead of
+    /// refusing; inert under `warn` and `off` beyond picking the slot.
+    pub bill: Option<&'a str>,
+    /// Who this shell says is releasing the work — the WorkOS user signed in on
+    /// this device (gh#74). Resolved by [`signed_in_email`] rather than passed
+    /// by hand: the CLI is a frontend like the other two, and without it the
+    /// billing guard has nothing to compare an account against.
+    pub via_user: Option<&'a str>,
     /// End the task's live attempt and release a fresh one — `retry` on a
     /// blocked row (gh#49), and the one deliberate breach of the
     /// one-live-attempt rule. Ordinary dispatches send `false` and are refused
@@ -328,6 +340,82 @@ pub fn provenance(flag: Option<String>) -> Option<String> {
 
 fn provenance_from(flag: Option<String>, env: Option<String>) -> Option<String> {
     flag.or(env).filter(|s| !s.is_empty())
+}
+
+// ---- whose subscription (gh#101) ----------------------------------------
+
+/// The email of the WorkOS user signed in on THIS device, when there is one.
+///
+/// Local on purpose, and not forwarded to the board's host: the question is
+/// "who is running this shell", and the box's own signed-in user is the wrong
+/// answer to it. `None` for a signed-out engine, an engine that answers
+/// something else, and any failure at all — this decorates a dispatch, it must
+/// never be what stops one.
+pub async fn signed_in_email(board: &Board) -> Option<String> {
+    let mut stream = board
+        .client
+        .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
+        .await
+        .ok()?;
+    let first = tokio::time::timeout(SNAPSHOT_TIMEOUT, stream.recv())
+        .await
+        .ok()??;
+    match serde_json::from_value::<comet_proto::AuthState>(first).ok()? {
+        comet_proto::AuthState::SignedIn { user, .. }
+        | comet_proto::AuthState::NeedsOrganization { user } => {
+            Some(user.email).filter(|e| !e.is_empty())
+        }
+        comet_proto::AuthState::SignedOut => None,
+    }
+}
+
+/// The one line `dispatch` and `retry` print before releasing a run that
+/// charges somebody else — `None` when this one does not, which is most of
+/// them.
+///
+/// Resolved here rather than read back off the reply because it has to be said
+/// *before* the release: by the time `DispatchTask` answers, the worktree is
+/// cut and the agent is running on the account in question. The engine applies
+/// the guard itself either way (and is the only one that can refuse under
+/// `require-own`) — this is the CLI keeping the promise the pickers keep, that
+/// nobody spends a subscription without being told whose.
+///
+/// Every lookup degrades to silence. A board that cannot say whose login a slot
+/// is has not found a problem, and grounding a legitimate dispatch on a failed
+/// lookup would be the wrong half of this feature.
+pub async fn cross_billing_warning(
+    board: &Board,
+    task_id: &str,
+    opts: DispatchOpts<'_>,
+) -> Option<String> {
+    // Nobody to compare against: an unattributed dispatch names no wronged
+    // party, and asking the box two more questions could not change that.
+    let me = opts.via_user?;
+    let row = board_rows(board)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|r| r.id == task_id)?;
+    // Exactly the chain `build_spec` walks: `--bill <slot>`, then `--account`,
+    // then the route's own — which is what the row reports for a task nothing
+    // has run on yet.
+    let slot = opts
+        .bill
+        .filter(|b| comet_board::billing::bill_names_a_slot(b))
+        .or(opts.account)
+        .or(row.account.as_deref());
+    let harness = harness_for_runtime(opts.runtime.or(row.runtime.as_deref())?)?;
+    let accounts: comet_proto::AgentAccountsSnapshot = board
+        .client
+        .call(
+            methods::LIST_AGENT_ACCOUNTS,
+            board.params(serde_json::json!({})),
+        )
+        .await
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())?;
+    let billed = view::billed_email(&accounts.accounts, harness, slot)?;
+    view::cross_billed(Some(billed), Some(me)).then(|| view::bills_warning(billed, harness))
 }
 
 /// One model a dispatch can be pointed at, as `ListModels` reports it for a
@@ -529,6 +617,8 @@ fn dispatch_params(task_id: &str, opts: DispatchOpts<'_>) -> serde_json::Value {
         ("runtime", opts.runtime),
         ("model", opts.model),
         ("account", opts.account),
+        ("bill", opts.bill),
+        ("viaUser", opts.via_user),
     ] {
         if let Some(value) = value {
             object.insert(key.into(), serde_json::Value::String(value.to_string()));
@@ -780,6 +870,15 @@ pub fn print_config(cfg: &BoardConfig, host: Option<&str>, json: bool) -> Result
                 if let Some(a) = &r.account {
                     meta.push(format!("account {a}"));
                 }
+                // Only where the route disagrees with the board (gh#101) — the
+                // mode itself is `doctor`'s line, and repeating it on every
+                // route would bury the one route that answers differently.
+                if r.billing_guard.is_some() {
+                    meta.push(format!(
+                        "billing_guard {}",
+                        c.billing_guard(Some(r)).as_str()
+                    ));
+                }
                 if let Some(n) = r.max_concurrent {
                     meta.push(format!("max_concurrent {n}"));
                 }
@@ -810,6 +909,135 @@ pub fn print_config(cfg: &BoardConfig, host: Option<&str>, json: bool) -> Result
         }
         println!("  add one:  comet-board routes add <owner/repo>");
     }
+    Ok(())
+}
+
+// ---- onboard (gh#97) ----------------------------------------------------
+
+/// Clone, space, adopt — one round trip, all of it on the board's device.
+///
+/// Nothing here is done locally, deliberately: the checkout has to be where the
+/// agents run, the space has to be owned by that device, and the GitHub
+/// credential that decides whether the repo is reachable lives with the board.
+/// A laptop driving this needs no credential and no shell on the box.
+pub async fn onboard(
+    board: &Board,
+    slug: &str,
+    dir: Option<&str>,
+    labels: Option<&[String]>,
+) -> Result<Onboarded> {
+    let mut params = serde_json::json!({ "slug": slug });
+    if let Some(object) = params.as_object_mut() {
+        if let Some(dir) = dir {
+            object.insert("dir".into(), serde_json::json!(dir));
+        }
+        // Absent and `[]` are different instructions — see `label_filter`.
+        if let Some(labels) = labels {
+            object.insert("labels".into(), serde_json::json!(labels));
+        }
+    }
+    let reply = board
+        .client
+        .call(methods::ONBOARD_REPO, board.params(params))
+        .await?;
+    serde_json::from_value(reply).context("parsing OnboardRepo reply")
+}
+
+/// What the board's GitHub App can see, and which of it is already on the board.
+pub async fn app_repos(board: &Board) -> Result<Vec<Candidate>> {
+    let reply = board
+        .client
+        .call(methods::LIST_APP_REPOS, board.params(serde_json::json!({})))
+        .await?;
+    serde_json::from_value(reply).context("parsing ListAppRepos reply")
+}
+
+/// The onboarding offer, as `comet-board onboard` with no repo prints it.
+pub fn print_candidates(repos: &[Candidate], host: Option<&str>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(repos)?);
+        return Ok(());
+    }
+    let where_ = match host {
+        Some(h) => format!(" on {h}"),
+        None => String::new(),
+    };
+    if repos.is_empty() {
+        println!("the board's GitHub App is installed nowhere{where_}");
+        return Ok(());
+    }
+    println!("repos the board's App can see{where_}:");
+    for r in repos {
+        // The ones already on the board are shown, not hidden: "is this one set
+        // up?" is half of why anybody runs this.
+        println!("  {:<44} {}", r.slug, r.note());
+    }
+    println!(
+        "\nput one on the board:  comet-board onboard <owner/repo> [--dir <path>] [--labels a,b | --all-issues]"
+    );
+    Ok(())
+}
+
+/// What one onboard did, step by step.
+///
+/// Per step rather than as one line, because re-running after a half-finished
+/// first go is the intended repair and the operator has to see which half was
+/// missing to believe it is now whole.
+pub fn print_onboarded(done: &Onboarded, host: Option<&str>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(done)?);
+        return Ok(());
+    }
+    println!(
+        "onboarded {} on {}",
+        done.slug,
+        host.unwrap_or("this device")
+    );
+    println!("  clone    {:<8} {}", done.clone.as_str(), done.path);
+    println!("  space    {:<8} {}", done.space.as_str(), done.space_name);
+    match &done.adopted {
+        None => println!("  routing  unchanged  already polled and routed"),
+        Some(a) => {
+            let mut wrote = Vec::new();
+            if a.wrote_route {
+                wrote.push("a [[route]]".to_string());
+            }
+            if a.wrote_repo {
+                wrote.push("[github] repos".to_string());
+            }
+            if let Some(l) = &a.labels {
+                wrote.push(if l.is_empty() {
+                    "a [[github.repo]] polling every open issue".to_string()
+                } else {
+                    format!("a [[github.repo]] filter: {}", l.join(", "))
+                });
+            }
+            println!("  routing  wrote    {}", wrote.join(" + "));
+            println!(
+                "           a commented `label = \"{}\"` route was left for Linear issues",
+                a.suggested_label
+            );
+        }
+    }
+    if let Some(p) = &done.preview {
+        println!("  issues   {}", p.count_phrase());
+        for (label, n) in p.labels.iter().take(8) {
+            println!("             {n:>4}  {label}");
+        }
+        // The failure this warns about is real and quiet: pointing the board at
+        // one repo put 83 rows on it in a single poll.
+        if done.adopted.as_ref().is_some_and(|a| a.labels.is_none()) && p.open_issues > 20 {
+            println!(
+                "  note     the global [github] labels filter applies — {} would arrive \
+                 unfiltered; narrow it with `comet-board routes edit`",
+                p.count_phrase()
+            );
+        }
+    }
+    for note in done.notes() {
+        println!("  note     {note}");
+    }
+    println!("\nthe board polls on its next cycle: comet-board list --state ready");
     Ok(())
 }
 
@@ -1015,6 +1243,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            billed_to: None,
             max_duration_secs: None,
         }
     }
@@ -1232,6 +1461,8 @@ mod tests {
                     runtime: Some("opencode"),
                     model: Some("claude-opus-5"),
                     account: Some("slot-a"),
+                    bill: None,
+                    via_user: None,
                     replace: true,
                 }
             ),
@@ -1244,6 +1475,44 @@ mod tests {
                 "replace": true,
             })
         );
+    }
+
+    /// gh#101: the acknowledgement and this shell's own user ride along, and
+    /// only when there is one. `viaUser` is the half of the billing comparison
+    /// the CLI never sent before — without it the guard on the box has nothing
+    /// to compare an account against, and `require-own` could never refuse a
+    /// release from a shell.
+    #[test]
+    fn dispatch_carries_the_acknowledgement_and_who_is_signed_in() {
+        assert_eq!(
+            dispatch_params(
+                "gh:o/r#1",
+                DispatchOpts {
+                    bill: Some("brede@tally.no"),
+                    via_user: Some("ana@example.com"),
+                    ..Default::default()
+                }
+            ),
+            serde_json::json!({
+                "taskId": "gh:o/r#1",
+                "via": null,
+                "bill": "brede@tally.no",
+                "viaUser": "ana@example.com",
+            })
+        );
+        // A shell nobody is signed into sends neither, exactly as before.
+        let bare = dispatch_params("gh:o/r#1", DispatchOpts::default());
+        assert!(bare.get("viaUser").is_none());
+        assert!(bare.get("bill").is_none());
+    }
+
+    /// `--bill <slot>` is consent *and* a choice of account; `--bill <email>`
+    /// only ever the first, because there is no slot id to select when the
+    /// login being spent is the box's own.
+    #[test]
+    fn bill_selects_a_slot_but_an_email_only_acknowledges() {
+        assert!(comet_board::billing::bill_names_a_slot("8f2c1d0a7b6e4539"));
+        assert!(!comet_board::billing::bill_names_a_slot("brede@tally.no"));
     }
 
     #[test]

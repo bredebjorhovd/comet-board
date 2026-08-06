@@ -129,12 +129,17 @@ impl JwtSigner for Rs256 {
     }
 }
 
-/// The endpoints reached with the App JWT rather than with an installation
-/// token. A seam, so minting is testable without a real App.
+/// The endpoints reached outside [`HttpRest`]'s repo-scoped routing — the App's
+/// own, under the JWT, plus `/installation/repositories`, which is the one
+/// endpoint that needs an installation token and names no repo to derive it
+/// from. A seam, so minting is testable without a real App.
+///
+/// `bearer` is whatever the caller resolved; every method here stamps it
+/// verbatim.
 pub trait AppApi {
-    fn get(&self, path: &str, jwt: &str) -> Result<Value>;
-    /// POST with no body — the only App-JWT POST is the mint.
-    fn post(&self, path: &str, jwt: &str) -> Result<Value>;
+    fn get(&self, path: &str, bearer: &str) -> Result<Value>;
+    /// POST with no body — the only POST is the mint.
+    fn post(&self, path: &str, bearer: &str) -> Result<Value>;
 }
 
 /// One installation of the App, as `doctor` reports it.
@@ -240,7 +245,16 @@ impl AppAuth {
     /// expires, so several repos behind one installation share one token and one
     /// mint.
     pub fn token_for_repo(&self, repo: &str) -> Result<String> {
-        let id = self.installation_for(repo)?;
+        self.token_for_installation(self.installation_for(repo)?)
+    }
+
+    /// A live installation token for one installation, by id.
+    ///
+    /// The half of [`AppAuth::token_for_repo`] that does not need a repo — what
+    /// `/installation/repositories` is authenticated with, since that endpoint
+    /// answers *about* an installation and so names no repo to derive one from
+    /// (gh#97).
+    pub fn token_for_installation(&self, id: i64) -> Result<String> {
         let now = self.clock.now();
         if let Some(m) = self.cache.borrow().tokens.get(&id)
             && m.expires_at - REFRESH_MARGIN > now
@@ -347,7 +361,90 @@ impl AppAuth {
             })
             .collect())
     }
+
+    /// Every repo the App can see, across all of its installations (gh#97).
+    ///
+    /// This is the list an "onboard a repo" picker offers, and it is the honest
+    /// one: it is not what the operator *owns*, it is what the App was granted —
+    /// exactly the set a clone can authenticate for and the sync loop can poll.
+    /// A repo missing from it is a repo somebody has to go and install the App
+    /// on, and that is the answer worth showing.
+    ///
+    /// One installation that fails to enumerate does not lose the others: a
+    /// fleet with a dead installation should still offer the repos it can see.
+    pub fn accessible_repos(&self) -> Result<Vec<AppRepo>> {
+        let mut out: Vec<AppRepo> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for install in self.installations()? {
+            let Ok(token) = self.token_for_installation(install.id) else {
+                continue;
+            };
+            for page in 1..=REPO_PAGES {
+                let path = format!("/installation/repositories?per_page={REPO_PAGE}&page={page}");
+                let Ok(v) = self.api.get(&path, &token) else {
+                    break;
+                };
+                let repos = v
+                    .get("repositories")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let full = repos.len();
+                for r in repos {
+                    let Some(repo) = AppRepo::parse(&r, install.id) else {
+                        continue;
+                    };
+                    if seen.insert(repo.slug.to_ascii_lowercase()) {
+                        out.push(repo);
+                    }
+                }
+                // The first short page is the last page.
+                if full < REPO_PAGE {
+                    break;
+                }
+            }
+        }
+        out.sort_by_key(|r| r.slug.to_lowercase());
+        Ok(out)
+    }
 }
+
+/// One repo an installation of the App can see.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppRepo {
+    /// `owner/repo`, as GitHub spells it — the canonical casing.
+    pub slug: String,
+    pub private: bool,
+    /// Archived repos are still visible and still have issues; onboarding one is
+    /// almost never what somebody meant, so the picker says so rather than
+    /// hiding it.
+    pub archived: bool,
+    pub default_branch: String,
+    /// Which installation grants it — the thing to name when a clone is refused.
+    pub installation: i64,
+}
+
+impl AppRepo {
+    fn parse(v: &Value, installation: i64) -> Option<AppRepo> {
+        Some(AppRepo {
+            slug: v.get("full_name").and_then(Value::as_str)?.to_string(),
+            private: v.get("private").and_then(Value::as_bool).unwrap_or(false),
+            archived: v.get("archived").and_then(Value::as_bool).unwrap_or(false),
+            default_branch: v
+                .get("default_branch")
+                .and_then(Value::as_str)
+                .unwrap_or("main")
+                .to_string(),
+            installation,
+        })
+    }
+}
+
+/// Page size and ceiling for `/installation/repositories`. The ceiling is a
+/// runaway guard, not a limit: the walk stops on the first short page.
+const REPO_PAGE: usize = 100;
+const REPO_PAGES: usize = 20;
 
 /// GitHub's `expires_at` (RFC 3339) as unix seconds.
 fn parse_expiry(s: &str) -> Option<i64> {
@@ -570,6 +667,9 @@ pub(crate) struct FakeAppApi {
     ttl: i64,
     calls: RefCell<Vec<String>>,
     minted: std::cell::Cell<u32>,
+    /// Minted token → the installation it was minted for, so a request carrying
+    /// one can be answered as that installation.
+    minted_for: RefCell<BTreeMap<String, i64>>,
 }
 
 #[cfg(test)]
@@ -584,6 +684,7 @@ impl FakeAppApi {
             ttl: 3600,
             calls: RefCell::new(Vec::new()),
             minted: std::cell::Cell::new(0),
+            minted_for: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -608,7 +709,7 @@ impl FakeAppApi {
 
 #[cfg(test)]
 impl AppApi for Rc<FakeAppApi> {
-    fn get(&self, path: &str, _jwt: &str) -> Result<Value> {
+    fn get(&self, path: &str, bearer: &str) -> Result<Value> {
         self.calls.borrow_mut().push(path.to_string());
         if let Some(repo) = path
             .strip_prefix("/repos/")
@@ -622,6 +723,30 @@ impl AppApi for Rc<FakeAppApi> {
         }
         if path == "/app" {
             return Ok(serde_json::json!({ "slug": "comet-board-test" }));
+        }
+        // The installation-token endpoint. Which installation is asking is not
+        // in the path — it is the bearer — so the fake reads the id back out of
+        // the token it minted, which is what makes "installation 42 sees only
+        // its own repos" testable at all.
+        if path.starts_with("/installation/repositories") {
+            let for_install = self.minted_for.borrow().get(bearer).copied();
+            let repos: Vec<Value> = self
+                .installs
+                .iter()
+                .filter(|(_, id)| for_install.is_none_or(|want| **id == want))
+                .map(|(repo, _)| {
+                    serde_json::json!({
+                        "full_name": repo,
+                        "private": true,
+                        "archived": false,
+                        "default_branch": "main",
+                    })
+                })
+                .collect();
+            return Ok(serde_json::json!({
+                "total_count": repos.len(),
+                "repositories": repos,
+            }));
         }
         if path.starts_with("/app/installations") {
             // Derived from the installation map rather than stated separately,
@@ -648,14 +773,22 @@ impl AppApi for Rc<FakeAppApi> {
         bail!("no fake for GET {path}")
     }
 
-    fn post(&self, path: &str, _jwt: &str) -> Result<Value> {
+    fn post(&self, path: &str, _bearer: &str) -> Result<Value> {
         self.calls.borrow_mut().push(path.to_string());
         let n = self.minted.get() + 1;
         self.minted.set(n);
+        let token = format!("ghs_token_{n}");
+        if let Some(id) = path
+            .strip_prefix("/app/installations/")
+            .and_then(|r| r.strip_suffix("/access_tokens"))
+            .and_then(|id| id.parse::<i64>().ok())
+        {
+            self.minted_for.borrow_mut().insert(token.clone(), id);
+        }
         let expires = chrono::DateTime::from_timestamp(self.clock.now() + self.ttl, 0)
             .expect("a representable expiry")
             .to_rfc3339();
-        Ok(serde_json::json!({ "token": format!("ghs_token_{n}"), "expires_at": expires }))
+        Ok(serde_json::json!({ "token": token, "expires_at": expires }))
     }
 }
 
@@ -900,5 +1033,26 @@ mod tests {
             Some(0),
             "an unstated expiry must not read as a live token"
         );
+    }
+
+    /// gh#97: what an onboarding picker offers is what the App was *granted*,
+    /// gathered across every installation and under an installation token —
+    /// `/installation/repositories` is the one endpoint that answers about an
+    /// installation and names no repo to derive the credential from.
+    #[test]
+    fn the_accessible_repos_span_every_installation_and_are_deduped() {
+        let (auth, api, _) = test_app(&[("acme/one", 43), ("acme/two", 43), ("brede/solo", 42)]);
+        let repos = auth.accessible_repos().unwrap();
+        assert_eq!(
+            repos.iter().map(|r| r.slug.as_str()).collect::<Vec<_>>(),
+            ["acme/one", "acme/two", "brede/solo"],
+            "both installations contribute, sorted"
+        );
+        // Each repo is attributed to the installation that granted it — the
+        // thing to name when a clone is refused.
+        assert_eq!(repos[0].installation, 43);
+        assert_eq!(repos[2].installation, 42);
+        // One token per installation, not one per repo.
+        assert_eq!(api.mints(), 2);
     }
 }
