@@ -314,6 +314,28 @@ pub trait Runtime {
         anyhow::bail!("this runtime cannot reclaim worktrees")
     }
 
+    /// Whose subscription a dispatch on `account` would spend, as an email
+    /// (gh#101).
+    ///
+    /// `None` for `account` is the device's own CLI login — the *active* one
+    /// for that harness, which is exactly what a run naming no slot reaches.
+    /// The board core cannot answer this itself: which logins a device has
+    /// saved, and which of them is live, is engine knowledge, and the board
+    /// carries only the slot id (see [`DispatchSpec::account`]).
+    ///
+    /// The default is `Ok(None)` rather than a refusal, unlike
+    /// [`Runtime::reclaim_worktree`]'s: a runtime that cannot name the login
+    /// leaves the guard with nothing to compare, and the guard's answer to
+    /// "I do not know whose this is" must be silence, never an accusation.
+    fn account_email(
+        &self,
+        harness: HarnessId,
+        account: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let _ = (harness, account);
+        Ok(None)
+    }
+
     /// How the chat's most recent run ended, straight off the run journal:
     /// `Some` when the journal's last event is a `Done`, `None` while a run is
     /// mid-stream (or nothing has ever run). The settle authority §H4 names —

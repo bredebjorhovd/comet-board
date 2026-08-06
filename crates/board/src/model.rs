@@ -425,6 +425,17 @@ pub struct Attempt {
     /// establish. Until then this is the only record of which *human* released
     /// the work, and it is a claim, not a credential — never authorize on it.
     pub dispatched_by_user: Option<String>,
+    /// Whose subscription this attempt actually spends, as an email (gh#101) —
+    /// the `account` slot's login, or the box's own CLI login when the dispatch
+    /// named no slot.
+    ///
+    /// Resolved once, at dispatch, and recorded here rather than looked up from
+    /// `account` on demand: a slot id means nothing to a reader who has not
+    /// saved that login, the box's own login can be switched under a run that
+    /// is still going, and the point of the record is what the attempt *did*
+    /// spend. `None` on attempts from before this existed, and on a box that
+    /// could not name the login at all.
+    pub billed_to: Option<String>,
 }
 
 impl Attempt {

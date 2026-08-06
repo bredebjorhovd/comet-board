@@ -73,6 +73,13 @@ pub fn task_row(task: &Task, route: Option<&Route>) -> TaskRow {
             .or(last)
             .map(|a| a.account.clone())
             .unwrap_or_else(|| route.and_then(|r| r.account.clone())),
+        // Whose subscription it is spending, said in the one vocabulary a
+        // reader has (gh#101). No route fallback, unlike `account` above: the
+        // route names a *slot*, and only the box that saved it can say whose
+        // email that is — so a row nothing has run on carries no verdict, and
+        // the pickers resolve the route's default against the host's own
+        // account list instead of against a guess made here.
+        billed_to: live.or(last).and_then(|a| a.billed_to.clone()),
     }
 }
 
@@ -137,6 +144,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         db.set_attempt_pane(a, "chat-1").unwrap();
@@ -170,6 +178,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: Some("laptop-ana".into()),
             dispatched_by_user: Some("ana@example.com".into()),
+            billed_to: None,
         })
         .unwrap();
 
@@ -203,6 +212,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         db.close_attempt(first, Outcome::Cancelled).unwrap();
@@ -220,6 +230,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         })
         .unwrap();
 
@@ -282,6 +293,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         })
         .unwrap();
         let rows = board_rows(&db, &cfg).unwrap();
@@ -318,6 +330,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         })
         .unwrap();
         assert_eq!(board_rows(&db, &cfg).unwrap()[0].account, None);

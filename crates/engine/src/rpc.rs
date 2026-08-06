@@ -32,7 +32,9 @@
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
 //! - Board (comet-board fork, docs/BOARD.md): `WatchBoard` → stream of board
 //!   rows (herdr-board's `list --json` shape), `DispatchTask {taskId, via?,
-//!   runtime?, model?}` → `{chatId, cwd, attempt}`, `CancelTask {taskId}` →
+//!   runtime?, model?, account?, bill?}` → `{chatId, cwd, attempt}` — `bill` is
+//!   the acknowledgement `billing_guard = "require-own"` wants for a run that
+//!   spends somebody else's subscription (gh#101), `CancelTask {taskId}` →
 //!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
 //!   engine-hosted board service, and relay-forwardable (gh#55): one box hosts
 //!   the board, every teammate's device drives it with `targetDeviceId`.
@@ -240,6 +242,17 @@ struct DispatchTaskParams {
     /// and does what it was told.
     #[serde(default)]
     account: Option<String>,
+    /// "Bill this account, I know whose it is" — the acknowledgement
+    /// `[defaults] billing_guard = "require-own"` accepts instead of refusing a
+    /// cross-billed release (gh#101). An agent-account slot id, which also
+    /// selects the account, or the email on the login being spent (the only
+    /// spelling there is when that login is the box's own).
+    ///
+    /// A separate key from `account` on purpose: `account` says which
+    /// subscription, this says that somebody meant to spend one that is not
+    /// theirs. Ignored entirely under `warn` and `off`.
+    #[serde(default)]
+    bill: Option<String>,
     /// End the task's live attempt and release a fresh one — the blocked row's
     /// Retry (gh#49). Off for ordinary dispatches, which are refused on a live
     /// attempt.
@@ -1087,6 +1100,7 @@ impl RpcService for EngineRpc {
                     runtime: p.runtime,
                     model: p.model,
                     account: p.account,
+                    bill: p.bill,
                 };
                 let origin = DispatchOrigin {
                     chat: p.via,

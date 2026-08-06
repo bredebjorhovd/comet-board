@@ -103,6 +103,17 @@ enum Command {
         /// `comet-board doctor` lists the ids this device has saved.
         #[arg(long)]
         account: Option<String>,
+        /// Spend an account that is not yours, on purpose (gh#101).
+        ///
+        /// Under `[defaults] billing_guard = "require-own"` a dispatch that
+        /// would charge somebody else's subscription is refused; this is the
+        /// acknowledgement that releases it, and it has to NAME the payer —
+        /// the agent-account slot id (which also selects it, so `--account` is
+        /// then redundant) or the email on the login being spent, which is the
+        /// only spelling there is when that login is the box's own. Under
+        /// `warn` and `off` it changes nothing but which slot is picked.
+        #[arg(long)]
+        bill: Option<String>,
     },
     /// Release a task again — the desktop panel's Retry, from a shell.
     ///
@@ -126,6 +137,17 @@ enum Command {
         /// Agent-account slot id to run under.
         #[arg(long)]
         account: Option<String>,
+        /// Spend an account that is not yours, on purpose (gh#101).
+        ///
+        /// Under `[defaults] billing_guard = "require-own"` a dispatch that
+        /// would charge somebody else's subscription is refused; this is the
+        /// acknowledgement that releases it, and it has to NAME the payer —
+        /// the agent-account slot id (which also selects it, so `--account` is
+        /// then redundant) or the email on the login being spent, which is the
+        /// only spelling there is when that login is the box's own. Under
+        /// `warn` and `off` it changes nothing but which slot is picked.
+        #[arg(long)]
+        bill: Option<String>,
     },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
@@ -281,7 +303,7 @@ enum RoutesCommand {
         /// Route number, as printed by `routes list` (1-based).
         route: usize,
         /// One of: name, workspace, repo, runtime, account, branch_template,
-        /// base, max_concurrent, max_duration.
+        /// base, max_concurrent, max_duration, billing_guard.
         key: String,
         /// The new value. Omit with `--unset` to remove the key, which falls
         /// the route back to `[defaults]`.
@@ -293,7 +315,8 @@ enum RoutesCommand {
     /// Set one key under `[defaults]`: `routes defaults max_duration 4h`.
     Defaults {
         /// One of: max_concurrent_per_workspace, branch_template, base,
-        /// notify, notify_dispatcher, new_source, max_duration.
+        /// notify, notify_dispatcher, new_source, max_duration,
+        /// billing_guard.
         key: String,
         value: Option<String>,
         #[arg(long, conflicts_with = "value")]
@@ -393,6 +416,7 @@ fn main() -> Result<()> {
             runtime: runtime_flag,
             model,
             account,
+            bill,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -400,10 +424,23 @@ fn main() -> Result<()> {
                 runtime: runtime_flag.as_deref(),
                 model: model.as_deref(),
                 account: account.as_deref(),
+                bill: bill.as_deref(),
+                // Filled in from the engine below — this shell has no way to
+                // know who is signed in without asking.
+                via_user: None,
                 replace: false,
             };
             let d = runtime.block_on(async {
                 let board = ops::attach(port, device).await?;
+                // Who this shell is, before anything else: it rides on the
+                // dispatch as `viaUser` (gh#74) and is the other half of the
+                // billing comparison (gh#101).
+                let me = ops::signed_in_email(&board).await;
+                let opts = ops::DispatchOpts {
+                    via_user: me.as_deref(),
+                    ..opts
+                };
+                warn_if_cross_billed(&board, &task, opts).await;
                 ops::dispatch_checked(&board, &task, opts).await
             })?;
             println!(
@@ -422,6 +459,7 @@ fn main() -> Result<()> {
             runtime: runtime_flag,
             model,
             account,
+            bill,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -429,6 +467,7 @@ fn main() -> Result<()> {
                 runtime: runtime_flag.as_deref(),
                 model: model.as_deref(),
                 account: account.as_deref(),
+                bill: bill.as_deref(),
                 // `replace` is not set here: `retry` reads the row and decides,
                 // because ending a live attempt is not something a verb should
                 // do without looking at what it is ending.
@@ -436,6 +475,15 @@ fn main() -> Result<()> {
             };
             let r = runtime.block_on(async {
                 let board = ops::attach(port, device).await?;
+                let me = ops::signed_in_email(&board).await;
+                let opts = ops::DispatchOpts {
+                    via_user: me.as_deref(),
+                    ..opts
+                };
+                // A retry bills someone too — it is a fresh attempt on the same
+                // account, and the one that ends a live agent is exactly the
+                // one nobody wants to have spent on the wrong plan.
+                warn_if_cross_billed(&board, &task, opts).await;
                 ops::retry(&board, &task, opts).await
             })?;
             println!(
@@ -545,15 +593,17 @@ fn main() -> Result<()> {
                 let d = runtime.block_on(async {
                     let board = ops::attach(port, device).await?;
                     ops::await_row(&board, &id, pickup).await?;
-                    ops::dispatch(
-                        &board,
-                        &id,
-                        ops::DispatchOpts {
-                            via: via.as_deref(),
-                            ..Default::default()
-                        },
-                    )
-                    .await
+                    let me = ops::signed_in_email(&board).await;
+                    let opts = ops::DispatchOpts {
+                        via: via.as_deref(),
+                        via_user: me.as_deref(),
+                        ..Default::default()
+                    };
+                    // The route's own account, on a ticket that did not exist a
+                    // second ago — the case where nobody has had a chance to
+                    // notice whose plan it lands on (gh#101).
+                    warn_if_cross_billed(&board, &id, opts).await;
+                    ops::dispatch(&board, &id, opts).await
                 })?;
                 println!(
                     "dispatched {id} → chat {} (attempt {})",
@@ -867,6 +917,19 @@ async fn edit_routing(board: &ops::Board) -> Result<()> {
     Ok(())
 }
 
+/// Say who a release is about to charge, before it charges them (gh#101).
+///
+/// On stderr, and never fatal: the engine applies the guard itself — it is the
+/// only side that can refuse under `require-own` — so this is the line that
+/// makes the spend visible in the surface the operator is actually looking at.
+/// A release the engine then refuses has said it twice, which is the right
+/// number of times for the sentence "somebody else is paying for this".
+async fn warn_if_cross_billed(board: &ops::Board, task: &str, opts: ops::DispatchOpts<'_>) {
+    if let Some(warning) = ops::cross_billing_warning(board, task, opts).await {
+        eprintln!("{warning}");
+    }
+}
+
 /// Echo the overrides a release was given, so the confirmation says what the
 /// attempt is actually running under and not just that it started.
 fn print_overrides(opts: &ops::DispatchOpts<'_>) {
@@ -874,6 +937,7 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
         opts.runtime.map(|r| format!("runtime={r}")),
         opts.model.map(|m| format!("model={m}")),
         opts.account.map(|a| format!("account={a}")),
+        opts.bill.map(|b| format!("bill={b}")),
     ]
     .into_iter()
     .flatten()

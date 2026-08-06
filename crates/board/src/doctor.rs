@@ -177,6 +177,10 @@ pub fn doctor(
 
             checks.push(operator_notice_check(&cfg.defaults));
 
+            // Whose subscription the dispatches on this box spend, and what the
+            // board says about it (gh#101).
+            checks.push(billing_guard_check(&cfg));
+
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
             // retrying it forever, and this is where that becomes visible.
@@ -856,6 +860,66 @@ fn operator_notice_check(defaults: &crate::config::Defaults) -> Check {
     }
 }
 
+/// What the board does about a dispatch that spends somebody else's
+/// subscription (gh#101).
+///
+/// Reported the way the notices are, and worded to the same rule: `off` has to
+/// read as a *choice* rather than as something left unconfigured. On a
+/// one-person box `off` is the right answer, and a `doctor` that nagged about
+/// it would be a `doctor` people stop reading — so this never fails, exactly
+/// like [`operator_notice_check`].
+///
+/// The honesty is not optional either. The guard compares the dispatching
+/// frontend's `viaUser` claim against the agent-account's email, and the box
+/// cannot check that claim until #66 lands, so every mode says so in the words
+/// that will still be true afterwards: a seatbelt, not a lock.
+fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
+    use crate::billing::GuardMode;
+    let mode = cfg.billing_guard(None);
+    // A route that answers differently from the board is worth naming here: the
+    // whole `doctor` line would otherwise describe a default that the route
+    // somebody actually dispatches on does not use.
+    let overrides: Vec<String> = cfg
+        .routes
+        .iter()
+        .filter(|r| r.billing_guard.is_some() && cfg.billing_guard(Some(r)) != mode)
+        .map(|r| {
+            format!(
+                "{} = {}",
+                r.display_name(),
+                cfg.billing_guard(Some(r)).as_str()
+            )
+        })
+        .collect();
+    let detail = match mode {
+        GuardMode::Warn => "warn — a dispatch that spends someone else's subscription says so \
+             in the picker, on the CLI, in the dispatch comment and on the row, \
+             and releases anyway. A seatbelt, not a lock: the match is the \
+             frontend's claimed user against the account's email, and the box \
+             cannot verify that claim yet (#66)"
+            .to_string(),
+        GuardMode::RequireOwn => "require-own — a dispatch that would spend someone else's \
+             subscription is refused unless it names them (`--bill`). Still a \
+             seatbelt: the match is the frontend's claimed user against the \
+             account's email, so a frontend that misreports one walks through \
+             it (#66)"
+            .to_string(),
+        GuardMode::Off => "off — nothing is said when a dispatch spends someone else's \
+             subscription. The right answer on a box where one person's plan \
+             pays for everything, and a choice rather than an oversight \
+             (`[defaults] billing_guard = \"warn\"` to hear about it)"
+            .to_string(),
+    };
+    Check {
+        name: "billing guard".into(),
+        ok: true,
+        detail: match overrides.as_slice() {
+            [] => detail,
+            some => format!("{detail}. Per route: {}", some.join(", ")),
+        },
+    }
+}
+
 /// Which repos the board will write to, by name.
 ///
 /// Named repos, not a posture. A global `ON` was enough while one flag answered
@@ -1429,6 +1493,72 @@ mod tests {
         assert!(detail.starts_with("on —"), "{detail}");
         assert!(detail.contains("o/theirs"), "{detail}");
         assert!(!detail.contains("o/mine"), "{detail}");
+    }
+
+    /// gh#101. Three modes, one line, and it never fails — `off` is the right
+    /// answer on a one-person box, and a `doctor` that nagged about a
+    /// preference is a `doctor` people stop reading. What it must never do is
+    /// imply the match is stronger than it is.
+    #[test]
+    fn the_billing_guard_line_reports_the_mode_and_admits_it_is_a_seatbelt() {
+        let mut cfg = RoutingConfig::default();
+
+        let warn = billing_guard_check(&cfg);
+        assert!(warn.ok);
+        assert!(warn.detail.starts_with("warn —"), "{}", warn.detail);
+        assert!(warn.detail.contains("#66"), "{}", warn.detail);
+
+        cfg.defaults.billing_guard = "require-own".into();
+        let strict = billing_guard_check(&cfg);
+        assert!(strict.ok, "a stricter mode is not a fault");
+        assert!(strict.detail.contains("--bill"), "{}", strict.detail);
+        assert!(
+            strict.detail.contains("seatbelt"),
+            "the honesty is not optional: {}",
+            strict.detail
+        );
+
+        cfg.defaults.billing_guard = "off".into();
+        let off = billing_guard_check(&cfg);
+        assert!(off.ok, "off is a choice, not an oversight");
+        assert!(
+            off.detail.contains("The right answer on a box where"),
+            "worded as a choice: {}",
+            off.detail
+        );
+    }
+
+    /// A route that answers differently from the board is named, or the line
+    /// describes a default the route people actually dispatch on does not use.
+    #[test]
+    fn the_billing_guard_line_names_the_routes_that_disagree() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[defaults]\nbilling_guard = \"warn\"\n\n\
+             [[route]]\nname = \"platform\"\nmatch = { label = \"team\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude\"\n\
+             billing_guard = \"require-own\"\n\n\
+             [[route]]\nname = \"scratch\"\nmatch = { label = \"mine\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude\"\n",
+        )
+        .unwrap();
+        let detail = billing_guard_check(&cfg).detail;
+        assert!(detail.contains("platform = require-own"), "{detail}");
+        assert!(
+            !detail.contains("scratch"),
+            "a route that agrees with the board is not news: {detail}"
+        );
+    }
+
+    #[test]
+    fn doctor_emits_the_billing_guard_check() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "billing guard")
+            .expect("doctor is silent about whose subscription dispatches spend");
+        assert!(c.detail.starts_with("warn —"), "{:?}", c.detail);
     }
 
     #[test]

@@ -64,11 +64,16 @@ Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
 `dispatched_by`, `dispatched_by_chat`, `dispatched_by_user`, `last_outcome`,
 `last_outcome_at`,
-`attempts`, `dispatchable`, `gone`, `reopened`, `account`. `workspace` names a
+`attempts`, `dispatchable`, `gone`, `reopened`, `account`, `billed_to`.
+`workspace` names a
 comet *space* — the field keeps herdr-board's spelling so ported tooling reads
 it. `account` is the agent login whose subscription the row's attempt spends
 (the route's default before anything has run); null is the device's own CLI
-login, which is every row on a single-account box.
+login, which is every row on a single-account box. `billed_to` is that account
+resolved to an email — whose subscription it actually is — recorded when the
+attempt was released, and null on a row nothing has run on. Read it against
+`dispatched_by_user`: different values mean the run is charged to somebody other
+than whoever released it.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.
@@ -105,6 +110,12 @@ is this board's `review`.
    `dispatch --account <id>` overrides it; do not pass it unless you were told
    which account to use. Spending someone else's limits is not yours to
    decide, and the board deliberately does not infer one from who dispatched.
+   `dispatch` prints a line on stderr when a release charges somebody other
+   than whoever it is attributed to — repeat it, do not swallow it. Under
+   `[defaults] billing_guard = "require-own"` such a release is *refused*
+   instead; `--bill <slot-or-email>` is the acknowledgement that overrides the
+   refusal, and passing it is a decision about someone else's money. Report the
+   refusal and let a human make it.
 4. **Provenance is automatic.** A board-dispatched chat carries its own id as
    `COMET_BOARD_CHAT_ID`, and `dispatch` passes it along — the board records
    your chat as the parent of what you release. Never pass `--via` unless

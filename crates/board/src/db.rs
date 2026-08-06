@@ -19,7 +19,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
      blocked_count,
      overrun_warned_at, repo_path, collectable_at, collected_at,
-     dispatched_by_device, dispatched_by_user";
+     dispatched_by_device, dispatched_by_user, billed_to";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -58,6 +58,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         collected_at: r.get(27)?,
         dispatched_by_device: r.get(28)?,
         dispatched_by_user: r.get(29)?,
+        billed_to: r.get(30)?,
     })
 }
 
@@ -192,7 +193,13 @@ impl Db {
               -- name beats an anonymous `Operator` for "who released this",
               -- and the columns are where #66's verified identity will land.
               dispatched_by_device TEXT,
-              dispatched_by_user TEXT
+              dispatched_by_user TEXT,
+              -- Whose subscription this attempt spends, as an email (gh#101):
+              -- the `account` slot's login, or the box's own CLI login when the
+              -- dispatch named no slot. Resolved once at dispatch — the slot id
+              -- above means nothing to a reader who has not saved that login,
+              -- and the box's own login can be switched under a live run.
+              billed_to TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -317,6 +324,11 @@ impl Db {
                 // would be a guess dressed as a record.
                 ("dispatched_by_device", "TEXT"),
                 ("dispatched_by_user", "TEXT"),
+                // Whose subscription the attempt spends (gh#101). Existing rows
+                // keep NULL, which reads as "nobody resolved it" — resolving it
+                // now would answer with today's logins about a run that spent
+                // whatever was live months ago.
+                ("billed_to", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -601,8 +613,8 @@ impl Db {
                (task_id, pane_id, workspace, runtime, worktree, branch,
                 dispatched_by, dispatched_by_pane, started_at, base_sha, account,
                 repo_path,
-                dispatched_by_device, dispatched_by_user)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                dispatched_by_device, dispatched_by_user, billed_to)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -617,7 +629,8 @@ impl Db {
                 a.account,
                 a.repo_path,
                 a.dispatched_by_device,
-                a.dispatched_by_user
+                a.dispatched_by_user,
+                a.billed_to
             ],
         );
         match res {
@@ -1100,6 +1113,10 @@ pub struct NewAttempt {
     /// Who the dispatching frontend said was signed in there (gh#74).
     /// Unverified — see the column comment in `migrate`.
     pub dispatched_by_user: Option<String>,
+    /// Whose subscription this attempt spends, as an email (gh#101). Resolved
+    /// by the engine at dispatch, because which logins a device has saved is
+    /// engine knowledge; `None` when it could not name one.
+    pub billed_to: Option<String>,
 }
 
 pub struct NewWriteback {
@@ -1170,6 +1187,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            billed_to: None,
         }
     }
 
@@ -1182,6 +1200,7 @@ mod tests {
         db.insert_attempt(&NewAttempt {
             dispatched_by_device: Some("laptop-ana".into()),
             dispatched_by_user: Some("ana@example.com".into()),
+            billed_to: None,
             ..attempt("linear:LIN-142")
         })
         .unwrap();

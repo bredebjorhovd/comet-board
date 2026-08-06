@@ -1069,6 +1069,46 @@ impl AgentAccounts {
         }
     }
 
+    // ── who a run bills (gh#101) ────────────────────────────────────────────
+
+    /// Whose subscription a run under `harness` pointed at `account` would
+    /// spend — the board's billing guard asks this before every dispatch.
+    ///
+    /// `None` for `account` is the device's own CLI login, which is what a run
+    /// naming no slot actually reaches; the answer is that login's email, read
+    /// straight off the CLI's own config file.
+    ///
+    /// Deliberately not [`AgentAccounts::list`]: that detects, snapshots, and
+    /// probes usage over the network, and this runs on the board loop thread in
+    /// the middle of a dispatch. It also asks for strictly less — an email, not
+    /// a credential — so it never touches the Keychain, and a slot whose secret
+    /// is unreadable still names its owner.
+    ///
+    /// Only Claude and Codex can answer. The rest have no per-account identity
+    /// in comet (opencode's provider store is not an account, `cursor` and
+    /// `mock` have none at all), and inventing one would have the guard accuse
+    /// somebody on the strength of a placeholder.
+    pub fn billed_email(&self, harness: HarnessId, account: Option<&str>) -> Option<String> {
+        if !matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex) {
+            return None;
+        }
+        let email = match account.filter(|a| !a.is_empty()) {
+            Some(slot) => self
+                .read_slots(harness)
+                .into_iter()
+                .find(|s| s.id == slot)
+                .map(|s| s.profile.email),
+            None => match harness {
+                HarnessId::ClaudeCode => read_json(&self.inner.config.claude_config_file)
+                    .as_ref()
+                    .and_then(|c| c.get("oauthAccount"))
+                    .and_then(|oauth| str_field(oauth, "emailAddress")),
+                _ => self.detect_codex().map(|d| d.profile.email),
+            },
+        };
+        email.filter(|e| !e.is_empty())
+    }
+
     // ── detection ───────────────────────────────────────────────────────────
 
     async fn detect_claude(&self) -> (Option<Detected>, Option<String>) {
