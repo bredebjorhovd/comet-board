@@ -18,14 +18,15 @@
 //! directly with the same clients the sync loop uses.
 
 use anyhow::{Context, Result, anyhow, bail};
-use comet_board::adopt::{git_remote, github_slug};
+use comet_board::adopt::{Unadopted, git_remote, github_slug};
 use comet_board::config::{self, Paths, RoutingConfig};
 use comet_board::model::{BoardState, Source};
+use comet_board::routes::{RoutingView, cap_summary, match_summary};
 use comet_board::rows::TaskRow;
 use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
 use comet_proto::Device;
 use comet_rpc::{RpcClient, connect_ws, methods};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// The engine answers a `WatchBoard` subscription with the current rows
@@ -697,6 +698,136 @@ pub async fn await_row(board: &Board, task_id: &str, timeout: Duration) -> Resul
             Some(v) => serde_json::from_value(v).context("parsing board rows")?,
             None => bail!("the board stream ended while waiting — did the engine stop?"),
         };
+    }
+}
+
+// ---- routes (the routing.toml surface, gh#75) ---------------------------
+
+/// What both config RPCs answer with: the host's `routing.toml`, and the repos
+/// with a space on that device that nothing on the board watches.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BoardConfig {
+    pub routing: RoutingView,
+    #[serde(default)]
+    pub unadopted: Vec<Unadopted>,
+}
+
+pub async fn read_config(board: &Board) -> Result<BoardConfig> {
+    let reply = board
+        .client
+        .call(
+            methods::READ_BOARD_CONFIG,
+            board.params(serde_json::json!({})),
+        )
+        .await?;
+    serde_json::from_value(reply).context("parsing ReadBoardConfig reply")
+}
+
+/// Send one edit. `op` is the tagged params documented on
+/// [`methods::WRITE_BOARD_CONFIG`]; the reply is a fresh read, so what is
+/// printed afterwards is the file as it now stands rather than what we hoped.
+pub async fn write_config(board: &Board, op: serde_json::Value) -> Result<BoardConfig> {
+    let reply = board
+        .client
+        .call(methods::WRITE_BOARD_CONFIG, board.params(op))
+        .await?;
+    serde_json::from_value(reply).context("parsing WriteBoardConfig reply")
+}
+
+/// Print the config: the routes with their numbers, what is wrong with it, and
+/// what is sitting there unadopted.
+///
+/// The numbers are what `routes set` takes, and they are 1-based here and
+/// 0-based on the wire — a person counting routes in a file starts at one, and
+/// the conversion happens once, at the edge.
+pub fn print_config(cfg: &BoardConfig, host: Option<&str>, json: bool) -> Result<()> {
+    if json {
+        // The whole reply, not just the routing half: an agent asking what is
+        // configured wants the same answer about what is *not* — that is the
+        // list it would act on.
+        println!("{}", serde_json::to_string_pretty(cfg)?);
+        return Ok(());
+    }
+    let where_ = match host {
+        Some(h) => format!("{} on {h}", cfg.routing.path),
+        None => cfg.routing.path.clone(),
+    };
+    println!("{where_}");
+    if !cfg.routing.exists {
+        println!("no routing.toml yet — `comet-board init` writes the first one");
+    }
+
+    match &cfg.routing.config {
+        None => {}
+        Some(c) => {
+            if c.routes.is_empty() {
+                println!("\nno routes — every row on the board reads `no route`");
+            }
+            for (i, r) in c.routes.iter().enumerate() {
+                println!(
+                    "\n{:>2}  {}  ·  {}",
+                    i + 1,
+                    r.display_name(),
+                    match_summary(&r.match_)
+                );
+                let cap = cap_summary(r, &c.defaults.max_duration);
+                let mut meta = vec![
+                    format!("space {}", r.workspace),
+                    format!("repo {}", r.repo),
+                    format!("runtime {}", r.runtime),
+                    format!("cap {cap}"),
+                ];
+                if let Some(a) = &r.account {
+                    meta.push(format!("account {a}"));
+                }
+                if let Some(n) = r.max_concurrent {
+                    meta.push(format!("max_concurrent {n}"));
+                }
+                println!("    {}", meta.join(" · "));
+            }
+            if !c.github.repos.is_empty() {
+                println!("\npolled repos: {}", c.github.repos.join(", "));
+            }
+        }
+    }
+
+    if !cfg.routing.problems.is_empty() {
+        // Loudly, and last-but-one: this is the config the board is NOT
+        // running on, and a reader who scrolled past the routes has to see why
+        // they are not in force.
+        println!(
+            "\n{} problem(s) — the board is running on the last config that loaded:",
+            cfg.routing.problems.len()
+        );
+        for p in &cfg.routing.problems {
+            println!("  ✕ {p}");
+        }
+    }
+    if !cfg.unadopted.is_empty() {
+        println!("\nnot on the board yet:");
+        for u in &cfg.unadopted {
+            println!("  {:<40} {}{}", u.slug, u.label, u.missing.note());
+        }
+        println!("  add one:  comet-board routes add <owner/repo>");
+    }
+    Ok(())
+}
+
+/// Report what a write landed: the problems if any, else a one-liner.
+pub fn print_write_result(cfg: &BoardConfig) {
+    if cfg.routing.problems.is_empty() {
+        println!("routing.toml updated (previous contents in routing.toml.bak)");
+    } else {
+        // A write only lands if it validates, so problems here are ones the
+        // file already had — worth saying, and not the same as "your edit
+        // broke it", which comes back as an error instead.
+        println!(
+            "routing.toml updated, but {} pre-existing problem(s) remain:",
+            cfg.routing.problems.len()
+        );
+        for p in &cfg.routing.problems {
+            println!("  ✕ {p}");
+        }
     }
 }
 

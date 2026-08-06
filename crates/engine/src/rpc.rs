@@ -36,6 +36,12 @@
 //!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
 //!   engine-hosted board service, and relay-forwardable (gh#55): one box hosts
 //!   the board, every teammate's device drives it with `targetDeviceId`.
+//! - Board config (gh#75): `ReadBoardConfig` → `{routing, unadopted}` — the
+//!   host's `routing.toml`, its parse, everything wrong with it, and the repos
+//!   with a space there that nothing on the board watches; `WriteBoardConfig
+//!   {op: text|route|default|adopt|ignore, …}` → the same shape, after a write
+//!   that had to parse and validate and left a `.bak`. Forwardable for the
+//!   reason the file is worth reaching at all: it lives on the box.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -81,6 +87,30 @@ use comet_board::dispatch::{DispatchOrigin, DispatchOverrides};
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
+}
+
+/// `WriteBoardConfig` params (gh#75).
+///
+/// The file edits are [`comet_board::routes::Edit`] verbatim — one definition,
+/// so the CLI and a settings page send what the board crate's tests exercise.
+/// The two that cannot live there are here: adopting and ignoring a repo need
+/// the space list and a git probe, which are the engine's to supply and only
+/// mean anything on the device the board runs on.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum BoardConfigWrite {
+    /// Write the `[[route]]` + `[github] repos` halves a repo is missing, with
+    /// the same writer `comet-board adopt` uses. `labels` narrows what the repo
+    /// contributes (`Some([])` is "every open issue, said out loud").
+    Adopt {
+        slug: String,
+        #[serde(default)]
+        labels: Option<Vec<String>>,
+    },
+    /// Stop offering a repo — you are only reading it.
+    Ignore { slug: String },
+    #[serde(untagged)]
+    Edit(comet_board::routes::Edit),
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,6 +528,97 @@ impl EngineRpc {
         }
     }
 
+    // ---- the routing surface (gh#75) ----
+
+    /// The reply both config methods answer with: the file, and the repos on
+    /// this device that have a space but nothing on the board watching them.
+    ///
+    /// The unadopted list rides along because it is the same question asked
+    /// from the other side — "what is not routed yet" is the reason somebody
+    /// opened the config — and because detecting it needs the space list and a
+    /// git probe, neither of which a remote caller has for *this* device.
+    async fn config_reply(
+        &self,
+        routing: comet_board::routes::RoutingView,
+    ) -> Result<serde_json::Value, RpcError> {
+        let unadopted = match &routing.config {
+            // Nothing to compare against: a file that does not parse cannot say
+            // which repos it already covers, and offering to "adopt" every one
+            // of them would be wrong in both directions.
+            None => Vec::new(),
+            Some(cfg) => {
+                let device = self.doc_host.device_id().to_string();
+                let spaces: Vec<comet_proto::Space> = self
+                    .workspace
+                    .watch_spaces()
+                    .borrow()
+                    .iter()
+                    .filter(|s| s.device_id == device)
+                    .cloned()
+                    .collect();
+                let cfg = cfg.clone();
+                // `probe` shells out to git once per space. Off the reactor.
+                tokio::task::spawn_blocking(move || {
+                    comet_board::adopt::detect(&spaces, &cfg, comet_board::adopt::probe)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("detecting unadopted repos: {e}")))?
+            }
+        };
+        Ok(serde_json::json!({ "routing": routing, "unadopted": unadopted }))
+    }
+
+    /// Perform one config write. Everything lands through
+    /// [`comet_board::routes::edit`] or [`comet_board::adopt`], which is where
+    /// the parse + validate + `.bak` discipline lives.
+    fn write_board_config(
+        &self,
+        paths: &comet_board::config::Paths,
+        write: BoardConfigWrite,
+    ) -> anyhow::Result<comet_board::routes::RoutingView> {
+        use comet_board::adopt;
+        match write {
+            BoardConfigWrite::Edit(edit) => comet_board::routes::edit(paths, &edit),
+            BoardConfigWrite::Ignore { slug } => {
+                adopt::ignore(&paths.routing(), &slug)?;
+                comet_board::routes::read(paths)
+            }
+            BoardConfigWrite::Adopt { slug, labels } => {
+                // The offer has to be current: adopting a repo the board is
+                // already watching would write a second route for it, and
+                // `adopt_with` computes its insertion point from a config it
+                // parses itself.
+                let routing = comet_board::routes::read(paths)?;
+                let cfg = routing.config.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "routing.toml does not parse, so nothing can be adopted into it — \
+                         fix it first ({})",
+                        routing.problems.join("; ")
+                    )
+                })?;
+                let device = self.doc_host.device_id().to_string();
+                let spaces: Vec<comet_proto::Space> = self
+                    .workspace
+                    .watch_spaces()
+                    .borrow()
+                    .iter()
+                    .filter(|s| s.device_id == device)
+                    .cloned()
+                    .collect();
+                let found = adopt::detect(&spaces, &cfg, adopt::probe);
+                let Some(u) = found.iter().find(|u| u.slug.eq_ignore_ascii_case(&slug)) else {
+                    anyhow::bail!(
+                        "`{slug}` is not on this board's unadopted list — already-adopted \
+                         and ignored repos are not offered, and a repo needs a space on \
+                         this device to be adopted at all"
+                    );
+                };
+                adopt::adopt_with(&paths.routing(), u, labels.as_deref())?;
+                comet_board::routes::read(paths)
+            }
+        }
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -669,6 +790,11 @@ fn forwardable(method: &str) -> bool {
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
             | methods::LIST_BOARD_RUNTIMES
+            // `routing.toml` is a file on the board's device, which is exactly
+            // why it is forwarded (gh#75): the alternative for a teammate who
+            // needs a repo routed is an ssh account on the box.
+            | methods::READ_BOARD_CONFIG
+            | methods::WRITE_BOARD_CONFIG
     )
 }
 
@@ -868,9 +994,7 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
-            methods::UPDATE_STATUS => {
-                Ok(RpcReply::Stream(watch_stream(self.updater()?.watch())))
-            }
+            methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
                 let version = self
                     .updater()?
@@ -927,6 +1051,22 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            // The routing surface (gh#75). Served off the board's own paths, so
+            // this answers about the config the running loop reads — and keeps
+            // answering when that config is what stopped the loop.
+            methods::READ_BOARD_CONFIG => {
+                let view = comet_board::routes::read(self.board()?.paths())
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&self.config_reply(view).await?)
+            }
+            methods::WRITE_BOARD_CONFIG => {
+                let p: BoardConfigWrite = parse_params(params)?;
+                let paths = self.board()?.paths().clone();
+                let view = self
+                    .write_board_config(&paths, p)
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&self.config_reply(view).await?)
             }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))

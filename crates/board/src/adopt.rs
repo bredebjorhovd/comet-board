@@ -15,7 +15,9 @@
 //!
 //! Everything written here goes through [`apply`], which re-parses and
 //! *validates* the result before it replaces the file. A writer that could emit
-//! a config `doctor` refuses would be worse than no writer at all.
+//! a config `doctor` refuses would be worse than no writer at all. That is now
+//! the discipline for *every* write to this file: [`crate::routes`] is the rest
+//! of the surface (gh#75) and goes through the same [`apply`].
 //!
 //! Ported from herdr-board's `adopt.rs`; a herdr *workspace* is a comet
 //! *space*. The label-picker flow survives as [`preview`] + the `labels`
@@ -256,7 +258,7 @@ pub fn git_toplevel(dir: &str) -> Option<String> {
 /// of everything not done — and nothing had been wrong: `labels = []` means
 /// "every open issue", and that repo has 83 of them. The information needed to
 /// poll only what is current was already on those issues, unused.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RepoPreview {
     /// Open issues, pull requests excluded.
     pub open_issues: usize,
@@ -328,7 +330,8 @@ pub fn preview<T: crate::sources::github::Rest>(
 // ---- writing routing.toml ----------------------------------------------
 
 /// What one adoption wrote, for the caller to report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Adopted {
     pub wrote_route: bool,
     pub wrote_repo: bool,
@@ -391,7 +394,7 @@ pub fn ignore(path: &Path, slug: &str) -> Result<()> {
     apply(path, &before, &text)
 }
 
-fn read(path: &Path) -> Result<String> {
+pub(crate) fn read(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| {
         format!(
             "reading {} — run `comet-board init` if it does not exist yet",
@@ -407,7 +410,7 @@ fn read(path: &Path) -> Result<String> {
 /// we just wrote — and the previous contents are kept beside it. A one-command
 /// writer that could corrupt somebody's routing config would not be worth
 /// having.
-fn apply(path: &Path, before: &str, after: &str) -> Result<()> {
+pub(crate) fn apply(path: &Path, before: &str, after: &str) -> Result<()> {
     if before == after {
         return Ok(());
     }
@@ -416,9 +419,13 @@ fn apply(path: &Path, before: &str, after: &str) -> Result<()> {
     cfg.check()
         .context("the edit would not have validated; routing.toml is untouched")?;
 
-    let backup = backup_path(path);
-    std::fs::write(&backup, before)
-        .with_context(|| format!("writing the backup {}", backup.display()))?;
+    // Nothing to preserve when there was no file: a `.bak` of nothing reads as
+    // "there is a previous version to go back to", and there is not.
+    if !before.is_empty() {
+        let backup = backup_path(path);
+        std::fs::write(&backup, before)
+            .with_context(|| format!("writing the backup {}", backup.display()))?;
+    }
     std::fs::write(path, after).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -491,7 +498,7 @@ fn repo_table_block(slug: &str, labels: &[String]) -> String {
 /// A TOML basic string. Labels are somebody else's data — `area:design` is
 /// fine, and a label with a quote in it would otherwise write a file that does
 /// not parse, which `apply` would then refuse in full.
-fn toml_string(s: &str) -> String {
+pub(crate) fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -609,7 +616,7 @@ fn insert_route(text: &str, cfg: &RoutingConfig, u: &Unadopted) -> Result<String
 
 /// Walk back from a table header over the comment block attached to it, so an
 /// insertion does not land between a comment and the route it describes.
-fn start_of_block(lines: &[&str], header: usize) -> usize {
+pub(crate) fn start_of_block(lines: &[&str], header: usize) -> usize {
     let mut i = header;
     while i > 0 {
         let prev = lines[i - 1].trim_start();
@@ -714,7 +721,7 @@ fn add_to_array(text: &str, table: &str, key: &str, value: &str, preamble: &str)
 }
 
 /// Reassemble lines, preserving whether the original ended in a newline.
-fn join(lines: &[String], original: &str) -> String {
+pub(crate) fn join(lines: &[String], original: &str) -> String {
     let mut s = lines.join("\n");
     if original.ends_with('\n') || original.is_empty() {
         s.push('\n');
@@ -728,7 +735,7 @@ fn join(lines: &[String], original: &str) -> String {
 /// the shipped example config, and a prompt that happens to contain a line
 /// starting with `[` would otherwise be read as a table header and every
 /// insertion point computed from it would be wrong.
-fn header_lines(text: &str) -> Vec<(usize, String)> {
+pub(crate) fn header_lines(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut open: Option<&'static str> = None;
     for (i, line) in text.lines().enumerate() {
@@ -748,7 +755,7 @@ fn header_lines(text: &str) -> Vec<(usize, String)> {
 }
 
 /// Track `"""` / `'''` across a line.
-fn scan_multiline(line: &str, open: &mut Option<&'static str>) {
+pub(crate) fn scan_multiline(line: &str, open: &mut Option<&'static str>) {
     let mut rest = line;
     loop {
         match *open {

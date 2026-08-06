@@ -1385,6 +1385,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "comet-board",
  "comet-doc",
  "comet-engine",
  "comet-proto",

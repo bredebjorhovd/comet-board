@@ -36,6 +36,7 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearanceEvent, AppearancePage};
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::routing::RoutingPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
@@ -149,15 +150,19 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 pub enum SettingsSection {
     Devices,
     Agents,
+    /// The board's `routing.toml` (gh#75) — a comet-board addition, and the
+    /// only settings section whose subject lives on another device.
+    Routing,
     Appearance,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
+        SettingsSection::Routing,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -170,6 +175,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Routing => "Board routing",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -444,6 +450,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    routing_page: Option<Entity<RoutingPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -613,6 +620,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/routing") => Route::Settings(SettingsSection::Routing),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -653,6 +661,7 @@ impl Shell {
             route,
             nav,
             devices_page: None,
+            routing_page: None,
             archived_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1197,6 +1206,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Routing => {
+                if self.routing_page.is_none() {
+                    let state = self.state.clone();
+                    self.routing_page = Some(cx.new(|cx| RoutingPage::new(state, cx)));
+                }
+                match &self.routing_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Appearance => {
                 if self.appearance_page.is_none() {
                     let state = self.state.clone();
@@ -1722,6 +1741,7 @@ impl Shell {
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Routing => icons::CHECKLIST,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to
