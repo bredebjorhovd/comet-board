@@ -1,5 +1,5 @@
-//! The agent-facing half of `comet-board`: list / dispatch / cancel / wait /
-//! new — docs/BOARD.md §H6.
+//! The agent-facing half of `comet-board`: list / dispatch / retry / cancel /
+//! wait / new — docs/BOARD.md §H6.
 //!
 //! Everything that reads or moves the live board goes through the engine's
 //! typed RPC on the localhost IPC port, exactly as `comet-tui` attaches: the
@@ -8,6 +8,10 @@
 //! contract verbatim (modulo the pane→chat renames documented on
 //! [`TaskRow`]) — the agent conventions text depends on that shape, so it is
 //! not ours to bend here.
+//!
+//! The board those RPCs reach need not be this device's: they are all
+//! relay-forwardable (gh#55), so [`Board`] carries a `targetDeviceId` and
+//! `--device` points the whole CLI at the box that hosts the board (gh#73).
 //!
 //! `new` is the exception to "ask the engine": it writes to the *trackers*
 //! (Linear / GitHub), which sit upstream of the engine, so it speaks to them
@@ -19,6 +23,7 @@ use comet_board::config::{self, Paths, RoutingConfig};
 use comet_board::model::{BoardState, Source};
 use comet_board::rows::TaskRow;
 use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
+use comet_proto::Device;
 use comet_rpc::{RpcClient, connect_ws, methods};
 use serde::Deserialize;
 use std::time::Duration;
@@ -31,14 +36,122 @@ pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 /// one inherits identity the way `HERDR_PANE_ID` provided it under herdr.
 pub const CHAT_ID_ENV: &str = "COMET_BOARD_CHAT_ID";
 
-pub async fn attach(port: u16) -> Result<RpcClient> {
-    connect_ws(&format!("ws://127.0.0.1:{port}"))
+/// The engine connection plus which device's board it drives (gh#73).
+///
+/// The board store lives on exactly one device — usually the always-on box —
+/// and every board RPC is relay-forwardable, so this dials the *local* engine
+/// exactly as it always did and names the host in the params. That is the same
+/// shape the desktop panel and the TUI pane send, and it is why `--device`
+/// needs no new transport: the local engine forwards.
+///
+/// `host` is `None` for this device's own board, and then nothing extra is
+/// sent — a single-device install speaks byte-for-byte what it spoke before.
+pub struct Board {
+    client: RpcClient,
+    host: Option<String>,
+}
+
+/// Attach to the local engine, pointed at `device`'s board (`None` = this
+/// device's own). A named device is resolved against the registered devices
+/// first, so a typo costs an error naming the fleet rather than a call
+/// forwarded into nothing.
+pub async fn attach(port: u16, device: Option<&str>) -> Result<Board> {
+    let client = connect_ws(&format!("ws://127.0.0.1:{port}"))
         .await
         .with_context(|| {
             format!(
                 "connecting to the engine on 127.0.0.1:{port} — start `comet` or `comet headless`"
             )
-        })
+        })?;
+    let host = match device {
+        Some(want) => Some(resolve_device(&client, want).await?),
+        None => None,
+    };
+    Ok(Board { client, host })
+}
+
+impl Board {
+    /// Merge the host's `targetDeviceId` passthrough into a call's params. The
+    /// local board leaves them untouched.
+    fn params(&self, value: serde_json::Value) -> serde_json::Value {
+        with_target(value, self.host())
+    }
+
+    /// The device hosting the board, when it is not this one — for the error
+    /// and confirmation text that has to say where the work landed.
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+}
+
+/// The `targetDeviceId` passthrough merged into a call's params (gh#55). `None`
+/// — the board is this device's — leaves the params untouched, so a
+/// single-device install sends exactly the shape it always did.
+fn with_target(value: serde_json::Value, host: Option<&str>) -> serde_json::Value {
+    let mut value = value;
+    if let (Some(host), Some(object)) = (host, value.as_object_mut()) {
+        object.insert("targetDeviceId".into(), serde_json::json!(host));
+    }
+    value
+}
+
+/// A device id for `--device`: an exact id, or a name as the device switcher
+/// shows it. Names are the ones people have, ids are the ones that are unique;
+/// accepting both and refusing an ambiguous name is the only honest reading.
+async fn resolve_device(client: &RpcClient, want: &str) -> Result<String> {
+    let mut stream = client
+        .subscribe(methods::WATCH_DEVICES, serde_json::json!({}))
+        .await
+        .context("listing devices")?;
+    let first = tokio::time::timeout(SNAPSHOT_TIMEOUT, stream.recv())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {}s listing devices",
+                SNAPSHOT_TIMEOUT.as_secs()
+            )
+        })?
+        .ok_or_else(|| anyhow!("the device stream ended before a snapshot"))?;
+    let devices: Vec<Device> = serde_json::from_value(first).context("parsing devices")?;
+    pick_device(&devices, want)
+}
+
+/// `--device`'s value against the registered devices: an id wins outright, then
+/// a case-insensitive name. Two devices sharing a name is a real thing (two
+/// laptops called `laptop`), and picking one would send the work somewhere the
+/// operator did not choose — so that asks for the id instead.
+fn pick_device(devices: &[Device], want: &str) -> Result<String> {
+    if let Some(d) = devices.iter().find(|d| d.id == want) {
+        return Ok(d.id.clone());
+    }
+    let named: Vec<&Device> = devices
+        .iter()
+        .filter(|d| d.name.eq_ignore_ascii_case(want))
+        .collect();
+    match named.as_slice() {
+        [d] => Ok(d.id.clone()),
+        [] => bail!("no device `{want}`; this org has: {}", device_list(devices)),
+        several => bail!(
+            "`{want}` names {} devices; use the id: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn device_list(devices: &[Device]) -> String {
+    if devices.is_empty() {
+        return "none registered".to_string();
+    }
+    devices
+        .iter()
+        .map(|d| format!("{} ({})", d.name, d.id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The first `WatchBoard` snapshot. A stream that ends before one arrives is a
@@ -46,6 +159,7 @@ pub async fn attach(port: u16) -> Result<RpcClient> {
 /// server's error into end-of-stream, so name the likely cause here.
 async fn snapshot(
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    host: Option<&str>,
 ) -> Result<Vec<TaskRow>> {
     let first = tokio::time::timeout(SNAPSHOT_TIMEOUT, stream.recv())
         .await
@@ -55,22 +169,35 @@ async fn snapshot(
                 SNAPSHOT_TIMEOUT.as_secs()
             )
         })?
-        .ok_or_else(|| {
-            anyhow!(
-                "the board stream ended before a snapshot — the board is disabled \
-                 (COMET_BOARD=0) or its service failed to start; see the engine log"
-            )
-        })?;
+        .ok_or_else(|| no_board(host))?;
     serde_json::from_value(first).context("parsing board rows")
+}
+
+/// "Said nothing at all" IS the answer: the engine refuses `WatchBoard` outright
+/// when it hosts no board, and the RPC layer folds that refusal into
+/// end-of-stream. Which device was asked decides what to suggest.
+fn no_board(host: Option<&str>) -> anyhow::Error {
+    match host {
+        Some(device) => anyhow!(
+            "device {device} hosts no board — its stream ended before a snapshot; \
+             the board is disabled there (COMET_BOARD=0) or its service failed to start"
+        ),
+        None => anyhow!(
+            "the board stream ended before a snapshot — this device's board is disabled \
+             (COMET_BOARD=0) or its service failed to start (see the engine log); if the \
+             board lives on another device, name it with --device"
+        ),
+    }
 }
 
 /// Current board rows, in board order — one snapshot of what `WatchBoard`
 /// streams.
-pub async fn board_rows(client: &RpcClient) -> Result<Vec<TaskRow>> {
-    let mut stream = client
-        .subscribe(methods::WATCH_BOARD, serde_json::json!({}))
+pub async fn board_rows(board: &Board) -> Result<Vec<TaskRow>> {
+    let mut stream = board
+        .client
+        .subscribe(methods::WATCH_BOARD, board.params(serde_json::json!({})))
         .await?;
-    snapshot(&mut stream).await
+    snapshot(&mut stream, board.host()).await
 }
 
 // ---- list ---------------------------------------------------------------
@@ -147,7 +274,7 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-// ---- dispatch / cancel --------------------------------------------------
+// ---- dispatch / retry / cancel ------------------------------------------
 
 /// What `DispatchTask` answers: the attempt's address.
 #[derive(Debug, Deserialize)]
@@ -156,6 +283,39 @@ pub struct Dispatched {
     pub chat_id: String,
     pub cwd: String,
     pub attempt: usize,
+}
+
+/// Everything a release carries besides the task itself.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DispatchOpts<'a> {
+    /// The dispatching chat's id — provenance, never authority.
+    pub via: Option<&'a str>,
+    /// Runtime override for this one dispatch; `None` = the route's.
+    pub runtime: Option<&'a str>,
+    /// Model override for the chosen harness.
+    pub model: Option<&'a str>,
+    /// Agent-account slot whose subscription this run spends.
+    pub account: Option<&'a str>,
+    /// End the task's live attempt and release a fresh one — `retry` on a
+    /// blocked row (gh#49), and the one deliberate breach of the
+    /// one-live-attempt rule. Ordinary dispatches send `false` and are refused
+    /// on a live attempt.
+    pub replace: bool,
+}
+
+/// Whether `retry` on a row in this state has to replace a live attempt.
+///
+/// Only `blocked`: its agent is alive and waiting on input, so the
+/// one-live-attempt rule would refuse a plain dispatch, and ending it is the
+/// whole point of retrying. A `failed` attempt is already closed — replacing
+/// nothing would be a lie in the log — so that one is an ordinary release, and
+/// so is a `ready` row that never got off the ground. Anything else keeps its
+/// live attempt and is left to the engine's own refusal, which names the chat.
+///
+/// Exactly the desktop panel's rule (`crates/ui/src/board.rs`), so the same row
+/// retried from a shell and from the panel takes the same path.
+pub fn retry_replaces(state: &str) -> bool {
+    state == BoardState::Blocked.as_str()
 }
 
 /// The dispatching chat's id: `--via` when given, else the identity a
@@ -187,26 +347,52 @@ struct ModelChoice {
 /// time the harness sees it the dispatch has already cut a worktree, made a
 /// chat and started an agent. A typo should cost an error, not an attempt.
 pub async fn dispatch_checked(
-    client: &RpcClient,
+    board: &Board,
     task_id: &str,
-    via: Option<&str>,
-    runtime: Option<&str>,
-    model: Option<&str>,
-    account: Option<&str>,
+    opts: DispatchOpts<'_>,
 ) -> Result<Dispatched> {
     // A model with no runtime beside it runs under the row's — which is what
     // `list --json` shows as that row's `runtime`, and what `--runtime`'s help
     // points at. Only fetched when it is the missing half of the answer.
-    let row_runtime = match (model, runtime) {
-        (Some(_), None) => board_rows(client)
+    let row_runtime = match (opts.model, opts.runtime) {
+        (Some(_), None) => board_rows(board)
             .await
             .ok()
             .and_then(|rows| rows.into_iter().find(|r| r.id == task_id))
             .and_then(|r| r.runtime),
         _ => None,
     };
-    check_overrides(client, runtime, model, row_runtime.as_deref()).await?;
-    dispatch(client, task_id, via, runtime, model, account).await
+    check_overrides(board, opts.runtime, opts.model, row_runtime.as_deref()).await?;
+    dispatch(board, task_id, opts).await
+}
+
+/// `retry`, deciding from the row itself whether the release has to replace a
+/// live attempt (gh#73). Reading the row is not optional: `replace` is a real
+/// cancellation, and sending it unconditionally would let `retry` end a
+/// *working* agent that nobody asked to interrupt.
+pub async fn retry(board: &Board, task_id: &str, opts: DispatchOpts<'_>) -> Result<Retried> {
+    let row = board_rows(board)
+        .await?
+        .into_iter()
+        .find(|r| r.id == task_id)
+        .ok_or_else(|| anyhow!("{task_id} is not on the board"))?;
+    let replace = retry_replaces(&row.state);
+    let dispatched = dispatch_checked(board, task_id, DispatchOpts { replace, ..opts }).await?;
+    Ok(Retried {
+        dispatched,
+        replaced: replace,
+        was: row.state,
+    })
+}
+
+/// What `retry` did, so the confirmation can say whether an attempt was ended
+/// to make room — the difference between a retry and a first dispatch is the
+/// agent that was killed, and that is worth one line.
+pub struct Retried {
+    pub dispatched: Dispatched,
+    pub replaced: bool,
+    /// The state the row was in when the retry was decided.
+    pub was: String,
 }
 
 /// Refuse an override the dispatch would only choke on later.
@@ -217,7 +403,7 @@ pub async fn dispatch_checked(
 /// rather than trapping the operator). Refusing there would ground a legitimate
 /// dispatch on the strength of a failed lookup.
 async fn check_overrides(
-    client: &RpcClient,
+    board: &Board,
     runtime: Option<&str>,
     model: Option<&str>,
     row_runtime: Option<&str>,
@@ -228,8 +414,12 @@ async fn check_overrides(
 
     let mut chosen = runtime.or(row_runtime).map(str::to_string);
     if let Some(want) = runtime {
-        match client
-            .call(methods::LIST_BOARD_RUNTIMES, serde_json::json!({}))
+        match board
+            .client
+            .call(
+                methods::LIST_BOARD_RUNTIMES,
+                board.params(serde_json::json!({})),
+            )
             .await
             .context("listing runtimes")
             .and_then(|v| {
@@ -246,7 +436,9 @@ async fn check_overrides(
     // Which harness's catalog to ask about. `ListModels` is keyed by harness
     // id, and the canonical runtime name *is* that id — an alias spelling
     // (`claude`, `openai-codex`) has to be resolved through the same table the
-    // engine's own `build_spec` uses, or the lookup asks about nothing.
+    // engine's own `build_spec` uses, or the lookup asks about nothing. It
+    // carries the host too: the run executes there, so the catalog a dispatch
+    // is checked against has to be that device's.
     let Some(harness) = chosen
         .as_deref()
         .and_then(harness_for_runtime)
@@ -257,10 +449,11 @@ async fn check_overrides(
         return Ok(());
     };
 
-    match client
+    match board
+        .client
         .call(
             methods::LIST_MODELS,
-            serde_json::json!({ "harness": harness }),
+            board.params(serde_json::json!({ "harness": harness })),
         )
         .await
         .context("listing models")
@@ -316,45 +509,79 @@ fn check_model(models: &[ModelChoice], want: &str, runtime: &str) -> Result<()> 
     )
 }
 
-pub async fn dispatch(
-    client: &RpcClient,
-    task_id: &str,
-    via: Option<&str>,
-    runtime: Option<&str>,
-    model: Option<&str>,
-    account: Option<&str>,
-) -> Result<Dispatched> {
-    let mut params = serde_json::json!({ "taskId": task_id, "via": via });
-    if let (Some(runtime), Some(object)) = (runtime, params.as_object_mut()) {
-        object.insert(
-            "runtime".into(),
-            serde_json::Value::String(runtime.to_string()),
-        );
-    }
-    if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
-        object.insert("model".into(), serde_json::Value::String(model.to_string()));
-    }
-    if let (Some(account), Some(object)) = (account, params.as_object_mut()) {
-        object.insert(
-            "account".into(),
-            serde_json::Value::String(account.to_string()),
-        );
-    }
-    let reply = client.call(methods::DISPATCH_TASK, params).await?;
+pub async fn dispatch(board: &Board, task_id: &str, opts: DispatchOpts<'_>) -> Result<Dispatched> {
+    let params = board.params(dispatch_params(task_id, opts));
+    let reply = board.client.call(methods::DISPATCH_TASK, params).await?;
     serde_json::from_value(reply).context("parsing DispatchTask reply")
 }
 
-pub async fn cancel(client: &RpcClient, task_id: &str) -> Result<()> {
-    client
+/// The `DispatchTask` params for a release. Only the overrides that were given
+/// are sent: an absent key is "the route's", which is not the same statement as
+/// a null, and `replace` is absent unless it is true so an ordinary dispatch
+/// sends what it always sent.
+fn dispatch_params(task_id: &str, opts: DispatchOpts<'_>) -> serde_json::Value {
+    let mut params = serde_json::json!({ "taskId": task_id, "via": opts.via });
+    let Some(object) = params.as_object_mut() else {
+        return params;
+    };
+    for (key, value) in [
+        ("runtime", opts.runtime),
+        ("model", opts.model),
+        ("account", opts.account),
+    ] {
+        if let Some(value) = value {
+            object.insert(key.into(), serde_json::Value::String(value.to_string()));
+        }
+    }
+    if opts.replace {
+        object.insert("replace".into(), serde_json::Value::Bool(true));
+    }
+    params
+}
+
+pub async fn cancel(board: &Board, task_id: &str) -> Result<()> {
+    board
+        .client
         .call(
             methods::CANCEL_TASK,
-            serde_json::json!({ "taskId": task_id }),
+            board.params(serde_json::json!({ "taskId": task_id })),
         )
         .await?;
     Ok(())
 }
 
 // ---- wait ---------------------------------------------------------------
+
+/// The states that count as settled for one `wait` call.
+///
+/// The default trio is "finished, one way or another": work to look at, work
+/// that broke, or work whose ticket closed under it. `blocked` is deliberately
+/// not among them — an agent pausing for an approval mid-run is not a result,
+/// and an orchestrator that waited on it would be woken by every permission
+/// prompt.
+///
+/// But a child that asks a question and is never answered never settles either,
+/// and `wait` would then hold until its timeout or forever (gh#73). So
+/// `--blocked-is-settled` *adds* blocked to whichever set is in play rather
+/// than replacing it: the caller wants to be called back when its child needs
+/// an answer AND when it finishes, and spelling the whole set out by hand to
+/// say that is the kind of thing nobody does twice.
+pub fn settle_states(explicit: &[String], blocked_is_settled: bool) -> Vec<String> {
+    let mut states = if explicit.is_empty() {
+        vec![
+            BoardState::Review.as_str().to_string(),
+            BoardState::Failed.as_str().to_string(),
+            BoardState::Done.as_str().to_string(),
+        ]
+    } else {
+        explicit.to_vec()
+    };
+    let blocked = BoardState::Blocked.as_str();
+    if blocked_is_settled && !states.iter().any(|s| s == blocked) {
+        states.push(blocked.to_string());
+    }
+    states
+}
 
 /// Block until watched work settles — the counterpart to `dispatch`, so an
 /// orchestrator can release work and be told, instead of polling or falling
@@ -365,7 +592,7 @@ pub async fn cancel(client: &RpcClient, task_id: &str) -> Result<()> {
 /// engine pushes rows after every sync cycle, status refresh and command, so
 /// this answers as soon as the answer is true without doing any work itself.
 pub async fn wait_for(
-    client: &RpcClient,
+    board: &Board,
     tasks: &[String],
     states: &[String],
     timeout: Option<Duration>,
@@ -381,10 +608,11 @@ pub async fn wait_for(
     let started = tokio::time::Instant::now();
     let deadline = timeout.map(|t| started + t);
 
-    let mut stream = client
-        .subscribe(methods::WATCH_BOARD, serde_json::json!({}))
+    let mut stream = board
+        .client
+        .subscribe(methods::WATCH_BOARD, board.params(serde_json::json!({})))
         .await?;
-    let mut rows = snapshot(&mut stream).await?;
+    let mut rows = snapshot(&mut stream, board.host()).await?;
 
     // With no explicit tasks, watch whatever is in flight right now. Resolved
     // once, at the start: a task dispatched later is not what this call is
@@ -445,12 +673,13 @@ fn settled(rows: &[TaskRow], watching: &[String], states: &[String]) -> Vec<Task
 /// Wait for a task to appear on the board — `new --dispatch` needs the row to
 /// exist before it can be released, and the engine's sync loop is what puts it
 /// there on its next poll.
-pub async fn await_row(client: &RpcClient, task_id: &str, timeout: Duration) -> Result<()> {
+pub async fn await_row(board: &Board, task_id: &str, timeout: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut stream = client
-        .subscribe(methods::WATCH_BOARD, serde_json::json!({}))
+    let mut stream = board
+        .client
+        .subscribe(methods::WATCH_BOARD, board.params(serde_json::json!({})))
         .await?;
-    let mut rows = snapshot(&mut stream).await?;
+    let mut rows = snapshot(&mut stream, board.host()).await?;
     loop {
         if rows.iter().any(|r| r.id == task_id) {
             return Ok(());
@@ -802,6 +1031,117 @@ mod tests {
         let err = github_repo(&repos, None, Some("owner/unpolled".into())).unwrap_err();
         assert!(err.to_string().contains("adopt"), "{err}");
         assert!(github_repo(&repos, None, None).is_err());
+    }
+
+    fn device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "linux".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn device_resolves_by_id_then_name() {
+        let devices = vec![device("dev-1", "the-box"), device("dev-2", "laptop")];
+        assert_eq!(pick_device(&devices, "dev-2").unwrap(), "dev-2");
+        // The name people actually have, spelled how they feel like spelling it.
+        assert_eq!(pick_device(&devices, "The-Box").unwrap(), "dev-1");
+
+        let err = pick_device(&devices, "boxx").unwrap_err().to_string();
+        assert!(err.contains("no device `boxx`"), "{err}");
+        // The error carries the fleet; there is no picker to fall back on.
+        assert!(err.contains("the-box (dev-1)"), "{err}");
+    }
+
+    #[test]
+    fn an_ambiguous_device_name_asks_for_the_id() {
+        // Two laptops called `laptop` is a real fleet. Picking one would send
+        // the work to a device the operator did not choose.
+        let devices = vec![device("dev-1", "laptop"), device("dev-2", "laptop")];
+        let err = pick_device(&devices, "laptop").unwrap_err().to_string();
+        assert!(err.contains("names 2 devices"), "{err}");
+        assert!(err.contains("dev-1, dev-2"), "{err}");
+
+        // An id is never ambiguous, even when the names collide.
+        assert_eq!(pick_device(&devices, "dev-2").unwrap(), "dev-2");
+    }
+
+    #[test]
+    fn the_host_rides_on_board_calls_and_a_local_board_sends_nothing_extra() {
+        assert_eq!(
+            with_target(serde_json::json!({ "taskId": "t" }), Some("dev-1")),
+            serde_json::json!({ "taskId": "t", "targetDeviceId": "dev-1" })
+        );
+        assert_eq!(
+            with_target(serde_json::json!({ "taskId": "t" }), None),
+            serde_json::json!({ "taskId": "t" })
+        );
+    }
+
+    #[test]
+    fn dispatch_sends_only_the_overrides_it_was_given() {
+        // An absent key is "the route's", which is not the same statement as a
+        // null — and `replace` absent is what an ordinary dispatch has always
+        // sent.
+        assert_eq!(
+            dispatch_params("gh:o/r#1", DispatchOpts::default()),
+            serde_json::json!({ "taskId": "gh:o/r#1", "via": null })
+        );
+        assert_eq!(
+            dispatch_params(
+                "gh:o/r#1",
+                DispatchOpts {
+                    via: Some("chat-7"),
+                    runtime: Some("opencode"),
+                    model: Some("claude-opus-5"),
+                    account: Some("slot-a"),
+                    replace: true,
+                }
+            ),
+            serde_json::json!({
+                "taskId": "gh:o/r#1",
+                "via": "chat-7",
+                "runtime": "opencode",
+                "model": "claude-opus-5",
+                "account": "slot-a",
+                "replace": true,
+            })
+        );
+    }
+
+    #[test]
+    fn retry_replaces_only_a_blocked_rows_live_attempt() {
+        // Blocked: the agent is alive and waiting, so the one-live-attempt rule
+        // would refuse a plain dispatch — ending it is the point.
+        assert!(retry_replaces("blocked"));
+        // Failed and ready hold nothing live; replacing nothing would be a lie
+        // in the log, and the engine's own guard is free to refuse the rest.
+        assert!(!retry_replaces("failed"));
+        assert!(!retry_replaces("ready"));
+        assert!(!retry_replaces("working"));
+        assert!(!retry_replaces("review"));
+        assert!(!retry_replaces("done"));
+    }
+
+    #[test]
+    fn blocked_is_settled_adds_to_the_states_rather_than_replacing_them() {
+        assert_eq!(settle_states(&[], false), ["review", "failed", "done"]);
+        // The orchestrator wants to hear about a question AND about the finish.
+        assert_eq!(
+            settle_states(&[], true),
+            ["review", "failed", "done", "blocked"]
+        );
+        // An explicit set is still the caller's; the flag only tops it up.
+        assert_eq!(
+            settle_states(&["done".to_string()], true),
+            ["done", "blocked"]
+        );
+        // And it never doubles a state the caller already named.
+        assert_eq!(settle_states(&["blocked".to_string()], true), ["blocked"]);
     }
 
     #[test]
