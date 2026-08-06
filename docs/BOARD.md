@@ -777,7 +777,7 @@ attribution back beyond the row field — the panel's dispatch notice names the
 account it spent, and the issue comment names the human, which is where people
 were already looking.
 
-### H13 — Remote routing surface — **done** (gh#75)
+### H19 — Remote routing surface — **done** (gh#75)
 `routing.toml` is a hand-edited file on the box, documented as "not managed
 config", and no RPC touched it. Adding a repo, pointing a route at a different
 agent account, or lifting a cap was an ssh-and-edit job — fine for whoever set
@@ -1006,7 +1006,7 @@ the WorkOS user who dispatched. The guard *compares* the claim; it still never
 authorizes on it, and which subscription a run spends stays the explicit
 `account`.
 
-### H17 — Live agents in the sidebar — **done** (gh#103)
+### H20 — Live agents in the sidebar — **done** (gh#103)
 In herdr every working agent was a pane, so the pane list *was* the presence
 list and presence cost nothing. Here a dispatched agent is a chat among chats:
 three of them are three rows somewhere in a recency-sorted list, indistinguishable
