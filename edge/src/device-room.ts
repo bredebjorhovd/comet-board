@@ -16,7 +16,7 @@
  */
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
-import { AUTH_USER_HEADER, type Env } from "./env";
+import { AUTH_ORG_HEADER, AUTH_USER_HEADER, type Env } from "./env";
 
 export interface DeviceFrameHeader {
   /** Stream id, unique per (connId, logical stream). */
@@ -52,6 +52,40 @@ interface SocketState {
   /** Accept time — the liveness floor until the socket's first auto-pong. */
   joinedAt?: number;
 }
+
+/** What a caller may do with a device room (gh#66).
+ * - `claim`  — nobody owns it yet and the device's own backend is joining;
+ * - `owner`  — the claiming user, from any of their devices;
+ * - `member` — a different user of the SAME org: relay access, no writes;
+ * - `deny`   — everyone else. */
+export type DeviceRoomAccess = "claim" | "owner" | "member" | "deny";
+
+/** The relay's authorization rule, pure so it is testable without a DO.
+ *
+ * Before gh#66 this was claim-on-first-join by user id and nothing else, which
+ * made "one box, many users" impossible: a teammate signing in on their own
+ * laptop was refused by the edge before a frame ever reached the box. The room
+ * now also records the org that claimed it, and any member of that org may use
+ * the relay — which is precisely the guarantee `crates/engine/src/rpc.rs`
+ * asserts when it forwards board RPCs ("the relay only carries frames between
+ * devices of one org").
+ *
+ * Hosting stays owner-only: the host socket IS the device, and only the
+ * identity the device runs under may be it. `org` is unset on rooms claimed
+ * before this shipped (and by callers whose session carries no org claim);
+ * those keep the old owner-only behavior until the owner's next request
+ * backfills it. */
+export const deviceRoomAccess = (
+  room: { owner?: string; org?: string },
+  caller: { userId: string; orgId?: string },
+  role: "host" | "client"
+): DeviceRoomAccess => {
+  if (!room.owner) return role === "host" ? "claim" : "deny";
+  if (room.owner === caller.userId) return "owner";
+  if (role === "host") return "deny";
+  if (room.org && caller.orgId && room.org === caller.orgId) return "member";
+  return "deny";
+};
 
 const HOST_TAG = "host";
 const clientTag = (connId: string) => `client:${connId}`;
@@ -145,17 +179,29 @@ export class DeviceRoom implements DurableObject {
     const url = new URL(request.url);
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
+    const orgId = request.headers.get(AUTH_ORG_HEADER) ?? undefined;
     const owner = this.getMeta("owner");
+    const caller = { userId, orgId };
+    // Backfill the room's org from the owner's own requests: rooms claimed
+    // before gh#66 have an owner and no org, and would stay invisible to the
+    // rest of the org forever. The owner is the only identity trusted to say
+    // which org their device belongs to, and re-stamping keeps a device that
+    // moved orgs from being reachable by the old one.
+    if (owner === userId && orgId && this.getMeta("org") !== orgId) {
+      this.setMeta("org", orgId);
+    }
+    const room = { owner, org: this.getMeta("org") };
 
     if (url.pathname === "/ws") {
       const role = url.searchParams.get("role") === "host" ? "host" : "client";
-      if (role === "host") {
+      const access = deviceRoomAccess(room, caller, role);
+      if (access === "deny") return new Response("forbidden", { status: 403 });
+      if (access === "claim") {
         // The device's own backend claims the room; the claim is the identity
-        // anchor every later client join is checked against.
-        if (!owner) this.setMeta("owner", userId);
-        else if (owner !== userId) return new Response("forbidden", { status: 403 });
-      } else {
-        if (!owner || owner !== userId) return new Response("forbidden", { status: 403 });
+        // anchor every later join is checked against, and its org is what
+        // opens the relay to the rest of the team.
+        this.setMeta("owner", userId);
+        if (orgId) this.setMeta("org", orgId);
       }
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
       const pair = new WebSocketPair();
@@ -178,23 +224,33 @@ export class DeviceRoom implements DurableObject {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
+    // Everything below is a client-side use of the room (reads and nudges),
+    // so it is gated as a client join would be: the owner, or a teammate in
+    // the room's org. An unclaimed room denies everyone here (only a host
+    // claims) and keeps answering `not_found` — clients branch on that.
+    const access = deviceRoomAccess(room, caller, "client");
+    const refuse = () => json({ error: "forbidden" }, owner ? 403 : 404);
+
     // Sidecar slots (host-published JSON, e.g. repos snapshot §8.1).
     const sidecar = url.pathname.match(/^\/sidecar\/([a-z0-9-]{1,64})$/);
     if (sidecar) {
       const name = sidecar[1]!;
-      if (!owner || owner !== userId) return json({ error: "forbidden" }, owner ? 403 : 404);
+      if (access === "deny") return refuse();
       if (request.method === "GET") {
         const value = getJsonBlob<unknown>(this.blobs, `sidecar:${name}`);
         return value === undefined ? json({ error: "not_found" }, 404) : json(value);
       }
       if (request.method === "POST") {
+        // Publishing is the host's job — a teammate reads these slots, never
+        // writes them.
+        if (access !== "owner") return json({ error: "forbidden" }, 403);
         putJsonBlob(this.blobs, `sidecar:${name}`, await request.json());
         return json({ ok: true });
       }
     }
 
     if (url.pathname === "/status" && request.method === "GET") {
-      if (!owner || owner !== userId) return json({ error: "forbidden" }, owner ? 403 : 404);
+      if (access === "deny") return refuse();
       // `hostSockets` counts corpses too — the gap between it and
       // `hostConnected` is the only externally visible signal that a device's
       // room is accumulating silently-dead host sockets.
@@ -204,11 +260,12 @@ export class DeviceRoom implements DurableObject {
       });
     }
 
-    // Durable command nudge (§7). Any authenticated device of the owner may
+    // Durable command nudge (§7). Any authenticated device of the org may
     // nudge; the payload is only a chat id — the host validates against its
-    // own doc before executing anything.
+    // own doc before executing anything (and a teammate steering a chat the
+    // box hosts needs exactly this to wake a cold host).
     if (url.pathname === "/nudge" && request.method === "POST") {
-      if (!owner || owner !== userId) return json({ error: "forbidden" }, owner ? 403 : 404);
+      if (access === "deny") return refuse();
       const body = (await request.json().catch(() => null)) as { chatId?: string } | null;
       const chatId = body?.chatId;
       if (!chatId || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);

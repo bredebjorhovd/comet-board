@@ -239,6 +239,8 @@ async fn collect_text(
         // Titling is a chat-less throwaway run on whatever login the device
         // holds; it is not the teammate's turn and must not spend their slot.
         account: None,
+        // It names a chat. It does not touch a repo.
+        push: None,
     };
     let mut stream = harness.run(request, controls).await?;
     let mut text = String::new();

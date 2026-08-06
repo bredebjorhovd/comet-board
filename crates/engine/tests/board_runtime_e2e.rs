@@ -133,6 +133,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         harness: HarnessId::Mock,
         model: None,
         account: None,
+        push_repo: Some("o/widget".into()),
         prompt: "do the thing".into(),
     };
     let rt = runtime.clone();
@@ -163,6 +164,13 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     assert_eq!(chat.branch.as_deref(), Some("board/gh-1-widget"));
     assert_eq!(chat.title.as_deref(), Some("gh#1"));
     assert_eq!(chat.space_id.as_deref(), Some("space-widget"));
+    // The repo its pushes authenticate for, on the chat rather than on the run
+    // (gh#68): the fix for a review comment next week is a new run in this same
+    // chat, and it has to reach the same branch.
+    assert_eq!(
+        chat.config.as_ref().and_then(|c| c.push_repo.as_deref()),
+        Some("o/widget")
+    );
 
     // The brief is not just queued — the host executor runs it.
     let doc = core.doc_host.open(&handle.chat_id).unwrap();
@@ -232,6 +240,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         harness: HarnessId::ClaudeCode,
         model: None,
         account: Some("ffffffffffffffff".into()),
+        push_repo: None,
         prompt: "should never be sent".into(),
     };
     let err = tokio::task::spawn_blocking(move || rt.dispatch(&bogus))

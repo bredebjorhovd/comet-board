@@ -327,6 +327,10 @@ impl DocHost {
             }
             handles.insert(chat_id.to_string(), handle.clone());
         }
+        // Say in the doc itself who hosts this chat, so a device that opens it
+        // WITHOUT a workspace row (a teammate, on a chat shared into the org)
+        // knows not to execute its commands (gh#66).
+        self.stamp_host(&handle);
 
         // Edge room join — offline-tolerant: a failed join logs and stays local-first.
         if let Some(edge) = &self.inner.config.edge {
@@ -444,19 +448,79 @@ impl DocHost {
         Ok(id)
     }
 
-    /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
-    /// another device as host. Best-effort: offline/edge-less engines skip silently.
+    /// The device hosting `chat_id`, when anything says: the session doc's own
+    /// stamp first (it travels with a chat shared into the org — the only
+    /// source a teammate has), then this user's workspace row. `None` = nobody
+    /// has claimed it.
+    fn host_device(&self, chat_id: &str) -> Option<String> {
+        let stamped = lock(&self.inner.handles)
+            .get(chat_id)
+            .and_then(|handle| handle.doc.host_device_id());
+        if stamped.is_some() {
+            return stamped;
+        }
+        match self.workspace()?.doc().chat(chat_id) {
+            Ok(chat) => chat.map(|c| c.device_id),
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
+                None
+            }
+        }
+    }
+
+    /// Make a chat visible to the whole org at the edge (`POST /share/{chatId}`,
+    /// gh#66) — how a board dispatch becomes work a teammate can open and steer
+    /// rather than a chat only the box's owner may join. Owner-gated at the
+    /// edge; idempotent; best-effort (offline/edge-less engines skip silently,
+    /// and the chat stays private until a later dispatch re-shares it).
+    pub fn share_chat(&self, chat_id: &str) {
+        // Sharing is only ever done by the chat's host (the edge enforces that
+        // too), so stamp the doc before anyone else can open it: a teammate who
+        // synced a shared chat with no `hostDeviceId` would read "unclaimed" and
+        // execute its commands themselves.
+        match self.open(chat_id) {
+            Ok(handle) => self.stamp_host(&handle),
+            Err(err) => tracing::warn!(chat = %chat_id, error = %err, "share: open failed"),
+        }
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let url = format!("{}/share/{}", edge.url.trim_end_matches('/'), chat_id);
+        let chat = chat_id.to_string();
+        runtime.spawn(async move {
+            let Some(bearer) = edge.bearer().await else {
+                tracing::warn!(chat = %chat, "share skipped: signed out");
+                return;
+            };
+            let send = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(&bearer)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+            match send {
+                Ok(res) if res.status().is_success() => {
+                    tracing::info!(chat = %chat, "chat shared with the org");
+                }
+                Ok(res) => tracing::warn!(chat = %chat, status = res.status().as_u16(),
+                    "chat share rejected"),
+                Err(err) => tracing::warn!(chat = %chat, error = %err, "chat share failed"),
+            }
+        });
+    }
+
+    /// POST `{edge}/device/{host}/nudge {chatId}` when another device hosts this
+    /// chat. Best-effort: offline/edge-less engines skip silently.
     fn nudge_remote_host(&self, chat_id: &str) {
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
-        let Some(workspace) = self.workspace() else {
-            return;
-        };
-        let host_device = match workspace.doc().chat(chat_id) {
-            Ok(Some(chat)) => chat.device_id,
+        let Some(host_device) = self.host_device(chat_id) else {
             // Unclaimed chat: whoever drains first claims it — nobody to nudge.
-            _ => return,
+            return;
         };
         if host_device == self.inner.config.device_id {
             return;
@@ -502,8 +566,37 @@ impl DocHost {
     /// ours; a chat with no row is claimable (claim-on-first-command). Without a
     /// wired workspace host (bare-DocHost tests) every open chat is ours — M2's
     /// behavior, now the degenerate case.
+    ///
+    /// The session doc's own `hostDeviceId` outranks all of that when it is
+    /// stamped (gh#66). The workspace doc is PER-USER: a chat the box shared
+    /// into the org has no row on a teammate's laptop, and "no row" reads as
+    /// "claimable, so mine to execute" — which would run the box's work a
+    /// second time, in a cwd that does not exist there. The stamp travels with
+    /// the chat, so the answer is the same everywhere the chat is.
     fn is_host(&self, chat_id: &str) -> bool {
+        let stamped = lock(&self.inner.handles)
+            .get(chat_id)
+            .and_then(|handle| handle.doc.host_device_id());
+        if let Some(host) = stamped {
+            return host == self.inner.config.device_id;
+        }
         self.workspace().is_none_or(|ws| ws.is_host(chat_id))
+    }
+
+    /// Record this device as the chat's host in the session doc, when the
+    /// workspace says we are. Idempotent (a no-op once stamped), so warm-open
+    /// and every later drain cost nothing.
+    fn stamp_host(&self, handle: &ChatDocHandle) {
+        let hosted_here = self
+            .workspace()
+            .and_then(|ws| ws.doc().chat(&handle.chat_id).ok().flatten())
+            .is_some_and(|chat| chat.device_id == self.inner.config.device_id);
+        if !hosted_here {
+            return;
+        }
+        if let Err(err) = handle.doc.set_host_device_id(&self.inner.config.device_id) {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "host stamp failed");
+        }
     }
 
     /// Chat-config harness when the workspace row carries one, else the default.
@@ -623,9 +716,25 @@ impl DocHost {
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
+                self.stamp_host(handle);
+                let mut request = request.clone();
+                // An existing chat runs where its row says, not where the
+                // sender guessed. Identical for every composer on a device that
+                // has the row (it sends the row's cwd back), and the difference
+                // that matters for a chat shared into the org: a teammate has
+                // no row, so their send would otherwise arrive with a
+                // placeholder cwd and run the box's work in the wrong folder.
+                if let Some(cwd) = self
+                    .workspace()
+                    .and_then(|ws| ws.doc().chat(chat_id).ok().flatten())
+                    .and_then(|chat| chat.cwd)
+                    .filter(|cwd| !cwd.is_empty())
+                {
+                    request.cwd = cwd;
+                }
                 let harness = self.harness_for(chat_id);
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
+                    .dispatch(chat_id, harness, request, Some(message_id.clone()))
                     .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }

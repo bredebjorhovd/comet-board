@@ -17,8 +17,12 @@
  *   POST /diff/:chatId                — host publishes the diff sidecar
  *   GET  /snapshot/:chatId            — repair: read current doc snapshot
  *   POST /append/:chatId              — repair: merge-import a Loro update
+ *   POST /share/:chatId               — owner shares the chat with their org
+ *   GET  /share/:chatId               — the chat's sharing state
  *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
+ *   GET  /org/:orgId/devices/ws       — org device registry `orgdev1/{orgId}`
+ *   GET  /org/:orgId/devices/tail     — org device registry tail JSON
  *   GET  /device/:deviceId/ws?role=   — device-room byte pipe (§8)
  *   GET  /device/:deviceId/sidecar/:name
  *   POST /device/:deviceId/sidecar/:name
@@ -27,9 +31,9 @@
  *   GET  /attachments/:sha256
  *   HEAD /attachments/:sha256
  */
-import { authenticate } from "./auth";
+import { authenticate, type Verified } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import installSh from "./install.sh";
@@ -46,12 +50,15 @@ const json = (value: unknown, status = 200): Response =>
     headers: { "content-type": "application/json" }
   });
 
-/** Forward into a DO with the verified user stamped on the request. */
+/** Forward into a DO with the verified identity stamped on the request. Both
+ * the user and (when the session is org-scoped) the org claim ride along: the
+ * DOs authorize cross-user access on the org, never on a value a client could
+ * have chosen (gh#66). */
 const forward = (
   ns: DurableObjectNamespace,
   name: string,
   request: Request,
-  userId: string,
+  auth: Verified,
   path: string,
   search?: string,
   roomKind?: "workspace"
@@ -61,7 +68,11 @@ const forward = (
   url.pathname = path;
   if (search !== undefined) url.search = search;
   const headers = new Headers(request.headers);
-  headers.set(AUTH_USER_HEADER, userId);
+  headers.set(AUTH_USER_HEADER, auth.userId);
+  // Delete first: `set` overwrites, but a caller with NO org claim would
+  // otherwise pass their own header straight through to the DO.
+  headers.delete(AUTH_ORG_HEADER);
+  if (auth.orgId) headers.set(AUTH_ORG_HEADER, auth.orgId);
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
 };
@@ -136,25 +147,32 @@ export default {
         env.SESSION_ROOMS,
         `s2/${parts[1]}`,
         request,
-        auth.userId,
+        auth,
         "/ws",
         `?chatId=${parts[1]}`
       );
     }
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/tail", "");
     }
     if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/stats", "");
     }
     if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/diff", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/diff", "");
     }
     if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/snapshot", "");
     }
     if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/append", "");
+    }
+    // gh#66: the chat's owner marks it visible to their whole org (the board
+    // does this for every task it dispatches, which is what lets a teammate
+    // open and steer work the box started). The DO enforces owner-only; the
+    // org comes from the caller's verified claim, never from the body.
+    if (parts[0] === "share" && parts[1] && ID_RE.test(parts[1])) {
+      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/share", "");
     }
 
     // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
@@ -178,27 +196,70 @@ export default {
           env.SESSION_ROOMS,
           room,
           request,
-          auth.userId,
+          auth,
           "/ws",
           `?chatId=${encodeURIComponent(room)}`,
           "workspace"
         );
       }
       if (parts[2] === "tail" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/tail", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/tail", "", "workspace");
       }
       // Observability: log/snapshot sizes for the per-user workspace room, so a
       // human can see whether the compaction budget is holding (org-membership
       // was already checked above; the DO bypasses the owner gate for
       // workspace kind).
       if (parts[2] === "stats" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/stats", "", "workspace");
       }
       // Operator wedge-break: clear a workspace room whose update log grew big
       // enough to CPU-reset the DO on every cold start (org-membership already
       // checked; state re-uploads from each device's local doc on rejoin).
       if (parts[2] === "reset-log" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
+        return forward(env.SESSION_ROOMS, room, request, auth, "/reset-log", "", "workspace");
+      }
+    }
+
+    // ── org device registry (gh#66) ─────────────────────────────────────────
+    //    The one thing the per-user workspace doc CANNOT hold: which devices
+    //    the org has. A teammate signing in on their own laptop has an empty
+    //    workspace doc, so without this they never see the box — no device to
+    //    address, no relay to sweep, no board. Same SessionRoom DO class and
+    //    the same org-membership authz as a workspace room (`workspace` kind ⇒
+    //    the DO skips its per-chat owner gate), but ONE room per org that every
+    //    member joins: each device writes only its own row, everyone reads all
+    //    of them, and presence rides the room's EphemeralStore as usual.
+    //
+    //    Deliberately devices ONLY. Spaces, chats and sessions stay per-user in
+    //    `ws3/{orgId}/{userId}`; org visibility is opt-in per chat (`/share`).
+    if (parts[0] === "org" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "devices") {
+      const orgId = parts[1];
+      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      const room = `orgdev1/${orgId}`;
+      if (parts[3] === "ws") {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        return forward(
+          env.SESSION_ROOMS,
+          room,
+          request,
+          auth,
+          "/ws",
+          `?chatId=${encodeURIComponent(room)}`,
+          "workspace"
+        );
+      }
+      if (parts[3] === "tail" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/tail", "", "workspace");
+      }
+      if (parts[3] === "stats" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/stats", "", "workspace");
+      }
+      // Same operator wedge-break as the workspace room: every device
+      // re-uploads its row from its local snapshot on the next join.
+      if (parts[3] === "reset-log" && request.method === "POST") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/reset-log", "", "workspace");
       }
     }
 
@@ -216,22 +277,22 @@ export default {
           env.DEVICE_ROOMS,
           `d2/${deviceId}`,
           request,
-          auth.userId,
+          auth,
           "/ws",
           `?role=${role}&connId=${encodeURIComponent(connId)}`
         );
       }
       if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, `/sidecar/${parts[3]}`, "");
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, `/sidecar/${parts[3]}`, "");
       }
       if (parts[2] === "status") {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/status", "");
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, "/status", "");
       }
       // Durable command nudge (§7): "chat X has pending commands — open its
       // doc". Delivered live if the host is connected, else queued in the DO
       // and replayed on the host's next join.
       if (parts[2] === "nudge" && request.method === "POST") {
-        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, "/nudge", "");
       }
     }
 

@@ -114,6 +114,10 @@ impl Runtime for CometRuntime {
             // deliveries, the operator typing into the same session — keeps
             // spending the account the dispatch chose.
             account: spec.account.clone(),
+            // Likewise for the credential its pushes authenticate with
+            // (gh#68): the fix for a review comment three days from now is a
+            // new run in this chat, and it has to reach the same branch.
+            push_repo: spec.push_repo.clone(),
         };
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;
@@ -142,6 +146,12 @@ impl Runtime for CometRuntime {
                 message_id: crate::new_id(),
             },
         )?;
+        // The board dispatches on the TEAM's behalf, so its chats are the one
+        // kind that is org-visible (gh#66): every member may open the
+        // transcript and steer the agent, while private chats on the same box
+        // stay private. Best-effort — a chat that failed to share is still a
+        // running attempt, just one only its owner can open.
+        self.doc_host.share_chat(&chat_id);
         Ok(DispatchHandle { chat_id, cwd })
     }
 

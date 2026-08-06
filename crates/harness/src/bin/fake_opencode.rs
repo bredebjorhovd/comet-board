@@ -34,6 +34,12 @@ enum Scenario {
     StreamEnd,
     /// Emit a busy→delta turn, then exit(1) mid-run — the server dies.
     Crash,
+    /// Die the way a crashing serve usually looks from the outside: the dying
+    /// process's session goes `session.idle` without the assistant message ever
+    /// settling, and the exit lands in the same instant (gh#79). The idle
+    /// arrives first, so the stall path (gh#37) must still report the real exit
+    /// status rather than "went idle".
+    IdleThenCrash,
     /// Emit a full busy→delta→completed-message→idle turn and stay parked
     /// (persistent session); the harness reaps the process when the run ends.
     Happy,
@@ -103,6 +109,8 @@ async fn handle(
             let body = String::from_utf8_lossy(&request.body);
             let sc = if body.contains("scenario:stream-end") {
                 Scenario::StreamEnd
+            } else if body.contains("scenario:idle-then-crash") {
+                Scenario::IdleThenCrash
             } else if body.contains("scenario:crash") {
                 Scenario::Crash
             } else if body.contains("scenario:idle-mid-turn") {
@@ -202,12 +210,16 @@ async fn serve_events(
             )
             .await;
         }
-        Scenario::Crash | Scenario::IdleMidTurn => {}
+        Scenario::Crash | Scenario::IdleThenCrash | Scenario::IdleMidTurn => {}
     }
     match sc {
         Scenario::StreamEnd => {}
         Scenario::Crash => {
             let _ = stream.flush().await;
+            std::process::exit(1);
+        }
+        Scenario::IdleThenCrash => {
+            sse(&mut stream, "session.idle", "{\"sessionID\":\"ses_fake\"}").await;
             std::process::exit(1);
         }
         Scenario::Happy | Scenario::IdleMidTurn | Scenario::SlowTurn => {

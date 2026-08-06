@@ -222,6 +222,15 @@ enum Command {
         /// The prompt git is asking — "Username for …" or "Password for …".
         prompt: Option<String>,
     },
+    /// Print a GitHub token for the repo named by COMET_BOARD_ASKPASS_REPO
+    /// (gh#68).
+    ///
+    /// Not for people either: the `gh` shim on a dispatched agent's PATH runs
+    /// this so `gh pr create` authenticates as the board's App installation
+    /// with a token minted for that invocation, rather than one that was
+    /// already an hour old when the agent got round to opening the PR.
+    #[command(hide = true)]
+    GhToken,
 }
 
 fn main() -> Result<()> {
@@ -269,6 +278,22 @@ fn main() -> Result<()> {
             )?;
             // Straight to stdout, which is the pipe git is holding. Nowhere else.
             println!("{secret}");
+            Ok(())
+        }
+        // Same deal for `gh`, and for the same reason it is answered before
+        // anything dials the engine: this runs inside every `gh` the agent
+        // invokes.
+        Command::GhToken => {
+            let repo = std::env::var(comet_board::git_credentials::ASKPASS_REPO_ENV)
+                .ok()
+                .filter(|r| !r.is_empty())
+                .with_context(|| {
+                    format!(
+                        "{} is not set — nothing to mint for",
+                        comet_board::git_credentials::ASKPASS_REPO_ENV
+                    )
+                })?;
+            println!("{}", comet_board::git_credentials::token(&paths, &repo)?);
             Ok(())
         }
         Command::List {

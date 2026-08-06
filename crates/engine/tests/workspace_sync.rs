@@ -420,6 +420,7 @@ async fn chat_config_selects_the_run_harness() {
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
                 account: None,
+                push_repo: None,
             }),
             None,
         )

@@ -1,7 +1,7 @@
 //! Session doc schema over `loro` — Rust port of `packages/session-doc/src/schema.ts`.
 //!
 //! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
-//! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
+//! - `meta`:     LoroMap  { chatId, schemaVersion, hostDeviceId? } (host-only writer)
 //! - `messages`: LoroList of LoroMap {
 //!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
 //! - `commands`: LoroList of LoroMap {
@@ -178,7 +178,35 @@ impl SessionDoc {
     }
 
     pub fn chat_id(&self) -> Option<String> {
-        match self.doc.get_map("meta").get("chatId") {
+        self.meta_string("chatId")
+    }
+
+    /// The device that hosts this chat — the one device allowed to execute its
+    /// commands (gh#66).
+    ///
+    /// Chat ownership normally lives in the workspace doc, but that doc is
+    /// PER-USER: a chat the box shared into the org has no row at all in a
+    /// teammate's workspace, and "no row" reads as "unclaimed, so mine to
+    /// execute". Carrying the host in the session doc itself means the answer
+    /// travels with the chat, to anyone the chat is shared with.
+    pub fn host_device_id(&self) -> Option<String> {
+        self.meta_string("hostDeviceId")
+    }
+
+    /// Stamp the hosting device (host-only writer, like the rest of `meta`).
+    /// A no-op when it already says this device, so warm-opening a chat on
+    /// every boot costs no ops.
+    pub fn set_host_device_id(&self, device_id: &str) -> Result<bool, DocError> {
+        if self.host_device_id().as_deref() == Some(device_id) {
+            return Ok(false);
+        }
+        self.doc.get_map("meta").insert("hostDeviceId", device_id)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    fn meta_string(&self, key: &str) -> Option<String> {
+        match self.doc.get_map("meta").get(key) {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
             _ => None,
         }
