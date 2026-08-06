@@ -183,11 +183,26 @@ branch_template = "board/{{identifier_lower}}"
 # `origin/develop`) to pin one, or `HEAD` to branch from the checkout without
 # fetching — which is what a repo with no remote needs.
 base = "origin/HEAD"
+# How long a finished attempt's checkout — and the branch under it — is kept
+# before the board deletes both. The clock starts when the task leaves the board
+# (merged, closed upstream, marked done), never while an attempt is live or a
+# pull request is open, so a week here is a week to go and look at what an agent
+# actually did. `off` keeps every checkout forever, which is what a box does
+# until somebody notices the disk; `comet-board doctor` reports the running cost
+# either way.
+retain_worktrees = "7d"
 # When an agent releases work through the board, prompt it in its own chat once
-# that work settles, instead of only raising a notification at you. Off, because
-# an orchestrator woken by every child it released cannot hold a train of
-# thought. Turn it on if you dispatch from orchestrators rather than by hand.
+# that work settles. Off, because an orchestrator woken by every child it
+# released cannot hold a train of thought. Turn it on if you dispatch from
+# orchestrators rather than by hand.
 # notify_dispatcher = true
+# Where the board tells *you* — one URL, POSTed a small JSON body when a
+# dispatched attempt blocks or settles (`{{"event": "on_blocked", …}}`). This is
+# the only channel that reaches you when you are looking at neither the board
+# nor the tracker; without it, an agent that stops to ask at 02:00 is a comment
+# on its issue and a coloured row, and nothing else. `notify` switches it off
+# without deleting the URL. `doctor` reports which of the two is missing.
+# notify_webhook = "https://hooks.example.com/comet-board"
 
 [linear]
 # Which state means "finished, waiting on a human". Uncomment and Linear moves

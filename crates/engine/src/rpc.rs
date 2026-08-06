@@ -1022,6 +1022,10 @@ impl RpcService for EngineRpc {
                     .delete_worktree(
                         std::path::Path::new(&p.repo_path),
                         std::path::Path::new(&p.worktree_path),
+                        // The frontend deletes a worktree it did not name a
+                        // branch for, so only comet's own `comet/…` branch is
+                        // ours to remove here.
+                        None,
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;

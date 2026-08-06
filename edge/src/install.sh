@@ -1,7 +1,7 @@
 #!/bin/sh
 # Comet (native) headless installer.
 #
-#   curl -fsSL https://comet.zeron.sh/install.sh | sh
+#   curl -fsSL https://edge.comet.offhand.dev/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
 # ~/.comet-native/app, puts `comet` on PATH, and — once you've signed in —
@@ -12,7 +12,7 @@
 # client-id configuration needed. Overrides (if any) go in ~/.comet-native/env.
 set -eu
 
-BASE="${COMET_BASE_URL:-https://comet.zeron.sh}"
+BASE="${COMET_BASE_URL:-https://edge.comet.offhand.dev}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"

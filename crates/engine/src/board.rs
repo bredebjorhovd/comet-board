@@ -439,6 +439,11 @@ fn handle_dispatch(
         workspace: route.workspace.clone(),
         runtime: runtime_name.to_string(),
         worktree: None,
+        // Where the checkout will be cut from. Recorded now rather than beside
+        // the worktree path afterwards, because it is the fact that outlives
+        // the checkout: reclaiming the branch a week later runs in the repo
+        // (gh#72).
+        repo_path: Some(spec.repo_path.clone()),
         branch: Some(spec.branch.clone()),
         dispatched_by: dispatcher.task().map(str::to_string),
         dispatched_by_pane: dispatcher.pane().map(str::to_string),
@@ -731,6 +736,7 @@ mod tests {
                 workspace: workspace.into(),
                 runtime: "claude-code".into(),
                 worktree: None,
+                repo_path: None,
                 branch: None,
                 dispatched_by: None,
                 dispatched_by_pane: None,

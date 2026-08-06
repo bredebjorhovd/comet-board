@@ -138,6 +138,11 @@ pub enum Command {
         account: Option<String>,
         via_device: Option<String>,
         via_user: Option<String>,
+        /// End the task's live attempt and release a fresh one — `R` on a
+        /// blocked row (gh#73), the deliberate exception to the
+        /// one-live-attempt rule. Plain dispatches send `false` and are
+        /// refused on a live attempt.
+        replace: bool,
     },
     /// The logins a dispatch of `task_id` could spend, for the account picker
     /// (gh#74). Answered as [`Update::DispatchAccounts`], filtered to the
@@ -449,6 +454,7 @@ async fn session(
                     account,
                     via_device,
                     via_user,
+                    replace,
                 }) => {
                     // The release lands on the device whose board this is.
                     spawn_dispatch(
@@ -460,6 +466,7 @@ async fn session(
                             account,
                             via_device,
                             via_user,
+                            replace,
                         },
                         board_host.clone(),
                     );
@@ -942,10 +949,15 @@ struct Dispatch {
     account: Option<String>,
     via_device: Option<String>,
     via_user: Option<String>,
+    replace: bool,
 }
 
 /// Release a board task. The reply names the chat the run landed in; the row
 /// flips to `working` on the next board frame either way.
+///
+/// `replace` is the blocked row's retry: the engine ends the live attempt the
+/// row is stuck on before releasing, which is the one thing cancel-then-
+/// dispatch cannot do atomically.
 fn spawn_dispatch(
     client: Arc<RpcClient>,
     updates: mpsc::UnboundedSender<Update>,
@@ -959,8 +971,12 @@ fn spawn_dispatch(
             account,
             via_device,
             via_user,
+            replace,
         } = dispatch;
         let mut params = serde_json::json!({ "taskId": task_id });
+        if replace && let Some(object) = params.as_object_mut() {
+            object.insert("replace".into(), serde_json::Value::Bool(true));
+        }
         for (key, value) in [
             ("targetDeviceId", target_device),
             ("account", account),
@@ -971,6 +987,9 @@ fn spawn_dispatch(
                 object.insert(key.into(), serde_json::Value::String(value));
             }
         }
+        // The verb the notice uses, so a retry that ended a live agent does not
+        // read like a first release.
+        let verb = if replace { "Retried" } else { "Dispatched" };
         match client.call(methods::DISPATCH_TASK, params).await {
             Ok(value) => {
                 let chat = value
@@ -979,11 +998,14 @@ fn spawn_dispatch(
                     .map(str::to_string)
                     .unwrap_or_default();
                 let _ = updates.send(Update::Notice(format!(
-                    "Dispatched {identifier} — chat {chat} is on it"
+                    "{verb} {identifier} — chat {chat} is on it"
                 )));
             }
             Err(err) => {
-                let _ = updates.send(Update::Notice(format!("Couldn't dispatch {identifier}: {err}")));
+                let _ = updates.send(Update::Notice(format!(
+                    "Couldn't {} {identifier}: {err}",
+                    if replace { "retry" } else { "dispatch" }
+                )));
             }
         }
     });

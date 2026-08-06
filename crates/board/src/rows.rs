@@ -134,6 +134,7 @@ mod tests {
                 dispatched_by_pane: Some("chat-parent".into()),
                 base_sha: None,
                 account: None,
+                repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
             })
@@ -198,6 +199,7 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
             })
@@ -214,6 +216,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
         })
@@ -275,6 +278,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: Some("8f2c1d0a7b6e4539".into()),
+            repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
         })
@@ -310,6 +314,7 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
         })

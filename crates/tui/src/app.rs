@@ -833,6 +833,7 @@ impl App {
                 Vec::new()
             }
             Action::BoardEnter => self.board_enter(),
+            Action::BoardRetry => self.board_retry(),
             Action::BoardCycleFilter => {
                 if let Some(message) = self.board.cycle_filter() {
                     self.notify(message);
@@ -1040,7 +1041,11 @@ impl App {
             return Vec::new();
         };
         match row.state() {
-            BoardState::Ready => {
+            // A failed attempt is already closed, so retrying one is an
+            // ordinary release — `enter` may do it (gh#73), the desktop rule.
+            // A *blocked* row's retry kills a live agent: that stays on `R`.
+            // Both go through the account picker — a retry bills someone too.
+            BoardState::Ready | BoardState::Failed => {
                 if row.dispatchable {
                     // Ask whose subscription this run spends before releasing
                     // it (gh#74). The desktop panel has asked which runtime and
@@ -1087,6 +1092,56 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// `R` on the board: retry the selected row (gh#73) — the desktop panel's
+    /// Retry chip, which the pane had no answer to.
+    ///
+    /// On a blocked row this replaces the live attempt: the agent is alive and
+    /// waiting on input, so the one-live-attempt rule would refuse a plain
+    /// release, and ending it is what a retry means. On a failed or ready row
+    /// nothing is live and it is an ordinary dispatch. Anything else keeps its
+    /// attempt and says so rather than quietly cancelling someone's work.
+    fn board_retry(&mut self) -> Effects {
+        if self.board.on_section().is_some() {
+            return Vec::new();
+        }
+        let Some(row) = self.board.selected_task() else {
+            return Vec::new();
+        };
+        match row.state() {
+            BoardState::Blocked => self.board_release(true),
+            BoardState::Ready | BoardState::Failed => self.board_release(false),
+            state => {
+                self.notify(format!(
+                    "{} — {}; R retries a blocked or failed task",
+                    row.identifier,
+                    state.as_str()
+                ));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Release the selected row, replacing its live attempt or not. The route
+    /// check is here rather than at each caller: an unrouted row cannot be
+    /// dispatched however you asked for it.
+    fn board_release(&mut self, replace: bool) -> Effects {
+        let Some(row) = self.board.selected_task() else {
+            return Vec::new();
+        };
+        if !row.dispatchable {
+            let identifier = row.identifier.clone();
+            self.notify(format!(
+                "{identifier} has no route — it cannot be dispatched"
+            ));
+            return Vec::new();
+        }
+        vec![Command::Dispatch {
+            task_id: row.id.clone(),
+            identifier: row.identifier.clone(),
+            replace,
+        }]
     }
 
     // -----------------------------------------------------------------------
