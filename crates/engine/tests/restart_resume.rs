@@ -693,8 +693,14 @@ async fn resume_is_cwd_scoped() {
             fail_on_resume: false,
         },
     );
-    // Same chat, different launch directory: claude session stores are keyed
-    // by cwd, so the stored id must NOT be injected.
+    // Same chat, different launch directory — retargeted the way it happens in
+    // practice, on the chat row (gh#66: a run lands where the row says, not
+    // where the sender guessed, so the request's own cwd is not the lever).
+    core.workspace
+        .set_chat_cwd(CHAT, "/elsewhere")
+        .expect("retarget chat cwd");
+    // claude session stores are keyed by cwd, so the stored id must NOT be
+    // injected.
     queue_run(
         &core,
         "now from another project",
@@ -706,11 +712,16 @@ async fn resume_is_cwd_scoped() {
         "cross-cwd turn to complete",
     )
     .await;
+    let log = requests.lock().unwrap();
     assert_eq!(
-        requests.lock().unwrap()[1].resume,
-        None,
+        log[1].cwd, "/elsewhere",
+        "the retargeted row governs where the turn runs"
+    );
+    assert_eq!(
+        log[1].resume, None,
         "a session created under /tmp must not resume from /elsewhere"
     );
+    drop(log);
     core.shutdown().await;
 }
 

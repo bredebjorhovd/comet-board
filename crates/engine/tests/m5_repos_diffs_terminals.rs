@@ -93,9 +93,13 @@ async fn drain_until(
 #[tokio::test]
 async fn repos_round_trip_add_branches_worktrees() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let repo_dir = tmp.path().join("myrepo");
+    // git reports resolved paths, and on macOS TMPDIR lives under a symlink
+    // (/var → /private/var): compare against the canonical root or every
+    // path git hands back reads as a different directory.
+    let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+    let repo_dir = root.join("myrepo");
     init_repo(&repo_dir).await;
-    let repos = test_repos(&tmp.path().join("data"));
+    let repos = test_repos(&root.join("data"));
 
     // Add + list.
     let repo = repos
@@ -115,7 +119,7 @@ async fn repos_round_trip_add_branches_worktrees() {
         .expect("re-add repo");
     assert_eq!(repos.list().await.len(), 1);
     assert!(repos.add("/definitely/not/a/path").await.is_err());
-    let plain = tmp.path().join("plain");
+    let plain = root.join("plain");
     std::fs::create_dir_all(&plain).expect("plain dir");
     assert!(
         repos.add(&plain.to_string_lossy()).await.is_err(),
@@ -143,7 +147,7 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert!(
         worktree
             .path
-            .starts_with(&*tmp.path().join("data").to_string_lossy())
+            .starts_with(&*root.join("data").to_string_lossy())
     );
     let branches = repos
         .branches(&repo_dir)
