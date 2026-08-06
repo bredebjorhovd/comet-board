@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Two-device e2e smoke: real edge (wrangler dev), two headless engines, and the
-# comet-rpc e2e_driver example proving the doc-queued cross-device command path:
+# Two-USER e2e smoke (gh#66): real edge (wrangler dev), two headless engines
+# signed in as two DIFFERENT WorkOS users of one org, and the comet-rpc
+# org_e2e_driver example proving the three org gates:
 #
-#   B queues a Run into the chat doc -> nudge -> A (host) executes via the mock
-#   harness -> transcript + session status sync A -> edge -> B.
+#   1. the teammate's WatchDevices lists the box (org device registry)
+#   2. a targetDeviceId RPC from the teammate is answered by the box (relay)
+#   3. the teammate opens a chat the box shared, reads it, and queues a turn
+#      that the BOX runs — never their own laptop
 #
-# Both engines run as the SAME user (alice@org1) on different devices — comet's
-# one-user-many-devices model; chat/device rooms are claim-on-first-join per user.
-# For the two-USER case (a teammate reaching the box: org device registry, relay
-# and a shared chat) see the sibling scripts/e2e-org-smoke.sh.
+# Its sibling e2e-smoke.sh covers one user on two devices; this one covers the
+# case that used to be impossible — a second person in the org.
 #
-# Usage: scripts/e2e-smoke.sh
+# Usage: scripts/e2e-org-smoke.sh
 # Env:   COMET_E2E_EDGE_PORT (default 27640), COMET_E2E_KEEP_LOGS=1 to keep logs.
 
 set -euo pipefail
@@ -19,13 +20,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 EDGE_PORT="${COMET_E2E_EDGE_PORT:-27640}"
 EDGE_URL="http://localhost:${EDGE_PORT}"
-TOKEN="alice@org1"
 ORG="org1"
-A_PORT=27801
-B_PORT=27802
-A_DIR=/tmp/e2e-a
-B_DIR=/tmp/e2e-b
-LOG_DIR="$(mktemp -d /tmp/comet-e2e-logs.XXXXXX)"
+# Dev-mode bearers are `user@org` — the box and a teammate, same org.
+BOX_TOKEN="alice@${ORG}"
+MATE_TOKEN="bob@${ORG}"
+A_PORT=27811
+B_PORT=27812
+A_DIR=/tmp/e2e-org-box
+B_DIR=/tmp/e2e-org-mate
+LOG_DIR="$(mktemp -d /tmp/comet-e2e-org-logs.XXXXXX)"
 
 EDGE_PID=""
 A_PID=""
@@ -48,8 +51,8 @@ cleanup() {
   [[ -n "$EDGE_PID" ]] && kill -9 -- -"$EDGE_PID" 2>/dev/null || true
   rm -rf "$A_DIR" "$B_DIR"
   if [[ "$STATUS" -ne 0 ]]; then
-    echo "--- engine A log (tail) ---"; tail -n 40 "$LOG_DIR/engine-a.log" 2>/dev/null || true
-    echo "--- engine B log (tail) ---"; tail -n 40 "$LOG_DIR/engine-b.log" 2>/dev/null || true
+    echo "--- the box's log (tail) ---"; tail -n 40 "$LOG_DIR/engine-box.log" 2>/dev/null || true
+    echo "--- the teammate's log (tail) ---"; tail -n 40 "$LOG_DIR/engine-mate.log" 2>/dev/null || true
     echo "--- edge log (tail) ---"; tail -n 40 "$LOG_DIR/edge.log" 2>/dev/null || true
   fi
   if [[ "${COMET_E2E_KEEP_LOGS:-0}" != "1" ]]; then
@@ -85,30 +88,32 @@ else
 fi
 
 # ── 2. Build the binaries (workspace target is warm in CI/dev) ─────────────────
-echo "build: comet + e2e_driver"
-(cd "$ROOT" && cargo build -q -p comet -p comet-rpc --example e2e_driver)
+echo "build: comet + org_e2e_driver"
+(cd "$ROOT" && cargo build -q -p comet -p comet-rpc --example org_e2e_driver)
 COMET="$ROOT/target/debug/comet"
-DRIVER="$ROOT/target/debug/examples/e2e_driver"
+DRIVER="$ROOT/target/debug/examples/org_e2e_driver"
 
-# ── 3. Two headless engines, one user, two devices ─────────────────────────────
+# ── 3. Two headless engines: the box and a teammate's laptop, two users ────────
 rm -rf "$A_DIR" "$B_DIR"
 mkdir -p "$A_DIR" "$B_DIR"
 
-start_engine() { # start_engine <data_dir> <ipc_port> <name> <log>
+start_engine() { # start_engine <data_dir> <ipc_port> <name> <token> <user> <log>
   COMET_DATA_DIR="$1" COMET_IPC_PORT="$2" COMET_DEVICE_NAME="$3" \
-    COMET_EDGE_URL="$EDGE_URL" COMET_EDGE_TOKEN="$TOKEN" COMET_ORG_ID="$ORG" \
-    COMET_HARNESS=mock RUST_LOG=info \
-    "$COMET" headless >"$4" 2>&1 &
+    COMET_EDGE_URL="$EDGE_URL" COMET_EDGE_TOKEN="$4" COMET_ORG_ID="$ORG" \
+    COMET_USER_ID="$5" COMET_HARNESS=mock RUST_LOG=info \
+    "$COMET" headless >"$6" 2>&1 &
 }
 
-start_engine "$A_DIR" "$A_PORT" "e2e-device-a" "$LOG_DIR/engine-a.log"; A_PID=$!
-start_engine "$B_DIR" "$B_PORT" "e2e-device-b" "$LOG_DIR/engine-b.log"; B_PID=$!
+start_engine "$A_DIR" "$A_PORT" "e2e-org-box" "$BOX_TOKEN" "alice" \
+  "$LOG_DIR/engine-box.log"; A_PID=$!
+start_engine "$B_DIR" "$B_PORT" "e2e-org-mate" "$MATE_TOKEN" "bob" \
+  "$LOG_DIR/engine-mate.log"; B_PID=$!
 
-wait_for "engine A ipc :$A_PORT" 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$A_PORT"
-wait_for "engine B ipc :$B_PORT" 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$B_PORT"
-echo "engines: A pid=$A_PID ipc=:$A_PORT  B pid=$B_PID ipc=:$B_PORT"
+wait_for "the box's ipc :$A_PORT" 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$A_PORT"
+wait_for "the teammate's ipc :$B_PORT" 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$B_PORT"
+echo "engines: box pid=$A_PID ipc=:$A_PORT  teammate pid=$B_PID ipc=:$B_PORT"
 
-# ── 4. Drive the cross-device flow through both IPCs ───────────────────────────
-"$DRIVER" "$A_PORT" "$B_PORT"
+# ── 4. Drive the three gates through both IPCs ─────────────────────────────────
+"$DRIVER" "$A_PORT" "$B_PORT" "$EDGE_URL" "$BOX_TOKEN"
 STATUS=$?
 exit "$STATUS"

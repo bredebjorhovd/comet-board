@@ -5,6 +5,11 @@
 //! and the typed watch channels the WatchChats/WatchDevices/WatchSessions RPC
 //! streams are fed from.
 //!
+//! It also owns the ORG-wide device registry ([`crate::org_devices`], gh#66):
+//! devices are the one index a team must share, since a teammate who cannot see
+//! the box cannot reach it. `WatchDevices` publishes the union, presence beats
+//! on both rooms, and every device write lands in both docs.
+//!
 //! Writer discipline (kept from the doc schema): this host writes its own device row,
 //! its own session-status rows, and rows for chats it hosts; renames/archives are LWW
 //! sets accepted from any device (the Mutate surface).
@@ -23,6 +28,7 @@ use comet_proto::{Chat, ChatConfig, Device, Session, Space};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::doc_host::EdgeConfig;
+use crate::org_devices::{OrgDevices, OrgDevicesConfig, merge_devices};
 use crate::{EngineError, now_ms};
 
 /// Snapshot row id in the local `DocsStore` (chat ids never collide with it).
@@ -93,11 +99,15 @@ struct WorkspaceHostInner {
     store: Arc<DocsStore>,
     config: WorkspaceHostConfig,
     doc: Arc<WorkspaceDoc>,
+    /// The org-wide device registry (gh#66) — the only entity index that is
+    /// NOT private to this user. Shares this host's change channel, snapshot
+    /// debounce and presence tick.
+    org_devices: OrgDevices,
     chats_tx: watch::Sender<Vec<Chat>>,
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
-    room: Mutex<Option<RoomClient>>,
+    room: Arc<Mutex<Option<RoomClient>>>,
     /// Freshest presence heartbeat (ms) we have EVER observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
     /// room (re)join, so without this cache a receive-side hiccup snaps a
@@ -115,8 +125,71 @@ struct WorkspaceHostInner {
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Join `room_id` and hold it in `slot` for the joiner's life — the shared
+/// machinery behind both the per-user workspace room and the org device
+/// registry room.
+///
+/// `RoomClient` only self-reconnects AFTER a first successful join; an INITIAL
+/// failure (a 500 from an overloaded DO, a token racing a refresh, an edge
+/// deploy) used to end the task and leave the device offline until an app
+/// restart — presence stuck "offline" while the relay and per-chat rooms worked
+/// fine. The first join therefore retries on a capped, jittered backoff.
+///
+/// `slot` is held weakly: dropping the host drops its room Arc, which is what
+/// ends this task. `on_joined` runs once per successful join (the first
+/// presence beat); `on_event` runs on every ephemeral update.
+pub(crate) fn spawn_room_join(
+    url: Arc<dyn comet_sync::UrlProvider>,
+    room_id: String,
+    doc: loro::LoroDoc,
+    slot: Weak<Mutex<Option<RoomClient>>>,
+    on_joined: Arc<dyn Fn(&RoomClient) + Send + Sync>,
+    on_event: Arc<dyn Fn() + Send + Sync>,
+) {
+    tokio::spawn(async move {
+        let mut backoff = JOIN_RETRY_BASE;
+        loop {
+            if slot.upgrade().is_none() {
+                return; // host dropped
+            }
+            match RoomClient::connect_via(url.clone(), &room_id, doc.clone()).await {
+                Ok(client) => {
+                    on_joined(&client);
+                    let mut events = client.events();
+                    let Some(room) = slot.upgrade() else { return };
+                    *lock(&room) = Some(client);
+                    tracing::info!(room = %room_id, "room joined");
+                    drop(room);
+                    // Ends only when the RoomClient closes (host shutdown),
+                    // which drops us out to clear the slot.
+                    loop {
+                        match events.recv().await {
+                            Ok(comet_sync::RoomEvent::EphemeralUpdate) => on_event(),
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    // The established client gave up (host shutdown): clear the
+                    // slot and stop — nothing to rejoin into.
+                    if let Some(room) = slot.upgrade() {
+                        *lock(&room) = None;
+                    }
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(room = %room_id, error = %err, backoff_ms = backoff.as_millis() as u64,
+                        "room join failed; retrying");
+                }
+            }
+            tokio::time::sleep(backoff + join_retry_jitter()).await;
+            backoff = (backoff * 2).min(JOIN_RETRY_CAP);
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -144,14 +217,37 @@ impl WorkspaceHost {
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
         doc.ensure_schema_version()?;
 
-        // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
-        // any device) survives restarts — only a missing row gets the hostname.
+        let (changed_tx, changed_rx) = watch::channel(0u64);
+        let sub = doc.doc().subscribe_root(Arc::new({
+            let changed_tx = changed_tx.clone();
+            move |_diff| {
+                changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+            }
+        }));
+        // The org registry rides the same change channel, so a teammate's
+        // device row republishes `WatchDevices` exactly like a local write.
+        let org_devices = OrgDevices::open(
+            store.clone(),
+            OrgDevicesConfig {
+                device_id: config.device_id.clone(),
+                org_id: config.org_id.clone(),
+                edge: config.edge.clone(),
+            },
+            changed_tx,
+        )?;
+
+        // Boot: upsert our own device row — into BOTH the private workspace doc
+        // (this user's own fleet) and the org registry (everyone's). A user-set
+        // name (RenameDevice is LWW from any device) survives restarts; only a
+        // missing row gets the hostname.
         let now = Utc::now();
-        let existing = doc
-            .read_devices()?
-            .into_iter()
-            .find(|d| d.id == config.device_id);
-        doc.upsert_device(&Device {
+        let existing = org_devices.device(&config.device_id).or_else(|| {
+            doc.read_devices()
+                .ok()?
+                .into_iter()
+                .find(|d| d.id == config.device_id)
+        });
+        let row = Device {
             id: config.device_id.clone(),
             name: existing
                 .as_ref()
@@ -166,15 +262,14 @@ impl WorkspaceHost {
             // Every boot restamps the running binary's version (fleet staleness
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        })?;
+        };
+        doc.upsert_device(&row)?;
+        org_devices.upsert_device(&row);
 
-        let (changed_tx, changed_rx) = watch::channel(0u64);
-        let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
-            changed_tx.send_modify(|v| *v = v.wrapping_add(1));
-        }));
         let state = doc.read_all()?;
         let (chats_tx, _) = watch::channel(state.chats);
-        let (devices_tx, _) = watch::channel(state.devices);
+        let (devices_tx, _) =
+            watch::channel(merge_devices(state.devices, org_devices.read_devices()));
         let (sessions_tx, _) = watch::channel(state.sessions);
         let (spaces_tx, _) = watch::channel(state.spaces);
 
@@ -183,17 +278,26 @@ impl WorkspaceHost {
                 store,
                 config,
                 doc,
+                org_devices,
                 chats_tx,
                 devices_tx,
                 sessions_tx,
                 spaces_tx,
-                room: Mutex::new(None),
+                room: Arc::new(Mutex::new(None)),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 _sub: sub,
             }),
         };
         host.join_room();
+        // A teammate's heartbeat on the org room means the same thing as one on
+        // our own workspace room: republish, so the online dot is current.
+        let weak = Arc::downgrade(&host.inner);
+        host.inner.org_devices.set_presence_hook(Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.publish();
+            }
+        }));
         tokio::spawn(workspace_task(Arc::downgrade(&host.inner), changed_rx));
         if host.inner.config.edge.is_some() {
             tokio::spawn(relay_probe_task(Arc::downgrade(&host.inner)));
@@ -213,61 +317,25 @@ impl WorkspaceHost {
         // edge's join id, which it derives from the caller's own auth claim —
         // a mismatched user can never join).
         let room_id = format!("ws3/{}/{}", org_id, self.inner.config.user_id);
-        let room_doc = self.inner.doc.doc().clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            // `RoomClient` only self-reconnects AFTER a first successful join;
-            // an INITIAL failure (a 500 from an overloaded workspace DO, a token
-            // racing a refresh, an edge deploy) used to end this task and leave
-            // the device offline until an app restart — presence stuck "offline"
-            // while the relay and per-chat rooms worked. Retry the first join on
-            // a capped, jittered backoff so a transient edge blip self-heals.
-            let mut backoff = JOIN_RETRY_BASE;
-            loop {
-                if weak.upgrade().is_none() {
-                    return; // host dropped
+        spawn_room_join(
+            url,
+            room_id,
+            self.inner.doc.doc().clone(),
+            Arc::downgrade(&self.inner.room),
+            Arc::new(move |client: &RoomClient| {
+                client.ephemeral().set(&presence_key(&device_id), now_ms());
+            }),
+            // Presence rides `%EPH`, never the doc — remote heartbeats must
+            // re-publish the device watch themselves (the signal that
+            // distinguishes "host offline" from slow sync).
+            Arc::new(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.publish();
                 }
-                match RoomClient::connect_via(url.clone(), &room_id, room_doc.clone()).await {
-                    Ok(client) => {
-                        client.ephemeral().set(&presence_key(&device_id), now_ms());
-                        let mut events = client.events();
-                        let Some(inner) = weak.upgrade() else { return };
-                        *lock(&inner.room) = Some(client);
-                        tracing::info!(room = %room_id, "workspace room joined");
-                        drop(inner);
-                        // Presence rides `%EPH`, never the doc — remote
-                        // heartbeats must re-publish the device watch themselves
-                        // (the signal that distinguishes "host offline" from slow
-                        // sync). This loop ends only when the RoomClient closes
-                        // (host shutdown), which drops us out to a rejoin.
-                        loop {
-                            match events.recv().await {
-                                Ok(comet_sync::RoomEvent::EphemeralUpdate) => {
-                                    let Some(inner) = weak.upgrade() else { return };
-                                    inner.publish();
-                                }
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                        // The established client gave up (host shutdown): clear
-                        // the slot and stop — nothing to rejoin into.
-                        if let Some(inner) = weak.upgrade() {
-                            *lock(&inner.room) = None;
-                        }
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::warn!(room = %room_id, error = %err, backoff_ms = backoff.as_millis() as u64,
-                            "workspace room join failed; retrying");
-                    }
-                }
-                tokio::time::sleep(backoff + join_retry_jitter()).await;
-                backoff = (backoff * 2).min(JOIN_RETRY_CAP);
-            }
-        });
+            }),
+        );
     }
 
     /// Wire the "peer is alive" signal (fresh presence heartbeat) to a callback —
@@ -665,8 +733,35 @@ impl WorkspaceHost {
         Ok(self.inner.doc.delete_chat(chat_id)?)
     }
 
+    /// LWW rename from any device, written to both device docs so the new name
+    /// reaches this user's other devices AND the rest of the org.
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.rename_device(device_id, name)?)
+        let renamed = self.inner.doc.rename_device(device_id, name)?;
+        self.inner.org_devices.rename_device(device_id, name);
+        // The org registry may hold a row the private doc never did (another
+        // user's device), so either write landing counts as a rename.
+        Ok(renamed || self.inner.org_devices.device(device_id).is_some())
+    }
+
+    /// Every device the caller can address: this user's own rows merged with
+    /// the org registry (gh#66).
+    pub fn devices(&self) -> Vec<Device> {
+        let own = self.inner.doc.read_devices().unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "workspace device read failed");
+            Vec::new()
+        });
+        merge_devices(own, self.inner.org_devices.read_devices())
+    }
+
+    /// True once the org device registry room is live — the signal that this
+    /// device is visible to the rest of the org.
+    pub fn org_devices_connected(&self) -> bool {
+        self.inner.org_devices.connected()
+    }
+
+    /// The org device registry this host owns (gh#66).
+    pub fn org_devices(&self) -> OrgDevices {
+        self.inner.org_devices.clone()
     }
 
     // ── git metadata (diff-sync host writes) ────────────────────────────────
@@ -705,6 +800,9 @@ impl WorkspaceHost {
         {
             tracing::warn!(error = %err, "device lastSeenAt stamp failed");
         }
+        self.inner
+            .org_devices
+            .set_device_last_seen(&self.inner.config.device_id, now);
         self.inner.save_snapshot();
     }
 }
@@ -713,12 +811,17 @@ impl WorkspaceHostInner {
     fn publish(&self) {
         match self.doc.read_all() {
             Ok(mut state) => {
-                self.overlay_presence(&mut state.devices);
+                // The device list is the union of this user's private rows and
+                // the org registry — the org's devices are what a teammate has
+                // to see to reach the box at all (gh#66).
+                let mut devices = merge_devices(state.devices, self.org_devices.read_devices());
+                self.overlay_presence(&mut devices);
+                state.devices = Vec::new();
                 // send_replace, NOT send: `watch::Sender::send` drops the value when
                 // no receiver exists yet, so a stream subscribed later would start
                 // from a stale snapshot (found the hard way by the e2e smoke).
                 self.chats_tx.send_replace(state.chats);
-                self.devices_tx.send_replace(state.devices);
+                self.devices_tx.send_replace(devices);
                 self.sessions_tx.send_replace(state.sessions);
                 self.spaces_tx.send_replace(state.spaces);
             }
@@ -756,8 +859,11 @@ impl WorkspaceHostInner {
                         _ => None,
                     }
                 });
+                // A teammate's device only ever beats on the ORG room — the
+                // per-user workspace room never carries it.
+                let org_live = self.org_devices.presence_ms(&device.id);
                 let cached = seen.get(&device.id).copied();
-                let Some(ms) = live.into_iter().chain(cached).max() else {
+                let Some(ms) = live.into_iter().chain(org_live).chain(cached).max() else {
                     continue;
                 };
                 seen.insert(device.id.clone(), ms);
@@ -794,14 +900,18 @@ impl WorkspaceHostInner {
                 tracing::warn!(error = %err, "workspace snapshot export failed");
             }
         }
+        self.org_devices.save_snapshot();
     }
 
     /// Ephemeral presence heartbeat — relayed over `%EPH`, never the oplog.
+    /// Both rooms: the workspace room is how this user's other devices see us,
+    /// the org room is how the rest of the team does.
     fn presence_tick(&self) {
         if let Some(room) = lock(&self.room).as_ref() {
             room.ephemeral()
                 .set(&presence_key(&self.config.device_id), now_ms());
         }
+        self.org_devices.presence_tick();
     }
 }
 
@@ -842,9 +952,12 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
         let self_id = inner.config.device_id.clone();
         let now = now_ms();
         let stale: Vec<String> = {
-            let Ok(devices) = inner.doc.read_devices() else {
+            let Ok(own) = inner.doc.read_devices() else {
                 continue;
             };
+            // Teammates' devices are probed too: their heartbeats and ours
+            // share the org room, so a room pathology starves both alike.
+            let devices = merge_devices(own, inner.org_devices.read_devices());
             let seen = lock(&inner.presence_seen);
             devices
                 .into_iter()

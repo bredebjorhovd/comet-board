@@ -618,8 +618,10 @@ fn forwardable(method: &str) -> bool {
             // always-on box (gh#55). Forwarding is what turns "one box" into
             // "one box, many users": teammates read and drive the same board
             // from their own laptops instead of SSHing in. Authorization needs
-            // nothing per-method — the relay only carries frames between
-            // devices of one org, exactly as for every other forwardable call.
+            // nothing per-method — the relay carries frames only between
+            // devices of one org (the DeviceRoom's org gate, gh#66; it really
+            // was per-USER until then, which is what kept a second teammate
+            // out), exactly as for every other forwardable call.
             | methods::WATCH_BOARD
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
