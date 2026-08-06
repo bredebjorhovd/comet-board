@@ -260,6 +260,15 @@ pub fn doctor(
                     },
                 });
 
+                // Where this route's dispatches branch from (gh#67). Local
+                // only: doctor asks whether the repo has the remote the base
+                // names, not whether the network is up — a fetch here would
+                // hang the report on every unreachable remote, and dispatch
+                // refuses loudly on its own when the fetch fails.
+                if repo_ok {
+                    checks.push(base_check(&name, cfg.base(r), &repo));
+                }
+
                 let harness = harness_for_runtime(&r.runtime).map(harness_name);
                 checks.push(Check {
                     name: format!("route {name}: runtime"),
@@ -459,6 +468,46 @@ fn minutes(secs: i64) -> String {
         s if s <= 0 => "already expired".into(),
         s if s < 120 => format!("{s}s"),
         s => format!("{}m", s / 60),
+    }
+}
+
+/// Can this route's `base` be resolved at all — i.e. does the repo have the
+/// `origin` the base is fetched from (gh#67)?
+///
+/// Local check only. Whether origin *answers* is a network question, and a
+/// doctor that fetches every route's remote is a doctor that hangs; dispatch
+/// refuses loudly on a failed fetch, which is the case this cannot pre-empt.
+/// What it does pre-empt is the config-level mistake: a route pointing at a
+/// clone with no remote, where every dispatch fails until somebody sets
+/// `base = "HEAD"`.
+fn base_check(name: &str, base: &str, repo: &std::path::Path) -> Check {
+    let check = |ok: bool, detail: String| Check {
+        name: format!("route {name}: base"),
+        ok,
+        detail,
+    };
+    if matches!(base.trim(), "" | "HEAD") {
+        return check(
+            true,
+            "`HEAD` — branches from the repo's current checkout, no fetch".into(),
+        );
+    }
+    let origin = std::process::Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match origin {
+        Some(url) => check(true, format!("`{base}` — fetched from {url}")),
+        None => check(
+            false,
+            format!(
+                "`{base}` needs an `origin` remote; {} has none. Set \
+                 `base = \"HEAD\"` on the route to branch from the checkout instead",
+                repo.display()
+            ),
+        ),
     }
 }
 
@@ -734,6 +783,51 @@ mod tests {
             .expect("the route is still reported");
         assert!(space.ok, "{}", space.detail);
         assert!(space.detail.contains("not checked"), "{}", space.detail);
+    }
+
+    /// A route pointing at a clone with no remote fails its `base` check rather
+    /// than failing every dispatch on it (gh#67) — and the opt-out passes.
+    #[test]
+    fn a_route_whose_repo_has_no_origin_fails_the_base_check() {
+        let (d, p) = tmp();
+        let repo = d.path().join("local-only");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["-C", &repo.to_string_lossy(), "init", "-b", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let routing = |base: &str| {
+            std::fs::write(
+                p.routing(),
+                format!(
+                    "[[route]]\nmatch = {{ label = \"x\" }}\nworkspace = \"w\"\n\
+                     repo = \"{}\"\nruntime = \"claude-code\"\nbase = \"{base}\"\n",
+                    repo.display()
+                ),
+            )
+            .unwrap();
+        };
+        let base_check_in = |checks: &[Check]| {
+            checks
+                .iter()
+                .find(|c| c.name == "route w: base")
+                .map(|c| (c.ok, c.detail.clone()))
+                .expect("the route's base is checked")
+        };
+
+        routing("origin/HEAD");
+        let (ok, detail) = base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap());
+        assert!(!ok, "{detail}");
+        assert!(detail.contains("origin"), "{detail}");
+        assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
+
+        routing("HEAD");
+        let (ok, detail) = base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap());
+        assert!(ok, "{detail}");
     }
 
     fn account(id: &str, email: &str, harness: comet_proto::HarnessId) -> AgentAccount {

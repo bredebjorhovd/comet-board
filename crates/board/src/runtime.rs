@@ -183,6 +183,12 @@ pub struct DispatchSpec {
     pub repo_path: String,
     /// Branch to cut, from the route's `branch_template`.
     pub branch: String,
+    /// The ref that branch is cut from, from the route's `base` (gh#67).
+    /// `origin/HEAD` by default — the executor fetches it before cutting, so
+    /// what an agent starts on is the remote's tip and not whatever the space
+    /// folder happened to be sitting on. `HEAD` is the local-checkout opt-out.
+    /// Ignored on a retry, which reuses the previous attempt's branch as-is.
+    pub base: String,
     /// Whether to run in a fresh worktree (the default) or the repo root.
     pub worktree: bool,
     pub harness: HarnessId,
@@ -349,10 +355,7 @@ mod tests {
             .map(|o| harness_for_runtime(&o.name).expect("picker options must resolve"))
             .collect();
         assert_eq!(harnesses.len(), options.len());
-        for (name, label) in options
-            .iter()
-            .map(|o| (o.name.as_str(), o.label.as_str()))
-        {
+        for (name, label) in options.iter().map(|o| (o.name.as_str(), o.label.as_str())) {
             assert_eq!(runtime_name(harness_for_runtime(name).unwrap()), name);
             assert!(!label.is_empty(), "{name} needs a picker label");
         }

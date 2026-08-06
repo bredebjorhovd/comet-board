@@ -200,6 +200,7 @@ pub fn build_spec(
         repo_path,
         prompt: resolve_prompt(route, task, &branch),
         branch,
+        base: cfg.base(route).to_string(),
         worktree: true,
         harness,
         model: overrides.model.clone(),
@@ -297,13 +298,27 @@ mod tests {
 
     #[test]
     fn branch_comes_from_the_template_repo_qualified() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(spec.branch, "board/gh-7-widget");
     }
 
     #[test]
     fn the_brief_names_task_and_branch() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
         assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
         assert!(
             spec.prompt
@@ -314,7 +329,14 @@ mod tests {
 
     #[test]
     fn the_space_path_is_the_repo_root() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(spec.repo_path, "/home/x/dev/widget");
         assert_eq!(spec.space_id, "space-1");
         assert_eq!(spec.harness, comet_proto::HarnessId::ClaudeCode);
@@ -324,9 +346,15 @@ mod tests {
     fn an_unknown_runtime_is_refused_by_name() {
         let mut r = route();
         r.runtime = "gemini".into();
-        let err = build_spec(&RoutingConfig::default(), &r, &task(), &space(), &DispatchOverrides::default())
-            .unwrap_err()
-            .to_string();
+        let err = build_spec(
+            &RoutingConfig::default(),
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("gemini"), "{err}");
     }
 
@@ -389,7 +417,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("nonesuch"), "{err}");
-        assert!(err.contains("claude-code"), "the known list is named: {err}");
+        assert!(
+            err.contains("claude-code"),
+            "the known list is named: {err}"
+        );
     }
 
     /// Whose subscription pays: the dispatch's choice beats the route's, and
@@ -447,6 +478,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.account, None);
+    }
+
+    /// Where a dispatch's branch is cut from (gh#67): the remote's default
+    /// branch unless somebody says otherwise, the route's `base` over the
+    /// defaults' — and never the space folder's HEAD, which on an always-on box
+    /// is whatever ran there last.
+    #[test]
+    fn the_base_ref_comes_from_the_route_then_the_defaults() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.base, "origin/HEAD");
+
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [defaults]
+            base = "origin/develop"
+            "#,
+        )
+        .unwrap();
+        let from_defaults = build_spec(
+            &cfg,
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(from_defaults.base, "origin/develop");
+
+        let mut r = route();
+        r.base = Some("release".into());
+        let from_route =
+            build_spec(&cfg, &r, &task(), &space(), &DispatchOverrides::default()).unwrap();
+        assert_eq!(from_route.base, "release");
     }
 
     #[test]
@@ -612,7 +683,14 @@ mod tests {
     fn prompt_at_resolves_the_worktree_late() {
         let mut r = route();
         r.prompt = Some("Work on {title} in {worktree}.".into());
-        let spec = build_spec(&RoutingConfig::default(), &r, &task(), &space(), &DispatchOverrides::default()).unwrap();
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+        )
+        .unwrap();
         // Unresolved (and legible) until the executor knows the checkout…
         assert!(spec.prompt.contains("{worktree}"), "{}", spec.prompt);
         // …then resolved with the real path.
