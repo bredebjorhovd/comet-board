@@ -1,7 +1,7 @@
 //! Board directories, `.env` secrets, and `routing.toml`.
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -69,9 +69,24 @@ impl Paths {
     pub fn logfile(&self) -> PathBuf {
         self.state_dir.join("syncd.log")
     }
-    pub fn worktree_root(&self) -> PathBuf {
-        self.state_dir.join("wt")
-    }
+}
+
+/// Where attempt checkouts live — the engine's worktree root, named here
+/// because two crates need the same answer and only one may own it.
+///
+/// The engine cuts them (`crates/engine/src/repos.rs`) and the board reclaims
+/// and reports on them (gh#72), so a second copy of this rule would mean
+/// `doctor` measuring a directory nothing writes to. Deliberately NOT under the
+/// data dir — worktrees are user-facing working checkouts.
+/// `COMET_WORKTREES_DIR` overrides (test isolation); empty reads as unset.
+pub fn worktrees_root() -> PathBuf {
+    std::env::var_os("COMET_WORKTREES_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".comet-native").join("worktrees")
+        })
 }
 
 /// Credentials effective for one configuration read.
@@ -180,7 +195,7 @@ pub fn github_auth(paths: &Paths) -> GithubAuth {
     Credentials::load(paths).github_auth()
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub sync: SyncConfig,
@@ -202,7 +217,7 @@ pub struct RoutingConfig {
 /// `[github] repos` entries, because those are the config that already exists.
 /// Ignoring has nowhere else to live — "I am only reading this repo" is not a
 /// fact any other key can carry.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdoptConfig {
     /// `owner/repo` entries the board will never offer again. Delete a line to
     /// be offered it once more.
@@ -216,7 +231,7 @@ impl AdoptConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     /// Poll interval, e.g. `"30s"`.
     #[serde(default = "default_interval")]
@@ -288,7 +303,29 @@ pub fn parse_max_duration(s: &str) -> std::result::Result<Option<u64>, String> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Parse a `retain_worktrees` value into a retention window in seconds (gh#72).
+///
+/// `Ok(None)` is *keep forever*, said out loud — `off`, `none`, `never` or `0`
+/// — and it is the only spelling that turns worktree collection off. An
+/// unparseable value is an `Err` for the same reason `max_duration`'s is: a
+/// typo that read as "never" would leave the disk filling up silently, which is
+/// the bug this whole feature is about. No minimum: a retention of seconds is
+/// what the tests want and what an operator reclaiming a full disk means.
+pub fn parse_retention(s: &str) -> std::result::Result<Option<u64>, String> {
+    let t = s.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "never") {
+        return Ok(None);
+    }
+    match parse_duration_secs(t) {
+        Some(0) => Ok(None),
+        Some(n) => Ok(Some(n)),
+        None => Err(format!(
+            "`{s}` is not a duration; write it like `7d`, `2w`, `48h`, or `off`"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_per_workspace: usize,
@@ -361,10 +398,26 @@ pub struct Defaults {
     /// spelling of what every board did before this existed.
     #[serde(default = "default_max_duration")]
     pub max_duration: String,
+    /// How long a finished attempt's checkout is kept before the board deletes
+    /// it and its local branch (gh#72). The clock starts when the attempt is
+    /// closed *and* its task has left the board — merged, closed upstream, or
+    /// marked done — never while an attempt is live or a pull request is open.
+    ///
+    /// A week by default: long enough to open last Tuesday's checkout and see
+    /// what the agent actually did, short enough that a box dispatching a few
+    /// tasks a day does not fill its disk with them. `off` (or `0`) keeps every
+    /// checkout forever, which is what every board did before this existed —
+    /// and what `doctor`'s worktree check exists to make visible.
+    #[serde(default = "default_retain_worktrees")]
+    pub retain_worktrees: String,
 }
 
 fn default_max_duration() -> String {
     "2h".into()
+}
+
+fn default_retain_worktrees() -> String {
+    "7d".into()
 }
 
 fn default_new_source() -> String {
@@ -398,11 +451,12 @@ impl Default for Defaults {
             notify_dispatcher: false,
             new_source: default_new_source(),
             max_duration: default_max_duration(),
+            retain_worktrees: default_retain_worktrees(),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubConfig {
     /// `owner/repo` entries to poll for issues and PRs.
     #[serde(default)]
@@ -482,7 +536,7 @@ impl Default for GithubConfig {
 /// labels = ["release-a"]
 /// writeback = false
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// `owner/repo`. Must also appear in `[github] repos` — see
     /// [`RoutingConfig::validate`].
@@ -559,7 +613,7 @@ impl GithubConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinearConfig {
     /// Name of the workflow state a task moves to when the board derives
     /// `review` — typically `"In Review"`.
@@ -580,7 +634,7 @@ pub struct LinearConfig {
     pub review_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     /// Name shown in the picker and the prompt view. Defaults to the workspace.
     #[serde(default)]
@@ -635,7 +689,7 @@ impl Route {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteMatch {
     pub linear_team: Option<String>,
     pub linear_project: Option<String>,
@@ -715,44 +769,68 @@ impl RoutingConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        // Refusing on the first problem is the load path's contract: a config
+        // that is wrong anywhere is not used at all, and the first reason is
+        // the one to act on. The rest are still worth *seeing*, which is what
+        // [`RoutingConfig::problems`] is for.
+        match self.problems().into_iter().next() {
+            Some(problem) => bail!(problem),
+            None => Ok(()),
+        }
+    }
+
+    /// Everything wrong with this config, in file order.
+    ///
+    /// The same checks [`RoutingConfig::validate`] refuses on, collected rather
+    /// than stopped at the first — an editor showing one problem at a time
+    /// turns fixing three of them into three round trips, and the reader of a
+    /// remote box's config cannot see the file to spot the rest.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
         for (i, r) in self.routes.iter().enumerate() {
             if r.match_.is_empty() {
                 // A catch-all route is legal and useful, but it must be last or
                 // it silently shadows everything after it.
                 if i + 1 != self.routes.len() {
-                    bail!(
+                    out.push(format!(
                         "route {} ({}) has an empty `match` but is not last; \
                          first matching route wins, so it would shadow the {} route(s) after it",
                         i + 1,
                         r.display_name(),
                         self.routes.len() - i - 1
-                    );
+                    ));
                 }
             }
             if harness_for_runtime(&r.runtime).is_none() {
-                bail!(
+                out.push(format!(
                     "route {} ({}) has runtime `{}`, which is not a comet harness. \
                      Known runtimes: {}",
                     i + 1,
                     r.display_name(),
                     r.runtime,
                     RUNTIME_NAMES.join(", ")
-                );
+                ));
             }
             // A typo here reads exactly like "no cap" on the board, and only
             // one of those is what anybody meant (gh#70).
             if let Some(d) = &r.max_duration
                 && let Err(e) = parse_max_duration(d)
             {
-                bail!(
+                out.push(format!(
                     "route {} ({}) has max_duration {e}",
                     i + 1,
                     r.display_name()
-                );
+                ));
             }
         }
         if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
-            bail!("[defaults] max_duration {e}");
+            out.push(format!("[defaults] max_duration {e}"));
+        }
+        // Same reasoning as the cap above: an unparseable retention would read
+        // as `off` on a board nobody told, and the checkouts would pile up
+        // exactly as they did before gh#72.
+        if let Err(e) = parse_retention(&self.defaults.retain_worktrees) {
+            out.push(format!("[defaults] retain_worktrees {e}"));
         }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
@@ -764,24 +842,24 @@ impl RoutingConfig {
                 .iter()
                 .any(|listed| listed.eq_ignore_ascii_case(&r.name))
             {
-                bail!(
+                out.push(format!(
                     "[[github.repo]] name = \"{}\" is not in `[github] repos`, so nothing \
                      would ever use it. Add it to `repos`, or correct the name.",
                     r.name
-                );
+                ));
             }
             if self.github.per_repo[..i]
                 .iter()
                 .any(|earlier| earlier.name.eq_ignore_ascii_case(&r.name))
             {
-                bail!(
+                out.push(format!(
                     "[[github.repo]] name = \"{}\" appears twice; only the first would \
                      be used, so the second is settings that do nothing",
                     r.name
-                );
+                ));
             }
         }
-        Ok(())
+        out
     }
 
     /// First matching route wins (impl spec §5).
@@ -827,6 +905,19 @@ impl RoutingConfig {
         // default cap is the honest answer rather than none at all.
         parse_max_duration(raw)
             .unwrap_or_else(|_| parse_max_duration(&default_max_duration()).ok().flatten())
+    }
+
+    /// How long a finished attempt's checkout is kept, in seconds. `None` is
+    /// "forever" — collection off (gh#72).
+    ///
+    /// Board-wide rather than per route: which repo an attempt ran in says
+    /// nothing about how long you want to be able to look at its checkout, and
+    /// a per-route window would be one more place for the disk to fill up
+    /// behind a key nobody set. An unparseable value falls back to the default
+    /// window, never to "forever", for the same reason the cap does.
+    pub fn retain_worktrees_secs(&self) -> Option<u64> {
+        parse_retention(&self.defaults.retain_worktrees)
+            .unwrap_or_else(|_| parse_retention(&default_retain_worktrees()).ok().flatten())
     }
 }
 

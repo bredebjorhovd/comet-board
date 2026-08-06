@@ -53,7 +53,8 @@ struct Cli {
     /// The board store lives on exactly one device, usually the always-on box,
     /// and the board RPCs are relay-forwarded: this still dials the local
     /// engine, which passes the call on. Applies to the verbs that ask the
-    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`. The
+    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`, and
+    /// `routes`, which reads and writes the host's routing.toml (gh#75). The
     /// rest (doctor, init, adopt, stats) read this device's own files either
     /// way, and are unaffected.
     #[arg(long, global = true)]
@@ -191,6 +192,17 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Read and change the board's `routing.toml` — over the RPC, so `--device`
+    /// reaches the box that hosts the board (gh#75).
+    ///
+    /// The counterpart to `adopt`, which does the same writing against *this*
+    /// device's files. Use this one whenever the board is not yours: it needs no
+    /// shell on the box, and every write is validated and backed up before it
+    /// lands, exactly as `adopt`'s is.
+    Routes {
+        #[command(subcommand)]
+        command: RoutesCommand,
+    },
     /// Offer git-detected spaces the board is not watching; adopt one by slug.
     ///
     /// With no slug: list what could be adopted. With one: write the missing
@@ -231,6 +243,70 @@ enum Command {
     /// already an hour old when the agent got round to opening the PR.
     #[command(hide = true)]
     GhToken,
+}
+
+#[derive(Subcommand)]
+enum RoutesCommand {
+    /// The routes in force, what is wrong with the config, and what is not
+    /// routed yet.
+    List {
+        /// The whole reply as JSON — text, parse, problems, and what is
+        /// unadopted.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print `routing.toml` verbatim. Comments and all: this is the file.
+    Show,
+    /// Route a repo that has a space on the board's device but nothing
+    /// watching it — the `[[route]]` and `[github] repos` halves, written
+    /// together.
+    Add {
+        /// `owner/repo`, as `comet-board routes list` offers it.
+        slug: String,
+        /// Poll only issues carrying one of these labels (comma-separated), so
+        /// a roadmap-sized backlog does not land on the board whole.
+        #[arg(long, value_delimiter = ',')]
+        labels: Option<Vec<String>>,
+        /// Poll every open issue, said out loud (writes `labels = []`).
+        #[arg(long, conflicts_with = "labels")]
+        all_issues: bool,
+    },
+    /// Stop offering a repo — you are only reading it.
+    Ignore { slug: String },
+    /// Set one key on one route: `routes set 2 account brede-personal`.
+    ///
+    /// The number is the one `routes list` prints. Anything this cannot
+    /// express — a prompt, a match, the order of the routes — is `routes edit`.
+    Set {
+        /// Route number, as printed by `routes list` (1-based).
+        route: usize,
+        /// One of: name, workspace, repo, runtime, account, branch_template,
+        /// base, max_concurrent, max_duration.
+        key: String,
+        /// The new value. Omit with `--unset` to remove the key, which falls
+        /// the route back to `[defaults]`.
+        value: Option<String>,
+        /// Remove the key instead of setting it.
+        #[arg(long, conflicts_with = "value")]
+        unset: bool,
+    },
+    /// Set one key under `[defaults]`: `routes defaults max_duration 4h`.
+    Defaults {
+        /// One of: max_concurrent_per_workspace, branch_template, base,
+        /// notify, notify_dispatcher, new_source, max_duration.
+        key: String,
+        value: Option<String>,
+        #[arg(long, conflicts_with = "value")]
+        unset: bool,
+    },
+    /// Open `routing.toml` in `$EDITOR` and write it back, validated.
+    ///
+    /// The escape hatch that keeps this surface honest: everything the typed
+    /// edits cannot say is still one command away, on a board you have no shell
+    /// on. A file that would not validate is refused and the box keeps the
+    /// config it had; an edit that lands on a file somebody changed meanwhile
+    /// is refused too, rather than quietly overwriting them.
+    Edit,
 }
 
 fn main() -> Result<()> {
@@ -541,6 +617,10 @@ fn main() -> Result<()> {
             })?;
             comet_board::init::init(&paths, &spaces, adopt::probe, force)
         }
+        Command::Routes { command } => runtime.block_on(async {
+            let board = ops::attach(port, device).await?;
+            routes(&board, command).await
+        }),
         Command::Adopt {
             slug,
             labels,
@@ -645,6 +725,148 @@ fn main() -> Result<()> {
     }
 }
 
+/// `comet-board routes …` — the routing.toml surface (gh#75).
+///
+/// Every branch is one RPC round trip against the board's host, and every write
+/// answers with a fresh read: what gets printed after a change is the file as it
+/// now stands, not what we hoped it would say.
+async fn routes(board: &ops::Board, command: RoutesCommand) -> Result<()> {
+    match command {
+        RoutesCommand::List { json } => {
+            let cfg = ops::read_config(board).await?;
+            ops::print_config(&cfg, board.host(), json)
+        }
+        RoutesCommand::Show => {
+            let cfg = ops::read_config(board).await?;
+            if !cfg.routing.exists {
+                // Not on stdout: `routes show > routing.toml` must not capture
+                // an explanation as if it were config.
+                eprintln!(
+                    "{} does not exist yet — `comet-board init` writes the first one",
+                    cfg.routing.path
+                );
+                return Ok(());
+            }
+            print!("{}", cfg.routing.text);
+            Ok(())
+        }
+        RoutesCommand::Add {
+            slug,
+            labels,
+            all_issues,
+        } => {
+            let labels: Option<Vec<String>> = if all_issues { Some(Vec::new()) } else { labels };
+            let cfg = ops::write_config(
+                board,
+                serde_json::json!({ "op": "adopt", "slug": slug, "labels": labels }),
+            )
+            .await?;
+            println!("adopted {slug}");
+            ops::print_write_result(&cfg);
+            Ok(())
+        }
+        RoutesCommand::Ignore { slug } => {
+            let cfg = ops::write_config(board, serde_json::json!({ "op": "ignore", "slug": slug }))
+                .await?;
+            println!("{slug} will not be offered again (see [adopt] ignore)");
+            ops::print_write_result(&cfg);
+            Ok(())
+        }
+        RoutesCommand::Set {
+            route,
+            key,
+            value,
+            unset,
+        } => {
+            let value = settable(value, unset, &key)?;
+            // 1-based for a person counting routes in a file, 0-based on the
+            // wire. `routes list` prints the former.
+            let index = route
+                .checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("routes are numbered from 1"))?;
+            let cfg = ops::write_config(
+                board,
+                serde_json::json!({"op": "route", "route": index, "key": key, "value": value}),
+            )
+            .await?;
+            ops::print_write_result(&cfg);
+            Ok(())
+        }
+        RoutesCommand::Defaults { key, value, unset } => {
+            let value = settable(value, unset, &key)?;
+            let cfg = ops::write_config(
+                board,
+                serde_json::json!({"op": "default", "key": key, "value": value}),
+            )
+            .await?;
+            ops::print_write_result(&cfg);
+            Ok(())
+        }
+        RoutesCommand::Edit => edit_routing(board).await,
+    }
+}
+
+/// A `set`'s value: given, or explicitly cleared. Refusing the empty case is
+/// the point — `routes set 1 account` with neither a value nor `--unset` is
+/// somebody who meant one of them, and guessing which would either write an
+/// empty string or delete their configuration.
+fn settable(value: Option<String>, unset: bool, key: &str) -> Result<Option<String>> {
+    match (value, unset) {
+        (Some(v), _) => Ok(Some(v)),
+        (None, true) => Ok(None),
+        (None, false) => bail!("give a value for `{key}`, or `--unset` to remove it"),
+    }
+}
+
+/// `routes edit` — the file into `$EDITOR` and back, with the read it started
+/// from carried along so a hand-edit on the box in the meantime is refused
+/// rather than overwritten.
+async fn edit_routing(board: &ops::Board) -> Result<()> {
+    let before = ops::read_config(board).await?;
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .or_else(|| std::env::var("EDITOR").ok())
+        .filter(|e| !e.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("$EDITOR is not set — set it, or use `comet-board routes set`")
+        })?;
+
+    // A scratch copy: the real file is on the board's device, which may not be
+    // this one, and even when it is the write has to go through the validating
+    // writer rather than round the side of it.
+    let scratch =
+        std::env::temp_dir().join(format!("comet-board-routing-{}.toml", std::process::id()));
+    std::fs::write(&scratch, &before.routing.text)
+        .with_context(|| format!("writing {}", scratch.display()))?;
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(&scratch)
+        .status()
+        .with_context(|| format!("running $EDITOR ({editor})"))?;
+    let edited = std::fs::read_to_string(&scratch)
+        .with_context(|| format!("reading {} back", scratch.display()));
+    let _ = std::fs::remove_file(&scratch);
+    if !status.success() {
+        bail!("$EDITOR exited {status} — routing.toml is untouched");
+    }
+    let edited = edited?;
+
+    if edited == before.routing.text {
+        println!("no changes");
+        return Ok(());
+    }
+    let cfg = ops::write_config(
+        board,
+        serde_json::json!({"op": "text", "text": edited, "base": before.routing.text}),
+    )
+    .await?;
+    ops::print_write_result(&cfg);
+    Ok(())
+}
+
 /// Echo the overrides a release was given, so the confirmation says what the
 /// attempt is actually running under and not just that it started.
 fn print_overrides(opts: &ops::DispatchOpts<'_>) {
@@ -665,9 +887,7 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
 /// first `WatchSpaces` snapshot for the rows, filtered to spaces this device
 /// owns — a route's `repo =` is a local path, and another device's folders are
 /// not on this disk.
-async fn fetch_spaces(
-    port: u16,
-) -> Result<(String, Vec<Space>, Vec<comet_proto::AgentAccount>)> {
+async fn fetch_spaces(port: u16) -> Result<(String, Vec<Space>, Vec<comet_proto::AgentAccount>)> {
     let fetch = async {
         let client: RpcClient = connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
         let device = client

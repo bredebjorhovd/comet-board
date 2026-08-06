@@ -12,10 +12,9 @@
   "compatibility_date": "2026-07-01",
   "account_id": "0cac004a6d08e46e625eafa75b3ab625",
   "workers_dev": true,
-  // Public hostname on the zeron.sh zone, plus the install surface carved out
-  // of the (old) landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://comet.zeron.sh/install.sh | sh` now
-  // installs comet-native while the rest of comet.zeron.sh is untouched.
+  // Our public hostname (offhand.dev zone). It also carries the install
+  // surface — `curl -fsSL https://edge.comet.offhand.dev/install.sh | sh` and
+  // the /releases/* artifacts the release workflow uploads to R2.
   "routes": [
     { "pattern": "edge.comet.offhand.dev", "custom_domain": true }
   ],

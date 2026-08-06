@@ -117,6 +117,25 @@ pub mod methods {
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";
+    /// The board's `routing.toml` as it stands on its host: the text, its
+    /// parse, and everything wrong with it — plus the repos that have a space
+    /// on that device but nothing on the board watching them (gh#75). Params:
+    /// `{}` → `{routing: RoutingView, unadopted: [Unadopted]}`.
+    ///
+    /// Reading it is why this is not just a file: the config lives on the box,
+    /// and everyone who is not the person who set the box up has no shell on
+    /// it.
+    pub const READ_BOARD_CONFIG: &str = "ReadBoardConfig";
+    /// Change `routing.toml`, validated. Params are tagged `{op: text|route|
+    /// default|adopt|ignore, …}`; the reply is the same shape
+    /// [`READ_BOARD_CONFIG`] returns, so a caller never has to guess what it
+    /// just wrote.
+    ///
+    /// Every op re-parses and re-validates the whole file before it lands and
+    /// leaves the previous contents in `routing.toml.bak`. An edit that would
+    /// break the config is refused, naming what it would have broken, and the
+    /// file is untouched.
+    pub const WRITE_BOARD_CONFIG: &str = "WriteBoardConfig";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";

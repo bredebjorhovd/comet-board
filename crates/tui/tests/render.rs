@@ -2116,6 +2116,7 @@ fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_pro
         updated_at: Utc::now().to_rfc3339(),
         started_at: None,
         account: None,
+        dispatched_by_user: None,
     }
 }
 
@@ -2183,12 +2184,36 @@ fn a_selected_ready_row_offers_dispatch_in_the_footer() {
     assert!(screen.contains("enter dispatch"), "{screen}");
     assert!(screen.contains("[enter to dispatch]"), "{screen}");
 
-    // Enter actually dispatches.
+    // Enter opens the account picker for that row (gh#74) — the release itself
+    // is the picker's enter, and it names the row it will release.
     let effects = app.act(Action::BoardEnter);
     match effects.first() {
-        Some(comet_tui::link::Command::Dispatch { task_id, .. }) => assert_eq!(task_id, "1"),
-        other => panic!("expected a Dispatch, got {other:?}"),
+        Some(comet_tui::link::Command::ListDispatchAccounts { task_id, .. }) => {
+            assert_eq!(task_id, "1")
+        }
+        other => panic!("expected an account fetch, got {other:?}"),
     }
+    app.apply(Update::DispatchAccounts {
+        task_id: "1".into(),
+        accounts: vec![comet_proto::AgentAccount {
+            id: "slot-ana".into(),
+            harness: comet_proto::HarnessId::ClaudeCode,
+            email: Some("ana@example.com".into()),
+            plan_label: Some("Max".into()),
+            active: false,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }],
+    });
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+    assert!(screen.contains("Dispatch gh#1 on"), "{screen}");
+    assert!(screen.contains("Route default"), "{screen}");
+    assert!(screen.contains("ana@example.com"), "{screen}");
 }
 
 #[test]

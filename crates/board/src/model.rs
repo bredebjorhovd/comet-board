@@ -336,6 +336,11 @@ pub struct Attempt {
     pub workspace: String,
     pub runtime: String,
     pub worktree: Option<String>,
+    /// The repo the worktree was cut from (gh#72) — recorded at dispatch,
+    /// because reclaiming the checkout's branch afterwards is work that happens
+    /// in the repo and not in the (by then deleted) worktree. `None` on every
+    /// attempt made before this was recorded.
+    pub repo_path: Option<String>,
     pub branch: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -401,6 +406,25 @@ pub struct Attempt {
     /// warning and a grace period before the cap closes it, so this is also
     /// what says whether the grace clock has started. Cleared by a re-open.
     pub overrun_warned_at: Option<String>,
+    /// When this attempt's checkout first became nobody's — the attempt closed
+    /// and its task gone from the board (gh#72). The retention window is
+    /// measured from here rather than from `ended_at`, so a pull request that
+    /// sits in review for a fortnight still leaves a full window to look at the
+    /// checkout after it merges. Cleared if the task comes back to life.
+    pub collectable_at: Option<String>,
+    /// When the checkout and its local branch were reclaimed (gh#72). Non-`None`
+    /// means `worktree` names a path that is no longer on disk.
+    pub collected_at: Option<String>,
+    /// The device the dispatch was issued from, as its frontend reported it
+    /// (gh#74). `None` where nobody said — a `comet-board` run on the box, and
+    /// every attempt from before the frontends sent it.
+    pub dispatched_by_device: Option<String>,
+    /// Who the dispatching frontend said was signed in there — an email when it
+    /// knows one, else the user id (gh#74). The board cannot check it: relayed
+    /// frames arrive as the room owner, so per-call user identity is #66's to
+    /// establish. Until then this is the only record of which *human* released
+    /// the work, and it is a claim, not a credential — never authorize on it.
+    pub dispatched_by_user: Option<String>,
 }
 
 impl Attempt {

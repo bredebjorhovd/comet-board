@@ -36,6 +36,12 @@
 //!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
 //!   engine-hosted board service, and relay-forwardable (gh#55): one box hosts
 //!   the board, every teammate's device drives it with `targetDeviceId`.
+//! - Board config (gh#75): `ReadBoardConfig` → `{routing, unadopted}` — the
+//!   host's `routing.toml`, its parse, everything wrong with it, and the repos
+//!   with a space there that nothing on the board watches; `WriteBoardConfig
+//!   {op: text|route|default|adopt|ignore, …}` → the same shape, after a write
+//!   that had to parse and validate and left a `.bak`. Forwardable for the
+//!   reason the file is worth reaching at all: it lives on the box.
 //! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
 //!   `UploadCommit {uploadId, fileName}` → `{path}`,
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
@@ -75,12 +81,36 @@ use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
-use comet_board::dispatch::DispatchOverrides;
+use comet_board::dispatch::{DispatchOrigin, DispatchOverrides};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
+}
+
+/// `WriteBoardConfig` params (gh#75).
+///
+/// The file edits are [`comet_board::routes::Edit`] verbatim — one definition,
+/// so the CLI and a settings page send what the board crate's tests exercise.
+/// The two that cannot live there are here: adopting and ignoring a repo need
+/// the space list and a git probe, which are the engine's to supply and only
+/// mean anything on the device the board runs on.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum BoardConfigWrite {
+    /// Write the `[[route]]` + `[github] repos` halves a repo is missing, with
+    /// the same writer `comet-board adopt` uses. `labels` narrows what the repo
+    /// contributes (`Some([])` is "every open issue, said out loud").
+    Adopt {
+        slug: String,
+        #[serde(default)]
+        labels: Option<Vec<String>>,
+    },
+    /// Stop offering a repo — you are only reading it.
+    Ignore { slug: String },
+    #[serde(untagged)]
+    Edit(comet_board::routes::Edit),
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +202,49 @@ struct ResizeTerminalParams {
     terminal_id: String,
     cols: u16,
     rows: u16,
+}
+
+/// `DispatchTask`'s params. At module scope rather than inside the handler
+/// because these key names are a contract three callers write by hand — the
+/// desktop panel, the TUI and the `comet-board` CLI — and a camelCase slip
+/// would drop an override or an attribution silently, with a successful
+/// dispatch to show for it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchTaskParams {
+    task_id: String,
+    /// The dispatching chat's id when an agent released it — provenance, never
+    /// authority.
+    #[serde(default)]
+    via: Option<String>,
+    /// The device the dispatch was issued from, and who its frontend says is
+    /// signed in there (gh#74). Both are the caller's word — a relayed call
+    /// arrives as the device room's owner, so there is no per-call identity to
+    /// check them against yet (#66). Recorded on the attempt, and never
+    /// consulted for authorization or for billing: which account a run spends
+    /// is `account` below, always explicit.
+    #[serde(default)]
+    via_device: Option<String>,
+    #[serde(default)]
+    via_user: Option<String>,
+    /// Runtime override (e.g. `opencode`); `None` = the route's.
+    #[serde(default)]
+    runtime: Option<String>,
+    /// Model override for the chosen harness.
+    #[serde(default)]
+    model: Option<String>,
+    /// Agent-account slot id to spend — whose Claude/Codex subscription pays
+    /// for this run (gh#59). `None` = the route's `account`, and failing that
+    /// the device's own CLI login. Explicit on purpose: the board does not
+    /// infer an account from the WorkOS user who dispatched, it records `via`
+    /// and does what it was told.
+    #[serde(default)]
+    account: Option<String>,
+    /// End the task's live attempt and release a fresh one — the blocked row's
+    /// Retry (gh#49). Off for ordinary dispatches, which are refused on a live
+    /// attempt.
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +528,97 @@ impl EngineRpc {
         }
     }
 
+    // ---- the routing surface (gh#75) ----
+
+    /// The reply both config methods answer with: the file, and the repos on
+    /// this device that have a space but nothing on the board watching them.
+    ///
+    /// The unadopted list rides along because it is the same question asked
+    /// from the other side — "what is not routed yet" is the reason somebody
+    /// opened the config — and because detecting it needs the space list and a
+    /// git probe, neither of which a remote caller has for *this* device.
+    async fn config_reply(
+        &self,
+        routing: comet_board::routes::RoutingView,
+    ) -> Result<serde_json::Value, RpcError> {
+        let unadopted = match &routing.config {
+            // Nothing to compare against: a file that does not parse cannot say
+            // which repos it already covers, and offering to "adopt" every one
+            // of them would be wrong in both directions.
+            None => Vec::new(),
+            Some(cfg) => {
+                let device = self.doc_host.device_id().to_string();
+                let spaces: Vec<comet_proto::Space> = self
+                    .workspace
+                    .watch_spaces()
+                    .borrow()
+                    .iter()
+                    .filter(|s| s.device_id == device)
+                    .cloned()
+                    .collect();
+                let cfg = cfg.clone();
+                // `probe` shells out to git once per space. Off the reactor.
+                tokio::task::spawn_blocking(move || {
+                    comet_board::adopt::detect(&spaces, &cfg, comet_board::adopt::probe)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(format!("detecting unadopted repos: {e}")))?
+            }
+        };
+        Ok(serde_json::json!({ "routing": routing, "unadopted": unadopted }))
+    }
+
+    /// Perform one config write. Everything lands through
+    /// [`comet_board::routes::edit`] or [`comet_board::adopt`], which is where
+    /// the parse + validate + `.bak` discipline lives.
+    fn write_board_config(
+        &self,
+        paths: &comet_board::config::Paths,
+        write: BoardConfigWrite,
+    ) -> anyhow::Result<comet_board::routes::RoutingView> {
+        use comet_board::adopt;
+        match write {
+            BoardConfigWrite::Edit(edit) => comet_board::routes::edit(paths, &edit),
+            BoardConfigWrite::Ignore { slug } => {
+                adopt::ignore(&paths.routing(), &slug)?;
+                comet_board::routes::read(paths)
+            }
+            BoardConfigWrite::Adopt { slug, labels } => {
+                // The offer has to be current: adopting a repo the board is
+                // already watching would write a second route for it, and
+                // `adopt_with` computes its insertion point from a config it
+                // parses itself.
+                let routing = comet_board::routes::read(paths)?;
+                let cfg = routing.config.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "routing.toml does not parse, so nothing can be adopted into it — \
+                         fix it first ({})",
+                        routing.problems.join("; ")
+                    )
+                })?;
+                let device = self.doc_host.device_id().to_string();
+                let spaces: Vec<comet_proto::Space> = self
+                    .workspace
+                    .watch_spaces()
+                    .borrow()
+                    .iter()
+                    .filter(|s| s.device_id == device)
+                    .cloned()
+                    .collect();
+                let found = adopt::detect(&spaces, &cfg, adopt::probe);
+                let Some(u) = found.iter().find(|u| u.slug.eq_ignore_ascii_case(&slug)) else {
+                    anyhow::bail!(
+                        "`{slug}` is not on this board's unadopted list — already-adopted \
+                         and ignored repos are not offered, and a repo needs a space on \
+                         this device to be adopted at all"
+                    );
+                };
+                adopt::adopt_with(&paths.routing(), u, labels.as_deref())?;
+                comet_board::routes::read(paths)
+            }
+        }
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -626,6 +790,11 @@ fn forwardable(method: &str) -> bool {
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
             | methods::LIST_BOARD_RUNTIMES
+            // `routing.toml` is a file on the board's device, which is exactly
+            // why it is forwarded (gh#75): the alternative for a teammate who
+            // needs a repo routed is an ssh account on the box.
+            | methods::READ_BOARD_CONFIG
+            | methods::WRITE_BOARD_CONFIG
     )
 }
 
@@ -887,9 +1056,7 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
-            methods::UPDATE_STATUS => {
-                Ok(RpcReply::Stream(watch_stream(self.updater()?.watch())))
-            }
+            methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
                 let version = self
                     .updater()?
@@ -914,45 +1081,22 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&comet_board::runtime::runtime_options())
             }
             methods::DISPATCH_TASK => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    task_id: String,
-                    /// The dispatching chat's id when an agent released it —
-                    /// provenance, never authority.
-                    #[serde(default)]
-                    via: Option<String>,
-                    /// Runtime override (e.g. `opencode`); `None` = the route's.
-                    #[serde(default)]
-                    runtime: Option<String>,
-                    /// Model override for the chosen harness.
-                    #[serde(default)]
-                    model: Option<String>,
-                    /// Agent-account slot id to spend — whose Claude/Codex
-                    /// subscription pays for this run (gh#59). `None` = the
-                    /// route's `account`, and failing that the device's own
-                    /// CLI login. Explicit on purpose: the board does not
-                    /// infer an account from the WorkOS user who dispatched,
-                    /// it records `via` and does what it was told.
-                    #[serde(default)]
-                    account: Option<String>,
-                    /// End the task's live attempt and release a fresh one — the
-                    /// blocked row's Retry (gh#49). Off for ordinary dispatches,
-                    /// which are refused on a live attempt.
-                    #[serde(default)]
-                    replace: bool,
-                }
-                let p: P = parse_params(params)?;
+                let p: DispatchTaskParams = parse_params(params)?;
                 let board = self.board()?;
                 let overrides = DispatchOverrides {
                     runtime: p.runtime,
                     model: p.model,
                     account: p.account,
                 };
+                let origin = DispatchOrigin {
+                    chat: p.via,
+                    device: p.via_device,
+                    user: p.via_user,
+                };
                 let dispatched = if p.replace {
-                    board.retry_task(&p.task_id, p.via, overrides).await
+                    board.retry_task(&p.task_id, origin, overrides).await
                 } else {
-                    board.dispatch_task(&p.task_id, p.via, overrides).await
+                    board.dispatch_task(&p.task_id, origin, overrides).await
                 }
                 .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&dispatched)
@@ -969,6 +1113,22 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            // The routing surface (gh#75). Served off the board's own paths, so
+            // this answers about the config the running loop reads — and keeps
+            // answering when that config is what stopped the loop.
+            methods::READ_BOARD_CONFIG => {
+                let view = comet_board::routes::read(self.board()?.paths())
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&self.config_reply(view).await?)
+            }
+            methods::WRITE_BOARD_CONFIG => {
+                let p: BoardConfigWrite = parse_params(params)?;
+                let paths = self.board()?.paths().clone();
+                let view = self
+                    .write_board_config(&paths, p)
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&self.config_reply(view).await?)
             }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
@@ -1064,6 +1224,10 @@ impl RpcService for EngineRpc {
                     .delete_worktree(
                         std::path::Path::new(&p.repo_path),
                         std::path::Path::new(&p.worktree_path),
+                        // The frontend deletes a worktree it did not name a
+                        // branch for, so only comet's own `comet/…` branch is
+                        // ours to remove here.
+                        None,
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
@@ -1235,6 +1399,41 @@ mod tests {
         .expect("ui param shape");
         assert_eq!(p.account_id, "acct-1");
         assert_eq!(p.harness, HarnessId::ClaudeCode);
+    }
+
+    /// gh#74: the panel and the TUI hand-write these keys. `account` decides
+    /// whose subscription a run burns and `viaDevice`/`viaUser` are the only
+    /// record of who released it, so a name that fails to bind is a silent
+    /// wrong answer, not an error.
+    #[test]
+    fn dispatch_task_params_bind_the_names_the_frontends_send() {
+        let p: DispatchTaskParams = parse_params(serde_json::json!({
+            "taskId": "gh:owner/widget#74",
+            "targetDeviceId": "device-box",
+            "runtime": "opencode",
+            "model": "gpt-5.2",
+            "account": "slot-ana",
+            "viaDevice": "laptop-ana",
+            "viaUser": "ana@example.com",
+            "replace": true,
+        }))
+        .expect("the shape both frontends send");
+        assert_eq!(p.task_id, "gh:owner/widget#74");
+        assert_eq!(p.runtime.as_deref(), Some("opencode"));
+        assert_eq!(p.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(p.account.as_deref(), Some("slot-ana"));
+        assert_eq!(p.via_device.as_deref(), Some("laptop-ana"));
+        assert_eq!(p.via_user.as_deref(), Some("ana@example.com"));
+        assert!(p.replace);
+
+        // The CLI's shape: a task and its provenance, nothing else.
+        let p: DispatchTaskParams =
+            parse_params(serde_json::json!({ "taskId": "t", "via": "chat-parent" }))
+                .expect("the CLI's shape");
+        assert_eq!(p.via.as_deref(), Some("chat-parent"));
+        assert_eq!(p.via_device, None);
+        assert_eq!(p.via_user, None);
+        assert!(!p.replace);
     }
 
     #[test]

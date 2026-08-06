@@ -14,11 +14,21 @@
 //!   derivation;
 //! - `enter` on a ready row dispatches it (`DispatchTask`); on a running row it
 //!   opens that attempt's chat; on a section header it folds/unfolds;
-//! - the dispatch picker asks which runtime (and which model on that harness —
-//!   `ListModels`, defaulted to the harness's first catalog row) to release
-//!   under, and sends both overrides. The model list is type-to-filter: typing
-//!   narrows it by id or label (`deepseek` finds `opencode/deepseek-v4-flash`),
-//!   arrows walk the matches, enter dispatches the highlighted one;
+//! - the dispatch picker asks which runtime, whose agent account, and which
+//!   model on that harness (`ListModels`, defaulted to the harness's first
+//!   catalog row) to release under, and sends all three as overrides. The
+//!   account strip (`ListAgentAccounts` on the board's host, filtered to the
+//!   highlighted runtime's harness — gh#74) leads with the route's own account,
+//!   which sends no override; picking a slot is how a teammate spends their own
+//!   subscription instead of the box owner's. The model list is type-to-filter:
+//!   typing narrows it by id or label (`deepseek` finds
+//!   `opencode/deepseek-v4-flash`), arrows walk the matches, enter dispatches
+//!   the highlighted one;
+//! - every dispatch also carries who released it — this device's id and the
+//!   signed-in user's email (gh#74). The engine records both on the attempt and
+//!   names the human in the upstream comment. Claims, not credentials: board
+//!   calls relay as the room owner, so the box cannot check them, and nothing
+//!   is authorized on them.
 //! - `f` cycles the routes on the board, `F` clears the filter, `/` opens the
 //!   find field (live substring matching), `esc` closes the panel;
 //! - the panel is lazy: no RPC until it is first opened, and the stream
@@ -52,6 +62,7 @@ use gpui::{
 };
 
 use comet_proto::view::board::{self, BoardState, Filter, TaskRow};
+use comet_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
 use comet_rpc::methods;
 use serde::Deserialize;
 
@@ -62,13 +73,12 @@ use crate::popover;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
-/// One runtime a dispatch can be pointed at, as the engine's `ListBoardRuntimes`
-/// reports it — the same set `build_spec` validates an override against.
-#[derive(Debug, Clone, Deserialize)]
-struct BoardRuntime {
-    name: String,
-    label: String,
-}
+// One runtime a dispatch can be pointed at, as the engine's `ListBoardRuntimes`
+// reports it — the same set `build_spec` validates an override against. Its
+// `harness` is what tells the account strip which saved logins this runtime
+// could actually spend (gh#74). The shape is proto's, like `TaskRow`: the panel
+// deserializes what the board serves without depending on the board crate.
+use comet_proto::view::board::RuntimeOption as BoardRuntime;
 
 /// One model a dispatch can be pointed at, as the engine's `ListModels` reports
 /// it for a harness — `id` is exactly what the `DispatchTask` override sends.
@@ -78,10 +88,11 @@ struct BoardModelInfo {
     label: String,
 }
 
-/// Which of the picker's two rows the keyboard highlights.
+/// Which of the picker's rows the keyboard highlights, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerRow {
     Runtime,
+    Account,
     Model,
 }
 
@@ -94,6 +105,26 @@ enum ModelCatalog {
     Loading,
     Ready(Vec<BoardModelInfo>),
     Error(String),
+}
+
+/// The host's saved agent logins, loaded once when the picker opens (gh#74).
+/// One list for every harness — the account row filters it by the highlighted
+/// runtime's, so switching runtimes needs no second call.
+#[derive(Debug, Clone, Default)]
+enum AccountCatalog {
+    #[default]
+    Loading,
+    Ready(Vec<AgentAccount>),
+    Error(String),
+}
+
+impl AccountCatalog {
+    fn slots(&self) -> &[AgentAccount] {
+        match self {
+            AccountCatalog::Ready(accounts) => accounts,
+            _ => &[],
+        }
+    }
 }
 
 /// A dispatch in the pick step: the operator chose a task, and the panel is
@@ -120,6 +151,14 @@ struct DispatchDraft {
     /// The model highlight for the ACTIVE runtime: 0 = the harness default
     /// (no override — the route's behavior), `i` = the catalog's `i`-th model.
     active_model: usize,
+    /// Every agent login the host has saved, whatever harness it belongs to.
+    accounts: AccountCatalog,
+    /// The account highlight: 0 = the route's own `account` (no override), `i`
+    /// = the `i-1`th login the active runtime's harness can spend.
+    active_account: usize,
+    /// The route's account, for labelling row 0 — what "no override" will
+    /// actually spend, so the default is a choice rather than a mystery.
+    route_account: Option<String>,
 }
 
 impl DispatchDraft {
@@ -130,11 +169,113 @@ impl DispatchDraft {
             .map(|r| r.name.clone())
     }
 
+    /// The harness the highlighted runtime runs on. `None` before the runtime
+    /// list lands — the account row has nothing to filter by until then.
+    fn active_harness(&self) -> Option<HarnessId> {
+        self.runtimes.get(self.active_runtime).map(|r| r.harness)
+    }
+
     /// The model catalog of the highlighted runtime, when loaded.
     fn catalog(&self) -> Option<&ModelCatalog> {
         let name = self.active_runtime_name()?;
         self.catalogs.get(&name)
     }
+
+    /// The logins the highlighted runtime could spend, in the order the host
+    /// listed them.
+    fn account_options(&self) -> Vec<&AgentAccount> {
+        accounts_for_harness(self.accounts.slots(), self.active_harness())
+    }
+
+    /// The account override this highlight sends, if any — carrying the label
+    /// as well, so the confirmation can name whose limits the run will spend
+    /// rather than echo a slot id.
+    fn picked_account(&self) -> Option<PickedAccount> {
+        let options = self.account_options();
+        let id = override_account_id(&options, self.active_account)?.to_string();
+        let label = options
+            // Row 0 is the route's, and returned `None` above.
+            .get(self.active_account - 1)
+            .map(|account| account_label(account))
+            .unwrap_or_else(|| id.clone());
+        Some(PickedAccount { id, label })
+    }
+
+    /// Everything this release sends, from the three highlights. `catalog_ix`
+    /// is the model row being confirmed — the highlighted one for enter, the
+    /// clicked one for a click, and `None` when the catalog never landed (the
+    /// dispatch then goes out on the harness default, as it always could).
+    fn choice(&self, catalog_ix: Option<usize>) -> DispatchChoice {
+        let (model, effective_model) = match (self.catalog(), catalog_ix) {
+            (Some(ModelCatalog::Ready(models)), Some(ix)) => (
+                override_model_id(models, ix).map(str::to_string),
+                models.get(ix).map(|m| m.id.clone()),
+            ),
+            _ => (None, None),
+        };
+        DispatchChoice {
+            runtime: self.active_runtime_name(),
+            model,
+            effective_model,
+            account: self.picked_account(),
+        }
+    }
+}
+
+/// An account chosen in the picker: what to send, and what to call it.
+#[derive(Debug, Clone)]
+struct PickedAccount {
+    id: String,
+    label: String,
+}
+
+/// What the picker settled on for one release. A struct rather than four
+/// positional `Option<String>`s: they are all optional and all strings, so a
+/// swapped pair would be a silently wrong dispatch rather than a type error.
+#[derive(Debug, Clone, Default)]
+struct DispatchChoice {
+    /// Runtime override; `None` = the route's.
+    runtime: Option<String>,
+    /// Model override; `None` = the harness default.
+    model: Option<String>,
+    /// The model the run will actually use — the override, else the default
+    /// the catalog leads with. For the confirmation, never sent.
+    effective_model: Option<String>,
+    /// Account override; `None` = the route's account.
+    account: Option<PickedAccount>,
+}
+
+/// The saved logins a harness can spend. A Claude slot is not lendable to a
+/// codex run — the two harnesses read different config-dir variables — so a
+/// picker that offered every slot for every runtime would be offering dispatches
+/// that refuse themselves (gh#59). An unknown harness (the runtime list has not
+/// landed yet) matches nothing rather than everything.
+fn accounts_for_harness(accounts: &[AgentAccount], harness: Option<HarnessId>) -> Vec<&AgentAccount> {
+    let Some(harness) = harness else {
+        return Vec::new();
+    };
+    accounts.iter().filter(|a| a.harness == harness).collect()
+}
+
+/// The `account` a dispatch should SEND for an account highlight: `None` at row
+/// 0 — the route's own account, which needs no override — and the slot id of the
+/// `i-1`th offered login otherwise.
+fn override_account_id<'a>(options: &[&'a AgentAccount], active: usize) -> Option<&'a str> {
+    match active {
+        0 => None,
+        k => options.get(k - 1).map(|a| a.id.as_str()),
+    }
+}
+
+/// What an account chip says: the login's email, else the name the harness
+/// reported, else the slot id — never nothing, since the chip is how the
+/// operator tells whose limits a dispatch will spend.
+fn account_label(account: &AgentAccount) -> String {
+    account
+        .email
+        .clone()
+        .or_else(|| account.display_name.clone())
+        .unwrap_or_else(|| account.id.clone())
 }
 
 /// The picker's starting row: the route's runtime when the list offers it by
@@ -816,6 +957,7 @@ impl BoardPanel {
         self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
         self.dispatch = Some(DispatchDraft {
             route_runtime: row.runtime.clone(),
+            route_account: row.account.clone(),
             task_id,
             identifier,
             runtimes: Vec::new(),
@@ -824,9 +966,49 @@ impl BoardPanel {
             catalogs: HashMap::new(),
             row: PickerRow::Runtime,
             active_model: 0,
+            accounts: AccountCatalog::Loading,
+            active_account: 0,
         });
         cx.notify();
-        self.load_dispatch_runtimes(engine, cx);
+        self.load_dispatch_runtimes(engine.clone(), cx);
+        self.load_dispatch_accounts(engine, cx);
+    }
+
+    /// Fetch `ListAgentAccounts` into the open picker (gh#74).
+    ///
+    /// The host's logins, not this laptop's: the run executes there, and a slot
+    /// id only means anything on the device that saved it — the same reason the
+    /// model catalog is fetched with the host passthrough. Loaded once per
+    /// picker and filtered per runtime, since one call already returns every
+    /// harness's slots.
+    fn load_dispatch_accounts(&mut self, engine: EngineHandle, cx: &mut Context<Self>) {
+        let Some(task_id) = self.dispatch.as_ref().map(|d| d.task_id.clone()) else {
+            return;
+        };
+        let params = self.host_params(serde_json::json!({}));
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_AGENT_ACCOUNTS, params)
+                .await;
+            this.update(cx, |panel, cx| {
+                // A newer pick (or a cancel) replaced this one mid-flight.
+                let Some(draft) = panel.dispatch.as_mut() else { return };
+                if draft.task_id != task_id {
+                    return;
+                }
+                draft.accounts = match result {
+                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
+                        Ok(snapshot) => AccountCatalog::Ready(snapshot.accounts),
+                        Err(err) => AccountCatalog::Error(format!("Couldn't read accounts: {err}")),
+                    },
+                    Err(err) => AccountCatalog::Error(format!("Couldn't list accounts: {err}")),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Fetch `ListBoardRuntimes` into the open picker. The picker renders
@@ -951,25 +1133,9 @@ impl BoardPanel {
     fn confirm_dispatch(&mut self, cx: &mut Context<Self>) {
         let indices = self.dispatch_filtered_models(cx);
         let Some(draft) = self.dispatch.take() else { return };
-        let runtime = draft.active_runtime_name();
-        let (model, effective) = match draft.catalog() {
-            Some(ModelCatalog::Ready(models)) => match indices.get(draft.active_model) {
-                Some(catalog_ix) => (
-                    override_model_id(models, *catalog_ix).map(str::to_string),
-                    models.get(*catalog_ix).map(|m| m.id.clone()),
-                ),
-                None => (None, None),
-            },
-            _ => (None, None),
-        };
-        self.send_dispatch(
-            &draft.task_id,
-            &draft.identifier,
-            runtime.as_deref(),
-            model.as_deref(),
-            effective.as_deref(),
-            cx,
-        );
+        let catalog_ix = indices.get(draft.active_model).copied();
+        let choice = draft.choice(catalog_ix);
+        self.send_dispatch(&draft.task_id, &draft.identifier, choice, cx);
     }
 
     /// The catalog rows (indices) the dispatch picker displays for the active
@@ -1002,8 +1168,10 @@ impl BoardPanel {
         if draft.active_runtime != ix {
             draft.active_runtime = ix;
             // A new harness's highlight starts on its default — the old pick
-            // would be a model the new harness may not even offer.
+            // would be a model the new harness may not even offer, and the old
+            // login one it cannot spend at all.
             draft.active_model = 0;
+            draft.active_account = 0;
             // The runtime is settled; the next input belongs to the models.
             draft.row = PickerRow::Model;
         }
@@ -1016,46 +1184,58 @@ impl BoardPanel {
         cx.notify();
     }
 
+    /// Clicking an account chip: spend that login. A selection is never itself
+    /// a release — the model row (or enter) is, exactly as for the runtime
+    /// strip. Whose limits a run burns is too consequential to be one click
+    /// away from happening by accident.
+    fn select_account(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(draft) = self.dispatch.as_mut() else { return };
+        if ix > draft.account_options().len() {
+            return;
+        }
+        draft.active_account = ix;
+        draft.row = PickerRow::Account;
+        cx.notify();
+    }
+
     /// Clicking a model row: dispatch with the current runtime + that model.
     /// `catalog_ix` is the catalog row's own index (rows carry it through the
     /// filtered display).
     fn confirm_with_model(&mut self, catalog_ix: usize, cx: &mut Context<Self>) {
         let Some(draft) = self.dispatch.take() else { return };
-        let runtime = draft.active_runtime_name();
-        let (model, effective) = match draft.catalog() {
-            Some(ModelCatalog::Ready(models)) => (
-                override_model_id(models, catalog_ix).map(str::to_string),
-                models.get(catalog_ix).map(|m| m.id.clone()),
-            ),
-            _ => (None, None),
-        };
-        self.send_dispatch(
-            &draft.task_id,
-            &draft.identifier,
-            runtime.as_deref(),
-            model.as_deref(),
-            effective.as_deref(),
-            cx,
-        );
+        let choice = draft.choice(Some(catalog_ix));
+        self.send_dispatch(&draft.task_id, &draft.identifier, choice, cx);
     }
 
-    /// Send `DispatchTask` for a task, with the picked runtime/model overrides
-    /// (if any). The confirmation names the chat AND the model the run will
-    /// actually use — the override when one was picked, else the harness
-    /// default the catalog leads with.
+    /// Send `DispatchTask` for a task, with the picked runtime/model/account
+    /// overrides (if any). The confirmation names the chat AND the model the run
+    /// will actually use — the override when one was picked, else the harness
+    /// default the catalog leads with — plus the account, when the dispatch
+    /// chose one over the route's.
+    ///
+    /// Every call also carries who released it (gh#74): this device's id and the
+    /// signed-in user, so a teammate's dispatch is recorded as theirs instead of
+    /// as an anonymous operator. Hints, not credentials — the box cannot check
+    /// either, and nothing is authorized on them.
     fn send_dispatch(
         &mut self,
         task_id: &str,
         identifier: &str,
-        runtime: Option<&str>,
-        model: Option<&str>,
-        effective_model: Option<&str>,
+        choice: DispatchChoice,
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.engine(cx) else {
             self.set_notice("Engine not connected", cx);
             return;
         };
+        let state = self.state.read(cx);
+        let via_device = state.local_device_id.clone();
+        // Email when the profile carries one — a slot id or a WorkOS id is not
+        // what a person reading the attempt row is looking for.
+        let via_user = state
+            .auth_user()
+            .map(|user| user.email.clone())
+            .filter(|email| !email.is_empty());
         // A retry on a blocked row ends the live attempt it is stuck on before
         // releasing (gh#49). Read the row now, not when the picker opened: if
         // it cleared (cancelled, or the agent moved on) meanwhile, a plain
@@ -1067,18 +1247,29 @@ impl BoardPanel {
             .is_some_and(|row| row.state() == BoardState::Blocked);
         let task_id = task_id.to_string();
         let identifier = identifier.to_string();
-        let runtime = runtime.map(str::to_string);
-        let model = model.map(str::to_string);
-        let effective = effective_model.map(str::to_string);
+        let DispatchChoice {
+            runtime,
+            model,
+            effective_model,
+            account,
+        } = choice;
         // The dispatch runs where the board is: the worktree, the chat and the
         // agent all land on the host device.
         let host = self.host.clone();
-        // Computed before the params consume `runtime`/`model`.
-        let detail = match (&runtime, &effective) {
+        // Computed before the params consume the overrides.
+        let detail = match (&runtime, &effective_model) {
             (Some(runtime), Some(model)) => format!(" · {runtime} / {model}"),
             (Some(runtime), None) => format!(" · {runtime}"),
             _ => String::new(),
         };
+        // The account only when the dispatch chose one: the route's is what the
+        // board would have spent anyway, and naming it every time would make
+        // the exception invisible.
+        let detail = match &account {
+            Some(account) => format!("{detail} · on {}", account.label),
+            None => detail,
+        };
+        let account_id = account.map(|a| a.id);
         cx.spawn(async move |this, cx| {
             let mut params = host_params(host.as_deref(), serde_json::json!({ "taskId": task_id }));
             if replace {
@@ -1089,6 +1280,15 @@ impl BoardPanel {
             }
             if let (Some(model), Some(object)) = (model, params.as_object_mut()) {
                 object.insert("model".into(), serde_json::Value::String(model));
+            }
+            if let (Some(account), Some(object)) = (account_id, params.as_object_mut()) {
+                object.insert("account".into(), serde_json::Value::String(account));
+            }
+            if let (Some(device), Some(object)) = (via_device, params.as_object_mut()) {
+                object.insert("viaDevice".into(), serde_json::Value::String(device));
+            }
+            if let (Some(user), Some(object)) = (via_user, params.as_object_mut()) {
+                object.insert("viaUser".into(), serde_json::Value::String(user));
             }
             let result = engine.client().call(methods::DISPATCH_TASK, params).await;
             this.update(cx, |panel, cx| match result {
@@ -1265,16 +1465,27 @@ impl BoardPanel {
                     let mut focus_frame = false;
                     if let Some(draft) = self.dispatch.as_mut() {
                         match draft.row {
+                            // The top row: only down leads anywhere.
                             PickerRow::Runtime => {
+                                if delta > 0 {
+                                    draft.row = PickerRow::Account;
+                                    focus_frame = true;
+                                }
+                            }
+                            PickerRow::Account if delta > 0 => {
                                 draft.row = PickerRow::Model;
                                 draft.active_model = 0;
                                 focus_search = true;
                             }
+                            PickerRow::Account => {
+                                draft.row = PickerRow::Runtime;
+                                focus_frame = true;
+                            }
                             PickerRow::Model if search_focused => {
                                 // Empty filter + up on the top row returns to
-                                // the runtime strip; otherwise walk the matches.
+                                // the account strip; otherwise walk the matches.
                                 if filter_empty && delta < 0 && draft.active_model == 0 {
-                                    draft.row = PickerRow::Runtime;
+                                    draft.row = PickerRow::Account;
                                     focus_frame = true;
                                 } else {
                                     draft.active_model = popover::menu_step(
@@ -1286,7 +1497,7 @@ impl BoardPanel {
                                 }
                             }
                             PickerRow::Model => {
-                                draft.row = PickerRow::Runtime;
+                                draft.row = PickerRow::Account;
                                 focus_frame = true;
                             }
                         }
@@ -1312,7 +1523,19 @@ impl BoardPanel {
                                     .clamp(0, draft.runtimes.len() as isize - 1)
                                     as usize;
                                 draft.active_model = 0;
+                                // Another harness is another set of logins —
+                                // the slot highlighted for the old one may not
+                                // even be offered here.
+                                draft.active_account = 0;
                                 runtime_moved = true;
+                            }
+                            PickerRow::Account => {
+                                // Row 0 is the route's own account, so the walk
+                                // is one longer than the offered logins.
+                                let count = draft.account_options().len() + 1;
+                                draft.active_account = (draft.active_account as isize + delta)
+                                    .clamp(0, count as isize - 1)
+                                    as usize;
                             }
                             PickerRow::Model => {
                                 draft.active_model = popover::menu_step(
@@ -2183,12 +2406,13 @@ impl BoardPanel {
         cx.open_url(url);
     }
 
-    /// The dispatch picker: the runtime strip, then a type-to-filter model
-    /// search and the filtered, scrollable list of that harness's models.
-    /// Clicking a runtime SELECTS it and loads its models; typing narrows the
-    /// model list (matched against id OR label); clicking a model dispatches
-    /// immediately; enter dispatches with both highlights. Before the options
-    /// load it is a single "Loading…" row.
+    /// The dispatch picker: the runtime strip, the account strip, then a
+    /// type-to-filter model search and the filtered, scrollable list of that
+    /// harness's models. Clicking a runtime SELECTS it and loads its models;
+    /// clicking an account SELECTS whose subscription the run spends; typing
+    /// narrows the model list (matched against id OR label); clicking a model
+    /// dispatches immediately; enter dispatches with all three highlights.
+    /// Before the options load each strip is a single "Loading…" label.
     fn render_dispatch_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let draft = self.dispatch.clone().expect("picker renders only when open");
@@ -2267,7 +2491,10 @@ impl BoardPanel {
             );
         }
 
-        // Row 2: the model search + a "shown of total" count.
+        // Row 2: whose subscription the run spends (gh#74).
+        let account_row = self.render_account_strip(&draft, &theme, cx);
+
+        // Row 3: the model search + a "shown of total" count.
         let (total_models, filtered): (usize, Vec<usize>) = match draft.catalog() {
             Some(ModelCatalog::Ready(models)) => {
                 (models.len(), filtered_model_indices(models, &query))
@@ -2388,7 +2615,7 @@ impl BoardPanel {
                 .into_any_element(),
         };
 
-        // Row 4: the key hint.
+        // Row 5: the key hint.
         let hint = div()
             .flex_none()
             .px(px(Theme::SPACE_LG))
@@ -2410,10 +2637,116 @@ impl BoardPanel {
             .flex()
             .flex_col()
             .child(runtime_row)
+            .child(account_row)
             .child(model_row)
             .child(list)
             .child(hint)
             .into_any_element()
+    }
+
+    /// The account strip: which saved login this dispatch spends (gh#74).
+    ///
+    /// Chips, like the runtime row — a box has a handful of logins, not a
+    /// catalog. The first chip is the route's own account: dispatching on it
+    /// sends no override, which is exactly what every dispatch did before this
+    /// row existed. The rest are the logins the highlighted runtime's harness
+    /// can actually spend; a harness with none saved leaves just the default,
+    /// which is the honest answer for a single-account box.
+    fn render_account_strip(
+        &self,
+        draft: &DispatchDraft,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focused = draft.row == PickerRow::Account;
+        let options = draft.account_options();
+        let label: SharedString = match (&draft.accounts, options.is_empty()) {
+            (AccountCatalog::Error(err), _) => {
+                format!("{err} — enter dispatches on the route's").into()
+            }
+            (AccountCatalog::Loading, _) => "Loading accounts…".into(),
+            (AccountCatalog::Ready(_), true) => "Account · none saved here".into(),
+            (AccountCatalog::Ready(_), false) => "Account".into(),
+        };
+        // Row 0 names what "no override" spends, so the default is a choice
+        // rather than a blank: the route's account when it has one, otherwise
+        // the device's own CLI login.
+        let default_label = match draft.route_account.as_deref() {
+            Some(account) => format!("Route default · {account}"),
+            None => "Route default".to_string(),
+        };
+        let chips: Vec<(usize, String)> = std::iter::once((0, default_label))
+            .chain(
+                options
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, account)| (ix + 1, account_label(account))),
+            )
+            .collect();
+
+        let mut row = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_LG))
+            .py(px(6.0))
+            .border_t_1()
+            .border_color(theme.white_alpha(0.06))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(if focused {
+                        theme.accent
+                    } else {
+                        theme.text_faint
+                    })
+                    .child(label),
+            );
+        for (ix, chip_label) in chips {
+            let active = ix == draft.active_account;
+            let key = format!("board-account-{}-{ix}", draft.task_id);
+            row = row.child(
+                div()
+                    .id(key)
+                    .flex_none()
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(if active && focused {
+                        theme.accent.opacity(0.16)
+                    } else if active {
+                        theme.accent.opacity(0.08)
+                    } else {
+                        theme.wash(0.05)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_account(ix, cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(if active {
+                                if focused {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted.opacity(0.9)
+                                }
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(SharedString::from(chip_label)),
+                    ),
+            );
+        }
+        row.into_any_element()
     }
 
     /// One model row in the picker's filtered list. The catalog's first row —
@@ -2718,6 +3051,7 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
             started_at: None,
             account: None,
+            dispatched_by_user: None,
         }
     }
 
@@ -2907,14 +3241,15 @@ mod tests {
 
     fn runtimes() -> Vec<BoardRuntime> {
         [
-            ("claude-code", "Claude Code"),
-            ("opencode", "OpenCode"),
-            ("codex", "Codex"),
+            ("claude-code", "Claude Code", HarnessId::ClaudeCode),
+            ("opencode", "OpenCode", HarnessId::Opencode),
+            ("codex", "Codex", HarnessId::Codex),
         ]
         .into_iter()
-        .map(|(name, label)| BoardRuntime {
+        .map(|(name, label, harness)| BoardRuntime {
             name: name.into(),
             label: label.into(),
+            harness,
         })
         .collect()
     }
@@ -3027,5 +3362,80 @@ mod tests {
         // An out-of-range highlight (nothing matches) dispatches nothing.
         let empty = filtered_model_indices(&catalog, "nonesuch");
         assert!(empty.get(0).is_none());
+    }
+
+    // ---- the account strip (gh#74) ----
+
+    fn account(id: &str, email: &str, harness: HarnessId) -> AgentAccount {
+        AgentAccount {
+            id: id.into(),
+            harness,
+            email: Some(email.into()),
+            plan_label: None,
+            active: false,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    fn accounts() -> Vec<AgentAccount> {
+        vec![
+            account("slot-ana", "ana@example.com", HarnessId::ClaudeCode),
+            account("slot-box", "box@example.com", HarnessId::ClaudeCode),
+            account("slot-cod", "cod@example.com", HarnessId::Codex),
+        ]
+    }
+
+    #[test]
+    fn the_strip_offers_only_logins_the_runtime_can_spend() {
+        let all = accounts();
+        let claude = accounts_for_harness(&all, Some(HarnessId::ClaudeCode));
+        assert_eq!(
+            claude.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["slot-ana", "slot-box"],
+            "a codex slot cannot pay for a claude run"
+        );
+        assert_eq!(
+            accounts_for_harness(&all, Some(HarnessId::Cursor)).len(),
+            0,
+            "a harness with nothing saved offers nothing but the default"
+        );
+        assert!(
+            accounts_for_harness(&all, None).is_empty(),
+            "before the runtime list lands there is no harness to filter by"
+        );
+    }
+
+    #[test]
+    fn row_zero_is_the_routes_account_and_sends_no_override() {
+        let all = accounts();
+        let options = accounts_for_harness(&all, Some(HarnessId::ClaudeCode));
+        assert_eq!(override_account_id(&options, 0), None);
+        assert_eq!(override_account_id(&options, 1), Some("slot-ana"));
+        assert_eq!(override_account_id(&options, 2), Some("slot-box"));
+        // An out-of-range highlight never sends someone else's login.
+        assert_eq!(override_account_id(&options, 9), None);
+    }
+
+    #[test]
+    fn an_account_chip_names_the_person_it_bills() {
+        let mut anonymous = account("slot-x", "", HarnessId::ClaudeCode);
+        anonymous.email = None;
+        assert_eq!(
+            account_label(&account("slot-ana", "ana@example.com", HarnessId::ClaudeCode)),
+            "ana@example.com"
+        );
+        anonymous.display_name = Some("Ana".into());
+        assert_eq!(account_label(&anonymous), "Ana");
+        anonymous.display_name = None;
+        assert_eq!(
+            account_label(&anonymous),
+            "slot-x",
+            "a slot with no name still has to be pickable"
+        );
     }
 }

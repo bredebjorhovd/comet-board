@@ -52,7 +52,7 @@ working after you close your laptop.
 ## Install the daemon (Linux)
 
 ```bash
-curl -fsSL https://comet.zeron.sh/install.sh | sh
+curl -fsSL https://edge.comet.offhand.dev/install.sh | sh
 comet login                          # sign in (paste a code, done)
 systemctl --user start comet-native
 ```

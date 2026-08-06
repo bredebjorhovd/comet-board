@@ -65,6 +65,10 @@ nearly verbatim — it never depended on herdr:
   a live attempt, pure. Within / warn / cancel, plus the grace the warning
   buys. The machinery is `sync.rs`'s `enforce_duration_cap`, on the interval
   reconcile — the same clock orphaning rides.
+- `crates/board/src/gc.rs` — **new** (H12, gh#72): whose an attempt's checkout
+  is (live / held / spent) and when it may go, pure — plus the worktree-root
+  measurement `doctor` reports. The machinery is `sync.rs`'s
+  `collect_worktrees`, on the same interval clock.
 - `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
@@ -131,16 +135,19 @@ nearly verbatim — it never depended on herdr:
   `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, runtime?, model?, account?}` →
+`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
-`ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch can be
-pointed at (the canonical set `build_spec` validates an override against) for
-pickers in the desktop panel and the CLI. `runtime`/`model`/`account` override
-the route's configured runtime, the harness's default model, and the route's
-`account` for that one dispatch; the attempt row records whatever the agent
-actually ran under.
+`ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
+can be pointed at (the canonical set `build_spec` validates an override against)
+for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
+name resolves to, so a picker can tell which agent accounts a runtime could
+spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
+override the route's configured runtime, the harness's default model, and the
+route's `account` for that one dispatch; the attempt row records whatever the
+agent actually ran under. `via`/`viaDevice`/`viaUser` are provenance, never
+authority — see §H12.
 
 ### Per-run agent accounts (gh#59)
 
@@ -172,9 +179,11 @@ change it. An account that will not resolve **refuses** the dispatch before the
 chat exists, and refuses a later run rather than falling back — a silent
 fallback bills whoever the device's own login belongs to.
 
-Deliberately not in v1: inferring an account from the WorkOS user who
-dispatched. `via` already records who released the work; guessing a login from
-it is the kind of clever that bills the wrong person. `comet-board doctor`
+Deliberately not in v1, and still not: inferring an account from the WorkOS user
+who dispatched. §H12 now records who released the work by name as well as by
+chat, and that changes nothing here — guessing a login from either is the kind
+of clever that bills the wrong person, and the identity it would guess from is
+unverified. `comet-board doctor`
 checks each route's `account` against the device's saved logins, including the
 CLI it belongs to — a Claude slot on a codex route is not lendable, since the
 two config-dir variables are not interchangeable.
@@ -285,8 +294,11 @@ Do not resurrect these; their reasons to exist are herdr's, not comet's.
   the agent.
 - `ui/` — herdr-board's own ratatui app. The board renders inside comet's
   existing frontends instead (H7).
-- `settled.rs`'s screen-resample half and `gc.rs`'s pane logic. Settle keys
-  off run-journal events now (H4); worktrees are the engine's (`repos.rs`).
+- `settled.rs`'s screen-resample half and `gc.rs`'s **pane** logic. Settle keys
+  off run-journal events now (H4); there are no panes to collect. Its
+  *worktree* half was the half that mattered and its absence was a leak —
+  ported at last as H12 below (gh#72), keyed on board state rather than on
+  herdr's pane listing.
 - herdr-board's `adopt.rs` as written — it walked herdr workspaces. Its
   successor landed with H8 as `crates/board/src/adopt.rs`, walking comet
   spaces; the routing.toml writer came over verbatim.
@@ -425,6 +437,11 @@ section of `render.rs`) plus the shared derivations in `crates/proto/src/view/bo
 - `enter` dispatches a ready row (the operator's dispatch, so no `via`), retries
   a failed one (H11), opens a working/blocked row's chat, and folds section
   headers. `R` retries, replacing a blocked row's live attempt (H11).
+
+- `enter` releases a ready row (the operator's dispatch, so no `via`) — through
+  the account picker H12 added, whose first row is the route's own account and
+  so is the behaviour this line described before it; opens a working/blocked
+  row's chat, and folds section headers.
 - The `f` / `/` / `F` filter cycle, with the `/` field replacing the footer and
   the filter's label holding the header corner.
 - The derivations live in `comet_proto::view::board` — `Filter`, `sections`,
@@ -451,8 +468,9 @@ that need only H1):
 - `adopt` — detection offers git-detected spaces whose repo is missing a
   route and/or a `[github] repos` entry; the validated text-edit writer,
   `.bak` backup, ignore list, and backlog preview came over verbatim. The
-  label-picker survives as `--labels`/`--all-issues` on the CLI (H7's screen
-  can reuse `preview` + `adopt_with` as-is).
+  label-picker survives as `--labels`/`--all-issues` on the CLI. H13 took that
+  reuse: `WriteBoardConfig {op: adopt}` calls `adopt_with` unchanged, and the
+  settings page's Add is that call.
 
 ### H9 — Relay-forward the board RPCs — **done** (gh#55)
 The four board methods joined `forwardable` in `crates/engine/src/rpc.rs`
@@ -661,6 +679,144 @@ one genuine fault — an address that cannot be posted to, where the operator
 asked for the notice and every one is being dropped into a log line. Only that
 last state fails; a `doctor` that exits 1 over a preference stops meaning
 anything.
+
+### H14 — Worktree gc — **done** (gh#72)
+Landed as `crates/board/src/gc.rs` (the pure decision + the disk measurement)
+plus `SyncEngine::collect_worktrees` in `sync.rs`, with `retain_worktrees` on
+`[defaults]` (7d, `off` to disable).
+
+Nothing deleted a worktree before this. `Repos::delete_worktree` was reachable
+only from the `DeleteWorktree` RPC: settle, orphan, cancel and retry-replace all
+close the attempt row and walk away, so every attempt leaked a full checkout
+plus a local branch, forever. And the branch leaked even from the RPC — that
+function deleted a branch only when it was named `comet/…`, while the board's
+come from `branch_template` and are `board/…`.
+
+The shape:
+- **Whose is it.** `gc::standing` reads three states off the task: *live* (any
+  live attempt on the task — retries reuse the branch, so a closed attempt's
+  directory is usually the live one's), *held* (a pull request still open, or an
+  issue still owed — a retry lands on the previous attempt's commits and must
+  find them), *spent* (closed upstream, deleted upstream, or marked done, with
+  no open PR). Only spent is collectable, and it is read off upstream facts
+  rather than off the rendered `BoardState`, so the sweep does not depend on
+  having re-derived first.
+- **The clock starts when it is freed**, not when the attempt ended: a PR open
+  for a fortnight would otherwise be collected the instant it merged. The mark
+  is `attempts.collectable_at`; coming back to life clears it, so the next
+  window is whole.
+- **Wall time, on the interval**, like the cap and orphaning.
+- **Never silent.** The mark and the collection are both log lines naming the
+  path, a week apart.
+- **The branch too.** `delete_worktree` now takes the branch its creator
+  vouches for and deletes it when the checkout is still on it (or gone). An
+  operator's own branch checked out in there is still off limits, which is what
+  the `comet/` test was standing in for.
+- **`doctor` says what it costs.** A `worktrees` check reports the checkout
+  count, the disk under the root (time-boxed walk; `≥` when it ran out), how
+  many the board still tracks, and the retention window in force — the warning
+  that makes the leak visible before the disk is full.
+
+Deliberately not here: collecting checkouts the board has no row for (comet's
+own `comet/…` worktrees, attempts whose task was reaped). `doctor` counts them,
+because the disk does; deleting a directory nothing claims is a bigger decision
+than this one.
+
+### H15 — The frontends send an account, and say who dispatched — **done** (gh#74)
+`DispatchTask` has taken an `account` since gh#59 and no frontend sent one, so
+a dispatch from the panel spent whatever the route said — which on a shared box
+means the owner's subscription, whoever pressed enter. Nothing recorded who that
+was either: `Dispatcher::Operator` is anonymous by construction.
+
+**The account picker.** The desktop panel's dispatch picker grew a third strip
+between runtime and model; the TUI, which had no picker at all, opens one on
+`enter` over a ready row. Both are fed by `ListAgentAccounts` **on the board's
+host** — the run executes there, and a slot id means nothing on the device that
+did not save it, the same reason `ListModels` is fetched with the host
+passthrough. Both filter the slots to the harness the row's runtime resolves to,
+which is why `ListBoardRuntimes` now carries `harness`: a Claude slot cannot pay
+for a codex run (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not interchangeable),
+and offering one would be offering a dispatch that refuses itself.
+
+Row 0 in both is **the route's own account**, and sends no override — so
+enter-enter is exactly what enter did before, and the strip costs a keystroke
+rather than a decision. It names the route's account where the row knows one, so
+the default is a fact rather than a shrug. Picking a slot is one click and never
+itself the release: whose limits a run burns is too consequential to happen by
+accident, so the model row (or enter) still does the releasing.
+
+**Attribution, at the strength the transport allows.** Every dispatch from
+either frontend now carries `viaDevice` (this device's id) and `viaUser` (the
+signed-in email), recorded on the attempt as `dispatched_by_device` /
+`dispatched_by_user`. `dispatched_by_user` joins the `TaskRow` contract, so
+`list --json` and both viewports can say who released a row; the device id
+deliberately stays off the wire, since it names a laptop, not a person. With no
+agent in the chain the upstream dispatch comment names the human — "dispatched
+by ana@example.com" — where it previously said nothing at all.
+
+These are **claims, not credentials**, and `DispatchOrigin` says so where the
+code is: relayed board calls arrive as the device room's owner (§H9), so the box
+has no per-call identity to check them against. #66 established that a teammate
+may reach the box at all; establishing *which* teammate is the next step, and
+these two columns are where a verified identity will land. Until then nothing is
+authorized on them, and in particular no account is inferred from them — which
+subscription a run spends stays the explicit `account` (gh#59).
+
+Deliberately not here: a per-user default account (that is a preference, and
+preferences want a home and a settings surface), and any UI for reading the
+attribution back beyond the row field — the panel's dispatch notice names the
+account it spent, and the issue comment names the human, which is where people
+were already looking.
+
+### H13 — Remote routing surface — **done** (gh#75)
+`routing.toml` is a hand-edited file on the box, documented as "not managed
+config", and no RPC touched it. Adding a repo, pointing a route at a different
+agent account, or lifting a cap was an ssh-and-edit job — fine for whoever set
+the box up, a dead end for the teammate #66 just let onto the board.
+
+An RPC pair, `ReadBoardConfig` / `WriteBoardConfig`, both forwardable for the
+same reason the board four are: the file lives on the host.
+
+- **`crates/board/src/routes.rs`** is the file half. `read` answers with the
+  text, its parse, and *everything* wrong with it; `edit` applies one change.
+  Every write goes through `adopt::apply` — the writer H8 already proved out —
+  so the discipline is one implementation and not two: it has to parse, it has
+  to validate, and the previous contents land in `routing.toml.bak` first. An
+  edit that would break the config is refused naming what it would have broken,
+  and the file is untouched. `RoutingConfig` gained `Serialize` so a reader can
+  be handed the parse; nothing writes TOML from it, because every edit is a
+  *text* edit for the reason `add_to_array` gives — the file is full of
+  comments explaining choices, and re-serializing throws all of them away.
+- **`RoutingConfig::problems`** collects what `validate` refuses on instead of
+  stopping at the first. Same checks, same strings; `validate` is now "the first
+  problem, if any". An editor that shows one at a time turns fixing three into
+  three round trips, and the reader of a remote box's config cannot see the file
+  to spot the rest.
+- **The edits are a closed list.** `text` (whole file, with an optional `base`
+  precondition), `route` and `default` (one typed key each), plus `adopt` and
+  `ignore`, which live on the engine because they need the space list and a git
+  probe. An unknown key is refused *by name*: a misspelt key in a TOML file is
+  not an error — it parses, it is ignored, and the route goes on behaving the
+  way it did while somebody believes they changed it. Multi-line-string tracking
+  is load-bearing in the key finder, exactly as it is in `header_lines`: a
+  route's `prompt = """…"""` containing a line that reads `base = …` is prose,
+  and editing it would rewrite the agent's brief.
+- **`comet-board routes`** — `list` (routes, problems, what is unadopted),
+  `show`, `add`/`ignore`, `set <n> <key> <value>`, `defaults <key> <value>`, and
+  `edit` for `$EDITOR`. All over the RPC, so `--device` reaches the box; `adopt`
+  stays the local-files command it was. `routes edit` carries the text it
+  started from, so a hand-edit on the box in the meantime is refused rather than
+  overwritten — this is still a file people edit by hand.
+- **Settings → Board routing** (`crates/ui/src/settings/routing.rs`) is the
+  desktop half: the routes, the problems as warning strips, per-route Runtime /
+  Account / Cap, and the unadopted list with Add and Ignore. It finds the host
+  by the same contract the board panel sweeps on — the engine refuses a board
+  method outright when it hosts no board, so a candidate that errors has
+  answered "not me" — which keeps it independent of whether the board panel has
+  ever been opened.
+- **Not touched: `.env`.** Credentials are the other hand-edited file, and
+  moving secrets over the wire is a different decision from moving routes.
+  `doctor` still says which keys are missing.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

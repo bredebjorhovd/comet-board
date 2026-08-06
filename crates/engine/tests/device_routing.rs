@@ -692,6 +692,90 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         );
     }
 
+    // gh#75: so does the config. `routing.toml` is a file on B's disk, and A
+    // is the teammate with no ssh account on B — reading and writing it over
+    // the relay is the whole point.
+    let routing_path = Paths::under(&board_dir).expect("board paths").routing();
+    let read = client
+        .call(
+            methods::READ_BOARD_CONFIG,
+            serde_json::json!({ "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote ReadBoardConfig");
+    assert_eq!(
+        read["routing"]["path"].as_str(),
+        Some(routing_path.display().to_string().as_str()),
+        "the path is B's, not A's: {read}"
+    );
+    assert_eq!(
+        read["routing"]["exists"].as_bool(),
+        Some(false),
+        "nothing has written B a routing.toml yet: {read}"
+    );
+
+    // A writes B's first config, and it lands on B's disk.
+    let text = "[[route]]\nmatch = { gh_repo = \"o/r\" }\nworkspace = \"box\"\n\
+                repo = \"/tmp\"\nruntime = \"claude-code\"\n";
+    let wrote = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "text", "text": text, "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect("remote WriteBoardConfig");
+    assert_eq!(
+        wrote["routing"]["config"]["route"][0]["workspace"].as_str(),
+        Some("box"),
+        "the reply is a fresh read of what landed: {wrote}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&routing_path).expect("B's routing.toml"),
+        text,
+        "the file B's board loop reads is the one A wrote"
+    );
+
+    // And a targeted edit that would not validate is refused by B, with B's
+    // reason, leaving B's file exactly as it was.
+    let refused = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "route", "route": 0, "key": "runtime", "value": "nonesuch",
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect_err("an unknown runtime is refused");
+    assert!(
+        refused.to_string().contains("not a comet harness"),
+        "the refusal names what it would have broken: {refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&routing_path).expect("B's routing.toml"),
+        text,
+        "a refused edit leaves the config the board is running on untouched"
+    );
+
+    // A valid one lands.
+    let set = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "route", "route": 0, "key": "max_duration", "value": "6h",
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect("remote route edit");
+    assert_eq!(
+        set["routing"]["config"]["route"][0]["max_duration"].as_str(),
+        Some("6h"),
+        "got: {set}"
+    );
+
     core_a.shutdown().await;
     core_b.shutdown().await;
 }

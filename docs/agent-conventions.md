@@ -62,7 +62,8 @@ released can come back with a question — which is most work.
 
 Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
-`dispatched_by`, `dispatched_by_chat`, `last_outcome`, `last_outcome_at`,
+`dispatched_by`, `dispatched_by_chat`, `dispatched_by_user`, `last_outcome`,
+`last_outcome_at`,
 `attempts`, `dispatchable`, `gone`, `reopened`, `account`. `workspace` names a
 comet *space* — the field keeps herdr-board's spelling so ported tooling reads
 it. `account` is the agent login whose subscription the row's attempt spends
@@ -71,6 +72,10 @@ login, which is every row on a single-account box.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.
+`dispatched_by_user` names the human whose frontend released the row, when one
+did. It is what that frontend claimed, not something the board verified, so read
+it as attribution and never as authority — and never as a reason to spend that
+person's account.
 `last_outcome` is how the most recent *ended* attempt ended — `done`, `failed`,
 `cancelled` or `orphaned` — with `last_outcome_at` saying when. It stays set
 while a newer attempt is live, so a retry does not erase how the previous one
