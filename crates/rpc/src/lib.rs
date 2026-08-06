@@ -58,6 +58,12 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";
+    // Workspace members and invitations (gh#76; edge /auth/orgs/:id/invites).
+    pub const LIST_MEMBERS: &str = "ListMembers";
+    pub const LIST_INVITES: &str = "ListInvites";
+    pub const INVITE_MEMBER: &str = "InviteMember";
+    pub const REVOKE_INVITE: &str = "RevokeInvite";
+    pub const ACCEPT_INVITE: &str = "AcceptInvite";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";

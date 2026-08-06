@@ -83,6 +83,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | WorkOS exchange/refresh, org list/create at edge | done | `/auth/*` routes; API key stays edge-side. |
+| Member invitations (fork addition, gh#76) | done | `/auth/orgs/:id/invites` + `/auth/invites/accept`; Settings → Members, and a paste-the-code row on the org gate. |
 | Postgres/signaling dropped | done | Nothing depends on them. |
 
 ## §8 Exclusions

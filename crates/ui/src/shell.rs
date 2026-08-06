@@ -36,6 +36,7 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearanceEvent, AppearancePage};
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::members::MembersPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
@@ -149,15 +150,17 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 pub enum SettingsSection {
     Devices,
     Agents,
+    Members,
     Appearance,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
+        SettingsSection::Members,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -170,6 +173,8 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Agents => "Accounts",
+            // gh#76 — the workspace roster and its invitations.
+            SettingsSection::Members => "Members",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -416,11 +421,16 @@ enum UpdateFlow {
 /// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
 struct OrgGateUi {
     name_input: Entity<ComposerInput>,
+    /// The invitation code an invited teammate pastes (gh#76). The gate is
+    /// where it belongs: someone invited into an existing workspace lands here
+    /// with no org of their own, and creating one would be the wrong answer.
+    invite_input: Entity<ComposerInput>,
     orgs: Loadable<Vec<OrgRow>>,
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
     _events: Subscription,
+    _invite_events: Subscription,
 }
 
 pub struct Shell {
@@ -444,6 +454,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    members_page: Option<Entity<MembersPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -613,6 +624,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/members") => Route::Settings(SettingsSection::Members),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -653,6 +665,7 @@ impl Shell {
             route,
             nav,
             devices_page: None,
+            members_page: None,
             archived_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1197,6 +1210,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Members => {
+                if self.members_page.is_none() {
+                    let state = self.state.clone();
+                    self.members_page = Some(cx.new(|cx| MembersPage::new(state, cx)));
+                }
+                match &self.members_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Appearance => {
                 if self.appearance_page.is_none() {
                     let state = self.state.clone();
@@ -1396,13 +1419,21 @@ impl Shell {
                 this.create_org(cx);
             }
         });
+        let invite_input = cx.new(|cx| ComposerInput::new("Invitation code", cx));
+        let invite_events = cx.subscribe(&invite_input, |this: &mut Shell, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.accept_invite(cx);
+            }
+        });
         self.org = Some(OrgGateUi {
             name_input,
+            invite_input,
             orgs: Loadable::Idle,
             submitting: false,
             error: None,
             task: None,
             _events: events,
+            _invite_events: invite_events,
         });
         self.load_orgs(cx);
     }
@@ -1461,6 +1492,45 @@ impl Shell {
                     }
                     // Success: the AuthStatus stream flips to SignedIn and the
                     // gate falls away on its own.
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Redeem a pasted invitation code (gh#76). On success the engine scopes
+    /// the session to the workspace that invited us, the AuthStatus stream
+    /// flips to SignedIn, and this gate falls away — same landing as picking a
+    /// membership.
+    fn accept_invite(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(org) = self.org.as_mut() else { return };
+        if org.submitting {
+            return;
+        }
+        let token = org.invite_input.read(cx).text().trim().to_string();
+        if token.is_empty() {
+            org.error = Some("Paste the invitation code from your email".into());
+            cx.notify();
+            return;
+        }
+        org.submitting = true;
+        org.error = None;
+        org.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::ACCEPT_INVITE, serde_json::json!({ "token": token }))
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(org) = shell.org.as_mut() {
+                    org.submitting = false;
+                    if let Err(err) = result {
+                        org.error = Some(format!("{err}").into());
+                    }
                 }
                 cx.notify();
             })
@@ -1720,6 +1790,9 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            // The embedded Solar set has no people glyph; the workspace roster
+            // is a list of who is in it.
+            SettingsSection::Members => icons::CHECKLIST,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
@@ -3290,6 +3363,7 @@ impl Shell {
         let submitting = org.submitting;
         let error = org.error.clone();
         let name_input = org.name_input.clone();
+        let invite_input = org.invite_input.clone();
         let orgs = org.orgs.clone();
 
         let email: Option<SharedString> = self
@@ -3362,6 +3436,62 @@ impl Shell {
                     ))
                     .into_any_element(),
             };
+
+        // Someone who was invited into an existing workspace has nothing to
+        // create — they have a code (gh#76). The same 36px field/button pair
+        // as the name form, one notch quieter.
+        let join = div()
+            .mt(px(24.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pb(px(8.0))
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from("Or join a workspace you were invited to")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(36.0))
+                            .flex()
+                            .items_center()
+                            .px(px(12.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.bg)
+                            .text_size(px(13.0))
+                            .child(invite_input),
+                    )
+                    .child(
+                        div()
+                            .id("accept-invite")
+                            .h(px(36.0))
+                            .px(px(16.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .when(submitting, |el| el.opacity(0.5))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.element_hover))
+                            .on_click(cx.listener(|this, _, _, cx| this.accept_invite(cx)))
+                            .child(SharedString::from("Join")),
+                    ),
+            );
 
         // comet App.tsx OrgGate: w-400 card on the grid — logo, headline,
         // explainer (+ signed-in email), name form with a white Create button,
@@ -3454,6 +3584,7 @@ impl Shell {
                     ),
             )
             .child(memberships)
+            .child(join)
             .when_some(error, |el, message| {
                 el.child(
                     div()

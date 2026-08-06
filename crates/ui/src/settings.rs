@@ -16,6 +16,7 @@ pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
+pub mod members;
 pub mod shortcuts;
 pub mod widgets;
 
