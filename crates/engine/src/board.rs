@@ -78,6 +78,11 @@ pub struct BoardService {
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     watch_task: tokio::task::JoinHandle<()>,
     rows: watch::Receiver<Vec<TaskRow>>,
+    /// Where this board's `routing.toml`, `.env` and store live. Kept here so
+    /// the config RPCs (gh#75) resolve them off the running service rather than
+    /// re-deriving them from the data dir — two answers to "which routing.toml"
+    /// is one too many, and `COMET_BOARD_CONFIG_DIR` makes it a real risk.
+    paths: Paths,
 }
 
 impl BoardService {
@@ -127,19 +132,33 @@ impl BoardService {
             }
         });
 
+        let loop_paths = paths.clone();
         let thread = std::thread::Builder::new()
             .name("comet-board-sync".into())
-            .spawn(move || match SyncEngine::from_paths(&paths, log.clone()) {
-                Ok(engine) => run_loop(engine, rx, log, runtime, handle, spaces, rows_tx),
-                Err(e) => log.error(format!("board loop failed to start: {e}")),
-            })?;
+            .spawn(
+                move || match SyncEngine::from_paths(&loop_paths, log.clone()) {
+                    Ok(engine) => run_loop(engine, rx, log, runtime, handle, spaces, rows_tx),
+                    Err(e) => log.error(format!("board loop failed to start: {e}")),
+                },
+            )?;
         tracing::info!("board service started");
         Ok(BoardService {
             tx,
             thread: std::sync::Mutex::new(Some(thread)),
             watch_task,
             rows: rows_rx,
+            paths,
         })
+    }
+
+    /// This board's directories — where `ReadBoardConfig` / `WriteBoardConfig`
+    /// find `routing.toml`.
+    ///
+    /// Available even when the sync loop failed to start: a config that does
+    /// not parse stops the loop and is exactly the thing somebody then needs to
+    /// read and fix.
+    pub fn paths(&self) -> &Paths {
+        &self.paths
     }
 
     /// The board's rows, current value first — what `WatchBoard` streams.

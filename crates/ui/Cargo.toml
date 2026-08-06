@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 comet-proto.workspace = true
 comet-doc.workspace = true
+# The board's config types (gh#75): the routing settings page renders
+# `RoutingConfig` as the board parsed it, rather than a second twin of the
+# same TOML that would drift key by key. Already in the graph via comet-engine.
+comet-board.workspace = true
 comet-engine.workspace = true
 comet-rpc.workspace = true
 comet-update.workspace = true

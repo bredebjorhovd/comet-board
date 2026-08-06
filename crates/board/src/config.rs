@@ -1,7 +1,7 @@
 //! Board directories, `.env` secrets, and `routing.toml`.
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -180,7 +180,7 @@ pub fn github_auth(paths: &Paths) -> GithubAuth {
     Credentials::load(paths).github_auth()
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub sync: SyncConfig,
@@ -202,7 +202,7 @@ pub struct RoutingConfig {
 /// `[github] repos` entries, because those are the config that already exists.
 /// Ignoring has nowhere else to live — "I am only reading this repo" is not a
 /// fact any other key can carry.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdoptConfig {
     /// `owner/repo` entries the board will never offer again. Delete a line to
     /// be offered it once more.
@@ -216,7 +216,7 @@ impl AdoptConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     /// Poll interval, e.g. `"30s"`.
     #[serde(default = "default_interval")]
@@ -288,7 +288,7 @@ pub fn parse_max_duration(s: &str) -> std::result::Result<Option<u64>, String> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_per_workspace: usize,
@@ -382,7 +382,7 @@ impl Default for Defaults {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubConfig {
     /// `owner/repo` entries to poll for issues and PRs.
     #[serde(default)]
@@ -462,7 +462,7 @@ impl Default for GithubConfig {
 /// labels = ["release-a"]
 /// writeback = false
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// `owner/repo`. Must also appear in `[github] repos` — see
     /// [`RoutingConfig::validate`].
@@ -539,7 +539,7 @@ impl GithubConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinearConfig {
     /// Name of the workflow state a task moves to when the board derives
     /// `review` — typically `"In Review"`.
@@ -560,7 +560,7 @@ pub struct LinearConfig {
     pub review_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     /// Name shown in the picker and the prompt view. Defaults to the workspace.
     #[serde(default)]
@@ -615,7 +615,7 @@ impl Route {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteMatch {
     pub linear_team: Option<String>,
     pub linear_project: Option<String>,
@@ -695,44 +695,62 @@ impl RoutingConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        // Refusing on the first problem is the load path's contract: a config
+        // that is wrong anywhere is not used at all, and the first reason is
+        // the one to act on. The rest are still worth *seeing*, which is what
+        // [`RoutingConfig::problems`] is for.
+        match self.problems().into_iter().next() {
+            Some(problem) => bail!(problem),
+            None => Ok(()),
+        }
+    }
+
+    /// Everything wrong with this config, in file order.
+    ///
+    /// The same checks [`RoutingConfig::validate`] refuses on, collected rather
+    /// than stopped at the first — an editor showing one problem at a time
+    /// turns fixing three of them into three round trips, and the reader of a
+    /// remote box's config cannot see the file to spot the rest.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
         for (i, r) in self.routes.iter().enumerate() {
             if r.match_.is_empty() {
                 // A catch-all route is legal and useful, but it must be last or
                 // it silently shadows everything after it.
                 if i + 1 != self.routes.len() {
-                    bail!(
+                    out.push(format!(
                         "route {} ({}) has an empty `match` but is not last; \
                          first matching route wins, so it would shadow the {} route(s) after it",
                         i + 1,
                         r.display_name(),
                         self.routes.len() - i - 1
-                    );
+                    ));
                 }
             }
             if harness_for_runtime(&r.runtime).is_none() {
-                bail!(
+                out.push(format!(
                     "route {} ({}) has runtime `{}`, which is not a comet harness. \
                      Known runtimes: {}",
                     i + 1,
                     r.display_name(),
                     r.runtime,
                     RUNTIME_NAMES.join(", ")
-                );
+                ));
             }
             // A typo here reads exactly like "no cap" on the board, and only
             // one of those is what anybody meant (gh#70).
             if let Some(d) = &r.max_duration
                 && let Err(e) = parse_max_duration(d)
             {
-                bail!(
+                out.push(format!(
                     "route {} ({}) has max_duration {e}",
                     i + 1,
                     r.display_name()
-                );
+                ));
             }
         }
         if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
-            bail!("[defaults] max_duration {e}");
+            out.push(format!("[defaults] max_duration {e}"));
         }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
@@ -744,24 +762,24 @@ impl RoutingConfig {
                 .iter()
                 .any(|listed| listed.eq_ignore_ascii_case(&r.name))
             {
-                bail!(
+                out.push(format!(
                     "[[github.repo]] name = \"{}\" is not in `[github] repos`, so nothing \
                      would ever use it. Add it to `repos`, or correct the name.",
                     r.name
-                );
+                ));
             }
             if self.github.per_repo[..i]
                 .iter()
                 .any(|earlier| earlier.name.eq_ignore_ascii_case(&r.name))
             {
-                bail!(
+                out.push(format!(
                     "[[github.repo]] name = \"{}\" appears twice; only the first would \
                      be used, so the second is settings that do nothing",
                     r.name
-                );
+                ));
             }
         }
-        Ok(())
+        out
     }
 
     /// First matching route wins (impl spec §5).
