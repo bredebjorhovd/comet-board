@@ -391,6 +391,11 @@ pub struct Attempt {
     /// nudge itself — see [`crate::nudge::recovered`].
     pub nudges: i64,
     pub nudged_at: Option<String>,
+    /// When the board told this attempt's chat it had run past its route's
+    /// `max_duration` (gh#70). `None` is "not warned" — every attempt gets one
+    /// warning and a grace period before the cap closes it, so this is also
+    /// what says whether the grace clock has started. Cleared by a re-open.
+    pub overrun_warned_at: Option<String>,
 }
 
 impl Attempt {

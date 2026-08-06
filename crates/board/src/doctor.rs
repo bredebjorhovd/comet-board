@@ -260,6 +260,15 @@ pub fn doctor(
                     },
                 });
 
+                // Where this route's dispatches branch from (gh#67). Local
+                // only: doctor asks whether the repo has the remote the base
+                // names, not whether the network is up — a fetch here would
+                // hang the report on every unreachable remote, and dispatch
+                // refuses loudly on its own when the fetch fails.
+                if repo_ok {
+                    checks.push(base_check(&name, cfg.base(r), &repo));
+                }
+
                 let harness = harness_for_runtime(&r.runtime).map(harness_name);
                 checks.push(Check {
                     name: format!("route {name}: runtime"),
@@ -268,6 +277,29 @@ pub fn doctor(
                         Some(h) if h == r.runtime => format!("`{}`", r.runtime),
                         Some(h) => format!("`{}` → comet harness `{h}`", r.runtime),
                         None => format!("`{}` is not a comet harness", r.runtime),
+                    },
+                });
+
+                // Always reported, unlike `account` below, because here it is
+                // the *absence* that is the risk: `off` and "never configured"
+                // look identical on the board, and one of them means an agent
+                // on this route runs until somebody looks (gh#70).
+                let cap = cfg.max_duration_secs(Some(r));
+                checks.push(Check {
+                    name: format!("route {name}: duration cap"),
+                    ok: true,
+                    detail: match (cap, r.max_duration.is_some()) {
+                        (Some(secs), true) => {
+                            format!("{} per attempt", crate::overrun::human_secs(secs as i64))
+                        }
+                        (Some(secs), false) => format!(
+                            "{} per attempt (from [defaults])",
+                            crate::overrun::human_secs(secs as i64)
+                        ),
+                        // Not a failure — turning the cap off is a choice, and
+                        // it was every board's behaviour before gh#70. Named
+                        // out loud so it stays a choice.
+                        (None, _) => "off — attempts here run until somebody cancels them".into(),
                     },
                 });
 
@@ -459,6 +491,46 @@ fn minutes(secs: i64) -> String {
         s if s <= 0 => "already expired".into(),
         s if s < 120 => format!("{s}s"),
         s => format!("{}m", s / 60),
+    }
+}
+
+/// Can this route's `base` be resolved at all — i.e. does the repo have the
+/// `origin` the base is fetched from (gh#67)?
+///
+/// Local check only. Whether origin *answers* is a network question, and a
+/// doctor that fetches every route's remote is a doctor that hangs; dispatch
+/// refuses loudly on a failed fetch, which is the case this cannot pre-empt.
+/// What it does pre-empt is the config-level mistake: a route pointing at a
+/// clone with no remote, where every dispatch fails until somebody sets
+/// `base = "HEAD"`.
+fn base_check(name: &str, base: &str, repo: &std::path::Path) -> Check {
+    let check = |ok: bool, detail: String| Check {
+        name: format!("route {name}: base"),
+        ok,
+        detail,
+    };
+    if matches!(base.trim(), "" | "HEAD") {
+        return check(
+            true,
+            "`HEAD` — branches from the repo's current checkout, no fetch".into(),
+        );
+    }
+    let origin = std::process::Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match origin {
+        Some(url) => check(true, format!("`{base}` — fetched from {url}")),
+        None => check(
+            false,
+            format!(
+                "`{base}` needs an `origin` remote; {} has none. Set \
+                 `base = \"HEAD\"` on the route to branch from the checkout instead",
+                repo.display()
+            ),
+        ),
     }
 }
 
@@ -736,6 +808,51 @@ mod tests {
         assert!(space.detail.contains("not checked"), "{}", space.detail);
     }
 
+    /// A route pointing at a clone with no remote fails its `base` check rather
+    /// than failing every dispatch on it (gh#67) — and the opt-out passes.
+    #[test]
+    fn a_route_whose_repo_has_no_origin_fails_the_base_check() {
+        let (d, p) = tmp();
+        let repo = d.path().join("local-only");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["-C", &repo.to_string_lossy(), "init", "-b", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let routing = |base: &str| {
+            std::fs::write(
+                p.routing(),
+                format!(
+                    "[[route]]\nmatch = {{ label = \"x\" }}\nworkspace = \"w\"\n\
+                     repo = \"{}\"\nruntime = \"claude-code\"\nbase = \"{base}\"\n",
+                    repo.display()
+                ),
+            )
+            .unwrap();
+        };
+        let base_check_in = |checks: &[Check]| {
+            checks
+                .iter()
+                .find(|c| c.name == "route w: base")
+                .map(|c| (c.ok, c.detail.clone()))
+                .expect("the route's base is checked")
+        };
+
+        routing("origin/HEAD");
+        let (ok, detail) = base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap());
+        assert!(!ok, "{detail}");
+        assert!(detail.contains("origin"), "{detail}");
+        assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
+
+        routing("HEAD");
+        let (ok, detail) = base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap());
+        assert!(ok, "{detail}");
+    }
+
     fn account(id: &str, email: &str, harness: comet_proto::HarnessId) -> AgentAccount {
         AgentAccount {
             id: id.into(),
@@ -886,6 +1003,46 @@ mod tests {
                 && !c.ok
                 && c.detail.contains("not a comet harness")),
             "the typo is named"
+        );
+    }
+
+    /// The cap is reported whether or not the route sets one: `off` and
+    /// "never thought about it" look identical on the board, and one of them
+    /// means an agent on this route runs until somebody looks (gh#70).
+    #[test]
+    fn every_route_says_what_bounds_its_attempts() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"inherits\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\n\n\
+             [[route]]\nmatch = { label = \"y\" }\nworkspace = \"long\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"6h\"\n\n\
+             [[route]]\nmatch = { label = \"z\" }\nworkspace = \"unbounded\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"off\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let detail = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == format!("route {name}: duration cap"))
+                .unwrap_or_else(|| panic!("{name} has no cap line"))
+                .detail
+                .clone()
+        };
+        assert_eq!(detail("inherits"), "2h per attempt (from [defaults])");
+        assert_eq!(detail("long"), "6h per attempt");
+        assert!(
+            detail("unbounded").starts_with("off —"),
+            "{}",
+            detail("unbounded")
+        );
+        // Off is a choice, not a broken route: it must not fail the report.
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.name != "route unbounded: duration cap" || c.ok)
         );
     }
 

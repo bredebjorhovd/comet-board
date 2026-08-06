@@ -29,6 +29,7 @@ use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
 use crate::log::Logger;
 use crate::model::*;
+use crate::overrun;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Evidence, Verdict};
 use crate::sources::github::{Github, HttpRest, PullRequest, Rest, pr_matches_branch};
@@ -225,7 +226,6 @@ impl SyncEngine {
         statuses: Option<&SessionStatuses>,
         runtime: Option<&dyn Runtime>,
     ) -> Result<Vec<PullRequest>> {
-
         self.poll_linear();
         let pulls = self.poll_github();
 
@@ -801,9 +801,176 @@ impl SyncEngine {
             // PR state is as fresh as a lookup would be.
             self.maybe_settle(runtime, &task, &attempt, status, false)?;
         }
+        // After settling, so an attempt that just finished is never failed for
+        // running long; before the rewatch, which only looks at closed rows.
+        self.enforce_duration_cap(runtime)?;
         // Last, because it may re-open an attempt: doing it first would hand
         // the live pass above a row it has already decided about.
         self.rewatch_settled_attempts(statuses)?;
+        Ok(())
+    }
+
+    // ---- the wall-clock cap (gh#70) --------------------------------------
+
+    /// Bound every live attempt by wall time: warn its chat once past the
+    /// route's `max_duration`, then close it `failed` when the grace runs out.
+    ///
+    /// Nothing else bounds a *running* attempt. The engine's stall watchdog
+    /// hard-stops only a run that emits nothing — its silence-after-output tier
+    /// is advisory by design — so an agent looping happily keeps running until
+    /// somebody looks, and `attempts.started_at` was a column nobody read. The
+    /// same clock closes the other end of that gap: an engine crash past its
+    /// revival budget settles the chat `Idle`, and with no commits
+    /// [`crate::settled::decide`] says `StayLive(NoArtifacts)` — orphaning
+    /// fires on a *missing* session row, and that one exists, so without this
+    /// the row renders `working` forever.
+    ///
+    /// Three properties, in the order they matter:
+    ///
+    /// - **Never silent.** The breach is a warning in the chat and in the log
+    ///   first; the close carries an upstream comment naming the timeout. An
+    ///   agent that gets its warning can commit what it has and open a pull
+    ///   request, and the settle beats the cancel — a run that finishes inside
+    ///   the grace closes `done` on its artifacts like any other.
+    /// - **Wall time, not event time.** Called from the interval reconcile
+    ///   only, exactly as orphaning is, so a burst of session-watch events
+    ///   cannot age an attempt faster than the clock.
+    /// - **Every live attempt**, whatever its status. `blocked` holds a chat
+    ///   and a concurrency slot as surely as `working` does, and a dispatch
+    ///   that never got a session row at all is the most stranded of the lot.
+    ///   The cap bounds the *attempt*; which of the ways it got stuck it took
+    ///   is the log line's business.
+    ///
+    /// `runtime` is what talks to the chat. Without one — the read-only callers
+    /// — the verdict still stands and is still logged and written back; only
+    /// the chat-side warning and interrupt are skipped, because there is
+    /// nothing to send them through.
+    fn enforce_duration_cap(&self, runtime: Option<&dyn Runtime>) -> Result<()> {
+        let interval = self.cfg.sync.interval_secs();
+        let now = chrono::Utc::now();
+        for attempt in self.db.live_attempts()? {
+            let Some(task) = self.db.get_task(&attempt.task_id)? else {
+                continue;
+            };
+            // The route the task resolves to *now*: an attempt outlives the
+            // config that released it, and `max_duration_secs` treats a route
+            // that has since gone away as the default cap rather than as none.
+            let route = self.cfg.resolve(&route_context(&task));
+            let Some(cap) = self.cfg.max_duration_secs(route) else {
+                continue;
+            };
+            let Some(age) = secs_since(&attempt.started_at, now) else {
+                // An unreadable `started_at` is a row we cannot age. Say so
+                // rather than silently exempting it from the cap forever.
+                self.log.warn(format!(
+                    "{}: attempt {} has an unreadable started_at ({}) — \
+                     the duration cap cannot see it",
+                    task.identifier, attempt.id, attempt.started_at
+                ));
+                continue;
+            };
+            // A stamp we cannot parse counts as "warned just now": it means the
+            // warning went out, and the grace restarting is the safe direction
+            // to be wrong in.
+            let warned = attempt
+                .overrun_warned_at
+                .as_deref()
+                .map(|t| secs_since(t, now).unwrap_or(0));
+            let grace = overrun::grace_secs(cap, interval);
+            match overrun::decide(age, warned, cap, grace) {
+                overrun::Verdict::Within => {}
+                overrun::Verdict::Warn => {
+                    self.warn_overrun(runtime, &task, &attempt, age, cap, grace)?
+                }
+                overrun::Verdict::Cancel => {
+                    self.cancel_overrun(runtime, &task, &attempt, age, cap)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The prompt-once warning: into the chat, so the agent can wrap up, and
+    /// into the log, so the operator sees it whether or not the chat is alive.
+    ///
+    /// Stamped **before** the prompt, and stamped whatever the prompt reports.
+    /// A chat that refuses delivery is a chat there is no point re-telling
+    /// every cycle, and a warning that only counted when it landed would leave
+    /// a dead chat's attempt live forever — which is the bug, not the fix.
+    fn warn_overrun(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        age: i64,
+        cap: u64,
+        grace: u64,
+    ) -> Result<()> {
+        self.db.set_overrun_warned(attempt.id)?;
+        self.log.warn(format!(
+            "{} has been live for {} — past its {} cap; \
+             warning chat {} and cancelling in {}",
+            task.identifier,
+            overrun::human_secs(age),
+            overrun::human_secs(cap as i64),
+            attempt.pane_id.as_deref().unwrap_or("(none yet)"),
+            overrun::human_secs(grace as i64),
+        ));
+        let (Some(runtime), Some(chat_id)) = (runtime, attempt.pane_id.as_deref()) else {
+            return Ok(());
+        };
+        let text = format!(
+            "comet-board: this attempt has been running for {} — past the {} cap for its route. \
+             It will be cancelled in {}. Commit what you have and open a pull request now; \
+             if you are looping on something, stop and say so in the PR description.",
+            overrun::human_secs(age),
+            overrun::human_secs(cap as i64),
+            overrun::human_secs(grace as i64),
+        );
+        if let Err(e) = runtime.prompt(chat_id, &text) {
+            self.log.warn(format!(
+                "{}: warning chat {chat_id} about the duration cap: {e:#}",
+                task.identifier
+            ));
+        }
+        Ok(())
+    }
+
+    /// The grace ran out. Interrupt and archive the chat as a cancel does,
+    /// close the attempt `failed`, and write back upstream naming the timeout.
+    ///
+    /// `failed` rather than `cancelled`: nobody chose this, and the two
+    /// verdicts derive differently — `cancelled` returns the issue to `ready`
+    /// as if the attempt had never been made, while `failed` renders the row
+    /// red and keeps it there until somebody decides what to do with it. A run
+    /// that hit the ceiling is exactly the second thing.
+    fn cancel_overrun(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        age: i64,
+        cap: u64,
+    ) -> Result<()> {
+        if let (Some(runtime), Some(chat_id)) = (runtime, attempt.pane_id.as_deref())
+            && let Err(e) = runtime.cancel(chat_id)
+        {
+            // The attempt closes either way: a chat that cannot be interrupted
+            // is a reason to stop counting it as live, not to keep it.
+            self.log.warn(format!(
+                "{}: cancelling chat {chat_id} at the duration cap: {e:#}",
+                task.identifier
+            ));
+        }
+        let note = format!(
+            "timed out after {} (cap {})",
+            overrun::human_secs(age),
+            overrun::human_secs(cap as i64),
+        );
+        self.db.close_attempt(attempt.id, Outcome::Failed)?;
+        self.enqueue_outcome_note(task, Outcome::Failed, None, Some(&note))?;
+        self.log
+            .warn(format!("{}: attempt failed — {note}", task.identifier));
         Ok(())
     }
 
@@ -1226,6 +1393,23 @@ impl SyncEngine {
         outcome: Outcome,
         pr_url: Option<&str>,
     ) -> Result<()> {
+        self.enqueue_outcome_note(task, outcome, pr_url, None)
+    }
+
+    /// As [`SyncEngine::enqueue_outcome`], with a phrase saying *why* — for the
+    /// verdicts the board reaches on its own rather than reads off an artifact.
+    ///
+    /// The duration cap (gh#70) is the first: `failed` alone reads as a
+    /// dispatch that never produced an agent, and the operator upstream has no
+    /// way to tell that from a run the board stopped at its ceiling. The note
+    /// rides the same comment, after the outcome.
+    pub fn enqueue_outcome_note(
+        &self,
+        task: &Task,
+        outcome: Outcome,
+        pr_url: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<()> {
         let attempt_no = task.attempt_count();
         self.db.enqueue_writeback(&NewWriteback {
             task_id: task.id.clone(),
@@ -1233,6 +1417,7 @@ impl SyncEngine {
             payload: json!({
                 "outcome": outcome.as_str(),
                 "pr_url": pr_url,
+                "note": note,
                 "log": self.paths.logfile().to_string_lossy(),
                 "attempt": attempt_no,
             })
@@ -1358,9 +1543,10 @@ impl SyncEngine {
                                 linear.comment(
                                     &task.source_id,
                                     &format!(
-                                        "comet-board: attempt {} · {} · log: {}",
+                                        "comet-board: attempt {} · {}{} · log: {}",
                                         payload["attempt"].as_u64().unwrap_or(1),
                                         other,
+                                        outcome_note(&payload),
                                         payload["log"].as_str().unwrap_or("(none)"),
                                     ),
                                 )?;
@@ -1457,9 +1643,10 @@ impl SyncEngine {
                                 format!("comet-board: attempt finished · {url}")
                             }
                             None => format!(
-                                "comet-board: attempt {} · {} · log: {}",
+                                "comet-board: attempt {} · {}{} · log: {}",
                                 payload["attempt"].as_u64().unwrap_or(1),
                                 outcome,
+                                outcome_note(&payload),
                                 payload["log"].as_str().unwrap_or("(none)"),
                             ),
                         };
@@ -1656,6 +1843,23 @@ pub fn route_context(task: &Task) -> RouteContext {
             labels: task.labels.clone(),
         },
     }
+}
+
+/// The ` · why` clause an outcome comment carries when the board reached the
+/// verdict itself — empty for the outcomes an artifact decided (gh#70).
+fn outcome_note(payload: &Value) -> String {
+    match payload["note"].as_str().filter(|n| !n.is_empty()) {
+        Some(note) => format!(" · {note}"),
+        None => String::new(),
+    }
+}
+
+/// Seconds from an RFC-3339 stamp to `now`, or `None` if it will not parse.
+/// Negative when the stamp is in the future — a clock that moved, which the
+/// duration cap reads as "no time has passed" rather than as a breach.
+fn secs_since(stamp: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let t = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
+    Some((now - t.with_timezone(&chrono::Utc)).num_seconds())
 }
 
 #[cfg(test)]
@@ -2421,6 +2625,326 @@ mod tests {
         assert_eq!(live(&e).outcome, Some(Outcome::Done));
         assert!(outcome_payload(&e)["pr_url"].is_null());
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- the wall-clock cap (gh#70) --------------------------------------
+
+    /// A runtime that records what the cap said into the chat and whether it
+    /// interrupted one — the two effects the check has on the world outside
+    /// the database.
+    #[derive(Default)]
+    struct CapWatcher {
+        prompts: std::cell::RefCell<Vec<(String, String)>>,
+        cancels: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Runtime for CapWatcher {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("the cap never dispatches")
+        }
+        fn prompt(&self, chat: &str, text: &str) -> anyhow::Result<()> {
+            self.prompts
+                .borrow_mut()
+                .push((chat.to_string(), text.to_string()));
+            Ok(())
+        }
+        fn cancel(&self, chat: &str) -> anyhow::Result<()> {
+            self.cancels.borrow_mut().push(chat.to_string());
+            Ok(())
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+    }
+
+    /// Move an attempt's clocks back, as wall time would have. The cap reads
+    /// `started_at` and the grace reads `overrun_warned_at`, so a test that
+    /// wants to be an hour late only has to say so.
+    fn age_attempt(e: &SyncEngine, attempt_id: i64, started_ago: i64, warned_ago: Option<i64>) {
+        let now = chrono::Utc::now();
+        let stamp = |secs: i64| crate::db::rfc3339(now - chrono::Duration::seconds(secs));
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET started_at = ?2, overrun_warned_at = ?3 WHERE id = ?1",
+                rusqlite::params![attempt_id, stamp(started_ago), warned_ago.map(stamp)],
+            )
+            .unwrap();
+    }
+
+    fn routed(e: &mut SyncEngine, max_duration: &str) {
+        e.cfg = toml::from_str(&format!(
+            r#"
+[[route]]
+match = {{ linear_team = "LIN" }}
+workspace = "offhand"
+repo = "/tmp"
+runtime = "claude-code"
+max_duration = "{max_duration}"
+"#
+        ))
+        .unwrap();
+    }
+
+    /// The exit criterion's quiet half: a legit long run is untouched. Two
+    /// hours is the default cap and this one is one hour in.
+    #[test]
+    fn a_run_inside_its_cap_is_left_alone() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 3600, None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+        assert!(live(&e).overrun_warned_at.is_none());
+        assert!(rt.prompts.borrow().is_empty(), "nothing to say yet");
+        assert!(rt.cancels.borrow().is_empty());
+    }
+
+    /// Past the cap is a warning, not a kill — and exactly one warning,
+    /// however many cycles pass while the agent wraps up.
+    #[test]
+    fn the_cap_warns_the_chat_once_before_it_closes_anything() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 3 * 3600, None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        let warned = live(&e);
+        assert!(warned.outcome.is_none(), "a warning is not a cancel");
+        assert!(
+            warned.overrun_warned_at.is_some(),
+            "the grace clock started"
+        );
+        let prompts = rt.prompts.borrow().clone();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "chat-9");
+        assert!(
+            prompts[0].1.contains("3h"),
+            "it names the age: {}",
+            prompts[0].1
+        );
+        assert!(
+            prompts[0].1.contains("2h cap"),
+            "and the cap: {}",
+            prompts[0].1
+        );
+        assert!(rt.cancels.borrow().is_empty());
+
+        // Two more cycles inside the grace: no second warning, still live.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert_eq!(rt.prompts.borrow().len(), 1, "prompt-once means once");
+        assert!(live(&e).outcome.is_none());
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
+    }
+
+    /// The grace ran out: interrupt the chat, close `failed`, and say why
+    /// upstream. Never silent — the writeback names the timeout, because
+    /// `failed` on its own reads as a dispatch that never produced an agent.
+    #[test]
+    fn the_grace_running_out_closes_the_attempt_failed_with_a_writeback() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 3 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Failed));
+        assert_eq!(rt.cancels.borrow().clone(), vec!["chat-9".to_string()]);
+        let payload = outcome_payload(&e);
+        assert_eq!(payload["outcome"].as_str(), Some("failed"));
+        let note = payload["note"].as_str().unwrap();
+        assert!(note.contains("timed out after 3h"), "{note}");
+        assert!(note.contains("cap 2h"), "{note}");
+        // The row is red and stays there — `failed`, not `cancelled`, which
+        // would send the issue back to `ready` as if nothing had run.
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Failed
+        );
+    }
+
+    /// gh#70's second hole. The engine crashed past its revival budget, so the
+    /// chat settled `Idle`; with no commits `settled::decide` says
+    /// `StayLive(NoArtifacts)`, and orphaning fires only on a *missing* session
+    /// row — this one exists. Before the cap, that row rendered `working`
+    /// forever.
+    #[test]
+    fn a_stranded_idle_row_with_no_artifacts_is_closed_by_the_clock() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        // The session row is still there, saying Idle, with nothing to settle
+        // on. The settle declines every cycle, exactly as designed.
+        age_attempt(&e, a, 3 * 3600, None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).outcome.is_none(), "warned first");
+
+        age_attempt(&e, a, 4 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Failed));
+    }
+
+    /// The settle beats the cap. An agent that took the warning, committed and
+    /// finished inside its grace is a finished attempt — closing it `failed`
+    /// on the same tick would throw away the work it just did.
+    #[test]
+    fn work_finished_inside_the_grace_settles_done_not_failed() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, true);
+        age_attempt(&e, a, 5 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert!(
+            rt.cancels.borrow().is_empty(),
+            "a finished run is not killed"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// The cap is a property of the work, so it is per route: the refactor
+    /// route gets six hours without loosening the one that fixes typos.
+    #[test]
+    fn a_route_can_raise_the_cap_over_the_default() {
+        let mut e = engine(None);
+        routed(&mut e, "6h");
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 5 * 3600, None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).overrun_warned_at.is_none(), "5h is inside 6h");
+        assert!(rt.prompts.borrow().is_empty());
+    }
+
+    /// `off` is what every board did before this existed, said out loud.
+    #[test]
+    fn a_route_can_turn_the_cap_off_entirely() {
+        let mut e = engine(None);
+        routed(&mut e, "off");
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 48 * 3600, None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+        assert!(rt.prompts.borrow().is_empty());
+    }
+
+    /// A dispatch whose brief never reached a chat is the most stranded row of
+    /// the lot: no session, no `saw_working`, so orphaning deliberately leaves
+    /// it (H2). The clock is what closes it — with nothing to interrupt, and
+    /// the reason still written back.
+    #[test]
+    fn a_dispatch_that_never_got_a_chat_is_closed_by_the_clock_too() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch_on(&e, "linear:LIN-142", "board/lin-142");
+        age_attempt(&e, a, 3 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Failed));
+        assert!(rt.cancels.borrow().is_empty(), "there was no chat to end");
+        assert!(
+            outcome_payload(&e)["note"]
+                .as_str()
+                .unwrap()
+                .contains("timed out")
+        );
+    }
+
+    /// The watch is a firehose; the cap is a clock. Counting it in event time
+    /// is the flap gh#34 taught herdr-board about, and would let a busy chat
+    /// talk itself past its own cap.
+    #[test]
+    fn a_watch_event_never_enforces_the_cap() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        // Nine hours over a two-hour cap: the interval reconcile would warn on
+        // its next tick and close it on the one after. Events decide nothing.
+        age_attempt(&e, a, 9 * 3600, None);
+
+        for _ in 0..10 {
+            e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
+                .unwrap();
+        }
+        assert!(live(&e).outcome.is_none());
+        assert!(live(&e).overrun_warned_at.is_none());
+    }
+
+    /// The warning has to happen even where it cannot be delivered — the log
+    /// and the eventual close are what the operator has left. A read-only
+    /// caller has no runtime at all, and must not be the reason a runaway
+    /// attempt is exempt.
+    #[test]
+    fn the_cap_still_decides_without_a_runtime_to_talk_through() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 3 * 3600, None);
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        assert!(live(&e).overrun_warned_at.is_some());
+
+        age_attempt(&e, a, 4 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Failed));
+    }
+
+    /// Re-opening hands the attempt back its warning and its grace. It has
+    /// been live the whole time — `started_at` is not reset — but a row that
+    /// came back to work being killed on the next tick, by a stamp collected
+    /// before the board wrongly called it finished, is the cap punishing the
+    /// board's own mistake.
+    #[test]
+    fn reopening_gives_the_attempt_a_fresh_warning() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 3 * 3600, Some(60));
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+
+        assert!(e.db.reopen_attempt(a).unwrap());
+        assert!(live(&e).overrun_warned_at.is_none());
     }
 
     // ---- pull-request linking -------------------------------------------
