@@ -177,6 +177,12 @@ max_concurrent_per_workspace = 3
 # per repository, so a GitHub identifier carries its repo as well — `gh#2` in
 # tripletex-mcp is `gh-2-tripletex-mcp`.
 branch_template = "board/{{identifier_lower}}"
+# What each branch is cut from. `origin/HEAD` is the remote's default branch,
+# fetched before the worktree is cut, so a box whose folders sit on last week's
+# checkout still starts agents on today's main. Name a branch (`main`,
+# `origin/develop`) to pin one, or `HEAD` to branch from the checkout without
+# fetching — which is what a repo with no remote needs.
+base = "origin/HEAD"
 # When an agent releases work through the board, prompt it in its own chat once
 # that work settles, instead of only raising a notification at you. Off, because
 # an orchestrator woken by every child it released cannot hold a train of
