@@ -292,7 +292,12 @@ step "Pick (or create) the environment your team will live in."
 step "Left sidebar → 'API keys': copy the Client ID (starts client_...)."
 ask WORKOS_CLIENT_ID "Paste the WorkOS Client ID:"
 write_env WORKOS_CLIENT_ID "$WORKOS_CLIENT_ID"
-patch edge/wrangler.jsonc "s/client_01KWD0EAKZKD50YCQJNYSRE4BY/$WORKOS_CLIENT_ID/" "$WORKOS_CLIENT_ID"
+# The edge exchanges the auth code with its client id and the clients build
+# the authorize URL with theirs — a mismatch fails sign-in at exchange, so all
+# three move together. Matched by shape, not by literal, so re-runs work.
+for f in edge/wrangler.jsonc apps/comet/src/main.rs apps/ios/Comet/Views/SignInView.swift; do
+  patch "$f" "s/client_01[A-Z0-9]+/$WORKOS_CLIENT_ID/" "$WORKOS_CLIENT_ID"
+done
 step "Same page: reveal + copy the API key (starts sk_...)."
 ask_secret WORKOS_API_KEY "Paste the WorkOS API key:"
 say "Storing it as a Worker secret (never lands in a file here):"

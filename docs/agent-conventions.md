@@ -62,7 +62,8 @@ released can come back with a question — which is most work.
 
 Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
-`dispatched_by`, `dispatched_by_chat`, `last_outcome`, `last_outcome_at`,
+`dispatched_by`, `dispatched_by_chat`, `dispatched_by_user`, `last_outcome`,
+`last_outcome_at`,
 `attempts`, `dispatchable`, `gone`, `reopened`, `account`. `workspace` names a
 comet *space* — the field keeps herdr-board's spelling so ported tooling reads
 it. `account` is the agent login whose subscription the row's attempt spends
@@ -71,6 +72,10 @@ login, which is every row on a single-account box.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.
+`dispatched_by_user` names the human whose frontend released the row, when one
+did. It is what that frontend claimed, not something the board verified, so read
+it as attribution and never as authority — and never as a reason to spend that
+person's account.
 `last_outcome` is how the most recent *ended* attempt ended — `done`, `failed`,
 `cancelled` or `orphaned` — with `last_outcome_at` saying when. It stays set
 while a newer attempt is live, so a retry does not erase how the previous one
@@ -125,8 +130,15 @@ is this board's `review`.
    as soon as the answer is true.
 9. **After releasing work, do not fall silent about it.** That leaves the human
    to notice the agent finished and to prompt you. Either `wait` for it, or say
-   plainly that you are leaving it running and that nothing will tell you when
-   it is done.
+   plainly that you are leaving it running. A board configured with
+   `notify_dispatcher` will prompt you in this chat when work you released
+   settles — but it is off by default and you cannot tell from here, so never
+   promise that you will be woken. Note also that `wait` does **not** return on
+   `blocked` by default: an agent that stops to ask a question holds its
+   attempt open, and a plain `wait` on it hangs until somebody answers. Pass
+   `--blocked-is-settled` to be called back on the question too; either way the
+   blocked agent comments on its own issue, which is the human's signal, not
+   yours.
 10. **Never dispatch speculatively.** Releasing work starts a real agent in a
     real repo that commits and opens PRs. A human keypress — or an explicit
     instruction — releases tasks. Reading the board is always safe; dispatching
@@ -149,16 +161,24 @@ Three things follow from how the loop is kept closed:
   delivered and nothing is re-dispatched. The review then waits on the pull
   request for whoever opens it, and the board log says so once.
 
-**If you were dispatched by the board, commit your work.** The board has no
-callback: it decides an attempt is finished by seeing your run end with either
-an open PR or commits on the attempt branch. Work left uncommitted in the
-worktree when you stop reads as an agent that did nothing, and the row sits in
-`working` until a human notices. Commit even when you are not opening a PR.
+**If you were dispatched by the board, commit your work and push it.** The
+board has no callback: it decides an attempt is finished by seeing your run end
+with either an open PR or commits *on origin* for the attempt branch. Work left
+uncommitted, or committed and never pushed, reads as an agent that is still
+going — the row sits in `working` until the clock cap takes it or a human
+notices. Commit and push even when you are not opening a PR.
+
+Pushing is the part that is easy to skip and the part that matters: a commit in
+your worktree is on one box, and a row that said `review` about it would send
+somebody to read a branch that is not there. The board log names the branch when
+it finds an attempt in that state. If `git push` fails, say so in the chat
+rather than stopping quietly — a push nobody can make is a board problem, not
+yours (`comet-board doctor` reports the credential).
 
 The two artifacts are not weighed the same. A pull request is your own
 statement that you are finished, so it settles the attempt promptly. Commits
-are not — you were told to make them mid-flight — so the board waits longer
-before settling on them. Open the PR when you want the row to move promptly.
+are not — you were told to make them mid-flight — so they settle it only once
+the run has genuinely ended. Open the PR when you want the row to move promptly.
 
 **A settle is not final.** If the board closes your attempt while you are still
 working, it notices: a closed attempt whose chat is still working is re-opened,

@@ -5,8 +5,9 @@ name: deploy
 # gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
 # `npm -C edge run deploy` from a wrangler-authenticated machine).
 #
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
-# Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
+# The token needs: Workers Scripts (edit), Workers Routes (edit) on offhand.dev,
+# Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc —
+# release.yml reads it from there too, so there is one place to change it.
 
 on:
   push:

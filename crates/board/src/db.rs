@@ -17,7 +17,9 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      started_at, ended_at, outcome, missing_ticks, agent_status, \
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
      settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
-     overrun_warned_at";
+     blocked_count,
+     overrun_warned_at, repo_path, collectable_at, collected_at,
+     dispatched_by_device, dispatched_by_user";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -49,7 +51,13 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         nudges: r.get(20)?,
         nudged_at: r.get(21)?,
         account: r.get(22)?,
-        overrun_warned_at: r.get(23)?,
+        blocked_count: r.get(23)?,
+        overrun_warned_at: r.get(24)?,
+        repo_path: r.get(25)?,
+        collectable_at: r.get(26)?,
+        collected_at: r.get(27)?,
+        dispatched_by_device: r.get(28)?,
+        dispatched_by_user: r.get(29)?,
     })
 }
 
@@ -155,10 +163,36 @@ impl Db {
               -- route, because the route's default can change under a run that
               -- is still going.
               account      TEXT,
+              -- How many times this attempt has *entered* blocked — the agent
+              -- stopped to ask, or its run died (gh#71). The notice upstream is
+              -- keyed on this count, so a block that is answered and happens
+              -- again is a second notice, and a hundred ticks of the same block
+              -- are still one.
+              blocked_count INTEGER NOT NULL DEFAULT 0,
               -- When the board told this attempt's chat it was past its
               -- wall-clock cap (gh#70). Stamped once; the grace that follows is
               -- measured from here.
-              overrun_warned_at TEXT
+              overrun_warned_at TEXT,
+              -- The repo the worktree was cut from (gh#72). Recorded at
+              -- dispatch because collection needs it after the checkout is
+              -- gone: `git branch -D` runs in the repo, not in the worktree.
+              repo_path    TEXT,
+              -- When this attempt's checkout first became nobody's — the
+              -- attempt closed and its task off the board (gh#72). The
+              -- retention window is measured from here, and a task that comes
+              -- back to life clears it so the next window starts whole.
+              collectable_at TEXT,
+              -- When the checkout and its branch were actually reclaimed.
+              -- Non-NULL means `worktree` names a path that is no longer there.
+              collected_at TEXT,
+              -- Which device the dispatch was issued from, and which human the
+              -- frontend there said was signed in (gh#74). Both are the
+              -- caller's word: a relayed call arrives as the room owner, so
+              -- the box cannot check either. Recorded anyway — an unverified
+              -- name beats an anonymous `Operator` for "who released this",
+              -- and the columns are where #66's verified identity will land.
+              dispatched_by_device TEXT,
+              dispatched_by_user TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -259,12 +293,30 @@ impl Db {
                 // keep NULL, which is exactly right: they ran before accounts
                 // could be chosen, on the device's own CLI login.
                 ("account", "TEXT"),
+                // Times this attempt entered blocked (gh#71). Existing rows
+                // keep 0: a block they are *currently* in was never noticed
+                // upstream, so the next tick that sees it is its first notice.
+                ("blocked_count", "INTEGER NOT NULL DEFAULT 0"),
                 // When this attempt was told it had run past its cap (gh#70).
                 // Existing rows keep NULL, which reads as "not warned yet" —
                 // right for an attempt already hours over when the cap landed,
                 // because it gets its warning and its grace before anything
                 // closes it.
                 ("overrun_warned_at", "TEXT"),
+                // Worktree collection (gh#72). Existing rows keep NULL on all
+                // three, which reads as "cut before the board recorded the
+                // repo, never marked, never collected" — so an old attempt's
+                // checkout is collected on the same terms as a new one, from
+                // the first sweep that finds its task finished.
+                ("repo_path", "TEXT"),
+                ("collectable_at", "TEXT"),
+                ("collected_at", "TEXT"),
+                // Which device and which human released this attempt (gh#74).
+                // Existing rows keep NULL: they were recorded when no frontend
+                // sent either, and inventing the box's own device id for them
+                // would be a guess dressed as a record.
+                ("dispatched_by_device", "TEXT"),
+                ("dispatched_by_user", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -547,8 +599,10 @@ impl Db {
         let res = self.conn.execute(
             "INSERT INTO attempts
                (task_id, pane_id, workspace, runtime, worktree, branch,
-                dispatched_by, dispatched_by_pane, started_at, base_sha, account)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                dispatched_by, dispatched_by_pane, started_at, base_sha, account,
+                repo_path,
+                dispatched_by_device, dispatched_by_user)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -560,7 +614,10 @@ impl Db {
                 a.dispatched_by_pane,
                 now(),
                 a.base_sha,
-                a.account
+                a.account,
+                a.repo_path,
+                a.dispatched_by_device,
+                a.dispatched_by_user
             ],
         );
         match res {
@@ -591,6 +648,57 @@ impl Db {
             params![attempt_id, worktree],
         )?;
         Ok(())
+    }
+
+    /// Start or stop the retention clock on an attempt's checkout (gh#72).
+    ///
+    /// `true` stamps *now* only if nothing is stamped — the window is measured
+    /// from when the checkout first became nobody's, and re-stamping every
+    /// sweep would keep pushing collection a cycle further out, forever.
+    pub fn set_attempt_collectable(&self, attempt_id: i64, collectable: bool) -> Result<()> {
+        if collectable {
+            self.conn.execute(
+                "UPDATE attempts SET collectable_at = ?2
+                  WHERE id = ?1 AND collectable_at IS NULL",
+                params![attempt_id, now()],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE attempts SET collectable_at = NULL WHERE id = ?1",
+                params![attempt_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record that this attempt's checkout and branch are gone (gh#72). The
+    /// `worktree` path is kept: it is where the work happened, and a row that
+    /// forgot it could not say what it collected.
+    pub fn set_attempt_collected(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET collected_at = ?2 WHERE id = ?1",
+            params![attempt_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Closed attempts still holding a checkout the board could reclaim — the
+    /// gc sweep's candidate set (gh#72).
+    ///
+    /// Live attempts are excluded here as well as by [`crate::gc::standing`]:
+    /// the sweep must never so much as consider a running agent's checkout, and
+    /// the two guards are cheap. Already-collected rows are excluded so a box
+    /// that has been up for months does not re-walk every attempt it ever made.
+    pub fn collectable_attempts(&self) -> Result<Vec<Attempt>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts
+              WHERE outcome IS NOT NULL
+                AND worktree IS NOT NULL
+                AND collected_at IS NULL
+              ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], read_attempt)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn close_attempt(&self, attempt_id: i64, outcome: Outcome) -> Result<()> {
@@ -644,6 +752,24 @@ impl Db {
             params![attempt_id],
         )?;
         Ok(())
+    }
+
+    /// Record that this attempt has entered blocked once more, and say which
+    /// block that is (1 for the first).
+    ///
+    /// The counter is what makes the upstream notice "once per block" rather
+    /// than once per attempt or once per tick: it goes into the writeback's
+    /// idempotency key, so a block that is answered and then happens again
+    /// earns a second comment while the ticks in between earn none. Bumped in
+    /// the same statement it is read back from, so two reconcile paths racing
+    /// the same transition cannot both claim block 1 (gh#71).
+    pub fn bump_blocked_count(&self, attempt_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "UPDATE attempts SET blocked_count = blocked_count + 1
+              WHERE id = ?1 RETURNING blocked_count",
+            params![attempt_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn set_missing_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {
@@ -963,6 +1089,17 @@ pub struct NewAttempt {
     /// The agent-account slot this attempt runs under — whose subscription it
     /// spends (gh#59). `None` is the device's own CLI login.
     pub account: Option<String>,
+    /// The repo the attempt's worktree is cut from (gh#72). Known at dispatch
+    /// and recorded then, because collection needs it once the checkout is
+    /// gone: `git worktree prune` and `git branch -D` run in the repo.
+    pub repo_path: Option<String>,
+    /// The device the dispatch was issued from, as the caller reported it
+    /// (gh#74). `None` for a dispatch that named none — the CLI on the box,
+    /// and every attempt recorded before frontends sent it.
+    pub dispatched_by_device: Option<String>,
+    /// Who the dispatching frontend said was signed in there (gh#74).
+    /// Unverified — see the column comment in `migrate`.
+    pub dispatched_by_user: Option<String>,
 }
 
 pub struct NewWriteback {
@@ -1030,7 +1167,27 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
+    }
+
+    /// gh#74: who released an attempt is stored on it, so the record survives
+    /// the frontend that made the claim going away.
+    #[test]
+    fn an_attempt_remembers_the_device_and_human_that_released_it() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "linear:LIN-142");
+        db.insert_attempt(&NewAttempt {
+            dispatched_by_device: Some("laptop-ana".into()),
+            dispatched_by_user: Some("ana@example.com".into()),
+            ..attempt("linear:LIN-142")
+        })
+        .unwrap();
+        let stored = db.attempts_for("linear:LIN-142").unwrap().remove(0);
+        assert_eq!(stored.dispatched_by_device.as_deref(), Some("laptop-ana"));
+        assert_eq!(stored.dispatched_by_user.as_deref(), Some("ana@example.com"));
     }
 
     #[test]
@@ -1074,6 +1231,10 @@ mod tests {
         // An attempt recorded before accounts existed ran on the device's own
         // CLI login, which is exactly what NULL means (gh#59).
         assert_eq!(tasks[0].attempts[0].account, None);
+        // Same for who released it: nobody said, and the box's own id would be
+        // a guess dressed as a record (gh#74).
+        assert_eq!(tasks[0].attempts[0].dispatched_by_device, None);
+        assert_eq!(tasks[0].attempts[0].dispatched_by_user, None);
         assert!(!tasks[0].local_done);
 
         // And it is idempotent — opening again must not try to add them twice.

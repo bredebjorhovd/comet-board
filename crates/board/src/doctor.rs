@@ -10,6 +10,7 @@
 
 use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
 use crate::db::Db;
+use crate::gc;
 use crate::git_credentials;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
@@ -61,6 +62,15 @@ pub fn doctor(
             Err(e) => format!("{e:#}"),
         },
     });
+
+    // What the attempts have left on the disk (gh#72). Beside the database
+    // check because it is the same question — what is this box holding — and
+    // the answer is read partly out of that database.
+    checks.push(worktrees_check(
+        paths,
+        &crate::config::worktrees_root(),
+        db_ok.as_ref().ok(),
+    ));
 
     checks.push(Check {
         name: "LINEAR_API_KEY".into(),
@@ -136,6 +146,18 @@ pub fn doctor(
                 ok: true,
                 detail: settle_notice_detail(cfg.defaults.notify_dispatcher),
             });
+
+            // The counterpart to the settle notice, and the one gh#71 existed
+            // for: an attempt that blocks settles nothing, so no outcome
+            // comment fires and the row is the only trace. This says what the
+            // board does about that, per repo, because writeback is per repo.
+            checks.push(Check {
+                name: "blocked notice".into(),
+                ok: true,
+                detail: blocked_notice_detail(&cfg.github),
+            });
+
+            checks.push(operator_notice_check(&cfg.defaults));
 
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
@@ -317,6 +339,64 @@ pub fn doctor(
     checks.push(dispatched_push_check(paths));
 
     Ok(checks)
+}
+
+/// What the attempts have left on the disk, and what will reclaim it (gh#72).
+///
+/// The check exists because the failure it reports is invisible until it is
+/// terminal: every dispatch cuts a full checkout plus a branch, nothing removed
+/// either before gh#72, and the first symptom on a busy box is a disk with no
+/// space left in the middle of somebody's run. Three numbers answer it — how
+/// many checkouts, how much disk, and how many of them the board is still
+/// holding open (a live attempt, a pull request in review, an issue still
+/// owed).
+///
+/// `ok` is false only when the root is genuinely large ([`gc::WARN_BYTES`] /
+/// [`gc::WARN_CHECKOUTS`]); a board holding a week of checkouts on purpose is
+/// working exactly as configured and must not fail the report for it. The
+/// retention window is named either way, because `off` is a choice whose cost
+/// is this line.
+fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Check {
+    let usage = gc::usage(root);
+    let about = format!(
+        "{} checkout(s), {}{} in {}",
+        usage.checkouts,
+        if usage.truncated { "≥ " } else { "" },
+        gc::human_bytes(usage.bytes),
+        root.display(),
+    );
+    // What the board still has a claim on. Not the same as "on disk": a
+    // checkout cut by comet itself, or one left by an attempt whose row has
+    // been reaped, is on the disk and in nobody's records.
+    let held = db.and_then(|db| db.collectable_attempts().ok()).map(|a| {
+        let marked = a.iter().filter(|a| a.collectable_at.is_some()).count();
+        format!(
+            "{} tracked by the board, {marked} on the retention clock",
+            a.len()
+        )
+    });
+    let retention = match RoutingConfig::load_unvalidated(&paths.routing()) {
+        Ok(cfg) => match cfg.retain_worktrees_secs() {
+            Some(secs) => format!(
+                "collected {} after their task leaves the board",
+                gc::human_window(secs)
+            ),
+            None => "retain_worktrees = off — nothing here is ever collected".to_string(),
+        },
+        // A routing.toml that will not parse is the loud check above; here it
+        // only means the window cannot be quoted.
+        Err(_) => "retention unknown — routing.toml did not parse".to_string(),
+    };
+    let detail = [Some(about), held, Some(retention)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Check {
+        name: "worktrees".into(),
+        ok: !usage.alarming(),
+        detail,
+    }
 }
 
 /// Can a dispatched agent on this box push and open a pull request (gh#68)?
@@ -663,10 +743,90 @@ fn settle_notice_detail(notify_dispatcher: bool) -> String {
          when that work settles"
             .into()
     } else {
-        "off — only you are notified when released work settles; the agent \
-         that released it waits to be asked (`[defaults] notify_dispatcher \
-         = true` to enable)"
+        // Deliberately not "only you are notified": until gh#71 that was what
+        // this line said, and there was no channel that notified you either.
+        // A `doctor` line describing a notice nobody sends is worse than no
+        // line, because it is the answer somebody stops investigating at.
+        "off — the agent that released work is not told when it settles; the \
+         board row and the comment on the issue are the whole trail \
+         (`[defaults] notify_dispatcher = true` to enable)"
             .into()
+    }
+}
+
+/// What happens upstream when an agent stops and cannot go on (gh#71).
+///
+/// Unconditional for Linear and gated per repo for GitHub, which is the same
+/// rule every other comment follows — and the reason this is worth a line: a
+/// read-only repo gets no comment, so on those repos the board row really is
+/// the only signal, and an operator should learn that here rather than by
+/// waiting for a comment that is never coming.
+fn blocked_notice_detail(github: &crate::config::GithubConfig) -> String {
+    let mut s = "on — an agent that stops to ask, or whose run dies, leaves one comment \
+                 on its issue per block (Linear always; GitHub where writeback is on)"
+        .to_string();
+    let reads = github.read_only_repos();
+    if !reads.is_empty() {
+        s.push_str(&format!(
+            ". No comment on the read-only repos, so a block there shows on the board \
+             and nowhere else: {}",
+            reads.join(", ")
+        ));
+    }
+    s
+}
+
+/// Whether anything reaches a human who is looking at neither the board nor
+/// the issue tracker (gh#71).
+///
+/// Two keys answer this, so `doctor` reads them together: `notify_webhook` is
+/// the address and `notify` is the mute switch. No address is *not configured*
+/// rather than a fault — not wanting an out-of-band channel is a legitimate
+/// answer, and a `doctor` that exits non-zero over a preference stops meaning
+/// anything. What is a fault is an address that cannot be posted to: the
+/// operator asked for the notice, and every one of them is being dropped into
+/// a log line.
+///
+/// What this line must never do is what the settle-notice line did before
+/// gh#71 — imply somebody is being told when nobody is.
+fn operator_notice_check(defaults: &crate::config::Defaults) -> Check {
+    let name = "operator notice".to_string();
+    let Some(url) = defaults.notify_webhook.as_deref() else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not configured — nothing reaches you out of band. A blocked agent \
+                     comments on its issue and colours a row on the board, and at 02:00 \
+                     that is all (`[defaults] notify_webhook = \"https://…\"` for a POST \
+                     on every block and settle)"
+                .into(),
+        };
+    };
+    if let Some(problem) = crate::notify::webhook_url_problem(url) {
+        return Check {
+            name,
+            ok: false,
+            detail: format!(
+                "`[defaults] notify_webhook` cannot be posted to ({problem}) — every \
+                 notice is dropped with a warning in the log and nothing reaches you"
+            ),
+        };
+    }
+    Check {
+        name,
+        ok: true,
+        detail: if defaults.notify {
+            format!(
+                "on — `on_blocked` and `on_settled` are POSTed to {}",
+                crate::notify::webhook_host(url)
+            )
+        } else {
+            format!(
+                "muted — {} is configured but `[defaults] notify = false` silences it; \
+                 a blocked agent still comments on its issue",
+                crate::notify::webhook_host(url)
+            )
+        },
     }
 }
 
@@ -1106,6 +1266,58 @@ mod tests {
         );
     }
 
+    /// gh#71. `notify` used to be parsed, documented, and read nowhere — and
+    /// `doctor` implied it notified you. The line now has to be true in every
+    /// state, and only the one genuine misconfiguration may fail: an address
+    /// that cannot be posted to. Not wanting the channel is not a fault, or
+    /// `doctor` would exit 1 on a default install and stop meaning anything.
+    #[test]
+    fn doctor_tells_the_truth_about_the_operator_channel() {
+        let mut d = crate::config::Defaults::default();
+        assert!(d.notify && d.notify_webhook.is_none(), "the default state");
+        let c = operator_notice_check(&d);
+        assert!(c.ok, "a preference is not a failure: {}", c.detail);
+        assert!(c.detail.starts_with("not configured —"), "{}", c.detail);
+        assert!(c.detail.contains("notify_webhook"), "{}", c.detail);
+
+        d.notify_webhook = Some("https://hooks.example.com/x".into());
+        let c = operator_notice_check(&d);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("on —"), "{}", c.detail);
+        assert!(c.detail.contains("hooks.example.com"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("/x"),
+            "a webhook URL is the credential; name the host only: {}",
+            c.detail
+        );
+
+        // Muted is a decision, and says which key made it.
+        d.notify = false;
+        let c = operator_notice_check(&d);
+        assert!(c.ok && c.detail.starts_with("muted —"), "{}", c.detail);
+
+        // A typo is silence with a warning in a log nobody reads — the one
+        // state worth failing over.
+        d.notify = true;
+        d.notify_webhook = Some("hooks.example.com/x".into());
+        assert!(!operator_notice_check(&d).ok);
+    }
+
+    /// A block comments on its issue — except on a repo the board only reads,
+    /// where it comments nowhere, and an operator should learn that here.
+    #[test]
+    fn doctor_names_the_repos_where_a_block_shows_nowhere() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[github]\nrepos = [\"o/mine\", \"o/theirs\"]\nwriteback = true\n\n\
+             [[github.repo]]\nname = \"o/theirs\"\nwriteback = false\n",
+        )
+        .unwrap();
+        let detail = blocked_notice_detail(&cfg.github);
+        assert!(detail.starts_with("on —"), "{detail}");
+        assert!(detail.contains("o/theirs"), "{detail}");
+        assert!(!detail.contains("o/mine"), "{detail}");
+    }
+
     #[test]
     fn doctor_emits_the_settle_notice_check() {
         let (_d, p) = tmp();
@@ -1197,6 +1409,38 @@ mod tests {
     /// called.
     fn rest_on(app: std::rc::Rc<crate::sources::github_app::AppAuth>) -> HttpRest {
         HttpRest::over(Box::new(NoWire), TokenProvider::App(app))
+    }
+
+    /// The disk report exists to make gh#72's leak visible before it is
+    /// terminal, so it has to say all three things: what is there, what the
+    /// board still tracks, and what will ever remove it.
+    #[test]
+    fn the_worktree_check_counts_the_disk_and_names_the_retention() {
+        let (_d, p) = tmp();
+        let root = _d.path().join("worktrees");
+        for name in ["board-gh-7-widget", "board-lin-1-widget"] {
+            let dir = root.join("widget").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("big"), vec![b'x'; 2048]).unwrap();
+        }
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
+
+        let check = worktrees_check(&p, &root, None);
+        assert!(check.ok, "two checkouts is not a problem: {}", check.detail);
+        assert!(check.detail.contains("2 checkout(s)"), "{}", check.detail);
+        assert!(check.detail.contains("4.0 KiB"), "{}", check.detail);
+        assert!(check.detail.contains("7d"), "{}", check.detail);
+    }
+
+    /// Turning collection off is a choice; the check is where its cost shows.
+    #[test]
+    fn retention_off_is_said_out_loud() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"off\"\n").unwrap();
+        let check = worktrees_check(&p, &_d.path().join("nothing-here"), None);
+        assert!(check.detail.contains("ever collected"), "{}", check.detail);
+        // An empty root is still not a failure — nothing has been dispatched.
+        assert!(check.ok);
     }
 
     #[test]

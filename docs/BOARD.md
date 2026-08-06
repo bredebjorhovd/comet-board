@@ -65,12 +65,18 @@ nearly verbatim — it never depended on herdr:
   a live attempt, pure. Within / warn / cancel, plus the grace the warning
   buys. The machinery is `sync.rs`'s `enforce_duration_cap`, on the interval
   reconcile — the same clock orphaning rides.
+- `crates/board/src/gc.rs` — **new** (H12, gh#72): whose an attempt's checkout
+  is (live / held / spent) and when it may go, pure — plus the worktree-root
+  measurement `doctor` reports. The machinery is `sync.rs`'s
+  `collect_worktrees`, on the same interval clock.
 - `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
-  run that ended cleanly; an `Errored` run stays live so its retry is the
-  same attempt) and the reopen rule. The machinery around it is in `sync.rs`
-  (`maybe_settle`, `rewatch_settled_attempts`, the targeted PR recheck) and
+  run that ended cleanly *and* only once they are on origin, gh#69; an
+  `Errored` run stays live so its retry is the same attempt) and the reopen
+  rule. The machinery around it is in `sync.rs`
+  (`maybe_settle`, `rewatch_settled_attempts`, the targeted PR recheck,
+  `commits_are_on_origin`) and
   keys off run-journal facts via `Runtime::last_run_end` — no debounce
   clock anywhere.
 - `adopt.rs`, `doctor.rs`, `init.rs` — the operator-facing trio (H8), walking
@@ -115,6 +121,10 @@ nearly verbatim — it never depended on herdr:
   `review.rs` minus the wake latch and busy-check, delivering over the
   command ledger via `Runtime::prompt`. See §H5 below for what was dropped
   and why the loop still converges.
+- `crates/board/src/notify.rs` — **new** (gh#71): who gets told what when a
+  dispatched attempt blocks or settles, and the wording each of the three
+  audiences gets. The effects are in `sync.rs` (`announce`, `wake_dispatcher`,
+  `post_webhook`, `note_blocked`); see §H10 below.
 - `crates/proto/src/view/board.rs` — **new** (H7): the view's shared
   derivations — `BoardState` (moved from `comet-board`, glyphs included),
   `TaskRow` (moved, wire contract), plus `Filter`, `sections`,
@@ -125,16 +135,19 @@ nearly verbatim — it never depended on herdr:
   `DispatchTask`. See §H7 below.
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, runtime?, model?, account?}` →
+`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
-`ListBoardRuntimes` → `[{name, label}]` lists the runtimes a dispatch can be
-pointed at (the canonical set `build_spec` validates an override against) for
-pickers in the desktop panel and the CLI. `runtime`/`model`/`account` override
-the route's configured runtime, the harness's default model, and the route's
-`account` for that one dispatch; the attempt row records whatever the agent
-actually ran under.
+`ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
+can be pointed at (the canonical set `build_spec` validates an override against)
+for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
+name resolves to, so a picker can tell which agent accounts a runtime could
+spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
+override the route's configured runtime, the harness's default model, and the
+route's `account` for that one dispatch; the attempt row records whatever the
+agent actually ran under. `via`/`viaDevice`/`viaUser` are provenance, never
+authority — see §H12.
 
 ### Per-run agent accounts (gh#59)
 
@@ -166,9 +179,11 @@ change it. An account that will not resolve **refuses** the dispatch before the
 chat exists, and refuses a later run rather than falling back — a silent
 fallback bills whoever the device's own login belongs to.
 
-Deliberately not in v1: inferring an account from the WorkOS user who
-dispatched. `via` already records who released the work; guessing a login from
-it is the kind of clever that bills the wrong person. `comet-board doctor`
+Deliberately not in v1, and still not: inferring an account from the WorkOS user
+who dispatched. §H12 now records who released the work by name as well as by
+chat, and that changes nothing here — guessing a login from either is the kind
+of clever that bills the wrong person, and the identity it would guess from is
+unverified. `comet-board doctor`
 checks each route's `account` against the device's saved logins, including the
 CLI it belongs to — a Claude slot on a codex route is not lendable, since the
 two config-dir variables are not interchangeable.
@@ -279,8 +294,11 @@ Do not resurrect these; their reasons to exist are herdr's, not comet's.
   the agent.
 - `ui/` — herdr-board's own ratatui app. The board renders inside comet's
   existing frontends instead (H7).
-- `settled.rs`'s screen-resample half and `gc.rs`'s pane logic. Settle keys
-  off run-journal events now (H4); worktrees are the engine's (`repos.rs`).
+- `settled.rs`'s screen-resample half and `gc.rs`'s **pane** logic. Settle keys
+  off run-journal events now (H4); there are no panes to collect. Its
+  *worktree* half was the half that mattered and its absence was a leak —
+  ported at last as H12 below (gh#72), keyed on board state rather than on
+  herdr's pane listing.
 - herdr-board's `adopt.rs` as written — it walked herdr workspaces. Its
   successor landed with H8 as `crates/board/src/adopt.rs`, walking comet
   spaces; the routing.toml writer came over verbatim.
@@ -326,11 +344,33 @@ the event path settles on the status *transition*, the interval reconcile is
 the catch-up. Artifact checks kept: recorded PR → commits-since-base → and,
 only on the event path (the interval polls seconds earlier), one targeted
 GitHub `pulls` recheck before closing on commits, which closes herdr's gh#29
-window instead of wording around it. `reopened` semantics kept both ways: an
+window instead of wording around it.
+
+**Commits must be on origin** (gh#69). `attempt_has_commits` is a local
+`rev-list` count, so an agent that committed and could not open a pull request
+— guaranteed on a headless box with no `gh` credential, which is what gh#68
+went on to fix — ended `Completed`, settled on `Evidence::Commits`, and put the
+row in `review` while the work sat in one worktree on one box. The crash path
+had the same shape: recovery stamps an aborted run `Interrupted`, not
+`Errored`, so the errored-runs-never-settle guard never covered it.
+`settled::decide` now takes a three-way `Commits::{None, Unpushed, Pushed}`,
+and `Unpushed` is a `StayLive` with its own `Why` — logged once per attempt,
+naming the branch, and left for the H10 clock to close if nobody acts. The
+push check is `SyncEngine::commits_are_on_origin`: a remote-tracking ref that
+*contains* HEAD (free, offline, true of any ordinary `git push`, and the only
+tier a non-GitHub remote gets), then — event path only, for the same reason the
+`pulls` recheck is — one `GET /repos/{repo}/branches/{branch}`, for a push made
+straight to a URL, which updates no tracking ref. Containment rather than
+existence, because a retry reuses its predecessor's branch. Unproven reads as
+unpushed: an attempt that stays live is visible and bounded, a row that says
+`review` about work nobody can fetch is the bug. A pull request short-circuits
+all of it — GitHub will not open one for a branch it does not have.
+
+`reopened` semantics kept both ways: an
 `Errored`→retried run never left its attempt, and a settled attempt whose
 chat works again is re-opened in place (refused when re-dispatched, closed
-upstream, or marked done). The dispatcher wake (herdr AGE-25) was
-deliberately not ported with this.
+upstream, or marked done). The dispatcher wake (herdr AGE-25) was not ported
+with this; it landed later as part of §H10.
 
 ### H5 — Review delivery — **done**
 Landed as `crates/board/src/review.rs`: `SyncEngine::deliver_reviews`, run by
@@ -397,6 +437,11 @@ section of `render.rs`) plus the shared derivations in `crates/proto/src/view/bo
 - `enter` dispatches a ready row (the operator's dispatch, so no `via`), retries
   a failed one (H11), opens a working/blocked row's chat, and folds section
   headers. `R` retries, replacing a blocked row's live attempt (H11).
+
+- `enter` releases a ready row (the operator's dispatch, so no `via`) — through
+  the account picker H12 added, whose first row is the route's own account and
+  so is the behaviour this line described before it; opens a working/blocked
+  row's chat, and folds section headers.
 - The `f` / `/` / `F` filter cycle, with the `/` field replacing the footer and
   the filter's label holding the header corner.
 - The derivations live in `comet_proto::view::board` — `Filter`, `sections`,
@@ -464,7 +509,9 @@ agent looping and talking ran until somebody looked. The same clock closes the
 stranded-`working` row at the other end: an engine crash past its revival
 budget settles the chat `Idle`, and with no commits `settled::decide` returns
 `StayLive(NoArtifacts)`; orphaning fires only on a *missing* session row, and
-that one exists. A dispatch whose brief never reached a chat (no session, no
+that one exists. Since gh#69 it closes one more: an attempt whose commits never
+reached origin (`StayLive(Unpushed)`) stays live by design, and this is what
+eventually calls it `failed` rather than leaving it `working` forever. A dispatch whose brief never reached a chat (no session, no
 `saw_working`, deliberately left alone by H2) is closed by the same clock.
 
 The shape:
@@ -578,6 +625,148 @@ on, and the desktop app is not the only frontend. All three are in
   the kind of thing nobody does twice. The flag tops up whichever set is in
   play. Not in the default set: `wait` returning on every permission prompt
   would break the contract `docs/agent-conventions.md` teaches.
+
+### H13 — Notifications: blocked has to reach a human — **done** (gh#71)
+Landed as `crates/board/src/notify.rs` (who is told what, and the wording)
+plus the effects in `sync.rs`. Before it, `notify`/`notify_dispatcher` were
+parsed, documented and reported by `doctor` — and read nowhere. Worse, the
+one state that most needs a signal produced none: a `blocked` attempt settles
+nothing and closes nothing (correctly — the chat holds the context and the
+call is the operator's), so no outcome writeback fired, and an agent that
+asked a question at 02:00 was discoverable only by looking at the board.
+
+Three audiences, three channels, and the point of the design is that they are
+not the same person:
+
+- **The issue.** Entering `blocked` queues a `blocked` writeback — one comment
+  saying whether the agent is waiting on an answer or its run died, and what
+  to do about each. Keyed `<task>:blocked:<attempt>:<block>` off the new
+  `attempts.blocked_count` column, bumped on the *transition* into blocked:
+  once per block, so a block that lasts three hours is one comment and a
+  question answered at 09:00 followed by another at 11:00 is two. Delivered
+  by the existing queue, so GitHub's per-repo `writeback` decides at delivery
+  exactly as it does for dispatch and outcome comments. An attempt that blocks
+  and settles in the same pass (an errored run whose PR is already open) gets
+  the outcome comment only — two comments contradicting each other is worse
+  than one.
+- **The agent that released it.** herdr-board's AGE-25 dispatcher wake, now
+  ported: `notify_dispatcher = true` prompts the dispatching chat when its
+  released work settles (or orphans), over the same `Runtime::prompt` review
+  delivery uses. The provenance was already on the attempt row
+  (`dispatched_by_pane`). Still off by default, and that is the design rather
+  than caution — an orchestrator woken by every child it released cannot hold
+  a train of thought. Operator-released work has no dispatcher chat, so the
+  switch is silent for it by construction, which is why it stays separate from
+  the operator's own.
+- **The operator, out of band.** `notify` is now real: it switches one webhook
+  URL (`notify_webhook`), POSTed `{"event": "on_blocked" | "on_settled", …}`
+  with a `text` line for endpoints that render nothing else. One URL, no
+  per-service clients — Slack, ntfy, a pager and a two-line relay all already
+  accept a POST, and a board holding three credentials it never reads would be
+  three more things to be wrong. Five-second timeout, no retry: the writeback
+  queue retries because a comment is worth the same tomorrow, and a
+  notification is not — one delivered forty minutes late reads as current.
+  A dead endpoint logs and is dropped; it never holds a settle open.
+
+`doctor` now matches reality, which was half the bug. Its settle-notice line
+no longer claims "only you are notified when released work settles" — nothing
+notified you. There is a `blocked notice` line that names the read-only repos
+where a block really does show nowhere but the board. And an `operator notice`
+line reads the two keys together and is true in each state: *not configured*
+(no webhook — a preference, so `ok`, but worded so nobody reads it as a notice
+that fires), *on*, *muted* (`notify = false` over a configured URL), and the
+one genuine fault — an address that cannot be posted to, where the operator
+asked for the notice and every one is being dropped into a log line. Only that
+last state fails; a `doctor` that exits 1 over a preference stops meaning
+anything.
+
+### H14 — Worktree gc — **done** (gh#72)
+Landed as `crates/board/src/gc.rs` (the pure decision + the disk measurement)
+plus `SyncEngine::collect_worktrees` in `sync.rs`, with `retain_worktrees` on
+`[defaults]` (7d, `off` to disable).
+
+Nothing deleted a worktree before this. `Repos::delete_worktree` was reachable
+only from the `DeleteWorktree` RPC: settle, orphan, cancel and retry-replace all
+close the attempt row and walk away, so every attempt leaked a full checkout
+plus a local branch, forever. And the branch leaked even from the RPC — that
+function deleted a branch only when it was named `comet/…`, while the board's
+come from `branch_template` and are `board/…`.
+
+The shape:
+- **Whose is it.** `gc::standing` reads three states off the task: *live* (any
+  live attempt on the task — retries reuse the branch, so a closed attempt's
+  directory is usually the live one's), *held* (a pull request still open, or an
+  issue still owed — a retry lands on the previous attempt's commits and must
+  find them), *spent* (closed upstream, deleted upstream, or marked done, with
+  no open PR). Only spent is collectable, and it is read off upstream facts
+  rather than off the rendered `BoardState`, so the sweep does not depend on
+  having re-derived first.
+- **The clock starts when it is freed**, not when the attempt ended: a PR open
+  for a fortnight would otherwise be collected the instant it merged. The mark
+  is `attempts.collectable_at`; coming back to life clears it, so the next
+  window is whole.
+- **Wall time, on the interval**, like the cap and orphaning.
+- **Never silent.** The mark and the collection are both log lines naming the
+  path, a week apart.
+- **The branch too.** `delete_worktree` now takes the branch its creator
+  vouches for and deletes it when the checkout is still on it (or gone). An
+  operator's own branch checked out in there is still off limits, which is what
+  the `comet/` test was standing in for.
+- **`doctor` says what it costs.** A `worktrees` check reports the checkout
+  count, the disk under the root (time-boxed walk; `≥` when it ran out), how
+  many the board still tracks, and the retention window in force — the warning
+  that makes the leak visible before the disk is full.
+
+Deliberately not here: collecting checkouts the board has no row for (comet's
+own `comet/…` worktrees, attempts whose task was reaped). `doctor` counts them,
+because the disk does; deleting a directory nothing claims is a bigger decision
+than this one.
+
+### H15 — The frontends send an account, and say who dispatched — **done** (gh#74)
+`DispatchTask` has taken an `account` since gh#59 and no frontend sent one, so
+a dispatch from the panel spent whatever the route said — which on a shared box
+means the owner's subscription, whoever pressed enter. Nothing recorded who that
+was either: `Dispatcher::Operator` is anonymous by construction.
+
+**The account picker.** The desktop panel's dispatch picker grew a third strip
+between runtime and model; the TUI, which had no picker at all, opens one on
+`enter` over a ready row. Both are fed by `ListAgentAccounts` **on the board's
+host** — the run executes there, and a slot id means nothing on the device that
+did not save it, the same reason `ListModels` is fetched with the host
+passthrough. Both filter the slots to the harness the row's runtime resolves to,
+which is why `ListBoardRuntimes` now carries `harness`: a Claude slot cannot pay
+for a codex run (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not interchangeable),
+and offering one would be offering a dispatch that refuses itself.
+
+Row 0 in both is **the route's own account**, and sends no override — so
+enter-enter is exactly what enter did before, and the strip costs a keystroke
+rather than a decision. It names the route's account where the row knows one, so
+the default is a fact rather than a shrug. Picking a slot is one click and never
+itself the release: whose limits a run burns is too consequential to happen by
+accident, so the model row (or enter) still does the releasing.
+
+**Attribution, at the strength the transport allows.** Every dispatch from
+either frontend now carries `viaDevice` (this device's id) and `viaUser` (the
+signed-in email), recorded on the attempt as `dispatched_by_device` /
+`dispatched_by_user`. `dispatched_by_user` joins the `TaskRow` contract, so
+`list --json` and both viewports can say who released a row; the device id
+deliberately stays off the wire, since it names a laptop, not a person. With no
+agent in the chain the upstream dispatch comment names the human — "dispatched
+by ana@example.com" — where it previously said nothing at all.
+
+These are **claims, not credentials**, and `DispatchOrigin` says so where the
+code is: relayed board calls arrive as the device room's owner (§H9), so the box
+has no per-call identity to check them against. #66 established that a teammate
+may reach the box at all; establishing *which* teammate is the next step, and
+these two columns are where a verified identity will land. Until then nothing is
+authorized on them, and in particular no account is inferred from them — which
+subscription a run spends stays the explicit `account` (gh#59).
+
+Deliberately not here: a per-user default account (that is a preference, and
+preferences want a home and a settings surface), and any UI for reading the
+attribution back beyond the row field — the panel's dispatch notice names the
+account it spent, and the issue comment names the human, which is where people
+were already looking.
 
 ### H13 — Remote routing surface — **done** (gh#75)
 `routing.toml` is a hand-edited file on the box, documented as "not managed

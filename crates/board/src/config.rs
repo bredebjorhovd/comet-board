@@ -69,9 +69,24 @@ impl Paths {
     pub fn logfile(&self) -> PathBuf {
         self.state_dir.join("syncd.log")
     }
-    pub fn worktree_root(&self) -> PathBuf {
-        self.state_dir.join("wt")
-    }
+}
+
+/// Where attempt checkouts live — the engine's worktree root, named here
+/// because two crates need the same answer and only one may own it.
+///
+/// The engine cuts them (`crates/engine/src/repos.rs`) and the board reclaims
+/// and reports on them (gh#72), so a second copy of this rule would mean
+/// `doctor` measuring a directory nothing writes to. Deliberately NOT under the
+/// data dir — worktrees are user-facing working checkouts.
+/// `COMET_WORKTREES_DIR` overrides (test isolation); empty reads as unset.
+pub fn worktrees_root() -> PathBuf {
+    std::env::var_os("COMET_WORKTREES_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".comet-native").join("worktrees")
+        })
 }
 
 /// Credentials effective for one configuration read.
@@ -288,6 +303,28 @@ pub fn parse_max_duration(s: &str) -> std::result::Result<Option<u64>, String> {
     }
 }
 
+/// Parse a `retain_worktrees` value into a retention window in seconds (gh#72).
+///
+/// `Ok(None)` is *keep forever*, said out loud — `off`, `none`, `never` or `0`
+/// — and it is the only spelling that turns worktree collection off. An
+/// unparseable value is an `Err` for the same reason `max_duration`'s is: a
+/// typo that read as "never" would leave the disk filling up silently, which is
+/// the bug this whole feature is about. No minimum: a retention of seconds is
+/// what the tests want and what an operator reclaiming a full disk means.
+pub fn parse_retention(s: &str) -> std::result::Result<Option<u64>, String> {
+    let t = s.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "never") {
+        return Ok(None);
+    }
+    match parse_duration_secs(t) {
+        Some(0) => Ok(None),
+        Some(n) => Ok(Some(n)),
+        None => Err(format!(
+            "`{s}` is not a duration; write it like `7d`, `2w`, `48h`, or `off`"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
@@ -306,13 +343,32 @@ pub struct Defaults {
     /// whatever was last checked out in it, and that is nobody's intended base.
     #[serde(default = "default_base")]
     pub base: String,
-    /// Surface a notification when released work settles.
+    /// Surface a notification, out of band, when work blocks or settles.
     ///
     /// A conversational orchestrator cannot be woken — it only gets a turn when
-    /// something prompts it — so the operator is the one who has to notice.
-    /// Off means noticing is entirely on you.
+    /// something prompts it — so the operator is the one who has to notice, and
+    /// an agent that stops to ask at 02:00 is invisible until somebody looks at
+    /// the board. This is the switch for the channel that reaches them anyway;
+    /// [`notify_webhook`](Self::notify_webhook) is where it goes. On with
+    /// nothing configured is a channel with no address, which `doctor` says
+    /// plainly rather than reporting a notice that cannot fire.
+    ///
+    /// It does not gate the upstream comments — a blocked attempt comments on
+    /// its own issue regardless, because that trail belongs to the task and not
+    /// to whoever is watching tonight.
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Where [`notify`](Self::notify) sends: one URL, POSTed a small JSON body
+    /// (`{"event": "on_blocked" | "on_settled", …}`) when a dispatched attempt
+    /// blocks or settles.
+    ///
+    /// One URL and no per-service integration on purpose. Slack, email and
+    /// pagers all already accept a webhook — via their own incoming-webhook
+    /// endpoint, or the two lines of glue an operator already has — and the
+    /// board carrying a client per destination would be the board maintaining
+    /// three credentials it never reads.
+    #[serde(default)]
+    pub notify_webhook: Option<String>,
     /// Also tell the *agent* that released a task when its work settles, by
     /// queueing a message into the chat it dispatched from (AGE-25).
     ///
@@ -342,10 +398,26 @@ pub struct Defaults {
     /// spelling of what every board did before this existed.
     #[serde(default = "default_max_duration")]
     pub max_duration: String,
+    /// How long a finished attempt's checkout is kept before the board deletes
+    /// it and its local branch (gh#72). The clock starts when the attempt is
+    /// closed *and* its task has left the board — merged, closed upstream, or
+    /// marked done — never while an attempt is live or a pull request is open.
+    ///
+    /// A week by default: long enough to open last Tuesday's checkout and see
+    /// what the agent actually did, short enough that a box dispatching a few
+    /// tasks a day does not fill its disk with them. `off` (or `0`) keeps every
+    /// checkout forever, which is what every board did before this existed —
+    /// and what `doctor`'s worktree check exists to make visible.
+    #[serde(default = "default_retain_worktrees")]
+    pub retain_worktrees: String,
 }
 
 fn default_max_duration() -> String {
     "2h".into()
+}
+
+fn default_retain_worktrees() -> String {
+    "7d".into()
 }
 
 fn default_new_source() -> String {
@@ -375,9 +447,11 @@ impl Default for Defaults {
             branch_template: default_branch_template(),
             base: default_base(),
             notify: true,
+            notify_webhook: None,
             notify_dispatcher: false,
             new_source: default_new_source(),
             max_duration: default_max_duration(),
+            retain_worktrees: default_retain_worktrees(),
         }
     }
 }
@@ -752,6 +826,12 @@ impl RoutingConfig {
         if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
             out.push(format!("[defaults] max_duration {e}"));
         }
+        // Same reasoning as the cap above: an unparseable retention would read
+        // as `off` on a board nobody told, and the checkouts would pile up
+        // exactly as they did before gh#72.
+        if let Err(e) = parse_retention(&self.defaults.retain_worktrees) {
+            bail!("[defaults] retain_worktrees {e}");
+        }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
         // nothing — silently, which is the failure this table exists to fix.
@@ -825,6 +905,19 @@ impl RoutingConfig {
         // default cap is the honest answer rather than none at all.
         parse_max_duration(raw)
             .unwrap_or_else(|_| parse_max_duration(&default_max_duration()).ok().flatten())
+    }
+
+    /// How long a finished attempt's checkout is kept, in seconds. `None` is
+    /// "forever" — collection off (gh#72).
+    ///
+    /// Board-wide rather than per route: which repo an attempt ran in says
+    /// nothing about how long you want to be able to look at its checkout, and
+    /// a per-route window would be one more place for the disk to fill up
+    /// behind a key nobody set. An unparseable value falls back to the default
+    /// window, never to "forever", for the same reason the cap does.
+    pub fn retain_worktrees_secs(&self) -> Option<u64> {
+        parse_retention(&self.defaults.retain_worktrees)
+            .unwrap_or_else(|_| parse_retention(&default_retain_worktrees()).ok().flatten())
     }
 }
 

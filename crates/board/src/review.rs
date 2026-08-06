@@ -137,7 +137,7 @@ pub fn is_actionable(f: &Feedback) -> bool {
     f.requests_changes() || !f.body.trim().is_empty()
 }
 
-fn is_the_boards_own(body: &str) -> bool {
+pub(crate) fn is_the_boards_own(body: &str) -> bool {
     let b = body.trim_start();
     b.starts_with("comet-board:") || b.starts_with("Dispatched to comet")
 }
@@ -735,7 +735,13 @@ mod tests {
             screen_at: None,
             nudges: 0,
             nudged_at: None,
+            blocked_count: 0,
             overrun_warned_at: None,
+            repo_path: Some("/repo/r".into()),
+            collectable_at: None,
+            collected_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
     }
 
@@ -885,6 +891,7 @@ mod tests {
             log: std::sync::Arc::new(crate::log::Logger::new("", false)),
             linear: None,
             github: Some(Github::new(Box::new(Shared(rest)) as Box<dyn Rest>)),
+            webhook: std::sync::Arc::new(crate::notify::HttpWebhook),
         }
     }
 
@@ -919,6 +926,9 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat).unwrap();

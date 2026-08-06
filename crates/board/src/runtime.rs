@@ -68,12 +68,17 @@ pub const RUNTIME_NAMES: &[&str] = &[
 /// accept; `label` is the human spelling a picker shows. Served to the
 /// frontends by the engine's `ListBoardRuntimes`, so the board panel and the
 /// CLI offer the same set the engine validates against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeOption {
-    pub name: String,
-    pub label: String,
-}
+///
+/// `harness` is what [`harness_for_runtime`] resolves the name to. It rides
+/// along so an account picker can tell which saved logins a runtime can spend
+/// (gh#74) without either frontend re-implementing the mapping — a Claude slot
+/// is not lendable to a codex run, and the two config-dir variables are not
+/// interchangeable.
+///
+/// The shape lives in proto (`comet_proto::view::board`) so the viewports can
+/// deserialize `ListBoardRuntimes` without depending on this crate, exactly as
+/// [`crate::rows::TaskRow`] does; what the list *contains* is this module's.
+pub use comet_proto::view::board::RuntimeOption;
 
 /// The runtimes a dispatch can be told to use, in picker order.
 ///
@@ -95,6 +100,7 @@ pub fn runtime_options() -> Vec<RuntimeOption> {
     .map(|(id, label)| RuntimeOption {
         name: runtime_name(id).to_string(),
         label: label.to_string(),
+        harness: id,
     })
     .collect()
 }
@@ -278,6 +284,35 @@ pub trait Runtime {
     /// a session that moved on reaches the wrong author. What herdr-board read
     /// off the pane's live cwd, comet states on the chat row.
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>>;
+
+    /// Reclaim a finished attempt's checkout and the local branch it was cut
+    /// on (gh#72) — herdr-board's `gc`, which the port left behind.
+    ///
+    /// `repo_path` is where the worktree came from, recorded at dispatch: the
+    /// removal, the prune and the `branch -D` all run there, and it is the one
+    /// fact that survives the checkout being deleted by hand. `None` means an
+    /// attempt older than that column, and the engine derives what it can from
+    /// the checkout instead. `branch` is the branch the *board* cut; the
+    /// implementation deletes it only if the checkout is still on it, because
+    /// an operator may have checked out something else in there.
+    ///
+    /// Best-effort by contract: a checkout already gone, a branch already
+    /// deleted and a repo that has moved are all `Ok(())`. An `Err` means the
+    /// board should try again next cycle rather than record the space as
+    /// reclaimed.
+    ///
+    /// The default is a refusal rather than a no-op: a runtime that cannot do
+    /// this must not have the board stamping checkouts as collected that are
+    /// still sitting on the disk.
+    fn reclaim_worktree(
+        &self,
+        repo_path: Option<&str>,
+        worktree: &str,
+        branch: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _ = (repo_path, worktree, branch);
+        anyhow::bail!("this runtime cannot reclaim worktrees")
+    }
 
     /// How the chat's most recent run ended, straight off the run journal:
     /// `Some` when the journal's last event is a `Done`, `None` while a run is

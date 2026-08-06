@@ -27,11 +27,13 @@
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
+use crate::gc;
 use crate::log::Logger;
 use crate::model::*;
+use crate::notify::{self, Signal, Stopped, Webhook};
 use crate::overrun;
 use crate::runtime::{RunEnd, Runtime};
-use crate::settled::{self, Evidence, Verdict};
+use crate::settled::{self, Commits, Evidence, Verdict, Why};
 use crate::sources::github::{Github, HttpRest, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
@@ -96,6 +98,10 @@ pub struct SyncEngine {
     pub log: Arc<Logger>,
     pub linear: Option<Linear<Box<dyn GraphQl>>>,
     pub github: Option<Github<Box<dyn Rest>>>,
+    /// Where `[defaults] notify_webhook` is POSTed (gh#71). A field rather than
+    /// a call into `notify::HttpWebhook` so a test can watch what the board
+    /// would have sent without one listening socket in the suite.
+    pub webhook: Arc<dyn Webhook>,
 }
 
 /// Meta keys. Kept together so readers and the engine's loop cannot drift.
@@ -119,6 +125,11 @@ pub mod meta {
     /// [`crate::review::Delivered`], as JSON.
     pub fn reviews_for(task_id: &str) -> String {
         format!("reviews:{task_id}")
+    }
+    /// When an attempt was first found holding unpushed commits (gh#69), so
+    /// the log says it once rather than every cycle.
+    pub fn unpushed_noted(attempt: i64) -> String {
+        format!("unpushed:{attempt}")
     }
 }
 
@@ -162,6 +173,7 @@ impl SyncEngine {
             log,
             linear,
             github,
+            webhook: Arc::new(crate::notify::HttpWebhook),
         })
     }
 
@@ -233,6 +245,10 @@ impl SyncEngine {
             self.reconcile_sessions_with(statuses, runtime)?;
         }
         self.rederive_all()?;
+        // After reconciliation, so a checkout freed this cycle starts its
+        // retention clock this cycle; on the interval only, like every other
+        // clocked decision (gh#72).
+        self.collect_worktrees(runtime);
         self.drain_writebacks();
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
         Ok(pulls)
@@ -618,11 +634,14 @@ impl SyncEngine {
     /// Has this attempt produced commits on its branch?
     ///
     /// A pull request is not the only evidence of finished work: an agent that
-    /// commits locally and stops is done, and waiting for a PR that is never
+    /// commits, pushes and stops is done, and waiting for a PR that is never
     /// coming leaves the row `working` forever. Counting commits against the
     /// attempt's own starting commit is the local equivalent of "explicit done
-    /// detection". [`SyncEngine::maybe_settle`] consumes this (§H4); the
-    /// ranking of what it measures is [`crate::settled::decide`].
+    /// detection". Half the answer: whether those commits are anywhere but
+    /// this box is [`SyncEngine::commits_are_on_origin`], and the two together
+    /// are [`SyncEngine::attempt_commits`], which [`SyncEngine::maybe_settle`]
+    /// consumes (§H4). The ranking of what they measure is
+    /// [`crate::settled::decide`].
     pub fn attempt_has_commits(&self, worktree: Option<&str>, base_sha: Option<&str>) -> bool {
         let Some(worktree) = worktree else {
             return false;
@@ -692,6 +711,99 @@ impl SyncEngine {
             }
         }
         false
+    }
+
+    /// What this attempt's commits amount to (gh#69): nothing, work only its
+    /// own box can see, or work on origin.
+    ///
+    /// [`SyncEngine::attempt_has_commits`] answers the first half — is there
+    /// anything past the base — and this adds the half that decides whether a
+    /// settle may call it reviewable. `ask_github` allows the second, remote
+    /// tier of that check; see [`SyncEngine::commits_are_on_origin`].
+    pub fn attempt_commits(&self, task: &Task, attempt: &Attempt, ask_github: bool) -> Commits {
+        if !self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref()) {
+            return Commits::None;
+        }
+        if self.commits_are_on_origin(task, attempt, ask_github) {
+            Commits::Pushed
+        } else {
+            Commits::Unpushed
+        }
+    }
+
+    /// Is this attempt's HEAD on origin?
+    ///
+    /// The bar is containment, not existence: a retry reuses its predecessor's
+    /// branch, so "there is a branch called `board/gh-69-comet-board` on
+    /// origin" would settle a retry on the *previous* attempt's push. What
+    /// makes the work reviewable is that these commits are there.
+    ///
+    /// Two tiers, cheapest first:
+    ///
+    /// 1. **A remote-tracking ref that contains HEAD.** Free, offline, and
+    ///    true of every ordinary `git push`: git writes `refs/remotes/origin/…`
+    ///    itself when the push succeeds, and a linked worktree shares those
+    ///    refs with the checkout it was cut from. It is also the only tier that
+    ///    works at all for a remote that is not GitHub.
+    /// 2. **GitHub, asked directly** — for a push made straight to a URL
+    ///    (`git push https://…`, which updates no tracking ref at all: exactly
+    ///    what the credential path of gh#68 hands an agent) or into a checkout
+    ///    whose refs have since been pruned. Only on the event path, for the
+    ///    reason [`SyncEngine::recheck_pull_request`] gives: a run ending is a
+    ///    rare event, whereas the interval reconcile re-asks every cycle for as
+    ///    long as the attempt stays live, and one API call per cycle per stuck
+    ///    attempt is a poll nobody asked for.
+    ///
+    /// Unproven reads as unpushed, always. The cost of that is an attempt that
+    /// stays live longer than it had to — visible, and bounded by the wall
+    /// clock cap — against a row that says `review` about work nobody can
+    /// fetch, which is the bug.
+    fn commits_are_on_origin(&self, task: &Task, attempt: &Attempt, ask_github: bool) -> bool {
+        let Some(worktree) = attempt.worktree.as_deref() else {
+            return false;
+        };
+        let Some(head) = git_out(worktree, &["rev-parse", "HEAD"]) else {
+            return false;
+        };
+        // `--count=1` because the question is whether *any* remote holds it;
+        // the walk stops as soon as one does.
+        if git_out(
+            worktree,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                &head,
+                "refs/remotes/",
+            ],
+        )
+        .is_some_and(|refs| !refs.is_empty())
+        {
+            return true;
+        }
+        if !ask_github {
+            return false;
+        }
+        let (Some(gh), Some(branch)) = (self.github.as_ref(), attempt.branch.as_deref()) else {
+            return false;
+        };
+        // The task's own repo when it has one; otherwise whatever the checkout
+        // pushes to, which is all a Linear ticket can offer.
+        let Some(repo) = crate::model::gh_repo(&task.id)
+            .map(str::to_string)
+            .or_else(|| crate::git_credentials::repo_for_checkout(worktree))
+        else {
+            return false;
+        };
+        let Some(remote_head) = gh.branch_head(&repo, branch) else {
+            return false;
+        };
+        // Containment against a commit we hold locally. A remote tip we have
+        // never fetched cannot be checked, and unproven reads as unpushed.
+        git_ok(
+            worktree,
+            &["merge-base", "--is-ancestor", &head, &remote_head],
+        )
     }
 
     /// Map live attempts onto the sessions the engine currently reports.
@@ -771,7 +883,7 @@ impl SyncEngine {
                         "{} chat {} gone for {} ticks — orphaned",
                         task.identifier, chat_id, ticks
                     ));
-                    self.orphan(&task, &attempt)?;
+                    self.orphan(runtime, &task, &attempt)?;
                 } else {
                     self.log.info(format!(
                         "{} chat {} missing (tick {}/2)",
@@ -788,6 +900,7 @@ impl SyncEngine {
             }
             // Persist it so readers render state without a session watch of
             // their own.
+            let entered_blocked = self.entered_blocked(&attempt, status);
             if attempt.agent_status != Some(status) {
                 self.db.set_attempt_status(attempt.id, status)?;
             }
@@ -799,7 +912,14 @@ impl SyncEngine {
             // §H4: the turn ended — check the checkout. No fresh PR lookup on
             // this path: the cycle polled GitHub moments ago, so the recorded
             // PR state is as fresh as a lookup would be.
-            self.maybe_settle(runtime, &task, &attempt, status, false)?;
+            let settled = self.maybe_settle(runtime, &task, &attempt, status, false)?;
+            // Blocked *and* settled is an errored run whose pull request was
+            // already open: the work is reviewable, so it is a settle and not
+            // a block, and saying both would be the board contradicting
+            // itself in two comments on the same issue.
+            if entered_blocked && !settled {
+                self.note_blocked(runtime, &task, &attempt, chat_id)?;
+            }
         }
         // After settling, so an attempt that just finished is never failed for
         // running long; before the rewatch, which only looks at closed rows.
@@ -974,10 +1094,150 @@ impl SyncEngine {
         Ok(())
     }
 
+    // ---- reclaiming checkouts (gh#72) ------------------------------------
+
+    /// Delete the checkout and local branch of every attempt nobody is coming
+    /// back for, once it has sat unclaimed for `[defaults] retain_worktrees`.
+    ///
+    /// Every dispatch cuts a worktree and a branch, and until this landed
+    /// nothing removed either: settle, orphan, cancel and retry-replace all
+    /// close the attempt row and leave the checkout, so a box running a few
+    /// tasks a day filled up with a full copy of the repo per attempt. The
+    /// decisions are [`gc::standing`] and [`gc::decide`]; this is the sweep
+    /// around them.
+    ///
+    /// Three properties, in the order they matter:
+    ///
+    /// - **Never a live checkout.** A task with any live attempt is skipped
+    ///   whole — retries reuse the branch, so a closed attempt's directory is
+    ///   very often the live one's — and so is a task in review, whose branch a
+    ///   reviewer may check out and whose chat review delivery still matches
+    ///   against this path ([`crate::review`]).
+    /// - **Wall time from when it was freed**, not from when the attempt ended:
+    ///   a pull request open for a fortnight would otherwise be collected the
+    ///   instant it merged. The mark is stamped on one sweep and read on a
+    ///   later one, and a task that comes back to life clears it.
+    /// - **Never silent.** The mark and the collection are both log lines
+    ///   naming the path, so the week between them is visible to somebody who
+    ///   wants the checkout kept — `retain_worktrees = "off"` is the answer,
+    ///   and `doctor` reports the cost of choosing it.
+    ///
+    /// Collecting cannot strand a re-opened attempt, and the two rules are the
+    /// same rule: [`settled::should_reopen`] refuses to re-open on an upstream
+    /// that is final or a task marked done, which is exactly what
+    /// [`gc::Standing::Spent`] requires. A checkout is only ever deleted from
+    /// under an attempt that can no longer come back to life.
+    ///
+    /// Failure is never fatal to the cycle: an error is logged and the attempt
+    /// is left unmarked as collected, so the next sweep tries again.
+    fn collect_worktrees(&self, runtime: Option<&dyn Runtime>) {
+        let Some(retain) = self.cfg.retain_worktrees_secs() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let tasks = match self.db.load_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .error(format!("worktree gc: reading the board: {e}"));
+                return;
+            }
+        };
+        for task in &tasks {
+            for attempt in &task.attempts {
+                if attempt.collected_at.is_some() || attempt.worktree.is_none() {
+                    continue;
+                }
+                let spent = attempt
+                    .collectable_at
+                    .as_deref()
+                    .map(|t| secs_since(t, now).unwrap_or(0));
+                let standing = gc::standing(task, attempt);
+                if let Err(e) = match gc::decide(standing, spent, retain) {
+                    gc::Verdict::Keep => Ok(()),
+                    gc::Verdict::Mark => self.mark_collectable(task, attempt, retain),
+                    gc::Verdict::Unmark => self.db.set_attempt_collectable(attempt.id, false),
+                    gc::Verdict::Collect => self.collect_one(runtime, task, attempt),
+                } {
+                    self.log.warn(format!(
+                        "{}: worktree gc on attempt {}: {e:#}",
+                        task.identifier, attempt.id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Start the retention clock, and say so — the one warning anybody gets
+    /// before a checkout is deleted a week later.
+    fn mark_collectable(&self, task: &Task, attempt: &Attempt, retain: u64) -> Result<()> {
+        self.db.set_attempt_collectable(attempt.id, true)?;
+        self.log.info(format!(
+            "{}: {} is finished with — its checkout {} goes in {}",
+            task.identifier,
+            attempt
+                .branch
+                .as_deref()
+                .unwrap_or("the attempt's own branch"),
+            attempt.worktree.as_deref().unwrap_or("(none)"),
+            gc::human_window(retain),
+        ));
+        Ok(())
+    }
+
+    /// The window ran out: hand the checkout back to the engine, which owns
+    /// worktrees, and record that it is gone.
+    ///
+    /// A cycle run without a runtime marks and unmarks but deletes nothing —
+    /// the same split the duration cap makes, and the deliberate one here: only
+    /// the process that owns the worktrees may remove one, and everything else
+    /// is welcome to keep the clock.
+    fn collect_one(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+    ) -> Result<()> {
+        let Some(worktree) = attempt.worktree.as_deref() else {
+            return Ok(());
+        };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+        runtime.reclaim_worktree(
+            attempt.repo_path.as_deref(),
+            worktree,
+            attempt.branch.as_deref(),
+        )?;
+        self.db.set_attempt_collected(attempt.id)?;
+        self.log.info(format!(
+            "{}: reclaimed {} and branch {}",
+            task.identifier,
+            worktree,
+            attempt.branch.as_deref().unwrap_or("(none recorded)"),
+        ));
+        Ok(())
+    }
+
     /// End an attempt whose chat is gone, and tell everyone reading upstream.
-    fn orphan(&self, task: &Task, attempt: &Attempt) -> Result<()> {
+    ///
+    /// Notified on the same channels a settle is (gh#71): an attempt ending
+    /// because its chat vanished is still the end of the work a dispatcher was
+    /// waiting on, and it is the ending nobody would otherwise notice.
+    fn orphan(&self, runtime: Option<&dyn Runtime>, task: &Task, attempt: &Attempt) -> Result<()> {
         self.db.close_attempt(attempt.id, Outcome::Orphaned)?;
-        self.enqueue_outcome(task, Outcome::Orphaned, None)
+        self.enqueue_outcome(task, Outcome::Orphaned, None)?;
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome: Outcome::Orphaned,
+                evidence: None,
+                pr_url: None,
+            },
+        );
+        Ok(())
     }
 
     // ---- settling (§H4) --------------------------------------------------
@@ -1024,18 +1284,21 @@ impl SyncEngine {
     /// The §H4 settle check: if this attempt's run has ended, weigh the
     /// artifacts and maybe close it. Returns whether it settled.
     ///
-    /// `fresh_pr` allows one targeted GitHub lookup before closing on commits
-    /// alone. Only the event path passes true — the interval path polls before
-    /// it reconciles, so a lookup there would repeat the poll — and the lookup
-    /// itself is gated on commits existing, because a pull request cannot
-    /// exist without them.
+    /// `ask_github` allows the two targeted GitHub lookups the decision can
+    /// want — an unrecorded pull request, and (gh#69) a branch pushed without
+    /// leaving a tracking ref behind. Only the event path passes true: the
+    /// interval path polls before it reconciles, so a PR lookup there would
+    /// repeat the poll, and it re-asks every cycle for as long as the attempt
+    /// is live, so a branch lookup there would be a poll of its own. The PR
+    /// lookup is additionally gated on commits existing, because a pull
+    /// request cannot exist without them.
     fn maybe_settle(
         &self,
         runtime: Option<&dyn Runtime>,
         task: &Task,
         attempt: &Attempt,
         status: AgentStatus,
-        fresh_pr: bool,
+        ask_github: bool,
     ) -> Result<bool> {
         let Some(chat_id) = attempt.pane_id.as_deref() else {
             return Ok(false);
@@ -1046,7 +1309,7 @@ impl SyncEngine {
         let mut pr_open = task.pr_open;
         let mut pr_url = task.pr_url.clone().filter(|_| pr_open);
         if !pr_open
-            && fresh_pr
+            && ask_github
             && self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
             && let Some(url) = self.recheck_pull_request(task, attempt)
         {
@@ -1054,18 +1317,46 @@ impl SyncEngine {
             pr_url = Some(url);
         }
         let verdict = settled::decide(end, pr_open, || {
-            self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+            self.attempt_commits(task, attempt, ask_github)
         });
         match verdict {
             Verdict::Finished(evidence) => {
-                self.settle(task, attempt, evidence, pr_url.as_deref())?;
+                self.settle(runtime, task, attempt, evidence, pr_url.as_deref())?;
                 Ok(true)
+            }
+            // The one StayLive worth a line: a row that stays `working`
+            // because its commits never left the box looks identical to one
+            // whose agent is still typing, and the difference is the whole of
+            // gh#69. Said once per attempt — the interval path asks again
+            // every cycle, and a log that repeats it is a log nobody reads.
+            Verdict::StayLive(Why::Unpushed) => {
+                self.note_unpushed(task, attempt);
+                Ok(false)
             }
             // Not logged: the interval path re-asks every cycle, and an
             // errored or artifact-less attempt is already visible on the
             // board as blocked / dim idle. The settle is the event.
             Verdict::StayLive(_) => Ok(false),
         }
+    }
+
+    /// Say, once, that an attempt is sitting on work only its own box can see.
+    fn note_unpushed(&self, task: &Task, attempt: &Attempt) {
+        let key = meta::unpushed_noted(attempt.id);
+        if matches!(self.db.meta_get(&key), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.db.meta_set(&key, &crate::db::now());
+        self.log.info(format!(
+            "{}: run ended with commits that are not on origin{} — attempt stays live \
+             (push the branch, or open a pull request, to settle it)",
+            task.identifier,
+            attempt
+                .branch
+                .as_deref()
+                .map(|b| format!(" ({b})"))
+                .unwrap_or_default(),
+        ));
     }
 
     /// Ask GitHub, now, whether this attempt's branch has an open pull
@@ -1114,11 +1405,13 @@ impl SyncEngine {
         None
     }
 
-    /// Close an attempt whose evidence cleared the bar, and tell everyone
-    /// reading upstream. The §H4 half of what herdr-board's `settle` did — the
-    /// dispatcher wake (its AGE-25) is deliberately not ported here.
+    /// Close an attempt whose evidence cleared the bar, and tell everyone who
+    /// was waiting on it: the tracker, the agent that released it, and the
+    /// operator's out-of-band channel. The §H4 half of what herdr-board's
+    /// `settle` did, now including its AGE-25 dispatcher wake (gh#71).
     fn settle(
         &self,
+        runtime: Option<&dyn Runtime>,
         task: &Task,
         attempt: &Attempt,
         evidence: Evidence,
@@ -1131,7 +1424,242 @@ impl SyncEngine {
             task.identifier,
             evidence.as_str()
         ));
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome: Outcome::Done,
+                evidence: Some(evidence),
+                pr_url: pr_url.map(str::to_string),
+            },
+        );
         Ok(())
+    }
+
+    // ---- notification (gh#71) --------------------------------------------
+
+    /// Tell whoever is not watching the board that something happened to a
+    /// dispatched attempt.
+    ///
+    /// Two channels, two switches, and they are independent because they are
+    /// different audiences (see [`crate::notify`]): the chat of the agent that
+    /// released the work (`notify_dispatcher`, off by default) and the
+    /// operator's webhook (`notify` + `notify_webhook`). The third channel —
+    /// the comment upstream — is not here: outcome comments are queued by
+    /// [`SyncEngine::enqueue_outcome`] and the blocked comment by
+    /// [`SyncEngine::note_blocked`], because those are retryable writebacks
+    /// rather than best-effort notices.
+    ///
+    /// Nothing here can fail the caller. A settle that has already happened is
+    /// not undone because a webhook host is down, and an attempt is not left
+    /// open because a dispatcher's chat was archived.
+    fn announce(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        signal: Signal,
+    ) {
+        if let Signal::Settled {
+            outcome,
+            evidence,
+            pr_url,
+        } = &signal
+        {
+            self.wake_dispatcher(
+                runtime,
+                task,
+                attempt,
+                *outcome,
+                *evidence,
+                pr_url.as_deref(),
+            );
+        }
+        self.post_webhook(task, attempt, &signal);
+    }
+
+    /// Queue a settle notice into the chat of the agent that released this
+    /// work (herdr-board's AGE-25).
+    ///
+    /// The provenance is already on the attempt row — `dispatched_by_pane` is
+    /// the chat the dispatch ran from, recorded for every agent-issued
+    /// dispatch whether or not the board started that chat. So the delivery is
+    /// the same [`Runtime::prompt`] a review uses: a steer into a live run, a
+    /// send otherwise, durable either way.
+    ///
+    /// Silent for an operator-released task by construction — there is no chat
+    /// to prompt — which is why this switch is separate from the operator's.
+    fn wake_dispatcher(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        outcome: Outcome,
+        evidence: Option<Evidence>,
+        pr_url: Option<&str>,
+    ) {
+        if !self.cfg.defaults.notify_dispatcher {
+            return;
+        }
+        let dispatcher = attempt.dispatcher();
+        let Some(chat) = dispatcher.pane() else {
+            return;
+        };
+        // A chat that dispatched into itself would be prompted about its own
+        // settle. Not reachable through `comet-board dispatch` (a dispatch
+        // makes a fresh chat), but a hand-set `--via` can say anything.
+        if Some(chat) == attempt.pane_id.as_deref() {
+            return;
+        }
+        let Some(runtime) = runtime else {
+            self.log.warn(format!(
+                "{}: settled, but no runtime to notify chat {chat} with",
+                task.identifier
+            ));
+            return;
+        };
+        // The dispatcher is usually a long-lived orchestrator that outlives
+        // many children, but it can have been archived since. Not an error:
+        // there is simply nobody to tell.
+        match runtime.chat_alive(chat) {
+            Ok(false) => {
+                self.log.info(format!(
+                    "{}: settled, but the chat that released it ({chat}) is gone — \
+                     nobody notified",
+                    task.identifier
+                ));
+                return;
+            }
+            Err(e) => {
+                self.log
+                    .warn(format!("{}: checking chat {chat}: {e}", task.identifier));
+                return;
+            }
+            Ok(true) => {}
+        }
+        let text = notify::dispatcher_message(task, attempt, outcome, evidence, pr_url);
+        match runtime.prompt(chat, &text) {
+            Ok(()) => self.log.info(format!(
+                "{}: settle notice queued into chat {chat}",
+                task.identifier
+            )),
+            // Best effort by design: the attempt is closed and the tracker has
+            // the trail. Retrying a notice about a thing that already happened
+            // is how a dispatcher gets told twice.
+            Err(e) => self.log.warn(format!(
+                "{}: could not notify chat {chat}: {e}",
+                task.identifier
+            )),
+        }
+    }
+
+    /// POST the event at `[defaults] notify_webhook`, if the operator wants it.
+    ///
+    /// The only channel that reaches somebody who is looking at neither the
+    /// board nor the issue tracker — which at 02:00 is everybody.
+    fn post_webhook(&self, task: &Task, attempt: &Attempt, signal: &Signal) {
+        if !self.cfg.defaults.notify {
+            return;
+        }
+        let Some(url) = self.cfg.defaults.notify_webhook.as_deref() else {
+            return;
+        };
+        if let Some(problem) = notify::webhook_url_problem(url) {
+            self.log.warn(format!(
+                "[defaults] notify_webhook is unusable ({problem}); {} went unannounced",
+                task.identifier
+            ));
+            return;
+        }
+        let body = notify::webhook_payload(task, attempt, signal, &crate::db::now());
+        match self.webhook.post(url, &body) {
+            Ok(()) => self.log.info(format!(
+                "{}: {} posted to {}",
+                task.identifier,
+                signal.event(),
+                notify::webhook_host(url)
+            )),
+            // Not retried, and the reason is in `notify`'s docs: a
+            // notification delivered late reads as current, which is worse
+            // than one that never came.
+            Err(e) => self.log.warn(format!(
+                "{}: {} webhook to {} failed: {e}",
+                task.identifier,
+                signal.event(),
+                notify::webhook_host(url)
+            )),
+        }
+    }
+
+    /// An attempt has just *entered* blocked: leave one comment upstream, and
+    /// raise the operator's out-of-band notice (gh#71).
+    ///
+    /// This is the state the board had no signal for at all. A blocked attempt
+    /// settles nothing and closes nothing — that is deliberate, the chat holds
+    /// the context and the decision is the operator's — so no outcome
+    /// writeback fires and the only trace is a row colour nobody is looking at.
+    ///
+    /// Once per block, not once per tick and not once per attempt: the counter
+    /// bumped here goes into the idempotency key, so a question answered at
+    /// 09:00 and a second question at 11:00 are two comments, while the
+    /// hundreds of reconcile ticks in between are none.
+    fn note_blocked(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        chat_id: &str,
+    ) -> Result<()> {
+        // Which kind of block, straight off the journal — the same read
+        // `run_end` makes, and the only thing that tells a question apart from
+        // a dead run inside the one `Blocked` status.
+        let why = match runtime.map(|r| r.last_run_end(chat_id)) {
+            Some(Ok(Some(RunEnd::Errored))) => Stopped::Errored,
+            Some(Ok(_)) => Stopped::Asking,
+            Some(Err(_)) | None => Stopped::Unknown,
+        };
+        let block = self.db.bump_blocked_count(attempt.id)?;
+        let queued = self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "blocked".into(),
+            payload: json!({
+                "reason": why.as_str(),
+                "block": block,
+                "attempt": task.attempt_count(),
+                "log": self.paths.logfile().to_string_lossy(),
+            })
+            .to_string(),
+            idem_key: format!("{}:blocked:{}:{}", task.id, task.attempt_count(), block),
+        })?;
+        self.log.info(format!(
+            "{}: blocked ({}) — {}",
+            task.identifier,
+            why.as_str(),
+            if queued {
+                "queued a comment upstream"
+            } else {
+                "already told upstream about this block"
+            }
+        ));
+        // The row the notice describes: the caller's copy predates the bump,
+        // and the payload names which block this is.
+        let mut with_count = attempt.clone();
+        with_count.blocked_count = block;
+        self.announce(runtime, task, &with_count, Signal::Blocked(why));
+        Ok(())
+    }
+
+    /// Has this attempt just entered blocked, for the first time this block?
+    ///
+    /// A transition is the usual answer. The `blocked_count == 0` arm is for
+    /// the attempt that was already sitting blocked when this feature landed:
+    /// its status is persisted, so it will never transition again, and without
+    /// this the one case gh#71 is about — an agent that stopped in the night —
+    /// would stay silent for as long as it stays stuck.
+    fn entered_blocked(&self, attempt: &Attempt, status: AgentStatus) -> bool {
+        status == AgentStatus::Blocked
+            && (attempt.agent_status != Some(AgentStatus::Blocked) || attempt.blocked_count == 0)
     }
 
     /// Look again at attempts the board has already closed (§H4's inverse,
@@ -1242,6 +1770,7 @@ impl SyncEngine {
                 continue;
             };
             let transitioned = attempt.agent_status != Some(status);
+            let entered_blocked = self.entered_blocked(&attempt, status);
             if transitioned {
                 self.db.set_attempt_status(attempt.id, status)?;
                 changed = true;
@@ -1251,7 +1780,7 @@ impl SyncEngine {
             if status == AgentStatus::Working && !attempt.saw_working {
                 self.db.set_saw_working(attempt.id)?;
             }
-            if transitioned {
+            if transitioned || entered_blocked {
                 let Some(task) = self.db.get_task(&attempt.task_id)? else {
                     continue;
                 };
@@ -1259,7 +1788,15 @@ impl SyncEngine {
                 // may be a whole cycle behind the agent's own `gh pr create`
                 // (herdr's gh#29 window — the reason "finished — committed"
                 // notices used to reach dispatchers whose PR already existed).
-                if self.maybe_settle(runtime, &task, &attempt, status, true)? {
+                let settled = self.maybe_settle(runtime, &task, &attempt, status, true)?;
+                if settled {
+                    changed = true;
+                }
+                // This is the event path, so this is where a block is noticed
+                // the moment the agent asks rather than up to a poll interval
+                // later — which for the 02:00 case is the whole point (gh#71).
+                if entered_blocked && !settled {
+                    self.note_blocked(runtime, &task, &attempt, chat_id)?;
                     changed = true;
                 }
             }
@@ -1553,6 +2090,13 @@ impl SyncEngine {
                             }
                         }
                     }
+                    // The agent stopped and cannot go on by itself (gh#71).
+                    // Not a state transition: the issue is still In Progress
+                    // and that is true — it is in progress and stuck, which is
+                    // a thing to say rather than a state to move to.
+                    "blocked" => {
+                        linear.comment(&task.source_id, &blocked_comment(&payload))?;
+                    }
                     // The attempt settled with work waiting on a human. Dispatch
                     // moved this issue to In Progress and, without this, nothing
                     // moved it again until a merge — so Linear read In Progress
@@ -1651,6 +2195,9 @@ impl SyncEngine {
                             ),
                         };
                         gh.comment(&repo, number, &body)?;
+                    }
+                    "blocked" => {
+                        gh.comment(&repo, number, &blocked_comment(&payload))?;
                     }
                     // Close on done. This is what makes "mark done" mean the
                     // same thing on a GitHub row as on a Linear one.
@@ -1788,6 +2335,20 @@ pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus
     }
 }
 
+/// The comment a queued `blocked` writeback delivers (gh#71).
+///
+/// Composed at delivery rather than at enqueue so the wording is one thing in
+/// one place for both trackers, exactly as the outcome comment is — but the
+/// *facts* come out of the payload, because they were true when the block
+/// happened and the task row has moved on since.
+fn blocked_comment(payload: &Value) -> String {
+    notify::upstream_comment(
+        payload["attempt"].as_u64().unwrap_or(1),
+        Stopped::parse(payload["reason"].as_str().unwrap_or("")),
+        payload["log"].as_str().unwrap_or("(none)"),
+    )
+}
+
 /// The branches the board has dispatched onto, and where.
 ///
 /// A branch name alone is not an identity: the board watches several repos and
@@ -1857,6 +2418,33 @@ fn outcome_note(payload: &Value) -> String {
 /// Seconds from an RFC-3339 stamp to `now`, or `None` if it will not parse.
 /// Negative when the stamp is in the future — a clock that moved, which the
 /// duration cap reads as "no time has passed" rather than as a breach.
+/// One git command in a checkout: its trimmed stdout, or `None` if it failed.
+///
+/// Failure and empty output are deliberately different answers — `for-each-ref`
+/// succeeding with nothing is "no such ref", and a git that could not run at
+/// all is "no idea", and the push check must not read the second as the first.
+fn git_out(worktree: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A git command run for its exit status alone (`merge-base --is-ancestor`).
+fn git_ok(worktree: &str, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn secs_since(stamp: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
     let t = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
     Some((now - t.with_timezone(&chrono::Utc)).num_seconds())
@@ -1904,7 +2492,43 @@ mod tests {
             log: Arc::new(Logger::new("", false)),
             linear,
             github: None,
+            webhook: Arc::new(RecordingWebhook::default()),
         }
+    }
+
+    /// The webhook the tests watch instead of a listening socket. Shared by
+    /// `Arc`, so a test can read back exactly what the board would have POSTed.
+    #[derive(Default)]
+    struct RecordingWebhook {
+        posts: std::sync::Mutex<Vec<(String, Value)>>,
+        /// Answer every POST with a failure, for the tests that check a dead
+        /// endpoint changes nothing about the board.
+        fail: bool,
+    }
+
+    impl Webhook for RecordingWebhook {
+        fn post(&self, url: &str, body: &Value) -> anyhow::Result<()> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.clone()));
+            if self.fail {
+                anyhow::bail!("the endpoint is down");
+            }
+            Ok(())
+        }
+    }
+
+    /// An engine wired to a webhook the test can read back.
+    fn engine_with_webhook(url: &str, fail: bool) -> (SyncEngine, Arc<RecordingWebhook>) {
+        let hook = Arc::new(RecordingWebhook {
+            fail,
+            ..Default::default()
+        });
+        let mut e = engine_inner(None);
+        e.cfg.defaults.notify_webhook = Some(url.to_string());
+        e.webhook = hook.clone();
+        (e, hook)
     }
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1947,6 +2571,9 @@ mod tests {
                 dispatched_by_pane: None,
                 base_sha: None,
                 account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();
@@ -1966,6 +2593,9 @@ mod tests {
             dispatched_by_pane: None,
             base_sha: None,
             account: None,
+            repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         })
         .unwrap()
     }
@@ -2165,16 +2795,31 @@ mod tests {
 
     use crate::runtime::{DispatchHandle, DispatchSpec};
 
-    /// A runtime that answers only the journal question — nothing else on the
-    /// trait is reachable from the settle path.
-    struct JournalFact(Option<RunEnd>);
+    /// A runtime that answers the journal question and records the prompts the
+    /// settle path sends — the two things reachable from settling (gh#71).
+    #[derive(Default)]
+    struct JournalFact(Option<RunEnd>, std::sync::Mutex<Vec<(String, String)>>);
+
+    impl JournalFact {
+        fn ending(end: Option<RunEnd>) -> JournalFact {
+            JournalFact(end, Default::default())
+        }
+        /// (chat id, text) for every prompt the board queued.
+        fn prompts(&self) -> Vec<(String, String)> {
+            self.1.lock().unwrap().clone()
+        }
+    }
 
     impl Runtime for JournalFact {
         fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
             unreachable!("settling never dispatches")
         }
-        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            unreachable!("settling never prompts")
+        fn prompt(&self, chat: &str, text: &str) -> anyhow::Result<()> {
+            self.1
+                .lock()
+                .unwrap()
+                .push((chat.to_string(), text.to_string()));
+            Ok(())
         }
         fn cancel(&self, _: &str) -> anyhow::Result<()> {
             unreachable!("settling never cancels")
@@ -2207,21 +2852,37 @@ mod tests {
         );
     }
 
+    /// What the agent left in the checkout when its run ended.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Work {
+        /// Nothing past the attempt's base.
+        None,
+        /// A commit, and nowhere but this worktree — gh#69's stranded attempt.
+        Committed,
+        /// A commit, and on origin: the artifact a settle may call reviewable.
+        Pushed,
+    }
+
     /// Give an attempt a real checkout: base recorded at dispatch, and — when
-    /// asked — a commit the agent made after it. Built on the AGE-19 fixture
-    /// so the operator's own unpushed commit is always present underneath,
-    /// proving every settle here measures from the attempt's base.
-    fn agent_worked_in(e: &SyncEngine, attempt: i64, committed: bool) -> std::path::PathBuf {
+    /// asked — a commit the agent made after it, pushed or not. Built on the
+    /// AGE-19 fixture so the operator's own unpushed commit is always present
+    /// underneath, proving every settle here measures from the attempt's base.
+    fn agent_worked_in(e: &SyncEngine, attempt: i64, did: Work) -> std::path::PathBuf {
         let work = repo_ahead_of_its_remote();
         let head = std::process::Command::new("git")
             .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
             .output()
             .unwrap();
         let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        if committed {
+        if did != Work::None {
             std::fs::write(work.join("agent"), "work").unwrap();
             git_in(&work, &["add", "."]);
             git_in(&work, &["commit", "-m", "the agent's work"]);
+        }
+        if did == Work::Pushed {
+            // An ordinary push, which is what leaves the remote-tracking ref
+            // the settle's first tier reads.
+            git_in(&work, &["push", "origin", "main"]);
         }
         e.db.set_attempt_worktree(attempt, &work.to_string_lossy())
             .unwrap();
@@ -2273,11 +2934,11 @@ mod tests {
     }
 
     #[test]
-    fn commits_settle_a_run_that_ended_cleanly() {
+    fn pushed_commits_settle_a_run_that_ended_cleanly() {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -2290,6 +2951,174 @@ mod tests {
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
+    /// gh#69, end to end: the agent committed, `gh pr create` never happened
+    /// (no credential on the box — gh#68's whole premise), and the run ended
+    /// `Completed`. The old rule read that as a finished attempt and moved the
+    /// row to `review` while the work sat in a worktree nobody else can reach.
+    #[test]
+    fn a_run_that_ends_with_unpushed_commits_does_not_read_as_review() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, Work::Committed);
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert!(
+            live(&e).outcome.is_none(),
+            "commits only the agent's box can see are not a reviewable attempt"
+        );
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Working
+        );
+        // And the reason is on the record rather than left to be guessed at
+        // from a row that looks like an agent still typing.
+        assert!(
+            e.db.meta_get(&meta::unpushed_noted(a)).unwrap().is_some(),
+            "the stranded branch is noted once"
+        );
+
+        // The agent (or the operator) pushes; the next run end settles it.
+        git_in(&work, &["push", "origin", "main"]);
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// The crash variant. Recovery stamps an aborted run `Interrupted`, so the
+    /// errored-runs-never-settle-on-commits guard does not apply to it, and an
+    /// agent killed mid-task used to settle as finished on a commit it had
+    /// made along the way.
+    #[test]
+    fn a_recovery_aborted_run_with_unpushed_commits_stays_live() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, Work::Committed);
+        let rt = JournalFact::ending(Some(RunEnd::Interrupted));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// A push straight to a URL — what an agent carrying the board's
+    /// credential does — updates no remote-tracking ref, so the local tier
+    /// proves nothing and the row would sit `working` on work that is in fact
+    /// on origin. The event path asks GitHub, once, and settles.
+    #[test]
+    fn a_branch_pushed_without_a_tracking_ref_is_found_by_asking_github() {
+        let work_dir = repo_ahead_of_its_remote();
+        let wt = work_dir.to_string_lossy().into_owned();
+        let base = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(work_dir.join("agent"), "work").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-m", "the agent's work"]);
+        let head = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        // Pushed by URL: the remote has it, this checkout has no record of it.
+        let remote = work_dir.parent().unwrap().join("remote.git");
+        git_in(
+            &work_dir,
+            &[
+                "push",
+                &remote.to_string_lossy(),
+                "HEAD:refs/heads/board/lin-142",
+            ],
+        );
+        assert!(
+            git_out(&wt, &["for-each-ref", "--contains", &head, "refs/remotes/"])
+                .is_some_and(|r| r.is_empty()),
+            "the fixture must leave no tracking ref, or it proves nothing"
+        );
+
+        let gh = Github::new(Box::new(FixtureRest::new(vec![(
+            "/repos/o/r/branches/board/lin-142".to_string(),
+            json!({ "commit": { "sha": head } }),
+        )])) as Box<dyn Rest>);
+        let e = engine_with(None, Some(gh));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &base).unwrap();
+        // The Linear task names no repo; the checkout's own remote answers.
+        git_in(
+            &work_dir,
+            &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+        );
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        let attempt = live(&e);
+        assert_eq!(
+            e.attempt_commits(&task, &attempt, false),
+            Commits::Unpushed,
+            "the interval path stays local: no API call per cycle per attempt"
+        );
+        assert_eq!(
+            e.attempt_commits(&task, &attempt, true),
+            Commits::Pushed,
+            "the event path asks GitHub and finds the branch"
+        );
+        std::fs::remove_dir_all(work_dir.parent().unwrap()).ok();
+    }
+
+    /// The bar is containment, not a name: a retry reuses its predecessor's
+    /// branch, and the push that branch already carries is not this attempt's.
+    #[test]
+    fn a_retrys_own_commits_are_what_must_be_on_origin() {
+        let work_dir = repo_ahead_of_its_remote();
+        let wt = work_dir.to_string_lossy().into_owned();
+        // The previous attempt's work, pushed under the shared branch name.
+        std::fs::write(work_dir.join("first"), "1").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-m", "the cancelled run's work"]);
+        let pushed = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let remote = work_dir.parent().unwrap().join("remote.git");
+        git_in(
+            &work_dir,
+            &[
+                "push",
+                &remote.to_string_lossy(),
+                "HEAD:refs/heads/board/lin-142",
+            ],
+        );
+        // The retry, committing on top and pushing nothing.
+        std::fs::write(work_dir.join("second"), "2").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-m", "the retry's work"]);
+
+        let gh = Github::new(Box::new(FixtureRest::new(vec![(
+            "/repos/o/r/branches/board/lin-142".to_string(),
+            json!({ "commit": { "sha": pushed } }),
+        )])) as Box<dyn Rest>);
+        let e = engine_with(None, Some(gh));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &pushed).unwrap();
+        git_in(
+            &work_dir,
+            &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+        );
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(
+            e.attempt_commits(&task, &live(&e), true),
+            Commits::Unpushed,
+            "a branch on origin at somebody else's commit settles nothing"
+        );
+        std::fs::remove_dir_all(work_dir.parent().unwrap()).ok();
+    }
+
     #[test]
     fn a_run_that_ends_with_nothing_new_committed_stays_live() {
         // The checkout exists and holds the operator's own unpushed commit —
@@ -2298,7 +3127,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, false);
+        let work = agent_worked_in(&e, a, Work::None);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -2318,8 +3147,8 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
-        let rt = JournalFact(Some(RunEnd::Errored));
+        let work = agent_worked_in(&e, a, Work::Pushed);
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
@@ -2358,7 +3187,7 @@ mod tests {
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
             .unwrap();
-        let rt = JournalFact(Some(RunEnd::Errored));
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
@@ -2377,7 +3206,7 @@ mod tests {
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
             .unwrap();
-        let rt = JournalFact(None);
+        let rt = JournalFact::ending(None);
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
             .unwrap();
         assert!(live(&e).outcome.is_none());
@@ -2404,18 +3233,326 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Unknown)]))
             .unwrap();
         assert!(live(&e).outcome.is_none());
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
+    // ---- notification (gh#71) --------------------------------------------
+
+    /// An attempt released by an agent in `chat-parent`, as `--via` records it.
+    fn dispatch_via(e: &SyncEngine, task: &str, chat_id: &str, parent: &str) -> i64 {
+        let a =
+            e.db.insert_attempt(&crate::db::NewAttempt {
+                task_id: task.into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: Some("board/lin-142".into()),
+                dispatched_by: None,
+                dispatched_by_pane: Some(parent.into()),
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+            })
+            .unwrap();
+        e.db.set_attempt_pane(a, chat_id).unwrap();
+        a
+    }
+
+    fn blocked_writebacks(e: &SyncEngine) -> Vec<Value> {
+        e.db.pending_writebacks(50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind == "blocked")
+            .map(|w| serde_json::from_str(&w.payload).unwrap())
+            .collect()
+    }
+
+    /// The exit criterion in one test: an agent that stops to ask produces one
+    /// comment, not one per reconcile tick. Before gh#71 it produced none at
+    /// all — a blocked attempt settles nothing, so no outcome writeback fires
+    /// and the row colour was the entire signal.
+    #[test]
+    fn a_blocked_agent_comments_upstream_exactly_once() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        for _ in 0..5 {
+            e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+                .unwrap();
+        }
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 1, "one block, one comment: {queued:?}");
+        assert_eq!(queued[0]["reason"], "asking");
+        assert_eq!(queued[0]["block"], 1);
+        assert!(live(&e).outcome.is_none(), "a block ends nothing");
+    }
+
+    /// Once per *block*, which is not the same as once per attempt: a question
+    /// answered at 09:00 and a second one at 11:00 are two things a human has
+    /// to hear about.
+    #[test]
+    fn blocking_again_after_being_answered_is_a_second_comment() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        for status in [
+            AgentStatus::Blocked,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+        ] {
+            e.reconcile_sessions_with(&statuses(&[("chat-9", status)]), Some(&rt))
+                .unwrap();
+        }
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued[1]["block"], 2);
+        assert_eq!(live(&e).blocked_count, 2);
+    }
+
+    /// The two ways of blocking are not the same news: one needs an answer,
+    /// the other needs a retry-or-cancel. Only the run journal splits them.
+    #[test]
+    fn an_errored_run_says_so_in_its_blocked_comment() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["reason"], "errored");
+        let body = blocked_comment(&queued[0]);
+        assert!(body.contains("stopped with an error"), "{body}");
+        assert!(body.starts_with("comet-board:"), "{body}");
+    }
+
+    /// The board must not say two contradictory things about one event. An
+    /// errored run whose pull request is already open *settles* — the work is
+    /// reviewable — so it gets the outcome comment and no blocked comment.
+    #[test]
+    fn a_block_that_settles_in_the_same_pass_comments_only_once() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert!(
+            blocked_writebacks(&e).is_empty(),
+            "a settled attempt is not also announced as blocked"
+        );
+    }
+
+    /// The event path is where a block is noticed the moment it happens
+    /// rather than up to a poll interval later — which for the 02:00 case is
+    /// the whole point.
+    #[test]
+    fn the_event_path_notices_a_block_immediately() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert_eq!(blocked_writebacks(&e).len(), 1);
+
+        // And the interval pass behind it does not say it again.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert_eq!(blocked_writebacks(&e).len(), 1);
+    }
+
+    /// herdr-board's AGE-25, ported: the agent that released the work is
+    /// prompted in its own chat when that work settles. An orchestrator only
+    /// gets a turn when something prompts it, so this is the only way it can
+    /// hear.
+    #[test]
+    fn a_settle_wakes_the_chat_that_released_the_work() {
+        let mut e = engine(None);
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/18"),
+            Some(18),
+            true,
+        )
+        .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let prompts = rt.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0].0, "chat-parent", "the dispatcher, not the child");
+        assert!(prompts[0].1.contains("LIN-142"));
+        assert!(prompts[0].1.contains("https://github.com/o/r/pull/18"));
+    }
+
+    /// Off by default, and the default is the design: an orchestrator woken by
+    /// every child it released cannot hold a train of thought.
+    #[test]
+    fn the_dispatcher_is_not_woken_unless_asked_for() {
+        let e = engine(None);
+        assert!(!e.cfg.defaults.notify_dispatcher, "off by default");
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert!(rt.prompts().is_empty());
+        assert_eq!(
+            live(&e).outcome,
+            Some(Outcome::Done),
+            "but it still settles"
+        );
+    }
+
+    /// Operator-released work has no dispatcher chat, so the switch being on
+    /// changes nothing about it. That is why it is a separate switch from the
+    /// operator's own notice.
+    #[test]
+    fn operator_released_work_has_nobody_to_wake() {
+        let mut e = engine(None);
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert!(rt.prompts().is_empty());
+    }
+
+    #[test]
+    fn the_webhook_gets_both_events() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let posts = hook.posts.lock().unwrap().clone();
+        let events: Vec<&str> = posts
+            .iter()
+            .map(|(_, b)| b["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(events, vec!["on_blocked", "on_settled"]);
+        assert_eq!(posts[0].0, "https://hooks.example.com/x");
+        assert_eq!(posts[0].1["reason"], "asking");
+        assert_eq!(posts[1].1["outcome"], "done");
+    }
+
+    /// `notify = false` is the operator saying "not tonight". It silences the
+    /// out-of-band channel and nothing else — the comment upstream belongs to
+    /// the task, not to whoever is watching.
+    #[test]
+    fn notify_off_silences_the_webhook_but_not_the_issue() {
+        let (mut e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        e.cfg.defaults.notify = false;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        assert!(hook.posts.lock().unwrap().is_empty());
+        assert_eq!(blocked_writebacks(&e).len(), 1);
+    }
+
+    /// A notification is best effort by construction. An endpoint that is down
+    /// must not hold a settle open, and must not be retried into telling
+    /// somebody tomorrow about a thing that happened tonight.
+    #[test]
+    fn a_dead_webhook_changes_nothing_about_the_board() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", true);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert_eq!(
+            hook.posts.lock().unwrap().len(),
+            1,
+            "tried once, not queued"
+        );
+    }
+
+    /// An orphaned attempt is the other ending nobody would notice: the chat
+    /// vanished, so there is no agent left to ask and no run journal to read.
+    #[test]
+    fn an_orphaned_attempt_is_announced_like_a_settle() {
+        let (mut e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        for _ in 0..2 {
+            e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+                .unwrap();
+        }
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Orphaned));
+        let posts = hook.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1["event"], "on_settled");
+        assert_eq!(posts[0].1["outcome"], "orphaned");
+        assert_eq!(rt.prompts().len(), 1, "the dispatcher hears about it too");
+    }
+
     // ---- the settle the board got wrong (§H4's inverse) ------------------
 
     /// Settle an attempt on commits, returning its checkout for cleanup.
     fn settled_on_commits(e: &SyncEngine, attempt: i64) -> std::path::PathBuf {
-        let work = agent_worked_in(e, attempt, true);
+        let work = agent_worked_in(e, attempt, Work::Pushed);
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
@@ -2577,7 +3714,7 @@ mod tests {
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
 
         e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -2616,7 +3753,7 @@ mod tests {
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -2820,7 +3957,7 @@ max_duration = "{max_duration}"
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
         age_attempt(&e, a, 5 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
@@ -4246,6 +5383,240 @@ max_duration = "{max_duration}"
             "the remote-relative count is fooled by unpushed work — this is the bug"
         );
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- reclaiming checkouts (gh#72) ------------------------------------
+
+    /// A runtime that records what the sweep asked it to delete, and can be
+    /// told to refuse — the two things the gc does to the world outside the
+    /// database.
+    /// One reclaim call, as the sweep made it: repo, checkout, branch.
+    type Reclaimed = (Option<String>, String, Option<String>);
+
+    #[derive(Default)]
+    struct Collector {
+        reclaimed: std::cell::RefCell<Vec<Reclaimed>>,
+        refuse: bool,
+    }
+
+    impl Runtime for Collector {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("the gc never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!("the gc never talks to a chat")
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("the gc never cancels")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+        fn reclaim_worktree(
+            &self,
+            repo_path: Option<&str>,
+            worktree: &str,
+            branch: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.reclaimed.borrow_mut().push((
+                repo_path.map(str::to_string),
+                worktree.to_string(),
+                branch.map(str::to_string),
+            ));
+            if self.refuse {
+                anyhow::bail!("git said no");
+            }
+            Ok(())
+        }
+    }
+
+    /// A closed attempt with a checkout, on a task whose issue is closed
+    /// upstream — the shape everything below varies from.
+    fn spent_attempt(e: &SyncEngine) -> i64 {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        let a = dispatch(e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET repo_path = '/repo/widget' WHERE id = ?1",
+                rusqlite::params![a],
+            )
+            .unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        a
+    }
+
+    /// Move the retention clock back, as wall time would have.
+    fn age_mark(e: &SyncEngine, attempt_id: i64, secs: i64) {
+        let stamp = crate::db::rfc3339(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET collectable_at = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, stamp],
+            )
+            .unwrap();
+    }
+
+    fn attempt_row(e: &SyncEngine, id: i64) -> Attempt {
+        e.db.attempts_for("linear:LIN-142")
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_finished_attempts_checkout_is_marked_then_collected_a_week_later() {
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+
+        // The sweep that finds it finished only starts the clock.
+        e.collect_worktrees(Some(&gc));
+        let row = attempt_row(&e, a);
+        assert!(row.collectable_at.is_some(), "the clock has to start");
+        assert!(row.collected_at.is_none());
+        assert!(gc.reclaimed.borrow().is_empty(), "nothing goes on day one");
+
+        // Six days in, still nothing.
+        age_mark(&e, a, 6 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty(), "the window is a week");
+
+        age_mark(&e, a, 7 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(
+            gc.reclaimed.borrow().as_slice(),
+            [(
+                Some("/repo/widget".to_string()),
+                "/wt/board-lin-142".to_string(),
+                Some("board/lin-142".to_string()),
+            )],
+            "the repo, the checkout and the branch the board cut"
+        );
+        assert!(attempt_row(&e, a).collected_at.is_some());
+
+        // And it is not offered again — the row says it is gone.
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(gc.reclaimed.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_live_attempt_is_never_collected_however_finished_the_task_looks() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
+        let gc = Collector::default();
+
+        // However long the board has been up, an agent's checkout is untouched
+        // and its clock never even starts.
+        for _ in 0..3 {
+            e.collect_worktrees(Some(&gc));
+            age_mark(&e, a, 30 * 86_400);
+        }
+        assert!(gc.reclaimed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_retry_dispatched_beside_a_marked_attempt_stops_the_clock() {
+        // The retry reuses the branch and lands in the same directory, so the
+        // closed attempt's checkout is the live one's. Deleting it would throw
+        // away the commits the retry is meant to continue.
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        e.collect_worktrees(Some(&gc));
+        age_mark(&e, a, 30 * 86_400);
+
+        dispatch(&e, "linear:LIN-142", "chat-10");
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty(), "a live retry holds it");
+        assert!(
+            attempt_row(&e, a).collectable_at.is_none(),
+            "and the window starts over when the retry ends"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_back_in_review_stops_the_clock() {
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        e.collect_worktrees(Some(&gc));
+        assert!(attempt_row(&e, a).collectable_at.is_some());
+
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET pr_open = 1 WHERE id = 'linear:LIN-142'",
+                [],
+            )
+            .unwrap();
+        age_mark(&e, a, 30 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(
+            gc.reclaimed.borrow().is_empty(),
+            "review holds the checkout"
+        );
+        assert!(attempt_row(&e, a).collectable_at.is_none());
+    }
+
+    #[test]
+    fn retention_off_keeps_every_checkout() {
+        let mut e = engine(None);
+        e.cfg.defaults.retain_worktrees = "off".into();
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        e.collect_worktrees(Some(&gc));
+        assert!(
+            attempt_row(&e, a).collectable_at.is_none(),
+            "the clock never starts"
+        );
+        // Not even one left over from before the operator turned it off.
+        age_mark(&e, a, 365 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_removal_that_fails_is_tried_again_next_cycle() {
+        // The stamp is what says the disk space is back. A `git worktree
+        // remove` that failed must leave the row uncollected, or the board
+        // would report space it never reclaimed.
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector {
+            refuse: true,
+            ..Default::default()
+        };
+        e.collect_worktrees(Some(&gc));
+        age_mark(&e, a, 30 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(attempt_row(&e, a).collected_at.is_none());
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(gc.reclaimed.borrow().len(), 2, "and again the cycle after");
+    }
+
+    #[test]
+    fn a_cycle_without_a_runtime_marks_but_never_deletes() {
+        // Only the process that owns the worktrees may remove one; anything
+        // else running the cycle is welcome to keep the clock.
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        e.collect_worktrees(None);
+        age_mark(&e, a, 30 * 86_400);
+        e.collect_worktrees(None);
+        assert!(attempt_row(&e, a).collectable_at.is_some());
+        assert!(attempt_row(&e, a).collected_at.is_none());
     }
 
     // ---- the full cycle --------------------------------------------------
