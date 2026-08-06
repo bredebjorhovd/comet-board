@@ -271,6 +271,29 @@ pub fn doctor(
                     },
                 });
 
+                // Always reported, unlike `account` below, because here it is
+                // the *absence* that is the risk: `off` and "never configured"
+                // look identical on the board, and one of them means an agent
+                // on this route runs until somebody looks (gh#70).
+                let cap = cfg.max_duration_secs(Some(r));
+                checks.push(Check {
+                    name: format!("route {name}: duration cap"),
+                    ok: true,
+                    detail: match (cap, r.max_duration.is_some()) {
+                        (Some(secs), true) => {
+                            format!("{} per attempt", crate::overrun::human_secs(secs as i64))
+                        }
+                        (Some(secs), false) => format!(
+                            "{} per attempt (from [defaults])",
+                            crate::overrun::human_secs(secs as i64)
+                        ),
+                        // Not a failure — turning the cap off is a choice, and
+                        // it was every board's behaviour before gh#70. Named
+                        // out loud so it stays a choice.
+                        (None, _) => "off — attempts here run until somebody cancels them".into(),
+                    },
+                });
+
                 // Only when the route names one: a board on one person's
                 // laptop has no accounts to check and should not be told about
                 // a feature it is not using (gh#59).
@@ -886,6 +909,46 @@ mod tests {
                 && !c.ok
                 && c.detail.contains("not a comet harness")),
             "the typo is named"
+        );
+    }
+
+    /// The cap is reported whether or not the route sets one: `off` and
+    /// "never thought about it" look identical on the board, and one of them
+    /// means an agent on this route runs until somebody looks (gh#70).
+    #[test]
+    fn every_route_says_what_bounds_its_attempts() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"inherits\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\n\n\
+             [[route]]\nmatch = { label = \"y\" }\nworkspace = \"long\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"6h\"\n\n\
+             [[route]]\nmatch = { label = \"z\" }\nworkspace = \"unbounded\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"off\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let detail = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == format!("route {name}: duration cap"))
+                .unwrap_or_else(|| panic!("{name} has no cap line"))
+                .detail
+                .clone()
+        };
+        assert_eq!(detail("inherits"), "2h per attempt (from [defaults])");
+        assert_eq!(detail("long"), "6h per attempt");
+        assert!(
+            detail("unbounded").starts_with("off —"),
+            "{}",
+            detail("unbounded")
+        );
+        // Off is a choice, not a broken route: it must not fail the report.
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.name != "route unbounded: duration cap" || c.ok)
         );
     }
 

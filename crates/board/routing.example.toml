@@ -63,10 +63,32 @@ runtime = "codex"
 # runtime = "claude-code"
 # account = "8f2c1d0a7b6e4539"
 
+# `max_duration` is the wall-clock cap on one attempt, per route. Past it the
+# board says so in the chat — once — and cancels the attempt shortly after,
+# closing it `failed` with a comment upstream naming the timeout. It is per
+# route because the answer is a property of the work: a route pointed at a
+# refactor across a monorepo is not the one that fixes typos, and a single
+# number gets set by whichever runs longest, leaving every other route's
+# runaway agent going until somebody looks.
+#
+# [[route]]
+# match = { label = "refactor" }
+# workspace = "platform"
+# repo = "~/code/platform"
+# runtime = "claude-code"
+# max_duration = "6h"
+
 # A route with no `match` is a catch-all and must come last.
 
 [defaults]
 max_concurrent_per_workspace = 3
+# The default cap, for routes that do not set their own. Two hours: long enough
+# for work a dispatch is worth giving an agent, short enough that a looping one
+# is noticed the same afternoon. The engine's stall watchdog only ever stopped a
+# run that emitted *nothing*, so before this an agent that kept talking ran
+# until somebody looked. `off` (or `0`) removes the cap, which is that old
+# behaviour said out loud.
+max_duration = "2h"
 # `{identifier_lower}` is the identifier made branch-safe: `LIN-145` →
 # `lin-145`. For GitHub it also carries the repo — `gh#2` in tripletex-mcp is
 # `gh-2-tripletex-mcp` — because GitHub numbers issues per repository, and every

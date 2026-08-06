@@ -265,6 +265,29 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
+/// Parse a `max_duration` value into a cap in seconds (gh#70).
+///
+/// `Ok(None)` is *no cap*, said out loud — `off`, `none`, `never` or `0`. An
+/// unparseable value is an `Err` rather than a silent `None`, because the two
+/// look identical on the board and only one of them is what somebody meant:
+/// `RoutingConfig::validate` refuses the config instead of leaving a typo
+/// reading as "unlimited". Anything shorter than [`crate::overrun::MIN_CAP_SECS`]
+/// is raised to it — a cap that expires before the first turn finishes would
+/// fail every dispatch on the route.
+pub fn parse_max_duration(s: &str) -> std::result::Result<Option<u64>, String> {
+    let t = s.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "never") {
+        return Ok(None);
+    }
+    match parse_duration_secs(t) {
+        Some(0) => Ok(None),
+        Some(n) => Ok(Some(n.max(crate::overrun::MIN_CAP_SECS))),
+        None => Err(format!(
+            "`{s}` is not a duration; write it like `2h`, `90m`, `3600`, or `off`"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
@@ -298,6 +321,19 @@ pub struct Defaults {
     /// override per ticket with `--source`.
     #[serde(default = "default_new_source")]
     pub new_source: String,
+    /// How long a single attempt may stay live before the board warns its chat
+    /// and then closes it `failed` (gh#70). Overridden per route.
+    ///
+    /// Two hours by default — long enough for the work a dispatch is worth
+    /// giving an agent, short enough that a looping one is noticed the same
+    /// afternoon. `off` (or `0`) removes the cap entirely, which is the honest
+    /// spelling of what every board did before this existed.
+    #[serde(default = "default_max_duration")]
+    pub max_duration: String,
+}
+
+fn default_max_duration() -> String {
+    "2h".into()
 }
 
 fn default_new_source() -> String {
@@ -322,6 +358,7 @@ impl Default for Defaults {
             notify: true,
             notify_dispatcher: false,
             new_source: default_new_source(),
+            max_duration: default_max_duration(),
         }
     }
 }
@@ -532,6 +569,16 @@ pub struct Route {
     pub branch_template: Option<String>,
     #[serde(default)]
     pub max_concurrent: Option<usize>,
+    /// Per-route override of `defaults.max_duration` (gh#70) — the wall-clock
+    /// cap on one attempt, e.g. `"6h"`, or `"off"` for none.
+    ///
+    /// Per route because the answer is a property of the work: a route pointed
+    /// at a refactor across a monorepo is not the route that fixes typos, and a
+    /// single number has to be set by whichever of them runs longest — which
+    /// leaves the looping agent on every other route running until somebody
+    /// looks.
+    #[serde(default)]
+    pub max_duration: Option<String>,
 }
 
 impl Route {
@@ -649,6 +696,20 @@ impl RoutingConfig {
                     RUNTIME_NAMES.join(", ")
                 );
             }
+            // A typo here reads exactly like "no cap" on the board, and only
+            // one of those is what anybody meant (gh#70).
+            if let Some(d) = &r.max_duration
+                && let Err(e) = parse_max_duration(d)
+            {
+                bail!(
+                    "route {} ({}) has max_duration {e}",
+                    i + 1,
+                    r.display_name()
+                );
+            }
+        }
+        if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
+            bail!("[defaults] max_duration {e}");
         }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
@@ -696,6 +757,27 @@ impl RoutingConfig {
         route
             .max_concurrent
             .unwrap_or(self.defaults.max_concurrent_per_workspace)
+    }
+
+    /// The wall-clock cap for attempts on a route, in seconds — the route's
+    /// own `max_duration`, else `defaults.max_duration`. `None` is uncapped
+    /// (gh#70).
+    ///
+    /// `route` is an `Option` because the caller is reconciliation, not
+    /// dispatch: an attempt outlives the config that released it, and a route
+    /// renamed or deleted under a running agent must still leave that agent
+    /// bounded. No route means the default cap, which is the safe reading —
+    /// falling back to "unlimited" would make deleting a route the way to
+    /// escape the cap.
+    pub fn max_duration_secs(&self, route: Option<&Route>) -> Option<u64> {
+        let raw = route
+            .and_then(|r| r.max_duration.as_deref())
+            .unwrap_or(&self.defaults.max_duration);
+        // Validation has already refused an unparseable value; a config that
+        // reached here with one is one `load_or_default` fell back on, so the
+        // default cap is the honest answer rather than none at all.
+        parse_max_duration(raw)
+            .unwrap_or_else(|_| parse_max_duration(&default_max_duration()).ok().flatten())
     }
 }
 
@@ -1206,6 +1288,85 @@ labels = ["release-a"]
         assert_eq!(parse_duration_secs("1h"), Some(3600));
         assert_eq!(parse_duration_secs("90"), Some(90));
         assert_eq!(parse_duration_secs(""), None);
+    }
+
+    // ---- the wall-clock cap (gh#70) --------------------------------------
+
+    #[test]
+    fn attempts_are_capped_at_two_hours_unless_told_otherwise() {
+        // The default has to be a real number, not "unlimited": before this
+        // existed, nothing bounded a running attempt at all.
+        let c = RoutingConfig::default();
+        assert_eq!(c.max_duration_secs(None), Some(7200));
+    }
+
+    #[test]
+    fn a_route_sets_its_own_cap_over_the_default() {
+        // The answer is a property of the work: the monorepo-refactor route is
+        // not the typo route, and one number would be set by whichever runs
+        // longest — leaving every other route unbounded.
+        let c = github(
+            r#"
+[defaults]
+max_duration = "45m"
+
+[[route]]
+match = { label = "big" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+max_duration = "6h"
+
+[[route]]
+match = { label = "small" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+"#,
+        );
+        assert_eq!(c.max_duration_secs(Some(&c.routes[0])), Some(21_600));
+        assert_eq!(c.max_duration_secs(Some(&c.routes[1])), Some(2_700));
+        // A route that has since been deleted from under a running attempt
+        // falls back to the default, never to "unlimited".
+        assert_eq!(c.max_duration_secs(None), Some(2_700));
+    }
+
+    #[test]
+    fn off_is_how_the_cap_is_removed() {
+        for spelling in ["off", "OFF", "none", "never", "0"] {
+            let c = github(&format!("[defaults]\nmax_duration = \"{spelling}\"\n"));
+            assert_eq!(c.max_duration_secs(None), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_cap_shorter_than_a_minute_is_raised_to_one() {
+        // A cap that expires before the first turn finishes would fail every
+        // dispatch on the route.
+        assert_eq!(parse_max_duration("5s"), Ok(Some(60)));
+        assert_eq!(parse_max_duration("90s"), Ok(Some(90)));
+    }
+
+    #[test]
+    fn a_mistyped_cap_is_refused_rather_than_read_as_unlimited() {
+        // The two look identical on the board and only one is what anybody
+        // meant — so it is a config error, like an unknown runtime.
+        let c: RoutingConfig = toml::from_str(
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"w\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_duration = \"two hours\"\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("max_duration"), "{err}");
+        assert!(err.contains("two hours"), "it names the offender: {err}");
+
+        let c: RoutingConfig = toml::from_str("[defaults]\nmax_duration = \"forever\"\n").unwrap();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("[defaults] max_duration")
+        );
     }
 
     #[test]

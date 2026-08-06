@@ -267,6 +267,7 @@ mod tests {
             screen_at: None,
             nudges: 0,
             nudged_at: None,
+            overrun_warned_at: None,
         }
     }
 
