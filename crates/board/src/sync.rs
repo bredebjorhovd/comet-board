@@ -3252,6 +3252,7 @@ mod tests {
                 dispatched_by_pane: Some(parent.into()),
                 base_sha: None,
                 account: None,
+                repo_path: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat_id).unwrap();
