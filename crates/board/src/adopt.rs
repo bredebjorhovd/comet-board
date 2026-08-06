@@ -111,12 +111,19 @@ pub struct SpaceRepo {
 }
 
 /// `owner/repo` from a git remote URL, for the SSH and HTTPS forms.
+///
+/// HTTPS remotes may carry userinfo — `https://x-access-token@github.com/o/r` is
+/// what an App-authenticated clone starts life with (gh#97), and a remote a
+/// human set up with their own username in it is just as real. The credential
+/// half of a URL says nothing about which repo it names, so it is dropped rather
+/// than allowed to make the remote unreadable.
 pub fn github_slug(remote: &str) -> Option<String> {
     let r = remote.trim().trim_end_matches(".git");
     let rest = r
         .strip_prefix("git@github.com:")
         .or_else(|| r.strip_prefix("https://github.com/"))
-        .or_else(|| r.strip_prefix("ssh://git@github.com/"))?;
+        .or_else(|| r.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| strip_userinfo_https(r))?;
     let mut parts = rest.split('/');
     let owner = parts.next()?;
     let repo = parts.next()?;
@@ -124,6 +131,19 @@ pub fn github_slug(remote: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{repo}"))
+}
+
+/// `https://<userinfo>@github.com/<rest>` → `<rest>`. Only github.com: a
+/// userinfo form for another host is not a GitHub remote and must not be read
+/// as one.
+fn strip_userinfo_https(r: &str) -> Option<&str> {
+    let after_scheme = r.strip_prefix("https://")?;
+    let (userinfo, rest) = after_scheme.split_once('@')?;
+    // A `@` after the first slash is inside the path, not userinfo.
+    if userinfo.contains('/') {
+        return None;
+    }
+    rest.strip_prefix("github.com/")
 }
 
 /// Which spaces the board is not watching.
@@ -160,30 +180,8 @@ where
             continue;
         }
 
-        let polled = cfg
-            .github
-            .repos
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(&slug));
-        // A route that *names* this repo, not merely one that would match it.
-        //
-        // A catch-all matches everything, so asking `resolve` would call this
-        // repo routed — and it would dispatch, into whatever space the
-        // catch-all names. Starting an agent for a tripletex-mcp issue in
-        // somebody else's checkout is a worse silent failure than the one this
-        // whole feature exists to remove, so a catch-all does not count.
-        let routed = cfg.routes.iter().any(|r| {
-            r.match_
-                .gh_repo
-                .as_deref()
-                .is_some_and(|g| g.eq_ignore_ascii_case(&slug))
-        });
-
-        let missing = match (polled, routed) {
-            (true, true) => continue,
-            (false, true) => Missing::Polling,
-            (true, false) => Missing::Route,
-            (false, false) => Missing::Both,
+        let Some(missing) = missing_for(cfg, &slug) else {
+            continue;
         };
         // Two spaces can sit on one repo — the checkout and a clone of it. The
         // repo is what gets adopted, so it is offered once.
@@ -199,6 +197,40 @@ where
     }
     out.sort_by(|a, b| a.slug.cmp(&b.slug));
     out
+}
+
+/// Which half of the config a repo is missing, or `None` when the board already
+/// both polls and routes it.
+///
+/// The decision [`detect`] makes about one repo, named so `onboard` (gh#97) can
+/// ask it about a repo that has no space yet — a clone it is about to make. Two
+/// implementations of "is this repo on the board" would be two answers to the
+/// question adoption exists to settle.
+pub fn missing_for(cfg: &RoutingConfig, slug: &str) -> Option<Missing> {
+    let polled = cfg
+        .github
+        .repos
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(slug));
+    // A route that *names* this repo, not merely one that would match it.
+    //
+    // A catch-all matches everything, so asking `resolve` would call this repo
+    // routed — and it would dispatch, into whatever space the catch-all names.
+    // Starting an agent for a tripletex-mcp issue in somebody else's checkout is
+    // a worse silent failure than the one this whole feature exists to remove,
+    // so a catch-all does not count.
+    let routed = cfg.routes.iter().any(|r| {
+        r.match_
+            .gh_repo
+            .as_deref()
+            .is_some_and(|g| g.eq_ignore_ascii_case(slug))
+    });
+    match (polled, routed) {
+        (true, true) => None,
+        (false, true) => Some(Missing::Polling),
+        (true, false) => Some(Missing::Route),
+        (false, false) => Some(Missing::Both),
+    }
 }
 
 /// What git says about a folder — the production resolver for [`detect`].
@@ -1079,8 +1111,22 @@ repos = ["Florin-AS/Tally"]
             github_slug("ssh://git@github.com/offhand/tally.git").as_deref(),
             Some("offhand/tally")
         );
-        // Not GitHub, so not a GitHub source.
+        // Userinfo in an HTTPS remote — what an App-authenticated clone starts
+        // life with (gh#97). Failing to read it would make an onboarded checkout
+        // invisible to detection, which is the exact silent gap adoption exists
+        // to close. The credential half names no repo, so it is dropped.
+        assert_eq!(
+            github_slug("https://x-access-token@github.com/offhand/tally.git").as_deref(),
+            Some("offhand/tally")
+        );
+        // Not GitHub, so not a GitHub source — userinfo included.
         assert_eq!(github_slug("git@gitlab.com:offhand/tally.git"), None);
+        assert_eq!(
+            github_slug("https://user@gitlab.com/offhand/tally.git"),
+            None
+        );
+        // A `@` after the first slash is in the path, not userinfo.
+        assert_eq!(github_slug("https://example.test/x@github.com/o/r"), None);
         assert_eq!(github_slug(""), None);
     }
 
