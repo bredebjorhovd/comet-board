@@ -68,9 +68,11 @@ nearly verbatim — it never depended on herdr:
 - `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
-  run that ended cleanly; an `Errored` run stays live so its retry is the
-  same attempt) and the reopen rule. The machinery around it is in `sync.rs`
-  (`maybe_settle`, `rewatch_settled_attempts`, the targeted PR recheck) and
+  run that ended cleanly *and* only once they are on origin, gh#69; an
+  `Errored` run stays live so its retry is the same attempt) and the reopen
+  rule. The machinery around it is in `sync.rs`
+  (`maybe_settle`, `rewatch_settled_attempts`, the targeted PR recheck,
+  `commits_are_on_origin`) and
   keys off run-journal facts via `Runtime::last_run_end` — no debounce
   clock anywhere.
 - `adopt.rs`, `doctor.rs`, `init.rs` — the operator-facing trio (H8), walking
@@ -330,7 +332,29 @@ the event path settles on the status *transition*, the interval reconcile is
 the catch-up. Artifact checks kept: recorded PR → commits-since-base → and,
 only on the event path (the interval polls seconds earlier), one targeted
 GitHub `pulls` recheck before closing on commits, which closes herdr's gh#29
-window instead of wording around it. `reopened` semantics kept both ways: an
+window instead of wording around it.
+
+**Commits must be on origin** (gh#69). `attempt_has_commits` is a local
+`rev-list` count, so an agent that committed and could not open a pull request
+— guaranteed on a headless box with no `gh` credential, which is what gh#68
+went on to fix — ended `Completed`, settled on `Evidence::Commits`, and put the
+row in `review` while the work sat in one worktree on one box. The crash path
+had the same shape: recovery stamps an aborted run `Interrupted`, not
+`Errored`, so the errored-runs-never-settle guard never covered it.
+`settled::decide` now takes a three-way `Commits::{None, Unpushed, Pushed}`,
+and `Unpushed` is a `StayLive` with its own `Why` — logged once per attempt,
+naming the branch, and left for the H10 clock to close if nobody acts. The
+push check is `SyncEngine::commits_are_on_origin`: a remote-tracking ref that
+*contains* HEAD (free, offline, true of any ordinary `git push`, and the only
+tier a non-GitHub remote gets), then — event path only, for the same reason the
+`pulls` recheck is — one `GET /repos/{repo}/branches/{branch}`, for a push made
+straight to a URL, which updates no tracking ref. Containment rather than
+existence, because a retry reuses its predecessor's branch. Unproven reads as
+unpushed: an attempt that stays live is visible and bounded, a row that says
+`review` about work nobody can fetch is the bug. A pull request short-circuits
+all of it — GitHub will not open one for a branch it does not have.
+
+`reopened` semantics kept both ways: an
 `Errored`→retried run never left its attempt, and a settled attempt whose
 chat works again is re-opened in place (refused when re-dispatched, closed
 upstream, or marked done). The dispatcher wake (herdr AGE-25) was not ported
@@ -467,7 +491,9 @@ agent looping and talking ran until somebody looked. The same clock closes the
 stranded-`working` row at the other end: an engine crash past its revival
 budget settles the chat `Idle`, and with no commits `settled::decide` returns
 `StayLive(NoArtifacts)`; orphaning fires only on a *missing* session row, and
-that one exists. A dispatch whose brief never reached a chat (no session, no
+that one exists. Since gh#69 it closes one more: an attempt whose commits never
+reached origin (`StayLive(Unpushed)`) stays live by design, and this is what
+eventually calls it `failed` rather than leaving it `working` forever. A dispatch whose brief never reached a chat (no session, no
 `saw_working`, deliberately left alone by H2) is closed by the same clock.
 
 The shape:

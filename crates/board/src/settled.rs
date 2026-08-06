@@ -22,6 +22,18 @@
 //!   attempt only when the run genuinely ended — and never an `Errored` one,
 //!   because an errored run died mid-task, and settling it as `finished` would
 //!   tell the operator the opposite of what happened.
+//! - **Commits count only once they are on origin** (gh#69). A settle moves
+//!   the row to `review`, and `review` is a claim somebody can act on: fetch
+//!   the branch, read the diff, open the pull request the agent did not. A
+//!   commit that exists only in the attempt's worktree supports none of that —
+//!   it is a claim about work nobody but that box can see. The failure this
+//!   closes was not hypothetical: with no `gh` credential on a headless box
+//!   (gh#68) every dispatched agent committed, failed to open its pull
+//!   request, ended `Completed`, and settled to `review` with the work
+//!   stranded in a local checkout. The same shape reaches the crash path — a
+//!   recovery-aborted run stamps `Interrupted`, not `Errored`, so the
+//!   errored-runs-never-settle-on-commits rule does not cover it, and an agent
+//!   killed mid-task settled as finished.
 //! - **An `Errored` run stays live.** The chat is intact with its full
 //!   context; retry-or-cancel is the operator's call, and a retried run is the
 //!   *same attempt* — nobody dispatched anything, so nothing new is recorded.
@@ -44,8 +56,8 @@ pub enum Evidence {
     /// An open pull request on the attempt's branch — the agent's own
     /// statement of done.
     PullRequest,
-    /// Commits past the attempt's base — the local equivalent of "explicit
-    /// done detection", and the weaker of the two.
+    /// Commits past the attempt's base, **and on origin** — the local
+    /// equivalent of "explicit done detection", and the weaker of the two.
     Commits,
 }
 
@@ -57,6 +69,22 @@ impl Evidence {
             Evidence::Commits => "commits",
         }
     }
+}
+
+/// What the attempt's checkout holds, ranked by who can read it.
+///
+/// The middle variant is the whole of gh#69: a commit in a worktree and a
+/// commit on origin are not the same artifact, and only the second one is
+/// something the `review` state can send somebody to look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commits {
+    /// Nothing past the attempt's base.
+    None,
+    /// Commits, but no branch on origin carries them. The work exists on one
+    /// box, in one checkout, and nobody else can see it.
+    Unpushed,
+    /// Commits on origin — reviewable by whoever the settle tells to look.
+    Pushed,
 }
 
 /// What the end of a run means for the attempt.
@@ -77,34 +105,49 @@ pub enum Why {
     /// The run ended cleanly but left nothing to settle on. The agent may be
     /// mid-conversation — between turns is not finished.
     NoArtifacts,
+    /// There are commits, and they are only in the attempt's checkout (gh#69).
+    /// Nothing outside that box can read them, so there is nothing to review;
+    /// the attempt stays live and the log says which branch is stranded.
+    ///
+    /// This is a routine state, not a fault: agents are told to commit
+    /// mid-flight, and a run that ends between turns with an unpushed commit
+    /// is an agent still working. It is also where an agent that finished but
+    /// could not push ends up — the wall-clock cap ([`crate::overrun`]) is
+    /// what eventually closes that one, honestly, as `failed`.
+    Unpushed,
 }
 
 /// The decision, pure: given how the last run ended and what the checkout
 /// holds, is this attempt over?
 ///
-/// `has_commits` is a closure because the commit check shells out to git and
-/// the answer is only needed when nothing stronger decides first — a pull
-/// request must short-circuit it, and an errored run must never reach it.
+/// `commits` is a closure because the check shells out to git (and, at the
+/// far end, to GitHub) and the answer is only needed when nothing stronger
+/// decides first — a pull request must short-circuit it, and an errored run
+/// must never reach it.
 ///
 /// Pure so the hierarchy is testable without a chat, a checkout or a GitHub —
 /// the caller owns the artifact lookups, this owns the ranking.
-pub fn decide(end: RunEnd, pr_open: bool, has_commits: impl FnOnce() -> bool) -> Verdict {
+pub fn decide(end: RunEnd, pr_open: bool, commits: impl FnOnce() -> Commits) -> Verdict {
     // A PR is proof, whatever the run's own exit said: a harness that crashed
     // moments after `gh pr create` still finished the work. This is also why
-    // an errored run is checked at all rather than skipped outright.
+    // an errored run is checked at all rather than skipped outright. It is
+    // proof of the push, too — GitHub will not open a pull request for a
+    // branch it does not have — so the commit check below is not its business.
     if pr_open {
         return Verdict::Finished(Evidence::PullRequest);
     }
     if end == RunEnd::Errored {
         return Verdict::StayLive(Why::Errored);
     }
-    // Completed and Interrupted alike: an agent that did work and was then
-    // stopped settles on its commits — that is a finished attempt, not a
-    // failed one (herdr learned this from panes quit mid-session).
-    if has_commits() {
-        return Verdict::Finished(Evidence::Commits);
+    match commits() {
+        // Completed and Interrupted alike: an agent that did work, pushed it
+        // and was then stopped settles on its commits — that is a finished
+        // attempt, not a failed one (herdr learned this from panes quit
+        // mid-session).
+        Commits::Pushed => Verdict::Finished(Evidence::Commits),
+        Commits::Unpushed => Verdict::StayLive(Why::Unpushed),
+        Commits::None => Verdict::StayLive(Why::NoArtifacts),
     }
-    Verdict::StayLive(Why::NoArtifacts)
 }
 
 /// Should a *closed* attempt go back to work? (herdr gh#34, kept per §H4.)
@@ -150,20 +193,46 @@ mod tests {
     }
 
     #[test]
-    fn commits_close_a_run_that_genuinely_ended() {
+    fn pushed_commits_close_a_run_that_genuinely_ended() {
         assert_eq!(
-            decide(RunEnd::Completed, false, || true),
+            decide(RunEnd::Completed, false, || Commits::Pushed),
             Verdict::Finished(Evidence::Commits)
         );
     }
 
-    /// An agent that did work and was then stopped is a finished attempt, not
-    /// a failed start — herdr settled quit panes on their commits, and the
-    /// operator interrupting a run is the same fact here.
+    /// gh#69, the headline: the run ended cleanly and there are commits, but
+    /// they are in a worktree on one box. `review` would send somebody to read
+    /// a branch that is not there, so the attempt stays live and says why.
     #[test]
-    fn an_interrupted_run_with_commits_still_settles() {
+    fn unpushed_commits_are_not_a_finished_attempt() {
+        for end in [RunEnd::Completed, RunEnd::Interrupted] {
+            assert_eq!(
+                decide(end, false, || Commits::Unpushed),
+                Verdict::StayLive(Why::Unpushed),
+                "{end:?}"
+            );
+        }
+    }
+
+    /// The crash variant of the same bug. Recovery stamps an aborted run
+    /// `Interrupted`, not `Errored`, so the errored-runs-never-settle rule
+    /// below never covered it: an agent killed mid-task with a commit in its
+    /// worktree used to settle as finished.
+    #[test]
+    fn a_recovery_aborted_run_does_not_settle_on_work_only_its_box_can_see() {
         assert_eq!(
-            decide(RunEnd::Interrupted, false, || true),
+            decide(RunEnd::Interrupted, false, || Commits::Unpushed),
+            Verdict::StayLive(Why::Unpushed)
+        );
+    }
+
+    /// An agent that did work, pushed it, and was then stopped is a finished
+    /// attempt, not a failed start — herdr settled quit panes on their
+    /// commits, and the operator interrupting a run is the same fact here.
+    #[test]
+    fn an_interrupted_run_with_pushed_commits_still_settles() {
+        assert_eq!(
+            decide(RunEnd::Interrupted, false, || Commits::Pushed),
             Verdict::Finished(Evidence::Commits)
         );
     }
@@ -188,8 +257,19 @@ mod tests {
     #[test]
     fn a_clean_end_with_no_artifacts_settles_nothing() {
         assert_eq!(
-            decide(RunEnd::Completed, false, || false),
+            decide(RunEnd::Completed, false, || Commits::None),
             Verdict::StayLive(Why::NoArtifacts)
+        );
+    }
+
+    /// A pull request is itself proof of a push — GitHub cannot open one for a
+    /// branch it does not have — so the unpushed rule must not reach across
+    /// and re-open an attempt the agent already declared finished.
+    #[test]
+    fn a_pull_request_outranks_the_push_check() {
+        assert_eq!(
+            decide(RunEnd::Completed, true, || Commits::Unpushed),
+            Verdict::Finished(Evidence::PullRequest)
         );
     }
 

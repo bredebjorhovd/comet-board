@@ -56,9 +56,12 @@ pub fn resolve_prompt(route: &Route, task: &Task, branch: &str) -> String {
     let vars = prompt_vars(task, branch, &route.workspace);
     let template = route.prompt.clone().unwrap_or_else(|| {
         // A route with no prompt still needs to say something useful.
+        // "push" is not padding: the board settles an attempt on a pull
+        // request or on commits that reached origin (gh#69), so work that
+        // never leaves the worktree leaves the row `working`.
         "You are working on: {title} ({identifier})\n\n{body}\n\n\
          Work in this worktree; the branch {branch} is prepared. \
-         Open a pull request when done."
+         Commit and push your work, and open a pull request when done."
             .to_string()
     });
     interpolate(&template, &vars)

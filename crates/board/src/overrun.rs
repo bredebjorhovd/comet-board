@@ -9,7 +9,9 @@
 //! settles the chat `Idle`, and with no commits [`crate::settled::decide`]
 //! returns `StayLive(NoArtifacts)` — orphaning fires on a *missing* session row
 //! and this one exists, so the row renders `working` forever. One clock closes
-//! both.
+//! both — and, since gh#69, a third: an attempt whose commits never reached
+//! origin stays live on purpose (`StayLive(Unpushed)`), and this is what
+//! eventually closes it `failed` rather than leaving it `working` for good.
 //!
 //! Two decisions, kept pure here so the arithmetic is testable without a chat,
 //! a config or a database:

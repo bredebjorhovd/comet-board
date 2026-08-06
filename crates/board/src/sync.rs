@@ -32,7 +32,7 @@ use crate::model::*;
 use crate::notify::{self, Signal, Stopped, Webhook};
 use crate::overrun;
 use crate::runtime::{RunEnd, Runtime};
-use crate::settled::{self, Evidence, Verdict};
+use crate::settled::{self, Commits, Evidence, Verdict, Why};
 use crate::sources::github::{Github, HttpRest, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
@@ -124,6 +124,11 @@ pub mod meta {
     /// [`crate::review::Delivered`], as JSON.
     pub fn reviews_for(task_id: &str) -> String {
         format!("reviews:{task_id}")
+    }
+    /// When an attempt was first found holding unpushed commits (gh#69), so
+    /// the log says it once rather than every cycle.
+    pub fn unpushed_noted(attempt: i64) -> String {
+        format!("unpushed:{attempt}")
     }
 }
 
@@ -624,11 +629,14 @@ impl SyncEngine {
     /// Has this attempt produced commits on its branch?
     ///
     /// A pull request is not the only evidence of finished work: an agent that
-    /// commits locally and stops is done, and waiting for a PR that is never
+    /// commits, pushes and stops is done, and waiting for a PR that is never
     /// coming leaves the row `working` forever. Counting commits against the
     /// attempt's own starting commit is the local equivalent of "explicit done
-    /// detection". [`SyncEngine::maybe_settle`] consumes this (§H4); the
-    /// ranking of what it measures is [`crate::settled::decide`].
+    /// detection". Half the answer: whether those commits are anywhere but
+    /// this box is [`SyncEngine::commits_are_on_origin`], and the two together
+    /// are [`SyncEngine::attempt_commits`], which [`SyncEngine::maybe_settle`]
+    /// consumes (§H4). The ranking of what they measure is
+    /// [`crate::settled::decide`].
     pub fn attempt_has_commits(&self, worktree: Option<&str>, base_sha: Option<&str>) -> bool {
         let Some(worktree) = worktree else {
             return false;
@@ -698,6 +706,99 @@ impl SyncEngine {
             }
         }
         false
+    }
+
+    /// What this attempt's commits amount to (gh#69): nothing, work only its
+    /// own box can see, or work on origin.
+    ///
+    /// [`SyncEngine::attempt_has_commits`] answers the first half — is there
+    /// anything past the base — and this adds the half that decides whether a
+    /// settle may call it reviewable. `ask_github` allows the second, remote
+    /// tier of that check; see [`SyncEngine::commits_are_on_origin`].
+    pub fn attempt_commits(&self, task: &Task, attempt: &Attempt, ask_github: bool) -> Commits {
+        if !self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref()) {
+            return Commits::None;
+        }
+        if self.commits_are_on_origin(task, attempt, ask_github) {
+            Commits::Pushed
+        } else {
+            Commits::Unpushed
+        }
+    }
+
+    /// Is this attempt's HEAD on origin?
+    ///
+    /// The bar is containment, not existence: a retry reuses its predecessor's
+    /// branch, so "there is a branch called `board/gh-69-comet-board` on
+    /// origin" would settle a retry on the *previous* attempt's push. What
+    /// makes the work reviewable is that these commits are there.
+    ///
+    /// Two tiers, cheapest first:
+    ///
+    /// 1. **A remote-tracking ref that contains HEAD.** Free, offline, and
+    ///    true of every ordinary `git push`: git writes `refs/remotes/origin/…`
+    ///    itself when the push succeeds, and a linked worktree shares those
+    ///    refs with the checkout it was cut from. It is also the only tier that
+    ///    works at all for a remote that is not GitHub.
+    /// 2. **GitHub, asked directly** — for a push made straight to a URL
+    ///    (`git push https://…`, which updates no tracking ref at all: exactly
+    ///    what the credential path of gh#68 hands an agent) or into a checkout
+    ///    whose refs have since been pruned. Only on the event path, for the
+    ///    reason [`SyncEngine::recheck_pull_request`] gives: a run ending is a
+    ///    rare event, whereas the interval reconcile re-asks every cycle for as
+    ///    long as the attempt stays live, and one API call per cycle per stuck
+    ///    attempt is a poll nobody asked for.
+    ///
+    /// Unproven reads as unpushed, always. The cost of that is an attempt that
+    /// stays live longer than it had to — visible, and bounded by the wall
+    /// clock cap — against a row that says `review` about work nobody can
+    /// fetch, which is the bug.
+    fn commits_are_on_origin(&self, task: &Task, attempt: &Attempt, ask_github: bool) -> bool {
+        let Some(worktree) = attempt.worktree.as_deref() else {
+            return false;
+        };
+        let Some(head) = git_out(worktree, &["rev-parse", "HEAD"]) else {
+            return false;
+        };
+        // `--count=1` because the question is whether *any* remote holds it;
+        // the walk stops as soon as one does.
+        if git_out(
+            worktree,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                &head,
+                "refs/remotes/",
+            ],
+        )
+        .is_some_and(|refs| !refs.is_empty())
+        {
+            return true;
+        }
+        if !ask_github {
+            return false;
+        }
+        let (Some(gh), Some(branch)) = (self.github.as_ref(), attempt.branch.as_deref()) else {
+            return false;
+        };
+        // The task's own repo when it has one; otherwise whatever the checkout
+        // pushes to, which is all a Linear ticket can offer.
+        let Some(repo) = crate::model::gh_repo(&task.id)
+            .map(str::to_string)
+            .or_else(|| crate::git_credentials::repo_for_checkout(worktree))
+        else {
+            return false;
+        };
+        let Some(remote_head) = gh.branch_head(&repo, branch) else {
+            return false;
+        };
+        // Containment against a commit we hold locally. A remote tip we have
+        // never fetched cannot be checked, and unproven reads as unpushed.
+        git_ok(
+            worktree,
+            &["merge-base", "--is-ancestor", &head, &remote_head],
+        )
     }
 
     /// Map live attempts onto the sessions the engine currently reports.
@@ -1053,18 +1154,21 @@ impl SyncEngine {
     /// The §H4 settle check: if this attempt's run has ended, weigh the
     /// artifacts and maybe close it. Returns whether it settled.
     ///
-    /// `fresh_pr` allows one targeted GitHub lookup before closing on commits
-    /// alone. Only the event path passes true — the interval path polls before
-    /// it reconciles, so a lookup there would repeat the poll — and the lookup
-    /// itself is gated on commits existing, because a pull request cannot
-    /// exist without them.
+    /// `ask_github` allows the two targeted GitHub lookups the decision can
+    /// want — an unrecorded pull request, and (gh#69) a branch pushed without
+    /// leaving a tracking ref behind. Only the event path passes true: the
+    /// interval path polls before it reconciles, so a PR lookup there would
+    /// repeat the poll, and it re-asks every cycle for as long as the attempt
+    /// is live, so a branch lookup there would be a poll of its own. The PR
+    /// lookup is additionally gated on commits existing, because a pull
+    /// request cannot exist without them.
     fn maybe_settle(
         &self,
         runtime: Option<&dyn Runtime>,
         task: &Task,
         attempt: &Attempt,
         status: AgentStatus,
-        fresh_pr: bool,
+        ask_github: bool,
     ) -> Result<bool> {
         let Some(chat_id) = attempt.pane_id.as_deref() else {
             return Ok(false);
@@ -1075,7 +1179,7 @@ impl SyncEngine {
         let mut pr_open = task.pr_open;
         let mut pr_url = task.pr_url.clone().filter(|_| pr_open);
         if !pr_open
-            && fresh_pr
+            && ask_github
             && self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
             && let Some(url) = self.recheck_pull_request(task, attempt)
         {
@@ -1083,18 +1187,46 @@ impl SyncEngine {
             pr_url = Some(url);
         }
         let verdict = settled::decide(end, pr_open, || {
-            self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+            self.attempt_commits(task, attempt, ask_github)
         });
         match verdict {
             Verdict::Finished(evidence) => {
                 self.settle(runtime, task, attempt, evidence, pr_url.as_deref())?;
                 Ok(true)
             }
+            // The one StayLive worth a line: a row that stays `working`
+            // because its commits never left the box looks identical to one
+            // whose agent is still typing, and the difference is the whole of
+            // gh#69. Said once per attempt — the interval path asks again
+            // every cycle, and a log that repeats it is a log nobody reads.
+            Verdict::StayLive(Why::Unpushed) => {
+                self.note_unpushed(task, attempt);
+                Ok(false)
+            }
             // Not logged: the interval path re-asks every cycle, and an
             // errored or artifact-less attempt is already visible on the
             // board as blocked / dim idle. The settle is the event.
             Verdict::StayLive(_) => Ok(false),
         }
+    }
+
+    /// Say, once, that an attempt is sitting on work only its own box can see.
+    fn note_unpushed(&self, task: &Task, attempt: &Attempt) {
+        let key = meta::unpushed_noted(attempt.id);
+        if matches!(self.db.meta_get(&key), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.db.meta_set(&key, &crate::db::now());
+        self.log.info(format!(
+            "{}: run ended with commits that are not on origin{} — attempt stays live \
+             (push the branch, or open a pull request, to settle it)",
+            task.identifier,
+            attempt
+                .branch
+                .as_deref()
+                .map(|b| format!(" ({b})"))
+                .unwrap_or_default(),
+        ));
     }
 
     /// Ask GitHub, now, whether this attempt's branch has an open pull
@@ -2156,6 +2288,33 @@ fn outcome_note(payload: &Value) -> String {
 /// Seconds from an RFC-3339 stamp to `now`, or `None` if it will not parse.
 /// Negative when the stamp is in the future — a clock that moved, which the
 /// duration cap reads as "no time has passed" rather than as a breach.
+/// One git command in a checkout: its trimmed stdout, or `None` if it failed.
+///
+/// Failure and empty output are deliberately different answers — `for-each-ref`
+/// succeeding with nothing is "no such ref", and a git that could not run at
+/// all is "no idea", and the push check must not read the second as the first.
+fn git_out(worktree: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A git command run for its exit status alone (`merge-base --is-ancestor`).
+fn git_ok(worktree: &str, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn secs_since(stamp: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
     let t = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
     Some((now - t.with_timezone(&chrono::Utc)).num_seconds())
@@ -2557,21 +2716,37 @@ mod tests {
         );
     }
 
+    /// What the agent left in the checkout when its run ended.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Work {
+        /// Nothing past the attempt's base.
+        None,
+        /// A commit, and nowhere but this worktree — gh#69's stranded attempt.
+        Committed,
+        /// A commit, and on origin: the artifact a settle may call reviewable.
+        Pushed,
+    }
+
     /// Give an attempt a real checkout: base recorded at dispatch, and — when
-    /// asked — a commit the agent made after it. Built on the AGE-19 fixture
-    /// so the operator's own unpushed commit is always present underneath,
-    /// proving every settle here measures from the attempt's base.
-    fn agent_worked_in(e: &SyncEngine, attempt: i64, committed: bool) -> std::path::PathBuf {
+    /// asked — a commit the agent made after it, pushed or not. Built on the
+    /// AGE-19 fixture so the operator's own unpushed commit is always present
+    /// underneath, proving every settle here measures from the attempt's base.
+    fn agent_worked_in(e: &SyncEngine, attempt: i64, did: Work) -> std::path::PathBuf {
         let work = repo_ahead_of_its_remote();
         let head = std::process::Command::new("git")
             .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
             .output()
             .unwrap();
         let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        if committed {
+        if did != Work::None {
             std::fs::write(work.join("agent"), "work").unwrap();
             git_in(&work, &["add", "."]);
             git_in(&work, &["commit", "-m", "the agent's work"]);
+        }
+        if did == Work::Pushed {
+            // An ordinary push, which is what leaves the remote-tracking ref
+            // the settle's first tier reads.
+            git_in(&work, &["push", "origin", "main"]);
         }
         e.db.set_attempt_worktree(attempt, &work.to_string_lossy())
             .unwrap();
@@ -2623,11 +2798,11 @@ mod tests {
     }
 
     #[test]
-    fn commits_settle_a_run_that_ended_cleanly() {
+    fn pushed_commits_settle_a_run_that_ended_cleanly() {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -2640,6 +2815,174 @@ mod tests {
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
+    /// gh#69, end to end: the agent committed, `gh pr create` never happened
+    /// (no credential on the box — gh#68's whole premise), and the run ended
+    /// `Completed`. The old rule read that as a finished attempt and moved the
+    /// row to `review` while the work sat in a worktree nobody else can reach.
+    #[test]
+    fn a_run_that_ends_with_unpushed_commits_does_not_read_as_review() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, Work::Committed);
+
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert!(
+            live(&e).outcome.is_none(),
+            "commits only the agent's box can see are not a reviewable attempt"
+        );
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            BoardState::Working
+        );
+        // And the reason is on the record rather than left to be guessed at
+        // from a row that looks like an agent still typing.
+        assert!(
+            e.db.meta_get(&meta::unpushed_noted(a)).unwrap().is_some(),
+            "the stranded branch is noted once"
+        );
+
+        // The agent (or the operator) pushes; the next run end settles it.
+        git_in(&work, &["push", "origin", "main"]);
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// The crash variant. Recovery stamps an aborted run `Interrupted`, so the
+    /// errored-runs-never-settle-on-commits guard does not apply to it, and an
+    /// agent killed mid-task used to settle as finished on a commit it had
+    /// made along the way.
+    #[test]
+    fn a_recovery_aborted_run_with_unpushed_commits_stays_live() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let work = agent_worked_in(&e, a, Work::Committed);
+        let rt = JournalFact::ending(Some(RunEnd::Interrupted));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).outcome.is_none());
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// A push straight to a URL — what an agent carrying the board's
+    /// credential does — updates no remote-tracking ref, so the local tier
+    /// proves nothing and the row would sit `working` on work that is in fact
+    /// on origin. The event path asks GitHub, once, and settles.
+    #[test]
+    fn a_branch_pushed_without_a_tracking_ref_is_found_by_asking_github() {
+        let work_dir = repo_ahead_of_its_remote();
+        let wt = work_dir.to_string_lossy().into_owned();
+        let base = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(work_dir.join("agent"), "work").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-m", "the agent's work"]);
+        let head = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        // Pushed by URL: the remote has it, this checkout has no record of it.
+        let remote = work_dir.parent().unwrap().join("remote.git");
+        git_in(
+            &work_dir,
+            &[
+                "push",
+                &remote.to_string_lossy(),
+                "HEAD:refs/heads/board/lin-142",
+            ],
+        );
+        assert!(
+            git_out(&wt, &["for-each-ref", "--contains", &head, "refs/remotes/"])
+                .is_some_and(|r| r.is_empty()),
+            "the fixture must leave no tracking ref, or it proves nothing"
+        );
+
+        let gh = Github::new(Box::new(FixtureRest::new(vec![(
+            "/repos/o/r/branches/board/lin-142".to_string(),
+            json!({ "commit": { "sha": head } }),
+        )])) as Box<dyn Rest>);
+        let e = engine_with(None, Some(gh));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &base).unwrap();
+        // The Linear task names no repo; the checkout's own remote answers.
+        git_in(
+            &work_dir,
+            &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+        );
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        let attempt = live(&e);
+        assert_eq!(
+            e.attempt_commits(&task, &attempt, false),
+            Commits::Unpushed,
+            "the interval path stays local: no API call per cycle per attempt"
+        );
+        assert_eq!(
+            e.attempt_commits(&task, &attempt, true),
+            Commits::Pushed,
+            "the event path asks GitHub and finds the branch"
+        );
+        std::fs::remove_dir_all(work_dir.parent().unwrap()).ok();
+    }
+
+    /// The bar is containment, not a name: a retry reuses its predecessor's
+    /// branch, and the push that branch already carries is not this attempt's.
+    #[test]
+    fn a_retrys_own_commits_are_what_must_be_on_origin() {
+        let work_dir = repo_ahead_of_its_remote();
+        let wt = work_dir.to_string_lossy().into_owned();
+        // The previous attempt's work, pushed under the shared branch name.
+        std::fs::write(work_dir.join("first"), "1").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-m", "the cancelled run's work"]);
+        let pushed = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let remote = work_dir.parent().unwrap().join("remote.git");
+        git_in(
+            &work_dir,
+            &[
+                "push",
+                &remote.to_string_lossy(),
+                "HEAD:refs/heads/board/lin-142",
+            ],
+        );
+        // The retry, committing on top and pushing nothing.
+        std::fs::write(work_dir.join("second"), "2").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-m", "the retry's work"]);
+
+        let gh = Github::new(Box::new(FixtureRest::new(vec![(
+            "/repos/o/r/branches/board/lin-142".to_string(),
+            json!({ "commit": { "sha": pushed } }),
+        )])) as Box<dyn Rest>);
+        let e = engine_with(None, Some(gh));
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &pushed).unwrap();
+        git_in(
+            &work_dir,
+            &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+        );
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(
+            e.attempt_commits(&task, &live(&e), true),
+            Commits::Unpushed,
+            "a branch on origin at somebody else's commit settles nothing"
+        );
+        std::fs::remove_dir_all(work_dir.parent().unwrap()).ok();
+    }
+
     #[test]
     fn a_run_that_ends_with_nothing_new_committed_stays_live() {
         // The checkout exists and holds the operator's own unpushed commit —
@@ -2648,7 +2991,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, false);
+        let work = agent_worked_in(&e, a, Work::None);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -2668,7 +3011,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
         let rt = JournalFact::ending(Some(RunEnd::Errored));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
@@ -2754,7 +3097,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Unknown)]))
             .unwrap();
         assert!(live(&e).outcome.is_none());
@@ -3070,7 +3413,7 @@ mod tests {
 
     /// Settle an attempt on commits, returning its checkout for cleanup.
     fn settled_on_commits(e: &SyncEngine, attempt: i64) -> std::path::PathBuf {
-        let work = agent_worked_in(e, attempt, true);
+        let work = agent_worked_in(e, attempt, Work::Pushed);
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
@@ -3232,7 +3575,7 @@ mod tests {
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
 
         e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -3271,7 +3614,7 @@ mod tests {
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -3475,7 +3818,7 @@ max_duration = "{max_duration}"
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, true);
+        let work = agent_worked_in(&e, a, Work::Pushed);
         age_attempt(&e, a, 5 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
