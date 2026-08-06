@@ -144,6 +144,15 @@ the row goes back to `working`, and the count of times that happened is kept on
 the attempt (`reopened`). You do not need to do anything about it, and it is
 not recorded as a retry — nothing was re-dispatched.
 
+**Attempts are bounded by the clock.** Each route sets a `max_duration` (two
+hours by default). Past it the board says so in your chat once, naming how long
+you have left, and then cancels the attempt and closes it `failed` with a
+comment upstream. That message is not decoration: commit what you have and open
+a pull request while you still can, and if you are going round in circles, say
+so in the PR description rather than spending the remaining minutes on another
+lap. Finishing inside the grace settles the attempt `done` on your artifacts as
+normal — the cap only takes what nothing else has closed.
+
 `comet-board doctor` explains a board that looks wrong: missing keys,
 unreachable repos, routes pointing at spaces that do not exist, an engine that
 is not listening. Prefer it to guessing.
