@@ -51,18 +51,83 @@ jobs:
           path: target/package/*.tar.gz
           if-no-files-found: error
 
-  # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
-  # been type-checked against the Apple SDK — this job may surface errors on
-  # its first runs. continue-on-error keeps the Linux release shippable.
   macos:
     runs-on: macos-latest # Apple silicon
-    continue-on-error: true
+    env:
+      # `secrets` is not a valid context in step `if:` — same trick as the
+      # publish job below. Presence of the p12 is what switches the build from
+      # ad-hoc to Developer ID; everything else follows from it.
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
     steps:
       - uses: actions/checkout@v4
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Import into a keychain created for this run and deleted with the
+      # runner: the p12 never lands in the login keychain, and nothing has to
+      # be cleaned up if the job dies. Skipped entirely without the secret,
+      # which leaves CODESIGN_IDENTITY unset and the ad-hoc path unchanged.
+      - name: import Developer ID certificate
+        if: env.MACOS_CERTIFICATE_P12 != ''
+        env:
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pw="$(uuidgen)"
+          security create-keychain -p "$pw" "$keychain"
+          # Long timeout deliberately: the keychain must still be unlocked
+          # after a cold cargo build plus a notarization round-trip, and it
+          # dies with the runner regardless.
+          security set-keychain-settings -t 21600 -u "$keychain"
+          security unlock-keychain -p "$pw" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this, codesign blocks on a GUI keychain prompt that no one
+          # is there to answer and the job hangs until the step times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$pw" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          identity="$MACOS_SIGNING_IDENTITY"
+          if [ -z "$identity" ]; then
+            identity=$(security find-identity -v -p codesigning "$keychain" \
+              | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)
+          fi
+          [ -n "$identity" ] || { echo "no Developer ID Application identity in the imported p12"; exit 1; }
+          echo "::add-mask::$identity"
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: notary credentials
+        if: env.MACOS_CERTIFICATE_P12 != ''
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          # Either credential form works; the App Store Connect API key wins if
+          # both are set. Signing without notarizing still leaves a downloaded
+          # app Gatekeeper-rejected, so the script warns rather than pretending.
+          if [ -n "$MACOS_NOTARY_KEY" ]; then
+            printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+            {
+              echo "MACOS_NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8"
+              echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID"
+              echo "MACOS_NOTARY_ISSUER_ID=$MACOS_NOTARY_ISSUER_ID"
+            } >> "$GITHUB_ENV"
+          elif [ -n "$MACOS_NOTARY_APPLE_ID" ]; then
+            {
+              echo "MACOS_NOTARY_APPLE_ID=$MACOS_NOTARY_APPLE_ID"
+              echo "MACOS_NOTARY_TEAM_ID=$MACOS_NOTARY_TEAM_ID"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::Developer ID certificate present but no MACOS_NOTARY_* credentials — the build will be signed but not notarized, and downloads will still need the quarantine workaround."
+          fi
       - name: package dmg
+        env:
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
         run: scripts/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -82,6 +147,11 @@ jobs:
       # same repo secret deploy.yml uses: our account, Workers Scripts +
       # R2 Storage edit (scripts/edge-setup-wizard.sh stage 8).
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Mirrors the gate in the macos job: with no certificate the dmg is
+      # ad-hoc signed, and the release notes have to say so.
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
     steps:
       # Checked out for edge/wrangler.jsonc only — the account id lives there
       # and nowhere else, so moving the edge to another account can't leave
@@ -106,9 +176,41 @@ jobs:
           ls artifacts/ | grep -q "comet-$ver-" \
             || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
+      # The macOS install note goes above the generated changelog because it is
+      # the first thing a downloader needs and the failure it prevents looks
+      # like a corrupt download, not a policy decision. Written only while the
+      # dmg is ad-hoc signed — a notarized build needs no such note, and a
+      # stale one would teach people to strip quarantine out of habit.
+      - name: macOS note for the release body
+        run: |
+          if [ -n "$MACOS_CERTIFICATE_P12" ] \
+            && { [ -n "$MACOS_NOTARY_KEY" ] || [ -n "$MACOS_NOTARY_APPLE_ID" ]; }; then
+            : > release-body.md
+            exit 0
+          fi
+          cat > release-body.md <<'EOF'
+          ### macOS: one step before first launch
+
+          The dmg is **not signed with an Apple Developer ID** — the project
+          does not have one yet — so macOS quarantines it on download and
+          Gatekeeper refuses to open it, with a dialog that explains nothing
+          ("Comet can't be opened" / "Appen kan ikke åpnes", error -50).
+
+          Drag `Comet.app` to Applications, then run this once:
+
+          ```sh
+          xattr -dr com.apple.quarantine /Applications/Comet.app
+          ```
+
+          Comet then opens normally, and `comet update` is unaffected from
+          there on. Full explanation: [docs/macos-install.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/macos-install.md).
+
+          ---
+          EOF
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          body_path: release-body.md
           generate_release_notes: true
       - name: upload to R2 (edge.comet.offhand.dev/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''

@@ -134,14 +134,13 @@ where
     for s in &skipped {
         println!("skipped {s}");
     }
+    // Only the credential this config cannot work without: routes were just
+    // written for repos that answer 404 to a request with nothing on it.
+    // Either one answers for GitHub (gh#58) — the App is the one that survives
+    // somebody else installing the board on their own repos, and the token is
+    // the one that needs nothing registering. Naming both here is the only
+    // place most people will meet the choice.
     let mut missing = Vec::new();
-    if linear_api_key(paths).is_none() {
-        missing.push("LINEAR_API_KEY");
-    }
-    // Either credential answers for GitHub (gh#58) — the App is the one that
-    // survives somebody else installing the board on their own repos, and the
-    // token is the one that needs nothing registering. Naming both here is the
-    // only place most people will meet the choice.
     if !repos.is_empty() && matches!(github_auth(paths), GithubAuth::None) {
         missing.push("GITHUB_TOKEN (or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY_PATH)");
     }
@@ -151,6 +150,16 @@ where
         println!(
             "\nnext: add {} to {}",
             missing.join(" and "),
+            shorten_home(&paths.env_file())
+        );
+    }
+    // Offered, not demanded: a GitHub-only board is a supported configuration
+    // and listing the Linear key beside the GitHub one as a thing to "add" is
+    // what made a working board look half-installed (gh#96).
+    if linear_api_key(paths).is_none() {
+        println!(
+            "Linear is optional — this config polls GitHub only. Add LINEAR_API_KEY to {} \
+             and re-run with --force to route Linear teams as well.",
             shorten_home(&paths.env_file())
         );
     }

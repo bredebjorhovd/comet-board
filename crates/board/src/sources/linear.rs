@@ -331,6 +331,33 @@ impl<T: GraphQl> Linear<T> {
             .unwrap_or_default())
     }
 
+    /// Who the key authenticates as — the cheapest question that separates a
+    /// live key from a rejected one (gh#96).
+    ///
+    /// `doctor` asks it to decide whether a configured `LINEAR_API_KEY` is a
+    /// working credential or a revoked string somebody pasted a year ago; an
+    /// email is also what makes the answer worth a line, the same way the
+    /// GitHub auth check names the identity the board writes as.
+    pub fn viewer(&self) -> Result<String> {
+        let data = self.transport.query(&json!({
+            "query": "{ viewer { name email } }",
+        }))?;
+        let viewer = data
+            .get("viewer")
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| anyhow!("linear: response had no `viewer`"))?;
+        Ok(["email", "name"]
+            .iter()
+            .find_map(|k| {
+                viewer
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("unknown")
+            .to_string())
+    }
+
     /// Teams the key can see, for generating routes.
     pub fn teams(&self) -> Result<Vec<(String, String)>> {
         let data = self.transport.query(&json!({
@@ -816,6 +843,28 @@ mod tests {
         ]));
         assert!(l.comment("uuid-1", "hello").is_ok());
         assert!(l.comment("uuid-1", "hello").is_err());
+    }
+
+    /// `doctor` asks this to tell a working key from a revoked one (gh#96), so
+    /// it has to name somebody when the key is good — an `ok` line that says
+    /// nothing about which Linear the board is polling is not worth printing.
+    #[test]
+    fn the_viewer_query_names_who_the_key_authenticates_as() {
+        let l = Linear::new(FixtureTransport::new(vec![
+            json!({ "viewer": { "name": "Sam", "email": "sam@example.com" } }),
+            // A key with no email on the account still identifies somebody.
+            json!({ "viewer": { "name": "Sam", "email": "" } }),
+        ]));
+        assert_eq!(l.viewer().unwrap(), "sam@example.com");
+        assert_eq!(l.viewer().unwrap(), "Sam");
+    }
+
+    /// A rejected key is the failure this exists to surface, and it has to
+    /// arrive as an error rather than as an empty answer that reads like a pass.
+    #[test]
+    fn a_viewerless_response_is_an_error_not_an_empty_name() {
+        let l = Linear::new(FixtureTransport::new(vec![json!({ "viewer": null })]));
+        assert!(l.viewer().is_err());
     }
 
     #[test]

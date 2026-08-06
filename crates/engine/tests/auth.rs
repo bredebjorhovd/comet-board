@@ -1,6 +1,6 @@
 //! Auth service tests: dev mode, and the WorkOS flows (headless paste-code exchange,
-//! loopback callback, refresh rotation + revocation, org onboarding) against a stub
-//! edge HTTP server on a plain tokio TcpListener.
+//! loopback callback, refresh rotation + revocation, org onboarding, member
+//! invitations) against a stub edge HTTP server on a plain tokio TcpListener.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,10 @@ struct StubState {
     token_ttl: AtomicUsize,
     /// org_id claim for exchange-minted tokens ("" = none).
     exchange_org: Mutex<String>,
+    /// Emails posted to /auth/orgs/:id/invites, in order (gh#76).
+    invited: Mutex<Vec<String>>,
+    /// Invitation ids the engine asked to revoke.
+    revoked: Mutex<Vec<String>>,
 }
 
 struct StubEdge {
@@ -210,6 +214,74 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
         ("POST", "/auth/orgs") => {
             respond(&mut stream, "200 OK", r#"{"organizationId":"org_new"}"#).await;
         }
+        // -- members and invitations (gh#76) --
+        ("GET", "/auth/orgs/org_1/members") => {
+            respond(
+                &mut stream,
+                "200 OK",
+                r#"{"members":[{"id":"om_1","userId":"user_1","email":"w@example.com","role":"admin"}],"canInvite":true}"#,
+            )
+            .await;
+        }
+        ("GET", "/auth/orgs/org_1/invites") => {
+            let invites: Vec<serde_json::Value> = state
+                .invited
+                .lock()
+                .expect("lock")
+                .iter()
+                .enumerate()
+                .map(|(ix, email)| {
+                    serde_json::json!({ "id": format!("inv_{ix}"), "email": email,
+                                        "state": "pending" })
+                })
+                .collect();
+            let body = serde_json::json!({ "invites": invites });
+            respond(&mut stream, "200 OK", &body.to_string()).await;
+        }
+        ("POST", "/auth/orgs/org_1/invites") => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let email = parsed
+                .get("email")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if email == "taken@example.com" {
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    r#"{"error":"already a member of this workspace"}"#,
+                )
+                .await;
+                return;
+            }
+            state.invited.lock().expect("lock").push(email.clone());
+            let body = serde_json::json!({
+                "invitation": { "id": "inv_0", "email": email, "state": "pending",
+                                "acceptUrl": "https://authkit.example/invite/tok" }
+            });
+            respond(&mut stream, "200 OK", &body.to_string()).await;
+        }
+        ("DELETE", path) if path.starts_with("/auth/orgs/org_1/invites/") => {
+            let id = path.rsplit('/').next().unwrap_or_default().to_string();
+            state.revoked.lock().expect("lock").push(id);
+            respond(&mut stream, "200 OK", r#"{"ok":true}"#).await;
+        }
+        ("POST", "/auth/invites/accept") => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            match parsed.get("token").and_then(|v| v.as_str()) {
+                Some("good") => {
+                    respond(&mut stream, "200 OK", r#"{"organizationId":"org_2"}"#).await;
+                }
+                _ => {
+                    respond(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"error":"that invitation is for a different email address"}"#,
+                    )
+                    .await;
+                }
+            }
+        }
         _ => respond(&mut stream, "404 Not Found", r#"{"error":"not_found"}"#).await,
     }
 }
@@ -349,6 +421,103 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     auth.sign_out();
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(!session_file.exists());
+}
+
+/// gh#76: inviting a teammate used to be a manual membership creation in the
+/// WorkOS dashboard. The roster, the invite, and the withdrawal all go through
+/// the org the session is scoped to — the caller never names one.
+#[tokio::test]
+async fn members_and_invitations_go_through_the_scoped_org() {
+    let edge = StubEdge::start().await;
+    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state");
+    auth.complete_sign_in(&format!("{state}.code123"))
+        .await
+        .expect("sign-in");
+
+    let roster = auth.list_members().await.expect("list members");
+    assert_eq!(roster.members.len(), 1);
+    assert_eq!(roster.members[0].email.as_deref(), Some("w@example.com"));
+    assert_eq!(roster.members[0].role.as_deref(), Some("admin"));
+    assert!(roster.can_invite);
+
+    let invitation = auth
+        .invite_member("new@example.com", None)
+        .await
+        .expect("invite");
+    assert_eq!(invitation.email, "new@example.com");
+    assert_eq!(
+        invitation.accept_url.as_deref(),
+        Some("https://authkit.example/invite/tok"),
+        "the hosted link is carried through for teammates not on this desktop"
+    );
+    assert_eq!(
+        edge.state.invited.lock().expect("lock").as_slice(),
+        ["new@example.com"]
+    );
+
+    let pending = auth.list_invites().await.expect("list invites");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].email, "new@example.com");
+
+    auth.revoke_invite("inv_0").await.expect("revoke");
+    assert_eq!(
+        edge.state.revoked.lock().expect("lock").as_slice(),
+        ["inv_0"]
+    );
+
+    // A refusal keeps the edge's own words: "already a member of this
+    // workspace" tells the user what to do; "workspace request failed (400)"
+    // does not.
+    let err = auth
+        .invite_member("taken@example.com", None)
+        .await
+        .expect_err("duplicate refused");
+    assert!(
+        err.to_string().contains("already a member"),
+        "edge message surfaced: {err}"
+    );
+}
+
+/// The other half of gh#76: someone invited into an existing workspace signs in
+/// with no org of their own, and joins with the code instead of creating one.
+#[tokio::test]
+async fn accepting_an_invitation_scopes_the_session() {
+    let edge = StubEdge::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+    let url = auth.start_headless_sign_in();
+    let state = query_param(&url, "state").expect("state");
+    auth.complete_sign_in(&format!("{state}.code123"))
+        .await
+        .expect("sign-in");
+    assert!(matches!(auth.state(), AuthState::NeedsOrganization { .. }));
+
+    // No org yet: member management has nothing to talk about, and says so
+    // without a round trip.
+    assert!(auth.list_members().await.is_err());
+
+    // An empty code never reaches the edge.
+    assert!(auth.accept_invite("   ").await.is_err());
+    // A code for someone else is refused in the invitee's own words.
+    let err = auth.accept_invite("stolen").await.expect_err("refused");
+    assert!(
+        err.to_string().contains("different email address"),
+        "edge message surfaced: {err}"
+    );
+    assert!(
+        matches!(auth.state(), AuthState::NeedsOrganization { .. }),
+        "a refused code leaves the gate up"
+    );
+
+    // The real code lands the session in the workspace that invited us — the
+    // same landing picking a membership gives, so the gate falls away.
+    let org = auth.accept_invite("good").await.expect("accept");
+    assert_eq!(org, "org_2");
+    assert!(matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_2"));
 }
 
 #[tokio::test]
