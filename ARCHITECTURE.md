@@ -245,8 +245,9 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   (`{data_dir}/accounts/{slotId}/`) that a run points its harness child at with
   `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so several teammates' subscriptions coexist on one
   box and no swap happens under a live run.
-- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
-  callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
+- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs, member
+  invitations); loopback callback server headed, paste-code headless; dev mode (no key ⇒
+  bearer = configured user id).
 
 ## 6. Edge plan (TypeScript, `edge/`)
 
@@ -264,6 +265,12 @@ sidecar slots, R2 attachments, JWKS auth). Additions:
    chat rooms stay owner-only until the owner marks one shared (`POST /share/{chatId}`,
    which the board does for every task it dispatches), after which the org may read and
    write it. Private chats never become org-visible by being in an org.
+5. Member invitations (gh#76) — `/auth/orgs/:id/invites` (list/create/revoke) and
+   `/auth/invites/accept`, so adding a teammate is Settings → Members instead of a
+   hand-made `organization_membership` in the WorkOS dashboard. Admin-gated on the org's
+   actual membership list, never on the caller's `org_id` claim (which says which org a
+   session is scoped to, not what role it holds); an invitation is redeemable only by the
+   address it names, while it is pending.
 Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
 per `docs/research/durable-objects-language.md`.
 

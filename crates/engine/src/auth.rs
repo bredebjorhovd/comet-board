@@ -58,6 +58,45 @@ pub struct OrgMembership {
     pub name: String,
 }
 
+/// One member of the current workspace (gh#76). `email` is absent when the
+/// edge could not resolve the address — the row still renders, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgMember {
+    pub id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// `GET /auth/orgs/:id/members` — the roster and what we may do to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MembersView {
+    #[serde(default)]
+    pub members: Vec<OrgMember>,
+    /// False for a plain member: the invite form stays out of their way.
+    #[serde(default)]
+    pub can_invite: bool,
+}
+
+/// A pending invitation to the current workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Invitation {
+    pub id: String,
+    pub email: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// WorkOS's hosted accept link, for a teammate not on this desktop.
+    #[serde(default)]
+    pub accept_url: Option<String>,
+}
+
 /// AuthStatus stream payload (`SignedOut | NeedsOrganization{user} |
 /// SignedIn{user, orgId?}`). Serializes as the canonical [`comet_proto::AuthState`]
 /// wire shape (`{"state": "signedIn", …}`) so every client parses one form.
@@ -506,6 +545,133 @@ impl Auth {
         Ok(())
     }
 
+    // -- members and invitations (gh#76) -------------------------------------
+
+    /// The current workspace's roster, plus whether we may change it. Adding a
+    /// teammate used to mean creating the membership by hand in the WorkOS
+    /// dashboard; the edge routes behind these calls do it for us.
+    pub async fn list_members(&self) -> Result<MembersView, EngineError> {
+        if self.inner.workos.is_none() {
+            return Ok(MembersView::default());
+        }
+        let org = self.current_org()?;
+        self.authed_json(
+            reqwest::Method::GET,
+            &format!("/auth/orgs/{}/members", url_encode(&org)),
+            None,
+        )
+        .await
+    }
+
+    /// Invitations sent from this workspace that nobody has redeemed yet.
+    pub async fn list_invites(&self) -> Result<Vec<Invitation>, EngineError> {
+        if self.inner.workos.is_none() {
+            return Ok(Vec::new());
+        }
+        let org = self.current_org()?;
+        #[derive(Deserialize)]
+        struct Invites {
+            #[serde(default)]
+            invites: Vec<Invitation>,
+        }
+        let body: Invites = self
+            .authed_json(
+                reqwest::Method::GET,
+                &format!("/auth/orgs/{}/invites", url_encode(&org)),
+                None,
+            )
+            .await?;
+        Ok(body.invites)
+    }
+
+    /// Invite `email` into the current workspace (admin-gated at the edge).
+    pub async fn invite_member(
+        &self,
+        email: &str,
+        role: Option<&str>,
+    ) -> Result<Invitation, EngineError> {
+        if self.inner.workos.is_none() {
+            return Err(EngineError::Other(
+                "inviting teammates needs a WorkOS session".into(),
+            ));
+        }
+        let org = self.current_org()?;
+        #[derive(Deserialize)]
+        struct Created {
+            invitation: Invitation,
+        }
+        let mut body = serde_json::json!({ "email": email });
+        if let Some(role) = role.filter(|r| !r.is_empty()) {
+            body["role"] = serde_json::Value::String(role.to_string());
+        }
+        let created: Created = self
+            .authed_json(
+                reqwest::Method::POST,
+                &format!("/auth/orgs/{}/invites", url_encode(&org)),
+                Some(body),
+            )
+            .await?;
+        Ok(created.invitation)
+    }
+
+    /// Withdraw an invitation that has not been redeemed.
+    pub async fn revoke_invite(&self, invitation_id: &str) -> Result<(), EngineError> {
+        if self.inner.workos.is_none() {
+            return Ok(());
+        }
+        let org = self.current_org()?;
+        let _: serde_json::Value = self
+            .authed_json(
+                reqwest::Method::DELETE,
+                &format!(
+                    "/auth/orgs/{}/invites/{}",
+                    url_encode(&org),
+                    url_encode(invitation_id)
+                ),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Redeem an invitation code for the signed-in user and scope the session to
+    /// the workspace it was for — the same landing an org switch gives, so the
+    /// org gate falls away by itself.
+    pub async fn accept_invite(&self, token: &str) -> Result<String, EngineError> {
+        if self.inner.workos.is_none() {
+            return Err(EngineError::Other(
+                "joining a workspace needs a WorkOS session".into(),
+            ));
+        }
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(EngineError::Other("enter your invitation code".into()));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Accepted {
+            organization_id: String,
+        }
+        let accepted: Accepted = self
+            .authed_json(
+                reqwest::Method::POST,
+                "/auth/invites/accept",
+                Some(serde_json::json!({ "token": token })),
+            )
+            .await?;
+        self.select_org(&accepted.organization_id).await?;
+        Ok(accepted.organization_id)
+    }
+
+    /// The org the session is scoped to. Member management is always about the
+    /// workspace we are actually in — the caller never names one.
+    fn current_org(&self) -> Result<String, EngineError> {
+        lock(&self.inner.stored)
+            .as_ref()
+            .and_then(|s| s.org_id.clone())
+            .ok_or_else(|| EngineError::Other("no workspace selected".into()))
+    }
+
     // -- internals ----------------------------------------------------------
 
     fn begin_sign_in(&self, redirect_uri: &str) -> String {
@@ -750,10 +916,23 @@ impl Auth {
             .await
             .map_err(|e| EngineError::Other(format!("the edge is unreachable: {e}")))?;
         if !res.status().is_success() {
-            return Err(EngineError::Other(format!(
-                "workspace request failed ({})",
-                res.status().as_u16()
-            )));
+            // Prefer the edge's own `{"error": …}`: "only workspace admins can
+            // invite" is worth more to whoever reads it than a bare 403.
+            let status = res.status().as_u16();
+            let detail = res
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| {
+                    body.get("error")
+                        .and_then(|e| e.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|message| !message.is_empty());
+            return Err(EngineError::Other(match detail {
+                Some(message) => message,
+                None => format!("workspace request failed ({status})"),
+            }));
         }
         res.json::<T>()
             .await
