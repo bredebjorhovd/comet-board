@@ -56,6 +56,37 @@ gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "a6c1ad501f90c
 ] }
 gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "a6c1ad501f90c9437d2553bde691958f150364c5" }
 
+# AppKit, for the two bits of macOS presence gpui doesn't wrap at the pinned rev
+# (crates/ui/src/app_icon.rs): the runtime Dock/Cmd-Tab icon and the menu-bar
+# status item. Versions match gpui_macos's so cargo unifies on one objc2 runtime
+# — a second copy would mean two disjoint class registries.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSButton",
+    "NSControl",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "NSData",
+    "NSGeometry",
+    "NSObject",
+    "NSString",
+    "objc2-core-foundation",
+    "std",
+] }
+
 # ratatui — the terminal viewport (`comet-tui`). Deliberately narrow features:
 # `widget-calendar` (a default) drags in `time`, and we render no calendar.
 # `layout-cache` memoizes the cassowary solve, which is the one per-frame cost

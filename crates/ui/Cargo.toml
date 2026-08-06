@@ -32,5 +32,11 @@ chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+# AppKit for `app_icon` — the Dock/Cmd-Tab icon and the menu-bar status item.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
