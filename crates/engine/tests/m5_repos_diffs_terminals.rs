@@ -185,7 +185,7 @@ async fn repos_round_trip_add_branches_worktrees() {
 
     // Delete: dir removed, comet branch removed, refs pruned.
     repos
-        .delete_worktree(&repo_dir, Path::new(&worktree.path))
+        .delete_worktree(&repo_dir, Path::new(&worktree.path), None)
         .await
         .expect("delete worktree");
     assert!(!PathBuf::from(&worktree.path).exists());

@@ -883,6 +883,7 @@ mod tests {
             updated_at: "2026-08-01T11:00:00Z".into(),
             started_at: None,
             account: None,
+            dispatched_by_user: None,
         }
     }
 

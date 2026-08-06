@@ -18,6 +18,7 @@ pub mod config;
 pub mod db;
 pub mod dispatch;
 pub mod doctor;
+pub mod gc;
 pub mod git_credentials;
 pub mod init;
 pub mod log;

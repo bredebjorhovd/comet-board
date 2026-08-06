@@ -75,7 +75,7 @@ use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
-use comet_board::dispatch::DispatchOverrides;
+use comet_board::dispatch::{DispatchOrigin, DispatchOverrides};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +172,49 @@ struct ResizeTerminalParams {
     terminal_id: String,
     cols: u16,
     rows: u16,
+}
+
+/// `DispatchTask`'s params. At module scope rather than inside the handler
+/// because these key names are a contract three callers write by hand — the
+/// desktop panel, the TUI and the `comet-board` CLI — and a camelCase slip
+/// would drop an override or an attribution silently, with a successful
+/// dispatch to show for it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchTaskParams {
+    task_id: String,
+    /// The dispatching chat's id when an agent released it — provenance, never
+    /// authority.
+    #[serde(default)]
+    via: Option<String>,
+    /// The device the dispatch was issued from, and who its frontend says is
+    /// signed in there (gh#74). Both are the caller's word — a relayed call
+    /// arrives as the device room's owner, so there is no per-call identity to
+    /// check them against yet (#66). Recorded on the attempt, and never
+    /// consulted for authorization or for billing: which account a run spends
+    /// is `account` below, always explicit.
+    #[serde(default)]
+    via_device: Option<String>,
+    #[serde(default)]
+    via_user: Option<String>,
+    /// Runtime override (e.g. `opencode`); `None` = the route's.
+    #[serde(default)]
+    runtime: Option<String>,
+    /// Model override for the chosen harness.
+    #[serde(default)]
+    model: Option<String>,
+    /// Agent-account slot id to spend — whose Claude/Codex subscription pays
+    /// for this run (gh#59). `None` = the route's `account`, and failing that
+    /// the device's own CLI login. Explicit on purpose: the board does not
+    /// infer an account from the WorkOS user who dispatched, it records `via`
+    /// and does what it was told.
+    #[serde(default)]
+    account: Option<String>,
+    /// End the task's live attempt and release a fresh one — the blocked row's
+    /// Retry (gh#49). Off for ordinary dispatches, which are refused on a live
+    /// attempt.
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -852,45 +895,22 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&comet_board::runtime::runtime_options())
             }
             methods::DISPATCH_TASK => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    task_id: String,
-                    /// The dispatching chat's id when an agent released it —
-                    /// provenance, never authority.
-                    #[serde(default)]
-                    via: Option<String>,
-                    /// Runtime override (e.g. `opencode`); `None` = the route's.
-                    #[serde(default)]
-                    runtime: Option<String>,
-                    /// Model override for the chosen harness.
-                    #[serde(default)]
-                    model: Option<String>,
-                    /// Agent-account slot id to spend — whose Claude/Codex
-                    /// subscription pays for this run (gh#59). `None` = the
-                    /// route's `account`, and failing that the device's own
-                    /// CLI login. Explicit on purpose: the board does not
-                    /// infer an account from the WorkOS user who dispatched,
-                    /// it records `via` and does what it was told.
-                    #[serde(default)]
-                    account: Option<String>,
-                    /// End the task's live attempt and release a fresh one — the
-                    /// blocked row's Retry (gh#49). Off for ordinary dispatches,
-                    /// which are refused on a live attempt.
-                    #[serde(default)]
-                    replace: bool,
-                }
-                let p: P = parse_params(params)?;
+                let p: DispatchTaskParams = parse_params(params)?;
                 let board = self.board()?;
                 let overrides = DispatchOverrides {
                     runtime: p.runtime,
                     model: p.model,
                     account: p.account,
                 };
+                let origin = DispatchOrigin {
+                    chat: p.via,
+                    device: p.via_device,
+                    user: p.via_user,
+                };
                 let dispatched = if p.replace {
-                    board.retry_task(&p.task_id, p.via, overrides).await
+                    board.retry_task(&p.task_id, origin, overrides).await
                 } else {
-                    board.dispatch_task(&p.task_id, p.via, overrides).await
+                    board.dispatch_task(&p.task_id, origin, overrides).await
                 }
                 .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&dispatched)
@@ -1002,6 +1022,10 @@ impl RpcService for EngineRpc {
                     .delete_worktree(
                         std::path::Path::new(&p.repo_path),
                         std::path::Path::new(&p.worktree_path),
+                        // The frontend deletes a worktree it did not name a
+                        // branch for, so only comet's own `comet/…` branch is
+                        // ours to remove here.
+                        None,
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
@@ -1173,6 +1197,41 @@ mod tests {
         .expect("ui param shape");
         assert_eq!(p.account_id, "acct-1");
         assert_eq!(p.harness, HarnessId::ClaudeCode);
+    }
+
+    /// gh#74: the panel and the TUI hand-write these keys. `account` decides
+    /// whose subscription a run burns and `viaDevice`/`viaUser` are the only
+    /// record of who released it, so a name that fails to bind is a silent
+    /// wrong answer, not an error.
+    #[test]
+    fn dispatch_task_params_bind_the_names_the_frontends_send() {
+        let p: DispatchTaskParams = parse_params(serde_json::json!({
+            "taskId": "gh:owner/widget#74",
+            "targetDeviceId": "device-box",
+            "runtime": "opencode",
+            "model": "gpt-5.2",
+            "account": "slot-ana",
+            "viaDevice": "laptop-ana",
+            "viaUser": "ana@example.com",
+            "replace": true,
+        }))
+        .expect("the shape both frontends send");
+        assert_eq!(p.task_id, "gh:owner/widget#74");
+        assert_eq!(p.runtime.as_deref(), Some("opencode"));
+        assert_eq!(p.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(p.account.as_deref(), Some("slot-ana"));
+        assert_eq!(p.via_device.as_deref(), Some("laptop-ana"));
+        assert_eq!(p.via_user.as_deref(), Some("ana@example.com"));
+        assert!(p.replace);
+
+        // The CLI's shape: a task and its provenance, nothing else.
+        let p: DispatchTaskParams =
+            parse_params(serde_json::json!({ "taskId": "t", "via": "chat-parent" }))
+                .expect("the CLI's shape");
+        assert_eq!(p.via.as_deref(), Some("chat-parent"));
+        assert_eq!(p.via_device, None);
+        assert_eq!(p.via_user, None);
+        assert!(!p.replace);
     }
 
     #[test]
