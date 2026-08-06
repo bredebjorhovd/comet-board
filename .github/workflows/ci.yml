@@ -1,0 +1,79 @@
+name: ci
+
+# Build + test every pull request, and every push to main.
+#
+# Why this exists: gh#56 and gh#59 both reported MERGEABLE/CLEAN and were green
+# on their own branches, but the *merged* tree did not compile — two E0061s git
+# could not see, because no line of text conflicted. With agents working in
+# parallel worktrees that recurs by construction, so the merged result has to be
+# compiled by something other than a human remembering to.
+#
+# `pull_request` builds the merge commit (branch merged into the base), which is
+# exactly the tree those E0061s lived in. The push-to-main job is the backstop
+# for anything that lands without a PR.
+#
+# Not here on purpose:
+#   - `cargo fmt --check`: main currently has ~249 diffs, so gating on it would
+#     fail every PR. Separate cleanup if wanted.
+#   - macOS: the release job already type-checks the Apple cfg paths, and it is
+#     the platform where `repos_round_trip_add_branches_worktrees` trips over the
+#     /private tempdir symlink.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One run per PR: a new push cancels the previous, still-building run. main is
+# keyed per-sha so pushes never cancel each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces on a failing test are the whole point of reading CI output.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # test and clippy are separate jobs so they run in parallel: clippy compiles
+  # every crate through clippy-driver and shares almost no artifacts with a
+  # rustc test build, so folding them into one job would serialize two full
+  # builds of the gpui tree for no cache win.
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # No --all-targets here: it would silently drop doctests.
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy --all-targets
+        run: cargo clippy --workspace --all-targets
