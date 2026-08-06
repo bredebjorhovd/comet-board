@@ -200,6 +200,14 @@ pub struct DispatchSpec {
     /// at that instead of swapping the shared one; the board core only carries
     /// the id, since which logins exist is engine knowledge.
     pub account: Option<String>,
+    /// `owner/repo` the attempt's branch belongs to (gh#68) — what the agent's
+    /// `git push` and `gh pr create` authenticate against, minted per use from
+    /// the board's GitHub App rather than taken from the box user's git
+    /// credentials. From the task id for a GitHub ticket, and from the
+    /// checkout's `origin` remote for anything else. `None` when the space has
+    /// no GitHub remote at all, which is the case that keeps its own
+    /// credentials.
+    pub push_repo: Option<String>,
     /// The brief: task title, body, links, and the board conventions
     /// (commit as you go, open a PR, `comet-board list --json` to poll).
     /// `{worktree}` may still be unresolved — see [`DispatchSpec::prompt_at`].

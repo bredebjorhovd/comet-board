@@ -10,6 +10,7 @@
 
 use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
 use crate::db::Db;
+use crate::git_credentials;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
@@ -313,7 +314,49 @@ pub fn doctor(
         }
     }
 
+    checks.push(dispatched_push_check(paths));
+
     Ok(checks)
+}
+
+/// Can a dispatched agent on this box push and open a pull request (gh#68)?
+///
+/// The question this exists for is a headless one: a box with no keychain, no
+/// stored https credential and nobody to run `gh auth login` pushes with
+/// nothing at all, and finds out at the end of a run. The parts are the
+/// credential (checked above, as the board's own), the `comet-board` binary
+/// the engine points `GIT_ASKPASS` at, and a `gh` for the wrapper to wrap.
+///
+/// A missing `gh` is not a failure: `git push` still works, and a PR opened by
+/// hand from the branch is a normal way to finish. A missing binary is, because
+/// then nothing was handed to the agent at all.
+fn dispatched_push_check(paths: &Paths) -> Check {
+    let credential = !matches!(Credentials::load(paths).github_auth(), GithubAuth::None);
+    let exe = git_credentials::resolve_board_exe();
+    let gh = git_credentials::resolve_gh(None);
+    let detail = match (&exe, credential) {
+        (None, _) => format!(
+            "no comet-board binary found beside the engine or on PATH — agents push with \
+             this box's own git credentials (set {})",
+            git_credentials::BOARD_EXE_ENV
+        ),
+        (Some(_), false) => "no GitHub credential — agents push with this box's own git \
+             credentials"
+            .to_string(),
+        (Some(exe), true) => format!(
+            "{} git-askpass mints per push{}",
+            exe.display(),
+            match &gh {
+                Some(gh) => format!("; `gh` at {} is wrapped to mint per call", gh.display()),
+                None => "; no `gh` installed, so pull requests are opened by hand".into(),
+            }
+        ),
+    };
+    Check {
+        name: "dispatched pushes".into(),
+        ok: exe.is_some() && credential,
+        detail,
+    }
 }
 
 /// Which GitHub credential is live, and what it can reach (gh#58).

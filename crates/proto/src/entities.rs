@@ -89,6 +89,17 @@ pub struct ChatConfig {
     /// credentials under a turn already in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// `owner/repo` this chat's agent pushes to, when the board dispatched it
+    /// (comet-board `git_credentials`, gh#68). Set, the engine points the
+    /// harness child's `git` (and `gh`) at the board's GitHub App credential,
+    /// scoped to this repo; unset — every chat a person opened — the agent
+    /// pushes with the device's own git credentials, as it always has.
+    ///
+    /// On the chat for the same reason `account` is: a review comment
+    /// arriving next week starts a new run in this chat, and it has to be able
+    /// to push the fix too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
