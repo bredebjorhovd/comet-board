@@ -31,8 +31,10 @@
 //!   is authorized on them.
 //! - `f` cycles the routes on the board, `F` clears the filter, `/` opens the
 //!   find field (live substring matching), `esc` closes the panel;
-//! - the panel is lazy: no RPC until it is first opened, and the stream
-//!   reconnects with a 2 s backoff if the engine drops it.
+//! - the `WatchBoard` subscription is **standing**, not lazy — the shell's
+//!   sidebar draws its Agents section ([`BoardPanel::agents`], gh#103) off these
+//!   rows with the dock shut — and reconnects with a 2 s backoff if the engine
+//!   drops it.
 //!
 //! ## Which device's board (gh#55)
 //!
@@ -383,6 +385,20 @@ fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
     }
 }
 
+/// The accent a *live agent* carries in the sidebar — routed through
+/// [`state_color`] so a running attempt does not change colour on its way from
+/// the board pane to the sidebar (gh#103).
+pub fn agent_state_color(state: board::AgentState, theme: &Theme) -> gpui::Hsla {
+    state_color(
+        match state {
+            board::AgentState::Blocked => BoardState::Blocked,
+            board::AgentState::Errored => BoardState::Failed,
+            board::AgentState::Working => BoardState::Working,
+        },
+        theme,
+    )
+}
+
 /// The `[process exited]`-free reason a working/blocked row's metadata names
 /// the runtime of — see [`board::row_metadata`] for the shared derivation this
 /// trims the terminal padding off.
@@ -614,7 +630,14 @@ impl BoardModel {
 // Entity
 // ---------------------------------------------------------------------------
 
-/// The board dock. Lazy: no RPC until [`BoardPanel::set_open`] first runs.
+/// The board dock, and the shell's standing source of board rows.
+///
+/// The watch used to be lazy — no RPC until the dock was first opened. It is
+/// standing since gh#103: the sidebar's Agents section is drawn from these rows
+/// whether or not the dock has ever been open, and a presence list that only
+/// works after you have visited the board is not presence. The cost is the host
+/// sweep on a device with no board, which is bounded (`host_candidates` is asked
+/// once each, then a 2 s backoff) and is what the TUI has always done.
 pub struct BoardPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
@@ -665,10 +688,10 @@ pub struct BoardPanel {
 
 impl BoardPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        // Start (or restart) the watch as soon as the engine exists — the panel
+        // may never be opened, and the sidebar's Agents section still wants rows.
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
-            if this.open && !this.started {
-                this.ensure_watch(cx);
-            }
+            this.ensure_watch(cx);
         });
         let dispatch_search = cx.new(|cx| {
             ComposerInput::with_context("Search models…", "PaletteSearch", cx)
@@ -691,16 +714,10 @@ impl BoardPanel {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |panel, cx| {
-                    // Keep the elapsed counters live only while the board is
-                    // on screen and something is actually running.
-                    if panel.open
-                        && panel.model.rows.iter().any(|row| {
-                            matches!(
-                                row.state(),
-                                BoardState::Working | BoardState::Blocked
-                            )
-                        })
-                    {
+                    // Keep the elapsed counters live while something is running
+                    // — on the board pane, and on the sidebar's Agents rows,
+                    // which are drawn off the same rows with the dock shut.
+                    if panel.model.rows.iter().any(|row| row.state().holds_pane()) {
                         cx.notify();
                     }
                 });
@@ -738,6 +755,18 @@ impl BoardPanel {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// The live attempts, joined to this device's chats and sessions — what the
+    /// sidebar's Agents section draws (gh#103).
+    ///
+    /// On the panel rather than in `AppState` because the panel is what holds a
+    /// board subscription, host sweep included: there is exactly one place that
+    /// knows which device's rows these are, and a second copy in app state would
+    /// be a second thing to keep pointed at the same box.
+    pub fn agents(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::AgentRow> {
+        let state = self.state.read(cx);
+        board::agent_rows(&self.model.rows, &state.chats, &state.sessions, now)
     }
 
     /// Shell toggle hook. Opening starts the watch; closing keeps the rows so
@@ -3052,6 +3081,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            max_duration_secs: None,
         }
     }
 
@@ -3059,6 +3089,32 @@ mod tests {
         let mut m = BoardModel::new();
         m.set_rows(rows);
         m
+    }
+
+    /// A live attempt must not change colour on its way from the board pane to
+    /// the sidebar's Agents section (gh#103) — same state, same accent.
+    #[test]
+    fn a_live_agent_carries_the_board_pane_colour() {
+        use board::AgentState;
+        let theme = Theme::dark();
+        assert_eq!(
+            agent_state_color(AgentState::Blocked, &theme),
+            state_color(BoardState::Blocked, &theme)
+        );
+        // A dead run reads as the board's `failed`, which shares blocked's red;
+        // the glyph is what tells them apart, there and here.
+        assert_eq!(
+            agent_state_color(AgentState::Errored, &theme),
+            state_color(BoardState::Failed, &theme)
+        );
+        assert_eq!(
+            agent_state_color(AgentState::Working, &theme),
+            state_color(BoardState::Working, &theme)
+        );
+        assert_ne!(
+            agent_state_color(AgentState::Working, &theme),
+            agent_state_color(AgentState::Blocked, &theme)
+        );
     }
 
     #[test]

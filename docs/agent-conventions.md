@@ -64,11 +64,17 @@ Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
 `dispatched_by`, `dispatched_by_chat`, `dispatched_by_user`, `last_outcome`,
 `last_outcome_at`,
-`attempts`, `dispatchable`, `gone`, `reopened`, `account`. `workspace` names a
+`attempts`, `dispatchable`, `gone`, `reopened`, `account`,
+`max_duration_secs`. `workspace` names a
 comet *space* — the field keeps herdr-board's spelling so ported tooling reads
 it. `account` is the agent login whose subscription the row's attempt spends
 (the route's default before anything has run); null is the device's own CLI
 login, which is every row on a single-account box.
+`max_duration_secs` is the wall-clock cap one attempt on this row gets — the
+route's `max_duration` resolved against `[defaults]`, null when the route is
+uncapped. Read against `started_at` it is how long a running agent has left;
+it is on the row because the routing config lives on the board's host, and a
+caller reading a relayed board has never seen it.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.

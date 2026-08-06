@@ -1015,6 +1015,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            max_duration_secs: None,
         }
     }
 

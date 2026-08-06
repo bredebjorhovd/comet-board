@@ -2117,6 +2117,7 @@ fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_pro
         started_at: None,
         account: None,
         dispatched_by_user: None,
+        max_duration_secs: None,
     }
 }
 
@@ -2264,4 +2265,107 @@ fn the_board_find_field_counts_matches_as_you_type() {
     app.act(Action::BoardFindType('2'));
     let screen = joined(&snapshot(&mut app, 100, 26));
     assert!(screen.contains("1 row"), "the count after typing:\n{screen}");
+}
+
+// ---------------------------------------------------------------------------
+// The sidebar's Agents section (gh#103)
+// ---------------------------------------------------------------------------
+
+/// Three agents running, and the sidebar says so with the board pane shut.
+#[test]
+fn live_agents_draw_in_the_sidebar_with_the_board_closed() {
+    let mut app = populated();
+    // A dispatched chat sits on the attempt's branch, which is what the row's
+    // sub-line reads.
+    let on_branch = |id: &str, title: &str, branch: &str| Chat {
+        branch: Some(branch.into()),
+        ..chat(id, title)
+    };
+    app.apply(Update::Chats(vec![
+        on_branch("c1", "Rework the diff sidebar", "board/gh-101"),
+        on_branch("c2", "Chase the flaky room test", "board/gh-102"),
+        on_branch("c3", "Port the pane list", "board/gh-103"),
+    ]));
+    let live = |id: &str, chat: &str, state, branch: &str, started: i64| {
+        let mut row = board_row(id, state);
+        row.chat_id = Some(chat.into());
+        row.branch = Some(branch.into());
+        row.started_at = Some((Utc::now() - chrono::Duration::minutes(started)).to_rfc3339());
+        row.max_duration_secs = Some(7200);
+        row
+    };
+    use comet_proto::view::board::BoardState;
+    app.apply(Update::Board(vec![
+        live("1", "c1", BoardState::Working, "board/gh-101", 110),
+        live("2", "c2", BoardState::Working, "board/gh-102", 4),
+        live("3", "c3", BoardState::Blocked, "board/gh-103", 30),
+    ]));
+    let session = |chat_id: &str, status| Session {
+        chat_id: chat_id.into(),
+        device_id: "dev".into(),
+        status,
+        started_at: None,
+        updated_at: Utc::now(),
+    };
+    app.apply(Update::Sessions(vec![
+        session("c1", SessionStatus::Working),
+        session("c2", SessionStatus::Working),
+        session("c3", SessionStatus::AwaitingInput),
+    ]));
+
+    assert!(!app.board_open, "the board pane was never opened");
+    let rows = snapshot(&mut app, 100, 30);
+    let sidebar = joined(&sidebar_of(&rows, 100));
+
+    // The section, with the count of what wants a human on its header.
+    assert!(sidebar.contains("Agents"), "{sidebar}");
+    assert!(sidebar.contains("1 blocked"), "{sidebar}");
+    // One row per live attempt, titled by its issue, branch underneath.
+    for needle in ["gh#1", "gh#2", "gh#3", "board/gh-103"] {
+        assert!(sidebar.contains(needle), "{needle:?} missing:\n{sidebar}");
+    }
+    // Elapsed against the route's cap — the whole point of the counter.
+    assert!(sidebar.contains("1h50m / 2h"), "{sidebar}");
+
+    // Blocked floats above the two working rows.
+    let at = |needle: &str| {
+        sidebar
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar}"))
+    };
+    assert!(at("gh#3") < at("gh#1"), "blocked floats:\n{sidebar}");
+    assert!(at("gh#1") < at("gh#2"), "then longest-running:\n{sidebar}");
+    // And it sits above the chat list, where the eye lands first.
+    assert!(at("Agents") < at("Sessions"), "{sidebar}");
+}
+
+/// Nothing dispatched: no header, no gap, no reminder that a board exists.
+#[test]
+fn the_agents_section_is_absent_when_nothing_is_running() {
+    let mut app = populated();
+    app.apply(Update::Board(vec![board_row(
+        "1",
+        comet_proto::view::board::BoardState::Ready,
+    )]));
+    let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
+    assert!(!sidebar.contains("Agents"), "{sidebar}");
+}
+
+/// Clicking an agent row opens its chat — the click that replaces going to the
+/// board pane and finding the row there.
+#[test]
+fn clicking_an_agent_row_opens_its_chat() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![
+        chat("c1", "Rework the diff sidebar"),
+        chat("c2", "Chase the flaky room test"),
+    ]));
+    let mut live = board_row("2", comet_proto::view::board::BoardState::Blocked);
+    live.chat_id = Some("c2".into());
+    app.apply(Update::Board(vec![live]));
+
+    let (x, y) = cell_of(&mut app, 100, 30, "gh#2");
+    app.click(x, y);
+    assert_eq!(app.selected_chat.as_deref(), Some("c2"));
 }

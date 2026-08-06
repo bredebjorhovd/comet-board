@@ -10,6 +10,7 @@ use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
+use chrono::DateTime;
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
 
@@ -560,6 +561,217 @@ impl Shell {
                         format!("@ {device_name}")
                     })),
             )
+    }
+
+    /// The "Agents" section (gh#103): one row per live board attempt, blocked
+    /// first, with a count badge on the header.
+    ///
+    /// `None` when nothing is running — an empty section here would be a
+    /// permanent reminder that a board exists, on a machine that may host none.
+    /// The rows come from the board panel's standing `WatchBoard` stream joined
+    /// to chats and sessions ([`BoardPanel::agents`]); the board dock stays the
+    /// deep view, and this is the glance.
+    pub(super) fn render_agents_section(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let now = Utc::now();
+        let agents = self.board.read(cx).agents(cx, now);
+        if agents.is_empty() {
+            return None;
+        }
+        let blocked = comet_proto::view::board::agents_needing_attention(&agents);
+        let selected = self.state.read(cx).selected_chat.clone();
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(Theme::SPACE_SM))
+            .pt(px(12.0))
+            .pb(px(4.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from("Agents")),
+            )
+            // The count is what you look for first: three running, one of them
+            // stuck on a question you have not answered.
+            .when(blocked > 0, |el| {
+                el.child(
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(5.0))
+                        .bg(theme.danger.opacity(0.16))
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.danger)
+                        .child(SharedString::from(format!("{blocked} blocked"))),
+                )
+            });
+
+        let rows: Vec<AnyElement> = agents
+            .into_iter()
+            .map(|agent| {
+                let is_selected = selected.as_deref() == Some(agent.chat_id.as_str());
+                self.render_agent_row(&agent, is_selected, now, theme, cx)
+            })
+            .collect();
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(div().flex().flex_col().gap(px(2.0)).children(rows))
+                .into_any_element(),
+        )
+    }
+
+    /// One live attempt: state glyph, the issue identifier, elapsed against the
+    /// route's cap, and the branch underneath. Click opens the chat.
+    fn render_agent_row(
+        &self,
+        agent: &comet_proto::view::board::AgentRow,
+        selected: bool,
+        now: DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use comet_proto::view::board::AgentState;
+
+        let accent = crate::board::agent_state_color(agent.state, theme);
+        // Working spins (the session-row idiom, and the one state where motion
+        // says something no glyph can); the rest carry the board's own glyph, so
+        // a row means the same thing here as it does one keystroke away.
+        let rail: AnyElement = if agent.state == AgentState::Working {
+            div()
+                .w(px(8.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(loaders::mini_gradient_spinner(
+                    format!("agent-working-{}", agent.chat_id),
+                    2.0,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(8.0))
+                .flex_none()
+                .text_size(px(9.0))
+                .text_color(accent)
+                .child(SharedString::from(agent.state.glyph()))
+                .into_any_element()
+        };
+
+        let (hover, text) = (theme.element_hover, theme.text);
+        let subline = theme.text_muted.opacity(0.6);
+        let fade_key = format!("agent-row-{}", agent.chat_id);
+        let rest_bg = if selected {
+            theme.glass_selected_bg()
+        } else {
+            theme.wash(0.0)
+        };
+        let rest_text = if selected { text } else { text.opacity(0.8) };
+        let chat_id = agent.chat_id.clone();
+        // Past the cap the counter IS the warning: gh#70's clock will interrupt
+        // this agent, and the number is the reason.
+        let elapsed_color = if agent.over_cap(now) {
+            theme.warning
+        } else {
+            subline
+        };
+
+        div()
+            .id(SharedString::from(format!("agent-{}", agent.chat_id)))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .text_color(motion::hover_blend(&fade_key, rest_text, text))
+            .bg(motion::hover_blend(&fade_key, rest_bg, hover))
+            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
+            .on_hover(motion::hover_listener(fade_key))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let id = chat_id.clone();
+                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+            }))
+            // Line 1: state glyph, the issue identifier, elapsed / cap.
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(rail)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .line_height(px(17.0))
+                            .child(SharedString::from(agent.identifier.clone())),
+                    )
+                    .when_some(agent.elapsed_label(now), |el, label| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(elapsed_color)
+                                .child(SharedString::from(label)),
+                        )
+                    }),
+            )
+            // Line 2: the branch, aligned under the identifier. A row with no
+            // branch says what it is doing instead of leaving the line blank.
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(14.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when_some(agent.branch.clone(), |el, branch| {
+                        el.child(
+                            icon(icons::GIT_BRANCH)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(subline),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(subline)
+                                .child(SharedString::from(branch)),
+                        )
+                    })
+                    .when(agent.branch.is_none(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(accent.opacity(0.9))
+                                .child(SharedString::from(agent.state.label())),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 
     /// The global "Sessions" list: every session across all spaces (idle

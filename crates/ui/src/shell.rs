@@ -452,8 +452,10 @@ pub struct Shell {
     changes: Option<Entity<Changes>>,
     /// The task board (docs/BOARD.md §H10). Unlike the terminal and changes
     /// panes it is a GLOBAL view — the queue across every workspace — so its
-    /// open flag lives on the shell, not in [`SessionPanels`].
-    board: Option<Entity<BoardPanel>>,
+    /// open flag lives on the shell, not in [`SessionPanels`]. And unlike them
+    /// it is **not** lazy: its `WatchBoard` stream feeds the sidebar's Agents
+    /// section (gh#103), which is on screen with the dock shut.
+    board: Entity<BoardPanel>,
     board_open: bool,
     /// Chat outlet vs settings pages.
     route: Route,
@@ -578,6 +580,8 @@ pub struct Shell {
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
+    /// Board frames repaint the sidebar's Agents section.
+    _board_observation: Subscription,
     _composer_events: Subscription,
 }
 
@@ -619,6 +623,12 @@ impl Shell {
                 }
             }
         });
+        // The board panel is built up front, unlike the terminal and the diff
+        // pane: its `WatchBoard` subscription is what feeds the sidebar's Agents
+        // section (gh#103), which has to be there before anybody opens the dock.
+        // Observing it repaints the sidebar on every board frame.
+        let board = cx.new(|cx| BoardPanel::new(state.clone(), cx));
+        let board_observation = cx.observe(&board, |_this: &mut Shell, _, cx| cx.notify());
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
@@ -668,7 +678,7 @@ impl Shell {
             file_drag_active: false,
             terminal: None,
             changes: None,
-            board: None,
+            board,
             board_open: false,
             route,
             nav,
@@ -734,6 +744,7 @@ impl Shell {
             focus_sub: None,
             _ticker: ticker,
             _state_observation: observation,
+            _board_observation: board_observation,
             _composer_events: composer_events,
         }
     }
@@ -996,7 +1007,7 @@ impl Shell {
             if self.panels.get(&key).changes_open {
                 self.panels.toggle_changes(&key);
             }
-            let panel = self.board_panel(cx);
+            let panel = self.board.clone();
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
             // Keyboard focus lands in the board so ↑↓/f// keys work with no
             // click — the same lazy-focus the terminal panel gets.
@@ -1006,15 +1017,6 @@ impl Shell {
         }
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
-    }
-
-    fn board_panel(&mut self, cx: &mut Context<Self>) -> Entity<BoardPanel> {
-        if let Some(board) = &self.board {
-            return board.clone();
-        }
-        let board = cx.new(|cx| BoardPanel::new(self.state.clone(), cx));
-        self.board = Some(board.clone());
-        board
     }
 
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
@@ -2161,6 +2163,9 @@ impl Shell {
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
+        // Between the spaces and the sessions: the live board attempts, when
+        // there are any (gh#103).
+        let agents_section = self.render_agents_section(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2190,6 +2195,7 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
+                            .children(agents_section)
                     .child(
                         div()
                             .px(px(Theme::SPACE_SM))
@@ -3197,7 +3203,7 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
         let content: AnyElement = if self.board_open {
-            let panel = self.board_panel(cx);
+            let panel = self.board.clone();
             // Idempotent — also covers a toggle that landed before the engine
             // finished booting.
             panel.update(cx, |panel, cx| panel.set_open(true, cx));

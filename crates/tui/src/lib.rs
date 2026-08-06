@@ -132,6 +132,9 @@ pub async fn run(config: Config) -> anyhow::Result<Outcome> {
     outcome
 }
 
+/// How often a second-resolution counter on screen owes a redraw.
+const COUNTER_TICK: Duration = Duration::from_secs(1);
+
 struct Loop {
     app: App,
     link: EngineLink,
@@ -240,8 +243,12 @@ impl Loop {
             .app
             .animating()
             .then(|| self.last_spin + Duration::from_millis(theme::ANIMATION_TICK_MS));
+        // A live agent row counts up in seconds (gh#103). One wake-up a second
+        // while any is on screen — a blocked agent animates nothing, so without
+        // this its age would sit at whatever the last frame happened to catch.
+        let counter = self.app.counting().then(|| self.last_draw + COUNTER_TICK);
         let notice = self.app.notice_deadline();
-        [pace, spinner, notice].into_iter().flatten().min()
+        [pace, spinner, counter, notice].into_iter().flatten().min()
     }
 
     fn on_deadline(&mut self) {
@@ -251,6 +258,11 @@ impl Loop {
             self.last_spin = Instant::now();
             // The loaders read the clock at draw time, so a tick only has to
             // mark the frame dirty — no state to advance, nothing to rebuild.
+            self.dirty = true;
+        }
+        // Same rule for the agent counters: the row carries the start instant,
+        // and the draw reads the clock.
+        if self.app.counting() && self.last_draw.elapsed() >= COUNTER_TICK {
             self.dirty = true;
         }
         if self.app.expire_notice() {

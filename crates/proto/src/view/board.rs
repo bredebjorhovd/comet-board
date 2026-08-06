@@ -220,6 +220,15 @@ pub struct TaskRow {
     /// as permission to do anything.
     #[serde(default)]
     pub dispatched_by_user: Option<String>,
+    /// The wall-clock cap one attempt on this row gets (gh#70's `max_duration`,
+    /// in seconds), resolved route-then-defaults. `None` is uncapped.
+    ///
+    /// On the wire because the *elapsed* counter is worth nothing without it:
+    /// "1h50m" says one thing under a two-hour cap and another under six, and
+    /// only the board knows which — the routing config is the host's, and a
+    /// viewport reading a relayed board has never seen it (gh#103).
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +451,23 @@ pub fn format_elapsed(secs: i64) -> String {
     }
 }
 
+/// A *cap* said the way a person configured it: `2h`, `45m`, `1h30m`.
+///
+/// Deliberately not [`format_elapsed`]: a cap is a round number somebody typed
+/// into `routing.toml`, and rendering `defaults.max_duration = "2h"` as `2h00m`
+/// makes the reader check whether the minutes mean anything. They never do.
+pub fn format_cap(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    match (h, m) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m:02}m"),
+    }
+}
+
 /// Coarser form for the header (`synced 12s`, `last synced 4m`).
 pub fn format_age(secs: i64) -> String {
     let s = secs.max(0);
@@ -574,6 +600,245 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Live agents — the sidebar's Agents section (gh#103)
+// ---------------------------------------------------------------------------
+//
+// herdr gave presence away: a working agent was a pane, and the pane list was
+// the sidebar. Here a dispatched agent is a chat among chats, so tracking five
+// of them meant opening the board pane or nothing. This is that list, rebuilt
+// from what is already streamed — board rows joined to chats, state read live
+// off the session watch. Pure presentation: nothing here dispatches, settles or
+// decides anything, and a row leaves the list only because the attempt it names
+// stopped being live.
+
+/// What a live attempt's agent is doing right now.
+///
+/// Three states where the board has two, and the split is the point. The board
+/// calls a dead run and an agent asking a question both `blocked` — correctly,
+/// since both hold a chat and a concurrency slot — but they ask different
+/// things of a human: one wants an answer, the other a retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    /// Waiting on a human: a question, or a permission prompt.
+    Blocked,
+    /// Its run died. Still a live attempt — a retry is the *same* attempt.
+    Errored,
+    Working,
+}
+
+impl AgentState {
+    /// Sidebar order — lower is more urgent, and this is why blocked floats.
+    ///
+    /// The same ranking [`crate::view::attention_rank`] gives chat rows, for the
+    /// same reason: a question outranks a corpse, which outranks work that is
+    /// going fine on its own.
+    pub fn rank(self) -> u8 {
+        match self {
+            AgentState::Blocked => 0,
+            AgentState::Errored => 1,
+            AgentState::Working => 2,
+        }
+    }
+
+    /// Worth interrupting a human for — what the section's count badge counts.
+    pub fn needs_attention(self) -> bool {
+        !matches!(self, AgentState::Working)
+    }
+
+    /// The board's own glyphs, so a row means the same thing in the sidebar as
+    /// it does in the board pane one keystroke away.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            AgentState::Blocked => BoardState::Blocked.glyph(),
+            AgentState::Errored => BoardState::Failed.glyph(),
+            AgentState::Working => BoardState::Working.glyph(),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentState::Blocked => "blocked",
+            AgentState::Errored => "errored",
+            AgentState::Working => "working",
+        }
+    }
+}
+
+/// One live attempt, as the sidebar draws it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRow {
+    pub task_id: String,
+    /// Where the click goes. Always a chat that exists — see [`agent_rows`].
+    pub chat_id: String,
+    /// The issue identifier (`AGE-14`, `gh#103`): what the agent is *for*, and
+    /// a better title than the chat's, which the agent writes about itself.
+    pub identifier: String,
+    pub branch: Option<String>,
+    pub state: AgentState,
+    /// When the attempt started. `None` on a row carrying no `started_at`,
+    /// which is a board that predates the field.
+    ///
+    /// The instant rather than the age, so a viewport can re-read the clock on
+    /// its own frames instead of rebuilding this list once a second to move a
+    /// counter — the same rule the spinners follow.
+    pub started_at: Option<DateTime<Utc>>,
+    /// The route's `max_duration`, when it has one.
+    pub cap_secs: Option<u64>,
+}
+
+impl AgentRow {
+    /// How long this attempt has been going.
+    pub fn elapsed_secs(&self, now: DateTime<Utc>) -> Option<i64> {
+        agent_elapsed_secs(self.started_at, now)
+    }
+
+    /// Past its cap: gh#70's clock is warning it now and will cancel it next.
+    pub fn over_cap(&self, now: DateTime<Utc>) -> bool {
+        agent_over_cap(self.started_at, self.cap_secs, now)
+    }
+
+    /// `1h50m / 2h`, bare elapsed on an uncapped route, or nothing.
+    pub fn elapsed_label(&self, now: DateTime<Utc>) -> Option<String> {
+        agent_elapsed_label(self.started_at, self.cap_secs, now)
+    }
+}
+
+// The same three answers as free functions, for a viewport that has flattened
+// the row into its own model and holds the two fields rather than the struct.
+
+/// Seconds since an attempt started. Never negative: clock skew must not read
+/// as a count-up from the future.
+pub fn agent_elapsed_secs(started_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<i64> {
+    Some((now - started_at?).num_seconds().max(0))
+}
+
+/// Past the route's cap. The *decision* stays board-side
+/// (`comet_board::overrun`) — this is the display's half, and it deliberately
+/// says nothing about the grace, which is the board's to spend.
+pub fn agent_over_cap(
+    started_at: Option<DateTime<Utc>>,
+    cap_secs: Option<u64>,
+    now: DateTime<Utc>,
+) -> bool {
+    match (agent_elapsed_secs(started_at, now), cap_secs) {
+        (Some(elapsed), Some(cap)) => elapsed as u64 >= cap,
+        _ => false,
+    }
+}
+
+/// `1h50m / 2h` — or bare elapsed where the route caps nothing, or nothing at
+/// all where the row cannot say when it started.
+pub fn agent_elapsed_label(
+    started_at: Option<DateTime<Utc>>,
+    cap_secs: Option<u64>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let elapsed = format_elapsed(agent_elapsed_secs(started_at, now)?);
+    Some(match cap_secs {
+        Some(cap) => format!("{elapsed} / {}", format_cap(cap)),
+        None => elapsed,
+    })
+}
+
+/// Every live attempt with a chat to open, most urgent first.
+///
+/// The three inputs are the three standing streams every viewport already
+/// holds: `WatchBoard` rows, the chat rows, and the session watch.
+///
+/// - **A live attempt is `working` or `blocked` with a chat id.** That is the
+///   whole membership rule, and it is why the row leaves on its own: settle,
+///   cancel and orphan all end the attempt, which clears `chat_id` and moves
+///   the row out of both states in the same frame. The chat stays findable
+///   under its space, as it always was.
+/// - **The chat must exist here.** A row whose chat has not synced (or is not
+///   shared with this person) is dropped rather than drawn as something that
+///   cannot be opened.
+/// - **State comes from the session watch, not from the row.** The board's
+///   state is a sync cycle old; the session mirror is live, and staleness-gated
+///   ([`crate::view::effective_indicator`]) so a crashed backend cannot leave an
+///   eternal spinner in the sidebar. The row's state is the fallback for a chat
+///   with no session mirror yet — a dispatch whose first run has not started.
+pub fn agent_rows(
+    rows: &[TaskRow],
+    chats: &[crate::Chat],
+    sessions: &[crate::Session],
+    now: DateTime<Utc>,
+) -> Vec<AgentRow> {
+    let mut out: Vec<AgentRow> = rows
+        .iter()
+        .filter(|row| row.state().holds_pane())
+        .filter_map(|row| {
+            let chat_id = row.chat_id.as_deref()?;
+            let chat = chats.iter().find(|c| c.id == chat_id)?;
+            let session = sessions.iter().find(|s| s.chat_id == chat_id);
+            Some(AgentRow {
+                task_id: row.id.clone(),
+                chat_id: chat_id.to_string(),
+                identifier: row.identifier.clone(),
+                // The chat's branch first: it is the checkout the agent is
+                // actually in, and the attempt row's copy is what it was cut as.
+                branch: chat
+                    .branch
+                    .as_deref()
+                    .or(row.branch.as_deref())
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string),
+                state: agent_state(row.state(), session, now),
+                started_at: row
+                    .started_at
+                    .as_deref()
+                    .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                    .map(|at| at.with_timezone(&Utc)),
+                cap_secs: row.max_duration_secs,
+            })
+        })
+        .collect();
+    // Urgency first, then longest-running — which is stable, since that order is
+    // start order and start order never changes under a viewer. A row that
+    // cannot say when it started sorts last; the identifier breaks the final tie
+    // so the sort is total.
+    out.sort_by(|a, b| {
+        a.state
+            .rank()
+            .cmp(&b.state.rank())
+            .then_with(|| match (a.started_at, b.started_at) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.identifier.cmp(&b.identifier))
+    });
+    out
+}
+
+/// What the session mirror says about this attempt, falling back to the board.
+fn agent_state(
+    state: BoardState,
+    session: Option<&crate::Session>,
+    now: DateTime<Utc>,
+) -> AgentState {
+    match crate::view::effective_indicator(session, now) {
+        crate::view::Indicator::Working => AgentState::Working,
+        crate::view::Indicator::AwaitingInput => AgentState::Blocked,
+        crate::view::Indicator::Errored => AgentState::Errored,
+        // No live session: idle, stale, or never started. The board's verdict
+        // is older but it is a verdict, and `blocked` is the one it reaches for
+        // a run that ended without settling.
+        crate::view::Indicator::None => match state {
+            BoardState::Blocked => AgentState::Blocked,
+            _ => AgentState::Working,
+        },
+    }
+}
+
+/// How many live agents want a human — the section header's count badge.
+pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
+    rows.iter().filter(|row| row.state.needs_attention()).count()
+}
+
+// ---------------------------------------------------------------------------
 // Which device hosts the board (gh#55)
 // ---------------------------------------------------------------------------
 
@@ -656,6 +921,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            max_duration_secs: None,
         }
     }
 
@@ -881,6 +1147,180 @@ mod tests {
         assert_eq!(format_age(12), "12s");
         assert_eq!(format_age(240), "4m");
         assert_eq!(format_age(3 * 3600), "3h");
+        // A cap is a round number somebody typed, and reads as one.
+        assert_eq!(format_cap(7200), "2h");
+        assert_eq!(format_cap(45 * 60), "45m");
+        assert_eq!(format_cap(90 * 60), "1h30m");
+        assert_eq!(format_cap(30), "30s");
+    }
+
+    // ---- live agents (gh#103) ---------------------------------------------
+
+    fn chat(id: &str, branch: Option<&str>) -> crate::Chat {
+        crate::Chat {
+            id: id.into(),
+            device_id: "box".into(),
+            title: Some("some title the agent wrote".into()),
+            archived: false,
+            cwd: Some(format!("/w/{id}")),
+            branch: branch.map(str::to_string),
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: Some("space".into()),
+            last_seen_at: None,
+        }
+    }
+
+    fn session(chat_id: &str, status: crate::SessionStatus, age_ms: i64) -> crate::Session {
+        crate::Session {
+            chat_id: chat_id.into(),
+            device_id: "box".into(),
+            status,
+            started_at: None,
+            updated_at: now() - chrono::Duration::milliseconds(age_ms),
+        }
+    }
+
+    /// A live attempt is a `working`/`blocked` row with a chat, and the chat has
+    /// to be one this viewport can actually open.
+    #[test]
+    fn only_live_attempts_with_a_reachable_chat_are_agents() {
+        let mut live = row("live", BoardState::Working);
+        live.chat_id = Some("chat-live".into());
+        // Dispatched, but its chat has not synced here (or was never shared).
+        let mut orphan = row("orphan", BoardState::Working);
+        orphan.chat_id = Some("chat-elsewhere".into());
+        // Finished: the attempt closed, so the row kept neither state nor chat.
+        let settled = row("settled", BoardState::Review);
+        let ready = row("ready", BoardState::Ready);
+
+        let rows = vec![live, orphan, settled, ready];
+        let agents = agent_rows(&rows, &[chat("chat-live", None)], &[], now());
+        assert_eq!(
+            agents.iter().map(|a| a.task_id.as_str()).collect::<Vec<_>>(),
+            vec!["live"]
+        );
+    }
+
+    /// The state on screen is the session watch's, not the board's — the board's
+    /// is a sync cycle old, and the split of its one `blocked` into a question
+    /// and a corpse is the whole reason the section exists.
+    #[test]
+    fn state_comes_from_the_session_watch_and_falls_back_to_the_row() {
+        let mut asking = row("ask", BoardState::Working);
+        asking.chat_id = Some("c1".into());
+        let mut died = row("died", BoardState::Working);
+        died.chat_id = Some("c2".into());
+        let mut no_session = row("fresh", BoardState::Blocked);
+        no_session.chat_id = Some("c3".into());
+        let mut stale = row("stale", BoardState::Working);
+        stale.chat_id = Some("c4".into());
+
+        let chats = vec![chat("c1", None), chat("c2", None), chat("c3", None), chat("c4", None)];
+        let sessions = vec![
+            session("c1", crate::SessionStatus::AwaitingInput, 0),
+            session("c2", crate::SessionStatus::Errored, 0),
+            // Older than the staleness window: a crashed backend must not leave
+            // an eternal spinner in the sidebar.
+            session("c4", crate::SessionStatus::Working, crate::view::SESSION_STALE_MS + 1_000),
+        ];
+        let agents = agent_rows(&[asking, died, no_session, stale], &chats, &sessions, now());
+        let state = |id: &str| {
+            agents
+                .iter()
+                .find(|a| a.task_id == id)
+                .map(|a| a.state)
+                .unwrap()
+        };
+        assert_eq!(state("ask"), AgentState::Blocked);
+        assert_eq!(state("died"), AgentState::Errored);
+        // No session row yet: the board's verdict stands in.
+        assert_eq!(state("fresh"), AgentState::Blocked);
+        assert_eq!(state("stale"), AgentState::Working);
+    }
+
+    /// Blocked floats, and the badge counts everything that wants a human.
+    #[test]
+    fn blocked_floats_to_the_top_and_the_badge_counts_them() {
+        let mut fast = row("fast", BoardState::Working);
+        fast.chat_id = Some("c1".into());
+        fast.started_at = Some("2026-08-01T11:59:00Z".into()); // 1m
+        let mut slow = row("slow", BoardState::Working);
+        slow.chat_id = Some("c2".into());
+        slow.started_at = Some("2026-08-01T10:00:00Z".into()); // 2h
+        let mut asking = row("ask", BoardState::Blocked);
+        asking.chat_id = Some("c3".into());
+        asking.started_at = Some("2026-08-01T11:55:00Z".into()); // 5m
+        let mut died = row("died", BoardState::Working);
+        died.chat_id = Some("c4".into());
+
+        let chats = vec![chat("c1", None), chat("c2", None), chat("c3", None), chat("c4", None)];
+        let sessions = vec![
+            session("c1", crate::SessionStatus::Working, 0),
+            session("c2", crate::SessionStatus::Working, 0),
+            session("c3", crate::SessionStatus::AwaitingInput, 0),
+            session("c4", crate::SessionStatus::Errored, 0),
+        ];
+        let agents = agent_rows(&[fast, slow, asking, died], &chats, &sessions, now());
+        assert_eq!(
+            agents.iter().map(|a| a.task_id.as_str()).collect::<Vec<_>>(),
+            // A question, then a dead run, then the longest-running worker.
+            vec!["ask", "died", "slow", "fast"]
+        );
+        assert_eq!(agents_needing_attention(&agents), 2);
+    }
+
+    /// "That one's been at it 1h50 of 2h" — a glance, which needs both numbers.
+    #[test]
+    fn elapsed_reads_against_the_routes_cap() {
+        let mut r = row("x", BoardState::Working);
+        r.chat_id = Some("c1".into());
+        r.started_at = Some("2026-08-01T10:10:00Z".into()); // 1h50m
+        r.max_duration_secs = Some(7200);
+        let agents = agent_rows(&[r.clone()], &[chat("c1", None)], &[], now());
+        assert_eq!(agents[0].elapsed_label(now()).as_deref(), Some("1h50m / 2h"));
+        assert!(!agents[0].over_cap(now()));
+
+        // Past the cap: gh#70's clock is about to end it, and the row says so.
+        let mut over = r.clone();
+        over.started_at = Some("2026-08-01T09:00:00Z".into()); // 3h
+        let agents = agent_rows(&[over], &[chat("c1", None)], &[], now());
+        assert_eq!(agents[0].elapsed_label(now()).as_deref(), Some("3h00m / 2h"));
+        assert!(agents[0].over_cap(now()));
+
+        // An uncapped route says only how long it has been.
+        let mut uncapped = r.clone();
+        uncapped.max_duration_secs = None;
+        let agents = agent_rows(&[uncapped], &[chat("c1", None)], &[], now());
+        assert_eq!(agents[0].elapsed_label(now()).as_deref(), Some("1h50m"));
+        assert!(!agents[0].over_cap(now()));
+
+        // A board with no `started_at` (predates the field) says nothing rather
+        // than counting up from the epoch.
+        let mut undated = r;
+        undated.started_at = None;
+        let agents = agent_rows(&[undated], &[chat("c1", None)], &[], now());
+        assert_eq!(agents[0].elapsed_label(now()), None);
+        assert!(!agents[0].over_cap(now()));
+    }
+
+    /// The sub-line is the checkout the agent is in — the chat's own branch
+    /// first, the attempt's as recorded when the chat has none.
+    #[test]
+    fn the_sub_line_prefers_the_chats_branch() {
+        let mut r = row("x", BoardState::Working);
+        r.chat_id = Some("c1".into());
+        r.branch = Some("board/gh-103".into());
+        let renamed = [chat("c1", Some("board/gh-103-renamed"))];
+        let agents = agent_rows(&[r.clone()], &renamed, &[], now());
+        assert_eq!(agents[0].branch.as_deref(), Some("board/gh-103-renamed"));
+        let agents = agent_rows(&[r], &[chat("c1", None)], &[], now());
+        assert_eq!(agents[0].branch.as_deref(), Some("board/gh-103"));
     }
 
     fn device(id: &str, created: &str) -> crate::Device {
