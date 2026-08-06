@@ -1244,6 +1244,7 @@ mod tests {
             account: None,
             dispatched_by_user: None,
             billed_to: None,
+            max_duration_secs: None,
         }
     }
 

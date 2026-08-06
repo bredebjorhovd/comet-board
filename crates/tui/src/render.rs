@@ -403,6 +403,90 @@ fn draw_sidebar_row(
                 area,
             );
         }
+        // A live board attempt (gh#103): the same two-line shape as a session
+        // row, with the board's own state glyph and colours where the session
+        // dot would be — the row means the same thing here as in the board pane.
+        Row::Agent {
+            chat_id,
+            identifier,
+            branch,
+            state,
+            started_at,
+            cap_secs,
+        } => {
+            let base = if selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            if selected {
+                fill(frame, bleed, theme.selected());
+            }
+            let now = chrono::Utc::now();
+            let open = app.selected_chat.as_deref() == Some(chat_id.as_str());
+            // Working spins where the board pane can only draw a glyph: the
+            // sidebar redraws anyway, and a moving row is the cheapest way to
+            // say "still going" without reading the number.
+            let (glyph, glyph_style) = if *state == board::AgentState::Working {
+                let (glyph, tint) = loaders::mini_spinner(app.elapsed());
+                (glyph, base.patch(Style::default().fg(tint)))
+            } else {
+                (
+                    state.glyph().to_string(),
+                    base.patch(theme.agent_state(*state)),
+                )
+            };
+            let elapsed =
+                board::agent_elapsed_label(*started_at, *cap_secs, now).unwrap_or_default();
+            let elapsed_width = wrap::width_of(&elapsed);
+            let title_width = width.saturating_sub(3 + elapsed_width).max(1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(glyph, glyph_style),
+                    Span::styled(
+                        format!(" {}", wrap::truncate(identifier, title_width)),
+                        base.patch(if open { theme.body() } else { theme.subtle() }),
+                    ),
+                ])),
+                Rect { height: 1, ..area },
+            );
+            if elapsed_width > 0 && (elapsed_width as u16) < area.width {
+                // Past its cap the counter is the warning: gh#70's clock will
+                // interrupt this agent, and the number is why.
+                let style = if board::agent_over_cap(*started_at, *cap_secs, now) {
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    theme.hint()
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(elapsed, base.patch(style))),
+                    Rect {
+                        x: area.x + area.width - elapsed_width as u16,
+                        width: elapsed_width as u16,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+            if area.height > 1 {
+                // The branch, aligned under the identifier the way a session
+                // row's location hangs under its title.
+                let sub = branch.clone().unwrap_or_else(|| state.label().to_string());
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("  {}", wrap::truncate(&sub, width.saturating_sub(2))),
+                        base.patch(theme.hint()),
+                    )),
+                    Rect {
+                        y: area.y + 1,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+        }
         Row::Chat {
             id,
             title,

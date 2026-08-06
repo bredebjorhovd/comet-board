@@ -74,6 +74,18 @@ resolved to an email — whose subscription it actually is — recorded when the
 attempt was released, and null on a row nothing has run on. Read it against
 `dispatched_by_user`: different values mean the run is charged to somebody other
 than whoever released it.
+
+`attempts`, `dispatchable`, `gone`, `reopened`, `account`,
+`max_duration_secs`. `workspace` names a
+comet *space* — the field keeps herdr-board's spelling so ported tooling reads
+it. `account` is the agent login whose subscription the row's attempt spends
+(the route's default before anything has run); null is the device's own CLI
+login, which is every row on a single-account box.
+`max_duration_secs` is the wall-clock cap one attempt on this row gets — the
+route's `max_duration` resolved against `[defaults]`, null when the route is
+uncapped. Read against `started_at` it is how long a running agent has left;
+it is on the row because the routing config lives on the board's host, and a
+caller reading a relayed board has never seen it.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.

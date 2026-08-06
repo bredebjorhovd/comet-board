@@ -22,8 +22,10 @@ pub use comet_proto::view::board::TaskRow;
 /// One task, in the shape callers are promised.
 ///
 /// Separate from [`board_rows`] because this shape is the published contract
-/// and the surrounding function is filtering and database wiring.
-pub fn task_row(task: &Task, route: Option<&Route>) -> TaskRow {
+/// and the surrounding function is filtering and database wiring. Takes the
+/// whole config rather than only the route because the wall-clock cap is a
+/// route-then-`[defaults]` resolution, and half of it is not on the route.
+pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> TaskRow {
     let live = task.live_attempt();
     let last = task.attempts.last();
     let closed = task.last_closed_attempt();
@@ -80,6 +82,11 @@ pub fn task_row(task: &Task, route: Option<&Route>) -> TaskRow {
         // the pickers resolve the route's default against the host's own
         // account list instead of against a guess made here.
         billed_to: live.or(last).and_then(|a| a.billed_to.clone()),
+        // What gh#70's clock will hold this row's attempt to. Route-then-
+        // defaults, resolved here because the routing config is the host's and
+        // a viewport reading a relayed board has never seen it — an elapsed
+        // counter with no cap beside it says half of what it knows (gh#103).
+        max_duration_secs: cfg.max_duration_secs(route),
     }
 }
 
@@ -89,7 +96,7 @@ pub fn board_rows(db: &Db, cfg: &RoutingConfig) -> anyhow::Result<Vec<TaskRow>> 
     let mut rows: Vec<TaskRow> = Vec::new();
     for task in db.load_tasks()? {
         let route = cfg.resolve(&route_context(&task));
-        rows.push(task_row(&task, route));
+        rows.push(task_row(&task, route, cfg));
     }
     rows.sort_by_key(|r| {
         BoardState::SECTION_ORDER
@@ -298,6 +305,40 @@ mod tests {
         .unwrap();
         let rows = board_rows(&db, &cfg).unwrap();
         assert_eq!(rows[0].account.as_deref(), Some("8f2c1d0a7b6e4539"));
+    }
+
+    /// The wall-clock cap rides the row (gh#103): the sidebar's elapsed counter
+    /// is read against it, and the routing config lives on the board host — a
+    /// laptop reading a relayed board cannot resolve one for itself.
+    #[test]
+    fn rows_carry_the_caps_their_attempts_run_under() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#70", "gh#70");
+        let route = |repo: &str| -> RoutingConfig {
+            toml::from_str(&format!(
+                r#"
+                [defaults]
+                max_duration = "2h"
+
+                [[route]]
+                workspace = "r"
+                repo = "/tmp/r"
+                runtime = "claude-code"
+                max_duration = "6h"
+                match = {{ gh_repo = "{repo}" }}
+                "#
+            ))
+            .unwrap()
+        };
+
+        // Nothing routes this row, so it reports what `[defaults]` would cap it
+        // at — the same shape `runtime` and `account` have.
+        let rows = board_rows(&db, &route("someone/else")).unwrap();
+        assert_eq!(rows[0].max_duration_secs, Some(7200));
+
+        // A route with its own cap overrides it.
+        let rows = board_rows(&db, &route("o/r")).unwrap();
+        assert_eq!(rows[0].max_duration_secs, Some(6 * 3600));
     }
 
     /// An attempt from before the route named an account keeps saying so: the
