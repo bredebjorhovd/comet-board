@@ -77,12 +77,16 @@ impl CometRuntime {
 impl Runtime for CometRuntime {
     fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
         // The checkout first: a failure here leaves nothing behind to clean up.
+        // That includes an unreachable origin — `create_worktree_on` fetches
+        // `spec.base` before cutting and refuses rather than branching from a
+        // stale local HEAD (gh#67).
         let cwd = if spec.worktree {
             self.handle
-                .block_on(
-                    self.repos
-                        .create_worktree_on(Path::new(&spec.repo_path), &spec.branch),
-                )?
+                .block_on(self.repos.create_worktree_on(
+                    Path::new(&spec.repo_path),
+                    &spec.branch,
+                    &spec.base,
+                ))?
                 .path
         } else {
             spec.repo_path.clone()

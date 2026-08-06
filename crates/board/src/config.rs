@@ -294,6 +294,18 @@ pub struct Defaults {
     pub max_concurrent_per_workspace: usize,
     #[serde(default = "default_branch_template")]
     pub branch_template: String,
+    /// The ref every dispatch's branch is cut from, fetched from origin first
+    /// (gh#67).
+    ///
+    /// `origin/HEAD` (the default) is the remote's default branch, asked of the
+    /// remote at dispatch time. `main` or `origin/main` names a branch on
+    /// origin. `HEAD` is the opt-out: branch from the space folder's current
+    /// HEAD with no network at all — right for a repo with no remote, wrong for
+    /// an always-on box, which is why it is not the default. Whatever it says,
+    /// the dispatch never branches from a local branch: the folder sits on
+    /// whatever was last checked out in it, and that is nobody's intended base.
+    #[serde(default = "default_base")]
+    pub base: String,
     /// Surface a notification when released work settles.
     ///
     /// A conversational orchestrator cannot be woken — it only gets a turn when
@@ -350,11 +362,18 @@ fn default_branch_template() -> String {
     "board/{identifier_lower}".into()
 }
 
+/// The remote's default branch — the base a person means when they say "cut it
+/// from main" without naming which main.
+fn default_base() -> String {
+    "origin/HEAD".into()
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
             max_concurrent_per_workspace: default_max_concurrent(),
             branch_template: default_branch_template(),
+            base: default_base(),
             notify: true,
             notify_dispatcher: false,
             new_source: default_new_source(),
@@ -567,6 +586,10 @@ pub struct Route {
     /// Per-route override of `defaults.branch_template`.
     #[serde(default)]
     pub branch_template: Option<String>,
+    /// Per-route override of `defaults.base` — the ref a dispatch's branch is
+    /// cut from. See [`Defaults::base`].
+    #[serde(default)]
+    pub base: Option<String>,
     #[serde(default)]
     pub max_concurrent: Option<usize>,
     /// Per-route override of `defaults.max_duration` (gh#70) — the wall-clock
@@ -751,6 +774,12 @@ impl RoutingConfig {
             .branch_template
             .as_deref()
             .unwrap_or(&self.defaults.branch_template)
+    }
+
+    /// The ref this route's dispatches branch from — the route's `base`, else
+    /// `defaults.base`, else `origin/HEAD`.
+    pub fn base<'a>(&'a self, route: &'a Route) -> &'a str {
+        route.base.as_deref().unwrap_or(&self.defaults.base)
     }
 
     pub fn max_concurrent(&self, route: &Route) -> usize {

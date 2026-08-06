@@ -544,24 +544,34 @@ impl Repos {
     /// (docs/BOARD.md §H2), where the branch comes from routing.toml's
     /// `branch_template` rather than a generated `comet/…` name.
     ///
+    /// A fresh branch starts at `base` **fetched from origin** (gh#67), not at
+    /// the space folder's HEAD: on an always-on box that folder sits on
+    /// whatever was last checked out there, and branching from it silently
+    /// hands every agent a stale main. See [`Self::resolve_base`] for how the
+    /// route's `base` key is read, and why a fetch that fails refuses the
+    /// dispatch instead of falling back.
+    ///
     /// A retry reuses what exists, because git allows a branch in only one
     /// worktree: an existing checkout already on `branch` is returned as-is,
     /// and an existing branch without a checkout is opened rather than re-cut
-    /// (it may carry the previous attempt's commits). A fresh branch starts at
-    /// the repo's current HEAD, which is what herdr-board did.
+    /// (it may carry the previous attempt's commits). Neither path fetches or
+    /// moves anything — a retry must land on the previous attempt's commits,
+    /// never rebase them onto a newer base.
     pub async fn create_worktree_on(
         &self,
         repo_path: &Path,
         branch: &str,
+        base: &str,
     ) -> Result<Worktree, EngineError> {
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
-        std::fs::create_dir_all(&base)?;
+        let root = self.inner.worktrees_root.join(&repo_name);
+        std::fs::create_dir_all(&root)?;
         let name = branch.replace('/', "-");
-        let path = base.join(&name);
+        let path = root.join(&name);
+        let path_str = path.to_string_lossy().into_owned();
 
         if path.exists() {
             let current = self.current_branch(&path).await?;
@@ -572,17 +582,18 @@ impl Repos {
                 )));
             }
         } else if self.branch_exists(repo_path, branch).await {
-            self.git(
-                &["worktree", "add", &path.to_string_lossy(), branch],
-                Some(repo_path),
-            )
-            .await?;
+            self.prune_worktrees(repo_path).await;
+            self.git(&["worktree", "add", &path_str, branch], Some(repo_path))
+                .await?;
         } else {
-            self.git(
-                &["worktree", "add", "-b", branch, &path.to_string_lossy()],
-                Some(repo_path),
-            )
-            .await?;
+            // Only a fresh branch consults origin — see the doc comment.
+            let start = self.resolve_base(repo_path, base).await?;
+            self.prune_worktrees(repo_path).await;
+            let mut args = vec!["worktree", "add", "-b", branch, &path_str];
+            if let Some(start) = start.as_deref() {
+                args.push(start);
+            }
+            self.git(&args, Some(repo_path)).await?;
         }
         let checkout = self.checkout_identity(&path).await?;
         Ok(Worktree {
@@ -592,6 +603,88 @@ impl Repos {
             name,
             checkout_id: Some(checkout.id),
         })
+    }
+
+    /// Fetch the dispatch base from origin and return the ref to cut from —
+    /// always a remote-tracking ref, never a local branch. `None` means "cut
+    /// from the current HEAD", the explicit opt-out.
+    ///
+    /// How routing.toml's `base` is read:
+    /// - `origin/HEAD` (the default) — the remote's default branch, *asked of
+    ///   the remote*: a clone made with `--single-branch`, or one whose
+    ///   `refs/remotes/origin/HEAD` was never written, has no local answer, and
+    ///   a stale one is the failure this exists to prevent;
+    /// - `main` / `origin/main` — that branch on origin;
+    /// - `HEAD` (or empty) — the space folder's current HEAD, no network. What
+    ///   a repo with no remote needs, said out loud rather than inferred.
+    ///
+    /// A fetch that fails (offline, auth, no such branch) is an error and not a
+    /// fallback: falling back means an agent branches from a stale main and
+    /// nobody finds out until the pull request has the wrong diff in it.
+    async fn resolve_base(
+        &self,
+        repo_path: &Path,
+        base: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let base = base.trim();
+        let branch = match base {
+            "" | "HEAD" => return Ok(None),
+            "origin/HEAD" => self.origin_default_branch(repo_path).await?,
+            other => other.strip_prefix("origin/").unwrap_or(other).to_string(),
+        };
+        // An explicit refspec rather than `git fetch origin <branch>`: the
+        // latter leaves updating `refs/remotes/origin/<branch>` to whatever
+        // fetch refspec the clone was configured with, and a narrowed one
+        // would leave us branching from a remote-tracking ref that never moved.
+        self.git(
+            &[
+                "fetch",
+                "--no-tags",
+                "origin",
+                &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+            ],
+            Some(repo_path),
+        )
+        .await
+        .map_err(|e| {
+            EngineError::Other(format!(
+                "could not fetch `{branch}` from origin in {} ({e}) — refusing to \
+                 branch from a possibly stale local checkout",
+                repo_path.display()
+            ))
+        })?;
+        Ok(Some(format!("origin/{branch}")))
+    }
+
+    /// The remote's default branch, asked of the remote. `set-head --auto` is
+    /// the network half (and writes `refs/remotes/origin/HEAD`), `symbolic-ref`
+    /// reads what it wrote.
+    async fn origin_default_branch(&self, repo_path: &Path) -> Result<String, EngineError> {
+        self.git(&["remote", "set-head", "origin", "--auto"], Some(repo_path))
+            .await
+            .map_err(|e| {
+                EngineError::Other(format!(
+                    "could not ask origin for its default branch in {} ({e}) — set \
+                     `base` on the route to name one explicitly, or `base = \"HEAD\"` \
+                     to branch from this checkout",
+                    repo_path.display()
+                ))
+            })?;
+        let head = self
+            .git(
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                Some(repo_path),
+            )
+            .await?;
+        Ok(head.strip_prefix("origin/").unwrap_or(&head).to_string())
+    }
+
+    /// Drop registrations whose worktree directory is gone. Best-effort: a
+    /// hand-deleted checkout otherwise fails the next `worktree add` on that
+    /// path with "already registered", which fails a dispatch over housekeeping
+    /// git will do itself given the chance.
+    async fn prune_worktrees(&self, repo_path: &Path) {
+        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {

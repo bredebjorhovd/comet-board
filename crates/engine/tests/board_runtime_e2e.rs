@@ -73,12 +73,21 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     // (`~/.comet-native/worktrees`) and a leftover checkout there would
     // collide with every later run. Safe to set: this binary has one test.
     unsafe { std::env::set_var("COMET_WORKTREES_DIR", dir.path().join("worktrees")) };
+    // A clone with an origin, because that is what a dispatch now needs: the
+    // spec's `base` is fetched before the branch is cut (gh#67).
+    let origin = dir.path().join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-b", "main"]);
+    git(&origin, &["config", "user.email", "t@t"]);
+    git(&origin, &["config", "user.name", "t"]);
+    git(&origin, &["commit", "--allow-empty", "-m", "root"]);
     let repo = dir.path().join("widget");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    git(
+        dir.path(),
+        &["clone", &origin.to_string_lossy(), &repo.to_string_lossy()],
+    );
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
-    git(&repo, &["commit", "--allow-empty", "-m", "root"]);
 
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness {
@@ -119,6 +128,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         device_id: core.device_id.clone(),
         repo_path: repo.to_string_lossy().into_owned(),
         branch: "board/gh-1-widget".into(),
+        base: "origin/HEAD".into(),
         worktree: true,
         harness: HarnessId::Mock,
         model: None,
@@ -217,6 +227,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         device_id: core.device_id.clone(),
         repo_path: repo.to_string_lossy().into_owned(),
         branch: "board/gh-2-widget".into(),
+        base: "origin/HEAD".into(),
         worktree: true,
         harness: HarnessId::ClaudeCode,
         model: None,

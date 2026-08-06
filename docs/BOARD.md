@@ -102,6 +102,15 @@ nearly verbatim — it never depended on herdr:
   (`create_worktree_on` — exact branch names), chats via
   `workspace.create_chat`, briefs/steers/interrupts via the command ledger,
   status off the merged session mirror.
+  A fresh branch is cut from the route's `base` **fetched from origin**
+  (`defaults.base`, `origin/HEAD` by default — gh#67), never from the space
+  folder's HEAD: an always-on box's folder sits on whatever ran there last, and
+  branching from it hands every agent a stale main. A fetch that fails refuses
+  the dispatch rather than falling back; `base = "HEAD"` is the explicit opt-out
+  for a repo with no remote, and `doctor` fails a route needing an `origin` the
+  repo does not have. A retry neither fetches nor moves anything — an existing
+  branch is re-opened on its own commits (`git worktree prune` first, so a
+  hand-deleted checkout is a retry rather than a failure).
 - `crates/board/src/review.rs` — review delivery (H5): herdr-board's
   `review.rs` minus the wake latch and busy-check, delivering over the
   command ledger via `Runtime::prompt`. See §H5 below for what was dropped

@@ -95,6 +95,21 @@ max_duration = "2h"
 # watched repo's issue 2 sharing one branch name is how another repo's merged
 # pull request ends up attached to an untouched task.
 branch_template = "board/{identifier_lower}"
+# What a dispatch's branch is cut from. The dispatch fetches this from origin
+# first, then branches off the remote-tracking ref — never off the space
+# folder's current HEAD, which on an always-on box is whatever was checked out
+# there last week, and is how an agent ends up rewriting merged work.
+#
+#   origin/HEAD   the remote's default branch (the default), asked of the remote
+#   main          that branch on origin; `origin/main` means the same
+#   HEAD          the opt-out: branch from the checkout, no fetch. For a repo
+#                 with no remote — otherwise you want the fetch.
+#
+# A fetch that fails (offline, auth, no such branch) refuses the dispatch; the
+# alternative is a pull request with the wrong diff in it and nobody told. A
+# retry is unaffected either way: it reuses the branch the first attempt cut,
+# with its commits, and never rebases it onto a newer base.
+base = "origin/HEAD"
 # Surface a notification when released work settles. A conversational
 # orchestrator cannot be woken, so somebody has to notice — this is how you do,
 # without watching the board.
