@@ -22,6 +22,11 @@ case "$os" in
   Darwin)
     echo "comet install: on macOS, download the desktop app instead:" >&2
     echo "  $BASE/releases/latest.txt → $BASE/releases/comet-<version>-macos-arm64.dmg" >&2
+    echo >&2
+    echo "After dragging Comet.app to Applications, run this once — the build" >&2
+    echo "is not Developer ID signed, so macOS blocks it until you clear the" >&2
+    echo "download quarantine:" >&2
+    echo "  xattr -dr com.apple.quarantine /Applications/Comet.app" >&2
     exit 1
     ;;
   *)

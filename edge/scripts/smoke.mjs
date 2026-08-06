@@ -13,7 +13,8 @@
  *   9. org-shared visibility (gh#66): the org device registry is org-wide, a
  *      teammate relays through the box's device room, and a chat the owner
  *      shared is readable + writable by the org (and by nobody else)
- *  10. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
+ *  10. absorbed /auth routes: 501 without WORKOS_API_KEY (incl. the gh#76
+ *      member/invite routes); cli callback page
  *
  * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
  */
@@ -496,6 +497,24 @@ await new Promise((r) => setTimeout(r, 100));
   });
   if (refresh.status !== 501) fail(`auth refresh expected 501 in dev, got ${refresh.status}`);
   ok("auth exchange/refresh answer 501 without WORKOS_API_KEY");
+
+  // Member invitations (gh#76) are secret-bearing too — same 501, and the
+  // check happens before the bearer gate, like every other WorkOS route.
+  const invite = await fetch(`${base}/auth/orgs/org_1/invites`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "teammate@example.com" })
+  });
+  if (invite.status !== 501) fail(`invite expected 501 in dev, got ${invite.status}`);
+  const members = await fetch(`${base}/auth/orgs/org_1/members`);
+  if (members.status !== 501) fail(`members expected 501 in dev, got ${members.status}`);
+  const accept = await fetch(`${base}/auth/invites/accept`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: "tok" })
+  });
+  if (accept.status !== 501) fail(`invite accept expected 501 in dev, got ${accept.status}`);
+  ok("member/invite routes answer 501 without WORKOS_API_KEY");
 
   // The headless callback needs no WorkOS config: it just renders state.code.
   const cb = await fetch(`${base}/auth/cli/callback?code=abc123&state=xyz789`);

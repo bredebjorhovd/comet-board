@@ -1090,6 +1090,11 @@ impl AuthRpc {
                 | methods::LIST_ORGS
                 | methods::CREATE_ORG
                 | methods::SELECT_ORG
+                | methods::LIST_MEMBERS
+                | methods::LIST_INVITES
+                | methods::INVITE_MEMBER
+                | methods::REVOKE_INVITE
+                | methods::ACCEPT_INVITE
         )
     }
 }
@@ -1159,6 +1164,63 @@ impl RpcService for AuthRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::LIST_MEMBERS => {
+                let view = self
+                    .auth
+                    .list_members()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&view)
+            }
+            methods::LIST_INVITES => {
+                let invites = self
+                    .auth
+                    .list_invites()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "invites": invites }))
+            }
+            methods::INVITE_MEMBER => {
+                #[derive(Deserialize)]
+                struct P {
+                    email: String,
+                    #[serde(default)]
+                    role: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let invitation = self
+                    .auth
+                    .invite_member(&p.email, p.role.as_deref())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "invitation": invitation }))
+            }
+            methods::REVOKE_INVITE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    invitation_id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.auth
+                    .revoke_invite(&p.invitation_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::ACCEPT_INVITE => {
+                #[derive(Deserialize)]
+                struct P {
+                    token: String,
+                }
+                let p: P = parse_params(params)?;
+                let organization_id = self
+                    .auth
+                    .accept_invite(&p.token)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "organizationId": organization_id }))
             }
             _ => Err(RpcError::UnknownMethod(method.to_string())),
         }

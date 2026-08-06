@@ -862,6 +862,22 @@ impl RoutingConfig {
         out
     }
 
+    /// The Linear teams this config actually dispatches for, deduplicated.
+    ///
+    /// Empty is the answer that matters: a config no route of which names a
+    /// team is a board that wants nothing from Linear, and `doctor` reads that
+    /// as "GitHub only" rather than as a missing credential (gh#96).
+    pub fn linear_teams(&self) -> Vec<&str> {
+        let mut teams: Vec<&str> = self
+            .routes
+            .iter()
+            .filter_map(|r| r.match_.linear_team.as_deref())
+            .collect();
+        teams.sort_unstable();
+        teams.dedup();
+        teams
+    }
+
     /// First matching route wins (impl spec §5).
     pub fn resolve(&self, ctx: &RouteContext) -> Option<&Route> {
         self.routes.iter().find(|r| route_matches(&r.match_, ctx))
@@ -1608,6 +1624,29 @@ runtime = "claude"
         let c = Credentials::load_with(&paths, |_| Err(std::env::VarError::NotPresent));
         let _ = std::fs::remove_dir_all(dir);
         c
+    }
+
+    /// A skipped stage and a board nobody ever configured have to look
+    /// identical (gh#96). The box wizard writes `LINEAR_API_KEY=` when the
+    /// stage is skipped with Enter, and an empty string that reads as
+    /// "configured" turns a deliberate skip into a credential the board tries
+    /// to authenticate with — and, for the App pair, into a "half configured"
+    /// failure over two keys nobody set.
+    #[test]
+    fn an_empty_value_reads_as_never_configured() {
+        let c =
+            creds("LINEAR_API_KEY=\nGITHUB_TOKEN=\nGITHUB_APP_ID=\nGITHUB_APP_PRIVATE_KEY_PATH=\n");
+        assert_eq!(c.linear_api_key, None);
+        assert_eq!(c.github_auth(), GithubAuth::None);
+        assert_eq!(c.github_app_half_configured(), None);
+
+        // `KEY=""` is the same skip, written by a wizard that quotes.
+        assert_eq!(creds("LINEAR_API_KEY=\"\"\n").linear_api_key, None);
+
+        // And one real key beside a skipped one is still one real key.
+        let c = creds("LINEAR_API_KEY=\nGITHUB_TOKEN=ghp_real\n");
+        assert_eq!(c.linear_api_key, None);
+        assert_eq!(c.github_auth(), GithubAuth::Token("ghp_real".into()));
     }
 
     #[test]

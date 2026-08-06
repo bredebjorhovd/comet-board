@@ -245,8 +245,9 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   (`{data_dir}/accounts/{slotId}/`) that a run points its harness child at with
   `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, so several teammates' subscriptions coexist on one
   box and no swap happens under a live run.
-- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
-  callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
+- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs, member
+  invitations); loopback callback server headed, paste-code headless; dev mode (no key ⇒
+  bearer = configured user id).
 
 ## 6. Edge plan (TypeScript, `edge/`)
 
@@ -264,6 +265,12 @@ sidecar slots, R2 attachments, JWKS auth). Additions:
    chat rooms stay owner-only until the owner marks one shared (`POST /share/{chatId}`,
    which the board does for every task it dispatches), after which the org may read and
    write it. Private chats never become org-visible by being in an org.
+5. Member invitations (gh#76) — `/auth/orgs/:id/invites` (list/create/revoke) and
+   `/auth/invites/accept`, so adding a teammate is Settings → Members instead of a
+   hand-made `organization_membership` in the WorkOS dashboard. Admin-gated on the org's
+   actual membership list, never on the caller's `org_id` claim (which says which org a
+   session is scoped to, not what role it holds); an invitation is redeemable only by the
+   address it names, while it is pending.
 Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
 per `docs/research/durable-objects-language.md`.
 
@@ -303,9 +310,12 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   attachment UI (engine upload RPCs exist), Cursor harness.
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
-  (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: prefers-reduced-motion, parent-PID watchdog,
-  edge production deploy.
+  (`scripts/package-linux.sh` + release profile), macOS packaging (`scripts/package-macos.sh`
+  + `dist/macos/`, executed — dmg with app bundle, icns, `/Applications` symlink).
+  Gaps: prefers-reduced-motion, parent-PID watchdog, edge production deploy, and a
+  Developer ID for macOS — releases are ad-hoc signed, so a downloaded `Comet.app` is
+  Gatekeeper-rejected until the user clears quarantine ([docs/macos-install.md](docs/macos-install.md));
+  the signing + notarization path in `release.yml` is written and waits only on the cert.
 
 ## 9. Open questions (tracked, non-blocking)
 
