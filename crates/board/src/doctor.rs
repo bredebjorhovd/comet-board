@@ -72,14 +72,32 @@ pub fn doctor(
         db_ok.as_ref().ok(),
     ));
 
-    checks.push(Check {
-        name: "LINEAR_API_KEY".into(),
-        ok: linear_api_key(paths).is_some(),
-        detail: match linear_api_key(paths) {
-            Some(_) => "present".into(),
-            None => format!("missing — add it to {}", paths.env_file().display()),
+    // Read once and used three times below — the credential's own check, the
+    // review-state check, and the decision whether to mention Linear at all.
+    let linear_key = linear_api_key(paths);
+    // Parsed here rather than only at the `match` below, because whether this
+    // board wants anything from Linear is a question about its routes.
+    let routing = RoutingConfig::load_unvalidated(&paths.routing());
+    let linear_teams: Vec<String> = routing
+        .as_ref()
+        .map(|cfg| {
+            cfg.linear_teams()
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    checks.push(linear_key_check(
+        paths,
+        linear_key.clone(),
+        &linear_teams,
+        |key| {
+            HttpTransport::new(key)
+                .map(Linear::new)
+                .and_then(|l| l.viewer())
         },
-    });
+    ));
 
     // The engine hosts the board loop (there is no separate daemon), so
     // "reachable" answers both "can I list spaces" and "is anything polling".
@@ -92,7 +110,7 @@ pub fn doctor(
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
     // must not hide the problems in every other route.
-    match RoutingConfig::load_unvalidated(&paths.routing()) {
+    match routing {
         Err(e) => checks.push(Check {
             // `{:#}` so the cause chain shows: "reading X: No such file" is
             // actionable, "reading X" alone is not.
@@ -162,7 +180,15 @@ pub fn doctor(
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
             // retrying it forever, and this is where that becomes visible.
-            checks.push(review_state_check(paths, &cfg));
+            //
+            // Only when Linear is in the picture at all, on the same rule the
+            // `account` check follows: a GitHub-only board must not be handed a
+            // line about a Linear setting it has no use for, because the line
+            // reads as something left unconfigured (gh#96).
+            if linear_key.is_some() || !linear_teams.is_empty() || cfg.linear.review_state.is_some()
+            {
+                checks.push(review_state_check(linear_key.clone(), &linear_teams, &cfg));
+            }
 
             for repo in repos {
                 // The same client for every repo, deliberately: under an App
@@ -859,12 +885,100 @@ fn writeback_detail(github: &crate::config::GithubConfig) -> String {
     }
 }
 
+/// Is there a working Linear credential, and does this board want one (gh#96)?
+///
+/// Three states, and only one of them is a fault. A board with no key and no
+/// route matching on a Linear team is a *GitHub-only board* — a supported
+/// configuration, not a half-finished one, and saying `FAIL … missing` at it
+/// (which is what this check did, inherited from a board where Linear always
+/// existed) sends people looking for a break that is not there. That state
+/// reads like the operator-notice line: `ok`, and worded so nobody mistakes it
+/// for broken.
+///
+/// The two that do fail are the ones with real consequences. A key present but
+/// rejected means every Linear poll is failing in the log; a key absent while a
+/// route matches on `linear_team` means those tickets silently never arrive,
+/// and the route can never fire.
+///
+/// `viewer` is injected so the check is testable without the network — it
+/// answers who a key authenticates as, or why the API would not say.
+fn linear_key_check<P>(paths: &Paths, key: Option<String>, teams: &[String], viewer: P) -> Check
+where
+    P: FnOnce(String) -> Result<String>,
+{
+    let name = "LINEAR_API_KEY".to_string();
+    let Some(key) = key else {
+        return match teams {
+            [] => Check {
+                name,
+                ok: true,
+                detail: format!(
+                    "not configured — the board polls GitHub only (add it to {} to \
+                     poll Linear as well)",
+                    paths.env_file().display()
+                ),
+            },
+            // Not a preference any more: the config asked for Linear.
+            teams => Check {
+                name,
+                ok: false,
+                detail: format!(
+                    "not configured, but {} route(s) match on a Linear team ({}) — \
+                     those tickets never reach the board and the route can never fire. \
+                     Add the key to {}, or drop the `linear_team` match",
+                    teams.len(),
+                    teams.join(", "),
+                    paths.env_file().display()
+                ),
+            },
+        };
+    };
+    match viewer(key) {
+        Ok(who) => Check {
+            name,
+            ok: true,
+            detail: format!("accepted by Linear — polling as {who}"),
+        },
+        // An unreachable API is not a rejected key, and doctor must not report
+        // it as one: a laptop on a train would otherwise fail this check every
+        // time, which is the same false alarm gh#96 is about.
+        Err(e) if unreachable_api(&e) => Check {
+            name,
+            ok: true,
+            detail: format!("configured, not checked — Linear could not be reached ({e})"),
+        },
+        Err(e) => Check {
+            name,
+            ok: false,
+            detail: format!(
+                "rejected by Linear ({e:#}) — every poll fails with this. Replace it in {}, \
+                 or remove it to run the board on GitHub alone",
+                paths.env_file().display()
+            ),
+        },
+    }
+}
+
+/// Did the API decline to answer at all, rather than decline the key?
+///
+/// Transport failures arrive as a `reqwest::Error` straight off the wire; a
+/// rate limit is our own message from a 429. Everything else reached Linear and
+/// came back with something to say about the credential.
+fn unreachable_api(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>().is_some() || format!("{e:#}").contains("rate limited")
+}
+
 /// Does `[linear] review_state` name a state the configured teams actually have?
 ///
 /// Unset is fine and is the default — it means the ticket stays where dispatch
 /// left it while a PR waits. Set and unresolvable is not fine, and is invisible
 /// otherwise: the writeback is dropped with a log line nobody reads.
-fn review_state_check(paths: &Paths, cfg: &RoutingConfig) -> Check {
+///
+/// Only reached when Linear is in the picture at all; a board with neither a
+/// key nor a Linear route gets no line here (gh#96). `teams` are the teams the
+/// board actually dispatches for — checking every team the key can see would
+/// report states for workspaces this config never touches.
+fn review_state_check(key: Option<String>, teams: &[String], cfg: &RoutingConfig) -> Check {
     let Some(want) = cfg.linear.review_state.as_deref() else {
         return Check {
             name: "linear review state".into(),
@@ -874,17 +988,8 @@ fn review_state_check(paths: &Paths, cfg: &RoutingConfig) -> Check {
                 .into(),
         };
     };
-    // Teams the board actually dispatches for. Checking every team the key can
-    // see would report states for workspaces this config never touches.
-    let mut teams: Vec<&str> = cfg
-        .routes
-        .iter()
-        .filter_map(|r| r.match_.linear_team.as_deref())
-        .collect();
-    teams.sort_unstable();
-    teams.dedup();
 
-    let linear = linear_api_key(paths)
+    let linear = key
         .and_then(|k| HttpTransport::new(k).ok())
         .map(Linear::new);
     let (Some(linear), false) = (linear, teams.is_empty()) else {
@@ -896,7 +1001,7 @@ fn review_state_check(paths: &Paths, cfg: &RoutingConfig) -> Check {
     };
 
     let mut missing = Vec::new();
-    for team in &teams {
+    for team in teams {
         match linear.state_id_named(team, want) {
             Ok(Ok(_)) => {}
             Ok(Err(have)) => missing.push(format!("{team} has: {}", have.join(", "))),
@@ -949,6 +1054,14 @@ mod tests {
     use crate::sources::github_app::{TokenProvider, test_app};
 
     fn tmp() -> (tempfile::TempDir, Paths) {
+        // A `LINEAR_API_KEY` exported into the shell outranks the config
+        // directory, so on a box that has one every `doctor` below would find a
+        // credential these tests never wrote — and since gh#96 would go and ask
+        // the real Linear about it. The config directory each test builds is
+        // the only credential source any of them mean to have.
+        static UNSET: std::sync::Once = std::sync::Once::new();
+        UNSET.call_once(|| unsafe { std::env::remove_var("LINEAR_API_KEY") });
+
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             config_dir: dir.path().to_path_buf(),
@@ -1374,11 +1487,135 @@ mod tests {
 
     #[test]
     fn an_unset_review_state_passes_and_says_what_setting_it_would_do() {
-        let (_d, p) = tmp();
         let cfg: RoutingConfig = toml::from_str("").unwrap();
-        let c = review_state_check(&p, &cfg);
+        let c = review_state_check(Some("lin_x".into()), &[], &cfg);
         assert!(c.ok);
         assert!(c.detail.contains("review_state"), "{}", c.detail);
+    }
+
+    // ── the Linear credential (gh#96) ───────────────────────────────────────
+
+    /// A board with no key and no route matching a Linear team is a
+    /// *GitHub-only board* — a supported configuration, not a half-finished
+    /// one. Inherited from herdr-board, where Linear always existed, this check
+    /// said `FAIL … missing` at it and sent people looking for a break that was
+    /// not there. It passes, and is worded so nobody reads it as broken.
+    #[test]
+    fn a_github_only_board_is_not_failed_over_an_absent_linear_key() {
+        let (_d, p) = tmp();
+        let c = linear_key_check(&p, None, &[], |_| panic!("there is no key to probe"));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("not configured —"), "{}", c.detail);
+        assert!(c.detail.contains("GitHub only"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("missing"),
+            "the word this line failed people with: {}",
+            c.detail
+        );
+    }
+
+    /// The other half of the rule. Once a route matches on `linear_team` the
+    /// key has stopped being optional: without it those tickets never reach the
+    /// board and the route can never fire — silently, which is what `doctor` is
+    /// for. Same shape as the GitHub credential, which fails only once repos
+    /// are configured.
+    #[test]
+    fn a_route_matching_a_linear_team_still_needs_the_key() {
+        let (_d, p) = tmp();
+        let c = linear_key_check(&p, None, &["AGE".into(), "TAL".into()], |_| {
+            panic!("there is no key to probe")
+        });
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("AGE") && c.detail.contains("TAL"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("linear_team"), "{}", c.detail);
+    }
+
+    /// A key that is there is worth checking, and only the API can say whether
+    /// it still works — a revoked string in `.env` looked exactly like a good
+    /// one before this.
+    #[test]
+    fn a_present_key_is_reported_by_what_linear_says_about_it() {
+        let (_d, p) = tmp();
+        let good = linear_key_check(&p, Some("lin_x".into()), &[], |k| {
+            assert_eq!(k, "lin_x");
+            Ok("sam@example.com".into())
+        });
+        assert!(good.ok, "{}", good.detail);
+        assert!(good.detail.contains("sam@example.com"), "{}", good.detail);
+
+        let rejected = linear_key_check(&p, Some("lin_x".into()), &[], |_| {
+            Err(anyhow::anyhow!(
+                "linear GraphQL error: Authentication required, not authenticated"
+            ))
+        });
+        assert!(!rejected.ok, "{}", rejected.detail);
+        assert!(rejected.detail.contains("rejected"), "{}", rejected.detail);
+        assert!(
+            rejected.detail.contains("Authentication required"),
+            "the reason has to travel with the failure: {}",
+            rejected.detail
+        );
+    }
+
+    /// An API that would not answer is not a key that was rejected. Reporting
+    /// one as the other is the same false alarm from the other direction — a
+    /// laptop on a train would fail this check every time.
+    #[test]
+    fn an_unreachable_linear_does_not_condemn_a_configured_key() {
+        let (_d, p) = tmp();
+        let limited = linear_key_check(&p, Some("lin_x".into()), &[], |_| {
+            Err(anyhow::anyhow!("linear rate limited (429)"))
+        });
+        assert!(limited.ok, "{}", limited.detail);
+        assert!(limited.detail.contains("not checked"), "{}", limited.detail);
+
+        // The other arm: nothing on the wire at all. Port 1 on this machine
+        // refuses, so the error is a real `reqwest::Error` and never leaves it.
+        let refused = reqwest::blocking::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .expect_err("nothing listens on port 1");
+        let offline = linear_key_check(&p, Some("lin_x".into()), &[], |_| Err(refused.into()));
+        assert!(offline.ok, "{}", offline.detail);
+    }
+
+    /// And the report as a whole agrees: on a GitHub-only board nothing says
+    /// Linear is unconfigured — including the review-state line, which is not
+    /// printed at all, on the same rule the `account` check follows (gh#59).
+    #[test]
+    fn a_github_only_report_is_silent_about_linear() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { gh_repo = \"o/r\" }\nworkspace = \"w\"\n\
+             repo = \"/tmp\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        assert!(
+            !checks.iter().any(|c| c.name == "linear review state"),
+            "a board with no Linear anywhere must not be handed a Linear setting"
+        );
+        let key = checks
+            .iter()
+            .find(|c| c.name == "LINEAR_API_KEY")
+            .expect("the credential is still reported, just not as a fault");
+        assert!(key.ok, "{}", key.detail);
+
+        // With a Linear route in the file the line comes back — that board does
+        // have a workflow state to get wrong.
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { linear_team = \"AGE\" }\nworkspace = \"w\"\n\
+             repo = \"/tmp\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        assert!(checks.iter().any(|c| c.name == "linear review state"));
     }
 
     // ── github auth (gh#58) ─────────────────────────────────────────────────
