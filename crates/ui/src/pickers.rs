@@ -109,6 +109,9 @@ impl ResolvedRunConfig {
             // Composer-created chats run on the device's own CLI login; only a
             // board dispatch picks an account (gh#59).
             account: None,
+            // Same story for push credentials: a chat somebody opened pushes
+            // with the device's own git, not with the board's App (gh#68).
+            push_repo: None,
         })
     }
 }

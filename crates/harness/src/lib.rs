@@ -72,6 +72,50 @@ impl AgentAccount {
     }
 }
 
+/// Git and `gh` credentials for a dispatched agent's own pushes (comet-board's
+/// `git_credentials`, gh#68).
+///
+/// Nothing in here is a secret: `env` is askpass wiring (which helper to run,
+/// which repo it is for, terminal prompting off) and `bin_dir` holds a `gh`
+/// wrapper. Both mint at the moment the tool asks, so a run that lasts longer
+/// than the hour an installation token lives still pushes and still opens its
+/// pull request. Absent means the agent uses the box's own git credentials,
+/// which is every chat the board did not dispatch.
+#[derive(Debug, Clone, Default)]
+pub struct PushCredentials {
+    /// `name=value` pairs stamped on the child.
+    pub env: Vec<(String, String)>,
+    /// Prepended to the child's PATH — the directory holding the `gh` shim.
+    pub bin_dir: Option<std::path::PathBuf>,
+}
+
+impl PushCredentials {
+    /// Stamp the child's env. Called after the adapter's own PATH handling, so
+    /// the shim lands in front of whatever that put there — a `gh` beside the
+    /// harness CLI must not win over the one that carries the credential.
+    pub(crate) fn apply(&self, cmd: &mut tokio::process::Command) {
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        let Some(dir) = &self.bin_dir else { return };
+        // The adapters set PATH on the command; read theirs back rather than
+        // the process's, or prepending here would discard it.
+        let current = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v.map(|v| v.to_os_string()))
+            .or_else(|| std::env::var_os("PATH"));
+        let mut paths = vec![dir.clone()];
+        if let Some(path) = current {
+            paths.extend(std::env::split_paths(&path));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+}
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     /// The run sends questions and awaits answers (blocks the agent, mirrors comet).
@@ -95,6 +139,9 @@ pub struct RunControls {
     /// Which login this run spends. `None` = whatever the CLI's own config dir
     /// holds (the single-user default, and every run before gh#59).
     pub account: Option<AgentAccount>,
+    /// What this run pushes with. `None` = the box user's git credentials,
+    /// which is every chat the board did not dispatch (gh#68).
+    pub push: Option<PushCredentials>,
 }
 
 #[async_trait]
@@ -294,6 +341,48 @@ mod tests {
                 "/data/accounts/8f2c1d0a7b6e4539".to_string()
             )]
         );
+    }
+
+    /// The shim has to win over every other `gh` the child can see — including
+    /// the one that might sit beside the harness CLI, which the adapters have
+    /// already put at the front of PATH by the time this runs.
+    #[test]
+    fn the_push_shim_goes_in_front_of_the_path_the_adapter_built() {
+        let mut cmd = tokio::process::Command::new("claude");
+        prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
+        PushCredentials {
+            env: vec![("COMET_BOARD_ASKPASS_REPO".into(), "o/r".into())],
+            bin_dir: Some(std::path::PathBuf::from("/data/board/state/bin")),
+        }
+        .apply(&mut cmd);
+
+        let env: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        assert_eq!(
+            env.get("COMET_BOARD_ASKPASS_REPO").map(String::as_str),
+            Some("o/r")
+        );
+        let path = env.get("PATH").expect("PATH");
+        let dirs: Vec<&str> = path.split(':').collect();
+        assert_eq!(dirs[0], "/data/board/state/bin");
+        // …and the adapter's own entry is still there, behind it.
+        assert_eq!(dirs[1], "/opt/node/bin");
+    }
+
+    /// A run with no credentials leaves PATH exactly as the adapter built it —
+    /// no empty entry, no reordering.
+    #[test]
+    fn no_shim_means_no_path_change() {
+        let mut cmd = tokio::process::Command::new("claude");
+        prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
+        let before = envs(&cmd);
+        PushCredentials {
+            env: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+            bin_dir: None,
+        }
+        .apply(&mut cmd);
+        let after: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        let before: std::collections::BTreeMap<_, _> = before.into_iter().collect();
+        assert_eq!(after.get("PATH"), before.get("PATH"));
     }
 
     /// A Claude login says nothing about `CODEX_HOME`. Pointing the wrong CLI

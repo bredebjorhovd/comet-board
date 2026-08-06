@@ -109,6 +109,12 @@ struct Inner {
     /// into a config dir of its own, and the harness child is pointed at that
     /// instead of the shared `~/.claude` / `~/.codex` — gh#59.
     accounts: OnceLock<crate::agent_accounts::AgentAccounts>,
+    /// The board's GitHub credential, as something a run can push with (wired
+    /// only when the board is enabled; absent everywhere else). A chat the
+    /// board dispatched carries the repo it works on, and the harness child is
+    /// pointed at `comet-board`'s askpass helper for it instead of at the box
+    /// user's git credentials — gh#68.
+    push: OnceLock<Arc<crate::push_credentials::PushCredentials>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -141,6 +147,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 accounts: OnceLock::new(),
+                push: OnceLock::new(),
             }),
         }
     }
@@ -168,6 +175,14 @@ impl SessionsEngine {
     /// behavior that predates gh#59.
     pub fn set_accounts(&self, accounts: crate::agent_accounts::AgentAccounts) {
         let _ = self.inner.accounts.set(accounts);
+    }
+
+    /// Wire the board's push credentials (called at engine assembly, only when
+    /// the board is on). Without it — and for every chat the board did not
+    /// dispatch — an agent pushes with the device's own git credentials, which
+    /// is the behavior that predates gh#68.
+    pub fn set_push_credentials(&self, push: Arc<crate::push_credentials::PushCredentials>) {
+        let _ = self.inner.push.set(push);
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -348,6 +363,7 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
             chat_id: Some(chat_id.to_string()),
             account,
+            push: self.inner.push_for(chat_id),
         };
 
         lock(&self.inner.runs).insert(
@@ -762,6 +778,25 @@ impl Inner {
             }),
             Some(lease),
         ))
+    }
+
+    /// What this chat's runs push with (gh#68).
+    ///
+    /// Read off the chat row for the same reason the account is: the repo is a
+    /// property of the attempt, and a review comment landing next week starts a
+    /// new run in the same chat that has to be able to push the fix. A chat
+    /// nobody dispatched carries no repo and gets nothing, which leaves the
+    /// agent on the box's own git credentials.
+    ///
+    /// Never fatal, unlike a named account that will not resolve: a missing
+    /// credential means the push falls back to what it used before, and
+    /// refusing the run would take away the agent that could still do the work.
+    fn push_for(&self, chat_id: &str) -> Option<comet_harness::PushCredentials> {
+        let repo = self
+            .workspace()
+            .and_then(|ws| ws.chat_config(chat_id))
+            .and_then(|c| c.push_repo)?;
+        self.push.get()?.for_repo(&repo)
     }
 
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.

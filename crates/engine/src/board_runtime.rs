@@ -114,6 +114,10 @@ impl Runtime for CometRuntime {
             // deliveries, the operator typing into the same session — keeps
             // spending the account the dispatch chose.
             account: spec.account.clone(),
+            // Likewise for the credential its pushes authenticate with
+            // (gh#68): the fix for a review comment three days from now is a
+            // new run in this chat, and it has to reach the same branch.
+            push_repo: spec.push_repo.clone(),
         };
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;

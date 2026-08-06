@@ -193,10 +193,18 @@ pub fn build_spec(
     } else {
         space.path.clone()
     };
+    // Which repo the agent's pushes authenticate against (gh#68). The task id
+    // when it names one; the checkout's remote otherwise, which is the only
+    // thing that can answer for a Linear ticket dispatched into a git space —
+    // and is where the branch is going either way.
+    let push_repo = crate::model::gh_repo(&task.id)
+        .map(str::to_string)
+        .or_else(|| crate::git_credentials::repo_for_checkout(&repo_path));
     Ok(DispatchSpec {
         identifier: task.identifier.clone(),
         space_id: space.id.clone(),
         device_id: space.device_id.clone(),
+        push_repo,
         repo_path,
         prompt: resolve_prompt(route, task, &branch),
         branch,
@@ -340,6 +348,30 @@ mod tests {
         assert_eq!(spec.repo_path, "/home/x/dev/widget");
         assert_eq!(spec.space_id, "space-1");
         assert_eq!(spec.harness, comet_proto::HarnessId::ClaudeCode);
+    }
+
+    /// What the agent's `git push` and `gh pr create` authenticate for
+    /// (gh#68). A GitHub ticket carries its repo in its own id; nothing has to
+    /// touch the checkout to know it.
+    #[test]
+    fn a_github_task_names_the_repo_its_agent_pushes_to() {
+        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
+        assert_eq!(spec.push_repo.as_deref(), Some("owner/widget"));
+    }
+
+    /// A Linear ticket names no repo, and the space it dispatches into is the
+    /// only thing that can answer. A path that is not a git checkout answers
+    /// nothing, which leaves the agent on the box's own credentials.
+    #[test]
+    fn a_linear_task_falls_back_to_the_checkout_and_tolerates_having_none() {
+        let mut t = task();
+        t.id = "linear:LIN-142".into();
+        t.identifier = "LIN-142".into();
+        t.source = Source::Linear;
+        let mut s = space();
+        s.path = "/nonexistent/not-a-checkout".into();
+        let spec = build_spec(&RoutingConfig::default(), &route(), &t, &s, &DispatchOverrides::default()).unwrap();
+        assert_eq!(spec.push_repo, None);
     }
 
     #[test]
