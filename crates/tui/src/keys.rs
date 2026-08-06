@@ -115,6 +115,9 @@ pub enum Action {
     /// `enter` on the board: dispatch a ready task, fold a section header, or
     /// open a running task's chat.
     BoardEnter,
+    /// `R` — retry the selected row: a blocked row's live attempt is replaced,
+    /// a failed or ready one is released afresh (gh#73).
+    BoardRetry,
     /// `f` — the next route filter, then no route, then all.
     BoardCycleFilter,
     /// `/` — open the find field.
@@ -267,6 +270,9 @@ fn map_board(typing: bool, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::BoardFind),
         KeyCode::Char('F') => Some(Action::BoardClearFilter),
         KeyCode::Char('d') if !ctrl => Some(Action::BoardCycleHost),
+        // `r` is reconnect everywhere, including here; retry takes the shifted
+        // spelling, as `F` does beside `f`.
+        KeyCode::Char('R') => Some(Action::BoardRetry),
         KeyCode::Enter => Some(Action::BoardEnter),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::BoardDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::BoardUp),
@@ -434,7 +440,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("Ctrl-X", "interrupt the running agent"),
     ("r", "reconnect now"),
     ("B", "the task board (B again, esc, h: back)"),
-    ("enter", "board: dispatch a ready task"),
+    ("enter", "board: dispatch a ready task, retry a failed one"),
+    ("R", "board: retry — replaces a blocked task's live attempt"),
     ("f / F", "board: cycle the route filter / clear it"),
     ("/", "board: find as you type"),
     ("d", "board: which device hosts the board"),

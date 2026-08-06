@@ -8,6 +8,11 @@
 //! the one thing the setup commands cannot know (which spaces exist on this
 //! device). Everything else (config, detection, the routing.toml writer, the
 //! report, ticket writing) is library code with tests, plus [`ops`] here.
+//!
+//! The board it drives need not be this device's. `--device` names the box that
+//! hosts it, and the board RPCs are relay-forwardable (gh#55), so the dial
+//! stays localhost and the local engine forwards — the same thing the desktop
+//! panel and the TUI pane do (gh#73).
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -42,6 +47,17 @@ struct Cli {
     /// Engine data directory (env: COMET_DATA_DIR).
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    /// Which device hosts the board — its name or id (env:
+    /// COMET_BOARD_DEVICE). Omit for this device's own board.
+    ///
+    /// The board store lives on exactly one device, usually the always-on box,
+    /// and the board RPCs are relay-forwarded: this still dials the local
+    /// engine, which passes the call on. Applies to the verbs that ask the
+    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`. The
+    /// rest (doctor, init, adopt, stats) read this device's own files either
+    /// way, and are unaffected.
+    #[arg(long, global = true)]
+    device: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -87,6 +103,29 @@ enum Command {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Release a task again — the desktop panel's Retry, from a shell.
+    ///
+    /// On a blocked row this ends the live attempt and releases a fresh one in
+    /// the same call, which cancel-then-dispatch cannot do: between the two the
+    /// row is `ready` and anything else may take its slot. On a failed or ready
+    /// row nothing is live, so it is an ordinary dispatch.
+    Retry {
+        #[arg(long)]
+        task: String,
+        /// The retrying chat's id — provenance, never authority. Normally
+        /// omitted; see `dispatch --via`.
+        #[arg(long)]
+        via: Option<String>,
+        /// Override the route's configured runtime for this attempt.
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Override the harness's default model for this attempt.
+        #[arg(long)]
+        model: Option<String>,
+        /// Agent-account slot id to run under.
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
         #[arg(long)]
@@ -101,6 +140,11 @@ enum Command {
         /// States that count as settled. Defaults to review, failed and done.
         #[arg(long)]
         state: Vec<String>,
+        /// Also return when a watched task goes `blocked` — its agent is
+        /// waiting on an answer, and nothing else will settle until it gets
+        /// one. Adds to the settle states rather than replacing them.
+        #[arg(long)]
+        blocked_is_settled: bool,
         /// Give up after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
@@ -194,6 +238,14 @@ fn main() -> Result<()> {
         Some(dir) => Paths::under(dir)?,
         None => Paths::discover()?,
     };
+    // Which device's board the verbs drive. The environment carries it so an
+    // orchestrator points its whole shell at the box once, instead of
+    // threading the flag through every call it makes.
+    let device = cli
+        .device
+        .or_else(|| std::env::var("COMET_BOARD_DEVICE").ok())
+        .filter(|d| !d.is_empty());
+    let device = device.as_deref();
 
     // One-shot commands on a current-thread runtime; the async work is the IPC
     // round-trips (`wait` holds its subscription open, but it is still the
@@ -226,8 +278,8 @@ fn main() -> Result<()> {
         } => {
             ops::validate_filters(state.as_deref(), source.as_deref())?;
             let rows = runtime.block_on(async {
-                let client = ops::attach(port).await?;
-                ops::board_rows(&client).await
+                let board = ops::attach(port, device).await?;
+                ops::board_rows(&board).await
             })?;
             ops::print_tasks(
                 &ops::filter_rows(rows, state.as_deref(), source.as_deref()),
@@ -242,17 +294,16 @@ fn main() -> Result<()> {
             account,
         } => {
             let via = ops::provenance(via);
+            let opts = ops::DispatchOpts {
+                via: via.as_deref(),
+                runtime: runtime_flag.as_deref(),
+                model: model.as_deref(),
+                account: account.as_deref(),
+                replace: false,
+            };
             let d = runtime.block_on(async {
-                let client = ops::attach(port).await?;
-                ops::dispatch_checked(
-                    &client,
-                    &task,
-                    via.as_deref(),
-                    runtime_flag.as_deref(),
-                    model.as_deref(),
-                    account.as_deref(),
-                )
-                .await
+                let board = ops::attach(port, device).await?;
+                ops::dispatch_checked(&board, &task, opts).await
             })?;
             println!(
                 "dispatched {task} → chat {} (attempt {}, {})",
@@ -261,34 +312,60 @@ fn main() -> Result<()> {
             if let Some(v) = &via {
                 println!("released by chat {v}");
             }
-            if runtime_flag.is_some() || model.is_some() || account.is_some() {
-                println!(
-                    "overrides: {}",
-                    [
-                        runtime_flag.as_deref().map(|r| format!("runtime={r}")),
-                        model.as_deref().map(|m| format!("model={m}")),
-                        account.as_deref().map(|a| format!("account={a}")),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-                );
+            print_overrides(&opts);
+            Ok(())
+        }
+        Command::Retry {
+            task,
+            via,
+            runtime: runtime_flag,
+            model,
+            account,
+        } => {
+            let via = ops::provenance(via);
+            let opts = ops::DispatchOpts {
+                via: via.as_deref(),
+                runtime: runtime_flag.as_deref(),
+                model: model.as_deref(),
+                account: account.as_deref(),
+                // `replace` is not set here: `retry` reads the row and decides,
+                // because ending a live attempt is not something a verb should
+                // do without looking at what it is ending.
+                ..Default::default()
+            };
+            let r = runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                ops::retry(&board, &task, opts).await
+            })?;
+            println!(
+                "retried {task} → chat {} (attempt {}, {})",
+                r.dispatched.chat_id, r.dispatched.attempt, r.dispatched.cwd
+            );
+            // A retry that ended a live agent has to say so — that is the
+            // difference between this and a first dispatch, and the operator
+            // is the only one who can tell whether the answer it was waiting
+            // for is now lost.
+            if r.replaced {
+                println!("replaced the live attempt the {} row was stuck on", r.was);
             }
+            if let Some(v) = &via {
+                println!("released by chat {v}");
+            }
+            print_overrides(&opts);
             Ok(())
         }
         Command::Cancel { task } => {
             runtime.block_on(async {
-                let client = ops::attach(port).await?;
+                let board = ops::attach(port, device).await?;
                 // The row first: `CancelTask` answers `{ok}`, and the parent
                 // that will not be notified is on the row. Best-effort — a
                 // failed read must not block the cancel it precedes.
-                let parent = ops::board_rows(&client)
+                let parent = ops::board_rows(&board)
                     .await
                     .ok()
                     .and_then(|rows| rows.into_iter().find(|r| r.id == task))
                     .and_then(|r| r.dispatched_by_chat);
-                ops::cancel(&client, &task).await?;
+                ops::cancel(&board, &task).await?;
                 println!("cancelled {task} — the issue is still open");
                 // Nothing tells the parent. Say so where the caller will see
                 // it, rather than leaving a waiting agent to be discovered.
@@ -301,19 +378,14 @@ fn main() -> Result<()> {
         Command::Wait {
             task,
             state,
+            blocked_is_settled,
             timeout,
             json,
         } => {
-            // Finished, one way or another: work to look at, work that broke,
-            // or work whose ticket closed under it.
-            let states = if state.is_empty() {
-                vec!["review".to_string(), "failed".into(), "done".into()]
-            } else {
-                state
-            };
+            let states = ops::settle_states(&state, blocked_is_settled);
             let rows = runtime.block_on(async {
-                let client = ops::attach(port).await?;
-                ops::wait_for(&client, &task, &states, timeout.map(Duration::from_secs)).await
+                let board = ops::attach(port, device).await?;
+                ops::wait_for(&board, &task, &states, timeout.map(Duration::from_secs)).await
             })?;
             ops::print_tasks(&rows, json)
         }
@@ -370,9 +442,17 @@ fn main() -> Result<()> {
                 let pickup = Duration::from_secs(cfg.sync.interval_secs() * 2 + 30);
                 let via = ops::provenance(None);
                 let d = runtime.block_on(async {
-                    let client = ops::attach(port).await?;
-                    ops::await_row(&client, &id, pickup).await?;
-                    ops::dispatch(&client, &id, via.as_deref(), None, None, None).await
+                    let board = ops::attach(port, device).await?;
+                    ops::await_row(&board, &id, pickup).await?;
+                    ops::dispatch(
+                        &board,
+                        &id,
+                        ops::DispatchOpts {
+                            via: via.as_deref(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
                 })?;
                 println!(
                     "dispatched {id} → chat {} (attempt {})",
@@ -537,6 +617,22 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+/// Echo the overrides a release was given, so the confirmation says what the
+/// attempt is actually running under and not just that it started.
+fn print_overrides(opts: &ops::DispatchOpts<'_>) {
+    let parts: Vec<String> = [
+        opts.runtime.map(|r| format!("runtime={r}")),
+        opts.model.map(|m| format!("model={m}")),
+        opts.account.map(|a| format!("account={a}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !parts.is_empty() {
+        println!("overrides: {}", parts.join(", "));
     }
 }
 

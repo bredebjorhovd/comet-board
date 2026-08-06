@@ -333,9 +333,10 @@ checkout.
 ### H6 — `comet-board` CLI — **done**
 Landed as `apps/board-cli` (the `comet-board` binary H8 started with
 `doctor`/`init`/`adopt`), grown into the full surface — `list [--state
---source --json]`, `dispatch --task`, `cancel --task`, `wait`, `new`, `stats`
-— speaking the existing typed RPC to the local IPC port exactly as `comet-tui`
-attaches. `apps/board-cli/src/ops.rs` is the agent-facing half:
+--source --json]`, `dispatch --task`, `retry --task` (H11), `cancel --task`,
+`wait`, `new`, `stats` — speaking the existing typed RPC to the local IPC port
+exactly as `comet-tui` attaches, at the board host named by `--device` (H11).
+`apps/board-cli/src/ops.rs` is the agent-facing half:
 - `list --json` prints herdr-board's contract verbatim, modulo the two renames
   the port dictates (`pane_id` → `chat_id`, `dispatched_by_pane` →
   `dispatched_by_chat`). The shape lives in `comet_proto::view::board::TaskRow`
@@ -375,8 +376,9 @@ section of `render.rs`) plus the shared derivations in `crates/proto/src/view/bo
 - Glyph-carried state — `▲ ● ▸ ✓ ✕ ·` — with the herdr-board colour mapping
   (blocked/failed share red, working amber, review the accent) carried on
   `Theme::board_state`, which survives `NO_COLOR` exactly as herdr's did.
-- `enter` dispatches a ready row (the operator's dispatch, so no `via`), opens
-  a working/blocked row's chat, and folds section headers.
+- `enter` dispatches a ready row (the operator's dispatch, so no `via`), retries
+  a failed one (H11), opens a working/blocked row's chat, and folds section
+  headers. `R` retries, replacing a blocked row's live attempt (H11).
 - The `f` / `/` / `F` filter cycle, with the `/` field replacing the footer and
   the filter's label holding the header corner.
 - The derivations live in `comet_proto::view::board` — `Filter`, `sections`,
@@ -470,6 +472,54 @@ The shape:
 Deliberately not here: token and cost caps. Those need per-run accounting the
 board does not have (the engine knows; the board sees sessions), and wall time
 is the bound that was actually missing.
+
+### H11 — CLI parity once the box is remote — **done** (gh#73)
+Three gaps that only bite when the board is not on the machine you are typing
+on, and the desktop app is not the only frontend. All three are in
+`apps/board-cli` (the third also in `crates/tui`):
+
+- **`--device`.** H9 relay-forwarded the *frontends*; the CLI still hardcoded
+  `ws://127.0.0.1:{port}` with no passthrough, so a laptop's `comet-board list`
+  could only ever say "this device's board is disabled". It now dials the same
+  localhost port — the transport was never the problem, the local engine
+  forwards — and carries `targetDeviceId` on every board call, `ListModels`
+  included (the run executes on the host, so the catalog a dispatch is checked
+  against has to be the host's). `ops::Board` owns the host, so a call that
+  forgets it does not typecheck into existence. The flag takes a device *name*
+  or id, resolved against `WatchDevices` before anything is sent: a typo costs
+  an error naming the fleet, not a call forwarded into nothing, and an
+  ambiguous name asks for the id rather than picking a device the operator did
+  not choose. `COMET_BOARD_DEVICE` carries it for a whole shell, which is what
+  an orchestrator wants — the alternative is threading a flag through every
+  call it makes. Deliberately no auto-sweep: the viewports hold a connection
+  open and can afford to probe candidates, a one-shot command would pay for it
+  on every invocation, and a laptop with no board is a *configuration*, said
+  once. The setup commands (doctor, init, adopt) still read this device's own
+  config — a route's `repo =` is a local path, which is #66's problem.
+- **`retry --task`.** The verbs were list/dispatch/cancel/wait/new/stats/doctor
+  and `ops::dispatch` never sent `replace`, so retrying a blocked row from a
+  shell meant cancel-then-dispatch — and between the two the row is `ready`,
+  where a concurrency cap or another agent can take the slot the retry was
+  trying to keep. `retry` reads the row and decides: `blocked` replaces (the
+  engine ends the live attempt and releases in one call — `handle_dispatch`'s
+  deliberate breach of the one-live-attempt rule), `failed` and `ready` are
+  ordinary dispatches, and anything else is left to the engine's own refusal,
+  which names the chat. Reading the row is not optional: sending `replace`
+  unconditionally would let `retry` end a *working* agent nobody asked to
+  interrupt. Same rule as the desktop panel (`crates/ui/src/board.rs`), so a
+  row retried from a shell and from the panel takes the same path.
+  `crates/tui` gained the pane's half: `R` retries (replacing on blocked), and
+  `enter` now retries a `failed` row as the panel's does.
+- **`wait --blocked-is-settled`.** `wait`'s default settle set is
+  review/failed/done, which is right — an agent pausing for an approval is not
+  a result. But a child that asks a question and is never answered reaches none
+  of those, so an orchestrator waited until its timeout or forever. `--state
+  blocked` was already accepted and always had been; what it could not do is
+  *add* blocked, since naming any state replaces the default trio, and
+  respelling the whole set to say "call me back on a question OR a finish" is
+  the kind of thing nobody does twice. The flag tops up whichever set is in
+  play. Not in the default set: `wait` returning on every permission prompt
+  would break the contract `docs/agent-conventions.md` teaches.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from
