@@ -1,9 +1,17 @@
 /**
  * SessionRoom — one Durable Object per doc room, speaking loro-protocol over
  * hibernatable WebSockets (design §2, §3.1). Two doc kinds share this class:
- * chat session docs (room name = chatId, claim-on-first-join ownership) and
- * workspace docs (room name = `ws/{orgId}`, org-membership authz enforced by
- * the Worker — the DO sees the ROOM_KIND_HEADER stamp and skips ownership).
+ * chat session docs (room name = chatId, claim-on-first-join ownership, plus
+ * the org-shared opt-in below) and org-wide docs (the per-user workspace doc
+ * `ws3/{orgId}/{userId}` and the org device registry `orgdev1/{orgId}` —
+ * org-membership authz enforced by the Worker, so the DO sees the
+ * ROOM_KIND_HEADER stamp and skips ownership entirely).
+ *
+ * Chat sharing (gh#66): a chat room also records the org that claimed it and a
+ * `shared` flag the owner sets through `POST /share`. Shared is how a board
+ * dispatch — work the box did on the team's behalf — becomes readable and
+ * steerable by every member of the org, without making anyone's private chats
+ * org-visible. See [`chatRoomAccess`].
  *
  * Persistence model:
  * - `updates` — append-only incoming update log, buffered in memory during
@@ -48,7 +56,7 @@ import {
   materializeTail
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
-import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
@@ -62,12 +70,43 @@ const MAX_CHECKPOINTS = 36;
 
 interface SocketState {
   userId: string;
+  /** The caller's verified WorkOS org claim, when their session carries one —
+   * what admits a teammate to a chat the owner shared into the org (gh#66).
+   * Sockets attached before this shipped deserialize without it and fall back
+   * to the owner-only rule. */
+  orgId?: string;
   /** Joined sub-rooms by crdt magic ("%LOR", "%EPH"). */
   rooms: string[];
   /** True for sockets on a workspace-doc room — org membership was enforced
    * by the Worker, so the per-chat ownership discipline does not apply. */
   workspace?: boolean;
 }
+
+/** What a caller may do with a chat room (gh#66).
+ * - `claim`  — unclaimed; the first joiner becomes its owner;
+ * - `owner`  — the claiming user, from any of their devices;
+ * - `member` — a different user of the same org, on a chat the owner SHARED
+ *              into that org (a board dispatch — see `POST /share`);
+ * - `deny`   — everyone else. */
+export type ChatRoomAccess = "claim" | "owner" | "member" | "deny";
+
+/** The chat room's authorization rule, pure so it is testable without a DO.
+ *
+ * Chat rooms were owner-only forever, which is right for the private chats a
+ * per-user workspace doc indexes — and wrong for the one case the product has
+ * to support: a task the box dispatched on behalf of the team, whose transcript
+ * every teammate must be able to open and steer. Sharing is therefore explicit
+ * and per-room (never "everyone in the org sees every chat"): the owner marks
+ * the room shared, and only then does org membership admit anyone else. */
+export const chatRoomAccess = (
+  room: { owner?: string; org?: string; shared?: boolean },
+  caller: { userId: string; orgId?: string }
+): ChatRoomAccess => {
+  if (!room.owner) return "claim";
+  if (room.owner === caller.userId) return "owner";
+  if (room.shared && room.org && caller.orgId && room.org === caller.orgId) return "member";
+  return "deny";
+};
 
 interface FragmentBatch {
   parts: Uint8Array[];
@@ -136,6 +175,7 @@ export class SessionRoom implements DurableObject {
     const url = new URL(request.url);
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return new Response("unauthenticated", { status: 401 });
+    const orgId = request.headers.get(AUTH_ORG_HEADER) ?? undefined;
     // Workspace rooms: the Worker already checked org membership; every
     // member may read/write, so the owner gates below are bypassed.
     const workspace = request.headers.get(ROOM_KIND_HEADER) === "workspace";
@@ -145,19 +185,55 @@ export class SessionRoom implements DurableObject {
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = { userId, rooms: [], ...(workspace ? { workspace } : {}) };
+      const state: SocketState = {
+        userId,
+        rooms: [],
+        ...(orgId ? { orgId } : {}),
+        ...(workspace ? { workspace } : {})
+      };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
     const owner = this.getMeta("owner");
+    // Chat rooms authorize per [`chatRoomAccess`]; workspace rooms were already
+    // authorized by the Worker, so every member acts as an owner would.
+    const access: ChatRoomAccess = workspace
+      ? "owner"
+      : chatRoomAccess(
+          { owner, org: this.getMeta("org"), shared: this.getMeta("shared") === "1" },
+          { userId, orgId }
+        );
+    // Unclaimed reads keep answering `not_found` — "nothing here yet" is a
+    // different fact from "not yours", and clients branch on it.
+    const refuse = (): Response =>
+      access === "claim" ? json({ error: "not_found" }, 404) : json({ error: "forbidden" }, 403);
+    const mayRead = access === "owner" || access === "member";
+
+    if (url.pathname === "/share") {
+      // gh#66: the owner marks this chat visible to their org (the board does
+      // it for every task it dispatches). Nothing else in the room changes —
+      // the flag only widens who [`chatRoomAccess`] admits.
+      if (workspace) return json({ error: "not_applicable" }, 400);
+      if (request.method === "POST") {
+        if (access === "member" || access === "deny") return json({ error: "forbidden" }, 403);
+        // Without an org claim there is nobody to share WITH, and stamping an
+        // empty org would open the room to every other org-less caller.
+        if (!orgId) return json({ error: "no_org" }, 400);
+        if (access === "claim") this.setMeta("owner", userId);
+        this.setMeta("org", orgId);
+        this.setMeta("shared", "1");
+        return json({ ok: true, shared: true, org: orgId });
+      }
+      if (request.method === "GET") {
+        if (!mayRead) return refuse();
+        return json({ shared: this.getMeta("shared") === "1", org: this.getMeta("org") ?? null });
+      }
+    }
     if (url.pathname === "/stats" && request.method === "GET") {
       // Observability: what this room holds and who's on it. Owner-gated like
-      // every other read (org-membership-gated for workspace rooms).
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      // every other read (org-membership-gated for workspace and shared rooms).
+      if (!mayRead) return refuse();
       await this.flush();
       const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
         ?.n as number;
@@ -186,35 +262,26 @@ export class SessionRoom implements DurableObject {
       });
     }
     if (url.pathname === "/tail" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!mayRead) return refuse();
       return json(await this.currentTail());
     }
     if (url.pathname === "/diff" && request.method === "GET") {
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!mayRead) return refuse();
       const diff = getJsonBlob<unknown>(this.blobs, "diff");
       return diff === undefined ? json({ error: "not_found" }, 404) : json(diff);
     }
     if (url.pathname === "/diff" && request.method === "POST") {
-      // The host may publish before any room join has claimed the doc.
-      if (!workspace) {
-        if (!owner) this.setMeta("owner", userId);
-        else if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      // Publishing is the hosting device's job — a teammate reads the sidecar,
+      // never writes it. The host may publish before any room join has claimed
+      // the doc, so an unclaimed room claims here.
+      if (access === "member" || access === "deny") return json({ error: "forbidden" }, 403);
+      if (access === "claim") this.setMeta("owner", userId);
       putJsonBlob(this.blobs, "diff", await request.json());
       return json({ ok: true });
     }
     if (url.pathname === "/snapshot" && request.method === "GET") {
       // Repair/inspection read: the doc's full current snapshot bytes.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (!mayRead) return refuse();
       await this.flush();
       const doc = await this.ensureDoc();
       const bytes = doc.export({ mode: "snapshot" });
@@ -224,11 +291,9 @@ export class SessionRoom implements DurableObject {
     }
     if (url.pathname === "/append" && request.method === "POST") {
       // MERGE-safe repair write: import a Loro update (never replaces the
-      // doc). Same durability bookkeeping as a WS DocUpdate.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      // doc). Same durability bookkeeping as a WS DocUpdate. Repair is an
+      // owner/operator path — a shared chat's members write through the room.
+      if (access !== "owner") return refuse();
       const body = new Uint8Array(await request.arrayBuffer());
       const doc = await this.ensureDoc();
       try {
@@ -256,10 +321,7 @@ export class SessionRoom implements DurableObject {
       // holds the full workspace doc locally and re-uploads it on the next join
       // (CRDT merge), exactly like the `ws3` fresh-namespace recovery. Presence
       // is ephemeral and simply re-published. Owner/chatId meta are preserved.
-      if (!workspace) {
-        if (!owner) return json({ error: "not_found" }, 404);
-        if (owner !== userId) return json({ error: "forbidden" }, 403);
-      }
+      if (access !== "owner") return refuse();
       const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
         | number
         | undefined;
@@ -328,10 +390,22 @@ export class SessionRoom implements DurableObject {
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
     if (!state.workspace) {
-      // Chat rooms: claim-on-first-join ownership, then owner-only forever.
-      const owner = this.getMeta("owner");
-      if (!owner) this.setMeta("owner", state.userId);
-      else if (owner !== state.userId) {
+      // Chat rooms: claim-on-first-join ownership, then the owner — plus, once
+      // the owner has shared the chat into their org (gh#66), that org's
+      // members, who join with the same write permission so a teammate can
+      // steer a board-dispatched run.
+      const access = chatRoomAccess(
+        {
+          owner: this.getMeta("owner"),
+          org: this.getMeta("org"),
+          shared: this.getMeta("shared") === "1"
+        },
+        { userId: state.userId, orgId: state.orgId }
+      );
+      if (access === "claim") {
+        this.setMeta("owner", state.userId);
+        if (state.orgId) this.setMeta("org", state.orgId);
+      } else if (access === "deny") {
         this.send(ws, {
           type: MessageType.JoinError,
           crdt: message.crdt,

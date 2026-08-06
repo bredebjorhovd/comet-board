@@ -108,6 +108,13 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    Volume is tiny (index rows, no transcripts), so oplog growth is negligible and daily compaction
    applies anyway.
 
+   *Per-user, with one exception:* the room is really `ws3/{orgId}/{userId}` — spaces, chats and
+   sessions are private to the person who made them. Devices are the exception (gh#66): a
+   teammate who cannot see the box cannot address it, cannot sweep it for a board, and cannot
+   reach the shared work on it. So device rows are ALSO published to an org-wide registry doc
+   (`orgdev1/{orgId}`, `comet_engine::org_devices`), and `WatchDevices` serves the union.
+   Presence beats on both rooms.
+
 3. **Mirror layer** (`comet-doc` crate) — Rust equivalent of loro-mirror: typed structs for the
    schema, **incremental** application of `doc.subscribe` diffs into cached state (no full
    re-hydration per change — this is also what fixes comet's known O(transcript) re-projection
@@ -250,6 +257,13 @@ sidecar slots, R2 attachments, JWKS auth). Additions:
    claim-on-first-join.
 2. `/auth/*` routes absorbed from `apps/server` (WorkOS API key in Worker secret).
 3. Drop `/seed` migration path and legacy sync anything (fresh app).
+4. Org-shared visibility (gh#66) — what a SECOND user of an org can reach. The Worker
+   stamps the verified `org_id` on every DO forward, and: the org device registry room
+   (`orgdev1/{orgId}`) is org-membership authz'd like a workspace room; device rooms record
+   the org that claimed them and admit any member as a *client* (hosting stays owner-only);
+   chat rooms stay owner-only until the owner marks one shared (`POST /share/{chatId}`,
+   which the board does for every task it dispatches), after which the org may read and
+   write it. Private chats never become org-visible by being in an org.
 Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
 per `docs/research/durable-objects-language.md`.
 
@@ -281,6 +295,9 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   doc entity sync, WorkOS auth + org gate, presence. Proven live by `scripts/e2e-smoke.sh`:
   two headless engines against a real edge — B queues a run into the chat doc, the durable
   nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
+  Its two-USER sibling `scripts/e2e-org-smoke.sh` (gh#66) proves the org gates the same way:
+  a second WorkOS user of the org sees the box in `WatchDevices`, relays a `targetDeviceId`
+  RPC to it, and opens + steers a chat the box shared — with the run executing on the box.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
   agent accounts UI, settings (devices/shortcuts/archived), Codex harness. Gaps: composer
   attachment UI (engine upload RPCs exist), Cursor harness.

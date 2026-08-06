@@ -142,6 +142,12 @@ impl Runtime for CometRuntime {
                 message_id: crate::new_id(),
             },
         )?;
+        // The board dispatches on the TEAM's behalf, so its chats are the one
+        // kind that is org-visible (gh#66): every member may open the
+        // transcript and steer the agent, while private chats on the same box
+        // stay private. Best-effort — a chat that failed to share is still a
+        // running attempt, just one only its owner can open.
+        self.doc_host.share_chat(&chat_id);
         Ok(DispatchHandle { chat_id, cwd })
     }
 

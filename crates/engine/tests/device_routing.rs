@@ -2,6 +2,13 @@
 //! to engine B through B's device-room relay (host relay on B, link cache on A), with a
 //! minimal in-memory device-room standing in for the edge DO (route client→host with
 //! `from` stamped, host→client by `to`).
+//!
+//! The stand-in also enforces the DO's authorization rule (`edge/src/device-room.ts`,
+//! gh#66): the host claims the room for its user AND org, the owner reaches it from any
+//! device, any other member of that org reaches it as a client, and everyone else is
+//! refused at the handshake. That gate is the whole reason a teammate can drive the
+//! box's board, so the routing tests run with it in place rather than against an open
+//! relay. Dev-mode bearers carry identity as `user@org`, exactly like the edge's.
 
 // tungstenite's `accept_hdr_async` callback signature fixes the Err type as a full
 // `Response` — its size is not ours to shrink.
@@ -18,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
-    Request as WsRequest, Response as WsResponse,
+    ErrorResponse as WsErrorResponse, Request as WsRequest, Response as WsResponse,
 };
 
 use comet_doc::SessionCommandPayload;
@@ -41,6 +48,29 @@ use comet_rpc::{
 struct RelayState {
     host: Option<mpsc::UnboundedSender<Vec<u8>>>,
     clients: HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    /// Claim-on-first-host: `(userId, orgId)`, the identity anchor every later
+    /// join is checked against.
+    owner: Option<(String, String)>,
+}
+
+/// A dev-mode bearer's `(userId, orgId)` — the edge splits `user@org` the same way.
+fn identity(token: &str) -> (String, String) {
+    match token.split_once('@') {
+        Some((user, org)) => (user.to_string(), org.to_string()),
+        None => (token.to_string(), String::new()),
+    }
+}
+
+/// The DeviceRoom's gate: `edge/src/device-room.ts::deviceRoomAccess`.
+fn admits(owner: Option<&(String, String)>, caller: &(String, String), is_host: bool) -> bool {
+    match owner {
+        // Only a device's own backend may claim (and later re-host) its room.
+        None => is_host,
+        Some(owner) if *owner.0 == caller.0 => true,
+        Some(_) if is_host => false,
+        // Any other member of the room's org, as a client.
+        Some(owner) => !owner.1.is_empty() && owner.1 == caller.1,
+    }
 }
 
 async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
@@ -58,10 +88,26 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
             let state = state.clone();
             tokio::spawn(async move {
                 let mut uri = String::new();
+                let gate = state.clone();
                 let Ok(ws) = tokio_tungstenite::accept_hdr_async(
                     stream,
                     |req: &WsRequest, res: WsResponse| {
                         uri = req.uri().to_string();
+                        let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
+                        let is_host = query.contains("role=host");
+                        let caller = identity(
+                            query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("token="))
+                                .unwrap_or(""),
+                        );
+                        let mut st = gate.lock().expect("lock");
+                        if !admits(st.owner.as_ref(), &caller, is_host) {
+                            return Err(WsErrorResponse::new(Some("forbidden".to_string())));
+                        }
+                        if is_host && st.owner.is_none() {
+                            st.owner = Some(caller);
+                        }
                         Ok(res)
                     },
                 )
@@ -182,10 +228,46 @@ fn registry() -> Arc<HarnessRegistry> {
     Arc::new(registry)
 }
 
+/// The org every device in these tests belongs to (the box and the laptops
+/// driving it), and the two people in it.
+const ORG: &str = "org-relay";
+const OWNER: &str = "alice";
+const TEAMMATE: &str = "bob";
+
+fn bearer(user: &str, org: &str) -> String {
+    format!("{user}@{org}")
+}
+
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
+    assemble_as(dir, device_id, OWNER, ORG)
+}
+
+/// Assemble an engine signed in as `user` of `org` — the identity its host
+/// relay presents to the device room, which is what the room's gate judges.
+fn assemble_as(dir: &std::path::Path, device_id: &str, user: &str, org: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
+    let core =
+        EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles");
+    let mut auth = comet_engine::AuthConfig::new("http://localhost:27640", dir.join("auth"));
+    auth.dev_user_id = bearer(user, org);
+    core.set_auth(comet_engine::Auth::new(auth));
+    core
+}
+
+/// A link cache dialing the relay as `user` of `org`, at test speed.
+fn links(relay_url: &str, user: &str, org: &str) -> Arc<LinkCache> {
+    let mut config = LinkCacheConfig::new(
+        relay_url.to_string(),
+        Arc::new(StaticToken(bearer(user, org))),
+    );
+    config.probe_timeout = Duration::from_secs(5);
+    // The production curve backs a failed dial off 5s→60s, which under a loaded
+    // test binary turns "the host relay hasn't finished joining" into minutes of
+    // refusals. Retry at test speed instead.
+    config.cooldown_base = Duration::from_millis(50);
+    config.cooldown_max = Duration::from_millis(200);
+    LinkCache::new(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -203,10 +285,7 @@ async fn target_device_id_routes_over_the_relay() {
 
     // Engine A dials peers through the same relay.
     let core_a = assemble(&dirs.path().join("a"), "device-a");
-    let mut link_config =
-        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
-    link_config.probe_timeout = Duration::from_secs(5);
-    core_a.set_links(LinkCache::new(link_config));
+    core_a.set_links(links(&relay_url, OWNER, ORG));
 
     // Seed a transcript on B only — proves reads come from B, not A's (empty) doc.
     let handle_b = core_b.doc_host.open("chat-remote").expect("open chat on B");
@@ -368,10 +447,7 @@ async fn terminal_stream_proxies_over_the_relay() {
     let _host = core_b.start_host_relay(&relay_url);
 
     let core_a = assemble(&dirs.path().join("a"), "device-a");
-    let mut link_config =
-        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
-    link_config.probe_timeout = Duration::from_secs(5);
-    core_a.set_links(LinkCache::new(link_config));
+    core_a.set_links(links(&relay_url, OWNER, ORG));
     let client = comet_rpc::memory_client(core_a.rpc_service());
 
     // OpenTerminal forwards to B once the relay session is up.
@@ -520,15 +596,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
 
     // Engine A is a teammate's laptop: no board of its own.
     let core_a = assemble(&dirs.path().join("a"), "device-a");
-    let mut link_config =
-        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
-    link_config.probe_timeout = Duration::from_secs(5);
-    // The production curve backs a failed dial off 5s→60s, which under a loaded
-    // test binary turns "the host relay hasn't finished joining" into minutes of
-    // refusals. Retry at test speed instead.
-    link_config.cooldown_base = Duration::from_millis(50);
-    link_config.cooldown_max = Duration::from_millis(200);
-    core_a.set_links(LinkCache::new(link_config));
+    core_a.set_links(links(&relay_url, OWNER, ORG));
     let client = comet_rpc::memory_client(core_a.rpc_service());
 
     // Locally, A has nothing to show: the engine refuses the subscription, so
@@ -626,6 +694,67 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
 
     core_a.shutdown().await;
     core_b.shutdown().await;
+}
+
+/// gh#66: the relay carries frames between the devices of ONE ORG — the claim
+/// `forwardable()` in `rpc.rs` makes, and until this shipped the room was
+/// claim-on-first-join per USER, so a second teammate's laptop was refused
+/// before a frame ever reached the box. Everything device-addressed rides this
+/// one link, the board included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_relay_admits_the_org_and_refuses_everyone_else() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    // The always-on box, signed in as the person who set it up.
+    let core_box = assemble_as(&dirs.path().join("box"), "device-box", OWNER, ORG);
+    let _host = core_box.start_host_relay(&relay_url);
+
+    // A teammate's laptop: a DIFFERENT WorkOS user in the same org.
+    let core_mate = assemble_as(&dirs.path().join("mate"), "device-mate", TEAMMATE, ORG);
+    core_mate.set_links(links(&relay_url, TEAMMATE, ORG));
+    let mate = comet_rpc::memory_client(core_mate.rpc_service());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let reached = loop {
+        match mate
+            .call(
+                methods::LIST_HARNESSES,
+                serde_json::json!({ "targetDeviceId": "device-box" }),
+            )
+            .await
+        {
+            Ok(value) => break value,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a teammate must reach the box: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert!(reached.is_array(), "answered by the box: {reached}");
+
+    // Somebody from another org, with the room provably live: refused.
+    let core_outsider = assemble_as(
+        &dirs.path().join("outsider"),
+        "device-out",
+        "mallory",
+        "org-elsewhere",
+    );
+    core_outsider.set_links(links(&relay_url, "mallory", "org-elsewhere"));
+    let outsider = comet_rpc::memory_client(core_outsider.rpc_service());
+    outsider
+        .call(
+            methods::LIST_HARNESSES,
+            serde_json::json!({ "targetDeviceId": "device-box" }),
+        )
+        .await
+        .expect_err("another org must not reach the box");
+
+    core_box.shutdown().await;
+    core_mate.shutdown().await;
+    core_outsider.shutdown().await;
 }
 
 #[tokio::test]

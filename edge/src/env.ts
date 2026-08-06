@@ -22,8 +22,20 @@ export interface Env {
  * the Worker (design §2: "DO never sees an unauthenticated frame"). */
 export const AUTH_USER_HEADER = "x-comet-auth-user";
 
-/** Header the Worker stamps on requests forwarded into workspace-doc rooms
- * (`ws/{orgId}`). Membership (JWT org claim == orgId) is enforced at the
- * Worker; the SessionRoom DO sees this and skips its per-chat
+/** Header the Worker stamps with the caller's verified WorkOS org claim
+ * (`org_id`), when the session carries one. Same trust model as
+ * [`AUTH_USER_HEADER`]: the DO never sees an unverified value.
+ *
+ * This is what makes a room shareable ACROSS users of one org (gh#66): a DO
+ * records the org that claimed it and can then admit any caller the Worker
+ * vouches for as a member of that org, instead of only the claiming user. A
+ * caller with no org claim leaves the header unset, and every gate falls back
+ * to the pre-org owner-only rule. */
+export const AUTH_ORG_HEADER = "x-comet-auth-org";
+
+/** Header the Worker stamps on requests forwarded into org-wide doc rooms —
+ * the per-user workspace doc (`ws3/{orgId}/{userId}`) and the org device
+ * registry (`orgdev1/{orgId}`). Membership (JWT org claim == orgId) is
+ * enforced at the Worker; the SessionRoom DO sees this and skips its per-chat
  * claim-on-first-join ownership discipline for the room. */
 export const ROOM_KIND_HEADER = "x-comet-room-kind";

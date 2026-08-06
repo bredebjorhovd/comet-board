@@ -18,3 +18,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# The org e2e driver stands in for the board's own `POST /share/{chatId}`.
+reqwest.workspace = true
