@@ -10,10 +10,16 @@ PROFILE=debug scripts/package-linux.sh   # fast smoke package
 Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
 
 - `comet` — the binary (headed by default; `comet headless` runs the engine alone)
-- `comet.desktop` — XDG desktop entry
-- `comet.png` — 1024×1024 app icon (the comet mark from the original app;
-  vector source `comet.svg`)
+- `comet.desktop` — XDG desktop entry; `Icon=comet` is an icon-theme name, so it
+  resolves against whatever the installer drops into the hicolor theme
+- `comet.png` — 1024×1024 app icon (the comet mark from the original app)
+- `comet.svg` — the vector source, installed as `hicolor/scalable/apps/comet.svg`
+  (the size-independent entry every icon lookup indexes)
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+
+macOS needs no equivalent: `comet-ui` sets the Dock/Cmd-Tab icon at runtime from
+this same `comet.png` and adds a menu-bar status item, so an unbundled binary
+looks like the product too (`crates/ui/src/app_icon.rs`).
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.

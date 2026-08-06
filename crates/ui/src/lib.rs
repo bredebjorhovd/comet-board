@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — comet pulse loader, gradient spinner, boot splash.
 
+pub mod app_icon;
 pub mod app_menus;
 pub mod attachments;
 pub mod board;
@@ -124,14 +125,7 @@ pub fn run_app(config: UiConfig) {
     // Dock-icon click with no window (⌘W closed it): rebuild the main window
     // around the still-running engine — zed does the same via `on_reopen`
     // (crates/zed/src/main.rs `app.on_reopen`).
-    app.on_reopen(|cx| {
-        if cx.windows().is_empty()
-            && let Some(reopen) = cx.try_global::<ReopenState>()
-        {
-            let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
-            open_main_window(state, boot, cx);
-        }
-    });
+    app.on_reopen(activate_main_window);
     app.run(move |cx: &mut App| {
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
         gpui_tokio::init(cx);
@@ -178,8 +172,28 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
+        // Dock/Cmd-Tab icon + the menu-bar status item (macOS). Last, because
+        // the status item's Show entry reopens through `activate_main_window`,
+        // which wants the window and menus already in place.
+        app_icon::init(cx, activate_main_window);
         cx.activate(true);
     });
+}
+
+/// Bring comet forward with a window on screen: raise the one that exists, or —
+/// if ⌘W closed it, which on macOS leaves the process running with just the
+/// menu bar — rebuild it around the still-running engine. Shared by the
+/// dock-icon reopen hook and the status item's "Show Comet" entry.
+fn activate_main_window(cx: &mut App) {
+    cx.activate(true);
+    if let Some(window) = cx.windows().first().copied() {
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+    } else if let Some(reopen) = cx.try_global::<ReopenState>() {
+        let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
+        open_main_window(state, boot, cx);
+    }
 }
 
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
