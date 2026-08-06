@@ -2866,7 +2866,7 @@ mod tests {
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let work = agent_worked_in(&e, a, Work::Committed);
-        let rt = JournalFact(Some(RunEnd::Interrupted));
+        let rt = JournalFact::ending(Some(RunEnd::Interrupted));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
