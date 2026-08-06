@@ -396,6 +396,11 @@ pub struct Attempt {
     /// nudge itself — see [`crate::nudge::recovered`].
     pub nudges: i64,
     pub nudged_at: Option<String>,
+    /// How many times this attempt has *entered* blocked — the agent stopped
+    /// to ask, or its run died (gh#71). Not a tick count: it moves on the
+    /// transition only, which is what lets the upstream notice be one comment
+    /// per block rather than one per attempt or one every thirty seconds.
+    pub blocked_count: i64,
     /// When the board told this attempt's chat it had run past its route's
     /// `max_duration` (gh#70). `None` is "not warned" — every attempt gets one
     /// warning and a grace period before the cap closes it, so this is also

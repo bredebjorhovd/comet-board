@@ -147,6 +147,18 @@ pub fn doctor(
                 detail: settle_notice_detail(cfg.defaults.notify_dispatcher),
             });
 
+            // The counterpart to the settle notice, and the one gh#71 existed
+            // for: an attempt that blocks settles nothing, so no outcome
+            // comment fires and the row is the only trace. This says what the
+            // board does about that, per repo, because writeback is per repo.
+            checks.push(Check {
+                name: "blocked notice".into(),
+                ok: true,
+                detail: blocked_notice_detail(&cfg.github),
+            });
+
+            checks.push(operator_notice_check(&cfg.defaults));
+
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
             // retrying it forever, and this is where that becomes visible.
@@ -731,10 +743,90 @@ fn settle_notice_detail(notify_dispatcher: bool) -> String {
          when that work settles"
             .into()
     } else {
-        "off — only you are notified when released work settles; the agent \
-         that released it waits to be asked (`[defaults] notify_dispatcher \
-         = true` to enable)"
+        // Deliberately not "only you are notified": until gh#71 that was what
+        // this line said, and there was no channel that notified you either.
+        // A `doctor` line describing a notice nobody sends is worse than no
+        // line, because it is the answer somebody stops investigating at.
+        "off — the agent that released work is not told when it settles; the \
+         board row and the comment on the issue are the whole trail \
+         (`[defaults] notify_dispatcher = true` to enable)"
             .into()
+    }
+}
+
+/// What happens upstream when an agent stops and cannot go on (gh#71).
+///
+/// Unconditional for Linear and gated per repo for GitHub, which is the same
+/// rule every other comment follows — and the reason this is worth a line: a
+/// read-only repo gets no comment, so on those repos the board row really is
+/// the only signal, and an operator should learn that here rather than by
+/// waiting for a comment that is never coming.
+fn blocked_notice_detail(github: &crate::config::GithubConfig) -> String {
+    let mut s = "on — an agent that stops to ask, or whose run dies, leaves one comment \
+                 on its issue per block (Linear always; GitHub where writeback is on)"
+        .to_string();
+    let reads = github.read_only_repos();
+    if !reads.is_empty() {
+        s.push_str(&format!(
+            ". No comment on the read-only repos, so a block there shows on the board \
+             and nowhere else: {}",
+            reads.join(", ")
+        ));
+    }
+    s
+}
+
+/// Whether anything reaches a human who is looking at neither the board nor
+/// the issue tracker (gh#71).
+///
+/// Two keys answer this, so `doctor` reads them together: `notify_webhook` is
+/// the address and `notify` is the mute switch. No address is *not configured*
+/// rather than a fault — not wanting an out-of-band channel is a legitimate
+/// answer, and a `doctor` that exits non-zero over a preference stops meaning
+/// anything. What is a fault is an address that cannot be posted to: the
+/// operator asked for the notice, and every one of them is being dropped into
+/// a log line.
+///
+/// What this line must never do is what the settle-notice line did before
+/// gh#71 — imply somebody is being told when nobody is.
+fn operator_notice_check(defaults: &crate::config::Defaults) -> Check {
+    let name = "operator notice".to_string();
+    let Some(url) = defaults.notify_webhook.as_deref() else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not configured — nothing reaches you out of band. A blocked agent \
+                     comments on its issue and colours a row on the board, and at 02:00 \
+                     that is all (`[defaults] notify_webhook = \"https://…\"` for a POST \
+                     on every block and settle)"
+                .into(),
+        };
+    };
+    if let Some(problem) = crate::notify::webhook_url_problem(url) {
+        return Check {
+            name,
+            ok: false,
+            detail: format!(
+                "`[defaults] notify_webhook` cannot be posted to ({problem}) — every \
+                 notice is dropped with a warning in the log and nothing reaches you"
+            ),
+        };
+    }
+    Check {
+        name,
+        ok: true,
+        detail: if defaults.notify {
+            format!(
+                "on — `on_blocked` and `on_settled` are POSTed to {}",
+                crate::notify::webhook_host(url)
+            )
+        } else {
+            format!(
+                "muted — {} is configured but `[defaults] notify = false` silences it; \
+                 a blocked agent still comments on its issue",
+                crate::notify::webhook_host(url)
+            )
+        },
     }
 }
 
@@ -1172,6 +1264,58 @@ mod tests {
             off.contains("notify_dispatcher"),
             "off has to name the key to turn it on: {off}"
         );
+    }
+
+    /// gh#71. `notify` used to be parsed, documented, and read nowhere — and
+    /// `doctor` implied it notified you. The line now has to be true in every
+    /// state, and only the one genuine misconfiguration may fail: an address
+    /// that cannot be posted to. Not wanting the channel is not a fault, or
+    /// `doctor` would exit 1 on a default install and stop meaning anything.
+    #[test]
+    fn doctor_tells_the_truth_about_the_operator_channel() {
+        let mut d = crate::config::Defaults::default();
+        assert!(d.notify && d.notify_webhook.is_none(), "the default state");
+        let c = operator_notice_check(&d);
+        assert!(c.ok, "a preference is not a failure: {}", c.detail);
+        assert!(c.detail.starts_with("not configured —"), "{}", c.detail);
+        assert!(c.detail.contains("notify_webhook"), "{}", c.detail);
+
+        d.notify_webhook = Some("https://hooks.example.com/x".into());
+        let c = operator_notice_check(&d);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("on —"), "{}", c.detail);
+        assert!(c.detail.contains("hooks.example.com"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("/x"),
+            "a webhook URL is the credential; name the host only: {}",
+            c.detail
+        );
+
+        // Muted is a decision, and says which key made it.
+        d.notify = false;
+        let c = operator_notice_check(&d);
+        assert!(c.ok && c.detail.starts_with("muted —"), "{}", c.detail);
+
+        // A typo is silence with a warning in a log nobody reads — the one
+        // state worth failing over.
+        d.notify = true;
+        d.notify_webhook = Some("hooks.example.com/x".into());
+        assert!(!operator_notice_check(&d).ok);
+    }
+
+    /// A block comments on its issue — except on a repo the board only reads,
+    /// where it comments nowhere, and an operator should learn that here.
+    #[test]
+    fn doctor_names_the_repos_where_a_block_shows_nowhere() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[github]\nrepos = [\"o/mine\", \"o/theirs\"]\nwriteback = true\n\n\
+             [[github.repo]]\nname = \"o/theirs\"\nwriteback = false\n",
+        )
+        .unwrap();
+        let detail = blocked_notice_detail(&cfg.github);
+        assert!(detail.starts_with("on —"), "{detail}");
+        assert!(detail.contains("o/theirs"), "{detail}");
+        assert!(!detail.contains("o/mine"), "{detail}");
     }
 
     #[test]

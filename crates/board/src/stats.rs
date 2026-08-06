@@ -267,6 +267,7 @@ mod tests {
             screen_at: None,
             nudges: 0,
             nudged_at: None,
+            blocked_count: 0,
             overrun_warned_at: None,
             repo_path: Some("/repo/r".into()),
             collectable_at: None,
