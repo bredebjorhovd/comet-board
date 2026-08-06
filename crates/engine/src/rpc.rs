@@ -115,6 +115,22 @@ enum BoardConfigWrite {
     Edit(comet_board::routes::Edit),
 }
 
+/// `OnboardRepo` (gh#97): a repo the board has never seen, in one call.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OnboardParams {
+    /// `owner/repo`, or any GitHub URL carrying one.
+    slug: String,
+    /// Where the checkout goes **on this device**. Absent = the engine's own
+    /// clone root; `~` is expanded here, against this device's home.
+    #[serde(default)]
+    dir: Option<String>,
+    /// Poll only these labels. `Some([])` is "every open issue, said out loud";
+    /// absent keeps `[github] labels`.
+    #[serde(default)]
+    labels: Option<Vec<String>>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
@@ -632,6 +648,195 @@ impl EngineRpc {
         }
     }
 
+    // ---- onboarding a repo the board has never seen (gh#97) ----
+
+    /// Clone, space, adopt — everything on the device that hosts the board.
+    ///
+    /// The order is the one that fails cheapest first. Resolution is a single
+    /// round trip and it is the step most likely to say no (a repo the App is
+    /// not installed on), so it happens before anything touches the disk; the
+    /// clone is what leaves a directory behind, so it happens before the space
+    /// that would otherwise point at nothing.
+    ///
+    /// Two blocking phases rather than one: the GitHub clients hold `Rc`s and
+    /// cannot cross an await, and the clone in the middle is async because
+    /// `repos.rs` is. Each phase builds its own client — that costs one extra
+    /// installation-token mint per onboard, which is the right price for not
+    /// holding a `!Send` value across the clone.
+    async fn onboard_repo(
+        &self,
+        p: OnboardParams,
+    ) -> anyhow::Result<comet_board::onboard::Onboarded> {
+        use comet_board::onboard::{AtPath, Step, at_path, checkout_path, unreachable};
+
+        let slug_typed = comet_board::onboard::parse_slug(&p.slug)?;
+        let paths = self.board()?.paths().clone();
+
+        // ── phase 1: what GitHub says, under the board's own credential ──
+        //
+        // On the board's device on purpose: the laptop that ran the command
+        // usually has no GitHub credential at all, and the credential that
+        // decides whether this repo is reachable is the one that will poll it.
+        let want_preview = p.labels.is_none();
+        let ask = {
+            let slug = slug_typed.clone();
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || {
+                let rest = comet_board::sources::github::HttpRest::from_paths(&paths)?;
+                let gh = comet_board::sources::github::Github::new(rest);
+                let facts = match gh.repo(&slug) {
+                    Ok(facts) => facts,
+                    Err(e) => return Err(unreachable(&slug, gh.rest.auth(), &e)),
+                };
+                // Best-effort, exactly as `adopt`'s is: no network degrades to
+                // onboarding without the numbers rather than to not onboarding.
+                let preview = want_preview
+                    .then(|| comet_board::adopt::preview(&gh, &facts.slug).ok())
+                    .flatten();
+                Ok((facts, preview))
+            })
+            .await
+        };
+        let (facts, preview) =
+            ask.map_err(|e| anyhow::anyhow!("resolving {slug_typed}: {e}"))??;
+        // GitHub's casing from here on: `routing.toml` should spell the repo the
+        // way the repo is spelled.
+        let slug = facts.slug.clone();
+
+        // ── the clone ──
+        let target = checkout_path(p.dir.as_deref(), &slug, &self.repos.clone_root())?;
+        let exists = target.exists();
+        let origin = if exists {
+            self.repos.origin_url(&target).await
+        } else {
+            None
+        };
+        let clone = match at_path(&target, exists, origin.as_deref(), &slug) {
+            AtPath::Occupied(why) => anyhow::bail!("{why}"),
+            AtPath::SameRepo => Step::Reused,
+            AtPath::Vacant => {
+                self.repos
+                    .clone_to(
+                        &comet_board::git_credentials::push_url(&slug),
+                        &facts.clone_url,
+                        &target,
+                        &clone_env(&slug, &paths),
+                    )
+                    .await?;
+                Step::Created
+            }
+        };
+        let path = target.to_string_lossy().to_string();
+
+        // ── the space ──
+        //
+        // Reused by (device, path) rather than re-created: the workspace host
+        // dedupes that pair too, but silently, which would leave the minted id
+        // in the reply naming a space that does not exist.
+        let device_id = self.doc_host.device_id().to_string();
+        let existing = self
+            .workspace
+            .read_spaces()?
+            .into_iter()
+            .find(|s| s.device_id == device_id && s.path == path);
+        let (space, space_id, space_name) = match existing {
+            Some(s) => (Step::Reused, s.id.clone(), s.display_name().to_string()),
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                // `git_detected` is not a guess here: we just cloned it. The
+                // owning device's SpacesSync re-checks it either way.
+                self.workspace
+                    .create_space(&id, &device_id, &path, None, true)?;
+                let name = comet_proto::Space {
+                    id: id.clone(),
+                    device_id: device_id.clone(),
+                    path: path.clone(),
+                    name: None,
+                    git_detected: true,
+                    git_checked_at: None,
+                    checkout_id: None,
+                    created_at: chrono::Utc::now(),
+                }
+                .display_name()
+                .to_string();
+                (Step::Created, id, name)
+            }
+        };
+
+        // ── the routing halves ──
+        //
+        // Straight to `adopt_with` rather than through `detect`: detection reads
+        // the spaces *watch*, which has not necessarily observed the row created
+        // three lines ago, and an onboard that raced its own space would report
+        // "not on the unadopted list" about a repo it had just cloned.
+        let routing = comet_board::routes::read(&paths)?;
+        let cfg = routing.config.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "routing.toml does not parse, so nothing can be adopted into it — the \
+                 clone and the space are in place; fix the file and re-run ({})",
+                routing.problems.join("; ")
+            )
+        })?;
+        let adopted = match comet_board::onboard::routing_gap(&cfg, &slug) {
+            None => None,
+            Some(missing) => Some(comet_board::adopt::adopt_with(
+                &paths.routing(),
+                &comet_board::adopt::Unadopted {
+                    label: space_name.clone(),
+                    slug: slug.clone(),
+                    repo_root: path.clone(),
+                    missing,
+                },
+                p.labels.as_deref(),
+            )?),
+        };
+        // Read *after* the write: whether the board will comment on this repo is
+        // a question about the file as it now stands.
+        let writeback = comet_board::routes::read(&paths)?
+            .config
+            .map(|c| c.github.writeback_for(&slug))
+            .unwrap_or(false);
+
+        Ok(comet_board::onboard::Onboarded {
+            slug,
+            device_id,
+            path,
+            clone,
+            space,
+            space_id,
+            space_name,
+            adopted,
+            preview,
+            writeback,
+            issues_disabled: !facts.has_issues,
+            archived: facts.archived,
+        })
+    }
+
+    /// The repos the App can see, crossed with what the board already watches.
+    async fn list_app_repos(&self) -> anyhow::Result<Vec<comet_board::onboard::Candidate>> {
+        let paths = self.board()?.paths().clone();
+        tokio::task::spawn_blocking(move || {
+            let rest = comet_board::sources::github::HttpRest::from_paths(&paths)?;
+            let app = rest.auth().app().ok_or_else(|| {
+                // Not a failure of the board — a different credential shape. A
+                // PAT has no installations to enumerate, and guessing at
+                // `/user/repos` would offer repos the board cannot poll.
+                anyhow::anyhow!(
+                    "this board authenticates with GITHUB_TOKEN, which has no App \
+                     installations to list — name the repo directly instead"
+                )
+            })?;
+            let repos = app.accessible_repos()?;
+            let cfg = comet_board::routes::read(&paths)?
+                .config
+                .unwrap_or_default();
+            Ok(comet_board::onboard::candidates(&repos, &cfg))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("listing the App's repos: {e}"))?
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -745,6 +950,31 @@ impl EngineRpc {
     }
 }
 
+/// The environment an onboarding clone authenticates with (gh#97).
+///
+/// The same pairs a dispatched agent's `git push` gets, for the same reason: the
+/// board's App is the credential that will push this repo's branches, so it is
+/// the one that should fetch it. Nothing secret is in them — they name the
+/// askpass helper, which mints onto git's own pipe.
+///
+/// Without a resolvable helper binary there is nothing to authenticate *with*,
+/// and a public repo still clones anonymously — so the credential half is
+/// dropped and the "never block on a terminal" half is kept. A private repo then
+/// fails on git's own 403, naming the URL, which is a truer error than one this
+/// could invent.
+fn clone_env(slug: &str, paths: &comet_board::config::Paths) -> Vec<(String, String)> {
+    match comet_board::git_credentials::resolve_board_exe() {
+        Some(exe) => comet_board::git_credentials::agent_env(&exe, slug, paths),
+        None => {
+            tracing::warn!(
+                "onboard: no comet-board binary found for the askpass helper — cloning \
+                 {slug} without the board's credential"
+            );
+            vec![("GIT_TERMINAL_PROMPT".into(), "0".into())]
+        }
+    }
+}
+
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
@@ -808,6 +1038,13 @@ fn forwardable(method: &str) -> bool {
             // needs a repo routed is an ssh account on the box.
             | methods::READ_BOARD_CONFIG
             | methods::WRITE_BOARD_CONFIG
+            // Onboarding is three device-local effects behind one verb — a
+            // clone on the box's disk, a space owned by the box, and the box's
+            // routing.toml — plus a GitHub round trip that has to happen with
+            // the box's credential, because the laptop asking usually has none
+            // (gh#97).
+            | methods::ONBOARD_REPO
+            | methods::LIST_APP_REPOS
     )
 }
 
@@ -1144,6 +1381,24 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&self.config_reply(view).await?)
             }
+            // Clone + space + adopt, all on this device (gh#97). Slow by
+            // nature — it is a `git clone` — and unary, so a caller that gives
+            // up leaves the clone running rather than half-written.
+            methods::ONBOARD_REPO => {
+                let p: OnboardParams = parse_params(params)?;
+                let done = self
+                    .onboard_repo(p)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&done)
+            }
+            methods::LIST_APP_REPOS => {
+                let repos = self
+                    .list_app_repos()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&repos)
+            }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }
@@ -1454,5 +1709,46 @@ mod tests {
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
+    }
+
+    /// gh#97: onboarding is three device-local effects behind one verb — a
+    /// clone on the box's disk, a space the box owns, and the box's
+    /// routing.toml — and the laptop asking for it usually has none of the
+    /// three, nor a GitHub credential to resolve the repo with. Unforwardable,
+    /// it would only ever work from a shell on the box, which is the thing it
+    /// exists to stop needing.
+    #[test]
+    fn onboarding_reaches_the_box_the_way_the_rest_of_the_board_does() {
+        assert!(forwardable(methods::ONBOARD_REPO));
+        assert!(forwardable(methods::LIST_APP_REPOS));
+        // Unary, both of them: a clone that streamed progress would need the
+        // relay's stream proxy, and neither has progress to report yet.
+        assert!(!is_stream_method(methods::ONBOARD_REPO));
+        assert!(!is_stream_method(methods::LIST_APP_REPOS));
+    }
+
+    /// The params a picker and the CLI both send. `dir` and `labels` are absent
+    /// by default and mean different things from empty ones: no `dir` is the
+    /// engine's own clone root, and no `labels` keeps `[github] labels` where
+    /// `[]` deliberately overrides it.
+    #[test]
+    fn onboard_params_default_to_absent_rather_than_empty() {
+        let bare: OnboardParams = serde_json::from_value(serde_json::json!({
+            "slug": "o/r",
+            "targetDeviceId": "dev-box",
+        }))
+        .expect("the host passthrough must be tolerated like every other call");
+        assert_eq!(bare.slug, "o/r");
+        assert_eq!(bare.dir, None);
+        assert_eq!(bare.labels, None);
+
+        let every: OnboardParams = serde_json::from_value(serde_json::json!({
+            "slug": "o/r",
+            "dir": "~/dev/r",
+            "labels": [],
+        }))
+        .unwrap();
+        assert_eq!(every.dir.as_deref(), Some("~/dev/r"));
+        assert_eq!(every.labels, Some(Vec::new()), "`[]` is not `null`");
     }
 }

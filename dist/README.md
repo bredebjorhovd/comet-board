@@ -10,10 +10,16 @@ PROFILE=debug scripts/package-linux.sh   # fast smoke package
 Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
 
 - `comet` — the binary (headed by default; `comet headless` runs the engine alone)
-- `comet.desktop` — XDG desktop entry
-- `comet.png` — 1024×1024 app icon (the comet mark from the original app;
-  vector source `comet.svg`)
+- `comet.desktop` — XDG desktop entry; `Icon=comet` is an icon-theme name, so it
+  resolves against whatever the installer drops into the hicolor theme
+- `comet.png` — 1024×1024 app icon (the comet mark from the original app)
+- `comet.svg` — the vector source, installed as `hicolor/scalable/apps/comet.svg`
+  (the size-independent entry every icon lookup indexes)
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+
+macOS needs no equivalent: `comet-ui` sets the Dock/Cmd-Tab icon at runtime from
+this same `comet.png` and adds a menu-bar status item, so an unbundled binary
+looks like the product too (`crates/ui/src/app_icon.rs`).
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.
@@ -24,11 +30,26 @@ The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 scripts/package-macos.sh    # → target/package/comet-<version>-macos-<arch>.dmg
 ```
 
-Builds the release binary, assembles `Comet.app` (Info.plist + icns), ad-hoc
-signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. CI runs this on tags (`.github/workflows/release.yml`). The manual steps
-it automates, for reference (run on a macOS host — gpui needs Metal; no
-cross-build from Linux):
+Builds the release binary, assembles `Comet.app` (Info.plist + icns), signs it,
+and wraps it in a dmg (with an `/Applications` symlink). CI runs this on tags
+(`.github/workflows/release.yml`).
+
+The script ends by printing `spctl`'s verdict on what it just built, which is
+the only thing that matters to a downloader:
+
+- **No `CODESIGN_IDENTITY`** (today's releases) → ad-hoc signature, Gatekeeper
+  rejects a downloaded copy. The dmg then also carries `READ ME FIRST.txt`
+  (from `dist/macos/DMG-README.txt`) with the `xattr -dr com.apple.quarantine`
+  one-liner that unblocks it.
+- **`CODESIGN_IDENTITY` + `MACOS_NOTARY_*`** → hardened-runtime signed,
+  notarized and stapled (both the app and the dmg), Gatekeeper accepts, and the
+  README is left out because there is nothing to work around.
+
+See [docs/macos-install.md](../docs/macos-install.md) for the user-facing
+instructions and the secrets that switch CI onto the signed path.
+
+The manual steps the script automates, for reference (run on a macOS host —
+gpui needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
    ```sh

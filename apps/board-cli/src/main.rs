@@ -53,10 +53,11 @@ struct Cli {
     /// The board store lives on exactly one device, usually the always-on box,
     /// and the board RPCs are relay-forwarded: this still dials the local
     /// engine, which passes the call on. Applies to the verbs that ask the
-    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`, and
-    /// `routes`, which reads and writes the host's routing.toml (gh#75). The
-    /// rest (doctor, init, adopt, stats) read this device's own files either
-    /// way, and are unaffected.
+    /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`,
+    /// `routes`, which reads and writes the host's routing.toml (gh#75), and
+    /// `onboard`, whose clone, space and route all land on the host (gh#97).
+    /// The rest (doctor, init, adopt, stats) read this device's own files
+    /// either way, and are unaffected.
     #[arg(long, global = true)]
     device: Option<String>,
     #[command(subcommand)]
@@ -224,6 +225,44 @@ enum Command {
     Routes {
         #[command(subcommand)]
         command: RoutesCommand,
+    },
+    /// Put a repo the board has never seen on the board: clone it, give it a
+    /// space, and route it — one verb (gh#97).
+    ///
+    /// Everything happens on the board's device, which is what makes this
+    /// runnable from a laptop that is not the box and has no GitHub credential
+    /// of its own: the checkout has to be where the agents run, the space has to
+    /// belong to that device, and the credential that decides whether the repo
+    /// is reachable at all is the board's App.
+    ///
+    /// Idempotent at every step, because the failure it exists to remove is a
+    /// half-onboarded repo. Re-running is the repair: an existing checkout of
+    /// the same repo is reused, an existing space is reused, and a repo already
+    /// polled and routed is left alone. A directory holding something else is
+    /// refused rather than cloned over.
+    ///
+    /// With no repo: list what the board's App can see.
+    Onboard {
+        /// `owner/repo`, or the repository's github.com URL.
+        slug: Option<String>,
+        /// Where the checkout goes **on the board's device** — the folder that
+        /// ends up holding the repo, not a parent to clone into. Defaults to the
+        /// engine's own clone root. Quote a `~` so it means the box's home
+        /// rather than your shell's.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Poll only issues carrying one of these labels (comma-separated), so a
+        /// roadmap-sized backlog does not land on the board whole.
+        #[arg(long, value_delimiter = ',')]
+        labels: Option<Vec<String>>,
+        /// Poll every open issue, said out loud (writes `labels = []`,
+        /// overriding a narrower global filter).
+        #[arg(long, conflicts_with = "labels")]
+        all_issues: bool,
+        /// The whole result as JSON — every step's outcome, for an orchestrating
+        /// agent that has to decide what to do next.
+        #[arg(long)]
+        json: bool,
     },
     /// Offer git-detected spaces the board is not watching; adopt one by slug.
     ///
@@ -671,6 +710,31 @@ fn main() -> Result<()> {
             let board = ops::attach(port, device).await?;
             routes(&board, command).await
         }),
+        Command::Onboard {
+            slug,
+            dir,
+            labels,
+            all_issues,
+            json,
+        } => {
+            // Parsed before the round trip: a typo costs an error naming what to
+            // type, not a call to the box that comes back with the same news.
+            let slug = slug
+                .as_deref()
+                .map(comet_board::onboard::parse_slug)
+                .transpose()?;
+            let labels = comet_board::onboard::label_filter(labels, all_issues);
+            let dir = dir.map(|d| d.to_string_lossy().to_string());
+            runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                let Some(slug) = slug else {
+                    let repos = ops::app_repos(&board).await?;
+                    return ops::print_candidates(&repos, board.host(), json);
+                };
+                let done = ops::onboard(&board, &slug, dir.as_deref(), labels.as_deref()).await?;
+                ops::print_onboarded(&done, board.host(), json)
+            })
+        }
         Command::Adopt {
             slug,
             labels,

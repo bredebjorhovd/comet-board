@@ -135,10 +135,28 @@ impl Repos {
 
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+        self.git_env(args, cwd, &[]).await
+    }
+
+    /// [`Repos::git`], with extra environment for the child.
+    ///
+    /// The environment is how a credential reaches git without being written
+    /// anywhere it outlives the command — see `comet_board::git_credentials`,
+    /// which builds the pairs. Nothing secret is in them: they name an askpass
+    /// helper, and the helper prints the token onto git's own pipe.
+    async fn git_env(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+    ) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         cmd.stdin(std::process::Stdio::null());
         let output = cmd
@@ -300,6 +318,81 @@ impl Repos {
             .await?;
         self.register(&target.to_string_lossy())?;
         self.to_repo(&target).await
+    }
+
+    /// Clone `url` to an exact path, authenticating with `env`, and leave the
+    /// checkout's `origin` set to `canonical_url` (gh#97).
+    ///
+    /// Three things [`Repos::clone_repo`] does not do, each for a reason:
+    ///
+    /// - **The caller names the path.** Onboarding clones where the operator
+    ///   works, not into the data dir, because the route's `repo =` points at
+    ///   this directory and a person is going to open it.
+    /// - **`env` carries the credential**, so a private repo the board's App can
+    ///   see clones without the box's own git identity being involved. The
+    ///   secret is never in argv or in the environment — the pairs name an
+    ///   askpass helper that mints at the moment git asks.
+    /// - **The remote is rewritten afterwards.** The URL that authenticates
+    ///   carries `x-access-token@`, which is a username, not a secret — but it
+    ///   is a username for a credential this checkout does not own, and a
+    ///   checkout outlives the clone that made it. The human who opens this
+    ///   folder should find the remote they would have typed.
+    ///
+    /// The parent directory is created; the target itself must not exist. A
+    /// clone that fails leaves nothing behind, so a retry is a clean retry.
+    pub async fn clone_to(
+        &self,
+        url: &str,
+        canonical_url: &str,
+        target: &Path,
+        env: &[(String, String)],
+    ) -> Result<Repo, EngineError> {
+        if Self::path_exists(target).await {
+            return Err(EngineError::Other(format!(
+                "Already exists: {}",
+                target.display()
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target_str = target.to_string_lossy().to_string();
+        if let Err(err) = self.git_env(&["clone", url, &target_str], None, env).await {
+            // A half-written clone is worse than none: it would read as an
+            // existing checkout on the next attempt and be *reused*.
+            let _ = std::fs::remove_dir_all(target);
+            return Err(err);
+        }
+        // Best-effort: a checkout that clones but will not answer `remote
+        // set-url` is still a working checkout, and failing the onboard over the
+        // cosmetics of its remote would be the wrong trade.
+        if canonical_url != url
+            && let Err(err) = self
+                .git(
+                    &["remote", "set-url", "origin", canonical_url],
+                    Some(target),
+                )
+                .await
+        {
+            tracing::warn!(path = %target.display(), error = %err, "clone: origin rewrite failed");
+        }
+        self.register(&target_str)?;
+        self.to_repo(target).await
+    }
+
+    /// The `origin` of a checkout, or `None` when the path is not one. The
+    /// existing-clone probe onboarding decides reuse on.
+    pub async fn origin_url(&self, path: &Path) -> Option<String> {
+        self.git(&["remote", "get-url", "origin"], Some(path))
+            .await
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Where [`Repos::clone_repo`] puts a clone — `{data_dir}/repos`, and the
+    /// default parent for an onboarding clone that was given no `--dir`.
+    pub fn clone_root(&self) -> PathBuf {
+        self.inner.data_dir.join("repos")
     }
 
     /// `git init -b main` a fresh repository under `{data_dir}/repos`.
