@@ -830,7 +830,7 @@ impl RoutingConfig {
         // as `off` on a board nobody told, and the checkouts would pile up
         // exactly as they did before gh#72.
         if let Err(e) = parse_retention(&self.defaults.retain_worktrees) {
-            bail!("[defaults] retain_worktrees {e}");
+            out.push(format!("[defaults] retain_worktrees {e}"));
         }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
