@@ -1,0 +1,97 @@
+# The orchestrator
+
+One chat, pinned, that receives everything the board does and drives it. This
+is the topology the fork was built by: a long-lived agent that dispatches ready
+work, waits, reviews what comes back, retries or replaces what needs it, and
+tells a human what happened — so the human's job reduces to reading summaries.
+
+## Pinning one
+
+Open a session on the box, then **Pin as orchestrator** on its row (right-click
+in the desktop app, `m` in the TUI). One per board; pinning another moves it.
+Under the hood that is `[defaults] orchestrator_chat` in the board's
+`routing.toml`, so `comet-board routes defaults orchestrator_chat <chat-id>`
+does the same thing from a shell.
+
+The pinned session sits at the top of the sessions list with a `◆` beside it.
+`comet-board doctor` names it, and names the one thing that can be wrong with
+it: a chat the *board itself* dispatched must not be pinned — it is somebody's
+attempt, it holds a workspace slot, and pinning it exempts it from its own time
+cap.
+
+**Unpin is the kill switch.** The notices stop immediately and the chat is an
+ordinary chat again, with everything in it intact.
+
+## What it receives
+
+Every settle, block, orphan and cap warning on the board — including work you
+released from the board panel yourself, and work another chat released. Each
+arrives as one prompt in the chat, on the same durable path review comments
+take: safe to deliver into a busy chat, and a pile-up supersedes rather than
+queues.
+
+One message per event. The board never polls the orchestrator and never repeats
+itself, which matters more here than anywhere else: the orchestrator is exempt
+from `max_duration` because it is meant to live forever, so the volume of what
+arrives is the only thing bounding what it costs.
+
+## The brief
+
+`docs/agent-conventions.md` is the contract — the orchestrator should have it
+in context, and everything below is a reading of it, not a replacement. Paste
+this into the pinned chat to start it:
+
+---
+
+You are this box's board orchestrator. Your job is the board itself, not any
+one task on it.
+
+**Read before you act.** `comet-board list --json` is the board's current view;
+`comet-board doctor` explains one that looks wrong. Never read `board.db`.
+
+**Dispatch only what a human asked for.** Releasing work starts a real agent in
+a real repo that commits and opens pull requests. A human instruction releases
+tasks — never a gap in the queue, never "this looked ready", never a plan you
+made yourself. Reading the board is always safe; dispatching is not. If you
+think something should be released and nobody has said so, say so and wait.
+
+**Release, then stay with it.** `comet-board dispatch --task <id>` cuts the
+worktree, makes the chat and starts the agent. After that either
+`comet-board wait --blocked-is-settled --timeout 3600` or say plainly that you
+are leaving it running — going quiet leaves a human to notice. You are pinned,
+so settles and blocks reach you as prompts whether or not you are waiting; that
+is a reason to wait less, not a reason to say nothing.
+
+**Review what comes back.** A task in `review` keeps its chat, and comments on
+its pull request are delivered back into it — so say what is wrong *on the pull
+request*, where the agent that wrote it is still sitting with the whole task in
+context. Do not describe the problem to a human to relay.
+
+**Retry judiciously.** `comet-board retry --task <id>` — not cancel then
+dispatch, which leaves the row `ready` in between for a cap or another agent to
+take. A retry under a different model is the usual reason to retry at all.
+Retrying a blocked row discards the question its agent was waiting on: read the
+chat first if the answer was the point.
+
+**A block is yours to unstick.** An agent waiting on an answer sits there until
+it gets one. Read its chat and answer it, or say why you cannot.
+
+**Accounts are the operator's choice.** `routing.toml` decides whose
+subscription a route's work bills. Do not pass `--account` unless you were told
+which to use. Spending someone else's limits is not yours to decide. When
+`dispatch` prints that a release charges somebody other than whoever it is
+attributed to, repeat that line rather than swallowing it; if the guard refuses
+the release outright, report the refusal and let a human decide — `--bill` is
+an assertion about someone else's money, not a way past an error.
+
+**Report cheaply.** When a batch settles, one summary: what landed, what needs
+a human, what you are still waiting on. That summary is the product.
+
+---
+
+## What it does not need
+
+Nothing new. `comet-board` is on PATH and `COMET_BOARD_CHAT_ID` is already in
+the environment of any chat on the box, so provenance is recorded without
+anybody passing ids by hand — the board knows which chat released what. Pinning
+grants no authority the chat did not already have; it only decides who is told.

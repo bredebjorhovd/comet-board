@@ -382,6 +382,32 @@ pub struct Defaults {
     /// never fires for operator-released work, which has no dispatcher.
     #[serde(default)]
     pub notify_dispatcher: bool,
+    /// The chat pinned as this board's orchestrator (gh#104): the one agent
+    /// that hears about **everything**, not only the work it released itself.
+    ///
+    /// [`notify_dispatcher`](Self::notify_dispatcher) wakes the chat that
+    /// released each task, which is the right audience for a chat that released
+    /// one thing and is waiting on it. It is the wrong audience for the
+    /// topology this fork was actually built by: one long-lived agent that
+    /// drives the whole board, dispatches, reviews, merges and backfills. That
+    /// agent has to hear about work an operator released from the board panel
+    /// and work a *sibling* released, because a board it only half sees is a
+    /// board it cannot run.
+    ///
+    /// So this is a superset target rather than a second switch on the same
+    /// channel: every settle, block, orphan and cap warning on the board is
+    /// prompted into this chat, through the same [`crate::runtime::Runtime`]
+    /// path review delivery uses. One per board — re-pinning moves it — and
+    /// unset (the default) is a board with no orchestrator and no notices,
+    /// which is what every board was before this existed.
+    ///
+    /// The value is a comet chat id. Nothing here can check that it names a
+    /// live chat: the board core has no runtime at parse time, so a stale id is
+    /// caught at delivery (the chat is gone; the log says so once) and named by
+    /// `doctor`. Empty string reads as unset rather than as a chat called ""
+    /// — see [`Defaults::orchestrator`].
+    #[serde(default)]
+    pub orchestrator_chat: Option<String>,
     /// Which tracker `comet-board new` writes to: `linear` or `github`.
     ///
     /// Not inferable from a label — a label routes work to a repo and says
@@ -431,6 +457,21 @@ fn default_billing_guard() -> String {
     crate::billing::GuardMode::default().as_str().to_string()
 }
 
+impl Defaults {
+    /// The pinned orchestrator's chat id, if there is one.
+    ///
+    /// Trimmed, and an empty value is `None`. A settings surface that clears a
+    /// text field writes `orchestrator_chat = ""` at least as often as it
+    /// removes the key, and a board that then tried to prompt a chat named ""
+    /// would log a delivery failure every settle for as long as nobody noticed.
+    pub fn orchestrator(&self) -> Option<&str> {
+        self.orchestrator_chat
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
+}
+
 fn default_max_duration() -> String {
     "2h".into()
 }
@@ -468,6 +509,7 @@ impl Default for Defaults {
             notify: true,
             notify_webhook: None,
             notify_dispatcher: false,
+            orchestrator_chat: None,
             new_source: default_new_source(),
             max_duration: default_max_duration(),
             retain_worktrees: default_retain_worktrees(),

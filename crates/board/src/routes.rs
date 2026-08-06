@@ -208,6 +208,10 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("base", Kind::Str),
     ("notify", Kind::Bool),
     ("notify_dispatcher", Kind::Bool),
+    // The pin (gh#104). Here rather than only in the frontends' hands because
+    // this is how it is *unset*: a settings surface can clear a key it wrote,
+    // and a board reached over ssh can too.
+    ("orchestrator_chat", Kind::Str),
     ("new_source", Kind::Str),
     ("max_duration", Kind::Str),
     ("billing_guard", Kind::Str),

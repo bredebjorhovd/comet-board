@@ -1,6 +1,7 @@
-//! Who gets told what, when a dispatched attempt blocks or settles (gh#71).
+//! Who gets told what, when a dispatched attempt blocks or settles (gh#71),
+//! plus the one chat that hears about all of it (gh#104).
 //!
-//! Three audiences, and they are genuinely different people:
+//! Four audiences, and they are genuinely different people:
 //!
 //! 1. **The task.** A blocked attempt posts one comment on its own issue —
 //!    the same trail the dispatch and outcome comments leave, and the only one
@@ -15,8 +16,15 @@
 //!    `[defaults] notify_dispatcher` is still the switch, and still off by
 //!    default, because an orchestrator woken by every child it released cannot
 //!    hold a train of thought.
-//! 3. **The operator, out of band.** Neither of the above reaches a human who
-//!    is not looking at the board or at GitHub. `[defaults] notify_webhook` is
+//! 3. **The pinned orchestrator.** The agent whose job is the *board*, not one
+//!    task on it ([`orchestrator_message`]). Audience 2 hears about the work it
+//!    released; this one hears about everything — including work an operator
+//!    released from the board panel, and work a sibling released — because a
+//!    board it only half sees is a board it cannot run. One chat, named by
+//!    `[defaults] orchestrator_chat`, delivered on the same [`Signal`]s plus
+//!    the duration cap's warning ([`Event`]).
+//! 4. **The operator, out of band.** None of the above reaches a human who is
+//!    not looking at the board or at GitHub. `[defaults] notify_webhook` is
 //!    one URL, POSTed [`webhook_payload`] on both events.
 //!
 //! ## Why one webhook and no integrations
@@ -190,11 +198,32 @@ pub fn dispatcher_message(
     evidence: Option<Evidence>,
     pr_url: Option<&str>,
 ) -> String {
+    let mut s = "comet-board: work you released has finished.\n\n".to_string();
+    s.push_str(&settled_block(task, attempt, outcome, evidence, pr_url));
+    s.push_str(
+        "\nNo agent is working on it any more. `comet-board list --json` for the board's \
+         current view; if this was a step in something you are running, this is your cue \
+         to carry on.\n",
+    );
+    s
+}
+
+/// The identity block every settle notice shares: which task, which attempt,
+/// how it ended, and the two artifacts a reader immediately wants.
+///
+/// One builder rather than one per audience, because the moment the dispatcher
+/// and the orchestrator describe the same settle differently, the wording in
+/// `docs/agent-conventions.md` stops being the contract for either of them.
+fn settled_block(
+    task: &Task,
+    attempt: &Attempt,
+    outcome: Outcome,
+    evidence: Option<Evidence>,
+    pr_url: Option<&str>,
+) -> String {
     let mut s = format!(
-        "comet-board: work you released has finished.\n\n  {} · {}\n  {}\n  attempt {} · {}",
-        task.identifier,
-        task.title,
-        task.url,
+        "{}  attempt {} · {}",
+        task_lines(task),
         attempt_no(task),
         outcome.as_str(),
     );
@@ -209,12 +238,156 @@ pub fn dispatcher_message(
     if let Some(branch) = attempt.branch.as_deref() {
         s.push_str(&format!("  branch: {branch}\n"));
     }
-    s.push_str(
-        "\nNo agent is working on it any more. `comet-board list --json` for the board's \
-         current view; if this was a step in something you are running, this is your cue \
-         to carry on.\n",
-    );
     s
+}
+
+/// Which task, in the two lines every notice opens with. Shared for the same
+/// reason [`settled_block`] is: three events describing the same row three
+/// slightly different ways is how a format nobody can parse gets written.
+fn task_lines(task: &Task) -> String {
+    format!("  {} · {}\n  {}\n", task.identifier, task.title, task.url)
+}
+
+/// Everything the pinned orchestrator is told about, which is a superset of
+/// what [`Signal`] carries.
+///
+/// The duration cap's warning is here and not on `Signal` because the two are
+/// answering different questions. `Signal` is "something happened to an attempt
+/// and it is over or stuck", which is what the webhook and the issue comment
+/// are about. A cap warning is the opposite — the attempt is *still running*,
+/// and the only party who can do anything before the grace expires is an agent
+/// that can go and look at it. Putting it on `Signal` would POST every operator
+/// a notice about a run that is still fine.
+pub enum Event<'a> {
+    /// A settle, a block or an orphan — the same events audience 2 gets.
+    Signal(&'a Signal),
+    /// An attempt has passed its route's `max_duration` and will be cancelled
+    /// when the grace runs out (gh#70).
+    CapWarning {
+        age_secs: i64,
+        cap_secs: u64,
+        grace_secs: u64,
+    },
+}
+
+/// The prompt queued into the pinned orchestrator's chat (gh#104).
+///
+/// Same body as the settle notice audience 2 gets — deliberately, so the one
+/// description in `docs/agent-conventions.md` covers both — with two
+/// differences that come from the orchestrator not being the party that
+/// released the work:
+///
+/// - The lead line does not claim it released anything. Most of what reaches
+///   the orchestrator was released by an operator, or by a sibling chat.
+/// - It names who *did* release it, when the board recorded anyone. That is the
+///   fact an orchestrator acts on: work it released is a step in its own plan,
+///   and work somebody else released is something it has just been handed.
+pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> String {
+    let mut s = match event {
+        Event::Signal(Signal::Settled { .. }) => {
+            "comet-board: work on the board has finished.\n\n".to_string()
+        }
+        Event::Signal(Signal::Blocked(_)) => {
+            "comet-board: work on the board is blocked.\n\n".to_string()
+        }
+        Event::CapWarning { .. } => "comet-board: an attempt is past its time cap.\n\n".to_string(),
+    };
+    match event {
+        Event::Signal(Signal::Settled {
+            outcome,
+            evidence,
+            pr_url,
+        }) => s.push_str(&settled_block(
+            task,
+            attempt,
+            *outcome,
+            *evidence,
+            pr_url.as_deref(),
+        )),
+        Event::Signal(Signal::Blocked(why)) => {
+            s.push_str(&format!(
+                "{}  attempt {} · blocked ({})\n",
+                task_lines(task),
+                attempt_no(task),
+                why.as_str(),
+            ));
+            if let Some(chat) = attempt.pane_id.as_deref() {
+                s.push_str(&format!("  chat: {chat}\n"));
+            }
+        }
+        Event::CapWarning {
+            age_secs,
+            cap_secs,
+            grace_secs,
+        } => {
+            s.push_str(&format!(
+                "{}  attempt {} · running for {}, cap {}\n",
+                task_lines(task),
+                attempt_no(task),
+                crate::overrun::human_secs(*age_secs),
+                crate::overrun::human_secs(*cap_secs as i64),
+            ));
+            if let Some(chat) = attempt.pane_id.as_deref() {
+                s.push_str(&format!("  chat: {chat}\n"));
+            }
+            s.push_str(&format!(
+                "  will be cancelled in {}\n",
+                crate::overrun::human_secs(*grace_secs as i64)
+            ));
+        }
+    }
+    if let Some(by) = released_by(attempt) {
+        s.push_str(&format!("  released by: {by}\n"));
+    }
+    s.push('\n');
+    s.push_str(match event {
+        Event::Signal(Signal::Settled { .. }) => {
+            "No agent is working on it any more. `comet-board list --json` for the board's \
+             current view; review it, or carry on with whatever you were running.\n"
+        }
+        Event::Signal(Signal::Blocked(why)) => match why {
+            Stopped::Asking => {
+                "It is waiting on an answer and will sit there until it gets one. Read the \
+                 chat and answer it, or `comet-board retry --task <id>` under a different \
+                 model — which discards the question.\n"
+            }
+            Stopped::Errored => {
+                "The run died; the chat still holds the whole task, so this is a retry or a \
+                 cancel, not a lost attempt.\n"
+            }
+            Stopped::Unknown => {
+                "Either it is waiting on an answer or its run died — the chat will say \
+                 which. Nothing further happens until somebody picks it up.\n"
+            }
+        },
+        Event::CapWarning { .. } => {
+            "The agent has been told to commit and open a pull request. Nothing is required \
+             of you before the grace expires; after it, the attempt closes `failed` and is \
+             yours to retry or leave.\n"
+        }
+    });
+    s
+}
+
+/// Who released this attempt, as a line the orchestrator can read.
+///
+/// The task the releasing agent was itself running is the richest answer, its
+/// chat the one that is always recorded, and the human's name a claim a
+/// frontend made rather than something the board verified — so it is rendered
+/// as attribution beside the chat, never instead of it. `None` is the operator
+/// at a keyboard, which needs no line: it is the default assumption.
+fn released_by(attempt: &Attempt) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(task) = attempt.dispatched_by.as_deref() {
+        parts.push(task.to_string());
+    }
+    if let Some(chat) = attempt.dispatched_by_pane.as_deref() {
+        parts.push(format!("chat {chat}"));
+    }
+    if let Some(user) = attempt.dispatched_by_user.as_deref() {
+        parts.push(format!("for {user}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// The JSON body POSTed to `[defaults] notify_webhook`.
@@ -478,6 +651,92 @@ mod tests {
             m.contains("no pull request"),
             "an absent PR is a fact the dispatcher has to act on, not an omission"
         );
+    }
+
+    /// The point of sharing [`settled_block`]: whatever else the two notices
+    /// say, they describe the settle itself identically — which is what lets
+    /// `docs/agent-conventions.md` document it once.
+    #[test]
+    fn the_orchestrator_and_the_dispatcher_describe_a_settle_the_same_way() {
+        let (t, a) = (task(), attempt());
+        let signal = Signal::Settled {
+            outcome: Outcome::Done,
+            evidence: Some(Evidence::PullRequest),
+            pr_url: Some("https://github.com/o/r/pull/7".into()),
+        };
+        let to_dispatcher = dispatcher_message(
+            &t,
+            &a,
+            Outcome::Done,
+            Some(Evidence::PullRequest),
+            Some("https://github.com/o/r/pull/7"),
+        );
+        let to_orchestrator = orchestrator_message(&t, &a, &Event::Signal(&signal));
+        let block = settled_block(
+            &t,
+            &a,
+            Outcome::Done,
+            Some(Evidence::PullRequest),
+            Some("https://github.com/o/r/pull/7"),
+        );
+        assert!(to_dispatcher.contains(&block));
+        assert!(to_orchestrator.contains(&block));
+        // ...and only the orchestrator's is careful not to claim it released it.
+        assert!(to_dispatcher.contains("work you released"));
+        assert!(!to_orchestrator.contains("work you released"));
+    }
+
+    /// Most of what reaches the orchestrator is somebody else's dispatch, and
+    /// which somebody is the difference between "a step in my own plan landed"
+    /// and "I have just been handed something".
+    #[test]
+    fn the_orchestrator_is_told_who_released_the_work() {
+        let mut a = attempt();
+        a.dispatched_by = Some("linear:LIN-9".into());
+        a.dispatched_by_user = Some("brede@tally.no".into());
+        let signal = Signal::Blocked(Stopped::Asking);
+        let m = orchestrator_message(&task(), &a, &Event::Signal(&signal));
+        assert!(m.contains("released by: linear:LIN-9 · chat chat-parent · for brede@tally.no"));
+        // An operator's dispatch records nobody, and a line saying so would be
+        // noise on the common case.
+        let mut bare = attempt();
+        bare.dispatched_by_pane = None;
+        assert!(
+            !orchestrator_message(&task(), &bare, &Event::Signal(&signal)).contains("released by")
+        );
+    }
+
+    /// A block reaching the orchestrator has to say what unsticks it — it is
+    /// the one event where nothing at all happens until somebody acts.
+    #[test]
+    fn a_block_tells_the_orchestrator_what_to_do_about_it() {
+        let asking = Signal::Blocked(Stopped::Asking);
+        let errored = Signal::Blocked(Stopped::Errored);
+        let a = orchestrator_message(&task(), &attempt(), &Event::Signal(&asking));
+        let e = orchestrator_message(&task(), &attempt(), &Event::Signal(&errored));
+        assert!(a.contains("waiting on an answer"));
+        assert!(a.contains("comet-board retry"));
+        assert!(e.contains("The run died"));
+        // The chat is the address the answer has to be typed into.
+        assert!(a.contains("chat: chat-9"));
+    }
+
+    /// The cap warning is the one notice about a run that is still going, so it
+    /// has to say how long is left and that nothing is required of the reader.
+    #[test]
+    fn a_cap_warning_names_the_remaining_grace() {
+        let m = orchestrator_message(
+            &task(),
+            &attempt(),
+            &Event::CapWarning {
+                age_secs: 7_500,
+                cap_secs: 7_200,
+                grace_secs: 600,
+            },
+        );
+        assert!(m.contains("running for 2h 5m, cap 2h"));
+        assert!(m.contains("will be cancelled in 10m"));
+        assert!(m.contains("Nothing is required of you"));
     }
 
     #[test]

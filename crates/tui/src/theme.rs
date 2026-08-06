@@ -193,6 +193,17 @@ impl Theme {
         }
     }
 
+    /// The mark on the session pinned as the board's orchestrator (gh#104).
+    /// Accent where there is colour; the glyph is shape-distinct anyway, so
+    /// `plain` drops to weight without the row losing what it says.
+    pub fn orchestrator(&self) -> Style {
+        if self.plain {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.accent)
+        }
+    }
+
     /// Section labels ("Sessions").
     pub fn label(&self) -> Style {
         let style = Style::default().fg(self.muted);

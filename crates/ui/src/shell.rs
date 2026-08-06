@@ -1369,6 +1369,71 @@ impl Shell {
         cx.notify();
     }
 
+    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#104).
+    ///
+    /// `[defaults] orchestrator_chat` on the board's `routing.toml`, written
+    /// through `WriteBoardConfig` — the same validated, backed-up path the
+    /// routing settings page uses, rather than a second way to edit that file.
+    /// `None` removes the key: the notices stop and the chat goes back to being
+    /// an ordinary chat, which is the whole of the kill switch.
+    ///
+    /// Nothing is applied optimistically. The board republishes the pin as the
+    /// write lands, so the glyph appearing *is* the box agreeing; a refusal
+    /// leaves the list as it was and says why.
+    fn set_orchestrator(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let (devices, local) = {
+            let state = self.state.read(cx);
+            (state.devices.clone(), state.local_device_id.clone())
+        };
+        // The board is on one device and this may not be it. Sweep the same
+        // candidates its panel does; the first host that accepts the write is
+        // the one hosting the board.
+        let candidates = comet_proto::view::board::host_candidates(&devices, local.as_deref());
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
+            let mut last: Option<String> = None;
+            for candidate in candidates {
+                let mut params = serde_json::json!({
+                    "op": "default", "key": "orchestrator_chat"
+                });
+                if let Some(object) = params.as_object_mut() {
+                    if let Some(id) = &chat_id {
+                        object.insert("value".into(), serde_json::json!(id));
+                    }
+                    if let Some(host) = candidate.as_deref() {
+                        object.insert("targetDeviceId".into(), serde_json::json!(host));
+                    }
+                }
+                match engine
+                    .client()
+                    .call(methods::WRITE_BOARD_CONFIG, params)
+                    .await
+                {
+                    // The pin arrives back on the watch stream, not from here.
+                    Ok(_) => return,
+                    Err(err) => last = Some(err.to_string()),
+                }
+            }
+            this.update(cx, |shell, cx| {
+                shell.sidebar_notice = Some(
+                    match last {
+                        Some(err) => format!("No device here hosts a board ({err})"),
+                        None => "No device here hosts a board".to_string(),
+                    }
+                    .into(),
+                );
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -1927,6 +1992,9 @@ impl Shell {
         harness: Option<comet_proto::HarnessId>,
         status: comet_proto::ChatIndicator,
         selected: bool,
+        // The board's pinned orchestrator (gh#104) — marked, and drawn first in
+        // the list by `AppState::overview_chats`.
+        orchestrator: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2001,6 +2069,22 @@ impl Shell {
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
                     .child(status_rail)
+                    // The mark sits between the status rail and the space name:
+                    // the rail still says what the agent is doing, and this
+                    // says which agent this is. Shape-distinct rather than
+                    // colour-only, on the same rule the board glyphs follow.
+                    .when(orchestrator, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .line_height(px(14.0))
+                                .text_color(theme.accent)
+                                .child(SharedString::from(
+                                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -2596,6 +2680,11 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            // Unpinning is the same item on the row that is pinned: whoever
+            // wants the notices to stop reaches for the session they pinned,
+            // not for a settings page.
+            let pinned = self.state.read(cx).is_orchestrator(&chat_id);
+            let pin_target = (!pinned).then(|| chat_id.clone());
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2625,6 +2714,24 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Archive")),
+                )
+                .child(popover::menu_separator(&theme))
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_orchestrator(pin_target.clone(), cx)
+                        }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(if pinned {
+                            theme.accent
+                        } else {
+                            theme.text_muted
+                        }))
+                        .child(SharedString::from(if pinned {
+                            "Unpin as orchestrator"
+                        } else {
+                            "Pin as orchestrator"
+                        })),
                 )
                 .child(popover::menu_separator(&theme))
                 .child(

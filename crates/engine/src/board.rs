@@ -40,6 +40,7 @@ use comet_board::model::{AgentStatus, Outcome};
 use comet_board::rows::{TaskRow, board_rows};
 use comet_board::runtime::{Runtime, agent_status};
 use comet_board::sync::{SessionStatuses, SyncEngine};
+use comet_proto::view::board::OrchestratorPin;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
 
@@ -78,6 +79,14 @@ pub struct BoardService {
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     watch_task: tokio::task::JoinHandle<()>,
     rows: watch::Receiver<Vec<TaskRow>>,
+    /// The pinned orchestrator (gh#104). Held as the *sender* so two writers
+    /// can reach it: the loop, which republishes whenever it rereads
+    /// `routing.toml` (an `$EDITOR` over ssh), and
+    /// [`BoardService::note_config`], which republishes the instant a
+    /// `WriteBoardConfig` lands — pinning a chat from the app is a direct
+    /// action, and a glyph that appeared up to a sync interval later would read
+    /// as the click not having worked.
+    orchestrator: Arc<watch::Sender<OrchestratorPin>>,
     /// Where this board's `routing.toml`, `.env` and store live. Kept here so
     /// the config RPCs (gh#75) resolve them off the running service rather than
     /// re-deriving them from the data dir — two answers to "which routing.toml"
@@ -116,6 +125,8 @@ impl BoardService {
         drop(comet_board::db::Db::open(&paths.db())?);
         let (tx, rx) = mpsc::channel::<Msg>();
         let (rows_tx, rows_rx) = watch::channel(Vec::<TaskRow>::new());
+        let pin_tx = Arc::new(watch::Sender::new(OrchestratorPin::default()));
+        let loop_pin = pin_tx.clone();
 
         // Forward every watch snapshot (current value first — the loop must
         // not treat "no snapshot yet" as "every chat is missing").
@@ -137,7 +148,13 @@ impl BoardService {
             .name("comet-board-sync".into())
             .spawn(
                 move || match SyncEngine::from_paths(&loop_paths, log.clone()) {
-                    Ok(engine) => run_loop(engine, rx, log, runtime, handle, spaces, rows_tx),
+                    Ok(engine) => {
+                        let feeds = Feeds {
+                            rows: rows_tx,
+                            pin: loop_pin,
+                        };
+                        run_loop(engine, rx, log, runtime, handle, spaces, feeds)
+                    }
                     Err(e) => log.error(format!("board loop failed to start: {e}")),
                 },
             )?;
@@ -147,6 +164,7 @@ impl BoardService {
             thread: std::sync::Mutex::new(Some(thread)),
             watch_task,
             rows: rows_rx,
+            orchestrator: pin_tx,
             paths,
         })
     }
@@ -164,6 +182,28 @@ impl BoardService {
     /// The board's rows, current value first — what `WatchBoard` streams.
     pub fn watch_rows(&self) -> watch::Receiver<Vec<TaskRow>> {
         self.rows.clone()
+    }
+
+    /// The pinned orchestrator, current value first — what
+    /// `WatchBoardOrchestrator` streams (gh#104).
+    pub fn watch_orchestrator(&self) -> watch::Receiver<OrchestratorPin> {
+        self.orchestrator.subscribe()
+    }
+
+    /// A `routing.toml` write just landed: republish anything derived from it
+    /// that a frontend is watching, without waiting for the loop's next reread.
+    ///
+    /// Only the pin today. Called with the same `RoutingView` the write
+    /// returns — the parse of what is now on disk — so this cannot disagree
+    /// with the reply the caller gets back. A file that does not parse leaves
+    /// the pin as it was: the loop is still running on the last good config,
+    /// and a frontend un-pinning itself over a syntax error would be a second
+    /// lie on top of the first.
+    pub fn note_config(&self, view: &comet_board::routes::RoutingView) {
+        let Some(cfg) = view.config.as_ref() else {
+            return;
+        };
+        publish_pin(&self.orchestrator, cfg.defaults.orchestrator());
     }
 
     /// Release a task: resolve its route, cut the checkout, create the chat,
@@ -252,6 +292,14 @@ impl Drop for BoardService {
     }
 }
 
+/// What the loop publishes out to subscribers: the board's rows
+/// (`WatchBoard`) and its pinned orchestrator (`WatchBoardOrchestrator`). One
+/// struct because they are the loop's outputs and travel as a set.
+struct Feeds {
+    rows: watch::Sender<Vec<TaskRow>>,
+    pin: Arc<watch::Sender<OrchestratorPin>>,
+}
+
 fn run_loop(
     mut engine: SyncEngine,
     rx: mpsc::Receiver<Msg>,
@@ -259,7 +307,7 @@ fn run_loop(
     runtime: Arc<dyn Runtime + Send + Sync>,
     handle: tokio::runtime::Handle,
     spaces: watch::Receiver<Vec<Space>>,
-    rows: watch::Sender<Vec<TaskRow>>,
+    feeds: Feeds,
 ) {
     // The loop is a plain thread, but dispatch/cancel call engine code that
     // `tokio::spawn`s (doc_host.open) and `Handle::block_on`s (CometRuntime).
@@ -275,6 +323,10 @@ fn run_loop(
     // First cycle immediately: an operator starting the engine wants the board
     // fresh now, not in one interval.
     let mut next_sync = Instant::now();
+    // Before the first cycle: a frontend that connects to a box whose board is
+    // mid-poll should see the pin it already has, not "unpinned" for a whole
+    // interval and then a glyph appearing under the cursor.
+    publish_pin(&feeds.pin, engine.cfg.defaults.orchestrator());
     loop {
         if Instant::now() >= next_sync {
             // Credentials and routes are read at startup, but the engine
@@ -282,6 +334,10 @@ fn run_loop(
             // next cycle rather than requiring a restart.
             if let Some(fresh) = engine.reload_if_configuration_changed() {
                 engine = fresh;
+                // The reload is the only moment the pin can have moved: it is a
+                // `routing.toml` key, so `WriteBoardConfig` from a laptop and an
+                // `$EDITOR` over ssh both land here and nowhere else.
+                publish_pin(&feeds.pin, engine.cfg.defaults.orchestrator());
             }
             match engine.sync_once_with(statuses.as_ref(), Some(runtime.as_ref())) {
                 // Review delivery rides the cycle's own PR poll, and runs
@@ -289,7 +345,7 @@ fn run_loop(
                 Ok(pulls) => engine.deliver_reviews(runtime.as_ref(), &pulls),
                 Err(e) => log.error(format!("sync cycle failed: {e}")),
             }
-            publish_rows(&engine, &rows, &log);
+            publish_rows(&engine, &feeds.rows, &log);
             next_sync = Instant::now() + Duration::from_secs(engine.cfg.sync.interval_secs());
         }
         let wait = next_sync.saturating_duration_since(Instant::now());
@@ -299,7 +355,7 @@ fn run_loop(
                 // The event fast path: statuses, plus §H4's settle/reopen —
                 // the clocked lifecycle (orphaning) stays on the interval.
                 match engine.refresh_statuses_with(&mapped, Some(runtime.as_ref())) {
-                    Ok(true) => publish_rows(&engine, &rows, &log),
+                    Ok(true) => publish_rows(&engine, &feeds.rows, &log),
                     Ok(false) => {}
                     Err(e) => log.warn(format!("refreshing agent statuses: {e}")),
                 }
@@ -328,7 +384,7 @@ fn run_loop(
                     )),
                     Err(e) => log.error(format!("dispatch of {task_id} failed: {e:#}")),
                 }
-                publish_rows(&engine, &rows, &log);
+                publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
             Ok(Msg::Cancel { task_id, reply }) => {
@@ -336,7 +392,7 @@ fn run_loop(
                 if let Err(e) = &result {
                     log.error(format!("cancel of {task_id} failed: {e:#}"));
                 }
-                publish_rows(&engine, &rows, &log);
+                publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -346,6 +402,22 @@ fn run_loop(
             }
         }
     }
+}
+
+/// Publish the pinned orchestrator to `WatchBoardOrchestrator` subscribers
+/// (gh#104) — only when it actually changed, so the sidebars are not woken by
+/// every cycle that read the same config back.
+fn publish_pin(pin: &watch::Sender<OrchestratorPin>, chat_id: Option<&str>) {
+    let fresh = OrchestratorPin {
+        chat_id: chat_id.map(str::to_string),
+    };
+    pin.send_if_modified(|current| {
+        if *current == fresh {
+            return false;
+        }
+        *current = fresh;
+        true
+    });
 }
 
 /// Re-read the board and publish it to `WatchBoard` subscribers — only when it

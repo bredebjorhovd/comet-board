@@ -354,8 +354,8 @@ enum RoutesCommand {
     /// Set one key under `[defaults]`: `routes defaults max_duration 4h`.
     Defaults {
         /// One of: max_concurrent_per_workspace, branch_template, base,
-        /// notify, notify_dispatcher, new_source, max_duration,
-        /// billing_guard.
+        /// notify, notify_dispatcher, orchestrator_chat, new_source,
+        /// max_duration, billing_guard.
         key: String,
         value: Option<String>,
         #[arg(long, conflicts_with = "value")]

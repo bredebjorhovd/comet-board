@@ -7,6 +7,12 @@ issues come in, a dispatch releases a task into a comet chat with a coding
 agent, and session state reconciles back to the board and the trackers.
 Agents read the board and dispatch from it themselves.
 
+Pin one chat as the board's **orchestrator** and it receives every settle,
+block, orphan and cap warning on the board — so one long-lived agent can
+dispatch, review, retry and report while your job reduces to reading its
+summaries. [docs/orchestrator.md](docs/orchestrator.md) is the brief to open
+that chat with.
+
 Board code lives in `crates/board`; the port's status, design mapping, and
 remaining work are in [docs/BOARD.md](docs/BOARD.md). Upstream comet is the
 `upstream` remote; everything below this section is its README.
