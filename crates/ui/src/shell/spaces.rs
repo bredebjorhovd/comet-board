@@ -804,7 +804,10 @@ impl Shell {
                 })
                 .collect()
         };
-        let selected = self.state.read(cx).selected_chat.clone();
+        let (selected, pinned) = {
+            let state = self.state.read(cx);
+            (state.selected_chat.clone(), state.orchestrator.clone())
+        };
         rows.into_iter()
             .map(|(status, chat, folder, branch)| {
                 let time_ago: SharedString =
@@ -824,6 +827,7 @@ impl Shell {
                     harness,
                     status,
                     is_selected,
+                    pinned.as_deref() == Some(chat.id.as_str()),
                     theme,
                     cx,
                 );

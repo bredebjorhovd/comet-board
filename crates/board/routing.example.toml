@@ -137,7 +137,7 @@ branch_template = "board/{identifier_lower}"
 # retry is unaffected either way: it reuses the branch the first attempt cut,
 # with its commits, and never rebases it onto a newer base.
 base = "origin/HEAD"
-# Notifications. Three audiences, and they are genuinely different:
+# Notifications. Four audiences, and they are genuinely different:
 #
 #   the issue    A blocked attempt — the agent stopped to ask, or its run died
 #                — leaves one comment on its own issue, per block. Not
@@ -146,6 +146,9 @@ base = "origin/HEAD"
 #                night. (GitHub still obeys `[github] writeback` per repo.)
 #   the agent    `notify_dispatcher`, below — a dispatching orchestrator gets
 #                a prompt in its own chat when the work it released settles.
+#   the board's  `orchestrator_chat`, below — one pinned chat that hears about
+#   orchestrator every settle, block, orphan and cap warning, including work it
+#                did not release itself.
 #   you          `notify` + `notify_webhook`, here. The only channel that
 #                reaches somebody looking at neither the board nor the tracker.
 #
@@ -159,6 +162,24 @@ base = "origin/HEAD"
 # POST.
 # notify = true
 # notify_webhook = "https://hooks.example.com/comet-board"
+# The pinned orchestrator: one chat that receives everything and drives the
+# board. `notify_dispatcher` wakes whoever released each task, which is right
+# for a chat waiting on one thing and wrong for the agent whose job is the whole
+# board — it has to hear about work you released from the panel and work a
+# sibling released too. Name its chat id here and it does.
+#
+# It is an ordinary chat: no workspace slot (the board did not dispatch it),
+# though everything it releases counts against the caps like anyone's, and it
+# bills whatever account its chat config names. It is exempt from
+# `max_duration`, because it is meant to outlive every attempt on the board — so
+# the thing to watch is notice volume, and the board sends exactly one prompt
+# per event and never polls. Unset it and the notices stop; the chat carries on
+# as an ordinary chat.
+#
+# Easier set from the app than from here: "Pin as orchestrator" on a session in
+# the desktop app or the TUI writes this key for you. `docs/orchestrator.md` is
+# the brief to open it with.
+# orchestrator_chat = "chat_01J8Z…"
 # Which tracker `comet-board new` writes to: "linear" or "github". This is not
 # inferable — a label routes work to a repo and says nothing about where that
 # project's tickets live. This board's own backlog may be in Linear while its

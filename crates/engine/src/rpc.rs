@@ -1030,6 +1030,7 @@ fn forwardable(method: &str) -> bool {
             // was per-USER until then, which is what kept a second teammate
             // out), exactly as for every other forwardable call.
             | methods::WATCH_BOARD
+            | methods::WATCH_BOARD_ORCHESTRATOR
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
             | methods::LIST_BOARD_RUNTIMES
@@ -1057,6 +1058,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
             | methods::WATCH_BOARD
+            | methods::WATCH_BOARD_ORCHESTRATOR
     )
 }
 
@@ -1323,6 +1325,9 @@ impl RpcService for EngineRpc {
             // Board surface (comet-board fork, docs/BOARD.md §H2). Served off
             // the board service's loop; absent when the board is disabled.
             methods::WATCH_BOARD => Ok(RpcReply::Stream(watch_stream(self.board()?.watch_rows()))),
+            methods::WATCH_BOARD_ORCHESTRATOR => Ok(RpcReply::Stream(watch_stream(
+                self.board()?.watch_orchestrator(),
+            ))),
             // The runtimes a dispatch can be pointed at — a static catalog from
             // the board core, so the pickers and the engine validate against
             // the same set. Not board-loop state: served regardless of the
@@ -1379,6 +1384,11 @@ impl RpcService for EngineRpc {
                 let view = self
                     .write_board_config(&paths, p)
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                // Republish what a frontend is watching off this file before
+                // replying (gh#104): pinning a chat is a direct action, and the
+                // sidebar glyph should be there when the click returns rather
+                // than up to a sync interval later.
+                self.board()?.note_config(&view);
                 RpcReply::value(&self.config_reply(view).await?)
             }
             // Clone + space + adopt, all on this device (gh#97). Slow by

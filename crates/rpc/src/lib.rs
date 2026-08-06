@@ -114,6 +114,15 @@ pub mod methods {
     /// name + label per harness, the set the engine validates overrides
     /// against. Params: `{}` → `[{name, label}]`.
     pub const LIST_BOARD_RUNTIMES: &str = "ListBoardRuntimes";
+    /// Stream: which chat is pinned as this board's orchestrator (gh#104),
+    /// current value first, then every change. Params: `{}` → `{chatId}`.
+    ///
+    /// Separate from [`WATCH_BOARD`] because it answers a question about the
+    /// board rather than about the work on it, and every surface that renders
+    /// the pin — the session list, on both viewports — needs it whether or not
+    /// a board panel is open. Written through [`WRITE_BOARD_CONFIG`], like
+    /// every other `routing.toml` key: one writer discipline, not two.
+    pub const WATCH_BOARD_ORCHESTRATOR: &str = "WatchBoardOrchestrator";
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";

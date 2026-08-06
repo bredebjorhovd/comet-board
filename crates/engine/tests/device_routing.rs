@@ -776,6 +776,55 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         "got: {set}"
     );
 
+    // gh#104: the pin is a `routing.toml` key like any other, so A can set it
+    // on B's board — and B's `WatchBoardOrchestrator` says so at once rather
+    // than on its next reread, because pinning is a click and not a poll.
+    let mut pinned = client
+        .subscribe(
+            methods::WATCH_BOARD_ORCHESTRATOR,
+            serde_json::json!({ "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote WatchBoardOrchestrator");
+    let first = pinned.recv().await.expect("the current value first");
+    assert!(
+        first["chatId"].is_null(),
+        "nothing is pinned on B yet: {first}"
+    );
+
+    client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "default", "key": "orchestrator_chat", "value": "chat-boss",
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect("remote pin");
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), pinned.recv())
+        .await
+        .expect("the pin is published without waiting for a sync cycle")
+        .expect("a frame");
+    assert_eq!(next["chatId"].as_str(), Some("chat-boss"), "got: {next}");
+
+    // And the kill switch: unpinning removes the key and the stream says so.
+    client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "default", "key": "orchestrator_chat",
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect("remote unpin");
+    let cleared = tokio::time::timeout(std::time::Duration::from_secs(5), pinned.recv())
+        .await
+        .expect("unpinning is published too")
+        .expect("a frame");
+    assert!(cleared["chatId"].is_null(), "got: {cleared}");
+
     core_a.shutdown().await;
     core_b.shutdown().await;
 }

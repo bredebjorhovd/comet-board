@@ -155,8 +155,10 @@ is this board's `review`.
    to notice the agent finished and to prompt you. Either `wait` for it, or say
    plainly that you are leaving it running. A board configured with
    `notify_dispatcher` will prompt you in this chat when work you released
-   settles — but it is off by default and you cannot tell from here, so never
-   promise that you will be woken. Note also that `wait` does **not** return on
+   settles, and a board that has pinned this chat as its **orchestrator** will
+   prompt you about every settle, block, orphan and cap warning on the board —
+   including work you did not release. Both are off by default and you cannot
+   tell which is on from here, so never promise that you will be woken. Note also that `wait` does **not** return on
    `blocked` by default: an agent that stops to ask a question holds its
    attempt open, and a plain `wait` on it hangs until somebody answers. Pass
    `--blocked-is-settled` to be called back on the question too; either way the
@@ -166,6 +168,17 @@ is this board's `review`.
     real repo that commits and opens PRs. A human keypress — or an explicit
     instruction — releases tasks. Reading the board is always safe; dispatching
     is not.
+
+**One chat may be pinned as the board's orchestrator.** If this one is, you
+receive a `comet-board:` prompt for every settle, block, orphan and cap warning
+on the board — not only for work you released — and it is one message per
+event, never a stream. Everything else about you is unchanged: you hold no
+workspace slot, everything you release counts against the caps like anyone's,
+and you bill whatever account your chat names. You are exempt from
+`max_duration` because you are meant to outlive every attempt, which makes
+restraint your responsibility rather than the clock's: never poll the board in
+a loop, and never dispatch because a queue looked empty. Being told about work
+is not being told to release any. `docs/orchestrator.md` is the brief.
 
 **Reviewing a pull request is how you reach the agent that wrote it.** The board
 delivers new comments on an open PR back into the chat that produced it — the

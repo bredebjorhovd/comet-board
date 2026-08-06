@@ -129,6 +129,35 @@ pub struct RuntimeOption {
     pub harness: crate::HarnessId,
 }
 
+/// The mark a pinned orchestrator's session row carries, on both viewports.
+///
+/// Shape-distinct from every [`BoardState::glyph`] and from the session dot, on
+/// the same rule those follow: it has to survive colour being stripped, because
+/// one row in the list meaning something different from all the others is the
+/// whole point of drawing it.
+pub const ORCHESTRATOR_GLYPH: &str = "◆";
+
+/// Which chat, if any, is pinned as this board's orchestrator (gh#104).
+///
+/// A frame of its own rather than a field on [`TaskRow`], and a *stream* rather
+/// than a read, for the same reason: the pin is a property of the board and not
+/// of any task on it, and every surface that renders it — the sidebar, on both
+/// viewports — needs it before a board panel has ever been opened. Reading it
+/// off `ReadBoardConfig` would work and would cost a git probe per space every
+/// time, which is the wrong price for a glyph.
+///
+/// A struct rather than a bare `Option<String>` because this is the frame a
+/// pinned-chat feature grows in: `null` today means unpinned, and a field added
+/// beside it later does not change what an old client already parses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorPin {
+    /// The pinned chat's id. `None` = this board has no orchestrator, which is
+    /// the default and a legitimate way to run one.
+    #[serde(default)]
+    pub chat_id: Option<String>,
+}
+
 /// One task, in the shape callers are promised: herdr-board's `list --json`
 /// contract with the pane→chat rename applied.
 ///

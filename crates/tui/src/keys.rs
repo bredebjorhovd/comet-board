@@ -427,7 +427,10 @@ pub const HELP: &[(&str, &str)] = &[
         "Ctrl-W / Ctrl-U / Ctrl-K",
         "delete word / to line start / to line end",
     ),
-    ("right-click, m", "context menu (rename, archive, delete)"),
+    (
+        "right-click, m",
+        "context menu (rename, archive, pin as orchestrator, delete)",
+    ),
     ("Alt-M", "switch model"),
     ("Alt-R", "branch for a new session"),
     ("Alt-W", "where a new session runs"),

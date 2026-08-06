@@ -146,6 +146,11 @@ pub enum Row {
         indicator: ChatIndicator,
         archived: bool,
         activity: Option<DateTime<Utc>>,
+        /// The board's pinned orchestrator (gh#104) — first in the list and
+        /// marked, because it is the one session that is about the board rather
+        /// than about a task, and losing it in a recency-sorted list is how it
+        /// stops being the thing you talk to.
+        orchestrator: bool,
     },
     /// Placeholder text for an empty section.
     Empty { label: String },
@@ -393,6 +398,9 @@ pub enum MenuAction {
     RenameChat(String),
     SetArchived(String, bool),
     DeleteChat(String),
+    /// Pin this chat as the board's orchestrator, or (`None`) unpin whatever is
+    /// pinned. One per board, so pinning is a move rather than an add.
+    SetOrchestrator(Option<String>),
     RenameSpace(String),
     DeleteSpace(String),
     PickModel,
@@ -456,6 +464,10 @@ pub struct App {
     /// by the supervisor — the board RPCs are relay-forwardable, so a laptop
     /// hosting no board still reads and drives the box's.
     pub board_host: Option<String>,
+    /// The chat that board has pinned as its orchestrator (gh#104), as its
+    /// `WatchBoardOrchestrator` stream reports it. `None` = no pin, or a board
+    /// this pane has not found yet.
+    pub orchestrator: Option<String>,
     /// That device has actually delivered rows. Until it does, the header says
     /// who it is asking rather than claiming an answer.
     pub board_host_live: bool,
@@ -532,6 +544,7 @@ impl App {
             board: Board::new(),
             board_open: false,
             board_host: None,
+            orchestrator: None,
             board_host_live: false,
             board_pin: BoardHost::Auto,
             overlay: None,
@@ -690,6 +703,13 @@ impl App {
             Update::BoardHostChanged { device, live } => {
                 self.board_host = device;
                 self.board_host_live = live;
+                Vec::new()
+            }
+            Update::Orchestrator(chat_id) => {
+                self.orchestrator = chat_id;
+                // The pin decides a row's *position*, so the list has to be
+                // rebuilt rather than merely repainted.
+                self.rebuild_rows();
                 Vec::new()
             }
             Update::SendFailed {
@@ -1481,6 +1501,35 @@ impl App {
         }]
     }
 
+    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#104).
+    ///
+    /// One `[defaults]` key on the board's `routing.toml`, written through the
+    /// same validated path a settings page uses. `None` removes the key, which
+    /// is the kill switch: the notices stop and the chat is an ordinary chat
+    /// again. The pin is not applied optimistically — the board republishes it
+    /// as the write lands, and a refusal must not leave a glyph on a row the
+    /// box does not agree about.
+    fn set_orchestrator(&mut self, chat_id: Option<String>) -> Effects {
+        if self.board_host.is_none() && !self.board_host_live {
+            self.notify("No board found yet — nothing to pin an orchestrator on.".into());
+            return Vec::new();
+        }
+        let mut params = serde_json::json!({ "op": "default", "key": "orchestrator_chat" });
+        if let Some(object) = params.as_object_mut() {
+            if let Some(id) = &chat_id {
+                object.insert("value".into(), serde_json::json!(id));
+            }
+            if let Some(device) = &self.board_host {
+                object.insert("targetDeviceId".into(), serde_json::json!(device));
+            }
+        }
+        vec![Command::Call {
+            method: methods::WRITE_BOARD_CONFIG,
+            params,
+            context: "Couldn't change the board's orchestrator",
+        }]
+    }
+
     fn interrupt(&mut self) -> Effects {
         let Some(chat_id) = self.selected_chat.clone() else {
             return Vec::new();
@@ -1817,6 +1866,15 @@ impl App {
             .map(|chat| (display_status(chat, self.session_for(&chat.id), now), chat))
             .collect();
         view::sort_active(&mut active);
+        // ...and then the orchestrator on top of it, if this board has one. It
+        // is pinned in the literal sense: recency decides every other row's
+        // position and this one's position is the designation.
+        if let Some(pinned) = self.orchestrator.as_deref()
+            && let Some(at) = active.iter().position(|(_, chat)| chat.id == pinned)
+        {
+            let row = active.remove(at);
+            active.insert(0, row);
+        }
         if active.is_empty() {
             rows.push(Row::Empty {
                 label: "No sessions yet".into(),
@@ -1835,6 +1893,7 @@ impl App {
                 indicator,
                 archived: chat.archived,
                 activity: chat.last_message_at.or(Some(chat.created_at)),
+                orchestrator: self.orchestrator.as_deref() == Some(chat.id.as_str()),
             });
         }
 
@@ -2335,6 +2394,7 @@ impl App {
                 id,
                 title,
                 archived,
+                orchestrator,
                 ..
             }) => (
                 title,
@@ -2348,6 +2408,19 @@ impl App {
                         label: if archived { "Unarchive" } else { "Archive" }.into(),
                         action: MenuAction::SetArchived(id.clone(), !archived),
                         separated: false,
+                    },
+                    // Unpinning is the kill switch, so it is the same item
+                    // rather than something to go and find: whoever pinned it
+                    // reaches for the row they pinned.
+                    MenuItem {
+                        label: if orchestrator {
+                            "Unpin as orchestrator"
+                        } else {
+                            "Pin as orchestrator"
+                        }
+                        .into(),
+                        action: MenuAction::SetOrchestrator((!orchestrator).then(|| id.clone())),
+                        separated: true,
                     },
                     MenuItem {
                         label: "Delete…".into(),
@@ -2633,6 +2706,7 @@ impl App {
                 }),
                 context: "Couldn't archive the session",
             }],
+            MenuAction::SetOrchestrator(chat_id) => self.set_orchestrator(chat_id),
             MenuAction::DeleteChat(chat_id) => vec![Command::Call {
                 method: methods::MUTATE,
                 params: serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
@@ -3794,6 +3868,121 @@ mod tests {
         // And enter while nothing has landed releases nothing.
         assert!(app.act(Action::OverlayConfirm).is_empty());
         assert!(matches!(app.overlay, Some(Overlay::DispatchAccount { .. })));
+    }
+
+    // ---- the pinned orchestrator (gh#104) --------------------------------
+
+    /// Every other row's position is recency; the orchestrator's position *is*
+    /// the designation, so it does not slide down the list the moment two other
+    /// sessions say something.
+    #[test]
+    fn the_pinned_orchestrator_sits_at_the_top_of_the_sessions_list() {
+        let mut app = seeded();
+        let first_chat = |app: &App| {
+            app.rows
+                .iter()
+                .find_map(|row| match row {
+                    Row::Chat {
+                        id, orchestrator, ..
+                    } => Some((id.clone(), *orchestrator)),
+                    _ => None,
+                })
+                .expect("a chat row")
+        };
+        // c2 is the more recent, so it leads before anything is pinned.
+        assert_eq!(first_chat(&app), ("c2".into(), false));
+
+        app.apply(Update::Orchestrator(Some("c1".into())));
+        assert_eq!(first_chat(&app), ("c1".into(), true));
+
+        // And unpinning hands the list straight back to recency.
+        app.apply(Update::Orchestrator(None));
+        assert_eq!(first_chat(&app), ("c2".into(), false));
+    }
+
+    /// A pin the board does not know about — an archived chat, a stale id left
+    /// in `routing.toml` — must not reorder or mark anything. Nothing is
+    /// synthesised into the list to stand in for it.
+    #[test]
+    fn a_pin_naming_no_visible_chat_changes_nothing() {
+        let mut app = seeded();
+        let before: Vec<String> = app
+            .rows
+            .iter()
+            .filter_map(|r| r.id().map(str::to_string))
+            .collect();
+        app.apply(Update::Orchestrator(Some("gone".into())));
+        let after: Vec<String> = app
+            .rows
+            .iter()
+            .filter_map(|r| r.id().map(str::to_string))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// The pin is one `[defaults]` key on the board's `routing.toml`, written
+    /// through the same validated path the settings surfaces use — and aimed at
+    /// the device whose board the pane is showing, not at this laptop.
+    #[test]
+    fn pinning_writes_the_board_config_on_the_board_host() {
+        let mut app = seeded();
+        app.apply(Update::BoardHostChanged {
+            device: Some("the-box".into()),
+            live: true,
+        });
+        let effects = app.run_menu_action(MenuAction::SetOrchestrator(Some("c1".into())));
+        let Some(Command::Call { method, params, .. }) = effects.first() else {
+            panic!("expected one call, got {effects:?}");
+        };
+        assert_eq!(*method, methods::WRITE_BOARD_CONFIG);
+        assert_eq!(params["op"], "default");
+        assert_eq!(params["key"], "orchestrator_chat");
+        assert_eq!(params["value"], "c1");
+        assert_eq!(params["targetDeviceId"], "the-box");
+
+        // Unpinning sends no value at all, which is how the key is removed.
+        let effects = app.run_menu_action(MenuAction::SetOrchestrator(None));
+        let Some(Command::Call { params, .. }) = effects.first() else {
+            panic!("expected one call, got {effects:?}");
+        };
+        assert!(params.get("value").is_none(), "got: {params}");
+    }
+
+    /// The board is on one device and this pane may not have found it yet.
+    /// Writing the key into this laptop's own (absent) config would silently
+    /// pin nothing.
+    #[test]
+    fn pinning_without_a_board_says_so_rather_than_writing_nowhere() {
+        let mut app = seeded();
+        assert!(
+            app.run_menu_action(MenuAction::SetOrchestrator(Some("c1".into())))
+                .is_empty()
+        );
+        assert!(app.notice.is_some());
+    }
+
+    /// The same item does both, because whoever wants the notices to stop
+    /// reaches for the row they pinned.
+    #[test]
+    fn the_menu_offers_unpinning_on_the_row_that_is_pinned() {
+        let mut app = seeded();
+        app.apply(Update::Orchestrator(Some("c1".into())));
+        let at = app
+            .rows
+            .iter()
+            .position(|row| row.id() == Some("c1"))
+            .expect("c1 is on screen");
+        app.cursor = at;
+        app.open_context_menu(0, 0);
+        let Some(Overlay::Menu { items, .. }) = &app.overlay else {
+            panic!("no menu");
+        };
+        let pin = items
+            .iter()
+            .find(|i| i.label.contains("orchestrator"))
+            .expect("the pin item");
+        assert_eq!(pin.label, "Unpin as orchestrator");
+        assert_eq!(pin.action, MenuAction::SetOrchestrator(None));
     }
 
     fn board_device(id: &str, name: &str, created: &str) -> Device {

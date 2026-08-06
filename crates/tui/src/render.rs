@@ -494,6 +494,7 @@ fn draw_sidebar_row(
             indicator,
             archived,
             activity,
+            orchestrator,
             ..
         } => {
             let base = if selected {
@@ -506,14 +507,25 @@ fn draw_sidebar_row(
             }
             let open = app.selected_chat.as_deref() == Some(id.as_str());
             let when = app.relative_time(*activity);
-            // dot(1) + gap(1) + a column of air + the time column.
-            let title_width = width.saturating_sub(3 + wrap::width_of(&when)).max(1);
+            // The orchestrator's mark sits between the status dot and the
+            // title: the dot still says what the agent is doing, and the mark
+            // says which agent this is (gh#104).
+            let mark = if *orchestrator {
+                format!(" {}", board::ORCHESTRATOR_GLYPH)
+            } else {
+                String::new()
+            };
+            // dot(1) + gap(1) + a column of air + the time column, less the mark.
+            let title_width = width
+                .saturating_sub(3 + wrap::width_of(&when) + wrap::width_of(&mark))
+                .max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     {
                         let (glyph, style) = status_dot(*indicator, app, theme, base);
                         Span::styled(glyph, style)
                     },
+                    Span::styled(mark, base.patch(theme.orchestrator())),
                     Span::styled(
                         format!(" {}", wrap::truncate(title, title_width)),
                         base.patch(if open { theme.body() } else { theme.subtle() }),
