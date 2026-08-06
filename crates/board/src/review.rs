@@ -740,6 +740,8 @@ mod tests {
             repo_path: Some("/repo/r".into()),
             collectable_at: None,
             collected_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
     }
 
@@ -925,6 +927,8 @@ mod tests {
                 base_sha: None,
                 account: None,
                 repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
             })
             .unwrap();
         e.db.set_attempt_pane(a, chat).unwrap();

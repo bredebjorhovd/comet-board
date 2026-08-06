@@ -68,12 +68,17 @@ pub const RUNTIME_NAMES: &[&str] = &[
 /// accept; `label` is the human spelling a picker shows. Served to the
 /// frontends by the engine's `ListBoardRuntimes`, so the board panel and the
 /// CLI offer the same set the engine validates against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeOption {
-    pub name: String,
-    pub label: String,
-}
+///
+/// `harness` is what [`harness_for_runtime`] resolves the name to. It rides
+/// along so an account picker can tell which saved logins a runtime can spend
+/// (gh#74) without either frontend re-implementing the mapping — a Claude slot
+/// is not lendable to a codex run, and the two config-dir variables are not
+/// interchangeable.
+///
+/// The shape lives in proto (`comet_proto::view::board`) so the viewports can
+/// deserialize `ListBoardRuntimes` without depending on this crate, exactly as
+/// [`crate::rows::TaskRow`] does; what the list *contains* is this module's.
+pub use comet_proto::view::board::RuntimeOption;
 
 /// The runtimes a dispatch can be told to use, in picker order.
 ///
@@ -95,6 +100,7 @@ pub fn runtime_options() -> Vec<RuntimeOption> {
     .map(|(id, label)| RuntimeOption {
         name: runtime_name(id).to_string(),
         label: label.to_string(),
+        harness: id,
     })
     .collect()
 }

@@ -18,7 +18,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      dispatched_by, dispatched_by_pane, base_sha, saw_working, \
      settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
      blocked_count,
-     overrun_warned_at, repo_path, collectable_at, collected_at";
+     overrun_warned_at, repo_path, collectable_at, collected_at,
+     dispatched_by_device, dispatched_by_user";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -55,6 +56,8 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         repo_path: r.get(25)?,
         collectable_at: r.get(26)?,
         collected_at: r.get(27)?,
+        dispatched_by_device: r.get(28)?,
+        dispatched_by_user: r.get(29)?,
     })
 }
 
@@ -181,7 +184,15 @@ impl Db {
               collectable_at TEXT,
               -- When the checkout and its branch were actually reclaimed.
               -- Non-NULL means `worktree` names a path that is no longer there.
-              collected_at TEXT
+              collected_at TEXT,
+              -- Which device the dispatch was issued from, and which human the
+              -- frontend there said was signed in (gh#74). Both are the
+              -- caller's word: a relayed call arrives as the room owner, so
+              -- the box cannot check either. Recorded anyway — an unverified
+              -- name beats an anonymous `Operator` for "who released this",
+              -- and the columns are where #66's verified identity will land.
+              dispatched_by_device TEXT,
+              dispatched_by_user TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -300,6 +311,12 @@ impl Db {
                 ("repo_path", "TEXT"),
                 ("collectable_at", "TEXT"),
                 ("collected_at", "TEXT"),
+                // Which device and which human released this attempt (gh#74).
+                // Existing rows keep NULL: they were recorded when no frontend
+                // sent either, and inventing the box's own device id for them
+                // would be a guess dressed as a record.
+                ("dispatched_by_device", "TEXT"),
+                ("dispatched_by_user", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -583,8 +600,9 @@ impl Db {
             "INSERT INTO attempts
                (task_id, pane_id, workspace, runtime, worktree, branch,
                 dispatched_by, dispatched_by_pane, started_at, base_sha, account,
-                repo_path)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                repo_path,
+                dispatched_by_device, dispatched_by_user)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -597,7 +615,9 @@ impl Db {
                 now(),
                 a.base_sha,
                 a.account,
-                a.repo_path
+                a.repo_path,
+                a.dispatched_by_device,
+                a.dispatched_by_user
             ],
         );
         match res {
@@ -1073,6 +1093,13 @@ pub struct NewAttempt {
     /// and recorded then, because collection needs it once the checkout is
     /// gone: `git worktree prune` and `git branch -D` run in the repo.
     pub repo_path: Option<String>,
+    /// The device the dispatch was issued from, as the caller reported it
+    /// (gh#74). `None` for a dispatch that named none — the CLI on the box,
+    /// and every attempt recorded before frontends sent it.
+    pub dispatched_by_device: Option<String>,
+    /// Who the dispatching frontend said was signed in there (gh#74).
+    /// Unverified — see the column comment in `migrate`.
+    pub dispatched_by_user: Option<String>,
 }
 
 pub struct NewWriteback {
@@ -1141,7 +1168,26 @@ mod tests {
             base_sha: None,
             account: None,
             repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
+    }
+
+    /// gh#74: who released an attempt is stored on it, so the record survives
+    /// the frontend that made the claim going away.
+    #[test]
+    fn an_attempt_remembers_the_device_and_human_that_released_it() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "linear:LIN-142");
+        db.insert_attempt(&NewAttempt {
+            dispatched_by_device: Some("laptop-ana".into()),
+            dispatched_by_user: Some("ana@example.com".into()),
+            ..attempt("linear:LIN-142")
+        })
+        .unwrap();
+        let stored = db.attempts_for("linear:LIN-142").unwrap().remove(0);
+        assert_eq!(stored.dispatched_by_device.as_deref(), Some("laptop-ana"));
+        assert_eq!(stored.dispatched_by_user.as_deref(), Some("ana@example.com"));
     }
 
     #[test]
@@ -1185,6 +1231,10 @@ mod tests {
         // An attempt recorded before accounts existed ran on the device's own
         // CLI login, which is exactly what NULL means (gh#59).
         assert_eq!(tasks[0].attempts[0].account, None);
+        // Same for who released it: nobody said, and the box's own id would be
+        // a guess dressed as a record (gh#74).
+        assert_eq!(tasks[0].attempts[0].dispatched_by_device, None);
+        assert_eq!(tasks[0].attempts[0].dispatched_by_user, None);
         assert!(!tasks[0].local_done);
 
         // And it is idempotent — opening again must not try to add them twice.

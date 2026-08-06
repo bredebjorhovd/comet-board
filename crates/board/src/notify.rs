@@ -395,6 +395,8 @@ mod tests {
             repo_path: None,
             collectable_at: None,
             collected_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
     }
 

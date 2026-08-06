@@ -63,6 +63,13 @@ pub enum Update {
         device: Option<String>,
         live: bool,
     },
+    /// The agent logins a pending dispatch could spend, answering
+    /// [`Command::ListDispatchAccounts`]. Carries the task id so a reply that
+    /// raced a newer pick is dropped rather than shown under the wrong row.
+    DispatchAccounts {
+        task_id: String,
+        accounts: Vec<comet_proto::AgentAccount>,
+    },
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
         chat_id: String,
@@ -120,14 +127,33 @@ pub enum Command {
     /// that will hold the run; the identifier travels so the notice reads well.
     /// The target device is stamped by the supervisor, which owns the board
     /// host — a dispatch always lands on the device whose rows you are reading.
+    ///
+    /// `account` is the agent login the picker chose, `None` being the route's
+    /// own (gh#74). `via_device`/`via_user` say who released it — recorded on
+    /// the attempt, never checked, never authorized on; see the board's
+    /// `DispatchOrigin`.
     Dispatch {
         task_id: String,
         identifier: String,
+        account: Option<String>,
+        via_device: Option<String>,
+        via_user: Option<String>,
         /// End the task's live attempt and release a fresh one — `R` on a
         /// blocked row (gh#73), the deliberate exception to the
         /// one-live-attempt rule. Plain dispatches send `false` and are
         /// refused on a live attempt.
         replace: bool,
+    },
+    /// The logins a dispatch of `task_id` could spend, for the account picker
+    /// (gh#74). Answered as [`Update::DispatchAccounts`], filtered to the
+    /// harness `runtime` resolves to — a Claude slot cannot pay for a codex run.
+    ListDispatchAccounts {
+        task_id: String,
+        /// The row's runtime, i.e. the route's. `None` (or a name the host does
+        /// not know) leaves the list unfiltered rather than empty: an account
+        /// the run cannot use is refused by the engine, but a picker with no
+        /// rows at all cannot even be argued with.
+        runtime: Option<String>,
     },
     /// Point the board pane at a device, or hand the choice back to the sweep
     /// (gh#55). Survives reconnects, so a pinned box stays pinned across a
@@ -425,15 +451,35 @@ async fn session(
                 Some(Command::Dispatch {
                     task_id,
                     identifier,
+                    account,
+                    via_device,
+                    via_user,
                     replace,
                 }) => {
                     // The release lands on the device whose board this is.
                     spawn_dispatch(
                         client.clone(),
                         updates.clone(),
+                        Dispatch {
+                            task_id,
+                            identifier,
+                            account,
+                            via_device,
+                            via_user,
+                            replace,
+                        },
+                        board_host.clone(),
+                    );
+                }
+                Some(Command::ListDispatchAccounts { task_id, runtime }) => {
+                    // The host's logins, not this laptop's: the run executes
+                    // there, and a slot id only means anything on the device
+                    // that saved it.
+                    spawn_dispatch_accounts(
+                        client.clone(),
+                        updates.clone(),
                         task_id,
-                        identifier,
-                        replace,
+                        runtime,
                         board_host.clone(),
                     );
                 }
@@ -894,6 +940,18 @@ fn spawn_send(
     });
 }
 
+/// What a release carries beyond the task: the account it spends and who
+/// released it (gh#74). A struct rather than five positional strings — they are
+/// all `Option<String>` and swapping two would be a silent, wrong dispatch.
+struct Dispatch {
+    task_id: String,
+    identifier: String,
+    account: Option<String>,
+    via_device: Option<String>,
+    via_user: Option<String>,
+    replace: bool,
+}
+
 /// Release a board task. The reply names the chat the run landed in; the row
 /// flips to `working` on the next board frame either way.
 ///
@@ -903,19 +961,30 @@ fn spawn_send(
 fn spawn_dispatch(
     client: Arc<RpcClient>,
     updates: mpsc::UnboundedSender<Update>,
-    task_id: String,
-    identifier: String,
-    replace: bool,
+    dispatch: Dispatch,
     target_device: Option<String>,
 ) {
     tokio::spawn(async move {
+        let Dispatch {
+            task_id,
+            identifier,
+            account,
+            via_device,
+            via_user,
+            replace,
+        } = dispatch;
         let mut params = serde_json::json!({ "taskId": task_id });
-        if let Some(object) = params.as_object_mut() {
-            if let Some(device) = target_device {
-                object.insert("targetDeviceId".into(), serde_json::Value::String(device));
-            }
-            if replace {
-                object.insert("replace".into(), serde_json::Value::Bool(true));
+        if replace && let Some(object) = params.as_object_mut() {
+            object.insert("replace".into(), serde_json::Value::Bool(true));
+        }
+        for (key, value) in [
+            ("targetDeviceId", target_device),
+            ("account", account),
+            ("viaDevice", via_device),
+            ("viaUser", via_user),
+        ] {
+            if let (Some(value), Some(object)) = (value, params.as_object_mut()) {
+                object.insert(key.into(), serde_json::Value::String(value));
             }
         }
         // The verb the notice uses, so a retry that ended a live agent does not
@@ -939,5 +1008,77 @@ fn spawn_dispatch(
                 )));
             }
         }
+    });
+}
+
+/// Fill the dispatch account picker (gh#74): the host's saved logins, narrowed
+/// to the ones the row's runtime can actually spend.
+///
+/// Two calls, because the mapping from a runtime name to a harness is the
+/// engine's — `ListBoardRuntimes` carries it, so neither viewport re-implements
+/// `harness_for_runtime` and drifts from what the dispatch will validate. A
+/// runtime catalog that fails to load is not fatal: the picker then offers every
+/// login and the engine refuses a slot the harness cannot use, which is a worse
+/// message but a live one.
+fn spawn_dispatch_accounts(
+    client: Arc<RpcClient>,
+    updates: mpsc::UnboundedSender<Update>,
+    task_id: String,
+    runtime: Option<String>,
+    target_device: Option<String>,
+) {
+    tokio::spawn(async move {
+        let params = |value: serde_json::Value| {
+            let mut value = value;
+            if let (Some(device), Some(object)) = (&target_device, value.as_object_mut()) {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(device.clone()),
+                );
+            }
+            value
+        };
+        let snapshot = match client
+            .call(methods::LIST_AGENT_ACCOUNTS, params(serde_json::json!({})))
+            .await
+        {
+            Ok(value) => match serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(value) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let _ =
+                        updates.send(Update::Notice(format!("Account list malformed: {err}")));
+                    return;
+                }
+            },
+            Err(err) => {
+                let _ = updates.send(Update::Notice(format!("Couldn't list accounts: {err}")));
+                return;
+            }
+        };
+        let harness = match runtime {
+            Some(runtime) => client
+                .call(methods::LIST_BOARD_RUNTIMES, params(serde_json::json!({})))
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<board_view::RuntimeOption>>(value).ok()
+                })
+                .and_then(|options| {
+                    options
+                        .into_iter()
+                        .find(|option| option.name == runtime)
+                        .map(|option| option.harness)
+                }),
+            None => None,
+        };
+        let accounts = match harness {
+            Some(harness) => snapshot
+                .accounts
+                .into_iter()
+                .filter(|account| account.harness == harness)
+                .collect(),
+            None => snapshot.accounts,
+        };
+        let _ = updates.send(Update::DispatchAccounts { task_id, accounts });
     });
 }

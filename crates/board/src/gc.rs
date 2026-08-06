@@ -278,6 +278,8 @@ mod tests {
             nudged_at: None,
             blocked_count: 0,
             overrun_warned_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
             collectable_at: None,
             collected_at: None,
         }

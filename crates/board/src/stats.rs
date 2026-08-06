@@ -272,6 +272,8 @@ mod tests {
             repo_path: Some("/repo/r".into()),
             collectable_at: None,
             collected_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
         }
     }
 
