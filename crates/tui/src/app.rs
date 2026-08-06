@@ -1022,6 +1022,7 @@ impl App {
             task_id,
             identifier,
             account,
+            replace: false,
             via_device: self.local_device_id.clone(),
             via_user: self
                 .auth_user()
@@ -1141,6 +1142,12 @@ impl App {
             task_id: row.id.clone(),
             identifier: row.identifier.clone(),
             replace,
+            account: None,
+            via_device: self.local_device_id.clone(),
+            via_user: self
+                .auth_user()
+                .map(|user| user.email.clone())
+                .filter(|email| !email.is_empty()),
         }]
     }
 
