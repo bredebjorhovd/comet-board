@@ -10,16 +10,14 @@
   "name": "comet-native-edge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  "account_id": "0cac004a6d08e46e625eafa75b3ab625",
   "workers_dev": true,
   // Public hostname on the zeron.sh zone, plus the install surface carved out
   // of the (old) landing host: path routes beat the landing worker's custom
   // domain, so `curl -fsSL https://comet.zeron.sh/install.sh | sh` now
   // installs comet-native while the rest of comet.zeron.sh is untouched.
   "routes": [
-    { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
-    { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
+    { "pattern": "edge.comet.offhand.dev", "custom_domain": true }
   ],
   // Serve src/install.sh as a string (the /install.sh route).
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
@@ -56,7 +54,7 @@
     // set the real client id before deploying. Set AUTH_MODE=dev locally to
     // accept bearer==userId. WORKOS_API_KEY is a wrangler secret
     // (`wrangler secret put WORKOS_API_KEY`) powering the /auth/* routes.
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
+    "WORKOS_CLIENT_ID": "client_01KZ7CN5488CRQF7P0H7C12E8D",
     "AUTH_MODE": "workos"
   },
   "observability": {

@@ -43,9 +43,22 @@ comet-board wait --timeout 3600 --json    # returns when the first one settles
 With no `--task` it watches everything in flight at the moment it is called, and
 returns as soon as any of them reaches `review`, `failed` or `done` — the rows
 it returns are the ones that settled. Name `--task` (repeatable) to watch
-specific work, `--state` to wait for something else (`blocked` to be called back
-when an agent needs an answer). It exits non-zero on timeout, and refuses when
-nothing is in flight.
+specific work, `--state` to replace the settled set entirely. It exits non-zero
+on timeout, and refuses when nothing is in flight.
+
+**A child that asks a question settles nothing.** A blocked agent is waiting on
+input and will sit there until it gets some, so a plain `wait` on it holds until
+its timeout. Add `--blocked-is-settled` and `wait` also returns when a watched
+task goes `blocked` — that is how you get called back to answer it, instead of
+discovering the question when your own timeout expires:
+
+```bash
+comet-board wait --task linear:AGE-14 --blocked-is-settled --timeout 3600
+```
+
+It adds to the settled states rather than replacing them, so the same call still
+returns on `review`, `failed` and `done`. Wait this way whenever the work you
+released can come back with a question — which is most work.
 
 Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
@@ -97,18 +110,34 @@ is this board's `review`.
 6. **Cancel** with `comet-board cancel --task <id>`. This ends the *attempt*,
    not the issue: the row returns to `ready` with its history intact. It does
    not notify a parent agent that may be waiting on it — say so if one exists.
-7. **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes
+7. **Retry** with `comet-board retry --task <id>`, not cancel-then-dispatch. On
+   a `blocked` row it ends the live attempt and releases a fresh one in the same
+   call; done as two commands the row is `ready` in between and a concurrency
+   cap or another agent can take the slot. On a `failed` or `ready` row nothing
+   is live and it is an ordinary dispatch. It takes the same `--runtime`,
+   `--model` and `--account` overrides as `dispatch` — a retry under a different
+   model is the usual reason to retry at all. Retrying a blocked row **discards
+   the question its agent was waiting on**: read the chat first if the answer
+   was the point.
+8. **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes
    after every sync cycle, status refresh and dispatch, so there is no sync
    command to run first. `wait` holds the same subscription open, so it answers
    as soon as the answer is true.
-8. **After releasing work, do not fall silent about it.** That leaves the human
+9. **After releasing work, do not fall silent about it.** That leaves the human
    to notice the agent finished and to prompt you. Either `wait` for it, or say
-   plainly that you are leaving it running and that nothing will tell you when
-   it is done.
-9. **Never dispatch speculatively.** Releasing work starts a real agent in a
-   real repo that commits and opens PRs. A human keypress — or an explicit
-   instruction — releases tasks. Reading the board is always safe; dispatching
-   is not.
+   plainly that you are leaving it running. A board configured with
+   `notify_dispatcher` will prompt you in this chat when work you released
+   settles — but it is off by default and you cannot tell from here, so never
+   promise that you will be woken. Note also that `wait` does **not** return on
+   `blocked` by default: an agent that stops to ask a question holds its
+   attempt open, and a plain `wait` on it hangs until somebody answers. Pass
+   `--blocked-is-settled` to be called back on the question too; either way the
+   blocked agent comments on its own issue, which is the human's signal, not
+   yours.
+10. **Never dispatch speculatively.** Releasing work starts a real agent in a
+    real repo that commits and opens PRs. A human keypress — or an explicit
+    instruction — releases tasks. Reading the board is always safe; dispatching
+    is not.
 
 **Reviewing a pull request is how you reach the agent that wrote it.** The board
 delivers new comments on an open PR back into the chat that produced it — the
@@ -160,6 +189,14 @@ a pull request while you still can, and if you are going round in circles, say
 so in the PR description rather than spending the remaining minutes on another
 lap. Finishing inside the grace settles the attempt `done` on your artifacts as
 normal — the cap only takes what nothing else has closed.
+
+**The board may not be on this machine.** It lives on exactly one device —
+usually an always-on box — and every verb reaches it over the relay. If a
+command says this device's board is disabled or not running, name the host with
+`--device <name-or-id>` (or set `COMET_BOARD_DEVICE` once for the shell) and the
+same commands work unchanged: the dispatch cuts its worktree, makes its chat and
+runs its agent on that device, not this one. Nothing else about the contract
+changes, and `--device` is unnecessary wherever the board is local.
 
 `comet-board doctor` explains a board that looks wrong: missing keys,
 unreachable repos, routes pointing at spaces that do not exist, an engine that

@@ -412,6 +412,40 @@ fn new_message_id() -> String {
 /// settling — the server claimed a completion it never delivered (gh#37).
 const STALLED_TURN: &str = "opencode went idle without completing the assistant message";
 
+/// How long a run that is already erroring waits for a serve exit it may be
+/// racing before settling on the [`STALLED_TURN`] wording (gh#79). A dying
+/// serve closes its sockets and terminates near-simultaneously, so the idle /
+/// EOF its death produces can reach us a hair before the exit is visible to
+/// `try_wait` — more often on a fast Linux host than on macOS. This window is
+/// far wider than that gap, and only a run headed for Errored ever pays it.
+const EXIT_PROBE_GRACE: Duration = Duration::from_millis(500);
+
+/// Probe the serve child for a crash, waiting up to `grace` for an exit we may
+/// be racing (see [`EXIT_PROBE_GRACE`]; `Duration::ZERO` just asks). `Some(msg)`
+/// — the child is gone, and this crash diagnosis (with its real exit status) is
+/// what a human needs to read; `None` — still running, so the caller's own
+/// wording stands.
+async fn crash_if_exited(
+    child: &mut Child,
+    stderr_tail: &crate::StderrTail,
+    grace: Duration,
+) -> Option<String> {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        // ECHILD and friends: gone, status unknowable.
+        Err(_) => None,
+        // Still running as far as a bare probe can tell.
+        Ok(None) if grace.is_zero() => return None,
+        Ok(None) => match tokio::time::timeout(grace, child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(_)) => None,
+            // Outlived the grace: alive, not a crash.
+            Err(_) => return None,
+        },
+    };
+    Some(crate::crash_message("opencode serve", status, stderr_tail))
+}
+
 /// Rotate the assistant message id; returns (previous, next).
 fn rotate(id: &mut String) -> (String, String) {
     let prev = std::mem::replace(id, new_message_id());
@@ -745,14 +779,26 @@ async fn run_session(session: Session) {
                     }
                     if !done_for_turn {
                         done_for_turn = true;
-                        let error = turn_error.take();
+                        let mut error = turn_error.take();
                         // A turn that was in flight but whose assistant message
                         // never reached completion (`message.updated` with
                         // `time.completed`) before the idle is a stall, not a
                         // finished turn — report it Errored rather than a
-                        // spurious Completed (gh#37).
-                        let stalled = turn_was_active && error.is_none() && !current_msg_completed;
-                        let status = if error.is_some() || stalled {
+                        // spurious Completed (gh#37). Unless the serve is in
+                        // fact dead: then the crash, with its exit status, is
+                        // the honest diagnosis and "went idle" would send the
+                        // reader after the wrong problem (gh#79).
+                        if error.is_none() && turn_was_active && !current_msg_completed {
+                            error = Some(
+                                match crash_if_exited(&mut child, &stderr_tail, EXIT_PROBE_GRACE)
+                                    .await
+                                {
+                                    Some(crash) => crash,
+                                    None => STALLED_TURN.into(),
+                                },
+                            );
+                        }
+                        let status = if error.is_some() {
                             DoneStatus::Errored
                         } else {
                             DoneStatus::Completed
@@ -762,7 +808,7 @@ async fn run_session(session: Session) {
                             AgentEvent::Done {
                                 status,
                                 result: None,
-                                error: error.or_else(|| stalled.then(|| STALLED_TURN.into())),
+                                error,
                                 session_id: Some(session_id.clone()),
                             },
                         )
@@ -899,50 +945,42 @@ async fn run_session(session: Session) {
                 .await;
         } else if !done_for_turn {
             // The stream ended before the turn settled. Distinguish a real
-            // server exit from a clean stream end: a server still running
-            // (try_wait → Ok(None)) merely closed its SSE feed (idle-parked or
-            // a one-shot subscription), so the in-flight turn finishes
-            // Completed rather than reporting a bogus "still running" crash.
-            // A server that actually exited — or a turn error already booked —
-            // keeps the Errored terminal event. shutdown_child below reaps the
+            // server exit from a clean stream end: a serve still running merely
+            // closed its SSE feed (idle-parked or a one-shot subscription), so
+            // the in-flight turn finishes Completed rather than reporting a
+            // bogus "still running" crash. shutdown_child below reaps the
             // (possibly still-running, parked) serve we own either way.
-            let exit = child.try_wait();
-            match (&turn_error, exit) {
-                (None, Ok(None)) => {
-                    // A server still running (try_wait → Ok(None)) merely
-                    // closed its SSE feed (idle-parked / one-shot
-                    // subscription). If the in-flight turn's assistant message
-                    // settled, it's a clean Completed; a turn still streaming
-                    // when the feed died never settled — a stall, Errored
-                    // (gh#37).
-                    let error = (!current_msg_completed).then(|| STALLED_TURN.into());
-                    let _ = event_tx
-                        .send(Ok(AgentEvent::Done {
-                            status: if error.is_some() {
-                                DoneStatus::Errored
-                            } else {
-                                DoneStatus::Completed
-                            },
-                            result: None,
-                            error,
-                            session_id: Some(session_id.clone()),
-                        }))
-                        .await;
+            let error = match turn_error {
+                // A turn error already booked keeps its own wording.
+                Some(error) => Some(error),
+                // The assistant message settled: Completed, unless the feed
+                // ended because the serve is already gone.
+                None if current_msg_completed => {
+                    crash_if_exited(&mut child, &stderr_tail, Duration::ZERO).await
                 }
-                (turn_error, exit) => {
-                    let error = turn_error.clone().unwrap_or_else(|| {
-                        crate::crash_message("opencode serve", exit.ok().flatten(), &stderr_tail)
-                    });
-                    let _ = event_tx
-                        .send(Ok(AgentEvent::Done {
-                            status: DoneStatus::Errored,
-                            result: None,
-                            error: Some(error),
-                            session_id: Some(session_id.clone()),
-                        }))
-                        .await;
-                }
-            }
+                // A turn still streaming when the feed died never settled — a
+                // stall, Errored (gh#37) — unless the feed died because the
+                // serve did, in which case the crash is the real diagnosis and
+                // we may be racing its exit, so wait for it first (gh#79).
+                None => Some(
+                    match crash_if_exited(&mut child, &stderr_tail, EXIT_PROBE_GRACE).await {
+                        Some(crash) => crash,
+                        None => STALLED_TURN.into(),
+                    },
+                ),
+            };
+            let _ = event_tx
+                .send(Ok(AgentEvent::Done {
+                    status: if error.is_some() {
+                        DoneStatus::Errored
+                    } else {
+                        DoneStatus::Completed
+                    },
+                    result: None,
+                    error,
+                    session_id: Some(session_id.clone()),
+                }))
+                .await;
         }
     }
 

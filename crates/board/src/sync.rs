@@ -29,6 +29,7 @@ use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
 use crate::log::Logger;
 use crate::model::*;
+use crate::notify::{self, Signal, Stopped, Webhook};
 use crate::overrun;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Commits, Evidence, Verdict, Why};
@@ -96,6 +97,10 @@ pub struct SyncEngine {
     pub log: Arc<Logger>,
     pub linear: Option<Linear<Box<dyn GraphQl>>>,
     pub github: Option<Github<Box<dyn Rest>>>,
+    /// Where `[defaults] notify_webhook` is POSTed (gh#71). A field rather than
+    /// a call into `notify::HttpWebhook` so a test can watch what the board
+    /// would have sent without one listening socket in the suite.
+    pub webhook: Arc<dyn Webhook>,
 }
 
 /// Meta keys. Kept together so readers and the engine's loop cannot drift.
@@ -167,6 +172,7 @@ impl SyncEngine {
             log,
             linear,
             github,
+            webhook: Arc::new(crate::notify::HttpWebhook),
         })
     }
 
@@ -872,7 +878,7 @@ impl SyncEngine {
                         "{} chat {} gone for {} ticks — orphaned",
                         task.identifier, chat_id, ticks
                     ));
-                    self.orphan(&task, &attempt)?;
+                    self.orphan(runtime, &task, &attempt)?;
                 } else {
                     self.log.info(format!(
                         "{} chat {} missing (tick {}/2)",
@@ -889,6 +895,7 @@ impl SyncEngine {
             }
             // Persist it so readers render state without a session watch of
             // their own.
+            let entered_blocked = self.entered_blocked(&attempt, status);
             if attempt.agent_status != Some(status) {
                 self.db.set_attempt_status(attempt.id, status)?;
             }
@@ -900,7 +907,14 @@ impl SyncEngine {
             // §H4: the turn ended — check the checkout. No fresh PR lookup on
             // this path: the cycle polled GitHub moments ago, so the recorded
             // PR state is as fresh as a lookup would be.
-            self.maybe_settle(runtime, &task, &attempt, status, false)?;
+            let settled = self.maybe_settle(runtime, &task, &attempt, status, false)?;
+            // Blocked *and* settled is an errored run whose pull request was
+            // already open: the work is reviewable, so it is a settle and not
+            // a block, and saying both would be the board contradicting
+            // itself in two comments on the same issue.
+            if entered_blocked && !settled {
+                self.note_blocked(runtime, &task, &attempt, chat_id)?;
+            }
         }
         // After settling, so an attempt that just finished is never failed for
         // running long; before the rewatch, which only looks at closed rows.
@@ -1076,9 +1090,24 @@ impl SyncEngine {
     }
 
     /// End an attempt whose chat is gone, and tell everyone reading upstream.
-    fn orphan(&self, task: &Task, attempt: &Attempt) -> Result<()> {
+    ///
+    /// Notified on the same channels a settle is (gh#71): an attempt ending
+    /// because its chat vanished is still the end of the work a dispatcher was
+    /// waiting on, and it is the ending nobody would otherwise notice.
+    fn orphan(&self, runtime: Option<&dyn Runtime>, task: &Task, attempt: &Attempt) -> Result<()> {
         self.db.close_attempt(attempt.id, Outcome::Orphaned)?;
-        self.enqueue_outcome(task, Outcome::Orphaned, None)
+        self.enqueue_outcome(task, Outcome::Orphaned, None)?;
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome: Outcome::Orphaned,
+                evidence: None,
+                pr_url: None,
+            },
+        );
+        Ok(())
     }
 
     // ---- settling (§H4) --------------------------------------------------
@@ -1162,7 +1191,7 @@ impl SyncEngine {
         });
         match verdict {
             Verdict::Finished(evidence) => {
-                self.settle(task, attempt, evidence, pr_url.as_deref())?;
+                self.settle(runtime, task, attempt, evidence, pr_url.as_deref())?;
                 Ok(true)
             }
             // The one StayLive worth a line: a row that stays `working`
@@ -1246,11 +1275,13 @@ impl SyncEngine {
         None
     }
 
-    /// Close an attempt whose evidence cleared the bar, and tell everyone
-    /// reading upstream. The §H4 half of what herdr-board's `settle` did — the
-    /// dispatcher wake (its AGE-25) is deliberately not ported here.
+    /// Close an attempt whose evidence cleared the bar, and tell everyone who
+    /// was waiting on it: the tracker, the agent that released it, and the
+    /// operator's out-of-band channel. The §H4 half of what herdr-board's
+    /// `settle` did, now including its AGE-25 dispatcher wake (gh#71).
     fn settle(
         &self,
+        runtime: Option<&dyn Runtime>,
         task: &Task,
         attempt: &Attempt,
         evidence: Evidence,
@@ -1263,7 +1294,242 @@ impl SyncEngine {
             task.identifier,
             evidence.as_str()
         ));
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome: Outcome::Done,
+                evidence: Some(evidence),
+                pr_url: pr_url.map(str::to_string),
+            },
+        );
         Ok(())
+    }
+
+    // ---- notification (gh#71) --------------------------------------------
+
+    /// Tell whoever is not watching the board that something happened to a
+    /// dispatched attempt.
+    ///
+    /// Two channels, two switches, and they are independent because they are
+    /// different audiences (see [`crate::notify`]): the chat of the agent that
+    /// released the work (`notify_dispatcher`, off by default) and the
+    /// operator's webhook (`notify` + `notify_webhook`). The third channel —
+    /// the comment upstream — is not here: outcome comments are queued by
+    /// [`SyncEngine::enqueue_outcome`] and the blocked comment by
+    /// [`SyncEngine::note_blocked`], because those are retryable writebacks
+    /// rather than best-effort notices.
+    ///
+    /// Nothing here can fail the caller. A settle that has already happened is
+    /// not undone because a webhook host is down, and an attempt is not left
+    /// open because a dispatcher's chat was archived.
+    fn announce(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        signal: Signal,
+    ) {
+        if let Signal::Settled {
+            outcome,
+            evidence,
+            pr_url,
+        } = &signal
+        {
+            self.wake_dispatcher(
+                runtime,
+                task,
+                attempt,
+                *outcome,
+                *evidence,
+                pr_url.as_deref(),
+            );
+        }
+        self.post_webhook(task, attempt, &signal);
+    }
+
+    /// Queue a settle notice into the chat of the agent that released this
+    /// work (herdr-board's AGE-25).
+    ///
+    /// The provenance is already on the attempt row — `dispatched_by_pane` is
+    /// the chat the dispatch ran from, recorded for every agent-issued
+    /// dispatch whether or not the board started that chat. So the delivery is
+    /// the same [`Runtime::prompt`] a review uses: a steer into a live run, a
+    /// send otherwise, durable either way.
+    ///
+    /// Silent for an operator-released task by construction — there is no chat
+    /// to prompt — which is why this switch is separate from the operator's.
+    fn wake_dispatcher(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        outcome: Outcome,
+        evidence: Option<Evidence>,
+        pr_url: Option<&str>,
+    ) {
+        if !self.cfg.defaults.notify_dispatcher {
+            return;
+        }
+        let dispatcher = attempt.dispatcher();
+        let Some(chat) = dispatcher.pane() else {
+            return;
+        };
+        // A chat that dispatched into itself would be prompted about its own
+        // settle. Not reachable through `comet-board dispatch` (a dispatch
+        // makes a fresh chat), but a hand-set `--via` can say anything.
+        if Some(chat) == attempt.pane_id.as_deref() {
+            return;
+        }
+        let Some(runtime) = runtime else {
+            self.log.warn(format!(
+                "{}: settled, but no runtime to notify chat {chat} with",
+                task.identifier
+            ));
+            return;
+        };
+        // The dispatcher is usually a long-lived orchestrator that outlives
+        // many children, but it can have been archived since. Not an error:
+        // there is simply nobody to tell.
+        match runtime.chat_alive(chat) {
+            Ok(false) => {
+                self.log.info(format!(
+                    "{}: settled, but the chat that released it ({chat}) is gone — \
+                     nobody notified",
+                    task.identifier
+                ));
+                return;
+            }
+            Err(e) => {
+                self.log
+                    .warn(format!("{}: checking chat {chat}: {e}", task.identifier));
+                return;
+            }
+            Ok(true) => {}
+        }
+        let text = notify::dispatcher_message(task, attempt, outcome, evidence, pr_url);
+        match runtime.prompt(chat, &text) {
+            Ok(()) => self.log.info(format!(
+                "{}: settle notice queued into chat {chat}",
+                task.identifier
+            )),
+            // Best effort by design: the attempt is closed and the tracker has
+            // the trail. Retrying a notice about a thing that already happened
+            // is how a dispatcher gets told twice.
+            Err(e) => self.log.warn(format!(
+                "{}: could not notify chat {chat}: {e}",
+                task.identifier
+            )),
+        }
+    }
+
+    /// POST the event at `[defaults] notify_webhook`, if the operator wants it.
+    ///
+    /// The only channel that reaches somebody who is looking at neither the
+    /// board nor the issue tracker — which at 02:00 is everybody.
+    fn post_webhook(&self, task: &Task, attempt: &Attempt, signal: &Signal) {
+        if !self.cfg.defaults.notify {
+            return;
+        }
+        let Some(url) = self.cfg.defaults.notify_webhook.as_deref() else {
+            return;
+        };
+        if let Some(problem) = notify::webhook_url_problem(url) {
+            self.log.warn(format!(
+                "[defaults] notify_webhook is unusable ({problem}); {} went unannounced",
+                task.identifier
+            ));
+            return;
+        }
+        let body = notify::webhook_payload(task, attempt, signal, &crate::db::now());
+        match self.webhook.post(url, &body) {
+            Ok(()) => self.log.info(format!(
+                "{}: {} posted to {}",
+                task.identifier,
+                signal.event(),
+                notify::webhook_host(url)
+            )),
+            // Not retried, and the reason is in `notify`'s docs: a
+            // notification delivered late reads as current, which is worse
+            // than one that never came.
+            Err(e) => self.log.warn(format!(
+                "{}: {} webhook to {} failed: {e}",
+                task.identifier,
+                signal.event(),
+                notify::webhook_host(url)
+            )),
+        }
+    }
+
+    /// An attempt has just *entered* blocked: leave one comment upstream, and
+    /// raise the operator's out-of-band notice (gh#71).
+    ///
+    /// This is the state the board had no signal for at all. A blocked attempt
+    /// settles nothing and closes nothing — that is deliberate, the chat holds
+    /// the context and the decision is the operator's — so no outcome
+    /// writeback fires and the only trace is a row colour nobody is looking at.
+    ///
+    /// Once per block, not once per tick and not once per attempt: the counter
+    /// bumped here goes into the idempotency key, so a question answered at
+    /// 09:00 and a second question at 11:00 are two comments, while the
+    /// hundreds of reconcile ticks in between are none.
+    fn note_blocked(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        chat_id: &str,
+    ) -> Result<()> {
+        // Which kind of block, straight off the journal — the same read
+        // `run_end` makes, and the only thing that tells a question apart from
+        // a dead run inside the one `Blocked` status.
+        let why = match runtime.map(|r| r.last_run_end(chat_id)) {
+            Some(Ok(Some(RunEnd::Errored))) => Stopped::Errored,
+            Some(Ok(_)) => Stopped::Asking,
+            Some(Err(_)) | None => Stopped::Unknown,
+        };
+        let block = self.db.bump_blocked_count(attempt.id)?;
+        let queued = self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "blocked".into(),
+            payload: json!({
+                "reason": why.as_str(),
+                "block": block,
+                "attempt": task.attempt_count(),
+                "log": self.paths.logfile().to_string_lossy(),
+            })
+            .to_string(),
+            idem_key: format!("{}:blocked:{}:{}", task.id, task.attempt_count(), block),
+        })?;
+        self.log.info(format!(
+            "{}: blocked ({}) — {}",
+            task.identifier,
+            why.as_str(),
+            if queued {
+                "queued a comment upstream"
+            } else {
+                "already told upstream about this block"
+            }
+        ));
+        // The row the notice describes: the caller's copy predates the bump,
+        // and the payload names which block this is.
+        let mut with_count = attempt.clone();
+        with_count.blocked_count = block;
+        self.announce(runtime, task, &with_count, Signal::Blocked(why));
+        Ok(())
+    }
+
+    /// Has this attempt just entered blocked, for the first time this block?
+    ///
+    /// A transition is the usual answer. The `blocked_count == 0` arm is for
+    /// the attempt that was already sitting blocked when this feature landed:
+    /// its status is persisted, so it will never transition again, and without
+    /// this the one case gh#71 is about — an agent that stopped in the night —
+    /// would stay silent for as long as it stays stuck.
+    fn entered_blocked(&self, attempt: &Attempt, status: AgentStatus) -> bool {
+        status == AgentStatus::Blocked
+            && (attempt.agent_status != Some(AgentStatus::Blocked) || attempt.blocked_count == 0)
     }
 
     /// Look again at attempts the board has already closed (§H4's inverse,
@@ -1374,6 +1640,7 @@ impl SyncEngine {
                 continue;
             };
             let transitioned = attempt.agent_status != Some(status);
+            let entered_blocked = self.entered_blocked(&attempt, status);
             if transitioned {
                 self.db.set_attempt_status(attempt.id, status)?;
                 changed = true;
@@ -1383,7 +1650,7 @@ impl SyncEngine {
             if status == AgentStatus::Working && !attempt.saw_working {
                 self.db.set_saw_working(attempt.id)?;
             }
-            if transitioned {
+            if transitioned || entered_blocked {
                 let Some(task) = self.db.get_task(&attempt.task_id)? else {
                     continue;
                 };
@@ -1391,7 +1658,15 @@ impl SyncEngine {
                 // may be a whole cycle behind the agent's own `gh pr create`
                 // (herdr's gh#29 window — the reason "finished — committed"
                 // notices used to reach dispatchers whose PR already existed).
-                if self.maybe_settle(runtime, &task, &attempt, status, true)? {
+                let settled = self.maybe_settle(runtime, &task, &attempt, status, true)?;
+                if settled {
+                    changed = true;
+                }
+                // This is the event path, so this is where a block is noticed
+                // the moment the agent asks rather than up to a poll interval
+                // later — which for the 02:00 case is the whole point (gh#71).
+                if entered_blocked && !settled {
+                    self.note_blocked(runtime, &task, &attempt, chat_id)?;
                     changed = true;
                 }
             }
@@ -1685,6 +1960,13 @@ impl SyncEngine {
                             }
                         }
                     }
+                    // The agent stopped and cannot go on by itself (gh#71).
+                    // Not a state transition: the issue is still In Progress
+                    // and that is true — it is in progress and stuck, which is
+                    // a thing to say rather than a state to move to.
+                    "blocked" => {
+                        linear.comment(&task.source_id, &blocked_comment(&payload))?;
+                    }
                     // The attempt settled with work waiting on a human. Dispatch
                     // moved this issue to In Progress and, without this, nothing
                     // moved it again until a merge — so Linear read In Progress
@@ -1783,6 +2065,9 @@ impl SyncEngine {
                             ),
                         };
                         gh.comment(&repo, number, &body)?;
+                    }
+                    "blocked" => {
+                        gh.comment(&repo, number, &blocked_comment(&payload))?;
                     }
                     // Close on done. This is what makes "mark done" mean the
                     // same thing on a GitHub row as on a Linear one.
@@ -1918,6 +2203,20 @@ pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus
         open_pr: task.pr_open,
         local_done: task.local_done,
     }
+}
+
+/// The comment a queued `blocked` writeback delivers (gh#71).
+///
+/// Composed at delivery rather than at enqueue so the wording is one thing in
+/// one place for both trackers, exactly as the outcome comment is — but the
+/// *facts* come out of the payload, because they were true when the block
+/// happened and the task row has moved on since.
+fn blocked_comment(payload: &Value) -> String {
+    notify::upstream_comment(
+        payload["attempt"].as_u64().unwrap_or(1),
+        Stopped::parse(payload["reason"].as_str().unwrap_or("")),
+        payload["log"].as_str().unwrap_or("(none)"),
+    )
 }
 
 /// The branches the board has dispatched onto, and where.
@@ -2063,7 +2362,43 @@ mod tests {
             log: Arc::new(Logger::new("", false)),
             linear,
             github: None,
+            webhook: Arc::new(RecordingWebhook::default()),
         }
+    }
+
+    /// The webhook the tests watch instead of a listening socket. Shared by
+    /// `Arc`, so a test can read back exactly what the board would have POSTed.
+    #[derive(Default)]
+    struct RecordingWebhook {
+        posts: std::sync::Mutex<Vec<(String, Value)>>,
+        /// Answer every POST with a failure, for the tests that check a dead
+        /// endpoint changes nothing about the board.
+        fail: bool,
+    }
+
+    impl Webhook for RecordingWebhook {
+        fn post(&self, url: &str, body: &Value) -> anyhow::Result<()> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.clone()));
+            if self.fail {
+                anyhow::bail!("the endpoint is down");
+            }
+            Ok(())
+        }
+    }
+
+    /// An engine wired to a webhook the test can read back.
+    fn engine_with_webhook(url: &str, fail: bool) -> (SyncEngine, Arc<RecordingWebhook>) {
+        let hook = Arc::new(RecordingWebhook {
+            fail,
+            ..Default::default()
+        });
+        let mut e = engine_inner(None);
+        e.cfg.defaults.notify_webhook = Some(url.to_string());
+        e.webhook = hook.clone();
+        (e, hook)
     }
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2324,16 +2659,31 @@ mod tests {
 
     use crate::runtime::{DispatchHandle, DispatchSpec};
 
-    /// A runtime that answers only the journal question — nothing else on the
-    /// trait is reachable from the settle path.
-    struct JournalFact(Option<RunEnd>);
+    /// A runtime that answers the journal question and records the prompts the
+    /// settle path sends — the two things reachable from settling (gh#71).
+    #[derive(Default)]
+    struct JournalFact(Option<RunEnd>, std::sync::Mutex<Vec<(String, String)>>);
+
+    impl JournalFact {
+        fn ending(end: Option<RunEnd>) -> JournalFact {
+            JournalFact(end, Default::default())
+        }
+        /// (chat id, text) for every prompt the board queued.
+        fn prompts(&self) -> Vec<(String, String)> {
+            self.1.lock().unwrap().clone()
+        }
+    }
 
     impl Runtime for JournalFact {
         fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
             unreachable!("settling never dispatches")
         }
-        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            unreachable!("settling never prompts")
+        fn prompt(&self, chat: &str, text: &str) -> anyhow::Result<()> {
+            self.1
+                .lock()
+                .unwrap()
+                .push((chat.to_string(), text.to_string()));
+            Ok(())
         }
         fn cancel(&self, _: &str) -> anyhow::Result<()> {
             unreachable!("settling never cancels")
@@ -2662,7 +3012,7 @@ mod tests {
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let work = agent_worked_in(&e, a, Work::Pushed);
-        let rt = JournalFact(Some(RunEnd::Errored));
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
@@ -2701,7 +3051,7 @@ mod tests {
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
             .unwrap();
-        let rt = JournalFact(Some(RunEnd::Errored));
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
@@ -2720,7 +3070,7 @@ mod tests {
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
             .unwrap();
-        let rt = JournalFact(None);
+        let rt = JournalFact::ending(None);
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
             .unwrap();
         assert!(live(&e).outcome.is_none());
@@ -2752,6 +3102,311 @@ mod tests {
             .unwrap();
         assert!(live(&e).outcome.is_none());
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- notification (gh#71) --------------------------------------------
+
+    /// An attempt released by an agent in `chat-parent`, as `--via` records it.
+    fn dispatch_via(e: &SyncEngine, task: &str, chat_id: &str, parent: &str) -> i64 {
+        let a =
+            e.db.insert_attempt(&crate::db::NewAttempt {
+                task_id: task.into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: Some("board/lin-142".into()),
+                dispatched_by: None,
+                dispatched_by_pane: Some(parent.into()),
+                base_sha: None,
+                account: None,
+            })
+            .unwrap();
+        e.db.set_attempt_pane(a, chat_id).unwrap();
+        a
+    }
+
+    fn blocked_writebacks(e: &SyncEngine) -> Vec<Value> {
+        e.db.pending_writebacks(50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind == "blocked")
+            .map(|w| serde_json::from_str(&w.payload).unwrap())
+            .collect()
+    }
+
+    /// The exit criterion in one test: an agent that stops to ask produces one
+    /// comment, not one per reconcile tick. Before gh#71 it produced none at
+    /// all — a blocked attempt settles nothing, so no outcome writeback fires
+    /// and the row colour was the entire signal.
+    #[test]
+    fn a_blocked_agent_comments_upstream_exactly_once() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        for _ in 0..5 {
+            e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+                .unwrap();
+        }
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 1, "one block, one comment: {queued:?}");
+        assert_eq!(queued[0]["reason"], "asking");
+        assert_eq!(queued[0]["block"], 1);
+        assert!(live(&e).outcome.is_none(), "a block ends nothing");
+    }
+
+    /// Once per *block*, which is not the same as once per attempt: a question
+    /// answered at 09:00 and a second one at 11:00 are two things a human has
+    /// to hear about.
+    #[test]
+    fn blocking_again_after_being_answered_is_a_second_comment() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        for status in [
+            AgentStatus::Blocked,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+        ] {
+            e.reconcile_sessions_with(&statuses(&[("chat-9", status)]), Some(&rt))
+                .unwrap();
+        }
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued[1]["block"], 2);
+        assert_eq!(live(&e).blocked_count, 2);
+    }
+
+    /// The two ways of blocking are not the same news: one needs an answer,
+    /// the other needs a retry-or-cancel. Only the run journal splits them.
+    #[test]
+    fn an_errored_run_says_so_in_its_blocked_comment() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["reason"], "errored");
+        let body = blocked_comment(&queued[0]);
+        assert!(body.contains("stopped with an error"), "{body}");
+        assert!(body.starts_with("comet-board:"), "{body}");
+    }
+
+    /// The board must not say two contradictory things about one event. An
+    /// errored run whose pull request is already open *settles* — the work is
+    /// reviewable — so it gets the outcome comment and no blocked comment.
+    #[test]
+    fn a_block_that_settles_in_the_same_pass_comments_only_once() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert!(
+            blocked_writebacks(&e).is_empty(),
+            "a settled attempt is not also announced as blocked"
+        );
+    }
+
+    /// The event path is where a block is noticed the moment it happens
+    /// rather than up to a poll interval later — which for the 02:00 case is
+    /// the whole point.
+    #[test]
+    fn the_event_path_notices_a_block_immediately() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert_eq!(blocked_writebacks(&e).len(), 1);
+
+        // And the interval pass behind it does not say it again.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert_eq!(blocked_writebacks(&e).len(), 1);
+    }
+
+    /// herdr-board's AGE-25, ported: the agent that released the work is
+    /// prompted in its own chat when that work settles. An orchestrator only
+    /// gets a turn when something prompts it, so this is the only way it can
+    /// hear.
+    #[test]
+    fn a_settle_wakes_the_chat_that_released_the_work() {
+        let mut e = engine(None);
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/18"),
+            Some(18),
+            true,
+        )
+        .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let prompts = rt.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0].0, "chat-parent", "the dispatcher, not the child");
+        assert!(prompts[0].1.contains("LIN-142"));
+        assert!(prompts[0].1.contains("https://github.com/o/r/pull/18"));
+    }
+
+    /// Off by default, and the default is the design: an orchestrator woken by
+    /// every child it released cannot hold a train of thought.
+    #[test]
+    fn the_dispatcher_is_not_woken_unless_asked_for() {
+        let e = engine(None);
+        assert!(!e.cfg.defaults.notify_dispatcher, "off by default");
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert!(rt.prompts().is_empty());
+        assert_eq!(
+            live(&e).outcome,
+            Some(Outcome::Done),
+            "but it still settles"
+        );
+    }
+
+    /// Operator-released work has no dispatcher chat, so the switch being on
+    /// changes nothing about it. That is why it is a separate switch from the
+    /// operator's own notice.
+    #[test]
+    fn operator_released_work_has_nobody_to_wake() {
+        let mut e = engine(None);
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert!(rt.prompts().is_empty());
+    }
+
+    #[test]
+    fn the_webhook_gets_both_events() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let posts = hook.posts.lock().unwrap().clone();
+        let events: Vec<&str> = posts
+            .iter()
+            .map(|(_, b)| b["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(events, vec!["on_blocked", "on_settled"]);
+        assert_eq!(posts[0].0, "https://hooks.example.com/x");
+        assert_eq!(posts[0].1["reason"], "asking");
+        assert_eq!(posts[1].1["outcome"], "done");
+    }
+
+    /// `notify = false` is the operator saying "not tonight". It silences the
+    /// out-of-band channel and nothing else — the comment upstream belongs to
+    /// the task, not to whoever is watching.
+    #[test]
+    fn notify_off_silences_the_webhook_but_not_the_issue() {
+        let (mut e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        e.cfg.defaults.notify = false;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        assert!(hook.posts.lock().unwrap().is_empty());
+        assert_eq!(blocked_writebacks(&e).len(), 1);
+    }
+
+    /// A notification is best effort by construction. An endpoint that is down
+    /// must not hold a settle open, and must not be retried into telling
+    /// somebody tomorrow about a thing that happened tonight.
+    #[test]
+    fn a_dead_webhook_changes_nothing_about_the_board() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", true);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert_eq!(
+            hook.posts.lock().unwrap().len(),
+            1,
+            "tried once, not queued"
+        );
+    }
+
+    /// An orphaned attempt is the other ending nobody would notice: the chat
+    /// vanished, so there is no agent left to ask and no run journal to read.
+    #[test]
+    fn an_orphaned_attempt_is_announced_like_a_settle() {
+        let (mut e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        e.cfg.defaults.notify_dispatcher = true;
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        for _ in 0..2 {
+            e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+                .unwrap();
+        }
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Orphaned));
+        let posts = hook.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1["event"], "on_settled");
+        assert_eq!(posts[0].1["outcome"], "orphaned");
+        assert_eq!(rt.prompts().len(), 1, "the dispatcher hears about it too");
     }
 
     // ---- the settle the board got wrong (§H4's inverse) ------------------

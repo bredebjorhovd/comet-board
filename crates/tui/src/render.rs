@@ -817,7 +817,15 @@ fn board_footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     } else if let Some(row) = app.board.selected_task() {
         match row.state() {
             BoardState::Ready => hints.push(("enter", "dispatch", '\r')),
-            BoardState::Working | BoardState::Blocked => hints.push(("enter", "open chat", '\r')),
+            BoardState::Failed => hints.push(("enter", "retry", '\r')),
+            BoardState::Working => hints.push(("enter", "open chat", '\r')),
+            // Both keys are worth naming on a blocked row: the answer the agent
+            // is waiting for is usually in its chat, and `R` is the way out
+            // when it is not.
+            BoardState::Blocked => {
+                hints.push(("enter", "open chat", '\r'));
+                hints.push(("R", "retry", 'R'));
+            }
             _ => {}
         }
     }
