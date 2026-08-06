@@ -3,9 +3,11 @@ name: release
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-# then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at comet.zeron.sh/releases/* for
-# `curl -fsSL https://comet.zeron.sh/install.sh | sh`), bumping latest.txt.
+# then create a GitHub Release AND upload everything to our
+# `comet-native-releases` R2 bucket (served at
+# edge.comet.offhand.dev/releases/* for
+# `curl -fsSL https://edge.comet.offhand.dev/install.sh | sh`), bumping
+# latest.txt.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
@@ -76,29 +78,42 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
+      # the token through job env and gate on that instead. The token is the
+      # same repo secret deploy.yml uses: our account, Workers Scripts +
+      # R2 Storage edit (scripts/edge-setup-wizard.sh stage 8).
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
     steps:
+      # Checked out for edge/wrangler.jsonc only — the account id lives there
+      # and nowhere else, so moving the edge to another account can't leave
+      # releases uploading into the old one. Must precede download-artifact:
+      # checkout cleans the workspace.
+      - uses: actions/checkout@v4
+      - name: cloudflare account (from edge/wrangler.jsonc)
+        run: |
+          acct=$(sed -n 's/.*"account_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            edge/wrangler.jsonc | head -1)
+          [ -n "$acct" ] || { echo "no account_id in edge/wrangler.jsonc"; exit 1; }
+          echo "CLOUDFLARE_ACCOUNT_ID=$acct" >> "$GITHUB_ENV"
+      # Not `dist/`: that path is tracked in the repo (desktop entry, icons).
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: artifacts
           merge-multiple: true
       - name: version guard (tag == artifact version)
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          ls dist/
-          ls dist/ | grep -q "comet-$ver-" \
+          ls artifacts/
+          ls artifacts/ | grep -q "comet-$ver-" \
             || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: artifacts/*
           generate_release_notes: true
-      - name: upload to R2 (comet.zeron.sh/releases/*)
+      - name: upload to R2 (edge.comet.offhand.dev/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
-          for f in dist/*; do
+          for f in artifacts/*; do
             npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
               --file "$f" --remote
           done
@@ -106,7 +121,7 @@ jobs:
           # (crates/update) verifies downloads against it. Published before
           # latest.txt so no client ever sees a version without its checksums.
           manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
-          for f in dist/*; do
+          for f in artifacts/*; do
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
               '.files[$name] = {sha256: $sha}' <<<"$manifest")

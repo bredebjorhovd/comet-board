@@ -57,7 +57,7 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
+/// Production edge (Cloudflare Worker + Durable Objects on the offhand.dev zone).
 /// `COMET_EDGE_URL` overrides (local dev / self-hosting); `COMET_EDGE_URL=off`
 /// disables the edge entirely (local mode — single-box deployments).
 const DEFAULT_EDGE_URL: &str = "https://edge.comet.offhand.dev";
