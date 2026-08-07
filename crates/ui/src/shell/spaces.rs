@@ -25,6 +25,7 @@ use crate::pickers::{breadcrumbs, browser_rows, parent_path};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use chrono::DateTime;
 use comet_proto::view::board;
+use comet_proto::view::needs::{self as needs_view};
 use comet_proto::view::repos::{self, RepoOffer, RepoRow, SpaceSlug};
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
@@ -665,6 +666,330 @@ impl Shell {
                         format!("@ {device_name}")
                     })),
             )
+    }
+
+    /// The "Needs you" inbox (gh#122): the first section, and the one that
+    /// cannot miss. Every row says WHO and WHAT in words — no dot vocabulary —
+    /// and when nothing is pending the section says so ([`needs_view::ALL_CLEAR`])
+    /// instead of leaving a gap: the empty state is the reward, and it is what
+    /// licenses everything below to stay calm.
+    pub(super) fn render_needs_section(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let now = Utc::now();
+        let needs = self.board.read(cx).needs(cx, now);
+        let selected = self.state.read(cx).selected_chat.clone();
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(Theme::SPACE_SM))
+            .pt(px(12.0))
+            .pb(px(4.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(needs_view::NEEDS_YOU_TITLE)),
+            )
+            // The count is the header's whole answer: how many things want me.
+            .when(!needs.is_empty(), |el| {
+                el.child(
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(5.0))
+                        .bg(theme.accent.opacity(0.16))
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.accent)
+                        .child(SharedString::from(format!("{}", needs.len()))),
+                )
+            });
+
+        let body: AnyElement = if needs.is_empty() {
+            // The quiet check, in words.
+            div()
+                .px(px(Theme::SPACE_SM))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(status_dot_color(ChatIndicator::Completed, theme))
+                        .child(SharedString::from("✓")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(needs_view::ALL_CLEAR)),
+                )
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = needs
+                .iter()
+                .map(|need| {
+                    let is_selected = selected.as_deref() == Some(need.chat_id.as_str());
+                    self.render_need_row(need, is_selected, theme, cx)
+                })
+                .collect();
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(rows)
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// One thing waiting on a human: kind glyph, WHO, the one-line WHAT under
+    /// it. Click opens the chat, which is where answering happens.
+    fn render_need_row(
+        &self,
+        need: &needs_view::NeedRow,
+        selected: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use needs_view::NeedKind;
+        let accent = match need.kind {
+            NeedKind::Question => theme.accent,
+            NeedKind::DeadRun => theme.danger,
+            NeedKind::Report => status_dot_color(ChatIndicator::Completed, theme),
+        };
+        let subline = theme.text_muted.opacity(0.6);
+        let fade_key = format!("need-row-{}", need.chat_id);
+        let rest_bg = if selected {
+            theme.glass_selected_bg()
+        } else {
+            theme.wash(0.0)
+        };
+        let rest_text = if selected {
+            theme.text
+        } else {
+            theme.text.opacity(0.8)
+        };
+        let chat_id = need.chat_id.clone();
+
+        div()
+            .id(SharedString::from(format!("need-{}", need.chat_id)))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
+            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
+            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
+            .on_hover(motion::hover_listener(fade_key))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let id = chat_id.clone();
+                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+            }))
+            // Line 1: the kind's glyph, then WHO.
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .w(px(8.0))
+                            .flex_none()
+                            .text_size(px(9.0))
+                            .text_color(accent)
+                            .child(SharedString::from(need.kind.glyph())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .line_height(px(17.0))
+                            .child(SharedString::from(transcript::single_line(&need.who))),
+                    ),
+            )
+            // Line 2: WHAT, aligned under WHO.
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(14.0))
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .line_height(px(14.0))
+                    .text_color(subline)
+                    .child(SharedString::from(need.what.clone())),
+            )
+            .into_any_element()
+    }
+
+    /// The orchestrator's fixed slot above Spaces (gh#122): a pinned thread —
+    /// ◆ identity, the name, an unread badge, the latest report's preview —
+    /// not a decorated session row. `None` only when no orchestrator is pinned
+    /// (or its chat has not synced here); a pinned-but-silent orchestrator
+    /// renders as the empty fixture, teaching where to look before the first
+    /// notice arrives.
+    pub(super) fn render_orchestrator_slot(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let now = Utc::now();
+        let slot = self.state.read(cx).orchestrator_slot(now)?;
+        let selected = self.state.read(cx).selected_chat.as_deref() == Some(slot.chat_id.as_str());
+
+        let subline = theme.text_muted.opacity(0.6);
+        let fade_key = format!("orch-slot-{}", slot.chat_id);
+        let rest_bg = if selected {
+            theme.glass_selected_bg()
+        } else {
+            theme.wash(0.0)
+        };
+        let rest_text = if selected {
+            theme.text
+        } else {
+            theme.text.opacity(0.8)
+        };
+        let chat_id = slot.chat_id.clone();
+        // The ◆ is identity; state is carried honestly beside it — the spinner
+        // while a turn runs, so an 8h-old report can never be mistaken for a
+        // turn running now.
+        let lead: AnyElement = if slot.indicator == ChatIndicator::Working {
+            div()
+                .w(px(8.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(loaders::mini_gradient_spinner(
+                    format!("orch-working-{}", slot.chat_id),
+                    2.0,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(8.0))
+                .flex_none()
+                .text_size(px(9.0))
+                .text_color(theme.accent)
+                .child(SharedString::from(
+                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
+                ))
+                .into_any_element()
+        };
+        // The right column: the badge while something is unread, the time it
+        // last spoke otherwise. Words either way.
+        let tail: AnyElement = if slot.unseen {
+            div()
+                .flex_none()
+                .px(px(5.0))
+                .py(px(1.0))
+                .rounded(px(5.0))
+                .bg(status_dot_color(ChatIndicator::Completed, theme).opacity(0.16))
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(status_dot_color(ChatIndicator::Completed, theme))
+                .child(SharedString::from("new"))
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .text_size(px(11.0))
+                .text_color(subline)
+                .child(SharedString::from(
+                    slot.last_at
+                        .map(|at| format_time_ago(at, now))
+                        .unwrap_or_default(),
+                ))
+                .into_any_element()
+        };
+        let preview = slot
+            .preview
+            .clone()
+            .unwrap_or_else(|| needs_view::NO_REPORTS.to_string());
+        // The latest report is the payload: brighter while unread.
+        let preview_color = if slot.unseen {
+            theme.text.opacity(0.7)
+        } else {
+            subline
+        };
+
+        Some(
+            div()
+                .id(SharedString::from(format!("orchestrator-{}", slot.chat_id)))
+                .mt(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .rounded(px(8.0))
+                .px(px(Theme::SPACE_SM))
+                .py(px(6.0))
+                .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
+                .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
+                .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
+                .on_hover(motion::hover_listener(fade_key))
+                .cursor_pointer()
+                // Opening it opens the thread — and marks it seen, the synced
+                // marker that clears the badge on every device.
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let id = chat_id.clone();
+                    this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                }))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(lead)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .line_height(px(17.0))
+                                .child(SharedString::from(needs_view::ORCHESTRATOR_NAME)),
+                        )
+                        .child(tail),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .pl(px(14.0))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(preview_color)
+                        .child(SharedString::from(preview)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The "Agents" section (gh#103): one row per live board attempt, blocked

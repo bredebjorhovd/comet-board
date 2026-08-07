@@ -1324,8 +1324,9 @@ fn the_sidebar_and_the_transcript_sit_at_different_levels() {
     let buffer = terminal.backend().buffer();
     let panel = app.theme.panel;
 
-    // A row well clear of the header, the selection and the prompt.
-    let y = 9u16;
+    // A row well clear of the header, the selection and the prompt — the
+    // blank between the Spaces and Sessions sections, which nothing selects.
+    let y = 6u16;
     for x in 0..32u16 {
         assert_eq!(buffer[(x, y)].bg, panel, "sidebar column {x} is not filled");
     }

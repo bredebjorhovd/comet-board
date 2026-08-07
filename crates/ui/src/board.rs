@@ -64,6 +64,7 @@ use gpui::{
 };
 
 use comet_proto::view::board::{self, BoardState, Filter, TaskRow};
+use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
 use comet_rpc::methods;
 use serde::Deserialize;
@@ -867,7 +868,29 @@ impl BoardPanel {
     /// live chat is running.
     pub fn running(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::RunningRow> {
         let state = self.state.read(cx);
-        board::running_rows(&self.model.rows, &state.chats, &state.sessions, now)
+        board::running_rows(
+            &self.model.rows,
+            &state.chats,
+            &state.sessions,
+            state.orchestrator.as_deref(),
+            now,
+        )
+    }
+
+    /// The "Needs you" inbox (gh#122): everything waiting on a human, as rows
+    /// that say who and what in words. Here for the same reason
+    /// [`BoardPanel::agents`] is — the panel is the one holder of this
+    /// device-swept board's rows, and the inbox joins them to the pin, the
+    /// chats and the session watch.
+    pub fn needs(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<needs_view::NeedRow> {
+        let state = self.state.read(cx);
+        needs_view::needs_you(
+            state.orchestrator.as_deref(),
+            &self.model.rows,
+            &state.chats,
+            &state.sessions,
+            now,
+        )
     }
 
     /// Shell toggle hook. Opening starts the watch; closing keeps the rows so
