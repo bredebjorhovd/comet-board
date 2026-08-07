@@ -2117,6 +2117,8 @@ fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_pro
         started_at: None,
         account: None,
         dispatched_by_user: None,
+        billed_to: None,
+        max_duration_secs: None,
     }
 }
 
@@ -2194,6 +2196,7 @@ fn a_selected_ready_row_offers_dispatch_in_the_footer() {
         other => panic!("expected an account fetch, got {other:?}"),
     }
     app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
         task_id: "1".into(),
         accounts: vec![comet_proto::AgentAccount {
             id: "slot-ana".into(),
@@ -2214,6 +2217,63 @@ fn a_selected_ready_row_offers_dispatch_in_the_footer() {
     assert!(screen.contains("Dispatch gh#1 on"), "{screen}");
     assert!(screen.contains("Route default"), "{screen}");
     assert!(screen.contains("ana@example.com"), "{screen}");
+}
+
+/// gh#101's exit criterion in the TUI: a teammate's enter over a row whose
+/// route names no account lands on **row 0**, which spends the box's own login
+/// — the owner's. The picker has to say so there, on the row nobody chose,
+/// before enter-enter releases it.
+#[test]
+fn the_account_picker_says_when_row_zero_spends_someone_elses_plan() {
+    fn login(id: &str, email: &str, active: bool) -> comet_proto::AgentAccount {
+        comet_proto::AgentAccount {
+            id: id.into(),
+            harness: comet_proto::HarnessId::ClaudeCode,
+            email: Some(email.into()),
+            plan_label: Some("Max".into()),
+            active,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    // `populated()` signs in as w@example.com — the teammate at the keyboard.
+    // The box's live login is the owner's.
+    let mut app = boarded();
+    app.board.selected = Some("1".into());
+    app.act(Action::BoardEnter);
+    app.apply(Update::DispatchAccounts {
+        harness: Some(comet_proto::HarnessId::ClaudeCode),
+        task_id: "1".into(),
+        accounts: vec![
+            login("slot-box", "brede@tally.no", true),
+            login("slot-me", "w@example.com", false),
+        ],
+    });
+    let screen = joined(&snapshot(&mut app, 100, 26));
+
+    assert!(
+        screen.contains("bills brede@tally.no"),
+        "row 0 is the one an enter-enter release lands on:\n{screen}"
+    );
+    // The teammate's own slot is not a warning — it keeps its plan label.
+    assert!(screen.contains("w@example.com"), "{screen}");
+    assert!(
+        screen.contains("Max"),
+        "a row that bills you keeps its plan label:\n{screen}"
+    );
+    // Two rows charge the owner — the route default and his slot picked
+    // explicitly — and both say so. Only those two: the warning is worth
+    // nothing if it is on every row.
+    assert_eq!(
+        screen.matches("bills ").count(),
+        2,
+        "exactly the rows that charge somebody else say it:\n{screen}"
+    );
 }
 
 #[test]
@@ -2264,4 +2324,107 @@ fn the_board_find_field_counts_matches_as_you_type() {
     app.act(Action::BoardFindType('2'));
     let screen = joined(&snapshot(&mut app, 100, 26));
     assert!(screen.contains("1 row"), "the count after typing:\n{screen}");
+}
+
+// ---------------------------------------------------------------------------
+// The sidebar's Agents section (gh#103)
+// ---------------------------------------------------------------------------
+
+/// Three agents running, and the sidebar says so with the board pane shut.
+#[test]
+fn live_agents_draw_in_the_sidebar_with_the_board_closed() {
+    let mut app = populated();
+    // A dispatched chat sits on the attempt's branch, which is what the row's
+    // sub-line reads.
+    let on_branch = |id: &str, title: &str, branch: &str| Chat {
+        branch: Some(branch.into()),
+        ..chat(id, title)
+    };
+    app.apply(Update::Chats(vec![
+        on_branch("c1", "Rework the diff sidebar", "board/gh-101"),
+        on_branch("c2", "Chase the flaky room test", "board/gh-102"),
+        on_branch("c3", "Port the pane list", "board/gh-103"),
+    ]));
+    let live = |id: &str, chat: &str, state, branch: &str, started: i64| {
+        let mut row = board_row(id, state);
+        row.chat_id = Some(chat.into());
+        row.branch = Some(branch.into());
+        row.started_at = Some((Utc::now() - chrono::Duration::minutes(started)).to_rfc3339());
+        row.max_duration_secs = Some(7200);
+        row
+    };
+    use comet_proto::view::board::BoardState;
+    app.apply(Update::Board(vec![
+        live("1", "c1", BoardState::Working, "board/gh-101", 110),
+        live("2", "c2", BoardState::Working, "board/gh-102", 4),
+        live("3", "c3", BoardState::Blocked, "board/gh-103", 30),
+    ]));
+    let session = |chat_id: &str, status| Session {
+        chat_id: chat_id.into(),
+        device_id: "dev".into(),
+        status,
+        started_at: None,
+        updated_at: Utc::now(),
+    };
+    app.apply(Update::Sessions(vec![
+        session("c1", SessionStatus::Working),
+        session("c2", SessionStatus::Working),
+        session("c3", SessionStatus::AwaitingInput),
+    ]));
+
+    assert!(!app.board_open, "the board pane was never opened");
+    let rows = snapshot(&mut app, 100, 30);
+    let sidebar = joined(&sidebar_of(&rows, 100));
+
+    // The section, with the count of what wants a human on its header.
+    assert!(sidebar.contains("Agents"), "{sidebar}");
+    assert!(sidebar.contains("1 blocked"), "{sidebar}");
+    // One row per live attempt, titled by its issue, branch underneath.
+    for needle in ["gh#1", "gh#2", "gh#3", "board/gh-103"] {
+        assert!(sidebar.contains(needle), "{needle:?} missing:\n{sidebar}");
+    }
+    // Elapsed against the route's cap — the whole point of the counter.
+    assert!(sidebar.contains("1h50m / 2h"), "{sidebar}");
+
+    // Blocked floats above the two working rows.
+    let at = |needle: &str| {
+        sidebar
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar}"))
+    };
+    assert!(at("gh#3") < at("gh#1"), "blocked floats:\n{sidebar}");
+    assert!(at("gh#1") < at("gh#2"), "then longest-running:\n{sidebar}");
+    // And it sits above the chat list, where the eye lands first.
+    assert!(at("Agents") < at("Sessions"), "{sidebar}");
+}
+
+/// Nothing dispatched: no header, no gap, no reminder that a board exists.
+#[test]
+fn the_agents_section_is_absent_when_nothing_is_running() {
+    let mut app = populated();
+    app.apply(Update::Board(vec![board_row(
+        "1",
+        comet_proto::view::board::BoardState::Ready,
+    )]));
+    let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
+    assert!(!sidebar.contains("Agents"), "{sidebar}");
+}
+
+/// Clicking an agent row opens its chat — the click that replaces going to the
+/// board pane and finding the row there.
+#[test]
+fn clicking_an_agent_row_opens_its_chat() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![
+        chat("c1", "Rework the diff sidebar"),
+        chat("c2", "Chase the flaky room test"),
+    ]));
+    let mut live = board_row("2", comet_proto::view::board::BoardState::Blocked);
+    live.chat_id = Some("c2".into());
+    app.apply(Update::Board(vec![live]));
+
+    let (x, y) = cell_of(&mut app, 100, 30, "gh#2");
+    app.click(x, y);
+    assert_eq!(app.selected_chat.as_deref(), Some("c2"));
 }

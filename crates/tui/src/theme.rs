@@ -193,6 +193,17 @@ impl Theme {
         }
     }
 
+    /// The mark on the session pinned as the board's orchestrator (gh#104).
+    /// Accent where there is colour; the glyph is shape-distinct anyway, so
+    /// `plain` drops to weight without the row losing what it says.
+    pub fn orchestrator(&self) -> Style {
+        if self.plain {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.accent)
+        }
+    }
+
     /// Section labels ("Sessions").
     pub fn label(&self) -> Style {
         let style = Style::default().fg(self.muted);
@@ -325,6 +336,27 @@ impl Theme {
         // what separates it from READY when hue is gone.
         if state == S::Done {
             style.add_modifier(Modifier::DIM)
+        } else {
+            style
+        }
+    }
+
+    /// The sidebar Agents section's glyph colour (gh#103).
+    ///
+    /// Routed through [`Theme::board_state`] rather than given a palette of its
+    /// own: a live attempt should not change colour on its way from the board
+    /// pane to the sidebar. The one thing this adds is NO_COLOR emphasis — the
+    /// two states that want a human are bold when hue is gone, exactly as the
+    /// status dot's are.
+    pub fn agent_state(&self, state: comet_proto::view::board::AgentState) -> Style {
+        use comet_proto::view::board::{AgentState as A, BoardState as S};
+        let style = self.board_state(match state {
+            A::Blocked => S::Blocked,
+            A::Errored => S::Failed,
+            A::Working => S::Working,
+        });
+        if self.plain && state.needs_attention() {
+            style.add_modifier(Modifier::BOLD)
         } else {
             style
         }
@@ -561,7 +593,20 @@ mod tests {
         // Done is dim, and the emphasis is the carrier: it must survive NO_COLOR.
         assert!(t.board_state(S::Done).add_modifier.contains(Modifier::DIM));
 
+        // A live agent in the sidebar is the same state in the same colour as
+        // the board pane's row for it (gh#103) — blocked's red, failed's red for
+        // a dead run, working's amber.
+        use comet_proto::view::board::AgentState as A;
+        assert_eq!(t.agent_state(A::Blocked).fg, t.board_state(S::Blocked).fg);
+        assert_eq!(t.agent_state(A::Errored).fg, t.board_state(S::Failed).fg);
+        assert_eq!(t.agent_state(A::Working).fg, t.board_state(S::Working).fg);
+
         let t = Theme::plain();
+        // With hue gone the two states that want a human are bold, exactly as
+        // the status dot's are.
+        assert!(t.agent_state(A::Blocked).add_modifier.contains(Modifier::BOLD));
+        assert!(t.agent_state(A::Errored).add_modifier.contains(Modifier::BOLD));
+        assert!(!t.agent_state(A::Working).add_modifier.contains(Modifier::BOLD));
         for s in S::SECTION_ORDER {
             assert!(
                 matches!(t.board_state(s).fg, None | Some(Color::Reset)),

@@ -32,7 +32,9 @@
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
 //! - Board (comet-board fork, docs/BOARD.md): `WatchBoard` → stream of board
 //!   rows (herdr-board's `list --json` shape), `DispatchTask {taskId, via?,
-//!   runtime?, model?}` → `{chatId, cwd, attempt}`, `CancelTask {taskId}` →
+//!   runtime?, model?, account?, bill?}` → `{chatId, cwd, attempt}` — `bill` is
+//!   the acknowledgement `billing_guard = "require-own"` wants for a run that
+//!   spends somebody else's subscription (gh#101), `CancelTask {taskId}` →
 //!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
 //!   engine-hosted board service, and relay-forwardable (gh#55): one box hosts
 //!   the board, every teammate's device drives it with `targetDeviceId`.
@@ -256,6 +258,17 @@ struct DispatchTaskParams {
     /// and does what it was told.
     #[serde(default)]
     account: Option<String>,
+    /// "Bill this account, I know whose it is" — the acknowledgement
+    /// `[defaults] billing_guard = "require-own"` accepts instead of refusing a
+    /// cross-billed release (gh#101). An agent-account slot id, which also
+    /// selects the account, or the email on the login being spent (the only
+    /// spelling there is when that login is the box's own).
+    ///
+    /// A separate key from `account` on purpose: `account` says which
+    /// subscription, this says that somebody meant to spend one that is not
+    /// theirs. Ignored entirely under `warn` and `off`.
+    #[serde(default)]
+    bill: Option<String>,
     /// End the task's live attempt and release a fresh one — the blocked row's
     /// Retry (gh#49). Off for ordinary dispatches, which are refused on a live
     /// attempt.
@@ -1017,6 +1030,7 @@ fn forwardable(method: &str) -> bool {
             // was per-USER until then, which is what kept a second teammate
             // out), exactly as for every other forwardable call.
             | methods::WATCH_BOARD
+            | methods::WATCH_BOARD_ORCHESTRATOR
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
             | methods::LIST_BOARD_RUNTIMES
@@ -1044,6 +1058,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
             | methods::WATCH_BOARD
+            | methods::WATCH_BOARD_ORCHESTRATOR
     )
 }
 
@@ -1310,6 +1325,9 @@ impl RpcService for EngineRpc {
             // Board surface (comet-board fork, docs/BOARD.md §H2). Served off
             // the board service's loop; absent when the board is disabled.
             methods::WATCH_BOARD => Ok(RpcReply::Stream(watch_stream(self.board()?.watch_rows()))),
+            methods::WATCH_BOARD_ORCHESTRATOR => Ok(RpcReply::Stream(watch_stream(
+                self.board()?.watch_orchestrator(),
+            ))),
             // The runtimes a dispatch can be pointed at — a static catalog from
             // the board core, so the pickers and the engine validate against
             // the same set. Not board-loop state: served regardless of the
@@ -1324,6 +1342,7 @@ impl RpcService for EngineRpc {
                     runtime: p.runtime,
                     model: p.model,
                     account: p.account,
+                    bill: p.bill,
                 };
                 let origin = DispatchOrigin {
                     chat: p.via,
@@ -1365,6 +1384,11 @@ impl RpcService for EngineRpc {
                 let view = self
                     .write_board_config(&paths, p)
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                // Republish what a frontend is watching off this file before
+                // replying (gh#104): pinning a chat is a direct action, and the
+                // sidebar glyph should be there when the click returns rather
+                // than up to a sync interval later.
+                self.board()?.note_config(&view);
                 RpcReply::value(&self.config_reply(view).await?)
             }
             // Clone + space + adopt, all on this device (gh#97). Slow by

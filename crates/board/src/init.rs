@@ -212,6 +212,13 @@ retain_worktrees = "7d"
 # on its issue and a coloured row, and nothing else. `notify` switches it off
 # without deleting the URL. `doctor` reports which of the two is missing.
 # notify_webhook = "https://hooks.example.com/comet-board"
+# One chat pinned as this board's orchestrator: it hears about every settle,
+# block, orphan and cap warning, not only the work it released itself, and can
+# drive the board with the ordinary `comet-board` verbs. Set it from the desktop
+# app or the TUI ("Pin as orchestrator" on a session) rather than by hand — they
+# know the chat id. Unset, nothing is delivered anywhere but the trail on the
+# issue. `docs/orchestrator.md` is the brief to open that chat with.
+# orchestrator_chat = "chat_01J8Z…"
 
 [linear]
 # Which state means "finished, waiting on a human". Uncomment and Linear moves

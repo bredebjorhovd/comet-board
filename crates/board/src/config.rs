@@ -404,6 +404,32 @@ pub struct Defaults {
     /// never fires for operator-released work, which has no dispatcher.
     #[serde(default)]
     pub notify_dispatcher: bool,
+    /// The chat pinned as this board's orchestrator (gh#104): the one agent
+    /// that hears about **everything**, not only the work it released itself.
+    ///
+    /// [`notify_dispatcher`](Self::notify_dispatcher) wakes the chat that
+    /// released each task, which is the right audience for a chat that released
+    /// one thing and is waiting on it. It is the wrong audience for the
+    /// topology this fork was actually built by: one long-lived agent that
+    /// drives the whole board, dispatches, reviews, merges and backfills. That
+    /// agent has to hear about work an operator released from the board panel
+    /// and work a *sibling* released, because a board it only half sees is a
+    /// board it cannot run.
+    ///
+    /// So this is a superset target rather than a second switch on the same
+    /// channel: every settle, block, orphan and cap warning on the board is
+    /// prompted into this chat, through the same [`crate::runtime::Runtime`]
+    /// path review delivery uses. One per board — re-pinning moves it — and
+    /// unset (the default) is a board with no orchestrator and no notices,
+    /// which is what every board was before this existed.
+    ///
+    /// The value is a comet chat id. Nothing here can check that it names a
+    /// live chat: the board core has no runtime at parse time, so a stale id is
+    /// caught at delivery (the chat is gone; the log says so once) and named by
+    /// `doctor`. Empty string reads as unset rather than as a chat called ""
+    /// — see [`Defaults::orchestrator`].
+    #[serde(default)]
+    pub orchestrator_chat: Option<String>,
     /// Which tracker `comet-board new` writes to: `linear` or `github`.
     ///
     /// Not inferable from a label — a label routes work to a repo and says
@@ -432,6 +458,40 @@ pub struct Defaults {
     /// and what `doctor`'s worktree check exists to make visible.
     #[serde(default = "default_retain_worktrees")]
     pub retain_worktrees: String,
+    /// What the board does about a dispatch that spends somebody else's
+    /// subscription (gh#101): `warn` (the default), `require-own`, or `off`.
+    /// Overridden per route.
+    ///
+    /// `warn` says so everywhere and releases anyway — in the pickers, on the
+    /// CLI, in the upstream comment and on the row for the attempt's whole
+    /// life. `require-own` refuses instead, unless the dispatch names the payer
+    /// outright (`--bill`). `off` says nothing, which is the right answer on a
+    /// box where one person's plan pays for everything.
+    ///
+    /// A seatbelt, not a lock: the match is the dispatching frontend's `viaUser`
+    /// claim against the agent-account's email, and the box cannot check that
+    /// claim until #66's verified identity lands. See [`crate::billing`].
+    #[serde(default = "default_billing_guard")]
+    pub billing_guard: String,
+}
+
+fn default_billing_guard() -> String {
+    crate::billing::GuardMode::default().as_str().to_string()
+}
+
+impl Defaults {
+    /// The pinned orchestrator's chat id, if there is one.
+    ///
+    /// Trimmed, and an empty value is `None`. A settings surface that clears a
+    /// text field writes `orchestrator_chat = ""` at least as often as it
+    /// removes the key, and a board that then tried to prompt a chat named ""
+    /// would log a delivery failure every settle for as long as nobody noticed.
+    pub fn orchestrator(&self) -> Option<&str> {
+        self.orchestrator_chat
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
 }
 
 fn default_max_duration() -> String {
@@ -471,9 +531,11 @@ impl Default for Defaults {
             notify: true,
             notify_webhook: None,
             notify_dispatcher: false,
+            orchestrator_chat: None,
             new_source: default_new_source(),
             max_duration: default_max_duration(),
             retain_worktrees: default_retain_worktrees(),
+            billing_guard: default_billing_guard(),
         }
     }
 }
@@ -698,6 +760,14 @@ pub struct Route {
     /// looks.
     #[serde(default)]
     pub max_duration: Option<String>,
+    /// Per-route override of `defaults.billing_guard` (gh#101).
+    ///
+    /// Per route because the answer is a property of the work, not of the box:
+    /// the route into a shared team repo is the one where a teammate spending
+    /// the owner's plan is worth refusing, and the route into the owner's own
+    /// side project is the one where the warning is noise on every dispatch.
+    #[serde(default)]
+    pub billing_guard: Option<String>,
 }
 
 impl Route {
@@ -844,9 +914,24 @@ impl RoutingConfig {
                     r.display_name()
                 ));
             }
+            // And here a typo reads as `warn` — the default — which is the one
+            // spelling that would silently un-arm a route somebody deliberately
+            // set to `require-own` (gh#101).
+            if let Some(g) = &r.billing_guard
+                && let Err(e) = crate::billing::parse_guard_mode(g)
+            {
+                out.push(format!(
+                    "route {} ({}) has billing_guard {e}",
+                    i + 1,
+                    r.display_name()
+                ));
+            }
         }
         if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
             out.push(format!("[defaults] max_duration {e}"));
+        }
+        if let Err(e) = crate::billing::parse_guard_mode(&self.defaults.billing_guard) {
+            out.push(format!("[defaults] billing_guard {e}"));
         }
         // Same reasoning as the cap above: an unparseable retention would read
         // as `off` on a board nobody told, and the checkouts would pile up
@@ -977,6 +1062,23 @@ impl RoutingConfig {
         // default cap is the honest answer rather than none at all.
         parse_max_duration(raw)
             .unwrap_or_else(|_| parse_max_duration(&default_max_duration()).ok().flatten())
+    }
+
+    /// What this route does about a cross-billed dispatch — the route's own
+    /// `billing_guard`, else `defaults.billing_guard` (gh#101).
+    ///
+    /// `route` is an `Option` for the same reason [`Self::max_duration_secs`]'s
+    /// is: the guard is also read outside dispatch (`doctor`, and the row
+    /// detail on an attempt whose route was renamed under it), and no route
+    /// means the board-wide answer. An unparseable value has already been
+    /// refused by validation; a config that reached here with one is one
+    /// `load_or_default` fell back on, so it reads as the default mode — never
+    /// as `off`, which is the one wrong way to fail.
+    pub fn billing_guard(&self, route: Option<&Route>) -> crate::billing::GuardMode {
+        let raw = route
+            .and_then(|r| r.billing_guard.as_deref())
+            .unwrap_or(&self.defaults.billing_guard);
+        crate::billing::parse_guard_mode(raw).unwrap_or_default()
     }
 
     /// How long a finished attempt's checkout is kept, in seconds. `None` is
@@ -1500,6 +1602,63 @@ labels = ["release-a"]
         assert_eq!(parse_duration_secs("1h"), Some(3600));
         assert_eq!(parse_duration_secs("90"), Some(90));
         assert_eq!(parse_duration_secs(""), None);
+    }
+
+    // ---- the billing guard (gh#101) --------------------------------------
+
+    #[test]
+    fn the_billing_guard_warns_unless_a_route_says_otherwise() {
+        use crate::billing::GuardMode;
+        // Warn is the shipped answer: the board's job is to make the spend
+        // visible, and a box where two people share one plan is a normal box.
+        assert_eq!(
+            RoutingConfig::default().billing_guard(None),
+            GuardMode::Warn
+        );
+
+        let c = github(
+            r#"
+[defaults]
+billing_guard = "off"
+
+[[route]]
+match = { label = "team" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+billing_guard = "require-own"
+
+[[route]]
+match = { label = "mine" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+"#,
+        );
+        assert_eq!(c.billing_guard(Some(&c.routes[0])), GuardMode::RequireOwn);
+        assert_eq!(c.billing_guard(Some(&c.routes[1])), GuardMode::Off);
+        // A route deleted from under a running attempt falls back to the
+        // board's answer, whatever that is.
+        assert_eq!(c.billing_guard(None), GuardMode::Off);
+    }
+
+    /// A typo reads exactly like the default, which is the one wrong way to
+    /// fail: it would silently un-arm a route somebody set to `require-own`.
+    #[test]
+    fn an_unknown_billing_guard_is_refused_by_name() {
+        let c: RoutingConfig =
+            toml::from_str("[defaults]\nbilling_guard = \"require-mine\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[defaults] billing_guard"), "{err}");
+        assert!(err.contains("require-own"), "it names the set: {err}");
+
+        let c: RoutingConfig = toml::from_str(
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"w\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nbilling_guard = \"maybe\"\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("billing_guard"), "{err}");
     }
 
     // ---- the wall-clock cap (gh#70) --------------------------------------

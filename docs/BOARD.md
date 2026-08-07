@@ -129,13 +129,18 @@ nearly verbatim — it never depended on herdr:
   derivations — `BoardState` (moved from `comet-board`, glyphs included),
   `TaskRow` (moved, wire contract), plus `Filter`, `sections`,
   `routes_present`/`filter_cycle`, `finished_today`, `row_metadata` — so the
-  TUI and the future gpui app derive the same rows.
+  TUI and the gpui app derive the same rows. `AgentState`/`agent_rows`
+  (gh#103) joins those rows to the chats and the session watch for the
+  sidebar's Agents section, on both surfaces.
 - `crates/tui/src/board.rs` + the board section of `crates/tui/src/render.rs` —
   **new** (H7): the board pane (`B`), consuming `WatchBoard`, dispatching over
-  `DispatchTask`. See §H7 below.
+  `DispatchTask`. See §H7 below. The same stream also feeds the sidebar's
+  Agents section in both frontends (`Row::Agent` here,
+  `Shell::render_agents_section` in `crates/ui/src/shell/spaces.rs` — §H17).
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
-`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?}` →
+`DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?,
+bill?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
@@ -146,8 +151,10 @@ name resolves to, so a picker can tell which agent accounts a runtime could
 spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
 override the route's configured runtime, the harness's default model, and the
 route's `account` for that one dispatch; the attempt row records whatever the
-agent actually ran under. `via`/`viaDevice`/`viaUser` are provenance, never
-authority — see §H12.
+agent actually ran under. `bill` is the acknowledgement that a run spends
+somebody else's subscription, which `billing_guard = "require-own"` wants
+instead of a refusal — see §H17. `via`/`viaDevice`/`viaUser` are provenance,
+never authority — see §H12.
 
 ### Per-run agent accounts (gh#59)
 
@@ -770,7 +777,7 @@ attribution back beyond the row field — the panel's dispatch notice names the
 account it spent, and the issue comment names the human, which is where people
 were already looking.
 
-### H13 — Remote routing surface — **done** (gh#75)
+### H19 — Remote routing surface — **done** (gh#75)
 `routing.toml` is a hand-edited file on the box, documented as "not managed
 config", and no RPC touched it. Adding a repo, pointing a route at a different
 agent account, or lifting a cap was an ssh-and-edit job — fine for whoever set
@@ -931,7 +938,184 @@ dispatch this repo's issues into another repo's code — so it is refused.
   decision where it was. Same for an archived repo and one with issues disabled:
   both would otherwise be discovered as a board that stays empty.
 
-### H18 — Commits carry the dispatcher, not whatever the box improvises — **done** (gh#107)
+### H18 — Never spend someone's subscription silently — **done** (gh#101)
+gh#59 made *which* account a dispatch spends explicit and gh#74 made every
+frontend send one, and between them they left the case they had just made
+visible unaddressed: a dispatch that names no account runs on the box's own CLI
+login. On a shared box that is the owner's subscription, whoever pressed enter.
+The teammate did not know they were spending it; the owner found out on their
+usage page.
+
+**Who a run bills** is resolved at dispatch: the named slot's
+`AgentAccount.email`, or — when no slot is named — the box's own login, which is
+the *active* account for that harness and is displayed as the operator's. It is
+recorded on the attempt (`attempts.billed_to`) and joins the `TaskRow` contract
+as `billed_to`, rather than being looked up from `account` on demand: a slot id
+means nothing to a reader who has not saved that login, and the box's own login
+can be switched under a run that is still going. A run is **cross-billed** when
+that email differs from the dispatcher's `viaUser` claim; two unknowns read as
+"not cross-billed", because an unattributed dispatch names nobody to have
+wronged.
+
+**`[defaults] billing_guard = "warn" | "require-own" | "off"`**, per-route
+override, parsed like `max_duration` — an unrecognised value is refused by
+`validate` rather than falling back silently, since a typo would read exactly
+like the default and un-arm a route somebody deliberately set to `require-own`.
+
+`warn` (the default) says so everywhere and releases anyway:
+- both pickers mark a selection that cross-bills with a warning treatment and
+  the text *bills brede@tally.no* — **including row 0**, which is exactly the
+  chip an enter-enter release lands on without anybody having chosen it. Row 0's
+  effective slot is the route's account, resolved against the host's own
+  `ListAgentAccounts`, because `Route default · 8f2c1d0a` answers nothing;
+- `comet-board dispatch` / `retry` print one line before releasing — *this run
+  bills brede@tally.no's Claude — pass --account <your slot>*. The CLI resolves
+  it itself rather than reading it back off the reply: by the time `DispatchTask`
+  answers, the worktree is cut and the agent is running on that account. This is
+  also why the CLI now sends `viaUser` (from the local `AuthStatus`) — it is a
+  frontend like the other two, and without it the guard has nothing to compare;
+- the upstream dispatch comment appends *· on brede@tally.no's subscription*, so
+  the record is public to both parties instead of living on one usage page;
+- `row_metadata` appends *· bills brede@tally.no* for the attempt's whole life —
+  outside the per-state arms, because a fact that survives the row changing
+  section does not belong inside the match on which section it is in.
+
+`require-own` refuses instead, in `handle_dispatch` **beside the concurrency
+cap** — before any attempt row exists, because a refusal that left a `failed`
+attempt behind would cost the operator exactly the cleanup this mode exists to
+avoid. The override has to *name* the payer: `--bill <slot>` (which also selects
+the account) or `--bill <email>` (the only spelling available when the login is
+the box's own and has no slot id). In the panel the confirm is reactive — the
+mode lives in the host's `routing.toml`, which the panel does not read, so the
+only honest way to ask "do you mean it" is to ask after the box has said it
+minds. The refusal carries `view::board::REQUIRE_OWN_REFUSAL` so the panel can
+tell it from every other dispatch failure without parsing prose.
+
+**This is a seatbelt, not a lock**, and every surface says so in the words that
+stay true afterwards. The match is claim-vs-slot-email: a frontend willing to
+misreport its signed-in user walks straight through `require-own`, because
+relayed board calls arrive as the device room's owner (§H9) and #66's verified
+identity is what will change that. It is worth having anyway — the failure it
+exists for is nobody noticing, not somebody attacking. `doctor` reports the mode
+the way it reports the notices, never failing, and worded so `off` reads as the
+choice it is on a box where one person's plan pays for everything.
+
+Deliberately not here: token or cost caps (§H10's note still stands — those need
+per-run accounting the harnesses do not expose), and inferring an account from
+the WorkOS user who dispatched. The guard *compares* the claim; it still never
+authorizes on it, and which subscription a run spends stays the explicit
+`account`.
+### H21 — The pinned orchestrator — **done** (gh#104)
+Landed as `[defaults] orchestrator_chat` plus `notify::orchestrator_message` /
+`SyncEngine::wake_orchestrator`, a `WatchBoardOrchestrator` stream, and a "Pin
+as orchestrator" item on the session context menu of both viewports.
+`docs/orchestrator.md` is the brief to open the pinned chat with.
+
+This is herdr-board's AGE-24 topology, made a product concept instead of
+something a human wires by hand every time. It is also how this fork was
+built: one long-lived agent that dispatches board work, is woken on settles,
+reviews, merges and backfills.
+
+H13's `notify_dispatcher` was the closest thing and it is the wrong shape for
+this. It wakes *whoever released each task*, which is right for a chat waiting
+on the one thing it released and useless for an agent whose job is the board:
+work an operator releases from the panel has no dispatcher chat at all, and
+work a sibling releases wakes the sibling. So the pin is a **superset target**,
+not a second switch on the same channel — every settle, block, orphan and cap
+warning is prompted into it, over the same `Runtime::prompt` review delivery
+and the dispatcher wake already use. When the orchestrator *is* the dispatcher
+it is told once, in the dispatcher's words: the more specific truth wins.
+
+Wording is shared with the settle notice (`notify::settled_block`) rather than
+written twice, so the one description in `docs/agent-conventions.md` stays the
+contract for both audiences. The orchestrator's copy differs in exactly two
+ways, both because it did not release the work: the lead line does not claim it
+did, and it names who did.
+
+The cap warning is the one event that is *not* on `Signal`, and deliberately:
+`Signal` means "an attempt is over or stuck", which is what the webhook and the
+issue comment are about. A cap warning is about a run that is still going, and
+the only window in which reading its chat can still change how it ends — so it
+goes to the orchestrator and not to the operator's pager.
+
+Guardrails, all of them stated rather than incidental:
+- **No workspace slot.** The orchestrator is a chat somebody opened, not an
+  attempt, so it holds nothing — while everything it releases counts against
+  the caps exactly as anyone's does.
+- **It bills its own chat's `account`.** Nothing special, and nothing new:
+  §H18's billing guard reads its dispatches exactly as it reads anyone's, so an
+  orchestrator releasing work on somebody else's subscription is warned about —
+  or refused — on the same terms a human at the panel is.
+- **Exempt from `max_duration`.** It is supposed to outlive every attempt on
+  the board, so the clock that stops a looping agent must not stop it. Stated
+  in `enforce_duration_cap` and stamped so the log says it once. The exemption
+  is on the chat, which makes pinning a *board-dispatched* chat the one real
+  misconfiguration — so `doctor` fails on it by name rather than letting a
+  child run forever.
+- **Notice volume is the budget.** One prompt per event, no polling, no retry.
+  An agent that lives forever has no other bound on what it costs.
+- **Unpin is the kill switch.** The notices stop; the chat is an ordinary chat.
+
+Delivery to the frontends is its own stream rather than a field on `WatchBoard`
+or a read of `ReadBoardConfig`. The pin marks a row in the session list, which
+is on screen before any board panel is opened, and `ReadBoardConfig` shells out
+to git once per space — the wrong price for a glyph. `WriteBoardConfig`
+republishes it as the write lands, so pinning from the app is visible when the
+click returns rather than on the board's next reread; the loop's reread still
+covers an `$EDITOR` over ssh.
+
+### H20 — Live agents in the sidebar — **done** (gh#103)
+In herdr every working agent was a pane, so the pane list *was* the presence
+list and presence cost nothing. Here a dispatched agent is a chat among chats:
+three of them are three rows somewhere in a recency-sorted list, indistinguishable
+from the session you opened yesterday, and tracking them meant the board pane or
+nothing.
+
+Both sidebars grew an **Agents** section between Spaces and the sessions. One
+row per live attempt: the issue identifier as the title, the branch underneath,
+and elapsed against the route's cap on the right. Pure presentation — everything
+it draws was already streamed, and nothing here dispatches, settles or decides.
+
+- **`comet_proto::view::board::agent_rows`** is the whole derivation, shared as
+  the architecture rule requires: `WatchBoard` rows joined to the chat rows and
+  the session watch. Membership is "`working` or `blocked` **and** has a chat
+  id", which is why a row leaves on its own — settle, cancel and orphan all end
+  the attempt, clearing `chat_id` and moving the row out of both states in the
+  same frame. The chat stays findable under its space, as it always was.
+- **The state is the session watch's, not the row's** (`AgentState`). The board
+  is a sync cycle behind, and it calls a dead run and an agent asking a question
+  both `blocked` — correctly, since both hold a chat and a slot, but they want
+  different things from a person. The sidebar splits them: a spinner, a blocked
+  badge, an errored glyph. Staleness-gated through `effective_indicator`, so a
+  crashed backend cannot leave an eternal spinner; the row's own state is the
+  fallback for a chat whose session mirror does not exist yet.
+- **Blocked floats, with a count on the header** — the board's section-order
+  rationale, and the same ranking `attention_rank` gives chat rows. Under it,
+  longest-running first, which is stable because that order is start order.
+- **`TaskRow.max_duration_secs`** is new on the wire. An elapsed counter says
+  half of what it knows without the cap beside it ("1h50m" means one thing under
+  two hours and another under six), and the routing config lives on the board's
+  host — a laptop reading a relayed board has never seen it. Past the cap the
+  counter turns and bolds: gh#70's clock is about to end that attempt, and the
+  number is the reason.
+- **The desktop's board subscription is now standing.** It was lazy — no RPC
+  until the dock was first opened — and a presence list that only works after
+  you have visited the board is not presence. `BoardPanel` is built with the
+  shell and observed by it; the host sweep is unchanged and bounded, and it is
+  what `comet-tui` has always done (its board stream has been standing since
+  H7).
+- **The TUI pays one wake-up a second** while a live agent row is on screen
+  (`App::counting`), which `animating` does not cover: a *blocked* agent
+  animates nothing, and its age would otherwise sit at whatever the last frame
+  happened to catch. The row carries the start instant, not the age, so the
+  draw reads the clock and nothing rebuilds.
+
+Deliberately not here: acting on a row. Enter/click opens the chat and that is
+all — retry, cancel and dispatch stay in the board pane, which is the deep view
+and has the confirmations. A glance that can kill an agent is a glance nobody
+trusts.
+
+### H22 — Commits carry the dispatcher, not whatever the box improvises — **done** (gh#107)
 The box had no `git config user.*`. Git does not stop at that: the first
 dispatched agent invented an author, the commits went up under an address
 belonging to no GitHub account, and Vercel's contributor check refused to deploy

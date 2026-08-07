@@ -31,8 +31,10 @@
 //!   is authorized on them.
 //! - `f` cycles the routes on the board, `F` clears the filter, `/` opens the
 //!   find field (live substring matching), `esc` closes the panel;
-//! - the panel is lazy: no RPC until it is first opened, and the stream
-//!   reconnects with a 2 s backoff if the engine drops it.
+//! - the `WatchBoard` subscription is **standing**, not lazy — the shell's
+//!   sidebar draws its Agents section ([`BoardPanel::agents`], gh#103) off these
+//!   rows with the dock shut — and reconnects with a 2 s backoff if the engine
+//!   drops it.
 //!
 //! ## Which device's board (gh#55)
 //!
@@ -159,6 +161,11 @@ struct DispatchDraft {
     /// The route's account, for labelling row 0 — what "no override" will
     /// actually spend, so the default is a choice rather than a mystery.
     route_account: Option<String>,
+    /// The email of whoever is signed in on THIS device, for the billing guard
+    /// (gh#101). Snapshotted when the picker opens rather than read per frame:
+    /// it is the fixed half of the comparison, and the chips are re-derived on
+    /// every keystroke.
+    viewer: Option<String>,
 }
 
 impl DispatchDraft {
@@ -185,6 +192,23 @@ impl DispatchDraft {
     /// listed them.
     fn account_options(&self) -> Vec<&AgentAccount> {
         accounts_for_harness(self.accounts.slots(), self.active_harness())
+    }
+
+    /// What an account row has to say about whose subscription it spends
+    /// (gh#101) — `None` when it spends the viewer's own, or when the picker
+    /// cannot tell whose it is.
+    ///
+    /// `slot` is the agent-account id the row would send; `None` is row 0, the
+    /// route's own default, which is the one an enter-enter release lands on
+    /// without anybody having chosen it. That row is the whole reason this is
+    /// resolved against the host's account list rather than shown as a slot id:
+    /// `Route default · 8f2c1d0a` tells a teammate nothing about whose plan
+    /// they are about to spend.
+    fn bills(&self, slot: Option<&str>) -> Option<String> {
+        let harness = self.active_harness()?;
+        let billed = board::billed_email(self.accounts.slots(), harness, slot)?;
+        board::cross_billed(Some(billed), self.viewer.as_deref())
+            .then(|| board::bills_label(billed))
     }
 
     /// The account override this highlight sends, if any — carrying the label
@@ -218,7 +242,22 @@ impl DispatchDraft {
             model,
             effective_model,
             account: self.picked_account(),
+            // Never on the first send: the guard exists to make somebody say it
+            // out loud, and a picker that pre-consented would be the picker
+            // ticking the box for them.
+            bill: None,
         }
+    }
+
+    /// Who the highlighted selection charges, whoever that is — the payer the
+    /// confirm has to name if the host refuses this release (gh#101).
+    fn billed_to(&self) -> Option<String> {
+        let harness = self.active_harness()?;
+        let slot = self
+            .picked_account()
+            .map(|a| a.id)
+            .or_else(|| self.route_account.clone());
+        board::billed_email(self.accounts.slots(), harness, slot.as_deref()).map(str::to_string)
     }
 }
 
@@ -243,6 +282,25 @@ struct DispatchChoice {
     effective_model: Option<String>,
     /// Account override; `None` = the route's account.
     account: Option<PickedAccount>,
+    /// "Bill that account, I know whose it is" — set only on the second send,
+    /// after the host refused the first under `require-own` (gh#101). Names
+    /// the payer, because a consent that does not say what it consents to is
+    /// a checkbox people tick once.
+    bill: Option<String>,
+}
+
+/// A refused release, kept so `enter` can mean "yes, bill them" (gh#101).
+#[derive(Debug, Clone)]
+struct PendingBill {
+    task_id: String,
+    identifier: String,
+    /// Everything the picker settled on, replayed verbatim — the second send
+    /// must spend the same account the first one was refused for, or the
+    /// confirmation named something the dispatch did not do.
+    choice: DispatchChoice,
+    /// Who the run charges, as the picker resolved it. What the confirm says
+    /// out loud and what rides on the retry as `bill`.
+    billed_to: String,
 }
 
 /// The saved logins a harness can spend. A Claude slot is not lendable to a
@@ -381,6 +439,20 @@ fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
         BoardState::Ready => theme.text,
         BoardState::Done => theme.text_faint,
     }
+}
+
+/// The accent a *live agent* carries in the sidebar — routed through
+/// [`state_color`] so a running attempt does not change colour on its way from
+/// the board pane to the sidebar (gh#103).
+pub fn agent_state_color(state: board::AgentState, theme: &Theme) -> gpui::Hsla {
+    state_color(
+        match state {
+            board::AgentState::Blocked => BoardState::Blocked,
+            board::AgentState::Errored => BoardState::Failed,
+            board::AgentState::Working => BoardState::Working,
+        },
+        theme,
+    )
 }
 
 /// The `[process exited]`-free reason a working/blocked row's metadata names
@@ -614,7 +686,14 @@ impl BoardModel {
 // Entity
 // ---------------------------------------------------------------------------
 
-/// The board dock. Lazy: no RPC until [`BoardPanel::set_open`] first runs.
+/// The board dock, and the shell's standing source of board rows.
+///
+/// The watch used to be lazy — no RPC until the dock was first opened. It is
+/// standing since gh#103: the sidebar's Agents section is drawn from these rows
+/// whether or not the dock has ever been open, and a presence list that only
+/// works after you have visited the board is not presence. The cost is the host
+/// sweep on a device with no board, which is bounded (`host_candidates` is asked
+/// once each, then a 2 s backoff) and is what the TUI has always done.
 pub struct BoardPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
@@ -658,6 +737,15 @@ pub struct BoardPanel {
     /// An open runtime picker for a dispatch (ready row → enter). `None` =
     /// no dispatch is being confirmed.
     dispatch: Option<DispatchDraft>,
+    /// A release the host refused because it would spend somebody else's
+    /// subscription (`billing_guard = "require-own"`, gh#101), held so `enter`
+    /// can send it again naming the payer.
+    ///
+    /// The confirm the CLI spells `--bill`. Reactive rather than pre-emptive on
+    /// purpose: the mode lives in the host's `routing.toml` and this panel does
+    /// not read it, so the only honest way to ask "do you mean it" is to ask
+    /// after the box has said it minds.
+    pending_bill: Option<PendingBill>,
     /// Keeps the elapsed counters on working/blocked rows live.
     _ticker: Task<()>,
     _observe: Subscription,
@@ -665,10 +753,10 @@ pub struct BoardPanel {
 
 impl BoardPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        // Start (or restart) the watch as soon as the engine exists — the panel
+        // may never be opened, and the sidebar's Agents section still wants rows.
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
-            if this.open && !this.started {
-                this.ensure_watch(cx);
-            }
+            this.ensure_watch(cx);
         });
         let dispatch_search = cx.new(|cx| {
             ComposerInput::with_context("Search models…", "PaletteSearch", cx)
@@ -691,16 +779,10 @@ impl BoardPanel {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |panel, cx| {
-                    // Keep the elapsed counters live only while the board is
-                    // on screen and something is actually running.
-                    if panel.open
-                        && panel.model.rows.iter().any(|row| {
-                            matches!(
-                                row.state(),
-                                BoardState::Working | BoardState::Blocked
-                            )
-                        })
-                    {
+                    // Keep the elapsed counters live while something is running
+                    // — on the board pane, and on the sidebar's Agents rows,
+                    // which are drawn off the same rows with the dock shut.
+                    if panel.model.rows.iter().any(|row| row.state().holds_pane()) {
                         cx.notify();
                     }
                 });
@@ -731,6 +813,7 @@ impl BoardPanel {
             host_menu_open: false,
             host_menu_dismissed_at: None,
             dispatch: None,
+            pending_bill: None,
             _ticker: ticker,
             _observe: observe,
         }
@@ -738,6 +821,18 @@ impl BoardPanel {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// The live attempts, joined to this device's chats and sessions — what the
+    /// sidebar's Agents section draws (gh#103).
+    ///
+    /// On the panel rather than in `AppState` because the panel is what holds a
+    /// board subscription, host sweep included: there is exactly one place that
+    /// knows which device's rows these are, and a second copy in app state would
+    /// be a second thing to keep pointed at the same box.
+    pub fn agents(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::AgentRow> {
+        let state = self.state.read(cx);
+        board::agent_rows(&self.model.rows, &state.chats, &state.sessions, now)
     }
 
     /// Shell toggle hook. Opening starts the watch; closing keeps the rows so
@@ -968,6 +1063,16 @@ impl BoardPanel {
             active_model: 0,
             accounts: AccountCatalog::Loading,
             active_account: 0,
+            // The same email this dispatch will send as `viaUser` (gh#74) —
+            // the picker warns about exactly the claim the box will record and
+            // the guard will compare against, never a second answer to "who
+            // are you" that could disagree with it.
+            viewer: self
+                .state
+                .read(cx)
+                .auth_user()
+                .map(|user| user.email.clone())
+                .filter(|email| !email.is_empty()),
         });
         cx.notify();
         self.load_dispatch_runtimes(engine.clone(), cx);
@@ -1135,7 +1240,8 @@ impl BoardPanel {
         let Some(draft) = self.dispatch.take() else { return };
         let catalog_ix = indices.get(draft.active_model).copied();
         let choice = draft.choice(catalog_ix);
-        self.send_dispatch(&draft.task_id, &draft.identifier, choice, cx);
+        let billed_to = draft.billed_to();
+        self.send_dispatch(&draft.task_id, &draft.identifier, choice, billed_to, cx);
     }
 
     /// The catalog rows (indices) the dispatch picker displays for the active
@@ -1204,7 +1310,27 @@ impl BoardPanel {
     fn confirm_with_model(&mut self, catalog_ix: usize, cx: &mut Context<Self>) {
         let Some(draft) = self.dispatch.take() else { return };
         let choice = draft.choice(Some(catalog_ix));
-        self.send_dispatch(&draft.task_id, &draft.identifier, choice, cx);
+        let billed_to = draft.billed_to();
+        self.send_dispatch(&draft.task_id, &draft.identifier, choice, billed_to, cx);
+    }
+
+    /// Send the release the host refused, this time naming who it charges
+    /// (gh#101) — the panel's `--bill`.
+    fn confirm_bill(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_bill.take() else {
+            return;
+        };
+        let choice = DispatchChoice {
+            bill: Some(pending.billed_to.clone()),
+            ..pending.choice
+        };
+        self.send_dispatch(
+            &pending.task_id,
+            &pending.identifier,
+            choice,
+            Some(pending.billed_to),
+            cx,
+        );
     }
 
     /// Send `DispatchTask` for a task, with the picked runtime/model/account
@@ -1222,8 +1348,16 @@ impl BoardPanel {
         task_id: &str,
         identifier: &str,
         choice: DispatchChoice,
+        // Who this release charges, as the picker resolved it — carried so a
+        // `require-own` refusal can be turned into a confirm that names them
+        // (gh#101). `None` where the panel could not tell, and then a refusal
+        // is just an error: offering "bill them anyway" without being able to
+        // say who "them" is would be the opposite of this feature.
+        billed_to: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // A new release supersedes any confirm still on offer.
+        self.pending_bill = None;
         let Some(engine) = self.engine(cx) else {
             self.set_notice("Engine not connected", cx);
             return;
@@ -1252,7 +1386,8 @@ impl BoardPanel {
             model,
             effective_model,
             account,
-        } = choice;
+            bill,
+        } = choice.clone();
         // The dispatch runs where the board is: the worktree, the chat and the
         // agent all land on the host device.
         let host = self.host.clone();
@@ -1284,6 +1419,9 @@ impl BoardPanel {
             if let (Some(account), Some(object)) = (account_id, params.as_object_mut()) {
                 object.insert("account".into(), serde_json::Value::String(account));
             }
+            if let (Some(bill), Some(object)) = (bill, params.as_object_mut()) {
+                object.insert("bill".into(), serde_json::Value::String(bill));
+            }
             if let (Some(device), Some(object)) = (via_device, params.as_object_mut()) {
                 object.insert("viaDevice".into(), serde_json::Value::String(device));
             }
@@ -1304,7 +1442,34 @@ impl BoardPanel {
                     );
                 }
                 Err(err) => {
-                    panel.set_notice(format!("Couldn't dispatch {identifier}: {err}"), cx);
+                    let message = err.to_string();
+                    // The host refuses a cross-billed release under
+                    // `require-own` (gh#101). Turn that into the confirm the
+                    // CLI spells `--bill`, rather than a dead end whose only
+                    // remedy is editing someone else's routing.toml.
+                    match billed_to.filter(|_| message.contains(board::REQUIRE_OWN_REFUSAL)) {
+                        Some(billed_to) => {
+                            panel.set_notice(
+                                format!(
+                                    "{identifier} would spend {billed_to}'s subscription. \
+                                     Press enter to dispatch it on their plan, esc to back out"
+                                ),
+                                cx,
+                            );
+                            panel.pending_bill = Some(PendingBill {
+                                task_id: task_id.clone(),
+                                identifier: identifier.clone(),
+                                choice,
+                                billed_to,
+                            });
+                        }
+                        None => {
+                            panel.set_notice(
+                                format!("Couldn't dispatch {identifier}: {message}"),
+                                cx,
+                            );
+                        }
+                    }
                 }
             })
             .ok();
@@ -1592,6 +1757,27 @@ impl BoardPanel {
                         return;
                     }
                 }
+            }
+        }
+
+        // A release the host refused because it charges somebody else owns the
+        // next enter (gh#101). Ahead of the board's own keys, and only while
+        // the offer stands: this IS the confirm dialog, and a confirm that the
+        // cursor could walk away from without answering is not one.
+        if self.pending_bill.is_some() {
+            match key {
+                "enter" => {
+                    self.confirm_bill(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "escape" => {
+                    self.pending_bill = None;
+                    self.set_notice("Left it unreleased", cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -2670,19 +2856,26 @@ impl BoardPanel {
         };
         // Row 0 names what "no override" spends, so the default is a choice
         // rather than a blank: the route's account when it has one, otherwise
-        // the device's own CLI login.
-        let default_label = match draft.route_account.as_deref() {
-            Some(account) => format!("Route default · {account}"),
-            None => "Route default".to_string(),
+        // the device's own CLI login. When either one is somebody else's, it
+        // says whose instead — this is the chip an enter-enter release lands
+        // on, and a slot id is not an answer to "who pays" (gh#101).
+        // Row 0's *effective* slot is the route's account, not "no account" —
+        // sending no override is what makes the route's the one that pays.
+        let default_bills = draft.bills(draft.route_account.as_deref());
+        let default_label = match (&default_bills, draft.route_account.as_deref()) {
+            (Some(bills), _) => format!("Route default · {bills}"),
+            (None, Some(account)) => format!("Route default · {account}"),
+            (None, None) => "Route default".to_string(),
         };
-        let chips: Vec<(usize, String)> = std::iter::once((0, default_label))
-            .chain(
-                options
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, account)| (ix + 1, account_label(account))),
-            )
-            .collect();
+        let chips: Vec<(usize, String, bool)> =
+            std::iter::once((0, default_label, default_bills.is_some()))
+                .chain(options.iter().enumerate().map(|(ix, account)| {
+                    match draft.bills(Some(&account.id)) {
+                        Some(bills) => (ix + 1, format!("{} · {bills}", account_label(account)), true),
+                        None => (ix + 1, account_label(account), false),
+                    }
+                }))
+                .collect();
 
         let mut row = div()
             .flex_none()
@@ -2706,9 +2899,14 @@ impl BoardPanel {
                     })
                     .child(label),
             );
-        for (ix, chip_label) in chips {
+        for (ix, chip_label, bills_somebody_else) in chips {
             let active = ix == draft.active_account;
             let key = format!("board-account-{}-{ix}", draft.task_id);
+            // A chip that charges somebody else keeps the amber whether or not
+            // it is highlighted: the selection accent says "you are here", and
+            // overwriting the warning with it would hide the thing exactly when
+            // the operator is about to press enter on it.
+            let warned = theme.warning_text();
             row = row.child(
                 div()
                     .id(key)
@@ -2719,7 +2917,14 @@ impl BoardPanel {
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .bg(if active && focused {
+                    .when(bills_somebody_else, |chip| {
+                        chip.border_1().border_color(theme.warning.opacity(0.5))
+                    })
+                    .bg(if bills_somebody_else && active {
+                        theme.warning.opacity(0.16)
+                    } else if bills_somebody_else {
+                        theme.warning.opacity(0.08)
+                    } else if active && focused {
                         theme.accent.opacity(0.16)
                     } else if active {
                         theme.accent.opacity(0.08)
@@ -2733,7 +2938,9 @@ impl BoardPanel {
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(if active {
+                            .text_color(if bills_somebody_else {
+                                warned
+                            } else if active {
                                 if focused {
                                     theme.accent
                                 } else {
@@ -3052,6 +3259,8 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            billed_to: None,
+            max_duration_secs: None,
         }
     }
 
@@ -3059,6 +3268,32 @@ mod tests {
         let mut m = BoardModel::new();
         m.set_rows(rows);
         m
+    }
+
+    /// A live attempt must not change colour on its way from the board pane to
+    /// the sidebar's Agents section (gh#103) — same state, same accent.
+    #[test]
+    fn a_live_agent_carries_the_board_pane_colour() {
+        use board::AgentState;
+        let theme = Theme::dark();
+        assert_eq!(
+            agent_state_color(AgentState::Blocked, &theme),
+            state_color(BoardState::Blocked, &theme)
+        );
+        // A dead run reads as the board's `failed`, which shares blocked's red;
+        // the glyph is what tells them apart, there and here.
+        assert_eq!(
+            agent_state_color(AgentState::Errored, &theme),
+            state_color(BoardState::Failed, &theme)
+        );
+        assert_eq!(
+            agent_state_color(AgentState::Working, &theme),
+            state_color(BoardState::Working, &theme)
+        );
+        assert_ne!(
+            agent_state_color(AgentState::Working, &theme),
+            agent_state_color(AgentState::Blocked, &theme)
+        );
     }
 
     #[test]
@@ -3437,5 +3672,94 @@ mod tests {
             "slot-x",
             "a slot with no name still has to be pickable"
         );
+    }
+
+    // ---- who pays (gh#101) ----
+
+    /// A picker as a teammate sees it: the box's live login belongs to the
+    /// owner, `ana` is at the keyboard, and the route names no account.
+    fn shared_box_draft() -> DispatchDraft {
+        let mut box_login = account("slot-box", "brede@tally.no", HarnessId::ClaudeCode);
+        box_login.active = true;
+        DispatchDraft {
+            task_id: "gh:o/r#101".into(),
+            identifier: "gh#101".into(),
+            route_runtime: Some("claude-code".into()),
+            runtimes: runtimes(),
+            active_runtime: 0,
+            runtime_error: None,
+            catalogs: HashMap::new(),
+            row: PickerRow::Account,
+            active_model: 0,
+            accounts: AccountCatalog::Ready(vec![
+                box_login,
+                account("slot-ana", "ana@example.com", HarnessId::ClaudeCode),
+            ]),
+            active_account: 0,
+            route_account: None,
+            viewer: Some("ana@example.com".into()),
+        }
+    }
+
+    /// gh#101's exit criterion in the panel: **row 0** is the chip an
+    /// enter-enter release lands on, and on a route with no account of its own
+    /// it spends the box's login — the owner's. That is the row that has to say
+    /// whose plan it charges.
+    #[test]
+    fn row_zero_says_when_the_route_default_charges_somebody_else() {
+        let draft = shared_box_draft();
+        assert_eq!(
+            draft.bills(draft.route_account.as_deref()).as_deref(),
+            Some("bills brede@tally.no"),
+            "the route default resolves to the box's live login"
+        );
+        // A route that names the owner's slot outright reads the same way — the
+        // slot id itself would have told the teammate nothing.
+        let mut routed = shared_box_draft();
+        routed.route_account = Some("slot-box".into());
+        assert_eq!(
+            routed.bills(routed.route_account.as_deref()).as_deref(),
+            Some("bills brede@tally.no")
+        );
+        // Her own slot bills her, and says nothing.
+        assert_eq!(draft.bills(Some("slot-ana")), None);
+    }
+
+    /// The warning is a comparison, not a decoration: without a signed-in user
+    /// there is nothing to compare, and the panel accuses nobody.
+    #[test]
+    fn a_picker_that_cannot_tell_who_you_are_warns_about_nothing() {
+        let mut anonymous = shared_box_draft();
+        anonymous.viewer = None;
+        assert_eq!(anonymous.bills(None), None);
+        assert_eq!(anonymous.bills(Some("slot-box")), None);
+
+        // Nor does it warn about a harness whose logins it has not seen — the
+        // codex strip on a box with only Claude slots saved.
+        let mut codex = shared_box_draft();
+        codex.active_runtime = codex
+            .runtimes
+            .iter()
+            .position(|r| r.harness == HarnessId::Codex)
+            .expect("the catalog offers codex");
+        assert_eq!(codex.bills(None), None);
+    }
+
+    /// What the confirm has to name when the host refuses under `require-own`:
+    /// the account the *highlight* will actually spend, not the route's.
+    #[test]
+    fn the_payer_the_confirm_names_follows_the_highlight() {
+        let mut draft = shared_box_draft();
+        assert_eq!(draft.billed_to().as_deref(), Some("brede@tally.no"));
+        // Highlight her own slot (row 0 is the route's, so row 2 is slot-ana).
+        draft.active_account = 2;
+        assert_eq!(draft.billed_to().as_deref(), Some("ana@example.com"));
+    }
+
+    /// The first send never consents — the guard exists to make somebody say
+    /// it, and a picker that pre-filled `bill` would tick the box for them.
+    #[test]
+    fn a_release_carries_no_acknowledgement_until_the_host_asks_for_one() {
+        assert_eq!(shared_box_draft().choice(None).bill, None);
     }
 }

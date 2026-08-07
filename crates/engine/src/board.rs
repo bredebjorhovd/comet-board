@@ -40,6 +40,7 @@ use comet_board::model::{AgentStatus, Outcome};
 use comet_board::rows::{TaskRow, board_rows};
 use comet_board::runtime::{Runtime, agent_status};
 use comet_board::sync::{SessionStatuses, SyncEngine};
+use comet_proto::view::board::OrchestratorPin;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
 
@@ -78,6 +79,14 @@ pub struct BoardService {
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     watch_task: tokio::task::JoinHandle<()>,
     rows: watch::Receiver<Vec<TaskRow>>,
+    /// The pinned orchestrator (gh#104). Held as the *sender* so two writers
+    /// can reach it: the loop, which republishes whenever it rereads
+    /// `routing.toml` (an `$EDITOR` over ssh), and
+    /// [`BoardService::note_config`], which republishes the instant a
+    /// `WriteBoardConfig` lands — pinning a chat from the app is a direct
+    /// action, and a glyph that appeared up to a sync interval later would read
+    /// as the click not having worked.
+    orchestrator: Arc<watch::Sender<OrchestratorPin>>,
     /// Where this board's `routing.toml`, `.env` and store live. Kept here so
     /// the config RPCs (gh#75) resolve them off the running service rather than
     /// re-deriving them from the data dir — two answers to "which routing.toml"
@@ -116,6 +125,8 @@ impl BoardService {
         drop(comet_board::db::Db::open(&paths.db())?);
         let (tx, rx) = mpsc::channel::<Msg>();
         let (rows_tx, rows_rx) = watch::channel(Vec::<TaskRow>::new());
+        let pin_tx = Arc::new(watch::Sender::new(OrchestratorPin::default()));
+        let loop_pin = pin_tx.clone();
 
         // Forward every watch snapshot (current value first — the loop must
         // not treat "no snapshot yet" as "every chat is missing").
@@ -137,7 +148,13 @@ impl BoardService {
             .name("comet-board-sync".into())
             .spawn(
                 move || match SyncEngine::from_paths(&loop_paths, log.clone()) {
-                    Ok(engine) => run_loop(engine, rx, log, runtime, handle, spaces, rows_tx),
+                    Ok(engine) => {
+                        let feeds = Feeds {
+                            rows: rows_tx,
+                            pin: loop_pin,
+                        };
+                        run_loop(engine, rx, log, runtime, handle, spaces, feeds)
+                    }
                     Err(e) => log.error(format!("board loop failed to start: {e}")),
                 },
             )?;
@@ -147,6 +164,7 @@ impl BoardService {
             thread: std::sync::Mutex::new(Some(thread)),
             watch_task,
             rows: rows_rx,
+            orchestrator: pin_tx,
             paths,
         })
     }
@@ -164,6 +182,28 @@ impl BoardService {
     /// The board's rows, current value first — what `WatchBoard` streams.
     pub fn watch_rows(&self) -> watch::Receiver<Vec<TaskRow>> {
         self.rows.clone()
+    }
+
+    /// The pinned orchestrator, current value first — what
+    /// `WatchBoardOrchestrator` streams (gh#104).
+    pub fn watch_orchestrator(&self) -> watch::Receiver<OrchestratorPin> {
+        self.orchestrator.subscribe()
+    }
+
+    /// A `routing.toml` write just landed: republish anything derived from it
+    /// that a frontend is watching, without waiting for the loop's next reread.
+    ///
+    /// Only the pin today. Called with the same `RoutingView` the write
+    /// returns — the parse of what is now on disk — so this cannot disagree
+    /// with the reply the caller gets back. A file that does not parse leaves
+    /// the pin as it was: the loop is still running on the last good config,
+    /// and a frontend un-pinning itself over a syntax error would be a second
+    /// lie on top of the first.
+    pub fn note_config(&self, view: &comet_board::routes::RoutingView) {
+        let Some(cfg) = view.config.as_ref() else {
+            return;
+        };
+        publish_pin(&self.orchestrator, cfg.defaults.orchestrator());
     }
 
     /// Release a task: resolve its route, cut the checkout, create the chat,
@@ -252,6 +292,14 @@ impl Drop for BoardService {
     }
 }
 
+/// What the loop publishes out to subscribers: the board's rows
+/// (`WatchBoard`) and its pinned orchestrator (`WatchBoardOrchestrator`). One
+/// struct because they are the loop's outputs and travel as a set.
+struct Feeds {
+    rows: watch::Sender<Vec<TaskRow>>,
+    pin: Arc<watch::Sender<OrchestratorPin>>,
+}
+
 fn run_loop(
     mut engine: SyncEngine,
     rx: mpsc::Receiver<Msg>,
@@ -259,7 +307,7 @@ fn run_loop(
     runtime: Arc<dyn Runtime + Send + Sync>,
     handle: tokio::runtime::Handle,
     spaces: watch::Receiver<Vec<Space>>,
-    rows: watch::Sender<Vec<TaskRow>>,
+    feeds: Feeds,
 ) {
     // The loop is a plain thread, but dispatch/cancel call engine code that
     // `tokio::spawn`s (doc_host.open) and `Handle::block_on`s (CometRuntime).
@@ -275,6 +323,10 @@ fn run_loop(
     // First cycle immediately: an operator starting the engine wants the board
     // fresh now, not in one interval.
     let mut next_sync = Instant::now();
+    // Before the first cycle: a frontend that connects to a box whose board is
+    // mid-poll should see the pin it already has, not "unpinned" for a whole
+    // interval and then a glyph appearing under the cursor.
+    publish_pin(&feeds.pin, engine.cfg.defaults.orchestrator());
     loop {
         if Instant::now() >= next_sync {
             // Credentials and routes are read at startup, but the engine
@@ -282,6 +334,10 @@ fn run_loop(
             // next cycle rather than requiring a restart.
             if let Some(fresh) = engine.reload_if_configuration_changed() {
                 engine = fresh;
+                // The reload is the only moment the pin can have moved: it is a
+                // `routing.toml` key, so `WriteBoardConfig` from a laptop and an
+                // `$EDITOR` over ssh both land here and nowhere else.
+                publish_pin(&feeds.pin, engine.cfg.defaults.orchestrator());
             }
             match engine.sync_once_with(statuses.as_ref(), Some(runtime.as_ref())) {
                 // Review delivery rides the cycle's own PR poll, and runs
@@ -289,7 +345,7 @@ fn run_loop(
                 Ok(pulls) => engine.deliver_reviews(runtime.as_ref(), &pulls),
                 Err(e) => log.error(format!("sync cycle failed: {e}")),
             }
-            publish_rows(&engine, &rows, &log);
+            publish_rows(&engine, &feeds.rows, &log);
             next_sync = Instant::now() + Duration::from_secs(engine.cfg.sync.interval_secs());
         }
         let wait = next_sync.saturating_duration_since(Instant::now());
@@ -299,7 +355,7 @@ fn run_loop(
                 // The event fast path: statuses, plus §H4's settle/reopen —
                 // the clocked lifecycle (orphaning) stays on the interval.
                 match engine.refresh_statuses_with(&mapped, Some(runtime.as_ref())) {
-                    Ok(true) => publish_rows(&engine, &rows, &log),
+                    Ok(true) => publish_rows(&engine, &feeds.rows, &log),
                     Ok(false) => {}
                     Err(e) => log.warn(format!("refreshing agent statuses: {e}")),
                 }
@@ -328,7 +384,7 @@ fn run_loop(
                     )),
                     Err(e) => log.error(format!("dispatch of {task_id} failed: {e:#}")),
                 }
-                publish_rows(&engine, &rows, &log);
+                publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
             Ok(Msg::Cancel { task_id, reply }) => {
@@ -336,7 +392,7 @@ fn run_loop(
                 if let Err(e) = &result {
                     log.error(format!("cancel of {task_id} failed: {e:#}"));
                 }
-                publish_rows(&engine, &rows, &log);
+                publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -346,6 +402,22 @@ fn run_loop(
             }
         }
     }
+}
+
+/// Publish the pinned orchestrator to `WatchBoardOrchestrator` subscribers
+/// (gh#104) — only when it actually changed, so the sidebars are not woken by
+/// every cycle that read the same config back.
+fn publish_pin(pin: &watch::Sender<OrchestratorPin>, chat_id: Option<&str>) {
+    let fresh = OrchestratorPin {
+        chat_id: chat_id.map(str::to_string),
+    };
+    pin.send_if_modified(|current| {
+        if *current == fresh {
+            return false;
+        }
+        *current = fresh;
+        true
+    });
 }
 
 /// Re-read the board and publish it to `WatchBoard` subscribers — only when it
@@ -423,6 +495,36 @@ fn handle_dispatch(
     }
     let route = route_for(&engine.cfg, &task)?;
     check_capacity(&engine.db, &engine.cfg, route)?;
+    // Whose subscription this run spends, and the route's guard on it (gh#101).
+    // Here, beside the cap, for the cap's reason: under `require-own` this is a
+    // refusal, and a refusal that had already inserted an attempt row would
+    // leave the operator cleaning up after a dispatch that never happened.
+    let billing = comet_board::dispatch::check_billing(
+        &engine.cfg,
+        route,
+        origin,
+        overrides,
+        |harness, account| {
+            runtime.account_email(harness, account).unwrap_or_else(|e| {
+                // A device that cannot read its own logins knows less, not
+                // worse: the guard compares nothing and says nothing.
+                engine
+                    .log
+                    .warn(format!("resolving the billed account: {e:#}"));
+                None
+            })
+        },
+    )?;
+    // `warn` (and `require-own` on an acknowledged release) still owes both
+    // parties a record. The log line is the box's copy; the attempt row, the
+    // board row and the upstream comment below are everyone else's.
+    if let Some(warning) = billing.as_ref().and_then(|b| b.warning())
+        && engine.cfg.billing_guard(Some(route)).speaks()
+    {
+        engine.log.warn(format!("{}: {warning}", task.identifier));
+    }
+    let billed_to = billing.as_ref().and_then(|b| b.billed_to.clone());
+    let cross_billed = billing.as_ref().is_some_and(|b| b.cross_billed());
     let space = spaces
         .borrow()
         .iter()
@@ -485,6 +587,12 @@ fn handle_dispatch(
         // there (gh#74) — recorded exactly as claimed, see [`DispatchOrigin`].
         dispatched_by_device: origin.device.clone(),
         dispatched_by_user: origin.user.clone(),
+        // …and whose subscription it spends, resolved to an email now (gh#101).
+        // Recorded whether or not it is cross-billed: the row says who is
+        // paying for the attempt's whole life, and a field that only appeared
+        // on the awkward dispatches would make its absence the interesting
+        // signal.
+        billed_to: billed_to.clone(),
     })?;
 
     match runtime.dispatch(&spec) {
@@ -515,6 +623,13 @@ fn handle_dispatch(
                 &route.workspace,
                 attempt_no,
                 by.as_deref(),
+                // Only when somebody else is paying, and only when the guard is
+                // speaking at all: `off` is a board that has been told this is
+                // nobody's business, and writing it onto a public issue anyway
+                // would be the board overruling that.
+                (cross_billed && engine.cfg.billing_guard(Some(route)).speaks())
+                    .then_some(billed_to.as_deref())
+                    .flatten(),
             )?;
             engine.rederive_all()?;
             Ok(Dispatched {
@@ -645,6 +760,10 @@ mod tests {
         cancelled: std::sync::Mutex<Vec<String>>,
         /// What `chat_alive` answers — flip to fake an archived/gone chat.
         alive: std::sync::atomic::AtomicBool,
+        /// The device's saved logins, as `account_email` answers them (gh#101):
+        /// slot id → email, with `""` standing for the box's own CLI login —
+        /// the one a dispatch naming no slot actually reaches.
+        logins: std::sync::Mutex<std::collections::HashMap<String, String>>,
         /// Mirror `CometRuntime::dispatch` → `doc_host.open`, which `tokio::spawn`s
         /// the chat task: when set, `dispatch` needs a tokio context. The board
         /// loop runs on a plain thread, so without the fix this panics and kills
@@ -659,6 +778,7 @@ mod tests {
                 dispatched: Default::default(),
                 cancelled: Default::default(),
                 alive: std::sync::atomic::AtomicBool::new(true),
+                logins: Default::default(),
                 spawn_in_dispatch: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -690,6 +810,18 @@ mod tests {
         }
         fn chat_cwd(&self, _chat_id: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
+        }
+        fn account_email(
+            &self,
+            _harness: comet_proto::HarnessId,
+            account: Option<&str>,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(self
+                .logins
+                .lock()
+                .unwrap()
+                .get(account.unwrap_or(""))
+                .cloned())
         }
         fn last_run_end(
             &self,
@@ -772,6 +904,7 @@ mod tests {
                 account: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                billed_to: None,
             })
             .unwrap();
         db.set_attempt_pane(a, chat_id).unwrap();
@@ -1013,6 +1146,7 @@ runtime = "mock"
                     runtime: Some("opencode".into()),
                     model: Some("gpt-5.2".into()),
                     account: None,
+                    bill: None,
                 },
             )
             .await
@@ -1093,6 +1227,346 @@ runtime = "mock"
         service.shutdown();
     }
 
+    // ---- the billing guard (gh#101) --------------------------------------
+
+    /// A route into `widget` with `billing_guard` as given, and no `account` —
+    /// so a dispatch under it runs on the box's own login, which is the case
+    /// the whole guard exists for.
+    fn write_guarded_route(paths: &Paths, mode: &str) {
+        std::fs::write(
+            paths.routing(),
+            format!(
+                r#"
+[[route]]
+match = {{ gh_repo = "owner/widget" }}
+workspace = "widget"
+repo = "~/dev/widget"
+runtime = "mock"
+
+[defaults]
+billing_guard = "{mode}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The box's own login belongs to the owner; `ana` is the teammate at the
+    /// keyboard, with a slot of her own.
+    fn two_slots(runtime: &FakeRuntime) {
+        let mut logins = runtime.logins.lock().unwrap();
+        logins.insert(String::new(), "brede@tally.no".into());
+        logins.insert("slot-box".into(), "brede@tally.no".into());
+        logins.insert("slot-ana".into(), "ana@example.com".into());
+    }
+
+    /// gh#101's exit criterion on the box side: a teammate's enter-enter on a
+    /// route with no account of its own runs on the owner's subscription, and
+    /// the board says so — on the attempt, on the row, and in the comment that
+    /// lands on the issue where both of them can see it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cross_billed_dispatch_records_and_publishes_who_pays() {
+        let paths = scratch_paths();
+        write_guarded_route(&paths, "warn");
+        seed_task(&paths, "gh:owner/widget#101", "gh#101");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        two_slots(&runtime);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#101",
+                DispatchOrigin {
+                    chat: None,
+                    device: Some("laptop-ana".into()),
+                    user: Some("ana@example.com".into()),
+                },
+                DispatchOverrides::default(),
+            )
+            .await
+            .expect("warn releases");
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#101").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        assert_eq!(attempt.billed_to.as_deref(), Some("brede@tally.no"));
+        // No slot was named, so the attempt's `account` is still None — which
+        // is exactly why `billed_to` had to be resolved and stored: nothing
+        // else on the row could name the payer.
+        assert_eq!(attempt.account, None);
+
+        // The board row carries it for the attempt's whole life…
+        let rows = service.watch_rows().borrow().clone();
+        assert_eq!(rows[0].billed_to.as_deref(), Some("brede@tally.no"));
+        assert!(
+            comet_proto::view::board::billing_note(&rows[0])
+                .as_deref()
+                .is_some_and(|note| note.contains("brede@tally.no")),
+            "the shared derivation both viewports draw must say it"
+        );
+
+        // …and the upstream comment makes it public to both parties.
+        let dispatch = db
+            .pending_writebacks(10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        assert!(
+            dispatch.payload.contains("brede@tally.no"),
+            "the comment names the payer: {}",
+            dispatch.payload
+        );
+
+        service.shutdown();
+    }
+
+    /// Her own slot bills her, and nothing is said — the warning has to stay
+    /// rare enough to mean something.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_on_your_own_account_says_nothing_about_billing() {
+        let paths = scratch_paths();
+        write_guarded_route(&paths, "warn");
+        seed_task(&paths, "gh:owner/widget#102", "gh#102");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        two_slots(&runtime);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#102",
+                DispatchOrigin {
+                    user: Some("ana@example.com".into()),
+                    ..DispatchOrigin::default()
+                },
+                DispatchOverrides {
+                    account: Some("slot-ana".into()),
+                    ..DispatchOverrides::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#102").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        // Recorded either way — the row says who pays for every attempt, not
+        // only the awkward ones.
+        assert_eq!(attempt.billed_to.as_deref(), Some("ana@example.com"));
+        let rows = service.watch_rows().borrow().clone();
+        assert_eq!(comet_proto::view::board::billing_note(&rows[0]), None);
+
+        let dispatch = db
+            .pending_writebacks(10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        assert!(
+            !dispatch.payload.contains("subscription"),
+            "no suffix on a run that bills its own releaser: {}",
+            dispatch.payload
+        );
+
+        service.shutdown();
+    }
+
+    /// `require-own` refuses beside the concurrency cap — before an attempt row
+    /// exists, so the refusal costs no cleanup — and `--bill` naming the payer
+    /// is what releases it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn require_own_refuses_a_cross_billed_release_until_it_names_the_payer() {
+        let paths = scratch_paths();
+        write_guarded_route(&paths, "require-own");
+        seed_task(&paths, "gh:owner/widget#103", "gh#103");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        two_slots(&runtime);
+
+        let ana = DispatchOrigin {
+            user: Some("ana@example.com".into()),
+            ..DispatchOrigin::default()
+        };
+        let err = service
+            .dispatch_task("gh:owner/widget#103", ana.clone(), DispatchOverrides::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bills brede@tally.no's mock"), "{err}");
+        assert!(err.contains("--bill brede@tally.no"), "{err}");
+
+        // Nothing was created — no chat, no attempt row to clean up.
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let db = Db::open(&paths.db()).unwrap();
+        assert!(
+            db.get_task("gh:owner/widget#103")
+                .unwrap()
+                .unwrap()
+                .live_attempt()
+                .is_none()
+        );
+        drop(db);
+
+        // Naming somebody else is a typo, not consent.
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#103",
+                ana.clone(),
+                DispatchOverrides {
+                    bill: Some("someone@else.example".into()),
+                    ..DispatchOverrides::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bills brede@tally.no"), "{err}");
+
+        // Naming the payer releases it, and the record is unchanged by the
+        // acknowledgement: the run still bills the owner and still says so.
+        service
+            .dispatch_task(
+                "gh:owner/widget#103",
+                ana,
+                DispatchOverrides {
+                    bill: Some("brede@tally.no".into()),
+                    ..DispatchOverrides::default()
+                },
+            )
+            .await
+            .expect("named outright, it goes through");
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#103").unwrap().unwrap();
+        assert_eq!(
+            task.live_attempt().unwrap().billed_to.as_deref(),
+            Some("brede@tally.no")
+        );
+
+        service.shutdown();
+    }
+
+    /// `require-own` is about *whose*, not about *which*: the owner releasing
+    /// their own work walks straight through, and so does a dispatch nobody
+    /// attributed — an unattributed release names no wronged party.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn require_own_only_refuses_a_run_charged_to_somebody_else() {
+        let paths = scratch_paths();
+        write_guarded_route(&paths, "require-own");
+        seed_task(&paths, "gh:owner/widget#104", "gh#104");
+        seed_task(&paths, "gh:owner/widget#105", "gh#105");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        two_slots(&runtime);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#104",
+                DispatchOrigin {
+                    user: Some("brede@tally.no".into()),
+                    ..DispatchOrigin::default()
+                },
+                DispatchOverrides::default(),
+            )
+            .await
+            .expect("the owner's own subscription");
+
+        // No `viaUser` at all — `comet-board` from a shell nobody signed into,
+        // or an orchestrating agent. Nothing to compare, so nothing refused.
+        service
+            .dispatch_task(
+                "gh:owner/widget#105",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .expect("an unattributed dispatch is not an accusation");
+
+        service.shutdown();
+    }
+
+    /// A box that cannot name the login accuses nobody — `off` likewise, and
+    /// `off` additionally keeps the payer off the public issue, because a board
+    /// told this is nobody's business must not publish it anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn off_releases_quietly_and_writes_nothing_upstream() {
+        let paths = scratch_paths();
+        write_guarded_route(&paths, "off");
+        seed_task(&paths, "gh:owner/widget#106", "gh#106");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        two_slots(&runtime);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#106",
+                DispatchOrigin {
+                    user: Some("ana@example.com".into()),
+                    ..DispatchOrigin::default()
+                },
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let dispatch = db
+            .pending_writebacks(10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        assert!(
+            !dispatch.payload.contains("brede@tally.no"),
+            "`off` is a board that has been told this is nobody's business: {}",
+            dispatch.payload
+        );
+        // The attempt still records it — the mode governs what is *said*, not
+        // what the board knows about its own runs.
+        let task = db.get_task("gh:owner/widget#106").unwrap().unwrap();
+        assert_eq!(
+            task.live_attempt().unwrap().billed_to.as_deref(),
+            Some("brede@tally.no")
+        );
+
+        service.shutdown();
+    }
+
+    /// A device that cannot say whose a login is leaves the guard with nothing
+    /// to compare — and silence, not a refusal, is the only honest answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_box_that_cannot_name_its_logins_refuses_nothing() {
+        let paths = scratch_paths();
+        write_guarded_route(&paths, "require-own");
+        seed_task(&paths, "gh:owner/widget#107", "gh#107");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        // No logins registered: `account_email` answers `None` for everything.
+        let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#107",
+                DispatchOrigin {
+                    user: Some("ana@example.com".into()),
+                    ..DispatchOrigin::default()
+                },
+                DispatchOverrides::default(),
+            )
+            .await
+            .expect("unknown is not an accusation");
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#107").unwrap().unwrap();
+        assert_eq!(task.live_attempt().unwrap().billed_to, None);
+
+        service.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bad_dispatch_runtime_override_is_refused_and_leaves_no_attempt() {
         let paths = scratch_paths();
@@ -1110,6 +1584,7 @@ runtime = "mock"
                     runtime: Some("nonesuch".into()),
                     model: None,
                     account: None,
+                    bill: None,
                 },
             )
             .await

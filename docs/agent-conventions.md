@@ -64,11 +64,28 @@ Each row: `id`, `identifier`, `title`, `state`, `source`, `url`, `labels`,
 `route`, `workspace`, `runtime`, `chat_id`, `pr_url`, `pr_number`, `branch`,
 `dispatched_by`, `dispatched_by_chat`, `dispatched_by_user`, `last_outcome`,
 `last_outcome_at`,
-`attempts`, `dispatchable`, `gone`, `reopened`, `account`. `workspace` names a
+`attempts`, `dispatchable`, `gone`, `reopened`, `account`, `billed_to`.
+`workspace` names a
+comet *space* — the field keeps herdr-board's spelling so ported tooling reads
+it. `account` is the agent login whose subscription the row's attempt spends
+(the route's default before anything has run); null is the device's own CLI
+login, which is every row on a single-account box. `billed_to` is that account
+resolved to an email — whose subscription it actually is — recorded when the
+attempt was released, and null on a row nothing has run on. Read it against
+`dispatched_by_user`: different values mean the run is charged to somebody other
+than whoever released it.
+
+`attempts`, `dispatchable`, `gone`, `reopened`, `account`,
+`max_duration_secs`. `workspace` names a
 comet *space* — the field keeps herdr-board's spelling so ported tooling reads
 it. `account` is the agent login whose subscription the row's attempt spends
 (the route's default before anything has run); null is the device's own CLI
 login, which is every row on a single-account box.
+`max_duration_secs` is the wall-clock cap one attempt on this row gets — the
+route's `max_duration` resolved against `[defaults]`, null when the route is
+uncapped. Read against `started_at` it is how long a running agent has left;
+it is on the row because the routing config lives on the board's host, and a
+caller reading a relayed board has never seen it.
 `dispatched_by` is set only when the board dispatched the releasing agent too,
 so null there does **not** mean you released it — read `dispatched_by_chat`,
 which is set for every agent-released row. Both null is the operator.
@@ -105,6 +122,12 @@ is this board's `review`.
    `dispatch --account <id>` overrides it; do not pass it unless you were told
    which account to use. Spending someone else's limits is not yours to
    decide, and the board deliberately does not infer one from who dispatched.
+   `dispatch` prints a line on stderr when a release charges somebody other
+   than whoever it is attributed to — repeat it, do not swallow it. Under
+   `[defaults] billing_guard = "require-own"` such a release is *refused*
+   instead; `--bill <slot-or-email>` is the acknowledgement that overrides the
+   refusal, and passing it is a decision about someone else's money. Report the
+   refusal and let a human make it.
 4. **Provenance is automatic.** A board-dispatched chat carries its own id as
    `COMET_BOARD_CHAT_ID`, and `dispatch` passes it along — the board records
    your chat as the parent of what you release. Never pass `--via` unless
@@ -132,8 +155,10 @@ is this board's `review`.
    to notice the agent finished and to prompt you. Either `wait` for it, or say
    plainly that you are leaving it running. A board configured with
    `notify_dispatcher` will prompt you in this chat when work you released
-   settles — but it is off by default and you cannot tell from here, so never
-   promise that you will be woken. Note also that `wait` does **not** return on
+   settles, and a board that has pinned this chat as its **orchestrator** will
+   prompt you about every settle, block, orphan and cap warning on the board —
+   including work you did not release. Both are off by default and you cannot
+   tell which is on from here, so never promise that you will be woken. Note also that `wait` does **not** return on
    `blocked` by default: an agent that stops to ask a question holds its
    attempt open, and a plain `wait` on it hangs until somebody answers. Pass
    `--blocked-is-settled` to be called back on the question too; either way the
@@ -143,6 +168,17 @@ is this board's `review`.
     real repo that commits and opens PRs. A human keypress — or an explicit
     instruction — releases tasks. Reading the board is always safe; dispatching
     is not.
+
+**One chat may be pinned as the board's orchestrator.** If this one is, you
+receive a `comet-board:` prompt for every settle, block, orphan and cap warning
+on the board — not only for work you released — and it is one message per
+event, never a stream. Everything else about you is unchanged: you hold no
+workspace slot, everything you release counts against the caps like anyone's,
+and you bill whatever account your chat names. You are exempt from
+`max_duration` because you are meant to outlive every attempt, which makes
+restraint your responsibility rather than the clock's: never poll the board in
+a loop, and never dispatch because a queue looked empty. Being told about work
+is not being told to release any. `docs/orchestrator.md` is the brief.
 
 **Reviewing a pull request is how you reach the agent that wrote it.** The board
 delivers new comments on an open PR back into the chat that produced it — the

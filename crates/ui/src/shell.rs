@@ -452,8 +452,10 @@ pub struct Shell {
     changes: Option<Entity<Changes>>,
     /// The task board (docs/BOARD.md §H10). Unlike the terminal and changes
     /// panes it is a GLOBAL view — the queue across every workspace — so its
-    /// open flag lives on the shell, not in [`SessionPanels`].
-    board: Option<Entity<BoardPanel>>,
+    /// open flag lives on the shell, not in [`SessionPanels`]. And unlike them
+    /// it is **not** lazy: its `WatchBoard` stream feeds the sidebar's Agents
+    /// section (gh#103), which is on screen with the dock shut.
+    board: Entity<BoardPanel>,
     board_open: bool,
     /// Chat outlet vs settings pages.
     route: Route,
@@ -578,6 +580,8 @@ pub struct Shell {
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
+    /// Board frames repaint the sidebar's Agents section.
+    _board_observation: Subscription,
     _composer_events: Subscription,
 }
 
@@ -619,6 +623,12 @@ impl Shell {
                 }
             }
         });
+        // The board panel is built up front, unlike the terminal and the diff
+        // pane: its `WatchBoard` subscription is what feeds the sidebar's Agents
+        // section (gh#103), which has to be there before anybody opens the dock.
+        // Observing it repaints the sidebar on every board frame.
+        let board = cx.new(|cx| BoardPanel::new(state.clone(), cx));
+        let board_observation = cx.observe(&board, |_this: &mut Shell, _, cx| cx.notify());
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
@@ -668,7 +678,7 @@ impl Shell {
             file_drag_active: false,
             terminal: None,
             changes: None,
-            board: None,
+            board,
             board_open: false,
             route,
             nav,
@@ -734,6 +744,7 @@ impl Shell {
             focus_sub: None,
             _ticker: ticker,
             _state_observation: observation,
+            _board_observation: board_observation,
             _composer_events: composer_events,
         }
     }
@@ -996,7 +1007,7 @@ impl Shell {
             if self.panels.get(&key).changes_open {
                 self.panels.toggle_changes(&key);
             }
-            let panel = self.board_panel(cx);
+            let panel = self.board.clone();
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
             // Keyboard focus lands in the board so ↑↓/f// keys work with no
             // click — the same lazy-focus the terminal panel gets.
@@ -1006,15 +1017,6 @@ impl Shell {
         }
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
-    }
-
-    fn board_panel(&mut self, cx: &mut Context<Self>) -> Entity<BoardPanel> {
-        if let Some(board) = &self.board {
-            return board.clone();
-        }
-        let board = cx.new(|cx| BoardPanel::new(self.state.clone(), cx));
-        self.board = Some(board.clone());
-        board
     }
 
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
@@ -1366,6 +1368,71 @@ impl Shell {
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
             cx,
         );
+        cx.notify();
+    }
+
+    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#104).
+    ///
+    /// `[defaults] orchestrator_chat` on the board's `routing.toml`, written
+    /// through `WriteBoardConfig` — the same validated, backed-up path the
+    /// routing settings page uses, rather than a second way to edit that file.
+    /// `None` removes the key: the notices stop and the chat goes back to being
+    /// an ordinary chat, which is the whole of the kill switch.
+    ///
+    /// Nothing is applied optimistically. The board republishes the pin as the
+    /// write lands, so the glyph appearing *is* the box agreeing; a refusal
+    /// leaves the list as it was and says why.
+    fn set_orchestrator(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        self.chat_menu = None;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let (devices, local) = {
+            let state = self.state.read(cx);
+            (state.devices.clone(), state.local_device_id.clone())
+        };
+        // The board is on one device and this may not be it. Sweep the same
+        // candidates its panel does; the first host that accepts the write is
+        // the one hosting the board.
+        let candidates = comet_proto::view::board::host_candidates(&devices, local.as_deref());
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
+            let mut last: Option<String> = None;
+            for candidate in candidates {
+                let mut params = serde_json::json!({
+                    "op": "default", "key": "orchestrator_chat"
+                });
+                if let Some(object) = params.as_object_mut() {
+                    if let Some(id) = &chat_id {
+                        object.insert("value".into(), serde_json::json!(id));
+                    }
+                    if let Some(host) = candidate.as_deref() {
+                        object.insert("targetDeviceId".into(), serde_json::json!(host));
+                    }
+                }
+                match engine
+                    .client()
+                    .call(methods::WRITE_BOARD_CONFIG, params)
+                    .await
+                {
+                    // The pin arrives back on the watch stream, not from here.
+                    Ok(_) => return,
+                    Err(err) => last = Some(err.to_string()),
+                }
+            }
+            this.update(cx, |shell, cx| {
+                shell.sidebar_notice = Some(
+                    match last {
+                        Some(err) => format!("No device here hosts a board ({err})"),
+                        None => "No device here hosts a board".to_string(),
+                    }
+                    .into(),
+                );
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -1927,6 +1994,9 @@ impl Shell {
         harness: Option<comet_proto::HarnessId>,
         status: comet_proto::ChatIndicator,
         selected: bool,
+        // The board's pinned orchestrator (gh#104) — marked, and drawn first in
+        // the list by `AppState::overview_chats`.
+        orchestrator: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2001,6 +2071,22 @@ impl Shell {
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
                     .child(status_rail)
+                    // The mark sits between the status rail and the space name:
+                    // the rail still says what the agent is doing, and this
+                    // says which agent this is. Shape-distinct rather than
+                    // colour-only, on the same rule the board glyphs follow.
+                    .when(orchestrator, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .line_height(px(14.0))
+                                .text_color(theme.accent)
+                                .child(SharedString::from(
+                                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -2161,6 +2247,9 @@ impl Shell {
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
+        // Between the spaces and the sessions: the live board attempts, when
+        // there are any (gh#103).
+        let agents_section = self.render_agents_section(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2190,6 +2279,7 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
+                            .children(agents_section)
                     .child(
                         div()
                             .px(px(Theme::SPACE_SM))
@@ -2596,6 +2686,11 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            // Unpinning is the same item on the row that is pinned: whoever
+            // wants the notices to stop reaches for the session they pinned,
+            // not for a settings page.
+            let pinned = self.state.read(cx).is_orchestrator(&chat_id);
+            let pin_target = (!pinned).then(|| chat_id.clone());
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2625,6 +2720,24 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Archive")),
+                )
+                .child(popover::menu_separator(&theme))
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_orchestrator(pin_target.clone(), cx)
+                        }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(if pinned {
+                            theme.accent
+                        } else {
+                            theme.text_muted
+                        }))
+                        .child(SharedString::from(if pinned {
+                            "Unpin as orchestrator"
+                        } else {
+                            "Pin as orchestrator"
+                        })),
                 )
                 .child(popover::menu_separator(&theme))
                 .child(
@@ -3197,7 +3310,7 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
         let content: AnyElement = if self.board_open {
-            let panel = self.board_panel(cx);
+            let panel = self.board.clone();
             // Idempotent — also covers a toggle that landed before the engine
             // finished booting.
             panel.update(cx, |panel, cx| panel.set_open(true, cx));

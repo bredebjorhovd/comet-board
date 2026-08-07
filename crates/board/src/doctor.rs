@@ -178,6 +178,16 @@ pub fn doctor(
 
             checks.push(operator_notice_check(&cfg.defaults));
 
+            // Whose subscription the dispatches on this box spend, and what the
+            // board says about it (gh#101).
+            checks.push(billing_guard_check(&cfg));
+
+            // The pin (gh#104). Reported next to the other notice lines because
+            // it is another answer to the same question — who hears about a
+            // settle — and because an unpinned board is the one state where
+            // nobody hears about work an operator released by hand.
+            checks.push(orchestrator_check(&cfg.defaults, db_ok.as_ref().ok()));
+
             // Whose name a teammate's dispatch commits under (gh#107). Beside
             // the box's own identity below, and always printed for the same
             // reason the duration cap is: with no map every dispatch commits as
@@ -924,6 +934,67 @@ fn settle_notice_detail(notify_dispatcher: bool) -> String {
     }
 }
 
+/// Whether one agent is running this board, and whether the chat named as that
+/// agent can actually be one (gh#104).
+///
+/// Unpinned is a preference, not a fault: a board driven by a human at the panel
+/// wants no orchestrator, and a `doctor` that exited non-zero over that would
+/// stop meaning anything. What the line has to do is say what an unpinned board
+/// costs — work released from the panel reaches no agent at all — so that
+/// "nobody picked this up" is legible as a setting rather than as a bug.
+///
+/// The fault it does catch is the one misconfiguration the pin allows: pinning
+/// a chat the board itself dispatched. That chat is an attempt — it holds a
+/// workspace slot, it has a task of its own, and the exemption from
+/// `max_duration` now keeps it alive past every cap. None of that is what
+/// somebody meant by "run the board", and unpinned it would simply have
+/// finished.
+fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Check {
+    let name = "orchestrator".to_string();
+    let Some(chat) = defaults.orchestrator() else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not pinned — no chat is told about the board as a whole. Work you \
+                     release from the panel reaches no agent, and a settle is a row \
+                     colour and a comment on the issue (pin a session in the app, or \
+                     `[defaults] orchestrator_chat = \"<chat-id>\"`)"
+                .into(),
+        };
+    };
+    // A live attempt on the pinned chat is the real misconfiguration. A closed
+    // one is history — the chat outlived its attempt and somebody pinned it
+    // afterwards, which is odd but harmless — so only the live case is a fault.
+    let dispatched = db
+        .and_then(|db| db.live_attempts().ok())
+        .map(|attempts| {
+            attempts
+                .into_iter()
+                .find(|a| a.pane_id.as_deref() == Some(chat))
+        })
+        .unwrap_or(None);
+    match dispatched {
+        Some(attempt) => Check {
+            name,
+            ok: false,
+            detail: format!(
+                "chat {chat} is pinned, but the board dispatched it — it is the live \
+                 attempt on {}, so it holds a workspace slot and is now exempt from its \
+                 own time cap. Pin a chat you opened yourself",
+                attempt.task_id
+            ),
+        },
+        None => Check {
+            name,
+            ok: true,
+            detail: format!(
+                "chat {chat} — every settle, block, orphan and cap warning on this board \
+                 is prompted into it, one message per event. Unpin to stop them"
+            ),
+        },
+    }
+}
+
 /// What happens upstream when an agent stops and cannot go on (gh#71).
 ///
 /// Unconditional for Linear and gated per repo for GitHub, which is the same
@@ -996,6 +1067,66 @@ fn operator_notice_check(defaults: &crate::config::Defaults) -> Check {
                  a blocked agent still comments on its issue",
                 crate::notify::webhook_host(url)
             )
+        },
+    }
+}
+
+/// What the board does about a dispatch that spends somebody else's
+/// subscription (gh#101).
+///
+/// Reported the way the notices are, and worded to the same rule: `off` has to
+/// read as a *choice* rather than as something left unconfigured. On a
+/// one-person box `off` is the right answer, and a `doctor` that nagged about
+/// it would be a `doctor` people stop reading — so this never fails, exactly
+/// like [`operator_notice_check`].
+///
+/// The honesty is not optional either. The guard compares the dispatching
+/// frontend's `viaUser` claim against the agent-account's email, and the box
+/// cannot check that claim until #66 lands, so every mode says so in the words
+/// that will still be true afterwards: a seatbelt, not a lock.
+fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
+    use crate::billing::GuardMode;
+    let mode = cfg.billing_guard(None);
+    // A route that answers differently from the board is worth naming here: the
+    // whole `doctor` line would otherwise describe a default that the route
+    // somebody actually dispatches on does not use.
+    let overrides: Vec<String> = cfg
+        .routes
+        .iter()
+        .filter(|r| r.billing_guard.is_some() && cfg.billing_guard(Some(r)) != mode)
+        .map(|r| {
+            format!(
+                "{} = {}",
+                r.display_name(),
+                cfg.billing_guard(Some(r)).as_str()
+            )
+        })
+        .collect();
+    let detail = match mode {
+        GuardMode::Warn => "warn — a dispatch that spends someone else's subscription says so \
+             in the picker, on the CLI, in the dispatch comment and on the row, \
+             and releases anyway. A seatbelt, not a lock: the match is the \
+             frontend's claimed user against the account's email, and the box \
+             cannot verify that claim yet (#66)"
+            .to_string(),
+        GuardMode::RequireOwn => "require-own — a dispatch that would spend someone else's \
+             subscription is refused unless it names them (`--bill`). Still a \
+             seatbelt: the match is the frontend's claimed user against the \
+             account's email, so a frontend that misreports one walks through \
+             it (#66)"
+            .to_string(),
+        GuardMode::Off => "off — nothing is said when a dispatch spends someone else's \
+             subscription. The right answer on a box where one person's plan \
+             pays for everything, and a choice rather than an oversight \
+             (`[defaults] billing_guard = \"warn\"` to hear about it)"
+            .to_string(),
+    };
+    Check {
+        name: "billing guard".into(),
+        ok: true,
+        detail: match overrides.as_slice() {
+            [] => detail,
+            some => format!("{detail}. Per route: {}", some.join(", ")),
         },
     }
 }
@@ -1575,6 +1706,72 @@ mod tests {
         assert!(!detail.contains("o/mine"), "{detail}");
     }
 
+    /// gh#101. Three modes, one line, and it never fails — `off` is the right
+    /// answer on a one-person box, and a `doctor` that nagged about a
+    /// preference is a `doctor` people stop reading. What it must never do is
+    /// imply the match is stronger than it is.
+    #[test]
+    fn the_billing_guard_line_reports_the_mode_and_admits_it_is_a_seatbelt() {
+        let mut cfg = RoutingConfig::default();
+
+        let warn = billing_guard_check(&cfg);
+        assert!(warn.ok);
+        assert!(warn.detail.starts_with("warn —"), "{}", warn.detail);
+        assert!(warn.detail.contains("#66"), "{}", warn.detail);
+
+        cfg.defaults.billing_guard = "require-own".into();
+        let strict = billing_guard_check(&cfg);
+        assert!(strict.ok, "a stricter mode is not a fault");
+        assert!(strict.detail.contains("--bill"), "{}", strict.detail);
+        assert!(
+            strict.detail.contains("seatbelt"),
+            "the honesty is not optional: {}",
+            strict.detail
+        );
+
+        cfg.defaults.billing_guard = "off".into();
+        let off = billing_guard_check(&cfg);
+        assert!(off.ok, "off is a choice, not an oversight");
+        assert!(
+            off.detail.contains("The right answer on a box where"),
+            "worded as a choice: {}",
+            off.detail
+        );
+    }
+
+    /// A route that answers differently from the board is named, or the line
+    /// describes a default the route people actually dispatch on does not use.
+    #[test]
+    fn the_billing_guard_line_names_the_routes_that_disagree() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[defaults]\nbilling_guard = \"warn\"\n\n\
+             [[route]]\nname = \"platform\"\nmatch = { label = \"team\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude\"\n\
+             billing_guard = \"require-own\"\n\n\
+             [[route]]\nname = \"scratch\"\nmatch = { label = \"mine\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude\"\n",
+        )
+        .unwrap();
+        let detail = billing_guard_check(&cfg).detail;
+        assert!(detail.contains("platform = require-own"), "{detail}");
+        assert!(
+            !detail.contains("scratch"),
+            "a route that agrees with the board is not news: {detail}"
+        );
+    }
+
+    #[test]
+    fn doctor_emits_the_billing_guard_check() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "billing guard")
+            .expect("doctor is silent about whose subscription dispatches spend");
+        assert!(c.detail.starts_with("warn —"), "{:?}", c.detail);
+    }
+
     #[test]
     fn doctor_emits_the_settle_notice_check() {
         let (_d, p) = tmp();
@@ -1589,6 +1786,92 @@ mod tests {
             .find(|c| c.name == "settle notice")
             .expect("doctor is silent about notify_dispatcher");
         assert!(c.detail.starts_with("on —"), "{:?}", c.detail);
+    }
+
+    /// An unpinned board is a legitimate preference, so the line has to be
+    /// `ok` — and it still has to say what is *not* happening, because "nobody
+    /// picked this up" reads as a bug until you know no agent was told.
+    #[test]
+    fn doctor_says_when_no_agent_is_running_the_board() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "orchestrator")
+            .expect("doctor is silent about the pin");
+        assert!(c.ok, "not pinning anything is not a fault");
+        assert!(c.detail.starts_with("not pinned"), "{}", c.detail);
+        assert!(c.detail.contains("orchestrator_chat"), "{}", c.detail);
+    }
+
+    #[test]
+    fn doctor_names_the_pinned_chat() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        assert!(c.ok);
+        assert!(c.detail.contains("chat-boss"), "{}", c.detail);
+    }
+
+    /// The one misconfiguration the pin allows, and it is a quiet one: a
+    /// board-dispatched chat pinned as the orchestrator holds a workspace slot
+    /// and — since gh#104 — never hits its own time cap either.
+    #[test]
+    fn doctor_refuses_a_pin_on_a_chat_the_board_dispatched() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\norchestrator_chat = \"chat-9\"\n\n[github]\nrepos = []\n",
+        )
+        .unwrap();
+        let db = Db::open(&p.db()).unwrap();
+        db.upsert_task(&crate::db::UpsertTask {
+            id: "linear:LIN-142".into(),
+            source: crate::model::Source::Linear,
+            source_id: "uuid-1".into(),
+            identifier: "LIN-142".into(),
+            title: "Add retry".into(),
+            body: None,
+            url: "https://linear.app/x".into(),
+            labels: vec![],
+            source_state: None,
+            linear_team: Some("LIN".into()),
+            linear_project: None,
+            upstream: crate::model::UpstreamState::Started,
+            updated_at: crate::db::now(),
+        })
+        .unwrap();
+        let a = db
+            .insert_attempt(&crate::db::NewAttempt {
+                task_id: "linear:LIN-142".into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: None,
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                billed_to: None,
+            })
+            .unwrap();
+        db.set_attempt_pane(a, "chat-9").unwrap();
+        drop(db);
+
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
     }
 
     /// AGE-23, inherited. A global `ON` is not an answer once the answer

@@ -21,7 +21,7 @@ use comet_proto::view::{
     self, CheckoutKind, CheckoutPlan, ConnectionStatus, GatePhase, Indicator, display_status,
     format_time_ago,
 };
-use comet_proto::view::board::BoardState;
+use comet_proto::view::board::{self as board_view, AgentState, BoardState};
 use comet_proto::{
     AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, Space,
 };
@@ -121,6 +121,22 @@ pub enum Row {
         /// The host's presence heartbeat has lapsed.
         offline: bool,
     },
+    /// A live board attempt: state glyph + issue identifier + elapsed, then an
+    /// indented branch. Above the sessions, because an agent that is stuck is
+    /// the one thing on this pane worth interrupting a person for (gh#103).
+    Agent {
+        /// The chat the row opens — namespaced in [`Row::key`] so the cursor
+        /// can tell this row from the same chat's entry in the sessions list.
+        chat_id: String,
+        identifier: String,
+        branch: Option<String>,
+        state: AgentState,
+        /// When the attempt started, and what it is capped at — the instant, not
+        /// the age, so the counter moves on a redraw instead of needing the
+        /// whole sidebar rebuilt once a second.
+        started_at: Option<DateTime<Utc>>,
+        cap_secs: Option<u64>,
+    },
     /// A session: dot + title + time, then an indented "space@device".
     Chat {
         id: String,
@@ -130,6 +146,11 @@ pub enum Row {
         indicator: ChatIndicator,
         archived: bool,
         activity: Option<DateTime<Utc>>,
+        /// The board's pinned orchestrator (gh#104) — first in the list and
+        /// marked, because it is the one session that is about the board rather
+        /// than about a task, and losing it in a recency-sorted list is how it
+        /// stops being the thing you talk to.
+        orchestrator: bool,
     },
     /// Placeholder text for an empty section.
     Empty { label: String },
@@ -140,11 +161,27 @@ pub enum Row {
 }
 
 impl Row {
-    /// Row id, for the identity-preserving cursor. Decoration has none.
+    /// What this row *addresses* — a space, or a chat in the Sessions list.
+    /// Decoration addresses nothing, and neither does an agent row: it points
+    /// at a chat the Sessions list already answers for, and two rows answering
+    /// to one id would let "put the cursor on chat X" land on either.
+    /// Cursor identity is [`Row::key`].
     pub fn id(&self) -> Option<&str> {
         match self {
             Row::Space { id, .. } | Row::Chat { id, .. } => Some(id),
             _ => None,
+        }
+    }
+
+    /// Which row this *is*, for the identity-preserving cursor across rebuilds.
+    ///
+    /// An agent row shares its chat with the Sessions list, so its key is
+    /// namespaced with the NUL prefix the board pane's section headers use —
+    /// otherwise a rebuild would slide the cursor between the two lists.
+    pub fn key(&self) -> Option<String> {
+        match self {
+            Row::Agent { chat_id, .. } => Some(format!("\u{0}agent:{chat_id}")),
+            other => other.id().map(str::to_string),
         }
     }
 
@@ -156,6 +193,9 @@ impl Row {
             // rather than a list, and a terminal has no half-row to spend
             // instead. The breathing room comes from the pane's own padding.
             Row::Chat { .. } => 2,
+            // Identifier over branch — the same two-line shape, so the two
+            // lists read as one pane rather than two designs.
+            Row::Agent { .. } => 2,
             // An account with no display name is one line, not one line and a
             // blank: the second row exists to carry the email *under* a name.
             Row::User { name, email } => {
@@ -171,7 +211,10 @@ impl Row {
 
     /// Can the cursor land here? Decoration cannot.
     pub fn selectable(&self) -> bool {
-        matches!(self, Row::Space { .. } | Row::Chat { .. })
+        matches!(
+            self,
+            Row::Space { .. } | Row::Chat { .. } | Row::Agent { .. }
+        )
     }
 }
 
@@ -297,6 +340,12 @@ pub enum Overlay {
         /// What row 0 will spend when nothing is picked — the route's account,
         /// when the row names one.
         route_account: Option<String>,
+        /// The harness the row's runtime resolves to, as the host's
+        /// `ListBoardRuntimes` reported it. `None` when that lookup failed, and
+        /// then the picker says nothing about who pays: an unfiltered list has
+        /// no reliable "the box's own login" in it, and a wrong guess about
+        /// whose subscription a row spends is worse than no guess (gh#101).
+        harness: Option<comet_proto::HarnessId>,
         active: usize,
     },
     /// A single-line text prompt (rename).
@@ -349,6 +398,9 @@ pub enum MenuAction {
     RenameChat(String),
     SetArchived(String, bool),
     DeleteChat(String),
+    /// Pin this chat as the board's orchestrator, or (`None`) unpin whatever is
+    /// pinned. One per board, so pinning is a move rather than an add.
+    SetOrchestrator(Option<String>),
     RenameSpace(String),
     DeleteSpace(String),
     PickModel,
@@ -412,6 +464,10 @@ pub struct App {
     /// by the supervisor — the board RPCs are relay-forwardable, so a laptop
     /// hosting no board still reads and drives the box's.
     pub board_host: Option<String>,
+    /// The chat that board has pinned as its orchestrator (gh#104), as its
+    /// `WatchBoardOrchestrator` stream reports it. `None` = no pin, or a board
+    /// this pane has not found yet.
+    pub orchestrator: Option<String>,
     /// That device has actually delivered rows. Until it does, the header says
     /// who it is asking rather than claiming an answer.
     pub board_host_live: bool,
@@ -488,6 +544,7 @@ impl App {
             board: Board::new(),
             board_open: false,
             board_host: None,
+            orchestrator: None,
             board_host_live: false,
             board_pin: BoardHost::Auto,
             overlay: None,
@@ -605,15 +662,20 @@ impl App {
             Update::DispatchAccounts {
                 task_id: for_task,
                 accounts,
+                harness: for_harness,
             } => {
                 // Only fills the picker it was asked for: a slow reply must not
                 // land the wrong row's logins under a newer pick.
                 if let Some(Overlay::DispatchAccount {
-                    task_id, accounts: slot, ..
+                    task_id,
+                    accounts: slot,
+                    harness,
+                    ..
                 }) = &mut self.overlay
                     && *task_id == for_task
                 {
                     *slot = Some(accounts);
+                    *harness = for_harness;
                 }
                 Vec::new()
             }
@@ -633,11 +695,21 @@ impl App {
             }
             Update::Board(rows) => {
                 self.board.set_rows(rows);
+                // The sidebar's Agents section is built from these, so a board
+                // frame is a sidebar change even with the board pane closed.
+                self.rebuild_rows();
                 Vec::new()
             }
             Update::BoardHostChanged { device, live } => {
                 self.board_host = device;
                 self.board_host_live = live;
+                Vec::new()
+            }
+            Update::Orchestrator(chat_id) => {
+                self.orchestrator = chat_id;
+                // The pin decides a row's *position*, so the list has to be
+                // rebuilt rather than merely repainted.
+                self.rebuild_rows();
                 Vec::new()
             }
             Update::SendFailed {
@@ -1061,6 +1133,7 @@ impl App {
                         identifier,
                         accounts: None,
                         route_account: row.account.clone(),
+                        harness: None,
                         active: 0,
                     });
                     vec![Command::ListDispatchAccounts { task_id, runtime }]
@@ -1170,6 +1243,23 @@ impl App {
                     self.selected_space = space_id.clone();
                 }
                 let effects = self.select_chat(Some(id));
+                self.focus = Focus::Composer;
+                effects
+            }
+            // An agent row is its chat, said another way: opening it opens the
+            // transcript, which is where answering a blocked agent happens. The
+            // chat belongs to whatever space the dispatch routed to, so landing
+            // there is part of opening it.
+            Some(Row::Agent { chat_id, .. }) => {
+                if let Some(space) = self
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == chat_id)
+                    .and_then(|chat| chat.space_id.clone())
+                {
+                    self.selected_space = Some(space);
+                }
+                let effects = self.select_chat(Some(chat_id));
                 self.focus = Focus::Composer;
                 effects
             }
@@ -1411,6 +1501,35 @@ impl App {
         }]
     }
 
+    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#104).
+    ///
+    /// One `[defaults]` key on the board's `routing.toml`, written through the
+    /// same validated path a settings page uses. `None` removes the key, which
+    /// is the kill switch: the notices stop and the chat is an ordinary chat
+    /// again. The pin is not applied optimistically — the board republishes it
+    /// as the write lands, and a refusal must not leave a glyph on a row the
+    /// box does not agree about.
+    fn set_orchestrator(&mut self, chat_id: Option<String>) -> Effects {
+        if self.board_host.is_none() && !self.board_host_live {
+            self.notify("No board found yet — nothing to pin an orchestrator on.".into());
+            return Vec::new();
+        }
+        let mut params = serde_json::json!({ "op": "default", "key": "orchestrator_chat" });
+        if let Some(object) = params.as_object_mut() {
+            if let Some(id) = &chat_id {
+                object.insert("value".into(), serde_json::json!(id));
+            }
+            if let Some(device) = &self.board_host {
+                object.insert("targetDeviceId".into(), serde_json::json!(device));
+            }
+        }
+        vec![Command::Call {
+            method: methods::WRITE_BOARD_CONFIG,
+            params,
+            context: "Couldn't change the board's orchestrator",
+        }]
+    }
+
     fn interrupt(&mut self) -> Effects {
         let Some(chat_id) = self.selected_chat.clone() else {
             return Vec::new();
@@ -1648,14 +1767,11 @@ impl App {
     /// rather than its index — otherwise a session appearing above the cursor
     /// would silently move the selection under the user's hands.
     ///
-    /// Two sections, matching the desktop shell: Spaces, then a flat global
-    /// attention-sorted Sessions list.
+    /// Three sections, matching the desktop shell: Spaces, the live Agents (only
+    /// while something is running), then a flat global attention-sorted Sessions
+    /// list.
     pub fn rebuild_rows(&mut self) {
-        let anchor = self
-            .rows
-            .get(self.cursor)
-            .and_then(|row| row.id())
-            .map(str::to_string);
+        let anchor = self.rows.get(self.cursor).and_then(|row| row.key());
         let now = Utc::now();
         let user_row = self.auth_user().map(|user| {
             (
@@ -1711,6 +1827,32 @@ impl App {
             });
         }
 
+        // Agents, above the sessions: one row per live board attempt (gh#103).
+        // Omitted entirely when nothing is running — an empty section here would
+        // be a permanent reminder that a board exists on a box that has none.
+        // The board pane (`B`) stays the deep view; this is the glance.
+        let agents = board_view::agent_rows(&self.board.rows, &self.chats, &self.sessions, now);
+        if !agents.is_empty() {
+            let blocked = board_view::agents_needing_attention(&agents);
+            rows.push(Row::Blank);
+            rows.push(Row::Section {
+                label: "Agents".into(),
+                // The count is on the header because it is what you look for
+                // first: three running, one of them stuck on a question.
+                action: (blocked > 0).then(|| format!("{blocked} blocked")),
+            });
+            for agent in agents {
+                rows.push(Row::Agent {
+                    chat_id: agent.chat_id,
+                    identifier: agent.identifier,
+                    branch: agent.branch,
+                    state: agent.state,
+                    started_at: agent.started_at,
+                    cap_secs: agent.cap_secs,
+                });
+            }
+        }
+
         rows.push(Row::Blank);
         rows.push(Row::Section {
             label: "Sessions".into(),
@@ -1725,6 +1867,15 @@ impl App {
             .map(|chat| (display_status(chat, self.session_for(&chat.id), now), chat))
             .collect();
         view::sort_active(&mut active);
+        // ...and then the orchestrator on top of it, if this board has one. It
+        // is pinned in the literal sense: recency decides every other row's
+        // position and this one's position is the designation.
+        if let Some(pinned) = self.orchestrator.as_deref()
+            && let Some(at) = active.iter().position(|(_, chat)| chat.id == pinned)
+        {
+            let row = active.remove(at);
+            active.insert(0, row);
+        }
         if active.is_empty() {
             rows.push(Row::Empty {
                 label: "No sessions yet".into(),
@@ -1743,6 +1894,7 @@ impl App {
                 indicator,
                 archived: chat.archived,
                 activity: chat.last_message_at.or(Some(chat.created_at)),
+                orchestrator: self.orchestrator.as_deref() == Some(chat.id.as_str()),
             });
         }
 
@@ -1756,10 +1908,10 @@ impl App {
 
         self.rows = rows;
         self.cursor = anchor
-            .and_then(|id| {
+            .and_then(|key| {
                 self.rows
                     .iter()
-                    .position(|row| row.id() == Some(id.as_str()))
+                    .position(|row| row.key().as_deref() == Some(key.as_str()))
             })
             .or_else(|| {
                 self.selected_chat
@@ -2117,6 +2269,26 @@ impl App {
         })
     }
 
+    /// A second-resolution counter is on screen: the sidebar's Agents section
+    /// (or the board pane) is showing elapsed times, and they have to move.
+    ///
+    /// Separate from [`App::animating`], which paces the spinner at animation
+    /// framerate. This wants one wake-up a second, and only while an attempt is
+    /// actually live — a *blocked* agent animates nothing and would otherwise
+    /// sit at the age it had when the last frame happened to land.
+    pub fn counting(&self) -> bool {
+        matches!(self.gate(), GatePhase::Ready)
+            && self.rows.iter().any(|row| {
+                matches!(
+                    row,
+                    Row::Agent {
+                        started_at: Some(_),
+                        ..
+                    }
+                )
+            })
+    }
+
     /// Relative activity label for a sidebar row.
     pub fn relative_time(&self, at: Option<DateTime<Utc>>) -> String {
         at.map(|at| format_time_ago(at, Utc::now()))
@@ -2223,6 +2395,7 @@ impl App {
                 id,
                 title,
                 archived,
+                orchestrator,
                 ..
             }) => (
                 title,
@@ -2236,6 +2409,19 @@ impl App {
                         label: if archived { "Unarchive" } else { "Archive" }.into(),
                         action: MenuAction::SetArchived(id.clone(), !archived),
                         separated: false,
+                    },
+                    // Unpinning is the kill switch, so it is the same item
+                    // rather than something to go and find: whoever pinned it
+                    // reaches for the row they pinned.
+                    MenuItem {
+                        label: if orchestrator {
+                            "Unpin as orchestrator"
+                        } else {
+                            "Pin as orchestrator"
+                        }
+                        .into(),
+                        action: MenuAction::SetOrchestrator((!orchestrator).then(|| id.clone())),
+                        separated: true,
                     },
                     MenuItem {
                         label: "Delete…".into(),
@@ -2410,6 +2596,7 @@ impl App {
                 identifier,
                 accounts,
                 route_account,
+                harness,
                 active,
             }) => {
                 // Still loading: enter would be a release nobody aimed. Put the
@@ -2420,6 +2607,7 @@ impl App {
                         identifier,
                         accounts: None,
                         route_account,
+                        harness,
                         active,
                     });
                     return Vec::new();
@@ -2519,6 +2707,7 @@ impl App {
                 }),
                 context: "Couldn't archive the session",
             }],
+            MenuAction::SetOrchestrator(chat_id) => self.set_orchestrator(chat_id),
             MenuAction::DeleteChat(chat_id) => vec![Command::Call {
                 method: methods::MUTATE,
                 params: serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
@@ -3509,6 +3698,8 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            billed_to: None,
+            max_duration_secs: None,
         }
     }
 
@@ -3620,6 +3811,7 @@ mod tests {
         // Row 0: no account override — what enter alone always did.
         app.act(Action::BoardEnter);
         app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
             task_id: "1".into(),
             accounts: vec![agent_account("slot-ana", "ana@example.com")],
         });
@@ -3640,6 +3832,7 @@ mod tests {
         // Row 1: that slot, sent as the override.
         app.act(Action::BoardEnter);
         app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
             task_id: "1".into(),
             accounts: vec![agent_account("slot-ana", "ana@example.com")],
         });
@@ -3664,6 +3857,7 @@ mod tests {
         app.board.selected = Some("1".into());
         app.act(Action::BoardEnter);
         app.apply(Update::DispatchAccounts {
+            harness: Some(comet_proto::HarnessId::ClaudeCode),
             task_id: "9".into(),
             accounts: vec![agent_account("slot-ana", "ana@example.com")],
         });
@@ -3677,6 +3871,121 @@ mod tests {
         // And enter while nothing has landed releases nothing.
         assert!(app.act(Action::OverlayConfirm).is_empty());
         assert!(matches!(app.overlay, Some(Overlay::DispatchAccount { .. })));
+    }
+
+    // ---- the pinned orchestrator (gh#104) --------------------------------
+
+    /// Every other row's position is recency; the orchestrator's position *is*
+    /// the designation, so it does not slide down the list the moment two other
+    /// sessions say something.
+    #[test]
+    fn the_pinned_orchestrator_sits_at_the_top_of_the_sessions_list() {
+        let mut app = seeded();
+        let first_chat = |app: &App| {
+            app.rows
+                .iter()
+                .find_map(|row| match row {
+                    Row::Chat {
+                        id, orchestrator, ..
+                    } => Some((id.clone(), *orchestrator)),
+                    _ => None,
+                })
+                .expect("a chat row")
+        };
+        // c2 is the more recent, so it leads before anything is pinned.
+        assert_eq!(first_chat(&app), ("c2".into(), false));
+
+        app.apply(Update::Orchestrator(Some("c1".into())));
+        assert_eq!(first_chat(&app), ("c1".into(), true));
+
+        // And unpinning hands the list straight back to recency.
+        app.apply(Update::Orchestrator(None));
+        assert_eq!(first_chat(&app), ("c2".into(), false));
+    }
+
+    /// A pin the board does not know about — an archived chat, a stale id left
+    /// in `routing.toml` — must not reorder or mark anything. Nothing is
+    /// synthesised into the list to stand in for it.
+    #[test]
+    fn a_pin_naming_no_visible_chat_changes_nothing() {
+        let mut app = seeded();
+        let before: Vec<String> = app
+            .rows
+            .iter()
+            .filter_map(|r| r.id().map(str::to_string))
+            .collect();
+        app.apply(Update::Orchestrator(Some("gone".into())));
+        let after: Vec<String> = app
+            .rows
+            .iter()
+            .filter_map(|r| r.id().map(str::to_string))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// The pin is one `[defaults]` key on the board's `routing.toml`, written
+    /// through the same validated path the settings surfaces use — and aimed at
+    /// the device whose board the pane is showing, not at this laptop.
+    #[test]
+    fn pinning_writes_the_board_config_on_the_board_host() {
+        let mut app = seeded();
+        app.apply(Update::BoardHostChanged {
+            device: Some("the-box".into()),
+            live: true,
+        });
+        let effects = app.run_menu_action(MenuAction::SetOrchestrator(Some("c1".into())));
+        let Some(Command::Call { method, params, .. }) = effects.first() else {
+            panic!("expected one call, got {effects:?}");
+        };
+        assert_eq!(*method, methods::WRITE_BOARD_CONFIG);
+        assert_eq!(params["op"], "default");
+        assert_eq!(params["key"], "orchestrator_chat");
+        assert_eq!(params["value"], "c1");
+        assert_eq!(params["targetDeviceId"], "the-box");
+
+        // Unpinning sends no value at all, which is how the key is removed.
+        let effects = app.run_menu_action(MenuAction::SetOrchestrator(None));
+        let Some(Command::Call { params, .. }) = effects.first() else {
+            panic!("expected one call, got {effects:?}");
+        };
+        assert!(params.get("value").is_none(), "got: {params}");
+    }
+
+    /// The board is on one device and this pane may not have found it yet.
+    /// Writing the key into this laptop's own (absent) config would silently
+    /// pin nothing.
+    #[test]
+    fn pinning_without_a_board_says_so_rather_than_writing_nowhere() {
+        let mut app = seeded();
+        assert!(
+            app.run_menu_action(MenuAction::SetOrchestrator(Some("c1".into())))
+                .is_empty()
+        );
+        assert!(app.notice.is_some());
+    }
+
+    /// The same item does both, because whoever wants the notices to stop
+    /// reaches for the row they pinned.
+    #[test]
+    fn the_menu_offers_unpinning_on_the_row_that_is_pinned() {
+        let mut app = seeded();
+        app.apply(Update::Orchestrator(Some("c1".into())));
+        let at = app
+            .rows
+            .iter()
+            .position(|row| row.id() == Some("c1"))
+            .expect("c1 is on screen");
+        app.cursor = at;
+        app.open_context_menu(0, 0);
+        let Some(Overlay::Menu { items, .. }) = &app.overlay else {
+            panic!("no menu");
+        };
+        let pin = items
+            .iter()
+            .find(|i| i.label.contains("orchestrator"))
+            .expect("the pin item");
+        assert_eq!(pin.label, "Unpin as orchestrator");
+        assert_eq!(pin.action, MenuAction::SetOrchestrator(None));
     }
 
     fn board_device(id: &str, name: &str, created: &str) -> Device {
@@ -3867,6 +4176,178 @@ mod tests {
             board_row("a", BoardState::Ready),
         ]));
         assert_eq!(app.board.selected.as_deref(), Some("a"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The sidebar's Agents section (gh#103)
+    // -----------------------------------------------------------------------
+
+    /// The rows a live board attempt puts in the sidebar, with the board pane
+    /// never opened — presence must not be something you have to go and find.
+    fn agent_rows_in_sidebar(app: &App) -> Vec<(String, AgentState)> {
+        app.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Agent {
+                    identifier, state, ..
+                } => Some((identifier.clone(), *state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn live_attempts_show_in_the_sidebar_without_opening_the_board() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![
+            chat("chat-a", "s1", 1),
+            chat("chat-b", "s1", 2),
+            chat("chat-c", "s1", 3),
+        ]));
+        let mut a = board_row("a", BoardState::Working);
+        a.chat_id = Some("chat-a".into());
+        let mut b = board_row("b", BoardState::Working);
+        b.chat_id = Some("chat-b".into());
+        let mut c = board_row("c", BoardState::Blocked);
+        c.chat_id = Some("chat-c".into());
+        app.apply(Update::Board(vec![a, b, c]));
+        app.apply(Update::Sessions(vec![
+            session("chat-a", SessionStatus::Working, 0),
+            session("chat-b", SessionStatus::Working, 0),
+            session("chat-c", SessionStatus::AwaitingInput, 0),
+        ]));
+
+        assert!(!app.board_open, "nobody opened the board pane");
+        let agents = agent_rows_in_sidebar(&app);
+        assert_eq!(agents.len(), 3, "three agents running, three rows");
+        // Blocked floats, and the header says how many.
+        assert_eq!(agents[0], ("gh#c".to_string(), AgentState::Blocked));
+        assert!(app.rows.iter().any(|row| matches!(
+            row,
+            Row::Section { label, action: Some(count) }
+                if label == "Agents" && count == "1 blocked"
+        )));
+    }
+
+    /// The section is the *live* attempts and only those: it appears with the
+    /// first dispatch and goes when the attempt ends, with no other cleanup.
+    #[test]
+    fn the_section_appears_and_leaves_with_the_attempt() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        assert!(agent_rows_in_sidebar(&app).is_empty(), "nothing dispatched");
+
+        let mut live = board_row("a", BoardState::Working);
+        live.chat_id = Some("chat-a".into());
+        app.apply(Update::Board(vec![live]));
+        assert_eq!(agent_rows_in_sidebar(&app).len(), 1);
+
+        // Settled: the attempt closed, so the row kept neither its state nor its
+        // chat. The chat itself stays findable under its space.
+        app.apply(Update::Board(vec![board_row("a", BoardState::Review)]));
+        assert!(agent_rows_in_sidebar(&app).is_empty());
+        assert!(
+            app.rows.iter().any(|row| row.id() == Some("chat-a")),
+            "the session row outlives the attempt"
+        );
+        assert!(
+            !app.rows
+                .iter()
+                .any(|row| matches!(row, Row::Section { label, .. } if label == "Agents")),
+            "an empty Agents header is a permanent reminder of nothing"
+        );
+    }
+
+    /// An agent row and its session row address the same chat. The cursor has to
+    /// be able to tell them apart, or a rebuild slides it between the two lists.
+    #[test]
+    fn the_cursor_does_not_slide_between_an_agent_and_its_session_row() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        let mut live = board_row("a", BoardState::Working);
+        live.chat_id = Some("chat-a".into());
+        app.apply(Update::Board(vec![live.clone()]));
+
+        // Park on the session row, then let a board frame rebuild the sidebar.
+        app.cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Chat { id, .. } if id == "chat-a"))
+            .unwrap();
+        app.apply(Update::Board(vec![live]));
+        assert!(
+            matches!(app.rows.get(app.cursor), Some(Row::Chat { .. })),
+            "the cursor stayed in the Sessions list"
+        );
+
+        // And from the agent row, the same in reverse.
+        app.cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Agent { .. }))
+            .unwrap();
+        let mut again = board_row("a", BoardState::Blocked);
+        again.chat_id = Some("chat-a".into());
+        app.apply(Update::Board(vec![again]));
+        assert!(matches!(app.rows.get(app.cursor), Some(Row::Agent { .. })));
+    }
+
+    #[test]
+    fn opening_an_agent_row_opens_its_chat() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![
+            chat("chat-a", "s1", 1),
+            chat("chat-b", "s2", 2),
+        ]));
+        app.apply(Update::Spaces(vec![
+            space("s1", "/dev/one", 0),
+            space("s2", "/dev/two", 1),
+        ]));
+        let mut live = board_row("a", BoardState::Blocked);
+        live.chat_id = Some("chat-b".into());
+        app.apply(Update::Board(vec![live]));
+        app.selected_space = Some("s1".into());
+
+        app.cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Agent { .. }))
+            .unwrap();
+        let effects = app.act(Action::Open);
+        assert_eq!(app.selected_chat.as_deref(), Some("chat-b"));
+        // Answering a blocked agent means typing at it, so focus lands there.
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(
+            app.selected_space.as_deref(),
+            Some("s2"),
+            "opening an agent lands in the space its dispatch routed to"
+        );
+        assert!(effects.iter().any(|c| is_watch(c, Some("chat-b"))));
+    }
+
+    /// The counter has to move on its own: a blocked agent animates nothing, so
+    /// without this its age freezes at whatever the last frame caught.
+    #[test]
+    fn a_live_agent_row_owes_the_loop_a_second_by_second_redraw() {
+        let mut app = seeded();
+        app.apply(Update::Auth(Box::new(AuthState::SignedIn {
+            user: comet_proto::UserProfile {
+                id: "u".into(),
+                email: "b@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org".into()),
+        })));
+        app.connection = ConnectionStatus::Ready;
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        assert!(!app.counting(), "nothing running, no wake-ups owed");
+
+        let mut live = board_row("a", BoardState::Blocked);
+        live.chat_id = Some("chat-a".into());
+        live.started_at = Some(Utc::now().to_rfc3339());
+        app.apply(Update::Board(vec![live]));
+        assert!(!app.animating(), "a blocked agent spins nothing");
+        assert!(app.counting(), "but its age still has to move");
     }
 
     #[test]

@@ -63,12 +63,21 @@ pub enum Update {
         device: Option<String>,
         live: bool,
     },
+    /// Which chat the board has pinned as its orchestrator (gh#104), or `None`
+    /// for a board with no orchestrator. Rides the board host's sweep, so it is
+    /// always the pin of the board the pane is actually showing.
+    Orchestrator(Option<String>),
     /// The agent logins a pending dispatch could spend, answering
     /// [`Command::ListDispatchAccounts`]. Carries the task id so a reply that
     /// raced a newer pick is dropped rather than shown under the wrong row.
     DispatchAccounts {
         task_id: String,
         accounts: Vec<comet_proto::AgentAccount>,
+        /// The harness the row's runtime resolved to, when `ListBoardRuntimes`
+        /// answered. What lets the picker say whose subscription row 0 spends:
+        /// the box's own login is the *active* account for a harness, and
+        /// without one there is no reliable way to pick it out (gh#101).
+        harness: Option<comet_proto::HarnessId>,
     },
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
@@ -398,7 +407,7 @@ async fn session(
     let mut devices_seen: Vec<Device> = Vec::new();
     let mut board_host = board_pin.target();
     let mut board_delivered = false;
-    let mut board = open_board(client, board_host.as_deref()).await;
+    let (mut board, mut orchestrator) = open_board_pair(client, board_host.as_deref()).await;
     let mut board_retry: Option<tokio::time::Instant> = None;
     if updates
         .send(Update::BoardHostChanged {
@@ -488,10 +497,15 @@ async fn session(
                     board_host = board_pin.target();
                     board_delivered = false;
                     board_retry = None;
-                    board = open_board(client, board_host.as_deref()).await;
-                    // Another device is another board: clear the rows rather
-                    // than leave one box's tasks under the other's name.
+                    (board, orchestrator) = open_board_pair(client, board_host.as_deref()).await;
+                    // Another device is another board: clear the rows and the
+                    // pin rather than leave one box's tasks — and one box's
+                    // orchestrator glyph — under the other's name. The pin
+                    // especially: the new host answers with its own, or (no
+                    // board there) never answers at all, and a stale glyph
+                    // would then sit on a row nothing is delivered to.
                     if updates.send(Update::Board(Vec::new())).is_err()
+                        || updates.send(Update::Orchestrator(None)).is_err()
                         || updates
                             .send(Update::BoardHostChanged {
                                 device: board_host.clone(),
@@ -509,7 +523,7 @@ async fn session(
             _ = wait_until(board_retry) => {
                 board_retry = None;
                 board_delivered = false;
-                board = open_board(client, board_host.as_deref()).await;
+                (board, orchestrator) = open_board_pair(client, board_host.as_deref()).await;
             },
 
             frame = chats.recv() => match decode::<Vec<Chat>>(frame, "chats") {
@@ -567,6 +581,28 @@ async fn session(
                 }
             },
 
+            // The board's pinned orchestrator (gh#104). Additive: an engine too
+            // old to serve it never opened the stream, and this arm pends.
+            frame = recv_maybe(&mut orchestrator) => match frame {
+                Some(value) => {
+                    match serde_json::from_value::<board_view::OrchestratorPin>(value) {
+                        Ok(pin) => if updates.send(Update::Orchestrator(pin.chat_id)).is_err() {
+                            return SessionEnd::AppGone;
+                        },
+                        Err(err) => tracing::warn!(error = %err, "dropping malformed pin frame"),
+                    }
+                }
+                // Ended without the board's own stream ending — an engine that
+                // serves rows and not this. Nothing is pinned as far as this
+                // pane can tell, which is the honest thing to draw.
+                None => {
+                    orchestrator = None;
+                    if updates.send(Update::Orchestrator(None)).is_err() {
+                        return SessionEnd::AppGone;
+                    }
+                }
+            },
+
             // An absent board stream pends forever, so it never fires.
             frame = recv_maybe(&mut board) => match frame {
                 Some(value) => match decode::<Vec<TaskRow>>(Some(value), "board") {
@@ -594,6 +630,13 @@ async fn session(
                 // this arm) and decide where to look next.
                 None => {
                     board = None;
+                    // The pin belongs to the board that just went away. Keeping
+                    // the stream open would leave the sidebar drawing another
+                    // box's glyph the moment the sweep moves on.
+                    orchestrator = None;
+                    if updates.send(Update::Orchestrator(None)).is_err() {
+                        return SessionEnd::AppGone;
+                    }
                     let answered = board_delivered;
                     board_delivered = false;
                     // Only an unpinned host that said NOTHING is walked past: a
@@ -614,7 +657,8 @@ async fn session(
                         // finding the box take a visible age.
                         Some(Some(target)) => {
                             board_host = target;
-                            board = open_board(client, board_host.as_deref()).await;
+                            (board, orchestrator) =
+                                open_board_pair(client, board_host.as_deref()).await;
                         }
                         // Everyone was asked and nobody hosts a board: start the
                         // sweep over after the backoff, since the box may be
@@ -653,6 +697,35 @@ async fn open_board(
     client: &Arc<RpcClient>,
     target: Option<&str>,
 ) -> Option<mpsc::UnboundedReceiver<serde_json::Value>> {
+    subscribe_board(client, target, methods::WATCH_BOARD).await
+}
+
+/// The board's rows and its pinned orchestrator, opened at the same device
+/// (gh#104).
+///
+/// One helper so the two can never drift apart: the sweep decides which device
+/// hosts the board by whether its row stream answers, and a pin read from
+/// anywhere else would be some other box's. Both are best-effort — an older
+/// engine that does not serve the pin stream still serves rows, and the pane
+/// simply has no glyph to draw.
+async fn open_board_pair(
+    client: &Arc<RpcClient>,
+    target: Option<&str>,
+) -> (
+    Option<mpsc::UnboundedReceiver<serde_json::Value>>,
+    Option<mpsc::UnboundedReceiver<serde_json::Value>>,
+) {
+    (
+        open_board(client, target).await,
+        subscribe_board(client, target, methods::WATCH_BOARD_ORCHESTRATOR).await,
+    )
+}
+
+async fn subscribe_board(
+    client: &Arc<RpcClient>,
+    target: Option<&str>,
+    method: &'static str,
+) -> Option<mpsc::UnboundedReceiver<serde_json::Value>> {
     let mut params = serde_json::json!({});
     if let (Some(device), Some(object)) = (target, params.as_object_mut()) {
         object.insert(
@@ -660,10 +733,10 @@ async fn open_board(
             serde_json::Value::String(device.to_string()),
         );
     }
-    match client.subscribe(methods::WATCH_BOARD, params).await {
+    match client.subscribe(method, params).await {
         Ok(stream) => Some(stream),
         Err(err) => {
-            tracing::debug!(?target, error = %err, "WatchBoard unavailable");
+            tracing::debug!(?target, %method, error = %err, "board stream unavailable");
             None
         }
     }
@@ -1079,6 +1152,10 @@ fn spawn_dispatch_accounts(
                 .collect(),
             None => snapshot.accounts,
         };
-        let _ = updates.send(Update::DispatchAccounts { task_id, accounts });
+        let _ = updates.send(Update::DispatchAccounts {
+            task_id,
+            accounts,
+            harness,
+        });
     });
 }

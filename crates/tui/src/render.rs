@@ -403,6 +403,90 @@ fn draw_sidebar_row(
                 area,
             );
         }
+        // A live board attempt (gh#103): the same two-line shape as a session
+        // row, with the board's own state glyph and colours where the session
+        // dot would be — the row means the same thing here as in the board pane.
+        Row::Agent {
+            chat_id,
+            identifier,
+            branch,
+            state,
+            started_at,
+            cap_secs,
+        } => {
+            let base = if selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            if selected {
+                fill(frame, bleed, theme.selected());
+            }
+            let now = chrono::Utc::now();
+            let open = app.selected_chat.as_deref() == Some(chat_id.as_str());
+            // Working spins where the board pane can only draw a glyph: the
+            // sidebar redraws anyway, and a moving row is the cheapest way to
+            // say "still going" without reading the number.
+            let (glyph, glyph_style) = if *state == board::AgentState::Working {
+                let (glyph, tint) = loaders::mini_spinner(app.elapsed());
+                (glyph, base.patch(Style::default().fg(tint)))
+            } else {
+                (
+                    state.glyph().to_string(),
+                    base.patch(theme.agent_state(*state)),
+                )
+            };
+            let elapsed =
+                board::agent_elapsed_label(*started_at, *cap_secs, now).unwrap_or_default();
+            let elapsed_width = wrap::width_of(&elapsed);
+            let title_width = width.saturating_sub(3 + elapsed_width).max(1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(glyph, glyph_style),
+                    Span::styled(
+                        format!(" {}", wrap::truncate(identifier, title_width)),
+                        base.patch(if open { theme.body() } else { theme.subtle() }),
+                    ),
+                ])),
+                Rect { height: 1, ..area },
+            );
+            if elapsed_width > 0 && (elapsed_width as u16) < area.width {
+                // Past its cap the counter is the warning: gh#70's clock will
+                // interrupt this agent, and the number is why.
+                let style = if board::agent_over_cap(*started_at, *cap_secs, now) {
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    theme.hint()
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(elapsed, base.patch(style))),
+                    Rect {
+                        x: area.x + area.width - elapsed_width as u16,
+                        width: elapsed_width as u16,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+            if area.height > 1 {
+                // The branch, aligned under the identifier the way a session
+                // row's location hangs under its title.
+                let sub = branch.clone().unwrap_or_else(|| state.label().to_string());
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("  {}", wrap::truncate(&sub, width.saturating_sub(2))),
+                        base.patch(theme.hint()),
+                    )),
+                    Rect {
+                        y: area.y + 1,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+        }
         Row::Chat {
             id,
             title,
@@ -410,6 +494,7 @@ fn draw_sidebar_row(
             indicator,
             archived,
             activity,
+            orchestrator,
             ..
         } => {
             let base = if selected {
@@ -422,14 +507,25 @@ fn draw_sidebar_row(
             }
             let open = app.selected_chat.as_deref() == Some(id.as_str());
             let when = app.relative_time(*activity);
-            // dot(1) + gap(1) + a column of air + the time column.
-            let title_width = width.saturating_sub(3 + wrap::width_of(&when)).max(1);
+            // The orchestrator's mark sits between the status dot and the
+            // title: the dot still says what the agent is doing, and the mark
+            // says which agent this is (gh#104).
+            let mark = if *orchestrator {
+                format!(" {}", board::ORCHESTRATOR_GLYPH)
+            } else {
+                String::new()
+            };
+            // dot(1) + gap(1) + a column of air + the time column, less the mark.
+            let title_width = width
+                .saturating_sub(3 + wrap::width_of(&when) + wrap::width_of(&mark))
+                .max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     {
                         let (glyph, style) = status_dot(*indicator, app, theme, base);
                         Span::styled(glyph, style)
                     },
+                    Span::styled(mark, base.patch(theme.orchestrator())),
                     Span::styled(
                         format!(" {}", wrap::truncate(title, title_width)),
                         base.patch(if open { theme.body() } else { theme.subtle() }),
@@ -1736,6 +1832,7 @@ fn draw_overlay(
                     theme,
                     &item.label,
                     None,
+                    false,
                     0,
                     index == *active,
                 );
@@ -1746,7 +1843,7 @@ fn draw_overlay(
 
         Overlay::Refs { active } => {
             let refs = app_refs(app);
-            let rows: Vec<(String, Option<String>)> = match &refs {
+            let rows: Vec<CardRow> = match &refs {
                 Some(list) if !list.is_empty() => list
                     .iter()
                     .map(|candidate| {
@@ -1758,14 +1855,14 @@ fn draw_overlay(
                         if candidate.worktree_path.is_some() {
                             tags.push("worktree");
                         }
-                        (
+                        CardRow::new(
                             candidate.name.clone(),
                             (!tags.is_empty()).then(|| tags.join(" · ")),
                         )
                     })
                     .collect(),
-                Some(_) => vec![("Not a git checkout".into(), None)],
-                None => vec![("Loading…".into(), None)],
+                Some(_) => vec![CardRow::new("Not a git checkout", None)],
+                None => vec![CardRow::new("Loading…", None)],
             };
             list_card(frame, body, theme, "Branch", &rows, refs.is_some(), *active)
         }
@@ -1782,12 +1879,12 @@ fn draw_overlay(
                 picked.as_ref(),
             );
             let rows = vec![
-                (
+                CardRow::new(
                     local.to_string(),
                     Some("run where the space already points".into()),
                 ),
-                (
-                    "New worktree".to_string(),
+                CardRow::new(
+                    "New worktree",
                     Some("isolated checkout off the picked ref".into()),
                 ),
             ];
@@ -1795,21 +1892,21 @@ fn draw_overlay(
         }
 
         Overlay::Reasoning { levels, active } => {
-            let rows: Vec<(String, Option<String>)> = levels
+            let rows: Vec<CardRow> = levels
                 .iter()
-                .map(|level| (crate::app::reasoning_label(*level).to_string(), None))
+                .map(|level| CardRow::new(crate::app::reasoning_label(*level), None))
                 .collect();
             list_card(frame, body, theme, "Effort", &rows, true, *active)
         }
 
         Overlay::Models { models, active } => {
-            let rows: Vec<(String, Option<String>)> = match models {
+            let rows: Vec<CardRow> = match models {
                 Some(list) if !list.is_empty() => list
                     .iter()
-                    .map(|model| (model.label.clone(), model.description.clone()))
+                    .map(|model| CardRow::new(model.label.clone(), model.description.clone()))
                     .collect(),
-                Some(_) => vec![("No models for this harness".into(), None)],
-                None => vec![("Loading…".into(), None)],
+                Some(_) => vec![CardRow::new("No models for this harness", None)],
+                None => vec![CardRow::new("Loading…", None)],
             };
             // Same panel as every other picker — a model list is a list.
             list_card(
@@ -1827,34 +1924,50 @@ fn draw_overlay(
             identifier,
             accounts,
             route_account,
+            harness,
             active,
             ..
         } => {
+            // Whose subscription each row spends, against whoever is signed in
+            // here (gh#101). A row that charges somebody else says so in the
+            // warning tone instead of its plan label — including row 0, which
+            // is precisely the one an enter-enter release lands on without
+            // anybody choosing it.
+            let me = app.auth_user().map(|user| user.email.clone());
+            let bills = |slot: Option<&str>| -> Option<String> {
+                let (accounts, harness) = (accounts.as_deref()?, (*harness)?);
+                let billed = board::billed_email(accounts, harness, slot)?;
+                board::cross_billed(Some(billed), me.as_deref()).then(|| board::bills_label(billed))
+            };
             // Row 0 is the route's own account — no override, which is what
             // enter alone did before this picker existed. It names the account
             // when the row knows one, so "default" is a fact rather than a
             // shrug.
-            let default = (
-                "Route default".to_string(),
-                Some(match route_account.as_deref() {
-                    Some(account) => account.to_string(),
-                    None => "the box's own login".to_string(),
-                }),
-            );
-            let rows: Vec<(String, Option<String>)> = match accounts {
+            let default = match bills(route_account.as_deref()) {
+                Some(warning) => CardRow::warning("Route default", warning),
+                None => CardRow::new(
+                    "Route default",
+                    Some(match route_account.as_deref() {
+                        Some(account) => account.to_string(),
+                        None => "the box's own login".to_string(),
+                    }),
+                ),
+            };
+            let rows: Vec<CardRow> = match accounts {
                 Some(list) => std::iter::once(default)
                     .chain(list.iter().map(|account| {
-                        (
-                            account
-                                .email
-                                .clone()
-                                .or_else(|| account.display_name.clone())
-                                .unwrap_or_else(|| account.id.clone()),
-                            account.plan_label.clone(),
-                        )
+                        let label = account
+                            .email
+                            .clone()
+                            .or_else(|| account.display_name.clone())
+                            .unwrap_or_else(|| account.id.clone());
+                        match bills(Some(&account.id)) {
+                            Some(warning) => CardRow::warning(label, warning),
+                            None => CardRow::new(label, account.plan_label.clone()),
+                        }
                     }))
                     .collect(),
-                None => vec![("Loading…".into(), None)],
+                None => vec![CardRow::new("Loading…", None)],
             };
             list_card(
                 frame,
@@ -1908,6 +2021,38 @@ fn app_refs(app: &App) -> Option<Vec<comet_proto::RepoRef>> {
     app.draft.as_ref().and_then(|draft| draft.refs.clone())
 }
 
+/// One row of a floating list panel.
+///
+/// A struct rather than the `(label, detail)` pair it grew from, because a
+/// third thing turned out to matter: whether the detail is a *note* about the
+/// row or a *warning* about what picking it does. "bills brede@tally.no" in the
+/// same muted grey as "current" or a model description is a sentence nobody
+/// reads (gh#101).
+struct CardRow {
+    label: String,
+    detail: Option<String>,
+    warn: bool,
+}
+
+impl CardRow {
+    fn new(label: impl Into<String>, detail: Option<String>) -> CardRow {
+        CardRow {
+            label: label.into(),
+            detail,
+            warn: false,
+        }
+    }
+
+    /// A row whose detail is not a note but a consequence of picking it.
+    fn warning(label: impl Into<String>, detail: impl Into<String>) -> CardRow {
+        CardRow {
+            label: label.into(),
+            detail: Some(detail.into()),
+            warn: true,
+        }
+    }
+}
+
 /// A centred list panel: label plus a muted trailing detail per row.
 /// `selectable` is false while a list is still loading, so nothing highlights.
 fn list_card(
@@ -1915,7 +2060,7 @@ fn list_card(
     body: Rect,
     theme: &Theme,
     title: &str,
-    rows: &[(String, Option<String>)],
+    rows: &[CardRow],
     selectable: bool,
     active: usize,
 ) -> Rect {
@@ -1929,13 +2074,13 @@ fn list_card(
     // Capped at half the card, or one long label would push every detail off.
     let detail_col = rows
         .iter()
-        .filter(|(_, detail)| detail.is_some())
-        .map(|(label, _)| wrap::width_of(label) + 2)
+        .filter(|row| row.detail.is_some())
+        .map(|row| wrap::width_of(&row.label) + 2)
         .max()
         .unwrap_or(0)
         .min(width as usize / 2);
 
-    for (index, (label, detail)) in rows.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
         let y = inner.y + index as u16;
         if y >= inner.bottom() {
             break;
@@ -1948,8 +2093,9 @@ fn list_card(
                 ..inner
             },
             theme,
-            label,
-            detail.as_deref(),
+            &row.label,
+            row.detail.as_deref(),
+            row.warn,
             detail_col,
             selectable && index == active,
         );
@@ -1965,6 +2111,9 @@ fn draw_panel_row(
     theme: &Theme,
     label: &str,
     detail: Option<&str>,
+    // Draw the detail in the warning tone rather than the muted one — it is a
+    // consequence of picking the row, not a note about it (gh#101).
+    warn: bool,
     detail_col: usize,
     selected: bool,
 ) {
@@ -1997,7 +2146,11 @@ fn draw_panel_row(
         if room > 4 {
             spans.push(Span::styled(
                 format!("{}{}", " ".repeat(gap), wrap::truncate(detail, room)),
-                base.patch(Style::default().fg(theme.faint)),
+                base.patch(Style::default().fg(if warn {
+                    theme.warning
+                } else {
+                    theme.faint
+                })),
             ));
         }
     }

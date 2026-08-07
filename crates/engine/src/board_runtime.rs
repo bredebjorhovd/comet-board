@@ -270,6 +270,21 @@ impl Runtime for CometRuntime {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    /// Whose subscription a dispatch would spend (gh#101) — the slot's login,
+    /// or this device's own when the dispatch names no slot.
+    ///
+    /// Infallible in practice: an unsaved slot, an unreadable config file and a
+    /// harness with no account concept all answer `None`, which is the guard's
+    /// "I cannot say" and never an accusation. The `Result` is the trait's, so
+    /// a future runtime that really can fail has somewhere to say so.
+    fn account_email(
+        &self,
+        harness: comet_proto::HarnessId,
+        account: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self.accounts.billed_email(harness, account))
+    }
+
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>> {
         // The journal's last event is a `Done` exactly when no run is live in
         // the chat — every teardown path writes one (including boot recovery,

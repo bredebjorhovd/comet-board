@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -29,6 +30,7 @@ use serde::de::DeserializeOwned;
 
 use comet_doc::SessionMessageEntry;
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
+use comet_proto::view::board::{self as board_view, OrchestratorPin};
 use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -369,6 +371,11 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// The chat the board has pinned as its orchestrator (gh#104). `None` = no
+    /// pin, or no board this app can reach. Held on the app state rather than
+    /// on the board panel because it marks a row in the session list, which is
+    /// on screen whether or not the board is open.
+    pub orchestrator: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<comet_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
@@ -399,6 +406,7 @@ impl AppState {
             transcript: Vec::new(),
             echoes: HashMap::new(),
             local_device_id: None,
+            orchestrator: None,
             update: None,
             data_dir: None,
             engine: None,
@@ -593,7 +601,22 @@ impl AppState {
             .map(|c| (display_status(c, self.session_for(&c.id), now), c))
             .collect();
         sort_active(&mut rows);
+        // The orchestrator is pinned in the literal sense (gh#104): every other
+        // row's position is recency, and this one's position is the
+        // designation — a board's driver that slid down the list whenever two
+        // children spoke would stop being the thing you talk to.
+        if let Some(pinned) = self.orchestrator.as_deref()
+            && let Some(at) = rows.iter().position(|(_, c)| c.id == pinned)
+        {
+            let row = rows.remove(at);
+            rows.insert(0, row);
+        }
         rows
+    }
+
+    /// Is this the chat the board has pinned as its orchestrator?
+    pub fn is_orchestrator(&self, chat_id: &str) -> bool {
+        self.orchestrator.as_deref() == Some(chat_id)
     }
 
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
@@ -690,6 +713,7 @@ impl AppState {
                 methods::UPDATE_STATUS,
                 AppState::apply_update,
             ),
+            spawn_orchestrator_watch(cx, handle.clone()),
             spawn_local_device_probe(cx, handle.clone()),
         ];
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
@@ -850,6 +874,98 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
             if alive.is_err() {
                 break;
             }
+        }
+    })
+}
+
+/// How long before a device that hosts no board is asked again for its pin.
+/// The same 2s the board panel's sweep uses: a device with no board costs one
+/// refused subscribe, and a box still booting is picked up while you look.
+const ORCHESTRATOR_RETRY: Duration = Duration::from_secs(2);
+
+/// Watch which chat the board has pinned as its orchestrator (gh#104), sweeping
+/// devices the way the board panel does until one answers.
+///
+/// Its own sweep rather than the board panel's, because the audiences differ:
+/// the panel's watch starts when the panel is opened, and the pin marks a row
+/// in the session list, which is on screen from the first frame. Sharing the
+/// panel's stream would mean no glyph until somebody pressed the board button.
+///
+/// Best-effort throughout. A device that hosts no board refuses the subscribe,
+/// which is the answer; an engine too old to serve the method looks the same;
+/// and either way the list simply has no pinned row, which is also what an
+/// unpinned board looks like.
+fn spawn_orchestrator_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let mut host: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({});
+            if let (Some(device), Some(object)) = (host.as_deref(), params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), serde_json::json!(device));
+            }
+            let mut delivered = false;
+            if let Ok(mut rx) = handle
+                .client()
+                .subscribe(methods::WATCH_BOARD_ORCHESTRATOR, params)
+                .await
+            {
+                while let Some(value) = rx.recv().await {
+                    delivered = true;
+                    let pin: OrchestratorPin = match serde_json::from_value(value) {
+                        Ok(pin) => pin,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "dropping malformed pin frame");
+                            continue;
+                        }
+                    };
+                    if this
+                        .update(cx, |state, cx| {
+                            state.orchestrator = pin.chat_id;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            // The pin belonged to a board this app can no longer see. Clearing
+            // it beats leaving a glyph on a row nothing is delivered to.
+            if this
+                .update(cx, |state, cx| {
+                    if state.orchestrator.take().is_some() {
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                return;
+            }
+            // A device that answered does host the board; stay on it and wait
+            // out the blip. One that said nothing is walked past.
+            if !delivered {
+                let Ok(next) = this.update(cx, |state, _| {
+                    let candidates = board_view::host_candidates(
+                        &state.devices,
+                        state.local_device_id.as_deref(),
+                    );
+                    board_view::next_host_candidate(&candidates, host.as_deref())
+                }) else {
+                    return;
+                };
+                match next {
+                    // Ask the next device at once — a backoff per device would
+                    // make finding the box take a visible age.
+                    Some(target) => {
+                        host = target;
+                        continue;
+                    }
+                    // Everybody has been asked. Start over after the backoff:
+                    // the box may still be booting.
+                    None => host = None,
+                }
+            }
+            cx.background_executor().timer(ORCHESTRATOR_RETRY).await;
         }
     })
 }
@@ -1366,6 +1482,44 @@ mod tests {
             .map(|(_, c)| c.id.as_str())
             .collect();
         assert_eq!(overview, ["old", "new"]);
+    }
+
+    /// gh#104: every other row's position is attention-and-recency; the
+    /// orchestrator's position *is* the designation. A board's driver that slid
+    /// down the list whenever two children spoke would stop being the thing you
+    /// talk to.
+    #[test]
+    fn the_pinned_orchestrator_leads_the_overview() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
+        let mut boss = chat("boss", 1, None);
+        boss.space_id = Some("s1".into());
+        let mut recent = chat("recent", 9, None);
+        recent.space_id = Some("s1".into());
+        state.apply_chats(vec![boss, recent]);
+        let now = Utc::now();
+        let ids = |state: &AppState| -> Vec<String> {
+            state
+                .overview_chats(now)
+                .iter()
+                .map(|(_, c)| c.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&state), ["recent", "boss"]);
+
+        state.orchestrator = Some("boss".into());
+        assert_eq!(ids(&state), ["boss", "recent"]);
+        assert!(state.is_orchestrator("boss"));
+        assert!(!state.is_orchestrator("recent"));
+
+        // A stale pin — the chat was archived, or the id in `routing.toml` is
+        // from a chat that is gone — reorders nothing and invents nothing.
+        state.orchestrator = Some("nobody".into());
+        assert_eq!(ids(&state), ["recent", "boss"]);
+
+        // And unpinning hands the list straight back to recency.
+        state.orchestrator = None;
+        assert_eq!(ids(&state), ["recent", "boss"]);
     }
 
     #[test]
