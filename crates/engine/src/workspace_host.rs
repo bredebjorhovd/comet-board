@@ -617,8 +617,13 @@ impl WorkspaceHost {
     /// The chat's configured harness/model row, when present (RunRequest harness
     /// selection; callers fall back to the engine default).
     pub fn chat_config(&self, chat_id: &str) -> Option<ChatConfig> {
+        self.chat(chat_id).and_then(|c| c.config)
+    }
+
+    /// The whole chat row, when the workspace doc has one.
+    pub fn chat(&self, chat_id: &str) -> Option<comet_proto::Chat> {
         match self.inner.doc.chat(chat_id) {
-            Ok(chat) => chat.and_then(|c| c.config),
+            Ok(chat) => chat,
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
                 None

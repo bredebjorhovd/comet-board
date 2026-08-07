@@ -13,6 +13,11 @@ enum RowKind {
     case user(text: String)
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
+    /// A skill invocation — a landmark, never a row inside a tool group
+    /// (gh#134). Scrolling back through a long session, "which playbook did it
+    /// follow" is the question being asked, and a chip folded into "Ran 3
+    /// commands · read 2 files" cannot answer it.
+    case skillChip(name: String, args: String?, isError: Bool, resolved: Bool)
     case inputChip(header: String, resolved: Bool)
     case errorChip(message: String)
 }
@@ -140,6 +145,25 @@ enum TranscriptRowBuilder {
 
         for (ix, part) in entry.parts.enumerated() {
             switch part {
+            case .tool(let partId, let call, let isError, let resolved) where call.tag == "skill":
+                // A skill breaks the group it would otherwise have joined, so
+                // the tools it goes on to run read as its work rather than as
+                // more of the previous run's (gh#134).
+                flushTools(lastIx: ix - 1)
+                let name = call.string("name") ?? ""
+                let args = call.string("args").flatMap { $0.isEmpty ? nil : $0 }
+                var version = fnv1a(name + "\u{0}" + (args ?? "")) << 2
+                if isError { version ^= 2 }
+                if resolved { version ^= 1 }
+                rows.append(TranscriptRow(id: "\(entry.id)#\(partId)",
+                                          version: version,
+                                          turnStart: first,
+                                          kind: .skillChip(name: name, args: args,
+                                                           isError: isError,
+                                                           resolved: resolved),
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
+                first = false
+
             case .tool(_, let call, let isError, let resolved):
                 pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved))
                 if ix == lastPartIx { flushTools(lastIx: ix) }
@@ -260,6 +284,9 @@ extension RenderToolCall {
         case "webSearch": return "Web"
         case "todo": return "Todo"
         case "mcp": return "MCP"
+        // Only reachable if a skill ever ends up inside a group; the row
+        // builder breaks it out into a landmark of its own (gh#134).
+        case "skill": return "Skill"
         default: return "Tool"
         }
     }
@@ -280,6 +307,10 @@ extension RenderToolCall {
         case "mcp":
             let server = string("server").map { "\($0) · " } ?? ""
             return server + (string("tool") ?? "")
+        case "skill":
+            let name = "/" + (string("name") ?? "")
+            guard let args = string("args"), !args.isEmpty else { return name }
+            return name + " " + args
         default: return string("name") ?? ""
         }
     }
@@ -294,6 +325,7 @@ extension RenderToolCall {
         case "glob": return "folder"
         case "webFetch", "webSearch": return "globe"
         case "todo": return "checklist"
+        case "skill": return "wand.and.stars"
         default: return "square.grid.2x2"
         }
     }

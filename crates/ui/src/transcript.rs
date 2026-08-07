@@ -223,6 +223,17 @@ pub enum RowKind {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
     },
+    /// A skill invocation — a landmark, never a row inside a tool group
+    /// (gh#134). Scrolling back through a long session, "which playbook did it
+    /// follow" is the question being asked, and a chip folded into "Ran 3
+    /// commands · read 2 files" cannot answer it.
+    SkillChip {
+        name: SharedString,
+        args: Option<SharedString>,
+        is_error: bool,
+        /// False while the skill's own turn is still running.
+        resolved: bool,
+    },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
         /// chip shows it; unresolved shows "Awaiting your answer…" — which
@@ -364,6 +375,48 @@ pub fn rows_for_entry(
 
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
+            // A skill breaks the group it would otherwise have joined: it is a
+            // landmark, and a landmark folded under "Ran 3 commands" is not one.
+            // Splitting here also puts the tools it ran AFTER it into a group of
+            // their own, which is the reading you want — the invocation, then
+            // what it did.
+            MessagePart::Tool {
+                id: part_id,
+                call: call @ ToolCall::Skill { .. },
+                is_error,
+                resolved,
+            } => {
+                flush_group(
+                    &mut rows,
+                    &mut pending_group,
+                    &mut group_ix,
+                    group_last_part_ix,
+                );
+                let (_, detail) = tool_chip_content(call);
+                let ToolCall::Skill { name, args } = call else {
+                    unreachable!("matched above")
+                };
+                let args: Option<SharedString> = args
+                    .as_deref()
+                    .map(single_line)
+                    .filter(|a| !a.trim().is_empty())
+                    .map(SharedString::from);
+                rows.push(Row {
+                    id: format!("{}#{}", entry.id, part_id).into(),
+                    version: fnv1a(detail.as_bytes()) << 2
+                        | (*is_error as u64) << 1
+                        | *resolved as u64,
+                    turn_start: false,
+                    kind: RowKind::SkillChip {
+                        name: name.clone().into(),
+                        args,
+                        is_error: *is_error,
+                        resolved: *resolved,
+                    },
+                    entry_id: entry_id.clone(),
+                    timestamp: None,
+                });
+            }
             MessagePart::Tool {
                 call,
                 is_error,
@@ -1671,6 +1724,12 @@ impl Transcript {
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
             }
+            RowKind::SkillChip {
+                name,
+                args,
+                is_error,
+                resolved,
+            } => skill_chip(name.clone(), args.clone(), *is_error, *resolved, &theme),
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
@@ -2057,6 +2116,93 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
+/// The skill-invocation landmark (gh#134).
+///
+/// Deliberately unlike [`tool_chip`] in every dimension a glance registers: it
+/// keeps the accent, it is taller, its name is 13px medium in full-strength
+/// text where a tool chip's label is 12px muted, and it carries no guide rail —
+/// nothing threads it to a group, because it belongs to none. That is the whole
+/// feature: scrolling a session at speed, the accent-tinted blocks are where
+/// the agent picked up a playbook.
+fn skill_chip(
+    name: SharedString,
+    args: Option<SharedString>,
+    is_error: bool,
+    resolved: bool,
+    theme: &Theme,
+) -> AnyElement {
+    let tint = if is_error { theme.danger } else { theme.accent };
+    div()
+        .py(px(4.0))
+        .w_full()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .overflow_hidden()
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(tint.opacity(0.22))
+                .bg(tint.opacity(0.06))
+                .px(px(10.0))
+                .py(px(8.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(22.0))
+                        .rounded(px(7.0))
+                        .bg(tint.opacity(0.14))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::MAGIC_STICK)
+                                .size(px(14.0))
+                                .text_color(tint),
+                        ),
+                )
+                .child(
+                    // The name leads with its slash, because `/comet-board` is
+                    // what both the operator and the agent call it.
+                    div()
+                        .flex_none()
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if is_error { theme.danger } else { theme.text })
+                        .child(SharedString::from(format!("/{name}"))),
+                )
+                .when_some(args, |el, args| {
+                    el.child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(args),
+                    )
+                })
+                // Still running: the same "Skill" tag the label slot carries
+                // everywhere else, so an unresolved invocation is not a silent
+                // one. Resolution removes it rather than recoloring anything —
+                // a landmark that changed color on completion would read as a
+                // status, which it is not.
+                .when(!resolved && !is_error, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .ml_auto()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .child(SharedString::from("running…")),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
 /// A small glyph standing in for the tool's icon (comet uses an icon set; a
 /// quiet monochrome character keeps the tile without shipping SVGs).
 /// The glyph for a tool call (comet tool-chip.tsx `toolIcon`, Solar set).
@@ -2070,6 +2216,9 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
+        // Only reachable if a skill ever ends up inside a group; `rows_for_entry`
+        // breaks it out into a landmark of its own (gh#134).
+        ToolCall::Skill { .. } => crate::icons::MAGIC_STICK,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -2545,6 +2694,65 @@ mod tests {
         assert_eq!(top_gap_for(Some(&rows[3]), &rows[4]), GAP_BLOCK);
         // Turn starts get the turn gap regardless.
         assert_eq!(top_gap_for(None, &rows[0]), GAP_TURN);
+    }
+
+    #[test]
+    fn a_skill_gets_a_row_of_its_own_and_breaks_the_group_around_it() {
+        let skill_part = |id: &str, args: Option<&str>, resolved: bool| MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Skill {
+                name: "comet-board".into(),
+                args: args.map(str::to_owned),
+            },
+            is_error: false,
+            resolved,
+        };
+        let entry = assistant(
+            "m3",
+            MessageStatus::Complete,
+            vec![
+                tool_part("a", "ls"),
+                skill_part("s", Some("list --state ready"), true),
+                tool_part("b", "pwd"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            ["m3#g0", "m3#s", "m3#g1"],
+            "the tools it ran are its work, not more of the previous group's"
+        );
+        match &rows[1].kind {
+            RowKind::SkillChip {
+                name,
+                args,
+                resolved,
+                is_error,
+            } => {
+                assert_eq!(name.as_ref(), "comet-board");
+                assert_eq!(args.as_deref(), Some("list --state ready"));
+                assert!(*resolved && !*is_error);
+            }
+            _ => panic!("expected a skill landmark at {}", rows[1].id),
+        }
+
+        // Resolution is a rendering change with no length change — the row
+        // version has to notice, or the chip never stops saying "running…".
+        let pending = assistant(
+            "m3",
+            MessageStatus::Streaming,
+            vec![skill_part("s", Some("list --state ready"), false)],
+        );
+        let done = assistant(
+            "m3",
+            MessageStatus::Streaming,
+            vec![skill_part("s", Some("list --state ready"), true)],
+        );
+        let before = rows_for_entry(&pending, false, &mut parse);
+        let after = rows_for_entry(&done, false, &mut parse);
+        assert_eq!(before[0].id, after[0].id);
+        assert_ne!(before[0].version, after[0].version);
     }
 
     #[test]

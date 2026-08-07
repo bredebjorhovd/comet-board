@@ -27,6 +27,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+pub mod skills;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;

@@ -193,6 +193,18 @@ change it. An account that will not resolve **refuses** the dispatch before the
 chat exists, and refuses a later run rather than falling back — a silent
 fallback bills whoever the device's own login belongs to.
 
+One consequence the composer's `/` picker (gh#134) now makes visible: a slot
+IS the run's `CLAUDE_CONFIG_DIR`, so what a dispatched agent can invoke is what
+`{data_dir}/accounts/{slotId}/skills/` holds — the board's own skill that
+`materialize` stamps there (gh#133) and nothing else — plus whatever its
+checkout ships in `.claude/`. The user-level `~/.claude/skills` the operator
+sees in their own sessions is invisible from inside a slot.
+
+The picker reports that rather than offering the box user's list: offering a
+list the run cannot invoke is worse than a short one. So a skill an agent is
+*meant* to have belongs in the repo, or is installed the way the board's own is
+— written into every slot on every dispatch, byte-compared, never fatal.
+
 Deliberately not in v1, and still not: inferring an account from the WorkOS user
 who dispatched. §H12 now records who released the work by name as well as by
 chat, and that changes nothing here — guessing a login from either is the kind

@@ -67,9 +67,63 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Text between `<tag>` and `</tag>`, trimmed; `None` when the tag is absent.
+fn tagged(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim().to_string())
+}
+
+/// The skill invocation an expanded slash command carries, if this text is one.
+///
+/// The CLI rewrites a `/name args` turn into `<command-name>` /
+/// `<command-args>` markup before the model ever sees it, so the invocation is
+/// legible on the stream without parsing the user's prose. Tolerant by
+/// construction: anything that is not that markup returns `None` and the text
+/// is left alone.
+pub(crate) fn decode_command_markup(text: &str) -> Option<ToolCall> {
+    let name = tagged(text, "command-name")?;
+    let name = name.trim_start_matches('/').trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = tagged(text, "command-args").filter(|a| !a.is_empty());
+    Some(ToolCall::Skill { name, args })
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
+        // The Skill tool: `{skill, args}` in the CLI's own shape, with the
+        // older `command`/`name` spellings accepted so a version skew costs a
+        // plainer chip rather than an anonymous `Tool  Skill` row.
+        "Skill" | "SlashCommand" => {
+            let name = ["skill", "command", "name"]
+                .into_iter()
+                .find_map(|key| input.get(key).and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .trim()
+                .to_string();
+            let args = ["args", "arguments"]
+                .into_iter()
+                .find_map(|key| input.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::to_owned);
+            // A Skill call that names no skill is not a landmark — it is a
+            // malformed tool call, and pretending otherwise would put a
+            // nameless chip in the transcript.
+            if name.is_empty() {
+                return ToolCall::Unknown {
+                    name: "Skill".into(),
+                    input: (!input.is_null()).then(|| input.clone()),
+                };
+            }
+            ToolCall::Skill { name, args }
+        }
         "Bash" => ToolCall::Exec {
             command: str_field(input, "command"),
         },
@@ -145,6 +199,10 @@ pub(crate) struct Normalizer {
     assistant_message_id: String,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
+    /// Counter behind the synthetic ids expanded slash commands get. Monotonic
+    /// per run rather than random so a replayed stream folds to the same parts
+    /// (`fold_event_into_parts` keys tool parts on the id).
+    commands_seen: u64,
 }
 
 impl Normalizer {
@@ -153,7 +211,13 @@ impl Normalizer {
             saw_init: false,
             assistant_message_id: new_message_id(),
             session_id: None,
+            commands_seen: 0,
         }
+    }
+
+    fn next_command_id(&mut self) -> String {
+        self.commands_seen += 1;
+        format!("cmd-{}", self.commands_seen)
     }
 
     /// Rotate the assistant message id for a steer boundary; returns
@@ -245,14 +309,35 @@ impl Normalizer {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
                 }
-                f.message
-                    .blocks()
-                    .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .map(|b| AgentEvent::ToolResult {
-                        id: b.tool_use_id.clone(),
-                        is_error: b.is_error.unwrap_or(false),
-                    })
-                    .collect()
+                let mut out: Vec<AgentEvent> = Vec::new();
+                for block in f.message.blocks() {
+                    match block.kind.as_str() {
+                        "tool_result" => out.push(AgentEvent::ToolResult {
+                            id: block.tool_use_id.clone(),
+                            is_error: block.is_error.unwrap_or(false),
+                        }),
+                        // A slash command the CLI expanded on its way in. It
+                        // is an invocation with no tool_use id and no result
+                        // of its own, so it gets a synthetic id and is
+                        // resolved on the spot — an eternally-pending chip
+                        // would read as a skill that never returned.
+                        "text" => {
+                            if let Some(call) = decode_command_markup(&block.text) {
+                                let id = self.next_command_id();
+                                out.push(AgentEvent::ToolCall {
+                                    id: id.clone(),
+                                    call,
+                                });
+                                out.push(AgentEvent::ToolResult {
+                                    id,
+                                    is_error: false,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out
             }
 
             // A claude.ai plan window was hit. A hard `rejected` blocks the
@@ -396,6 +481,98 @@ mod tests {
             decode_tool_use("Mystery", &json!({})),
             ToolCall::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn skill_calls_decode_to_a_named_landmark() {
+        assert_eq!(
+            decode_tool_use("Skill", &json!({"skill": "comet-board", "args": "list"})),
+            ToolCall::Skill {
+                name: "comet-board".into(),
+                args: Some("list".into())
+            }
+        );
+        // A leading slash is how a human writes it; the wire form has none.
+        assert_eq!(
+            decode_tool_use("SlashCommand", &json!({"command": "/comet-board"})),
+            ToolCall::Skill {
+                name: "comet-board".into(),
+                args: None
+            }
+        );
+        // Blank args are no args — the chip must not read `/comet-board  `.
+        assert_eq!(
+            decode_tool_use("Skill", &json!({"skill": "debug", "args": "   "})),
+            ToolCall::Skill {
+                name: "debug".into(),
+                args: None
+            }
+        );
+        // Nameless: stays an unknown tool rather than becoming a blank chip.
+        assert!(matches!(
+            decode_tool_use("Skill", &json!({"args": "x"})),
+            ToolCall::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn expanded_slash_commands_become_resolved_invocations() {
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-message>comet-board is running…</command-message>\n<command-name>/comet-board</command-name>\n<command-args>list --state ready</command-args>"}]}}"#,
+        )
+        .expect("frame parses");
+        let events = Normalizer::new().normalize(frame, false);
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ToolCall {
+                    id: "cmd-1".into(),
+                    call: ToolCall::Skill {
+                        name: "comet-board".into(),
+                        args: Some("list --state ready".into())
+                    }
+                },
+                // Resolved immediately: the markup is the whole record of the
+                // invocation, so there is no later result to wait for.
+                AgentEvent::ToolResult {
+                    id: "cmd-1".into(),
+                    is_error: false
+                },
+            ]
+        );
+
+        // Ordinary user prose is left entirely alone.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"look at src/main.rs"}]}}"#,
+        )
+        .expect("frame parses");
+        assert!(Normalizer::new().normalize(frame, false).is_empty());
+    }
+
+    #[test]
+    fn command_markup_parses_tolerantly() {
+        // Args are optional.
+        assert_eq!(
+            decode_command_markup("<command-name>/debug</command-name>"),
+            Some(ToolCall::Skill {
+                name: "debug".into(),
+                args: None
+            })
+        );
+        // Empty args read as none.
+        assert_eq!(
+            decode_command_markup(
+                "<command-name>debug</command-name><command-args></command-args>"
+            ),
+            Some(ToolCall::Skill {
+                name: "debug".into(),
+                args: None
+            })
+        );
+        // Anything that is not the markup is not an invocation.
+        assert_eq!(decode_command_markup("just some prose"), None);
+        assert_eq!(decode_command_markup("<command-name></command-name>"), None);
+        assert_eq!(decode_command_markup("<command-name>/debug"), None);
     }
 
     fn result_done(raw: &str) -> AgentEvent {

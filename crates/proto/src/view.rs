@@ -19,6 +19,7 @@ use crate::{AuthState, Chat, ChatIndicator, EdgeHealth, Session, SessionStatus, 
 pub mod board;
 pub mod needs;
 pub mod repos;
+pub mod skills;
 pub mod spaces;
 
 // ---------------------------------------------------------------------------
@@ -421,6 +422,17 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             ("Todo", format!("{done}/{} done", items.len()))
         }
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
+        // The name leads and carries the slash, because `/comet-board` is what
+        // the operator and the agent both call it; the arguments are the
+        // detail. Every other kind puts a verb in the label slot — a skill's
+        // verb IS its name, so there is nothing generic to put in front of it.
+        ToolCall::Skill { name, args } => (
+            "Skill",
+            match args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                Some(args) => format!("/{name} {args}"),
+                None => format!("/{name}"),
+            },
+        ),
         ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
     }
 }
@@ -462,7 +474,11 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
-            ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
+            // Defensive: both viewports break a skill out of the group into a
+            // landmark of its own (gh#134), so one reaching here is a group
+            // that was assembled without that split — count it rather than
+            // dropping it from a summary that claims to cover the run.
+            ToolCall::Mcp { .. } | ToolCall::Skill { .. } | ToolCall::Unknown { .. } => other += 1,
         }
     }
     let mut segments: Vec<String> = Vec::new();

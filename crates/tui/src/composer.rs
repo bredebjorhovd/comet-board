@@ -50,6 +50,22 @@ impl Composer {
         self.cursor = self.text.len();
     }
 
+    /// Replace the whole buffer AND place the caret — the completion path,
+    /// which (unlike [`Composer::set_text`]) has somewhere specific to leave
+    /// it.
+    ///
+    /// The offset is floored to a char boundary before it lands, so a caller
+    /// that computed it against different text cannot break the invariant that
+    /// makes every slice in here infallible.
+    pub fn set_text_with_cursor(&mut self, text: impl Into<String>, cursor: usize) {
+        self.text = text.into();
+        let mut at = cursor.min(self.text.len());
+        while at > 0 && !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.cursor = at;
+    }
+
     /// Take the buffer, leaving it empty.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
