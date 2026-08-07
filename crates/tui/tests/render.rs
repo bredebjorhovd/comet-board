@@ -2481,7 +2481,7 @@ fn live_agents_draw_in_the_sidebar_with_the_board_closed() {
     assert!(at("gh#3") < at("gh#1"), "blocked floats:\n{sidebar}");
     assert!(at("gh#1") < at("gh#2"), "then longest-running:\n{sidebar}");
     // And it sits above the spaces tree, where the eye lands first (gh#124).
-    assert!(at("Agents") < at("comet"), "{sidebar}");
+    assert!(at("Active") < at("comet"), "{sidebar}");
 }
 
 /// Nothing dispatched and nothing running by hand: no header, no gap, no
@@ -2543,7 +2543,7 @@ fn unmanaged_runs_draw_in_the_sidebar_with_no_board_at_all() {
     };
     // Blocked floats, and the group sits above the sessions.
     assert!(at("Altinn docs") < at("Orchestrator"), "{sidebar}");
-    assert!(at("Running") < at("comet"), "{sidebar}");
+    assert!(at("Active") < at("comet"), "{sidebar}");
     // An idle chat is not a run — it is a nested session row and nothing more.
     assert!(at("Old chat") > at("comet"), "{sidebar}");
 }
@@ -2604,7 +2604,9 @@ fn attempts_and_unmanaged_runs_share_the_active_group() {
     // Needs-you-rank first inside Active: the hand-started question above the
     // working attempt.
     assert!(docs_in_active < after(active, "gh#1"), "{sidebar}");
-    assert!(after(active, "gh#1") < after(active, "Sessions"), "{sidebar}");
+    // The flat "Sessions" header is retired (gh#124): sessions nest under
+    // their space, so the Active group simply precedes the spaces tree.
+    assert!(after(active, "gh#1") < after(active, "Spaces"), "{sidebar}");
 }
 
 /// Nothing working: no header, no gap, no reminder that agents exist.
