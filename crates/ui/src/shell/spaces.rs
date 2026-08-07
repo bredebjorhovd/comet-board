@@ -1,18 +1,50 @@
 //! Spaces sidebar: the spaces list (folder + device rows), the global
-//! Sessions list, and the add-space palette (⌘K-style: device tabs + filtered
-//! folder browser).
+//! Sessions list, and the add-space palette (⌘K).
 //!
 //! A space = a synced (device, folder) pair; the sidebar's job is switching
 //! between them and surfacing which sessions want attention. Child module of
 //! `shell` so it renders straight off `Shell`'s private state.
+//!
+//! ## The palette has two doors (gh#118)
+//!
+//! It used to have one, and it was the wrong one: a folder browser asks "which
+//! folder on which machine?", which is a question about infrastructure. Work
+//! lives in GitHub repos and the box is where they run, so the front door is a
+//! repo list — every space you have, named by its repo, plus every repo the
+//! board's App can see that has no space yet. Picking a connected repo opens its
+//! space wherever it lives; picking an unconnected one clones it onto the box
+//! and lands you in the result, without the words "space" or "host" appearing.
+//!
+//! The folder browser is still there as the second door
+//! ([`AddSpaceMode::Folders`]): a scratch directory that is nobody's repo is a
+//! real place to work, and the repo list cannot offer it.
 
 use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use chrono::DateTime;
+use comet_proto::view::board;
+use comet_proto::view::repos::{self, RepoOffer, RepoRow, SpaceSlug};
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
+
+/// What [`methods::LIST_REPO_SPACES`] answers with (gh#118).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoSpacesReply {
+    /// The host's own device id — what a space's `device_id` is compared
+    /// against. Reported rather than inferred: a call with no `targetDeviceId`
+    /// went to this device, whose id the caller knows, but a call that was
+    /// forwarded came back from a device whose id it should not have to guess.
+    device_id: String,
+    #[serde(default)]
+    spaces: Vec<SpaceSlug>,
+    #[serde(default)]
+    repos: Vec<comet_board::onboard::Candidate>,
+    #[serde(default)]
+    repos_note: Option<String>,
+}
 
 /// Space-row slot height for drag drop-index math: py(6)×2 + 17px line ≈ 29,
 /// plus the 2px column gap.
@@ -66,11 +98,54 @@ impl Render for SpaceGhost {
     }
 }
 
+/// Which of the palette's two doors is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AddSpaceMode {
+    /// The front door (gh#118): repos, connected and not.
+    Repos,
+    /// The folder browser — this device (or any other), for the folders that
+    /// are nobody's GitHub repo.
+    Folders,
+}
+
+/// One device that answered [`methods::LIST_REPO_SPACES`], i.e. one board host.
+///
+/// The sweep collects every answer rather than stopping at the first, because
+/// "how many boards are there?" is the question that decides whether onboarding
+/// gets to pick a target silently. One host → don't ask. Two → ask.
+struct RepoHost {
+    /// Relay target: `None` is this device (no `targetDeviceId` passthrough).
+    target: Option<String>,
+    /// The device id the host reported for itself — what a space's `device_id`
+    /// is compared against, and not derivable from `target` when it is `None`.
+    device_id: String,
+    links: Vec<SpaceSlug>,
+    offers: Vec<RepoOffer>,
+    /// Why the host offered no repos, when it offered none. Not an error: a
+    /// board on a `GITHUB_TOKEN` has no App installations to enumerate, and its
+    /// spaces are still spaces.
+    note: Option<SharedString>,
+}
+
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
-/// across the top, folder browser on the left, a Devices rail on the right,
-/// kbd-hint footer. One surface — picking a device in the rail rebrowses in
-/// place, no step wizard.
+/// across the top, the repo list (or the folder browser) on the left, a rail on
+/// the right, kbd-hint footer. One surface — switching doors or picking a device
+/// re-lists in place, no step wizard.
 pub(super) struct AddSpaceFlow {
+    mode: AddSpaceMode,
+    /// The board hosts the sweep found. Empty after a completed sweep = no
+    /// device here hosts a board, which makes the repo list the spaces alone.
+    hosts: Vec<RepoHost>,
+    /// Which host an onboard clones onto — an index into `hosts`. Only ever
+    /// asked about when there is more than one.
+    target: usize,
+    /// The sweep's state; `Ready(())` once it has finished, however few hosts
+    /// answered.
+    repos: Loadable<()>,
+    /// The slug currently being cloned on the box. The palette stays open around
+    /// it: an onboard is a `git clone` on another machine, and a picker that
+    /// vanished would leave its refusals nowhere to land.
+    onboarding: Option<SharedString>,
     /// The device currently browsed (the highlighted rail row).
     device: Option<Device>,
     /// Filter input; Enter descends into the highlighted folder.
@@ -85,7 +160,7 @@ pub(super) struct AddSpaceFlow {
     /// descended through an entry whose `is_repo` we saw; the owning device's
     /// SpacesSync re-verifies either way).
     browser_repo: bool,
-    /// Keyboard highlight within the FILTERED folder rows.
+    /// Keyboard highlight within the FILTERED rows of whichever list is open.
     active: usize,
     submit_busy: bool,
     error: Option<SharedString>,
@@ -99,7 +174,36 @@ pub(super) struct AddSpaceFlow {
     focus_pending: bool,
     load_task: Option<Task<()>>,
     submit_task: Option<Task<()>>,
+    /// The sweep, and then the onboard. Its own slot: dropping a gpui `Task`
+    /// cancels it, and a folder browse landing mid-clone must not look like a
+    /// cancelled clone (the discipline the routing page already keeps).
+    repo_task: Option<Task<()>>,
     _search_events: Subscription,
+}
+
+impl AddSpaceFlow {
+    /// The board host an onboard clones onto, if the sweep found one.
+    fn host(&self) -> Option<&RepoHost> {
+        self.hosts.get(self.target).or_else(|| self.hosts.first())
+    }
+
+    /// Every host's `space → repo` links, merged. Space ids are unique across
+    /// devices, so concatenating cannot double-name one space.
+    fn links(&self) -> Vec<SpaceSlug> {
+        self.hosts.iter().flat_map(|h| h.links.clone()).collect()
+    }
+
+    /// Every host's App grant, merged and deduplicated by slug: two boards in
+    /// one org can be installed on the same repo, and it is still one repo.
+    fn offers(&self) -> Vec<RepoOffer> {
+        let mut out: Vec<RepoOffer> = Vec::new();
+        for offer in self.hosts.iter().flat_map(|h| h.offers.iter()) {
+            if !out.iter().any(|o| o.slug.eq_ignore_ascii_case(&offer.slug)) {
+                out.push(offer.clone());
+            }
+        }
+        out
+    }
 }
 
 /// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
@@ -320,7 +424,7 @@ impl Shell {
                             .size(px(16.0))
                             .text_color(theme.text_muted),
                     )
-                    .child(SharedString::from("Add space")),
+                    .child(SharedString::from("Add a repo")),
             );
         } else {
             let count = spaces.len();
@@ -997,7 +1101,8 @@ impl Shell {
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
         // text caret — Enter and ⌘Enter are both handled there.
-        let search = cx.new(|cx| ComposerInput::with_context("Search folders…", "PaletteSearch", cx));
+        let search =
+            cx.new(|cx| ComposerInput::with_context("Search repos…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 if let Some(flow) = this.add_space.as_mut() {
@@ -1006,8 +1111,12 @@ impl Shell {
                 cx.notify();
             }
         });
-        let has_device = device.is_some();
         self.add_space = Some(AddSpaceFlow {
+            mode: AddSpaceMode::Repos,
+            hosts: Vec::new(),
+            target: 0,
+            repos: Loadable::Idle,
+            onboarding: None,
             device,
             search,
             browser: Loadable::Idle,
@@ -1022,12 +1131,120 @@ impl Shell {
             focus_pending: true,
             load_task: None,
             submit_task: None,
+            repo_task: None,
             _search_events: search_events,
         });
-        if has_device {
+        self.load_repo_hosts(cx);
+        cx.notify();
+    }
+
+    /// Switch doors. The folder browser is loaded lazily — most opens of this
+    /// palette never reach it.
+    fn add_space_set_mode(&mut self, mode: AddSpaceMode, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        if flow.mode == mode {
+            return;
+        }
+        flow.mode = mode;
+        flow.active = 0;
+        flow.error = None;
+        flow.list_scroll.set_offset(gpui::Point::default());
+        let search = flow.search.clone();
+        let needs_browse = mode == AddSpaceMode::Folders && matches!(flow.browser, Loadable::Idle);
+        let has_device = flow.device.is_some();
+        search.update(cx, |input, cx| {
+            input.set_text("", cx);
+            input.set_placeholder(
+                match mode {
+                    AddSpaceMode::Repos => "Search repos…",
+                    AddSpaceMode::Folders => "Search folders…",
+                },
+                cx,
+            );
+        });
+        if needs_browse && has_device {
             self.load_space_folders(None, cx);
         }
         cx.notify();
+    }
+
+    /// Ask every device whether it hosts a board, and take the whole list of
+    /// answers (gh#118).
+    ///
+    /// Sweeping past the first answer costs almost nothing and buys the one fact
+    /// onboarding needs: a device hosting no board refuses
+    /// [`methods::LIST_REPO_SPACES`] before it does any git or GitHub work — the
+    /// same "said nothing at all" contract the board panel rules candidates out
+    /// with — so only real hosts are slow, and only real hosts are counted.
+    fn load_repo_hosts(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if let Some(flow) = self.add_space.as_mut() {
+                flow.repos = Loadable::Error("Engine not connected".into());
+            }
+            return;
+        };
+        let (devices, local) = {
+            let state = self.state.read(cx);
+            (state.devices.clone(), state.local_device_id.clone())
+        };
+        let candidates = board::host_candidates(&devices, local.as_deref());
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.repos = Loadable::Loading;
+            flow.hosts.clear();
+            flow.target = 0;
+        }
+        self.repo_task_set(cx.spawn(async move |this, cx| {
+            let mut hosts: Vec<RepoHost> = Vec::new();
+            for candidate in candidates {
+                let mut params = serde_json::json!({});
+                if let (Some(target), Some(object)) = (candidate.as_deref(), params.as_object_mut())
+                {
+                    object.insert("targetDeviceId".into(), serde_json::json!(target));
+                }
+                let Ok(value) = engine
+                    .client()
+                    .call(methods::LIST_REPO_SPACES, params)
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(reply) = serde_json::from_value::<RepoSpacesReply>(value) else {
+                    continue;
+                };
+                hosts.push(RepoHost {
+                    target: candidate,
+                    device_id: reply.device_id,
+                    links: reply.spaces,
+                    offers: reply
+                        .repos
+                        .into_iter()
+                        .map(|c| RepoOffer {
+                            slug: c.slug,
+                            private: c.private,
+                            archived: c.archived,
+                            on_board: c.missing.is_none(),
+                        })
+                        .collect(),
+                    note: reply.repos_note.map(SharedString::from),
+                });
+            }
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut() {
+                    flow.hosts = hosts;
+                    flow.repos = Loadable::Ready(());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn repo_task_set(&mut self, task: Task<()>) {
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.repo_task = Some(task);
+        }
     }
 
     /// Devices-rail click: rebrowse the same palette on another device.
@@ -1049,6 +1266,139 @@ impl Shell {
         search.update(cx, |input, cx| input.set_text("", cx));
         self.load_space_folders(None, cx);
         cx.notify();
+    }
+
+    // ---- the repo list (the front door, gh#118) ----
+
+    /// The palette's repo rows, filtered by the search query.
+    ///
+    /// Every space is in here, whether or not the sweep found a board: a picker
+    /// that showed nothing until a box answered would be useless on a laptop
+    /// that has never had one, and the spaces are the part it already knows.
+    fn add_space_repo_rows(&self, cx: &App) -> Vec<RepoRow> {
+        let Some(flow) = self.add_space.as_ref() else {
+            return Vec::new();
+        };
+        let spaces = self.state.read(cx).spaces.clone();
+        let host = flow.host().map(|h| h.device_id.clone());
+        let rows = repos::repo_rows(&spaces, &flow.links(), &flow.offers(), host.as_deref());
+        repos::filter_rows(flow.search.read(cx).text(), &rows)
+    }
+
+    /// Act on the highlighted repo row: open its space, or clone it onto the box.
+    fn add_space_activate_repo(&mut self, cx: &mut Context<Self>) {
+        let rows = self.add_space_repo_rows(cx);
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        let Some(row) = rows.get(flow.active).cloned() else {
+            return;
+        };
+        self.add_space_pick_repo(row, cx);
+    }
+
+    /// One repo row picked (keyboard or mouse).
+    ///
+    /// A connected repo lands in its space with no further questions — the space
+    /// knows its device, so there is nothing to ask and nothing to choose. An
+    /// unconnected one runs the gh#97 onboard against the board's host, which is
+    /// the only device that can do it.
+    fn add_space_pick_repo(&mut self, row: RepoRow, cx: &mut Context<Self>) {
+        if let Some(space_id) = row.space_id {
+            self.add_space = None;
+            self.activate_space(space_id, cx);
+            return;
+        }
+        let Some(slug) = row.slug else {
+            return;
+        };
+        self.submit_onboard(slug, cx);
+    }
+
+    /// Clone + createSpace + adopt on the board's host, then land in the result.
+    ///
+    /// Unary and slow — it is a `git clone` on another machine — so the palette
+    /// stays open and busy around it rather than closing on a hope. Its refusals
+    /// are written to be read ("the board's GitHub App cannot see it…") and land
+    /// on the palette's own error line, not in Settings.
+    fn submit_onboard(&mut self, slug: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if let Some(flow) = self.add_space.as_mut() {
+                flow.error = Some("Engine not connected".into());
+            }
+            cx.notify();
+            return;
+        };
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.onboarding.is_some() {
+            return;
+        }
+        let Some(host) = flow.host() else {
+            if let Some(flow) = self.add_space.as_mut() {
+                flow.error = Some(
+                    "No device here hosts a board, so there is nowhere to clone this repo".into(),
+                );
+            }
+            cx.notify();
+            return;
+        };
+        let mut params = serde_json::json!({ "slug": slug });
+        if let (Some(target), Some(object)) = (host.target.as_deref(), params.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::json!(target));
+        }
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.onboarding = Some(slug.clone().into());
+            flow.error = None;
+        }
+        cx.notify();
+        self.repo_task_set(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::ONBOARD_REPO, params).await;
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut() {
+                    flow.onboarding = None;
+                }
+                match result
+                    .map_err(|e| format!("{e}"))
+                    .and_then(|v| serde_json::from_value::<comet_board::onboard::Onboarded>(v)
+                        .map_err(|e| format!("Unreadable reply: {e}")))
+                {
+                    Ok(done) => {
+                        // The space was created on the box and will arrive with
+                        // the next workspace frame; echo it so landing in it is
+                        // instant, exactly as `submit_add_space` does for a
+                        // space this device created (same-id upsert is
+                        // idempotent).
+                        let space = Space {
+                            id: done.space_id.clone(),
+                            device_id: done.device_id.clone(),
+                            path: done.path.clone(),
+                            name: None,
+                            git_detected: true,
+                            git_checked_at: None,
+                            checkout_id: None,
+                            created_at: Utc::now(),
+                        };
+                        shell.state.update(cx, |s, cx| {
+                            if !s.spaces.iter().any(|existing| existing.id == space.id) {
+                                s.spaces.push(space);
+                            }
+                            cx.notify();
+                        });
+                        shell.add_space = None;
+                        shell.activate_space(done.space_id, cx);
+                    }
+                    Err(message) => {
+                        if let Some(flow) = shell.add_space.as_mut() {
+                            flow.error = Some(message.into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// The current listing's folder rows filtered by the search query
@@ -1271,19 +1621,35 @@ impl Shell {
     }
 
     /// Palette keys (bubbling from the focused search input) — every legend
-    /// maps to a REAL key: ↑↓ navigate, →/⏎ open the highlighted folder,
+    /// maps to a REAL key.
+    ///
+    /// In the repo list: ↑↓ navigate, ⏎ opens the highlighted repo (or connects
+    /// it), → is the second door (browse folders), esc closes.
+    ///
+    /// In the folder browser: ↑↓ navigate, →/⏎ open the highlighted folder,
     /// ← up a level, ⌘⏎ add the OPEN folder, ⌫ (empty query) also goes up,
     /// esc closes.
     fn add_space_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
-        // ←/→ act on the FOLDERS, not the text cursor — the palette is a
-        // navigator first; queries are short and edited with ⌫.
-        match event.keystroke.key.as_str() {
-            "right" => {
+        let mode = match self.add_space.as_ref() {
+            Some(flow) => flow.mode,
+            None => return,
+        };
+        // ←/→ act on the LIST, not the text cursor — the palette is a navigator
+        // first; queries are short and edited with ⌫.
+        match (event.keystroke.key.as_str(), mode) {
+            ("right", AddSpaceMode::Folders) => {
                 self.add_space_open_active(cx);
                 return;
             }
-            "left" => {
+            ("left", AddSpaceMode::Folders) => {
                 self.add_space_go_up(cx);
+                return;
+            }
+            // From the repo list, → is the way through to the other door and ←
+            // is the way back: the two lists sit side by side, not one inside
+            // the other.
+            ("right", AddSpaceMode::Repos) => {
+                self.add_space_set_mode(AddSpaceMode::Folders, cx);
                 return;
             }
             _ => {}
@@ -1299,7 +1665,10 @@ impl Shell {
                 cx.notify();
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
-                let count = self.add_space_filtered(cx).len();
+                let count = match mode {
+                    AddSpaceMode::Repos => self.add_space_repo_rows(cx).len(),
+                    AddSpaceMode::Folders => self.add_space_filtered(cx).len(),
+                };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 if let Some(flow) = self.add_space.as_mut() {
                     flow.active =
@@ -1311,29 +1680,60 @@ impl Shell {
                     cx.notify();
                 }
             }
-            // ⏎ opens the highlighted folder (an alias for →); the space is
-            // added with ⌘⏎ — and the chord acts on the folder OPEN in the
-            // breadcrumbs, not the highlight. The highlight auto-rests on the
-            // first row, so a chord that took it would add arbitrary
-            // subfolders; the usual target (a repo root full of subfolders)
-            // is only ever "the folder you're standing in".
-            popover::MenuKey::Enter => self.add_space_open_active(cx),
-            popover::MenuKey::ModEnter => self.submit_add_space(cx),
+            // Repo list: ⏎ IS the verb — open the space, or connect the repo.
+            // There is no second step to reach for, which is the whole point.
+            //
+            // Folder browser: ⏎ opens the highlighted folder (an alias for →);
+            // the space is added with ⌘⏎ — and the chord acts on the folder OPEN
+            // in the breadcrumbs, not the highlight. The highlight auto-rests on
+            // the first row, so a chord that took it would add arbitrary
+            // subfolders; the usual target (a repo root full of subfolders) is
+            // only ever "the folder you're standing in".
+            popover::MenuKey::Enter => match mode {
+                AddSpaceMode::Repos => self.add_space_activate_repo(cx),
+                AddSpaceMode::Folders => self.add_space_open_active(cx),
+            },
+            popover::MenuKey::ModEnter if mode == AddSpaceMode::Folders => {
+                self.submit_add_space(cx)
+            }
+            popover::MenuKey::ModEnter => {}
             popover::MenuKey::Backspace => {
                 let empty = self
                     .add_space
                     .as_ref()
                     .is_some_and(|f| f.search.read(cx).is_empty());
                 if empty {
-                    self.add_space_go_up(cx);
+                    match mode {
+                        // ⌫ on an empty query is "back", and back from the
+                        // folder browser is the repo list.
+                        AddSpaceMode::Repos => {}
+                        AddSpaceMode::Folders => {
+                            let at_root = self
+                                .add_space
+                                .as_ref()
+                                .and_then(|f| f.browser.ready())
+                                .and_then(|l| parent_path(&l.path))
+                                .is_none();
+                            if at_root {
+                                self.add_space_set_mode(AddSpaceMode::Repos, cx);
+                            } else {
+                                self.add_space_go_up(cx);
+                            }
+                        }
+                    }
                 }
             }
             popover::MenuKey::Other => {}
         }
     }
 
-    /// The palette card: ⌘K search bar (with the ⌘⏎ add / esc chips) ·
-    /// breadcrumbs + folder list beside the devices rail · kbd-hint footer.
+    /// The palette card: ⌘K search bar · the open door's list beside its rail ·
+    /// kbd-hint footer.
+    ///
+    /// Two doors, one card (gh#118). The chrome is deliberately identical
+    /// between them — same bar, same list rhythm, same rail column — because
+    /// they are two views of one question, and a browser that looked like a
+    /// different screen would make "add a space" feel like two features again.
     pub(super) fn render_add_space_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -1348,38 +1748,19 @@ impl Shell {
                 window.focus(&handle, cx);
             }
         }
-        let (device, search, error, submit_busy, active, loading, load_error, listing, focus, list_scroll, home) = {
+        let (mode, search, error, active, focus, list_scroll, onboarding) = {
             let flow = self.add_space.as_ref()?;
             (
-                flow.device.clone(),
+                flow.mode,
                 flow.search.clone(),
                 flow.error.clone(),
-                flow.submit_busy,
                 flow.active,
-                matches!(flow.browser, Loadable::Loading | Loadable::Idle),
-                flow.browser.error().map(str::to_string),
-                flow.browser.ready().cloned(),
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
-                flow.home.clone(),
+                flow.onboarding.clone(),
             )
         };
-        let devices = self.state.read(cx).devices.clone();
-        let rows = self.add_space_filtered(cx);
-        let query_empty = search.read(cx).is_empty();
         let hairline = theme.white_alpha(0.06);
-        let now = Utc::now();
-        // (browsed device name, online) per rail row — presence is the same
-        // signal the sidebar space rows use.
-        let device_presence: Vec<bool> = {
-            let state = self.state.read(cx);
-            devices.iter().map(|d| state.device_online(&d.id, now)).collect()
-        };
-        let device_name: SharedString = device
-            .as_ref()
-            .map(|d| d.name.clone())
-            .unwrap_or_else(|| "This device".to_string())
-            .into();
 
         // A quiet mono key-cap chip ("⌘K" / "esc") for the search bar ends.
         let key_chip = |theme: &Theme| {
@@ -1398,9 +1779,34 @@ impl Shell {
                 .text_color(theme.text_muted.opacity(0.7))
         };
 
-        // ── search bar (the ⌘K bar): summon chip · input · "⌘ Enter" add ·
-        //    esc. The primary chip leads with the ⌘ glyph, then says "Enter"
-        //    in words (user request — the bare return arrow read as noise).
+        // ── search bar (the ⌘K bar): summon chip · input · primary chip · esc.
+        //    The primary chip names what ⏎ (or ⌘⏎) will actually do to the row
+        //    under the cursor, because in the repo list those are two different
+        //    verbs — opening a space you have, and cloning one you do not.
+        let (primary_label, primary_enabled): (SharedString, bool) = match mode {
+            AddSpaceMode::Repos => match &onboarding {
+                Some(slug) => (format!("Connecting {slug}…").into(), false),
+                None => {
+                    let rows = self.add_space_repo_rows(cx);
+                    match rows.get(active) {
+                        Some(row) if row.connected() => ("Open".into(), true),
+                        Some(_) => ("Connect".into(), true),
+                        None => ("Open".into(), false),
+                    }
+                }
+            },
+            AddSpaceMode::Folders => {
+                let flow = self.add_space.as_ref()?;
+                if flow.submit_busy {
+                    ("Adding…".into(), false)
+                } else {
+                    ("Enter".into(), flow.browser.ready().is_some())
+                }
+            }
+        };
+        let busy = matches!(mode, AddSpaceMode::Repos) && onboarding.is_some()
+            || matches!(mode, AddSpaceMode::Folders)
+                && self.add_space.as_ref().is_some_and(|f| f.submit_busy);
         let submit_chip = popover::btn_primary(&theme, "")
             .id("add-space-submit")
             .h(px(22.0))
@@ -1415,20 +1821,33 @@ impl Shell {
             .items_center()
             .gap(px(4.0))
             .text_size(px(12.0))
-            .when(submit_busy || listing.is_none(), |el| el.opacity(0.6))
-            .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
-            .when(!submit_busy, |el| {
+            .when(!primary_enabled, |el| el.opacity(0.6))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let mode = this.add_space.as_ref().map(|f| f.mode);
+                match mode {
+                    Some(AddSpaceMode::Repos) => this.add_space_activate_repo(cx),
+                    Some(AddSpaceMode::Folders) => this.submit_add_space(cx),
+                    None => {}
+                }
+            }))
+            // The chip shows the key that really does this: ⏎ alone in the repo
+            // list (the row under the cursor IS the target), ⌘⏎ in the folder
+            // browser (where plain ⏎ descends instead).
+            .when(!busy, |el| {
                 el.child(
-                    icon(icons::COMMAND)
-                        .size(px(11.0))
-                        .text_color(theme.bg.opacity(0.8)),
+                    icon(if mode == AddSpaceMode::Repos {
+                        icons::RETURN
+                    } else {
+                        icons::COMMAND
+                    })
+                    .size(px(11.0))
+                    .text_color(theme.bg.opacity(0.8)),
                 )
-                .child(SharedString::from("Enter"))
             })
-            .when(submit_busy, |el| el.child(SharedString::from("Adding…")));
+            .child(primary_label.clone());
         // Header and footer sit a shade DEEPER than the body (the shared
-        // recessed-band tone) — the bands frame the folder list, which stays
-        // on the brighter tint.
+        // recessed-band tone) — the bands frame the list, which stays on the
+        // brighter tint.
         let band = popover::band(&theme);
         let input_row = div()
             .h(px(46.0))
@@ -1467,11 +1886,560 @@ impl Shell {
                     .child(SharedString::from("esc")),
             );
 
-        // ── breadcrumbs ("MacBook Pro / Projects / comet"): the quiet mono
-        //    path voice, `/` separators. The device crumb stands in for home —
-        //    everything up to the resolved home path folds into it; below
-        //    home the full path shows. Ancestors (device crumb included) are
-        //    clickable.
+        let (column, rail, hints) = match mode {
+            AddSpaceMode::Repos => (
+                self.render_repo_column(&theme, active, &list_scroll, cx),
+                self.render_repo_rail(&theme, cx),
+                vec![
+                    popover::key_hint_pair(&theme, icons::ARROW_UP, icons::ARROW_DOWN, "Navigate"),
+                    popover::key_hint(&theme, icons::RETURN, "Open"),
+                    popover::key_hint(&theme, icons::ARROW_RIGHT, "Browse folders"),
+                ],
+            ),
+            AddSpaceMode::Folders => (
+                self.render_folder_column(&theme, active, &list_scroll, cx)?,
+                self.render_devices_rail(&theme, cx),
+                vec![
+                    popover::key_hint_pair(&theme, icons::ARROW_UP, icons::ARROW_DOWN, "Navigate"),
+                    popover::key_hint(&theme, icons::ARROW_LEFT, "Up"),
+                    popover::key_hint(&theme, icons::ARROW_RIGHT, "Open"),
+                ],
+            ),
+        };
+
+        // ── body: the list column beside its rail. FIXED height — sparse lists,
+        //    loading skeletons, and door switches must not resize the card (the
+        //    list fills and scrolls).
+        let body = div()
+            .h(px(330.0))
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .child(div().flex_1().min_w_0().flex().flex_col().child(column))
+            .child(rail);
+
+        // ── footer: the shared key-cap legend voice (popover::key_hint).
+        let footer = div()
+            .flex_none()
+            .bg(band)
+            .border_t_1()
+            .border_color(hairline)
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .children(hints)
+            .when_some(error, |el, message| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(theme.danger)
+                        .child(message),
+                )
+            });
+
+        let card = div()
+            .id("add-space-palette")
+            .w(px(680.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(theme.white_alpha(0.10))
+            // The popover_card glass recipe: a translucent tint over the
+            // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
+            // an opaque fill here killed the vibrancy every other float has.
+            .bg(theme.float_card())
+            .shadow_lg()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .text_color(theme.text)
+            // On the keyboard dispatch path (see `AddSpaceFlow::focus`) — the
+            // pickers' proven structure for frame-level keys with a focused
+            // child input.
+            .track_focus(&focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.add_space_key(event, cx)
+            }))
+            // Clicking the scrim dismisses (user requirement) — same close
+            // path as Escape.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_space = None;
+                cx.notify();
+            }))
+            .child(input_row)
+            .child(body)
+            .child(footer)
+            .into_any_element();
+        Some(popover::modal("add-space-dialog", viewport, card))
+    }
+
+    // ---- the repo door ----
+
+    /// The repo list: one row per space (named by its repo where the box could
+    /// say), then the repos with no space yet.
+    fn render_repo_column(
+        &mut self,
+        theme: &Theme,
+        active: usize,
+        list_scroll: &gpui::ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = self.add_space_repo_rows(cx);
+        let (sweeping, onboarding) = match self.add_space.as_ref() {
+            Some(flow) => (
+                matches!(flow.repos, Loadable::Loading | Loadable::Idle),
+                flow.onboarding.clone(),
+            ),
+            None => (false, None),
+        };
+        let query_empty = self
+            .add_space
+            .as_ref()
+            .is_some_and(|f| f.search.read(cx).is_empty());
+        let now = Utc::now();
+        let device_labels: std::collections::HashMap<String, (String, bool)> = {
+            let state = self.state.read(cx);
+            state
+                .devices
+                .iter()
+                .map(|d| {
+                    (
+                        d.id.clone(),
+                        (d.name.clone(), state.device_online(&d.id, now)),
+                    )
+                })
+                .collect()
+        };
+
+        if rows.is_empty() {
+            return if sweeping {
+                div()
+                    .px(px(8.0))
+                    .py(px(10.0))
+                    .child(popover::skeleton_rows("add-space-repo-skeleton", theme, 6))
+                    .into_any_element()
+            } else {
+                div()
+                    .px(px(14.0))
+                    .py(px(16.0))
+                    .text_size(px(12.5))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(if query_empty {
+                        // Nothing to pick and nothing wrong: this is a fresh
+                        // install with no board yet, and the second door is the
+                        // honest answer rather than an error.
+                        "No repos yet — browse this device's folders instead (→)"
+                    } else {
+                        "No repos match"
+                    }))
+                    .into_any_element()
+            };
+        }
+
+        // The 6px gutters live on a WRAPPER, outside the scroll viewport: see
+        // the folder list's note — the wheel's max offset eats bottom padding.
+        div()
+            .flex_1()
+            .min_h_0()
+            .py(px(6.0))
+            .child(
+                div()
+                    .id("add-space-repos")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(list_scroll)
+                    .px(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                        // `is_some()` first: two `None`s are equal, and without
+                        // it every space that is not a GitHub checkout would
+                        // spin forever.
+                        let connecting =
+                            onboarding.is_some() && onboarding.as_deref() == row.slug.as_deref();
+                        self.render_repo_row(theme, ix, ix == active, connecting, &device_labels, row, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// One repo row: mark, name, and what is true about it. Click opens the
+    /// space, or starts the clone.
+    #[allow(clippy::too_many_arguments)]
+    fn render_repo_row(
+        &self,
+        theme: &Theme,
+        ix: usize,
+        highlighted: bool,
+        connecting: bool,
+        devices: &std::collections::HashMap<String, (String, bool)>,
+        row: RepoRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title: SharedString = row.title.clone().into();
+        let note = row.note();
+        let connected = row.connected();
+        // A connected row names its device the way the sidebar's space rows do —
+        // and marks it offline, because a space whose host is down is a space you
+        // cannot start anything in.
+        let device_tag = row.device_id.as_ref().and_then(|id| {
+            devices.get(id).map(|(name, online)| {
+                if *online {
+                    format!("@ {name}")
+                } else {
+                    format!("@ {name} · offline")
+                }
+            })
+        });
+        let device_offline = row
+            .device_id
+            .as_ref()
+            .and_then(|id| devices.get(id))
+            .is_some_and(|(_, online)| !online);
+        let picked = row.clone();
+        popover::menu_row_nav(theme, false, highlighted, format!("add-space-repo-{ix}"))
+            .when(highlighted, |el| el.shadow(theme.glass_selected_shadows()))
+            .id(("add-space-repo", ix))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.add_space_pick_repo(picked.clone(), cx);
+            }))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if connecting {
+                        loaders::mini_gradient_spinner(format!("add-space-connecting-{ix}"), 2.0)
+                            .into_any_element()
+                    } else if row.slug.is_some() {
+                        icon(icons::GITHUB_MARK)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted.opacity(if connected {
+                                0.85
+                            } else {
+                                // An unconnected repo is a row that will make you
+                                // wait; it sits a shade quieter than the ones
+                                // that open instantly.
+                                0.5
+                            }))
+                            .into_any_element()
+                    } else {
+                        icon(icons::FOLDER)
+                            .size(px(15.0))
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .into_any_element()
+                    }),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(title))
+            .when_some(note, |el, note| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .child(SharedString::from(note)),
+                )
+            })
+            .when_some(device_tag, |el, tag| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.5))
+                        .text_color(if device_offline {
+                            theme.warning.opacity(0.8)
+                        } else {
+                            theme.text_muted.opacity(0.6)
+                        })
+                        .child(SharedString::from(tag)),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The repo door's rail: where a new repo would land, and the way to the
+    /// folder browser.
+    fn render_repo_rail(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let hairline = theme.white_alpha(0.06);
+        let now = Utc::now();
+        let flow = self.add_space.as_ref();
+        // The device ids of every board the sweep found, in sweep order.
+        let hosts: Vec<String> = flow
+            .map(|f| f.hosts.iter().map(|h| h.device_id.clone()).collect())
+            .unwrap_or_default();
+        let target = flow.map(|f| f.target).unwrap_or(0);
+        let sweeping = flow.is_some_and(|f| matches!(f.repos, Loadable::Loading | Loadable::Idle));
+        let note = flow.and_then(|f| f.host()).and_then(|h| h.note.clone());
+        let (names, presence): (
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, bool>,
+        ) = {
+            let state = self.state.read(cx);
+            (
+                state
+                    .devices
+                    .iter()
+                    .map(|d| (d.id.clone(), d.name.clone()))
+                    .collect(),
+                state
+                    .devices
+                    .iter()
+                    .map(|d| (d.id.clone(), state.device_online(&d.id, now)))
+                    .collect(),
+            )
+        };
+        let host_name = |device_id: &str| -> String {
+            names
+                .get(device_id)
+                .cloned()
+                .unwrap_or_else(|| "the board's device".to_string())
+        };
+        // One host is not a choice, so it is not offered as one: the box is the
+        // default target and the rail simply says so (gh#118). Two is a choice
+        // nothing here can make for you.
+        let asking = hosts.len() > 1;
+
+        let mut rail = div()
+            .w(px(196.0))
+            .flex_none()
+            .border_l_1()
+            .border_color(hairline)
+            .px(px(8.0))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .pt(px(2.0))
+                    .pb(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(if asking {
+                        "Clone onto"
+                    } else {
+                        "Board"
+                    }))
+                    .when(sweeping, |el| {
+                        el.child(loaders::mini_gradient_spinner("add-space-sweep", 2.0))
+                    }),
+            );
+
+        for (ix, device_id) in hosts.iter().enumerate() {
+            let selected = asking && ix == target;
+            let online = presence.get(device_id).copied().unwrap_or(false);
+            let name: SharedString = host_name(device_id).into();
+            rail = rail.child(
+                div()
+                    .id(("add-space-host", ix))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(px(12.5))
+                    .when(selected, |el| {
+                        el.bg(theme.glass_selected_bg())
+                            .shadow(theme.glass_selected_shadows())
+                            .text_color(theme.text)
+                    })
+                    .when(!selected, |el| el.text_color(theme.text_muted.opacity(0.8)))
+                    .when(asking, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(theme.element_hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(flow) = this.add_space.as_mut() {
+                                    flow.target = ix;
+                                }
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        icon(icons::MONITOR)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .child(
+                        div()
+                            .size(px(5.0))
+                            .rounded_full()
+                            .flex_none()
+                            .when(online, |el| {
+                                let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+                                el.bg(emerald.opacity(0.9))
+                            })
+                            .when(!online, |el| el.bg(theme.white_alpha(0.22))),
+                    ),
+            );
+        }
+
+        let info: SharedString = if sweeping {
+            "Looking for the board…".into()
+        } else if hosts.is_empty() {
+            "No device here hosts a board, so a repo has nowhere to be cloned.".into()
+        } else if asking {
+            "Pick where a new repo gets cloned.".into()
+        } else {
+            format!(
+                "New repos clone onto {} and go on the board.",
+                host_name(&hosts[0])
+            )
+            .into()
+        };
+        rail = rail
+            .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(
+                        icon(icons::INFO_CIRCLE)
+                            .size(px(12.0))
+                            .flex_none()
+                            .mt(px(1.0))
+                            .text_color(theme.text_muted.opacity(0.5)),
+                    )
+                    .child(div().min_w_0().child(info)),
+            );
+        // Why the App offered nothing, when it offered nothing. Not an error: a
+        // board on a `GITHUB_TOKEN` has no installations to enumerate (gh#97),
+        // and its spaces are on the list above regardless.
+        if let Some(note) = note {
+            rail = rail.child(
+                div()
+                    .px(px(8.0))
+                    .pt(px(6.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.45))
+                    .child(note),
+            );
+        }
+
+        rail.child(div().flex_1())
+            .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .pb(px(4.0))
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from("This device")),
+            )
+            // The second door. A scratch folder that is nobody's repo is a real
+            // place to work, and the repo list cannot offer it.
+            .child(
+                div()
+                    .id("add-space-browse")
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(px(12.5))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_space_set_mode(AddSpaceMode::Folders, cx);
+                    }))
+                    .child(
+                        icon(icons::FOLDER)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
+                        "Browse folders…",
+                    )))
+                    .child(
+                        icon(icons::ARROW_RIGHT)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_faint.opacity(0.7)),
+                    ),
+            )
+    }
+
+    // ---- the folder door ----
+
+    /// Breadcrumbs + folder list (with a crumb back to the repo list).
+    fn render_folder_column(
+        &mut self,
+        theme: &Theme,
+        active: usize,
+        list_scroll: &gpui::ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (device, loading, load_error, listing, home) = {
+            let flow = self.add_space.as_ref()?;
+            (
+                flow.device.clone(),
+                matches!(flow.browser, Loadable::Loading | Loadable::Idle),
+                flow.browser.error().map(str::to_string),
+                flow.browser.ready().cloned(),
+                flow.home.clone(),
+            )
+        };
+        let rows = self.add_space_filtered(cx);
+        let query_empty = self
+            .add_space
+            .as_ref()
+            .is_some_and(|f| f.search.read(cx).is_empty());
+        let device_name: SharedString = device
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "This device".to_string())
+            .into();
+
+        // ── breadcrumbs ("Repos / MacBook Pro / Projects / comet"): the quiet
+        //    mono path voice, `/` separators. The leading crumb is the way back
+        //    to the repo list — the folder browser is a room off it, and every
+        //    room needs a door. The device crumb stands in for home: everything
+        //    up to the resolved home path folds into it; below home the full
+        //    path shows. Ancestors are clickable.
+        let back_crumb = div()
+            .id("add-space-crumb-repos")
+            .px(px(3.0))
+            .rounded(px(4.0))
+            .text_color(theme.text_muted.opacity(0.55))
+            .cursor_pointer()
+            .hover(|s| s.text_color(theme.text))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.add_space_set_mode(AddSpaceMode::Repos, cx);
+            }))
+            .child(SharedString::from("Repos"));
+        let separator = |theme: &Theme| {
+            div()
+                .text_color(theme.text_faint.opacity(0.7))
+                .child(SharedString::from("/"))
+        };
         let crumbs: AnyElement = match &listing {
             Some(listing) => {
                 let segments = breadcrumbs(&listing.path);
@@ -1496,6 +2464,8 @@ impl Shell {
                     .pb(px(2.0))
                     .text_size(px(11.0))
                     .font_family(theme.font_mono.clone())
+                    .child(back_crumb)
+                    .child(separator(theme))
                     .child({
                         let crumb = div()
                             .id("add-space-crumb-device")
@@ -1531,11 +2501,7 @@ impl Shell {
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .child(
-                                        div()
-                                            .text_color(theme.text_faint.opacity(0.7))
-                                            .child(SharedString::from("/")),
-                                    )
+                                    .child(separator(theme))
                                     .child({
                                         let crumb = div()
                                             .id(("add-space-crumb", ix))
@@ -1573,7 +2539,17 @@ impl Shell {
                     )
                     .into_any_element()
             }
-            None => div().pt(px(6.0)).into_any_element(),
+            None => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px(px(13.0))
+                .pt(px(10.0))
+                .pb(px(2.0))
+                .text_size(px(11.0))
+                .font_family(theme.font_mono.clone())
+                .child(back_crumb)
+                .into_any_element(),
         };
 
         // ── folder list ─────────────────────────────────────────────────────
@@ -1582,14 +2558,14 @@ impl Shell {
             div()
                 .px(px(8.0))
                 .py(px(6.0))
-                .child(popover::skeleton_rows("add-space-skeleton", &theme, 6))
+                .child(popover::skeleton_rows("add-space-skeleton", theme, 6))
                 .into_any_element()
         } else if let Some(message) = load_error {
             let device_line = device
                 .as_ref()
                 .map(|d| format!("{} didn't respond — is it online?", d.name))
                 .unwrap_or(message);
-            popover::error_row(&theme, &device_line)
+            popover::error_row(theme, &device_line)
                 .px(px(14.0))
                 .py(px(10.0))
                 .child(
@@ -1636,7 +2612,7 @@ impl Shell {
                         .id("add-space-folders")
                         .size_full()
                         .overflow_y_scroll()
-                        .track_scroll(&list_scroll)
+                        .track_scroll(list_scroll)
                         .px(px(8.0))
                         .flex()
                         .flex_col()
@@ -1646,7 +2622,7 @@ impl Shell {
                     let name: SharedString = entry.name.clone().into();
                     let full = crate::pickers::child_path(&base_path, &entry.name);
                     let is_repo = entry.is_repo;
-                    popover::menu_row_nav(&theme, false, ix == active, format!("add-space-folder-{ix}"))
+                    popover::menu_row_nav(theme, false, ix == active, format!("add-space-folder-{ix}"))
                         // The active-tab/session selection language: the wash
                         // plus the ring-only inset outline.
                         .when(ix == active, |el| {
@@ -1678,10 +2654,37 @@ impl Shell {
                 .into_any_element()
         };
 
-        // ── devices rail (mock right column): platform glyph + name +
-        //    presence dot per row, an info line naming the browsed device.
-        //    Rows are the tab recipe (h-28 rounded-8 washes), vertical.
-        let rail = div()
+        Some(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(crumbs)
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// The folder door's rail: platform glyph + name + presence dot per row, an
+    /// info line naming the browsed device. Rows are the tab recipe (h-28
+    /// rounded-8 washes), vertical.
+    fn render_devices_rail(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let hairline = theme.white_alpha(0.06);
+        let now = Utc::now();
+        let devices = self.state.read(cx).devices.clone();
+        let device = self.add_space.as_ref().and_then(|f| f.device.clone());
+        let device_presence: Vec<bool> = {
+            let state = self.state.read(cx);
+            devices.iter().map(|d| state.device_online(&d.id, now)).collect()
+        };
+        let device_name: SharedString = device
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "This device".to_string())
+            .into();
+
+        div()
             .w(px(196.0))
             .flex_none()
             .border_l_1()
@@ -1782,91 +2785,35 @@ impl Shell {
                     .child(div().min_w_0().child(SharedString::from(format!(
                         "Showing folders from {device_name} only"
                     )))),
-            );
-
-        // ── body: folder column (crumbs + list) beside the devices rail.
-        //    FIXED height — sparse folders, loading skeletons, and device
-        //    switches must not resize the card (the list fills and scrolls).
-        let body = div()
-            .h(px(330.0))
-            .flex()
-            .flex_row()
-            .items_stretch()
+            )
+            .child(div().flex_1())
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .id("add-space-back-to-repos")
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(8.0))
                     .flex()
-                    .flex_col()
-                    .child(crumbs)
-                    .child(list),
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(px(12.5))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.element_hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_space_set_mode(AddSpaceMode::Repos, cx);
+                    }))
+                    .child(
+                        icon(icons::ARROW_LEFT)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_faint.opacity(0.7)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
+                        "Back to repos",
+                    ))),
             )
-            .child(rail);
-
-        // ── footer: the shared key-cap legend voice (popover::key_hint).
-        let footer = div()
-            .flex_none()
-            .bg(band)
-            .border_t_1()
-            .border_color(hairline)
-            .px(px(12.0))
-            .py(px(8.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(12.0))
-            .child(popover::key_hint_pair(
-                &theme,
-                icons::ARROW_UP,
-                icons::ARROW_DOWN,
-                "Navigate",
-            ))
-            .child(popover::key_hint(&theme, icons::ARROW_LEFT, "Up"))
-            .child(popover::key_hint(&theme, icons::ARROW_RIGHT, "Open"))
-            .when_some(error, |el, message| {
-                el.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(11.0))
-                        .text_color(theme.danger)
-                        .child(message),
-                )
-            });
-
-        let card = div()
-            .id("add-space-palette")
-            .w(px(680.0))
-            .rounded(px(14.0))
-            .border_1()
-            .border_color(theme.white_alpha(0.10))
-            // The popover_card glass recipe: a translucent tint over the
-            // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
-            // an opaque fill here killed the vibrancy every other float has.
-            .bg(theme.float_card())
-            .shadow_lg()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .text_color(theme.text)
-            // On the keyboard dispatch path (see `AddSpaceFlow::focus`) — the
-            // pickers' proven structure for frame-level keys with a focused
-            // child input.
-            .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.add_space_key(event, cx)
-            }))
-            // Clicking the scrim dismisses (user requirement) — same close
-            // path as Escape.
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.add_space = None;
-                cx.notify();
-            }))
-            .child(input_row)
-            .child(body)
-            .child(footer)
-            .into_any_element();
-        Some(popover::modal("add-space-dialog", viewport, card))
     }
 
     // ---- space context menu / rename / delete overlays ----

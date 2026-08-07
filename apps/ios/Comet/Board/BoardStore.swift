@@ -165,6 +165,69 @@ final class BoardStore {
         return accounts.filter { $0.harness == harness }
     }
 
+    // MARK: The repo picker (gh#118)
+
+    /// One device that answered `ListRepoSpaces`, i.e. one board host.
+    struct RepoHost: Identifiable {
+        var id: String { deviceId }
+        var deviceId: String
+        var links: [SpaceSlug]
+        var offers: [RepoOffer]
+        /// Why the host offered no repos, when it offered none. Not an error: a
+        /// board on a `GITHUB_TOKEN` has no App installations to enumerate
+        /// (gh#97), and its spaces are still spaces.
+        var note: String?
+    }
+
+    private struct RepoSpacesReply: Decodable {
+        var deviceId: String
+        var spaces: [SpaceSlug]?
+        var repos: [RepoOffer]?
+        var reposNote: String?
+    }
+
+    /// Ask every device whether it hosts a board, and take the whole list of
+    /// answers.
+    ///
+    /// Sweeping past the first answer costs almost nothing and buys the one fact
+    /// onboarding needs: a device hosting no board refuses `ListRepoSpaces`
+    /// before it does any git or GitHub work — the same "said nothing at all"
+    /// contract this store's own sweep rules candidates out with — so only real
+    /// hosts are slow, and only real hosts are counted. One host is the box and
+    /// nothing needs asking; two is a choice the phone cannot make for you.
+    func repoHosts() async -> [RepoHost] {
+        var found: [RepoHost] = []
+        for deviceId in boardHostCandidates(devices()) {
+            guard let reply: RepoSpacesReply = try? await relay(for: deviceId)
+                .call(method: "ListRepoSpaces", params: [:]) else { continue }
+            found.append(RepoHost(deviceId: reply.deviceId,
+                                  links: reply.spaces ?? [],
+                                  offers: reply.repos ?? [],
+                                  note: reply.reposNote))
+        }
+        return found
+    }
+
+    /// What one onboard did, or why it did not. Its refusals are written to be
+    /// read ("the board's GitHub App (id 123) cannot see it — install it on
+    /// acme"), so they are carried back whole rather than reduced to a flag.
+    enum OnboardOutcome {
+        case connected(Onboarded)
+        case failed(String)
+    }
+
+    /// Clone + createSpace + adopt on `host`, in one call (gh#97). Slow by
+    /// nature — it is a `git clone` on another machine.
+    func onboard(slug: String, host: String) async -> OnboardOutcome {
+        do {
+            let done: Onboarded = try await relay(for: host)
+                .call(method: "OnboardRepo", params: ["slug": slug])
+            return .connected(done)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
     // MARK: Verbs
 
     enum DispatchOutcome {

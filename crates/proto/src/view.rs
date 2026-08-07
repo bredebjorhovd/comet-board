@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
 
 pub mod board;
+pub mod repos;
 
 // ---------------------------------------------------------------------------
 // Connection + status

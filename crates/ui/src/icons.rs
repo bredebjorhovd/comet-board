@@ -121,6 +121,10 @@ icon_assets![
     (CURSOR_MARK, "cursor-mark"),
     // opencode's favicon mark (the brand asset the CLI itself ships).
     (OPENCODE_MARK, "opencode-mark"),
+    // GitHub's own mark: the repo-first space picker (gh#118) names rows by
+    // `owner/repo`, and the glyph is what says those rows are repos rather than
+    // folders on somebody's disk.
+    (GITHUB_MARK, "github-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — comet keeps it even on the

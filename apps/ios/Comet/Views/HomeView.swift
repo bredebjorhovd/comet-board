@@ -75,7 +75,7 @@ struct HomeView: View {
                     } label: {
                         Image(systemName: "plus")
                     }
-                    .accessibilityLabel("New space")
+                    .accessibilityLabel("Add a repo")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -121,7 +121,9 @@ struct HomeView: View {
     private var spacesSection: some View {
         Section {
             if model.spaces.isEmpty {
-                Text("No spaces yet — add one from a desktop device")
+                // gh#118: reaching a space no longer means owning a desktop —
+                // "+" offers the board's repos and clones one onto the box.
+                Text("No repos yet — tap ＋ to connect one")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
