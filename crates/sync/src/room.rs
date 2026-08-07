@@ -52,6 +52,15 @@ const MAX_REASSEMBLED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FRAGMENT_COUNT: u64 = 16 * 1024;
 /// Presence timeout, matching the edge's `new EphemeralStore(30_000)`.
 const EPHEMERAL_TIMEOUT_MS: i64 = 30_000;
+/// Resend cadence for the `%EPH` sub-room join while the doc room is up and
+/// presence is not (gh#126). The eph join used to be fire-and-forget: sent once
+/// per session after `JoinResponseOk`, a `JoinError` only warned, and an
+/// unanswered join left `joined_eph` false forever — every outbound heartbeat
+/// silently dropped while doc sync stayed perfectly healthy, which is exactly
+/// the shape of a box that is up, roomed, and "offline" on every other screen.
+/// Nothing polices presence liveness the way `JOIN_RESPONSE_DEADLINE` polices
+/// the doc join, so the join is simply re-sent until it lands.
+const EPH_JOIN_RETRY: Duration = Duration::from_secs(15);
 /// Text `"ping"` keepalive interval — answered by the DO's hibernation-safe
 /// auto-response pair without waking it. 15s for the same reason as the
 /// device relay's (crates/rpc/src/device_room.rs): an idle-flow reaper on a
@@ -327,6 +336,7 @@ pub struct RoomClient {
     eph: EphemeralStore,
     events: broadcast::Sender<RoomEvent>,
     connected: watch::Receiver<bool>,
+    presence: watch::Receiver<bool>,
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// Doc + ephemeral local-update subscriptions (drop = unsubscribe).
@@ -383,6 +393,7 @@ impl RoomClient {
         let (events, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (connected_tx, connected_rx) = watch::channel(false);
+        let (presence_tx, presence_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let actor = RoomActor {
@@ -394,6 +405,7 @@ impl RoomClient {
             eph_rx,
             events: events.clone(),
             connected: Arc::new(ConnectedFlag(connected_tx)),
+            presence: Arc::new(ConnectedFlag(presence_tx)),
             shutdown: shutdown_rx,
         };
         let task = tokio::spawn(actor.run(ready_tx));
@@ -404,6 +416,7 @@ impl RoomClient {
                 eph,
                 events,
                 connected: connected_rx,
+                presence: presence_rx,
                 shutdown: shutdown_tx,
                 task: Some(task),
                 _subs: vec![sub_doc, sub_eph],
@@ -444,6 +457,24 @@ impl RoomClient {
     /// here rather than from the existence of the client (gh#116).
     pub fn connected(&self) -> bool {
         *self.connected.borrow()
+    }
+
+    /// Is the `%EPH` presence sub-room joined RIGHT NOW?
+    ///
+    /// Strictly narrower than [`Self::connected`]: presence rides its own
+    /// sub-room join on the same socket, and the edge answers (or refuses) it
+    /// independently of the doc machinery. A doc-live room with dead presence
+    /// is the gh#126 shape — every heartbeat silently dropped while sync looks
+    /// perfect — so health surfaces read this, never infer it from
+    /// `connected()`.
+    pub fn presence_joined(&self) -> bool {
+        *self.presence.borrow()
+    }
+
+    /// Watch [`Self::presence_joined`] (closes with the actor, like
+    /// [`Self::watch_connected`]).
+    pub fn watch_presence(&self) -> watch::Receiver<bool> {
+        self.presence.clone()
     }
 
     /// Watch [`Self::connected`]. The channel CLOSES when the actor task ends
@@ -494,6 +525,10 @@ struct RoomActor {
     /// `Arc` so the per-connection `Session` can raise it the moment the join
     /// is answered; dropped with the actor, which closes the watch.
     connected: Arc<ConnectedFlag>,
+    /// Same discipline for the `%EPH` sub-room: raised on its join answer,
+    /// lowered when the session ends — the truth behind
+    /// [`RoomClient::presence_joined`].
+    presence: Arc<ConnectedFlag>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -613,10 +648,12 @@ impl RoomActor {
             tx: pipe.tx.clone(),
             events: self.events.clone(),
             connected: self.connected.clone(),
+            presence: self.presence.clone(),
             pending: HashMap::new(),
             fragments: HashMap::new(),
             joined_lor: false,
             joined_eph: false,
+            eph_join_sent_at: None,
             invalid_rejoins: 0,
             full_resync_requested: false,
             join_sent_at: None,
@@ -649,6 +686,17 @@ impl RoomActor {
                 Some(sent) => (sent.max(sess.last_lor_rx) + JOIN_RESPONSE_DEADLINE, true),
                 None => (sess.last_lor_rx + probe_interval, false),
             };
+            // Presence must not die quieter than the doc room (gh#126): while
+            // the doc join has landed and the `%EPH` join has not — refused
+            // with a JoinError, or simply never answered — re-send it on a
+            // steady cadence. Cheap (one frame), idempotent server-side, and
+            // the only escape from a session whose presence sub-join was
+            // swallowed once and would otherwise stay dead for the session's
+            // whole life.
+            let eph_retry_at = (sess.joined_lor && !sess.joined_eph).then(|| {
+                sess.eph_join_sent_at
+                    .map_or_else(tokio::time::Instant::now, |at| at + EPH_JOIN_RETRY)
+            });
             tokio::select! {
                 // Biased so a buffered answer frame always beats an expired
                 // deadline in the same poll — never kill with the
@@ -721,6 +769,17 @@ impl RoomActor {
                         }
                     }
                 },
+                _ = async {
+                    match eph_retry_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::debug!(room = %self.room_id, "presence sub-room unjoined; re-sending %EPH join");
+                    if let Err(err) = sess.send_join_eph().await {
+                        break SessionEnd::Lost(err);
+                    }
+                }
                 _ = tokio::time::sleep_until(liveness_at) => {
                     if join_outstanding {
                         // The 2026-07-30 hang: a room that accepted the socket
@@ -753,8 +812,9 @@ impl RoomActor {
         };
         let joined = sess.joined_lor;
         // The session is over whatever the reason; nothing is live again until
-        // the next JoinResponseOk raises this.
+        // the next JoinResponseOk raises these.
         self.connected.set(false);
+        self.presence.set(false);
         (end, joined)
     }
 }
@@ -778,12 +838,18 @@ struct Session {
     /// answered probe IS proof the room is live); lowered by the actor when the
     /// session ends.
     connected: Arc<ConnectedFlag>,
+    /// Raised on the answered `%EPH` join; lowered with the session. The
+    /// health census reads this ([`RoomClient::presence_joined`], gh#126).
+    presence: Arc<ConnectedFlag>,
     /// Sent-but-unacked outbound batches, kept for FragmentTimeout resends.
     pending: HashMap<BatchId, Vec<Vec<u8>>>,
     /// Inbound reassembly buffers.
     fragments: HashMap<BatchId, FragmentBuffer>,
     joined_lor: bool,
     joined_eph: bool,
+    /// Instant of the last `%EPH` JoinRequest — `run_session` re-sends on
+    /// [`EPH_JOIN_RETRY`] while `joined_lor && !joined_eph` (gh#126).
+    eph_join_sent_at: Option<tokio::time::Instant>,
     invalid_rejoins: u32,
     full_resync_requested: bool,
     /// Instant of the last `%LOR` JoinRequest still awaiting `JoinResponseOk`
@@ -841,6 +907,21 @@ impl Session {
         .await
     }
 
+    /// Join (or re-join) the `%EPH` presence sub-room. Stamped so
+    /// `run_session` can re-send on [`EPH_JOIN_RETRY`] until it is answered —
+    /// the fire-and-forget version left presence dead for the session's whole
+    /// life whenever this one frame was refused or swallowed (gh#126).
+    async fn send_join_eph(&mut self) -> Result<(), SyncError> {
+        self.eph_join_sent_at = Some(tokio::time::Instant::now());
+        self.send(&ProtocolMessage::JoinRequest {
+            crdt: CrdtType::LoroEphemeralStore,
+            room_id: self.room_id.clone(),
+            auth: Vec::new(),
+            version: Vec::new(),
+        })
+        .await
+    }
+
     async fn handle_frame(
         &mut self,
         bytes: &[u8],
@@ -888,7 +969,9 @@ impl Session {
                     }
                     return Ok(Some(SessionEnd::Evicted(format!("{code:?}: {message}"))));
                 }
-                tracing::warn!(room = %self.room_id, ?code, %message, "ephemeral join failed");
+                // Not fatal, and no longer fire-and-forget: `joined_eph` stays
+                // false, so run_session re-sends the join on EPH_JOIN_RETRY.
+                tracing::warn!(room = %self.room_id, ?code, %message, "ephemeral join failed; will retry");
                 Ok(None)
             }
             ProtocolMessage::DocUpdate { crdt, updates, .. } => {
@@ -1005,16 +1088,16 @@ impl Session {
                     // join side effects below every probe would re-join %EPH
                     // (re-uploading full presence) and re-broadcast Connected
                     // (consumers treat it as "resync underway") on a timer.
+                    // The one exception: a presence sub-room that never came
+                    // up — re-asking for it is exactly what the probe's
+                    // "still alive" answer makes safe (gh#126).
+                    if !self.joined_eph {
+                        self.send_join_eph().await?;
+                    }
                     return Ok(());
                 }
                 // Join presence once the doc room is up.
-                self.send(&ProtocolMessage::JoinRequest {
-                    crdt: CrdtType::LoroEphemeralStore,
-                    room_id: self.room_id.clone(),
-                    auth: Vec::new(),
-                    version: Vec::new(),
-                })
-                .await?;
+                self.send_join_eph().await?;
                 if let Some(tx) = ready.take() {
                     let _ = tx.send(Ok(()));
                 }
@@ -1022,6 +1105,7 @@ impl Session {
             }
             CrdtType::LoroEphemeralStore => {
                 self.joined_eph = true;
+                self.presence.set(true);
                 let all = self.eph.encode_all();
                 if !all.is_empty() {
                     self.send_eph_updates(vec![all]).await?;

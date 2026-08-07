@@ -42,6 +42,12 @@ struct FakeEdge {
     mute: AtomicBool,
     leaves: AtomicUsize,
     join_requests: AtomicUsize,
+    /// Swallow this many `%EPH` JoinRequests (consume, answer nothing) — the
+    /// gh#126 shape: the doc room joins fine while the presence sub-join is
+    /// lost, and nothing at any layer notices.
+    swallow_eph_joins: AtomicUsize,
+    /// `%EPH` JoinRequests received (swallowed ones included).
+    eph_join_requests: AtomicUsize,
     /// Connector dials (initial connect + every redial).
     dials: AtomicUsize,
     /// `%LOR` DocUpdate messages received (liveness probes must send none).
@@ -59,6 +65,8 @@ impl FakeEdge {
             mute: AtomicBool::new(false),
             leaves: AtomicUsize::new(0),
             join_requests: AtomicUsize::new(0),
+            swallow_eph_joins: AtomicUsize::new(0),
+            eph_join_requests: AtomicUsize::new(0),
             dials: AtomicUsize::new(0),
             loro_doc_updates: AtomicUsize::new(0),
         })
@@ -184,6 +192,16 @@ impl FakeEdge {
                 room_id,
                 ..
             } => {
+                self.eph_join_requests.fetch_add(1, Ordering::SeqCst);
+                // gh#126: a swallowed presence join — accepted socket, healthy
+                // doc room, and this one frame vanishes.
+                if self
+                    .swallow_eph_joins
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return;
+                }
                 self.reply(
                     reply_to,
                     &ProtocolMessage::JoinResponseOk {
@@ -864,5 +882,50 @@ async fn healthy_session_join_backfill_reconnect_still_works() {
     doc.commit();
     wait_until(|| doc_text(&edge.doc).contains("after reconnect")).await;
 
+    client.shutdown().await.unwrap();
+}
+
+/// gh#126 — the presence sub-join is no longer fire-and-forget.
+///
+/// The doc room joins fine while the one `%EPH` JoinRequest vanishes (a
+/// swallowed frame, or a JoinError that used to only warn). Before the fix,
+/// `joined_eph` stayed false for the session's whole life: every outbound
+/// heartbeat was silently dropped while doc sync looked perfect — a box that
+/// is up, roomed, and "offline" on every other device. The session now
+/// re-sends the join on a cadence until it lands.
+#[tokio::test(start_paused = true)]
+async fn a_swallowed_presence_join_is_retried_until_presence_flows() {
+    let edge = FakeEdge::new();
+    edge.swallow_eph_joins.store(2, Ordering::SeqCst);
+
+    let client = RoomClient::connect_with(edge.connector(), "room-eph", LoroDoc::new())
+        .await
+        .expect("connect");
+    assert!(client.connected(), "doc room is up");
+    assert!(
+        !client.presence_joined(),
+        "the eph join was swallowed — presence must KNOW it is down"
+    );
+
+    // A heartbeat published while presence is down…
+    client.ephemeral().set("presence/dev-a", 1_i64);
+
+    // …must still reach the room: the retry re-sends the join (twice, here)
+    // and the join answer re-uploads the full local presence state. The
+    // retries live at virtual t=15s/30s — beyond `wait_until`'s 10s budget —
+    // so this wait carries its own, wider one.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !matches!(edge.eph.get("presence/dev-a"), Some(loro::LoroValue::I64(1)))
+            || !client.presence_joined()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("presence must recover through the join retry");
+    assert!(
+        edge.eph_join_requests.load(Ordering::SeqCst) >= 3,
+        "two swallowed + at least one answered"
+    );
     client.shutdown().await.unwrap();
 }

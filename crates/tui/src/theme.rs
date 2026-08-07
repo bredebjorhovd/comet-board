@@ -348,6 +348,25 @@ impl Theme {
     /// pane to the sidebar. The one thing this adds is NO_COLOR emphasis — the
     /// two states that want a human are bold when hue is gone, exactly as the
     /// status dot's are.
+    /// The Needs-you inbox's glyph colour (gh#122): the hues its members
+    /// already carry everywhere else — a question is the awaiting indigo, a
+    /// dead run is danger, a report is the finished-unseen green — so a thing
+    /// does not change colour by entering the inbox. Under `NO_COLOR` the two
+    /// blocking kinds go bold, exactly as the status dots do.
+    pub fn need_kind(&self, kind: comet_proto::view::needs::NeedKind) -> Style {
+        use comet_proto::view::needs::NeedKind as K;
+        let style = Style::default().fg(match kind {
+            K::Question => self.dot_awaiting,
+            K::DeadRun => self.danger,
+            K::Report => self.dot_completed,
+        });
+        if self.plain && kind != K::Report {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
+
     pub fn agent_state(&self, state: comet_proto::view::board::AgentState) -> Style {
         use comet_proto::view::board::{AgentState as A, BoardState as S};
         let style = self.board_state(match state {

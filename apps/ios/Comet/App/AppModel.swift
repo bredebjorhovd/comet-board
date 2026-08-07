@@ -297,7 +297,31 @@ final class AppModel {
     var activeChats: [ActiveRow] {
         let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
         let chats = demo?.chats ?? workspace?.chats ?? []
-        return activeRows(rows: boardRows, chats: chats, sessions: sessions)
+        return activeRows(rows: boardRows, chats: chats, sessions: sessions,
+                          orchestrator: orchestratorChatId)
+    }
+
+    /// Which chat the board has pinned as its orchestrator (gh#104), off the
+    /// host the board sweep settled on.
+    var orchestratorChatId: String? {
+        demo != nil ? demo?.orchestratorChatId : board?.orchestratorChatId
+    }
+
+    /// The "Needs you" inbox (gh#122): everything waiting on a human, most
+    /// owed first, joined from the four streams the app already holds.
+    var needsYouRows: [NeedRow] {
+        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
+        let chats = demo?.chats ?? workspace?.chats ?? []
+        return needsYou(orchestrator: orchestratorChatId, rows: boardRows,
+                        chats: chats, sessions: sessions)
+    }
+
+    /// The orchestrator's pinned slot (gh#122), or `nil` when none is pinned.
+    var orchestratorSlotRow: OrchestratorSlot? {
+        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
+        let chats = demo?.chats ?? workspace?.chats ?? []
+        return orchestratorSlot(orchestrator: orchestratorChatId,
+                                chats: chats, sessions: sessions)
     }
 
     /// The runtimes and logins a dispatch picker offers. Both belong to the

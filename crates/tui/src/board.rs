@@ -8,15 +8,18 @@
 //! later without re-deriving any of it, because nothing here recomputes a rule
 //! that proto already owns.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use comet_proto::view::board::{self, BoardState, Filter, TaskRow};
 
-/// A line the board body draws: a section header, or a task row.
+/// A line the board body draws: a section header, a route's group header
+/// within it (gh#125), or a task row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoardRow {
     Section(BoardState),
+    /// One route's group inside a section. `None` is the `no route` group.
+    Group(BoardState, Option<String>),
     Task(String),
 }
 
@@ -26,6 +29,7 @@ impl BoardRow {
     pub fn id(&self) -> String {
         match self {
             BoardRow::Section(state) => section_row_id(*state),
+            BoardRow::Group(state, route) => group_row_id(*state, route.as_deref()),
             BoardRow::Task(id) => id.clone(),
         }
     }
@@ -35,6 +39,15 @@ impl BoardRow {
 /// id space.
 pub fn section_row_id(state: BoardState) -> String {
     format!("\u{0}section:{}", state.as_str())
+}
+
+/// Selection id for a route group's header, under the same NUL convention.
+pub fn group_row_id(state: BoardState, route: Option<&str>) -> String {
+    format!(
+        "\u{0}group:{}:{}",
+        state.as_str(),
+        route.unwrap_or(board::NO_ROUTE)
+    )
 }
 
 pub struct Board {
@@ -47,6 +60,9 @@ pub struct Board {
     /// Sections folded away. `done` starts folded: it is history, and the rest
     /// is the queue.
     pub collapsed: HashSet<BoardState>,
+    /// Per-group fold overrides (gh#125). Absent means the group's default —
+    /// open for a named route, folded for `no route`.
+    pub group_folds: HashMap<(BoardState, Option<String>), bool>,
     /// First body line on screen; rows below the fold are otherwise
     /// unreachable, which on a short pane is most of the board.
     pub scroll: usize,
@@ -68,6 +84,7 @@ impl Board {
             typing: false,
             selected: None,
             collapsed: HashSet::from([BoardState::Done]),
+            group_folds: HashMap::new(),
             scroll: 0,
             height: 1,
         }
@@ -85,15 +102,30 @@ impl Board {
         board::sections(&self.rows, &self.filter, Utc::now())
     }
 
-    /// Every line the body draws, in display order.
+    /// The sections with each one's rows grouped by route (gh#125).
+    pub fn grouped(&self) -> Vec<(BoardState, Vec<board::SectionGroup<'_>>)> {
+        board::grouped_sections(&self.rows, &self.filter, Utc::now())
+    }
+
+    /// Every line the body draws, in display order. Group headers appear only
+    /// where the shared rule says they earn their row.
     pub fn lines(&self) -> Vec<BoardRow> {
         let mut out = Vec::new();
-        for (state, rows) in self.sections() {
+        for (state, groups) in self.grouped() {
             out.push(BoardRow::Section(state));
             if self.is_collapsed(state) {
                 continue;
             }
-            out.extend(rows.iter().map(|row| BoardRow::Task(row.id.clone())));
+            let headers = board::group_headers_shown(&self.filter, &groups);
+            for group in groups {
+                if headers {
+                    out.push(BoardRow::Group(state, group.route.clone()));
+                    if self.is_group_collapsed(state, group.route.as_deref()) {
+                        continue;
+                    }
+                }
+                out.extend(group.rows.iter().map(|row| BoardRow::Task(row.id.clone())));
+            }
         }
         out
     }
@@ -134,6 +166,49 @@ impl Board {
         }
     }
 
+    /// The group header the cursor is on, if any.
+    pub fn on_group(&self) -> Option<(BoardState, Option<String>)> {
+        let id = self.selected.as_deref()?;
+        self.lines().into_iter().find_map(|line| match line {
+            BoardRow::Group(state, route)
+                if group_row_id(state, route.as_deref()) == id =>
+            {
+                Some((state, route))
+            }
+            _ => None,
+        })
+    }
+
+    /// Folded, by the operator's override or the group's default: a named
+    /// route's group is open, the `no route` group starts folded on the
+    /// unfiltered board (gh#125).
+    pub fn is_group_collapsed(&self, state: BoardState, route: Option<&str>) -> bool {
+        self.group_folds
+            .get(&(state, route.map(str::to_string)))
+            .copied()
+            .unwrap_or_else(|| board::group_starts_collapsed(&self.filter, route))
+    }
+
+    pub fn toggle_group(&mut self, state: BoardState, route: Option<&str>) {
+        let folded = self.is_group_collapsed(state, route);
+        self.group_folds
+            .insert((state, route.map(str::to_string)), !folded);
+    }
+
+    /// How many rows a group holds, for the count on its header.
+    pub fn group_len(&self, state: BoardState, route: Option<&str>) -> usize {
+        self.grouped()
+            .into_iter()
+            .find(|(s, _)| *s == state)
+            .and_then(|(_, groups)| {
+                groups
+                    .into_iter()
+                    .find(|g| g.route.as_deref() == route)
+                    .map(|g| g.rows.len())
+            })
+            .unwrap_or(0)
+    }
+
     /// How many rows a section holds, for the count on a folded header.
     pub fn section_len(&self, state: BoardState) -> usize {
         self.sections()
@@ -150,7 +225,7 @@ impl Board {
             .into_iter()
             .find_map(|line| match line {
                 BoardRow::Task(id) => Some(id),
-                BoardRow::Section(_) => None,
+                BoardRow::Section(_) | BoardRow::Group(..) => None,
             })
     }
 

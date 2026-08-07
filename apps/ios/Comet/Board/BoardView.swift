@@ -23,9 +23,12 @@ struct BoardView: View {
     @State private var now = Date()
     @State private var dispatching: DispatchTarget?
     @State private var notice: String?
+    /// Per-group fold overrides (gh#125), keyed `state:route`. Absent means the
+    /// group's default — open for a named route, folded for `no route`.
+    @State private var groupFolds: [String: Bool] = [:]
 
-    private var sections: [(state: BoardState, rows: [TaskRow])] {
-        boardSections(model.boardRows, now: now)
+    private var sections: [(state: BoardState, groups: [BoardSectionGroup])] {
+        groupedBoardSections(model.boardRows, now: now)
     }
 
     private var counting: Bool {
@@ -38,18 +41,27 @@ struct BoardView: View {
                 emptyState
             }
             ForEach(sections, id: \.state) { section in
+                let headers = boardGroupHeadersShown(section.groups)
                 Section {
-                    ForEach(section.rows) { row in
-                        BoardTaskRowView(row: row, now: now,
-                                         onOpen: { open(row) },
-                                         onDispatch: { dispatching = target(for: row) },
-                                         onCancel: { cancel(row) })
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                    ForEach(section.groups, id: \.label) { group in
+                        if headers {
+                            groupHeader(section.state, group)
+                        }
+                        if !headers || !isFolded(section.state, group) {
+                            ForEach(group.rows) { row in
+                                BoardTaskRowView(row: row, now: now,
+                                                 onOpen: { open(row) },
+                                                 onDispatch: { dispatching = target(for: row) },
+                                                 onCancel: { cancel(row) })
+                                    .listRowBackground(Color.clear)
+                                    .listRowSeparator(.hidden)
+                                    .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                            }
+                        }
                     }
                 } header: {
-                    sectionHeader(section.state, count: section.rows.count)
+                    sectionHeader(section.state,
+                                  count: section.groups.reduce(0) { $0 + $1.rows.count })
                 }
             }
         }
@@ -135,6 +147,45 @@ struct BoardView: View {
 
     // MARK: Chrome
 
+    private func foldKey(_ state: BoardState, _ group: BoardSectionGroup) -> String {
+        "\(state.rawValue):\(group.label)"
+    }
+
+    private func isFolded(_ state: BoardState, _ group: BoardSectionGroup) -> Bool {
+        groupFolds[foldKey(state, group)] ?? group.startsCollapsed
+    }
+
+    /// A route's group header inside a section (gh#125): chevron, name, count.
+    /// `no route` is the trailing group and starts folded — visibility-only
+    /// rows get a headline, never pole position.
+    private func groupHeader(_ state: BoardState, _ group: BoardSectionGroup) -> some View {
+        let folded = isFolded(state, group)
+        return Button {
+            groupFolds[foldKey(state, group)] = !folded
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: folded ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.textFaint)
+                Text(group.label)
+                    .font(Theme.sans(11, weight: .medium))
+                    .foregroundStyle(group.route == nil
+                        ? Theme.textFaint
+                        : Theme.textMuted.opacity(0.85))
+                Text("\(group.rows.count)")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.textFaint.opacity(0.7))
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 2, leading: 20, bottom: 0, trailing: 12))
+    }
+
     private func sectionHeader(_ state: BoardState, count: Int) -> some View {
         HStack(spacing: 6) {
             Text(state.glyph)
@@ -207,7 +258,9 @@ struct BoardTaskRowView: View {
                         .font(Theme.mono(11))
                         .foregroundStyle(boardStateColor(row.boardState))
                         .frame(width: 10)
-                    Text(row.identifier)
+                    // The repo-qualified token (gh#125): `tally #507`, because
+                    // `gh#507` alone is ambiguous across repos.
+                    Text(row.displayIdentifier)
                         .font(Theme.mono(11))
                         .foregroundStyle(Theme.textMuted)
                         .lineLimit(1)

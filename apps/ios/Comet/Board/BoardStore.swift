@@ -22,6 +22,11 @@ import Observation
 final class BoardStore {
     /// The board's rows, newest frame wins. Empty until a host answers.
     private(set) var rows: [TaskRow] = []
+    /// Which chat the board has pinned as its orchestrator (gh#104/gh#122) —
+    /// the `WatchBoardOrchestrator` stream, ridden on the same host the board
+    /// sweep settled on. `nil` is a board with no orchestrator, which is a
+    /// legitimate way to run one.
+    private(set) var orchestratorChatId: String?
     /// The device currently serving this board, once the sweep has settled.
     private(set) var hostDeviceId: String?
     /// True once any host has ever delivered a frame — the difference between
@@ -40,6 +45,7 @@ final class BoardStore {
     private let devices: () -> [DeviceRow]
     private var relayClients: [String: DeviceRelayClient] = [:]
     private var watchTask: Task<Void, Never>?
+    private var pinTask: Task<Void, Never>?
 
     init(config: AppConfig, devices: @escaping () -> [DeviceRow]) {
         self.config = config
@@ -56,6 +62,8 @@ final class BoardStore {
     func stop() {
         watchTask?.cancel()
         watchTask = nil
+        pinTask?.cancel()
+        pinTask = nil
         let clients = relayClients.values
         relayClients.removeAll()
         Task { for client in clients { await client.close() } }
@@ -70,10 +78,25 @@ final class BoardStore {
 
     // MARK: The sweep
 
+    private enum WatchOutcome {
+        /// It is the board host and we held it until its stream ended.
+        case settled
+        /// It hosts a board, but one with no dispatch evidence (gh#125) — held
+        /// as a fallback while the sweep keeps asking.
+        case held
+        /// It hosts no board; the sweep moves on.
+        case notMe
+    }
+
     /// Sweep the candidates until one answers, hold that host until its stream
     /// ends, then sweep again. Backoff is per *round*, not per candidate: a
     /// board that is simply down should not make the phone hammer every device
     /// in the org.
+    ///
+    /// A frame proves a board exists, not that it is the org's board (gh#125):
+    /// a candidate whose board shows no dispatch evidence is held rather than
+    /// settled on, so a laptop's stale test board loses to the box everyone
+    /// works from — and still shows when nobody else answers.
     private func watchLoop() async {
         var backoff: UInt64 = 2
         while !Task.isCancelled {
@@ -87,15 +110,31 @@ final class BoardStore {
                 continue
             }
             var answered = false
+            var fallback: String?
             for deviceId in candidates where !Task.isCancelled {
-                if await watch(deviceId: deviceId) {
+                switch await watch(deviceId: deviceId, settling: false) {
+                case .settled:
                     answered = true
-                    backoff = 2
-                    break  // its stream ended; sweep again from the top
+                case .held:
+                    // First held answer wins the slot — earliest in sweep order.
+                    if fallback == nil { fallback = deviceId }
+                    continue
+                case .notMe:
+                    continue
+                }
+                break  // its stream ended; sweep again from the top
+            }
+            if !answered, let fallback, !Task.isCancelled {
+                // Nobody with dispatch evidence answered; the held board is
+                // the best there is. Settle on it this round.
+                if case .settled = await watch(deviceId: fallback, settling: true) {
+                    answered = true
                 }
             }
             if Task.isCancelled { return }
-            if !answered {
+            if answered {
+                backoff = 2
+            } else {
                 hostDeviceId = nil
                 status = attached
                     ? "Lost the board — retrying"
@@ -106,20 +145,22 @@ final class BoardStore {
         }
     }
 
-    /// Watch one candidate. Returns true if it ever delivered a frame (i.e. it
-    /// IS the board host and we held it until the stream ended); false means it
-    /// hosts no board and the sweep should move on.
-    private func watch(deviceId: String) async -> Bool {
+    /// Watch one candidate. `settling` skips the dispatch-evidence check — the
+    /// sweep already exhausted the org and is returning to its held fallback.
+    private func watch(deviceId: String, settling: Bool) async -> WatchOutcome {
         let stream = await relay(for: deviceId).subscribe(method: "WatchBoard", params: [:])
         var delivered = false
         do {
             for try await item in stream {
-                guard !Task.isCancelled else { return true }
+                guard !Task.isCancelled else { return .settled }
                 // A frame that will not decode is a schema skew, not a "no
                 // board here" — keep the host and keep the last good rows.
-                if let decoded = try? JSONDecoder().decode([TaskRow].self, from: item) {
-                    rows = decoded
+                let decoded = try? JSONDecoder().decode([TaskRow].self, from: item)
+                if !delivered, !settling, let decoded, !boardDispatched(decoded) {
+                    // Dropping the stream cancels the subscription.
+                    return .held
                 }
+                if let decoded { rows = decoded }
                 if !delivered {
                     delivered = true
                     attached = true
@@ -128,6 +169,11 @@ final class BoardStore {
                     // The pickers' data belongs to the host that will run the
                     // dispatch — reload it whenever the host changes.
                     Task { [weak self] in await self?.loadPickerCatalogs(host: deviceId) }
+                    // The pin rides the same host: it answers a question about
+                    // this board, and the sidebar's orchestrator slot needs it
+                    // before any board screen has been opened (gh#122).
+                    pinTask?.cancel()
+                    pinTask = watchPin(deviceId: deviceId)
                 }
             }
         } catch {
@@ -135,7 +181,35 @@ final class BoardStore {
             // link, not a verdict — `delivered` keeps that distinction.
             if delivered { status = "Board connection dropped — retrying" }
         }
-        return delivered
+        // The board stream ended, so the pin stream's host is over too; the
+        // last-known pin is kept, exactly as the rows are, until the next host
+        // answers with a fresh one.
+        pinTask?.cancel()
+        pinTask = nil
+        return delivered ? .settled : .notMe
+    }
+
+    /// The `WatchBoardOrchestrator` stream (gh#104): the current pin first,
+    /// then every change. A frame that will not decode is schema skew — keep
+    /// the last good value, the same discipline the row stream keeps.
+    private func watchPin(deviceId: String) -> Task<Void, Never> {
+        Task { [weak self] in
+            guard let self else { return }
+            struct Pin: Decodable { var chatId: String? }
+            let stream = await self.relay(for: deviceId)
+                .subscribe(method: "WatchBoardOrchestrator", params: [:])
+            do {
+                for try await item in stream {
+                    guard !Task.isCancelled else { return }
+                    if let pin = try? JSONDecoder().decode(Pin.self, from: item) {
+                        self.orchestratorChatId = pin.chatId
+                    }
+                }
+            } catch {
+                // A dropped pin stream is not a verdict on the board; the row
+                // stream's own lifecycle drives the resweep.
+            }
+        }
     }
 
     // MARK: Picker catalogs

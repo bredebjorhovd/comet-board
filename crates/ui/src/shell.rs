@@ -2246,6 +2246,10 @@ impl Shell {
         let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
+        // First, the inbox (gh#122): does anything want me — in words, and it
+        // cannot miss. Then the orchestrator's pinned slot, above Spaces.
+        let needs_section = self.render_needs_section(theme, cx);
+        let orchestrator_slot = self.render_orchestrator_slot(theme, cx);
         let spaces_section = self.render_spaces_section(theme, cx);
         // Between the spaces and the sessions: everything alive in one Active
         // group (gh#123) — board attempts (gh#103) and the runs the board
@@ -2279,6 +2283,8 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
+                            .child(needs_section)
+                            .children(orchestrator_slot)
                             .child(spaces_section)
                             .children(active_section)
                     .child(

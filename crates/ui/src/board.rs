@@ -48,10 +48,13 @@
 //! Finding the host needs no configuration. The engine refuses `WatchBoard`
 //! outright when it hosts no board, so a candidate that ends its stream without
 //! ever delivering a frame has answered "not me", and the watch loop walks the
-//! candidates from `comet_proto::view::board::host_candidates` until one
-//! answers. The header's host chip pins a device explicitly when the guess is
-//! wrong (or when two boxes both host a board), and offers "Automatic" to hand
-//! the sweep back.
+//! candidates from `comet_proto::view::board::host_candidates`. A frame alone
+//! does not settle the sweep (gh#125): a board with no dispatch evidence
+//! (`board_dispatched`) is held as a fallback while the rest of the org is
+//! asked, so a laptop's stale test board loses to the box everyone works from
+//! — and still shows when nobody else answers. The title's "on {device}"
+//! segment pins a device explicitly when the guess is wrong (or when two boxes
+//! both host a board), and offers "Automatic" to hand the sweep back.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -64,6 +67,7 @@ use gpui::{
 };
 
 use comet_proto::view::board::{self, BoardState, Filter, TaskRow};
+use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
 use comet_rpc::methods;
 use serde::Deserialize;
@@ -404,10 +408,13 @@ fn dispatch_picker_owns_key(key: &str, search_focused: bool) -> bool {
     }
 }
 
-/// A line the board body draws: a section header, or a task row.
+/// A line the board body draws: a section header, a route's group header
+/// within it (gh#125), or a task row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoardLine {
     Section(BoardState),
+    /// One route's group inside a section. `None` is the `no route` group.
+    Group(BoardState, Option<String>),
     Task(String),
 }
 
@@ -417,6 +424,7 @@ impl BoardLine {
     fn id(&self) -> String {
         match self {
             BoardLine::Section(state) => section_row_id(*state),
+            BoardLine::Group(state, route) => group_row_id(*state, route.as_deref()),
             BoardLine::Task(id) => id.clone(),
         }
     }
@@ -426,6 +434,15 @@ impl BoardLine {
 /// id space.
 fn section_row_id(state: BoardState) -> String {
     format!("\u{0}section:{}", state.as_str())
+}
+
+/// Selection id for a route group's header, under the same NUL convention.
+fn group_row_id(state: BoardState, route: Option<&str>) -> String {
+    format!(
+        "\u{0}group:{}:{}",
+        state.as_str(),
+        route.unwrap_or(board::NO_ROUTE)
+    )
 }
 
 /// The accent a board state carries, matching the TUI's palette: blocked and
@@ -478,6 +495,10 @@ pub struct BoardModel {
     /// Sections folded away. `done` starts folded: it is history, and the rest
     /// is the queue.
     pub collapsed: HashSet<BoardState>,
+    /// Per-group fold overrides (gh#125). Absent means the group's default —
+    /// open for a named route, folded for `no route` — so a group the operator
+    /// never touched keeps following the rule as it comes and goes.
+    pub group_folds: HashMap<(BoardState, Option<String>), bool>,
 }
 
 impl BoardModel {
@@ -489,6 +510,7 @@ impl BoardModel {
             typing: false,
             selected: None,
             collapsed: HashSet::from([BoardState::Done]),
+            group_folds: HashMap::new(),
         }
     }
 
@@ -504,15 +526,30 @@ impl BoardModel {
         board::sections(&self.rows, &self.filter, Utc::now())
     }
 
-    /// Every line the body draws, in display order.
+    /// The sections with each one's rows grouped by route (gh#125).
+    pub fn grouped(&self) -> Vec<(BoardState, Vec<board::SectionGroup<'_>>)> {
+        board::grouped_sections(&self.rows, &self.filter, Utc::now())
+    }
+
+    /// Every line the body draws, in display order. Group headers appear only
+    /// where the shared rule says they earn their row.
     pub fn lines(&self) -> Vec<BoardLine> {
         let mut out = Vec::new();
-        for (state, rows) in self.sections() {
+        for (state, groups) in self.grouped() {
             out.push(BoardLine::Section(state));
             if self.collapsed.contains(&state) {
                 continue;
             }
-            out.extend(rows.iter().map(|row| BoardLine::Task(row.id.clone())));
+            let headers = board::group_headers_shown(&self.filter, &groups);
+            for group in groups {
+                if headers {
+                    out.push(BoardLine::Group(state, group.route.clone()));
+                    if self.is_group_collapsed(state, group.route.as_deref()) {
+                        continue;
+                    }
+                }
+                out.extend(group.rows.iter().map(|row| BoardLine::Task(row.id.clone())));
+            }
         }
         out
     }
@@ -550,6 +587,49 @@ impl BoardModel {
         if !self.collapsed.remove(&state) {
             self.collapsed.insert(state);
         }
+    }
+
+    /// The group header the cursor is on, if any.
+    pub fn on_group(&self) -> Option<(BoardState, Option<String>)> {
+        let id = self.selected.as_deref()?;
+        self.lines().into_iter().find_map(|line| match line {
+            BoardLine::Group(state, route)
+                if group_row_id(state, route.as_deref()) == id =>
+            {
+                Some((state, route))
+            }
+            _ => None,
+        })
+    }
+
+    /// Folded, by the operator's override or the group's default: a named
+    /// route's group is open, the `no route` group starts folded on the
+    /// unfiltered board (gh#125).
+    pub fn is_group_collapsed(&self, state: BoardState, route: Option<&str>) -> bool {
+        self.group_folds
+            .get(&(state, route.map(str::to_string)))
+            .copied()
+            .unwrap_or_else(|| board::group_starts_collapsed(&self.filter, route))
+    }
+
+    pub fn toggle_group(&mut self, state: BoardState, route: Option<&str>) {
+        let folded = self.is_group_collapsed(state, route);
+        self.group_folds
+            .insert((state, route.map(str::to_string)), !folded);
+    }
+
+    /// How many rows a group holds, for the count on its header.
+    pub fn group_len(&self, state: BoardState, route: Option<&str>) -> usize {
+        self.grouped()
+            .into_iter()
+            .find(|(s, _)| *s == state)
+            .and_then(|(_, groups)| {
+                groups
+                    .into_iter()
+                    .find(|g| g.route.as_deref() == route)
+                    .map(|g| g.rows.len())
+            })
+            .unwrap_or(0)
     }
 
     /// How many rows a section holds, for the count on a folded header.
@@ -727,9 +807,16 @@ pub struct BoardPanel {
     /// and a silent device stays selected (with a banner) instead of being
     /// walked past.
     host_pinned: bool,
-    /// The current host has delivered at least one frame, so it really does
-    /// host the board. Drives the chip's presence dot.
+    /// The current host has delivered at least one frame the sweep settled on,
+    /// so it really is this panel's board. Drives the title's presence dot.
     host_confirmed: bool,
+    /// A host the automatic sweep held instead of settling on (gh#125): it
+    /// delivered a frame, but a board with no dispatch evidence must lose to
+    /// the org's active host if one answers. Used when the sweep exhausts.
+    sweep_fallback: Option<Option<String>>,
+    /// The sweep is returning to its held fallback: nobody with dispatch
+    /// evidence answered, so the next frame settles regardless.
+    sweep_settling: bool,
     host_menu_open: bool,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
@@ -832,6 +919,8 @@ impl BoardPanel {
             host: None,
             host_pinned: false,
             host_confirmed: false,
+            sweep_fallback: None,
+            sweep_settling: false,
             host_menu_open: false,
             host_menu_dismissed_at: None,
             dispatch: None,
@@ -857,7 +946,29 @@ impl BoardPanel {
     /// and every live chat is an unmanaged row.
     pub fn active(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::ActiveRow> {
         let state = self.state.read(cx);
-        board::active_rows(&self.model.rows, &state.chats, &state.sessions, now)
+        board::active_rows(
+            &self.model.rows,
+            &state.chats,
+            &state.sessions,
+            state.orchestrator.as_deref(),
+            now,
+        )
+    }
+
+    /// The "Needs you" inbox (gh#122): everything waiting on a human, as rows
+    /// that say who and what in words. Here for the same reason
+    /// [`BoardPanel::active`] is — the panel is the one holder of this
+    /// device-swept board's rows, and the inbox joins them to the pin, the
+    /// chats and the session watch.
+    pub fn needs(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<needs_view::NeedRow> {
+        let state = self.state.read(cx);
+        needs_view::needs_you(
+            state.orchestrator.as_deref(),
+            &self.model.rows,
+            &state.chats,
+            &state.sessions,
+            now,
+        )
     }
 
     /// Shell toggle hook. Opening starts the watch; closing keeps the rows so
@@ -911,6 +1022,8 @@ impl BoardPanel {
         self.host = host;
         self.host_pinned = pinned;
         self.host_confirmed = false;
+        self.sweep_fallback = None;
+        self.sweep_settling = false;
         self.error = None;
         // A different device is a different board: drop the rows rather than
         // leave another box's tasks on screen under the new host's name.
@@ -922,6 +1035,41 @@ impl BoardPanel {
             self.watch_task = Some(Self::spawn_watch(engine, cx));
         }
         cx.notify();
+    }
+
+    /// The watch loop's verdict on a frame from the current host. Returns true
+    /// when the sweep should move on instead of settling here (gh#125): an
+    /// automatic sweep holds a board with no dispatch evidence as a fallback
+    /// while other candidates remain unasked — a local board that exists but
+    /// was never dispatched from must lose to the org's active host.
+    fn host_frame(&mut self, rows: Vec<TaskRow>, cx: &mut Context<Self>) -> bool {
+        self.error = None;
+        if !self.host_confirmed {
+            if !self.host_pinned && !self.sweep_settling && !board::board_dispatched(&rows) {
+                let (devices, local) = {
+                    let state = self.state.read(cx);
+                    (state.devices.clone(), state.local_device_id.clone())
+                };
+                let candidates = board::host_candidates(&devices, local.as_deref());
+                if let Some(next) = board::next_host_candidate(&candidates, self.host.as_deref())
+                {
+                    // First held answer wins the fallback slot — it is the
+                    // earliest in sweep order, which is the old tie-break.
+                    if self.sweep_fallback.is_none() {
+                        self.sweep_fallback = Some(self.host.clone());
+                    }
+                    self.host = next;
+                    cx.notify();
+                    return true;
+                }
+            }
+            self.host_confirmed = true;
+            self.sweep_fallback = None;
+            self.sweep_settling = false;
+        }
+        self.model.set_rows(rows);
+        cx.notify();
+        false
     }
 
     /// The watch loop's verdict on a host whose stream just ended. Returns
@@ -952,16 +1100,28 @@ impl BoardPanel {
             Some(next) => {
                 self.host = next;
                 self.error = None;
+                // A settle pass that found its host silent is over; the sweep
+                // is back to judging frames on their evidence.
+                self.sweep_settling = false;
                 cx.notify();
                 true
             }
             None => {
-                // Everyone has been asked and nobody hosts a board. Start over
-                // from this device after the backoff: the box may be booting,
-                // and a panel that gave up would need a restart to notice.
+                // Everyone has been asked. A board held for want of dispatch
+                // evidence is the best answer there is — settle on it (gh#125).
+                if let Some(fallback) = self.sweep_fallback.take() {
+                    self.host = fallback;
+                    self.sweep_settling = true;
+                    self.error = None;
+                    cx.notify();
+                    return true;
+                }
+                // Nobody hosts a board at all. Start over from this device
+                // after the backoff: the box may be booting, and a panel that
+                // gave up would need a restart to notice.
                 self.host = None;
                 self.error =
-                    Some("No device here hosts a board — open the host chip to pick one".into());
+                    Some("No device here hosts a board — open the host menu to pick one".into());
                 cx.notify();
                 false
             }
@@ -1000,27 +1160,36 @@ impl BoardPanel {
                     return;
                 };
                 let mut delivered = false;
+                // The sweep held this host's answer and moved on (gh#125):
+                // drop the stream and re-subscribe at the new candidate now.
+                let mut advanced = false;
                 match engine.client().subscribe(methods::WATCH_BOARD, params).await {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
                             delivered = true;
                             let alive = this.update(cx, |panel, cx| {
-                                panel.error = None;
-                                panel.host_confirmed = true;
                                 match serde_json::from_value::<Vec<TaskRow>>(value) {
-                                    Ok(rows) => {
-                                        panel.model.set_rows(rows);
-                                        cx.notify();
+                                    Ok(rows) => panel.host_frame(rows, cx),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            "board: dropping malformed watch frame"
+                                        );
+                                        false
                                     }
-                                    Err(err) => tracing::warn!(
-                                        error = %err,
-                                        "board: dropping malformed watch frame"
-                                    ),
                                 }
                             });
-                            if alive.is_err() {
-                                return;
+                            match alive {
+                                Ok(true) => {
+                                    advanced = true;
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(_) => return,
                             }
+                        }
+                        if advanced {
+                            continue;
                         }
                     }
                     Err(err) => {
@@ -1548,6 +1717,11 @@ impl BoardPanel {
             cx.notify();
             return;
         }
+        if let Some((state, route)) = self.model.on_group() {
+            self.model.toggle_group(state, route.as_deref());
+            cx.notify();
+            return;
+        }
         let Some(row) = self.model.selected_task() else {
             return;
         };
@@ -1898,7 +2072,7 @@ impl BoardPanel {
         let filter_label = self.model.filter.label();
         let filter_active = self.model.filter.active();
 
-        let title = div()
+        let mut title = div()
             .flex_none()
             .flex()
             .items_center()
@@ -1914,19 +2088,27 @@ impl BoardPanel {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from("Board")),
-            )
-            .child(
-                div()
-                    .px(px(6.0))
-                    .h(px(18.0))
-                    .flex()
-                    .items_center()
-                    .rounded_full()
-                    .bg(theme.wash(0.08))
-                    .text_size(px(10.0))
-                    .text_color(theme.text_faint)
-                    .child(SharedString::from(shown.to_string())),
             );
+        // Whose board this is belongs in the panel's name, not a whisper of a
+        // chip in the corner (gh#125): "Board on Tokenmaxxer9000 · 124" is the
+        // sentence the rows only mean something under. Silent only in the
+        // ordinary case — one device, serving its own board.
+        let one_device = self.state.read(cx).devices.len() <= 1;
+        if !(one_device && self.host.is_none() && self.host_confirmed) {
+            title = title.child(self.render_host_title(&theme, cx));
+        }
+        let title = title.child(
+            div()
+                .px(px(6.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .rounded_full()
+                .bg(theme.wash(0.08))
+                .text_size(px(10.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(shown.to_string())),
+        );
 
         let mut header = div()
             .h(px(36.0))
@@ -2024,12 +2206,6 @@ impl BoardPanel {
                         .text_color(label_color)
                         .child(label),
                 );
-            // The host chip earns its space only when there is something to
-            // say: one device serving its own board is the ordinary case.
-            let one_device = self.state.read(cx).devices.len() <= 1;
-            if !(one_device && self.host.is_none() && self.host_confirmed) {
-                header = header.child(self.render_host_chip(&theme, cx));
-            }
             header = header.child(filter_chip);
             if filter_active {
                 let clear_id = "board-filter-clear";
@@ -2101,10 +2277,12 @@ impl BoardPanel {
         header.into_any_element()
     }
 
-    /// The host chip: which device's board this is, and a menu to pin another
-    /// one (gh#55). The dot is lit once that device has actually delivered
-    /// rows — while the sweep is still asking, the chip says who it is asking.
-    fn render_host_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The title's host segment: "on Tokenmaxxer9000", with the presence dot,
+    /// as part of the panel's name (gh#125 — formerly a corner chip, gh#55).
+    /// Clicking it opens the host menu. The dot is lit once that device has
+    /// actually delivered rows the sweep settled on — while the sweep is still
+    /// asking, the segment says who it is asking.
+    fn render_host_title(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (mut devices, local_id) = {
             let state = self.state.read(cx);
             (state.devices.clone(), state.local_device_id.clone())
@@ -2119,6 +2297,8 @@ impl BoardPanel {
         let host = self.host.clone();
         let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
 
+        // "on {host}", in the title's own type size so it reads as part of the
+        // panel's name rather than as a control that happens to be nearby.
         let mut chip = div()
             .id("board-host")
             .h(px(24.0))
@@ -2126,7 +2306,7 @@ impl BoardPanel {
             .flex()
             .items_center()
             .gap(px(5.0))
-            .px(px(8.0))
+            .px(px(4.0))
             .rounded(px(6.0))
             .cursor_pointer()
             .bg(if open {
@@ -2143,16 +2323,17 @@ impl BoardPanel {
                 this.host_menu_dismissed_at = None;
                 cx.notify();
             }))
-            .text_size(px(11.0))
+            .text_size(px(12.0))
             .child(
-                icon(icons::MONITOR)
-                    .size(px(13.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                div()
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from("on")),
             )
             .child(
                 div()
-                    .max_w(px(120.0))
+                    .max_w(px(140.0))
                     .truncate()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(if confirmed {
                         theme.text_muted
                     } else {
@@ -2293,15 +2474,18 @@ impl BoardPanel {
             }))
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(13.0))
                     .text_color(color)
                     .child(SharedString::from(state.glyph())),
             )
+            // A header managing a hundred rows carries the weight of one
+            // (gh#125): bold, a step up in size, its count always beside it —
+            // and a chevron for the fold, not a text button.
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(11.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::BOLD)
                     .text_color(if selected { theme.text } else { theme.text_muted })
                     .child(SharedString::from(if state == BoardState::Done {
                         "DONE TODAY".to_string()
@@ -2309,33 +2493,120 @@ impl BoardPanel {
                         state.label().to_string()
                     })),
             )
-            .child(div().flex_1())
-            .when(folded, |el| {
-                el.child(
-                    div()
-                        .px(px(7.0))
-                        .h(px(18.0))
-                        .flex()
-                        .items_center()
-                        .rounded_full()
-                        .bg(theme.wash(0.08))
-                        .text_size(px(10.0))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("{len} hidden"))),
-                )
-            })
             .child(
                 div()
+                    .px(px(7.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .bg(theme.wash(0.08))
                     .text_size(px(10.0))
-                    .text_color(theme.text_faint.opacity(0.7))
-                    .child(SharedString::from(if folded {
-                        "expand".to_string()
-                    } else {
-                        "collapse".to_string()
-                    })),
+                    .text_color(if folded { theme.text_muted } else { theme.text_faint })
+                    .child(SharedString::from(len.to_string())),
+            )
+            .child(div().flex_1())
+            .child(
+                icon(if folded {
+                    icons::ALT_ARROW_RIGHT
+                } else {
+                    icons::ALT_ARROW_DOWN
+                })
+                .size(px(13.0))
+                .text_color(theme.text_muted.opacity(0.7)),
             );
 
         el.into_any_element()
+    }
+
+    /// A route's group header inside a section (gh#125): chevron, the route's
+    /// name and its count — "tally · 34" is what makes 124 rows scannable.
+    /// `None` is the `no route` group, which starts folded at the bottom of its
+    /// section: those rows are visibility-only by design, worth a headline and
+    /// never pole position.
+    fn render_group(
+        &mut self,
+        state: BoardState,
+        route: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let row_id = group_row_id(state, route.as_deref());
+        let selected = self.model.selected.as_deref() == Some(row_id.as_str());
+        let folded = self.model.is_group_collapsed(state, route.as_deref());
+        let len = self.model.group_len(state, route.as_deref());
+        let label: SharedString = route
+            .as_deref()
+            .unwrap_or(board::NO_ROUTE)
+            .to_string()
+            .into();
+        let unrouted = route.is_none();
+        let fade_key = format!("board-group-{}-{}", state.as_str(), label);
+        let toggle_route = route.clone();
+
+        div()
+            .id(SharedString::from(format!(
+                "board-group-{}-{}",
+                state.as_str(),
+                label
+            )))
+            .h(px(26.0))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(Theme::SPACE_LG + 12.0))
+            .pr(px(Theme::SPACE_LG))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                &fade_key,
+                selected_bg(&theme, selected),
+                if selected {
+                    theme.wash(0.18)
+                } else {
+                    theme.wash(0.06)
+                },
+            ))
+            .on_hover(motion::hover_listener(&fade_key))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.model.toggle_group(state, toggle_route.as_deref());
+                cx.notify();
+            }))
+            .child(
+                icon(if folded {
+                    icons::ALT_ARROW_RIGHT
+                } else {
+                    icons::ALT_ARROW_DOWN
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted.opacity(0.6)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(180.0))
+                    .truncate()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    // The no-route group's headline uses the rows' own words,
+                    // in the quiet tone of something you cannot dispatch.
+                    .text_color(if unrouted {
+                        theme.text_faint
+                    } else if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint.opacity(0.85))
+                    .child(SharedString::from(format!("· {len}"))),
+            )
+            .into_any_element()
     }
 
     /// One task row: glyph + identifier + title on the first line, the shared
@@ -2357,14 +2628,17 @@ impl BoardPanel {
         let id = row.id.clone();
         let select_id = id.clone();
         let open_id = id.clone();
-        let identifier = row.identifier.clone();
+        let identifier = row.display_identifier();
         let title = row.title.clone();
 
         let actions = self.render_row_actions(row, selected || hovered, cx);
 
         div()
             .id(SharedString::from(format!("board-row-{}", row.id)))
-            .h(px(44.0))
+            // Min, not fixed (gh#125): the row under the cursor may wrap its
+            // title to a second line, and a fixed height would clip it.
+            .min_h(px(44.0))
+            .py(px(5.0))
             .flex_none()
             .flex()
             .flex_col()
@@ -2403,7 +2677,9 @@ impl BoardPanel {
                     }
                 }),
             )
-            // Line 1: glyph + identifier + title, then the actions.
+            // Line 1: glyph + the repo-qualified identifier + title, then the
+            // actions. The cursor's row gets a second title line (gh#125):
+            // "which Signicat issue" should not cost a click.
             .child(
                 div()
                     .w_full()
@@ -2435,7 +2711,13 @@ impl BoardPanel {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .map(|el| {
+                                if selected || hovered {
+                                    el.line_clamp(2)
+                                } else {
+                                    el.truncate()
+                                }
+                            })
                             .text_size(px(12.0))
                             .text_color(if state == BoardState::Done {
                                 theme.text_faint
@@ -3175,6 +3457,9 @@ impl Render for BoardPanel {
                 .map(|(ix, line)| {
                     let content = match line {
                         BoardLine::Section(state) => self.render_section(*state, cx),
+                        BoardLine::Group(state, route) => {
+                            self.render_group(*state, route.clone(), cx)
+                        }
                         BoardLine::Task(id) => {
                             let selected =
                                 self.model.selected.as_deref() == Some(id.as_str());
@@ -3358,6 +3643,68 @@ mod tests {
     }
 
     #[test]
+    fn a_section_with_several_routes_grows_group_headers_no_route_folded_last() {
+        let mut rows = vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+            row("3", BoardState::Ready),
+        ];
+        rows[1].route = Some("tally".into());
+        rows[2].route = None;
+        rows[2].dispatchable = false;
+        let mut m = model(rows);
+        let ids: Vec<String> = m.lines().iter().map(|l| l.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                section_row_id(BoardState::Ready),
+                group_row_id(BoardState::Ready, Some("offhand")),
+                "1".to_string(),
+                group_row_id(BoardState::Ready, Some("tally")),
+                "2".to_string(),
+                // The no-route group draws folded at the bottom: a headline,
+                // not pole position — its row is hidden.
+                group_row_id(BoardState::Ready, None),
+            ]
+        );
+        // The first task the cursor lands on is dispatchable, not `no route`.
+        m.clamp_selection();
+        assert_eq!(m.selected.as_deref(), Some("1"));
+        // Enter on the group header brings the rows back.
+        m.toggle_group(BoardState::Ready, None);
+        assert!(m.lines().iter().any(|l| l.id() == "3"));
+        assert_eq!(m.group_len(BoardState::Ready, None), 1);
+    }
+
+    #[test]
+    fn a_single_routed_group_keeps_the_section_flat() {
+        let m = model(vec![row("1", BoardState::Working), row("2", BoardState::Working)]);
+        let lines = m.lines();
+        assert!(
+            !lines.iter().any(|l| matches!(l, BoardLine::Group(..))),
+            "one route needs no header: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_toggles_a_group_it_sits_on() {
+        let mut rows = vec![row("1", BoardState::Ready), row("2", BoardState::Ready)];
+        rows[1].route = Some("tally".into());
+        let mut m = model(rows);
+        m.selected = Some(group_row_id(BoardState::Ready, Some("tally")));
+        let (state, route) = m.on_group().expect("cursor is on a group header");
+        assert_eq!(state, BoardState::Ready);
+        assert_eq!(route.as_deref(), Some("tally"));
+        assert!(!m.is_group_collapsed(state, route.as_deref()));
+        m.toggle_group(state, route.as_deref());
+        assert!(m.is_group_collapsed(state, route.as_deref()));
+        assert!(
+            !m.lines().iter().any(|l| l.id() == "2"),
+            "a folded group hides its rows"
+        );
+    }
+
+    #[test]
     fn selection_survives_refresh_by_id() {
         let mut m = model(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
         m.selected = Some("2".into());
@@ -3485,8 +3832,10 @@ mod tests {
     #[test]
     fn metadata_reuses_the_shared_derivation() {
         let now = Utc::now();
+        // The route rides the group header now (gh#125); a workspace matching
+        // it says nothing the row does not already.
         let ready = row("r", BoardState::Ready);
-        assert_eq!(metadata(&ready, now), "offhand");
+        assert_eq!(metadata(&ready, now), "");
         let mut w = row("w", BoardState::Working);
         w.started_at = Some(now.to_rfc3339());
         assert!(metadata(&w, now).contains("claude-code"));
