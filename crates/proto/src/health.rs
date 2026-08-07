@@ -37,10 +37,21 @@ pub struct EdgeHealth {
     /// spaces, sessions, presence).
     #[serde(default)]
     pub workspace_room: Option<bool>,
+    /// The workspace room's `%EPH` presence sub-room (gh#126). Joined
+    /// separately from the doc room on the same socket, so `Some(true)` for
+    /// [`Self::workspace_room`] with `Some(false)` here is a real state — doc
+    /// sync fine, every heartbeat silently dropped — and the one the census
+    /// exists to name.
+    #[serde(default)]
+    pub workspace_presence: Option<bool>,
     /// `orgdev1/{orgId}` — the org-wide device registry, the index a teammate
     /// needs before they can address this box.
     #[serde(default)]
     pub org_registry: Option<bool>,
+    /// The org registry room's `%EPH` sub-room — the channel a teammate's
+    /// online dot actually rides (gh#126).
+    #[serde(default)]
+    pub org_presence: Option<bool>,
     /// Chat docs open on this engine, and how many hold a live session room.
     #[serde(default)]
     pub chat_rooms_open: usize,
@@ -111,6 +122,23 @@ impl EdgeHealth {
                 self.chat_rooms_open
             ));
         }
+        // Presence dead on a doc-live room (gh#126): sync looks perfect while
+        // every heartbeat is dropped — the exact state that read as a healthy
+        // box rendering "offline" on every other device. Named, not counted.
+        let mut presence_down: Vec<&str> = Vec::new();
+        if self.workspace_room == Some(true) && self.workspace_presence == Some(false) {
+            presence_down.push("workspace room");
+        }
+        if self.org_registry == Some(true) && self.org_presence == Some(false) {
+            presence_down.push("org registry");
+        }
+        if !presence_down.is_empty() {
+            detail.push_str(&format!(
+                " — presence dead on {} (doc sync is up; this device will read \
+                 offline elsewhere)",
+                presence_down.join(", ")
+            ));
+        }
         if self.dark() {
             detail.push_str(
                 " — this engine believes it is online but holds NO edge connections; \
@@ -130,7 +158,9 @@ mod tests {
             edge_url: Some("https://edge.example".into()),
             host_relay: Some(true),
             workspace_room: Some(true),
+            workspace_presence: Some(true),
             org_registry: Some(true),
+            org_presence: Some(true),
             chat_rooms_open: 2,
             chat_rooms_live: 2,
         }
@@ -171,6 +201,45 @@ mod tests {
         let summary = health.summary();
         assert!(summary.contains("0 of 5 live"), "{summary}");
         assert!(summary.contains("holds NO edge connections"), "{summary}");
+    }
+
+    /// The gh#126 shape: the doc room answers, the presence sub-room does not.
+    /// `live()`/`dark()` stay clean — the sockets ARE up — but the summary must
+    /// name it, because from every other device this engine reads "offline".
+    #[test]
+    fn dead_presence_on_a_live_room_is_named() {
+        let health = EdgeHealth {
+            workspace_presence: Some(false),
+            ..online()
+        };
+        assert!(!health.dark());
+        let summary = health.summary();
+        assert!(summary.contains("presence dead on workspace room"), "{summary}");
+        assert!(summary.contains("read offline elsewhere"), "{summary}");
+
+        let both = EdgeHealth {
+            workspace_presence: Some(false),
+            org_presence: Some(false),
+            ..online()
+        };
+        assert!(
+            both.summary()
+                .contains("presence dead on workspace room, org registry"),
+            "{}",
+            both.summary()
+        );
+    }
+
+    /// A room that is DOWN carries no presence complaint — the room being down
+    /// is the story, and "presence dead" on top of it would be noise.
+    #[test]
+    fn a_down_room_does_not_double_report_presence() {
+        let health = EdgeHealth {
+            workspace_room: Some(false),
+            workspace_presence: Some(false),
+            ..online()
+        };
+        assert!(!health.summary().contains("presence dead"));
     }
 
     /// An engine wired to no edge holds nothing on purpose — never a complaint.

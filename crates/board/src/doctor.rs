@@ -1433,6 +1433,7 @@ mod tests {
             org_registry: Some(false),
             chat_rooms_open: 1,
             chat_rooms_live: 0,
+            ..EdgeHealth::default()
         };
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark)).unwrap();
         let check = edge_check_in(&checks);
@@ -1457,6 +1458,7 @@ mod tests {
             org_registry: Some(true),
             chat_rooms_open: 0,
             chat_rooms_live: 0,
+            ..EdgeHealth::default()
         };
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial)).unwrap();
         let check = edge_check_in(&checks);

@@ -64,6 +64,12 @@ struct EdgeState {
     /// Per-room doc, so a rejoining client gets real backfill rather than an
     /// empty answer that would hide a broken resync.
     docs: HashMap<String, LoroDoc>,
+    /// Live member sockets per room — what lets one engine's frames (doc
+    /// updates AND `%EPH` presence heartbeats) reach another engine on the
+    /// same room, exactly as the real edge broadcasts them (gh#126). Dead
+    /// senders are tolerated (their sends fail silently) and replaced by the
+    /// rejoin's registration.
+    members: HashMap<String, Vec<mpsc::UnboundedSender<WsMessage>>>,
     /// Is the DeviceRoom's host socket claimed right now? This is the fact the
     /// iOS host sweep reads through `GET /device/{id}/status`, and the one that
     /// was false-and-invisible for 25 minutes.
@@ -198,6 +204,15 @@ async fn serve_socket(
         state.lock().expect("lock").host_connected = true;
     }
     let room = room_id_for(&uri);
+    if let Some(room) = &room {
+        state
+            .lock()
+            .expect("lock")
+            .members
+            .entry(room.clone())
+            .or_default()
+            .push(out_tx.clone());
+    }
     let reader = tokio::spawn({
         let state = state.clone();
         async move {
@@ -305,6 +320,25 @@ fn serve_room_frame(
                 ref_id: batch_id,
                 status: UpdateStatusCode::Ok,
             });
+            // Broadcast to every other member of the room — the path a box's
+            // presence heartbeat (and its device-row write) takes to reach the
+            // engine that renders its online dot (gh#126).
+            let peers: Vec<mpsc::UnboundedSender<WsMessage>> = state
+                .lock()
+                .expect("lock")
+                .members
+                .get(room_id)
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter(|member| !member.same_channel(out))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for peer in peers {
+                let _ = peer.send(WsMessage::Binary(bytes.to_vec()));
+            }
         }
         _ => {}
     }
@@ -319,8 +353,12 @@ fn registry() -> Arc<HarnessRegistry> {
 }
 
 fn assemble(dir: &std::path::Path, edge_url: &str) -> EngineCore {
+    assemble_as(dir, edge_url, "device-box")
+}
+
+fn assemble_as(dir: &std::path::Path, edge_url: &str, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
-    std::fs::write(dir.join("device-id"), "device-box").expect("write device id");
+    std::fs::write(dir.join("device-id"), device_id).expect("write device id");
     EngineCore::assemble_with_identity(
         dir,
         registry(),
@@ -444,6 +482,63 @@ async fn health_reports_the_dark_window_rather_than_hiding_it() {
 
     wait_until("health to clear once the rooms are back", || {
         !core.edge_health().dark()
+    })
+    .await;
+}
+
+/// The gh#126 exit criterion: a box whose engine is up and roomed never reads
+/// offline on another device for longer than one staleness window.
+///
+/// Two engines (the "box" and a "viewer" — same user, same org, as Brede's Mac
+/// and box are) share the fake edge. The box's 15s ephemeral heartbeat must
+/// reach the viewer and fold into its device row's `lastSeenAt` — the exact
+/// value every sidebar's presence verdict reads. Then the edge is redeployed
+/// (all sockets die) and the beat must come back on its own, because the
+/// incident review showed the real outage began exactly here: sockets died,
+/// and what failed next determined whether eight amber rows lied for hours.
+/// The census must also carry the presence line up the whole way
+/// (`workspace_presence`/`org_presence`, the gh#126 EdgeHealth addition).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_roomed_box_reads_fresh_on_another_device_and_survives_a_redeploy() {
+    let edge = fake_edge().await;
+    let box_dir = tempfile::tempdir().expect("tempdir");
+    let viewer_dir = tempfile::tempdir().expect("tempdir");
+    let box_core = assemble_as(box_dir.path(), &edge.url, "device-box");
+    let viewer = assemble_as(viewer_dir.path(), &edge.url, "device-viewer");
+
+    let devices = viewer.workspace.watch_devices();
+    let box_seen_after = |floor: chrono::DateTime<chrono::Utc>| {
+        devices
+            .borrow()
+            .iter()
+            .find(|d| d.id == "device-box")
+            .and_then(|d| d.last_seen_at)
+            .is_some_and(|at| at >= floor)
+    };
+
+    // The box's join-time beat (or first 15s tick) must land in the viewer's
+    // device row well inside one staleness window.
+    let start = chrono::Utc::now();
+    wait_until("the viewer to see the box's heartbeat", || {
+        box_seen_after(start)
+    })
+    .await;
+    wait_until("the census to carry the presence line", || {
+        let health = box_core.edge_health();
+        health.workspace_presence == Some(true) && health.org_presence == Some(true)
+    })
+    .await;
+
+    // 10:06 — the deploy cycles every Durable Object. Presence must recover
+    // without anyone restarting anything, exactly like the doc rooms do.
+    edge.redeploy();
+    let after_deploy = chrono::Utc::now();
+    wait_until("the heartbeat to flow again after the redeploy", || {
+        box_seen_after(after_deploy)
+    })
+    .await;
+    wait_until("the presence census to recover", || {
+        box_core.edge_health().workspace_presence == Some(true)
     })
     .await;
 }

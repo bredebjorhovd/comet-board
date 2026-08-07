@@ -279,17 +279,11 @@ impl Shell {
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
-        let (spaces, selected, device_names, offline_devices, attention): (
-            Vec<Space>,
-            Option<String>,
-            std::collections::HashMap<String, String>,
-            std::collections::HashSet<String>,
-            std::collections::HashMap<String, ChatIndicator>,
-        ) = {
+        let (spaces, selected, device_names, device_presence, attention) = {
             let now = Utc::now();
             let state = self.state.read(cx);
-            let spaces = state.spaces.clone();
-            let device_names = spaces
+            let spaces: Vec<Space> = state.spaces.clone();
+            let device_names: std::collections::HashMap<String, String> = spaces
                 .iter()
                 .map(|s| {
                     (
@@ -301,13 +295,20 @@ impl Shell {
                     )
                 })
                 .collect();
-            // Host-presence (the revived "Remote" signal): a remote space whose
-            // device heartbeat lapsed shows offline — a host outage, not slow sync.
-            let offline_devices = spaces
-                .iter()
-                .map(|s| s.device_id.clone())
-                .filter(|id| !state.device_online(id, now))
-                .collect();
+            // Host-presence (the revived "Remote" signal), three-state (gh#126):
+            // a lapsed heartbeat reads "offline" (a host outage, not slow sync)
+            // only while THIS app's engine can hear — with our own sync rooms
+            // down the row indicts the pipe instead of the box.
+            let device_presence: std::collections::HashMap<String, crate::state::HostPresence> =
+                spaces
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.device_id.clone(),
+                            state.host_presence(&s.device_id, now),
+                        )
+                    })
+                    .collect();
             // Spaces with a live/awaiting session get an aggregate dot (the
             // most urgent member status wins) so the attention signal survives
             // even with the Sessions list scrolled off.
@@ -339,7 +340,7 @@ impl Shell {
                 spaces,
                 state.selected_space.clone(),
                 device_names,
-                offline_devices,
+                device_presence,
                 attention,
             )
         };
@@ -441,14 +442,17 @@ impl Shell {
                         .get(&space.device_id)
                         .cloned()
                         .unwrap_or_else(|| "Unknown device".to_string());
-                    let host_offline = offline_devices.contains(&space.device_id);
+                    let presence = device_presence
+                        .get(&space.device_id)
+                        .copied()
+                        .unwrap_or(crate::state::HostPresence::Online);
                     let is_selected = selected.as_deref() == Some(space.id.as_str());
                     let attention = attention.get(&space.id).copied();
                     let row = self.render_space_row(
                         ix,
                         space,
                         device_name,
-                        host_offline,
+                        presence,
                         is_selected,
                         attention,
                         theme,
@@ -553,14 +557,16 @@ impl Shell {
     }
 
     /// One space row: folder icon + folder name, device name subline.
-    /// `host_offline` marks a remote host whose presence heartbeat lapsed.
+    /// `presence` is the host's three-state verdict (gh#126): `Offline` is an
+    /// observed host outage (amber), `SyncDown` is this app's own sync being
+    /// down (muted — the pipe is indicted, never the box).
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
         ix: usize,
         space: Space,
         device_name: String,
-        host_offline: bool,
+        presence: crate::state::HostPresence,
         selected: bool,
         attention: Option<ChatIndicator>,
         theme: &Theme,
@@ -647,24 +653,29 @@ impl Shell {
                     .child(name),
             )
             .child(div().flex_1())
-            .child(
+            .child({
+                use crate::state::HostPresence;
                 div()
                     .flex_none()
                     .min_w_0()
                     .truncate()
                     .text_size(px(12.0))
                     .line_height(px(17.0))
-                    .text_color(if host_offline {
-                        theme.warning.opacity(0.8)
-                    } else {
-                        theme.text_muted.opacity(0.6)
+                    .text_color(match presence {
+                        // Amber only for an OBSERVED outage — this is the
+                        // sidebar's loudest claim, and a false one teaches the
+                        // user that every signal here lies (gh#126).
+                        HostPresence::Offline => theme.warning.opacity(0.8),
+                        _ => theme.text_muted.opacity(0.6),
                     })
-                    .child(SharedString::from(if host_offline {
-                        format!("@ {device_name} · offline")
-                    } else {
-                        format!("@ {device_name}")
-                    })),
-            )
+                    .child(SharedString::from(match presence {
+                        HostPresence::Online => format!("@ {device_name}"),
+                        HostPresence::Offline => format!("@ {device_name} · offline"),
+                        // Our own sync is down: the suffix indicts the pipe,
+                        // muted — the box may be fine and we cannot know.
+                        HostPresence::SyncDown => format!("@ {device_name} · sync down"),
+                    }))
+            })
     }
 
     /// The "Agents" section (gh#103): one row per live board attempt, blocked
