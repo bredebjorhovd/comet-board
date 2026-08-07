@@ -44,11 +44,20 @@ pub const DEFAULT_ORG_ID: &str = "dev-org";
 /// User used when none is configured (dev mode without a bearer).
 pub const DEFAULT_USER_ID: &str = "dev-user";
 /// Ephemeral presence refresh cadence.
-const PRESENCE_INTERVAL_MS: u64 = 15_000;
+///
+/// Every beat is a real `%EPH` frame that WAKES the workspace and org-registry
+/// DOs — the runtime's ping/pong auto-response does not cover it. At the
+/// original 15s the two rooms could never hibernate, so every always-on engine
+/// billed 2 × 86,400 DO-seconds/day (~170% of the free tier's daily duration
+/// allowance by itself; 2026-08-07 quota incident). 5 minutes lets the rooms
+/// sleep >95% of an idle day; fast offline detection is the relay-status
+/// probe's job (`relay_probe_task`), which reads host liveness from the
+/// DeviceRoom's auto-pong timestamps without waking anything.
+const PRESENCE_INTERVAL_MS: u64 = 300_000;
 /// A presence heartbeat younger than this marks the device alive (3 missed
 /// beats = offline). Also the "peer is reachable" signal that clears the
 /// peer-dial cooldown.
-const PRESENCE_FRESH_MS: i64 = 45_000;
+const PRESENCE_FRESH_MS: i64 = 900_000;
 /// Relay-status probe cadence. Ephemeral heartbeats ride the workspace room,
 /// so any workspace-DO pathology (log-replay wedge, CPU reset, our own room
 /// connection being down) silently starves them — and every device looks
@@ -948,11 +957,11 @@ impl WorkspaceHostInner {
         }
     }
 
-    /// Fold the 15s ephemeral presence heartbeats into the device rows'
+    /// Fold the ephemeral presence heartbeats into the device rows'
     /// `lastSeenAt` before publishing. The doc row is written on boot/shutdown
     /// ONLY (oplog hygiene), so without this overlay every device looks offline
-    /// ~70s after its boot — and a genuinely dead host is indistinguishable
-    /// from slow sync. Fresh remote heartbeats also fire the peer-alive hook
+    /// one online-window after its boot — and a genuinely dead host is
+    /// indistinguishable from slow sync. Fresh remote heartbeats also fire the peer-alive hook
     /// (dial-cooldown reset).
     fn overlay_presence(&self, devices: &mut [Device]) {
         let mut alive_peers: Vec<String> = Vec::new();
@@ -966,7 +975,7 @@ impl WorkspaceHostInner {
             let now = now_ms();
             for device in devices.iter_mut() {
                 // Freshest of the live ephemeral entry and the cache: the
-                // store's 30s TTL (and its empty state right after a room
+                // store's TTL (and its empty state right after a room
                 // rejoin) must not erase freshness this engine already
                 // witnessed — the device is offline only once heartbeats
                 // genuinely stop arriving for the UI's whole online window.

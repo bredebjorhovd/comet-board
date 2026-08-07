@@ -50,8 +50,12 @@ const FRAGMENT_BYTES: usize = 200_000;
 /// Refuse absurd inbound fragment batches (a healthy backfill snapshot is MBs).
 const MAX_REASSEMBLED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FRAGMENT_COUNT: u64 = 16 * 1024;
-/// Presence timeout, matching the edge's `new EphemeralStore(30_000)`.
-const EPHEMERAL_TIMEOUT_MS: i64 = 30_000;
+/// Presence entry TTL, matching the edge's `new EphemeralStore(...)`
+/// (session-room.ts). Must outlive the presence beat cadence
+/// (workspace_host.rs PRESENCE_INTERVAL_MS, 5 min — kept slow so the beats
+/// don't abolish DO hibernation) plus a missed beat, or a live peer's entry
+/// expires between beats and presence flickers.
+const EPHEMERAL_TIMEOUT_MS: i64 = 600_000;
 /// Text `"ping"` keepalive interval — answered by the DO's hibernation-safe
 /// auto-response pair without waking it. 15s for the same reason as the
 /// device relay's (crates/rpc/src/device_room.rs): an idle-flow reaper on a
@@ -93,7 +97,7 @@ const JOIN_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 /// Established sessions: after this long without a single %LOR frame from
 /// the room, rejoin on the same socket as a liveness probe. Only %LOR frames
 /// count: the edge's %EPH path never touches the doc machinery (ensureEph
-/// only), so presence acks/broadcasts keep flowing every ~15s from a
+/// only), so presence acks/broadcasts keep flowing on every beat from a
 /// doc-wedged DO — counting them made this probe unreachable on exactly the
 /// room that wedged (adversarial-review finding, round 2). Rejoin is the
 /// probe because it is already idempotent (the stale-peer and RejoinSuggested
@@ -797,7 +801,7 @@ struct Session {
     /// Instant of the last inbound `%LOR` frame — the room-liveness clock
     /// feeding both the join deadline and the probe timer. %EPH frames are
     /// deliberately EXCLUDED: the edge's presence path never touches the doc
-    /// machinery, so eph acks/broadcasts keep arriving every ~15s from a
+    /// machinery, so eph acks/broadcasts keep arriving on every beat from a
     /// doc-wedged DO, and counting them silenced the probe and pinned the
     /// join deadline open on exactly the room that wedged on 2026-07-30
     /// (adversarial-review finding, round 2). Auto-pongs never reach this

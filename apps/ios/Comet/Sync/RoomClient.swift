@@ -83,7 +83,9 @@ actor RoomClient {
 
     init(roomId: String,
          doc: LoroDoc,
-         ephTimeoutMs: Int64 = 30_000,
+         // Matches crates/sync EPHEMERAL_TIMEOUT_MS / the edge's store: must
+         // outlive the engines' 5-min presence beat or peers flicker offline.
+         ephTimeoutMs: Int64 = 600_000,
          urlProvider: @escaping @Sendable () async -> URL?,
          events: @escaping @Sendable (RoomEvent) -> Void) {
         self.roomId = roomId

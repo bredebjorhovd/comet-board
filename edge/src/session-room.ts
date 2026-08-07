@@ -684,7 +684,11 @@ export class SessionRoom implements DurableObject {
   }
 
   private ensureEph(): EphemeralStore {
-    if (!this.eph) this.eph = new EphemeralStore(30_000);
+    // TTL matches the clients' (crates/sync/src/room.rs EPHEMERAL_TIMEOUT_MS):
+    // it must outlive the 5-min presence beat cadence (workspace_host.rs
+    // PRESENCE_INTERVAL_MS — kept slow so beats don't abolish hibernation)
+    // plus a missed beat, or a joiner's backfill misses live peers.
+    if (!this.eph) this.eph = new EphemeralStore(600_000);
     return this.eph;
   }
 

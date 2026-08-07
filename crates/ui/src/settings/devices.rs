@@ -17,8 +17,11 @@ use crate::state::AppState;
 use crate::theme::Theme;
 
 /// A device that pinged within this window shows a presence dot (engines
-/// heartbeat every 15s; 70s tolerates a couple of missed beats).
-pub const DEVICE_ONLINE_WINDOW_SECS: i64 = 70;
+/// heartbeat every 5 min — kept slow so the beats don't pin the workspace DOs
+/// awake; 16 min tolerates a couple of missed beats, and the engine's
+/// relay-status probe refreshes `lastSeenAt` out-of-band for hosts whose
+/// relay socket is provably live).
+pub const DEVICE_ONLINE_WINDOW_SECS: i64 = 960;
 
 /// Presence: last-seen within the online window (future timestamps count). Pure.
 pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
@@ -410,8 +413,8 @@ mod tests {
     fn presence_window() {
         let now = Utc::now();
         assert!(device_online(Some(now - TimeDelta::seconds(10)), now));
-        assert!(device_online(Some(now - TimeDelta::seconds(70)), now));
-        assert!(!device_online(Some(now - TimeDelta::seconds(71)), now));
+        assert!(device_online(Some(now - TimeDelta::seconds(960)), now));
+        assert!(!device_online(Some(now - TimeDelta::seconds(961)), now));
         assert!(!device_online(None, now));
         // Clock skew (future) counts as online.
         assert!(device_online(Some(now + TimeDelta::seconds(30)), now));
