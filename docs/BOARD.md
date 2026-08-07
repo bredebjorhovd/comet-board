@@ -130,13 +130,14 @@ nearly verbatim — it never depended on herdr:
   `TaskRow` (moved, wire contract), plus `Filter`, `sections`,
   `routes_present`/`filter_cycle`, `finished_today`, `row_metadata` — so the
   TUI and the gpui app derive the same rows. `AgentState`/`agent_rows`
-  (gh#103) joins those rows to the chats and the session watch for the
-  sidebar's Agents section, on both surfaces.
+  (gh#103) joins those rows to the chats and the session watch;
+  `active_rows` (gh#123) merges them with gh#117's `running_rows` into the
+  one **Active** group every frontend's sidebar draws.
 - `crates/tui/src/board.rs` + the board section of `crates/tui/src/render.rs` —
   **new** (H7): the board pane (`B`), consuming `WatchBoard`, dispatching over
   `DispatchTask`. See §H7 below. The same stream also feeds the sidebar's
-  Agents section in both frontends (`Row::Agent` here,
-  `Shell::render_agents_section` in `crates/ui/src/shell/spaces.rs` — §H17).
+  Active group in both frontends (`Row::Agent` here,
+  `Shell::render_active_section` in `crates/ui/src/shell/spaces.rs` — §H17).
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
 `DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?,
@@ -1065,6 +1066,8 @@ click returns rather than on the board's next reread; the loop's reread still
 covers an `$EDITOR` over ssh.
 
 ### H20 — Live agents in the sidebar — **done** (gh#103)
+*(Since gh#123 — §H26 — this group and §H24's draw as one **Active** section;
+every rule below is unchanged, minus the header.)*
 In herdr every working agent was a pane, so the pane list *was* the presence
 list and presence cost nothing. Here a dispatched agent is a chat among chats:
 three of them are three rows somewhere in a recency-sorted list, indistinguishable
@@ -1241,6 +1244,8 @@ Apple Developer account — the same one gh#100's signing tier wants, so it is o
 purchase for both.
 
 ### H24 — Unmanaged runs are visible, and delegation goes through the board — **done** (gh#117)
+*(Since gh#123 — §H26 — this group and §H20's draw as one **Active** section;
+every rule below is unchanged, minus the header.)*
 The first real orchestrator session asked for two agents in a space, and the
 orchestrator raised two of its harness's *own* in-chat subagents inside its run
 instead of dispatching. Work was genuinely running on the box — editing a repo,
@@ -1447,6 +1452,43 @@ the top selected row of the whole panel. Five fixes, derived once in
   column got wider with the metadata cuts above. Desktop section headers also
   took on the weight of what they manage: bold, always-visible counts, a
   chevron instead of a 10 px text button.
+
+### H28 — One Active group — **done** (gh#123)
+§H20 gave the sidebar an **Agents** group and §H24 added **Running** under it —
+a split by how a run started: the board released it, or somebody (or some
+orchestrator) just started it. That is a mechanism distinction, and the
+reader's question does not contain it: "what is working, and which of it wants
+me" has one answer. Now it gets one group — **Active**, needs-you first, then
+working, blind to origin in the order — on all three frontends.
+
+- **`comet_proto::view::board::active_rows` is the merge, and it is small.**
+  Membership already partitioned (`running_rows` subtracts every chat a live
+  attempt claims — §H24), so the union never draws a chat twice and the merge
+  is only an order: the key both halves already sorted by (urgency rank, then
+  longest-running, then the chat id), applied once across the union. Without
+  that one sort, concatenated halves would put a working attempt above a
+  blocked hand-started run — the exact order the merge exists to end.
+  `ActiveRow` is the two-variant row (`Agent`/`Unmanaged`);
+  `active_needing_attention` feeds the one header badge, replacing the two
+  per-group counters. Ported whole to Swift in `BoardModels.swift`, as the
+  halves were.
+- **All three frontends dropped a header, not a row shape.** The TUI's
+  `Row::Agent`/`Row::Running`, the desktop's
+  `render_agent_row`/`render_running_row` and the phone's
+  `AgentRowView`/`RunningRowView` all survive; only the section build changed
+  (one "Active" header, one blocked count). The desktop's
+  `BoardPanel::active()` replaced `agents()`/`running()`, and the sessions
+  list's `render_active_rows` was renamed `render_session_rows` so "active"
+  means exactly one thing in that file.
+- **The chip is the origin telling.** In the split world, which header a row
+  sat under said "board" or "not"; merged, that job moves onto the row. The
+  issue identifier draws as a chip — element/wash fill, the "thing you act on"
+  level, never an accent tint (the accent stays on the state rail) — and an
+  unmanaged run deliberately wears none: its bare title *is* the other half of
+  the telling. The board rows keep their branch/cap sub-line unchanged.
+- **Everything else is inherited.** Membership, staleness expiry, the
+  no-empty-header rule, open-only click behavior, the second-by-second
+  counter debt: all exactly as §H20 and §H24 state them, per half.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

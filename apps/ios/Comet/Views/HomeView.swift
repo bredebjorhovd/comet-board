@@ -28,10 +28,10 @@ struct HomeView: View {
                 OrchestratorSlotSection(path: $path)
                 spacesSection
                 // Between Spaces and the sessions, exactly where both desktop
-                // sidebars put it (gh#103) — and under it everything working
-                // that no attempt accounts for (gh#117).
-                AgentsSection(path: $path)
-                RunningSection(path: $path)
+                // sidebars put it: everything alive in one Active group
+                // (gh#123) — board attempts (gh#103) and the runs the board
+                // never released (gh#117), needs-you first.
+                ActiveSection(path: $path)
                 sessionsSection
             }
             .listStyle(.plain)

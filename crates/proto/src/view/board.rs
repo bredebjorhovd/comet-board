@@ -898,7 +898,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Live agents — the sidebar's Agents section (gh#103)
+// Live agents — the Active group's board half (gh#103)
 // ---------------------------------------------------------------------------
 //
 // herdr gave presence away: a working agent was a pane, and the pane list was
@@ -908,6 +908,9 @@ pub fn truncate(s: &str, max: usize) -> String {
 // off the session watch. Pure presentation: nothing here dispatches, settles or
 // decides anything, and a row leaves the list only because the attempt it names
 // stopped being live.
+//
+// These rows drew under their own "Agents" heading until gh#123 folded them
+// into the single Active group — see [`active_rows`], which owns the order.
 
 /// What a live attempt's agent is doing right now.
 ///
@@ -1133,13 +1136,8 @@ pub(crate) fn agent_state(
     }
 }
 
-/// How many live agents want a human — the section header's count badge.
-pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
-    rows.iter().filter(|row| row.state.needs_attention()).count()
-}
-
 // ---------------------------------------------------------------------------
-// Running — every working chat the board is NOT running (gh#117)
+// Unmanaged runs — every working chat the board is NOT running (gh#117)
 // ---------------------------------------------------------------------------
 //
 // [`agent_rows`] answers "what has the board released", which is a smaller
@@ -1156,7 +1154,7 @@ pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
 // and a box hosting no board at all still fills this group.
 
 /// What a chat with no title is called — the spelling all three sessions lists
-/// already use, pinned here so the Running group cannot drift from them.
+/// already use, pinned here so an unmanaged row cannot drift from them.
 ///
 /// The two lists are a few rows apart, and one untitled chat reading
 /// `New session` in one and something else in the other looks like two chats.
@@ -1211,7 +1209,7 @@ impl RunningRow {
 ///   so the group fills within one watch frame of a run starting and empties
 ///   within one of it stopping. No board row is consulted to get *in*.
 /// - **A live attempt is subtracted, not re-drawn.** Any chat claimed by a
-///   `working`/`blocked` row belongs to the Agents group, which knows its
+///   `working`/`blocked` row is [`agent_rows`]'s to draw — that half knows its
 ///   issue, branch and cap; showing it twice would double-count the box's
 ///   load. The subtraction reads the board rows directly rather than
 ///   [`agent_rows`]'s output, so a claimed chat stays out of this group even
@@ -1286,9 +1284,106 @@ pub fn running_rows(
     out
 }
 
-/// How many of these want a human — the Running header's count badge.
-pub fn running_needing_attention(rows: &[RunningRow]) -> usize {
-    rows.iter().filter(|row| row.state.needs_attention()).count()
+// ---------------------------------------------------------------------------
+// Active — the one group everything alive draws under (gh#123)
+// ---------------------------------------------------------------------------
+//
+// [`agent_rows`] and [`running_rows`] split the live list by how a run started
+// — the board released it, or somebody (or some orchestrator) just started it.
+// That is a mechanism distinction, and the reader's question does not contain
+// it: "what is working, and which of it wants me" has one answer, not two. So
+// one group, needs-you first, then working, origin-blind in the order and
+// visible on the row — an attempt wears its issue identifier and keeps its
+// branch and cap, an unmanaged run is its own title and nothing more.
+
+/// One row of the sidebar's Active group: a live board attempt, or a working
+/// chat no attempt accounts for.
+///
+/// The two memberships partition by construction — [`running_rows`] subtracts
+/// every chat a live attempt claims — so the union never draws a chat twice,
+/// and merging them is only a matter of order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveRow {
+    /// The board released this: it has an issue, a branch, a cap and a bill.
+    Agent(AgentRow),
+    /// A run the board never heard of: the orchestrator, an ad-hoc chat,
+    /// anything started by hand.
+    Unmanaged(RunningRow),
+}
+
+impl ActiveRow {
+    /// Where the click goes, and the row's identity — unique across both
+    /// variants, because the partition never claims a chat twice.
+    pub fn chat_id(&self) -> &str {
+        match self {
+            ActiveRow::Agent(row) => &row.chat_id,
+            ActiveRow::Unmanaged(row) => &row.chat_id,
+        }
+    }
+
+    pub fn state(&self) -> AgentState {
+        match self {
+            ActiveRow::Agent(row) => row.state,
+            ActiveRow::Unmanaged(row) => row.state,
+        }
+    }
+
+    pub fn started_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            ActiveRow::Agent(row) => row.started_at,
+            ActiveRow::Unmanaged(row) => row.started_at,
+        }
+    }
+}
+
+/// Everything alive, most urgent first, blind to how it started.
+///
+/// The halves arrive pre-sorted, but concatenating them would put a working
+/// attempt above a blocked hand-started run — the exact order the merge exists
+/// to end — so the union is sorted once, by the key both halves already use:
+/// urgency, then longest-running (stable, since start order never changes
+/// under a viewer), then the chat id, which every row carries and no two rows
+/// share.
+pub fn active_rows(
+    rows: &[TaskRow],
+    chats: &[crate::Chat],
+    sessions: &[crate::Session],
+    orchestrator: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<ActiveRow> {
+    let mut out: Vec<ActiveRow> = agent_rows(rows, chats, sessions, now)
+        .into_iter()
+        .map(ActiveRow::Agent)
+        .chain(
+            // The pinned orchestrator is subtracted with the rest of the
+            // unmanaged membership rules (gh#122): its slot above Spaces
+            // carries its live state, and a second row here would report
+            // the same run twice.
+            running_rows(rows, chats, sessions, orchestrator, now)
+                .into_iter()
+                .map(ActiveRow::Unmanaged),
+        )
+        .collect();
+    out.sort_by(|a, b| {
+        a.state()
+            .rank()
+            .cmp(&b.state().rank())
+            .then_with(|| match (a.started_at(), b.started_at()) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.chat_id().cmp(b.chat_id()))
+    });
+    out
+}
+
+/// How many active rows want a human — the group header's count badge.
+pub fn active_needing_attention(rows: &[ActiveRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.state().needs_attention())
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,7 +1954,8 @@ mod tests {
             // A question, then a dead run, then the longest-running worker.
             vec!["ask", "died", "slow", "fast"]
         );
-        assert_eq!(agents_needing_attention(&agents), 2);
+        let active: Vec<ActiveRow> = agents.into_iter().map(ActiveRow::Agent).collect();
+        assert_eq!(active_needing_attention(&active), 2);
     }
 
     /// "That one's been at it 1h50 of 2h" — a glance, which needs both numbers.
@@ -2035,7 +2131,8 @@ mod tests {
         assert_eq!(running[0].elapsed_label(now()).as_deref(), Some("1h00m"));
         assert_eq!(running[1].title, UNTITLED_CHAT);
         assert_eq!(running[1].elapsed_label(now()), None);
-        assert_eq!(running_needing_attention(&running), 1);
+        let active: Vec<ActiveRow> = running.into_iter().map(ActiveRow::Unmanaged).collect();
+        assert_eq!(active_needing_attention(&active), 1);
     }
 
     /// A box with no board is the case this group matters most on — nothing to
@@ -2063,6 +2160,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["adhoc"]
         );
+    }
+
+    // ---- the Active group (gh#123) ----------------------------------------
+
+    /// The order the merge exists for: a hand-started run asking a question
+    /// outranks a board attempt working fine. Needs-you first, then working,
+    /// and inside a rank the longest-running first — origin never consulted.
+    #[test]
+    fn the_active_group_orders_by_urgency_not_by_origin() {
+        let mut attempt = row("live", BoardState::Working);
+        attempt.chat_id = Some("c-attempt".into());
+        attempt.started_at = Some("2026-08-01T11:00:00Z".into()); // 1h
+        let chats = vec![
+            chat("c-attempt", None),
+            chat("c-adhoc", None),
+            chat("c-orch", None),
+        ];
+        let sessions = vec![
+            session("c-attempt", crate::SessionStatus::Working, 0),
+            started("c-adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
+            started("c-orch", crate::SessionStatus::Working, "2026-08-01T09:00:00Z"), // 3h
+        ];
+        let active = active_rows(&[attempt], &chats, &sessions, None, now());
+        assert_eq!(
+            active.iter().map(|r| r.chat_id()).collect::<Vec<_>>(),
+            // The question first, wherever it came from; then the workers,
+            // longest-running first, the attempt's origin buying it nothing.
+            vec!["c-adhoc", "c-orch", "c-attempt"]
+        );
+        assert_eq!(active_needing_attention(&active), 1);
+        // Origin still shows on the row: the attempt kept its issue, branch
+        // and cap by staying the Agent variant.
+        assert!(matches!(
+            &active[2],
+            ActiveRow::Agent(a) if a.identifier == "gh#live"
+        ));
+        assert!(matches!(&active[0], ActiveRow::Unmanaged(_)));
+    }
+
+    /// The merge changes the order, never the membership: a dispatched chat
+    /// draws once, as the attempt that claimed it.
+    #[test]
+    fn a_dispatched_chat_draws_once_in_the_active_group() {
+        let mut live = row("live", BoardState::Working);
+        live.chat_id = Some("c1".into());
+        let chats = vec![chat("c1", None)];
+        let sessions = vec![session("c1", crate::SessionStatus::Working, 0)];
+        let active = active_rows(&[live], &chats, &sessions, None, now());
+        assert_eq!(active.len(), 1);
+        assert!(matches!(&active[0], ActiveRow::Agent(_)));
     }
 
     // ---- whose subscription (gh#101) ------------------------------------

@@ -688,12 +688,7 @@ private func agentState(row: BoardState, session: SessionRow?, now: Int64) -> Ag
     }
 }
 
-/// How many live agents want a human — the section header's count badge.
-func agentsNeedingAttention(_ rows: [AgentRow]) -> Int {
-    rows.filter { $0.state.needsAttention }.count
-}
-
-// MARK: - Running — every working chat the board is NOT running (gh#117)
+// MARK: - Unmanaged runs — every working chat the board is NOT running (gh#117)
 
 /// What a chat with no title is called — `Chat.displayTitle`'s spelling, pinned
 /// here so the Running group cannot drift from the sessions list a few rows
@@ -787,8 +782,73 @@ func runningRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
     return out
 }
 
-/// How many of these want a human — the Running header's count badge.
-func runningNeedingAttention(_ rows: [RunningRow]) -> Int {
+// MARK: - Active — the one group everything alive draws under (gh#123)
+
+/// One row of the home screen's Active group — a port of
+/// `view::board::ActiveRow`: a live board attempt, or a working chat no
+/// attempt accounts for. The two memberships partition by construction
+/// (`runningRows` subtracts every chat a live attempt claims), so the union
+/// never draws a chat twice, and merging them is only a matter of order.
+enum ActiveRow: Identifiable, Hashable {
+    /// The board released this: it has an issue, a branch, a cap and a bill.
+    case agent(AgentRow)
+    /// A run the board never heard of: the orchestrator, an ad-hoc chat,
+    /// anything started by hand.
+    case unmanaged(RunningRow)
+
+    /// Where the tap goes, and the row's identity — unique across both cases,
+    /// because the partition never claims a chat twice.
+    var chatId: String {
+        switch self {
+        case .agent(let row): return row.chatId
+        case .unmanaged(let row): return row.chatId
+        }
+    }
+
+    var id: String { chatId }
+
+    var state: AgentState {
+        switch self {
+        case .agent(let row): return row.state
+        case .unmanaged(let row): return row.state
+        }
+    }
+
+    var startedAt: Date? {
+        switch self {
+        case .agent(let row): return row.startedAt
+        case .unmanaged(let row): return row.startedAt
+        }
+    }
+}
+
+/// Everything alive, most urgent first, blind to how it started — a port of
+/// `view::board::active_rows`.
+///
+/// The halves arrive pre-sorted, but concatenating them would put a working
+/// attempt above a blocked hand-started run — the exact order the merge exists
+/// to end — so the union sorts once, by the key both halves already use:
+/// urgency, then longest-running, then the chat id, which every row carries
+/// and no two rows share.
+func activeRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
+                orchestrator: String? = nil, now: Date = Date()) -> [ActiveRow] {
+    var out = agentRows(rows: rows, chats: chats, sessions: sessions, now: now)
+        .map(ActiveRow.agent)
+        + runningRows(rows: rows, chats: chats, sessions: sessions,
+                      orchestrator: orchestrator, now: now)
+        .map(ActiveRow.unmanaged)
+    out.sort { a, b in
+        if a.state.rank != b.state.rank { return a.state.rank < b.state.rank }
+        if let x = a.startedAt, let y = b.startedAt, x != y { return x < y }
+        if a.startedAt != nil && b.startedAt == nil { return true }
+        if a.startedAt == nil && b.startedAt != nil { return false }
+        return a.chatId < b.chatId
+    }
+    return out
+}
+
+/// How many active rows want a human — the group header's count badge.
+func activeNeedingAttention(_ rows: [ActiveRow]) -> Int {
     rows.filter { $0.state.needsAttention }.count
 }
 
