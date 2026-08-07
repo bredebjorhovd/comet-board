@@ -198,6 +198,7 @@ const ROUTE_KEYS: &[(&str, Kind)] = &[
     ("base", Kind::Str),
     ("max_concurrent", Kind::Int),
     ("max_duration", Kind::Str),
+    ("archive_chats", Kind::Str),
     ("billing_guard", Kind::Str),
 ];
 
@@ -214,6 +215,11 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("orchestrator_chat", Kind::Str),
     ("new_source", Kind::Str),
     ("max_duration", Kind::Str),
+    // Both retentions (gh#72, gh#139): the shelf and the disk fill up on a box
+    // nobody has a shell on, which is the box where this surface is the only
+    // way to say how long they may.
+    ("retain_worktrees", Kind::Str),
+    ("archive_chats", Kind::Str),
     ("billing_guard", Kind::Str),
 ];
 

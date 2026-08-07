@@ -216,6 +216,29 @@ final class DemoDataset {
         boardRows[ix].lastOutcome = "cancelled"
     }
 
+    /// The issue text the demo's detail sheet reads (gh#132).
+    ///
+    /// Only some rows have one, on purpose: an issue with no description is the
+    /// common case on a real board, and the sheet's empty state should be
+    /// reachable in the demo rather than only in production.
+    static let boardBodies: [String: String] = [
+        "linear:AGE-14": """
+            The picker asks the host for its catalog on open. On a host that has \
+            just come up the answer is empty, and the picker caches the empty \
+            list for the session.
+
+            - repro: restart the box, open the picker within ~10s
+            - expected: a second ask once the harness has answered
+            """,
+        "gh:comet#121": """
+            The board is readable on the phone but not actionable: dispatching \
+            still means opening a laptop.
+
+            **Wanted:** the account picker as a sheet, and a release that names \
+            who is paying for it.
+            """,
+    ]
+
     /// One row per board state that has anything to say, in board order. The
     /// two live attempts point at real demo chats so `agentRows` keeps them
     /// (its membership rule drops a row whose chat has not synced).
@@ -379,6 +402,10 @@ final class DemoDataset {
                     > The curve is `1 − (1−p)^1.6` — fast attack, soft landing.
                     """),
                     .tool(id: "tool1", call: RenderToolCall(tag: "readFile", fields: ["path": "crates/ui/src/markdown/veil.rs"]), isError: false, resolved: true),
+                    // A skill between two tool groups: the shape that shows the
+                    // gh#134 landmark breaking a run in half, which is the whole
+                    // point of rendering it differently.
+                    .tool(id: "skill1", call: RenderToolCall(tag: "skill", fields: ["name": "comet-board", "args": "list --state ready"]), isError: false, resolved: true),
                     .tool(id: "tool2", call: RenderToolCall(tag: "editFile", fields: ["path": "Comet/Transcript/Veil.swift"]), isError: false, resolved: true),
                     .tool(id: "tool3", call: RenderToolCall(tag: "exec", fields: ["command": "xcodebuild -scheme Comet build"]), isError: false, resolved: true),
                     .text(id: "t1", text: """

@@ -143,6 +143,20 @@ pub fn default_registry() -> HarnessRegistry {
                 id: "mock-tool-1".into(),
                 is_error: false,
             },
+            // A skill invocation between two tool groups: the demo shape that
+            // shows the gh#134 landmark breaking a run in half, which is the
+            // whole point of rendering it differently.
+            AgentEvent::ToolCall {
+                id: "mock-skill-1".into(),
+                call: comet_proto::ToolCall::Skill {
+                    name: "comet-board".into(),
+                    args: Some("list --state ready".into()),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "mock-skill-1".into(),
+                is_error: false,
+            },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
                 call: comet_proto::ToolCall::Exec {

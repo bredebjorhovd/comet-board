@@ -101,6 +101,11 @@ pub(crate) struct ContentBlock {
     pub name: String,
     #[serde(default)]
     pub input: Value,
+    /// `text` blocks only. Read for the `<command-name>` markup the CLI wraps
+    /// an expanded slash command in (gh#134) — nothing else in a user frame's
+    /// prose is normalized.
+    #[serde(default)]
+    pub text: String,
     #[serde(default)]
     pub tool_use_id: String,
     #[serde(default)]

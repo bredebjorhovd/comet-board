@@ -455,3 +455,42 @@ pub enum TerminalEvent {
         signal: Option<String>,
     },
 }
+
+/// One skill or slash command a run can invoke (`ListSkills`; gh#134).
+///
+/// "Available to this run" is the whole point, so this is never the box user's
+/// list: the engine enumerates the config dir the harness child would actually
+/// read — the account slot's when the chat names one, since a slot overrides
+/// `CLAUDE_CONFIG_DIR` — plus the repo-level `.claude/` for the chat's cwd.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDescriptor {
+    /// What the user types after `/`, no leading slash.
+    pub name: String,
+    /// The `description:` frontmatter line, one line, for the picker subtitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub source: SkillSource,
+}
+
+/// Where a [`SkillDescriptor`] was found — the picker says so, because "why is
+/// this offered here and not in my other chat" is otherwise unanswerable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillSource {
+    /// The run's config dir: the account slot's when the chat names one, else
+    /// `$CLAUDE_CONFIG_DIR` / `~/.claude`.
+    Personal,
+    /// `.claude/` inside the chat's own checkout.
+    Project,
+}
+
+impl SkillSource {
+    /// Short tag for the picker row's right edge.
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillSource::Personal => "personal",
+            SkillSource::Project => "project",
+        }
+    }
+}

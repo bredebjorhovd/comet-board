@@ -51,6 +51,14 @@ pub enum Update {
     Models(Vec<comet_proto::Model>),
     /// A space's branches, answering [`Command::ListRefs`].
     Refs(Vec<comet_proto::RepoRef>),
+    /// The skills a run in `key`'s chat could invoke, answering
+    /// [`Command::ListSkills`] (gh#134). `key` is the composer key the request
+    /// was made for — a reply that raced a navigation is dropped rather than
+    /// offering another chat's skills.
+    Skills {
+        key: String,
+        skills: Vec<comet_proto::SkillDescriptor>,
+    },
     /// A board snapshot: every task as a row, in board order. Best-effort — an
     /// engine without the board serves nothing and the app just shows an empty
     /// board.
@@ -78,6 +86,16 @@ pub enum Update {
         /// the box's own login is the *active* account for a harness, and
         /// without one there is no reliable way to pick it out (gh#101).
         harness: Option<comet_proto::HarnessId>,
+    },
+    /// The issue text behind one board row, answering
+    /// [`Command::ReadBoardTask`] (gh#132). Carries the task id for the same
+    /// reason [`Update::DispatchAccounts`] does: a reply that raced the cursor
+    /// moving on is dropped rather than rendered under the wrong title.
+    TaskDetail {
+        task_id: String,
+        /// `Ok(None)` is an issue with no description — a fact. `Err` is a
+        /// fetch that failed, which is a different one.
+        body: Result<Option<String>, String>,
     },
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
@@ -122,6 +140,19 @@ pub enum Command {
         repo_path: String,
         target_device: Option<String>,
     },
+    /// Fetch what the composer's `/` picker offers (gh#134). Answered as
+    /// [`Update::Skills`].
+    ///
+    /// Targeted at the chat's host like the other per-device catalogs: skills
+    /// are files over there, and which files depends on the agent account that
+    /// chat names.
+    ListSkills {
+        key: String,
+        chat_id: Option<String>,
+        cwd: Option<String>,
+        target_device: Option<String>,
+        harness: Option<comet_proto::HarnessId>,
+    },
     /// Turn a drafted session into a real one, then send its first prompt.
     ///
     /// This is one command rather than three because the steps are *ordered and
@@ -163,6 +194,12 @@ pub enum Command {
         /// the run cannot use is refused by the engine, but a picker with no
         /// rows at all cannot even be argued with.
         runtime: Option<String>,
+    },
+    /// The issue text behind one board row, for the detail panel (gh#132).
+    /// Answered as [`Update::TaskDetail`]. Targets the board's host, like every
+    /// other board call — the store is on that box and nowhere else.
+    ReadBoardTask {
+        task_id: String,
     },
     /// Point the board pane at a device, or hand the choice back to the sweep
     /// (gh#55). Survives reconnects, so a pinned box stays pinned across a
@@ -457,6 +494,23 @@ async fn session(
                 Some(Command::ListModels { harness }) => {
                     spawn_models(client.clone(), updates.clone(), harness);
                 }
+                Some(Command::ListSkills {
+                    key,
+                    chat_id,
+                    cwd,
+                    target_device,
+                    harness,
+                }) => {
+                    spawn_skills(
+                        client.clone(),
+                        updates.clone(),
+                        key,
+                        chat_id,
+                        cwd,
+                        target_device,
+                        harness,
+                    );
+                }
                 Some(Command::ListRefs { repo_path, target_device }) => {
                     spawn_refs(client.clone(), updates.clone(), repo_path, target_device);
                 }
@@ -483,6 +537,15 @@ async fn session(
                             via_user,
                             replace,
                         },
+                        board_host.clone(),
+                    );
+                }
+                Some(Command::ReadBoardTask { task_id }) => {
+                    // The board's store is on its host, so the read is too.
+                    spawn_task_detail(
+                        client.clone(),
+                        updates.clone(),
+                        task_id,
                         board_host.clone(),
                     );
                 }
@@ -932,6 +995,52 @@ fn spawn_models(
     });
 }
 
+/// Fetch the skills the composer's `/` picker offers.
+///
+/// Silent on failure, unlike the model catalogue: the picker is a completion
+/// aid that only appears once you type a slash, and a notice on the status line
+/// about a list nobody asked for would be noise on every reconnect.
+#[allow(clippy::too_many_arguments)] // one call's parameters, not an API
+fn spawn_skills(
+    client: Arc<RpcClient>,
+    updates: mpsc::UnboundedSender<Update>,
+    key: String,
+    chat_id: Option<String>,
+    cwd: Option<String>,
+    target_device: Option<String>,
+    harness: Option<comet_proto::HarnessId>,
+) {
+    tokio::spawn(async move {
+        let mut params = serde_json::Map::new();
+        for (field, value) in [
+            ("chatId", chat_id),
+            ("cwd", cwd),
+            ("targetDeviceId", target_device),
+        ] {
+            if let Some(value) = value {
+                params.insert(field.into(), serde_json::Value::String(value));
+            }
+        }
+        if let Some(harness) = harness
+            && let Ok(value) = serde_json::to_value(harness)
+        {
+            params.insert("harness".into(), value);
+        }
+        match client
+            .call(methods::LIST_SKILLS, serde_json::Value::Object(params))
+            .await
+        {
+            Ok(value) => match serde_json::from_value(value) {
+                Ok(skills) => {
+                    let _ = updates.send(Update::Skills { key, skills });
+                }
+                Err(err) => tracing::warn!(error = %err, "ListSkills malformed"),
+            },
+            Err(err) => tracing::debug!(error = %err, "ListSkills unavailable"),
+        }
+    });
+}
+
 /// Fetch a space's branches for the ref picker.
 fn spawn_refs(
     client: Arc<RpcClient>,
@@ -1156,6 +1265,39 @@ fn spawn_dispatch(
 /// runtime catalog that fails to load is not fatal: the picker then offers every
 /// login and the engine refuses a slot the harness cannot use, which is a worse
 /// message but a live one.
+/// Read one row's issue text off the board's host (gh#132).
+///
+/// A failure comes back as an error *on the panel* rather than as a status-line
+/// notice: the panel is what asked, it is what is on screen, and a notice that
+/// scrolls away under an empty body would leave the reader thinking the issue
+/// had no description.
+fn spawn_task_detail(
+    client: Arc<RpcClient>,
+    updates: mpsc::UnboundedSender<Update>,
+    task_id: String,
+    target_device: Option<String>,
+) {
+    tokio::spawn(async move {
+        let mut params = serde_json::json!({ "taskId": task_id });
+        if let (Some(device), Some(object)) = (&target_device, params.as_object_mut()) {
+            object.insert(
+                "targetDeviceId".into(),
+                serde_json::Value::String(device.clone()),
+            );
+        }
+        let body = client
+            .call(methods::READ_BOARD_TASK, params)
+            .await
+            .map_err(|err| format!("{err}"))
+            .and_then(|value| {
+                serde_json::from_value::<board_view::TaskDetail>(value)
+                    .map(|detail| detail.body)
+                    .map_err(|err| format!("malformed reply: {err}"))
+            });
+        let _ = updates.send(Update::TaskDetail { task_id, body });
+    });
+}
+
 fn spawn_dispatch_accounts(
     client: Arc<RpcClient>,
     updates: mpsc::UnboundedSender<Update>,

@@ -898,6 +898,247 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The detail surface — a row is a door (gh#132)
+// ---------------------------------------------------------------------------
+//
+// A board row shows a truncated title and nothing else you can open. gh#125
+// made the cursor's row wrap to a second line to answer "which Signicat issue",
+// which bought half a sentence at the price of the list reflowing under the
+// pointer. The answer to both is the same: rows never change height, and the
+// full text lives one deliberate keypress away, on a surface that also holds
+// the body, the labels, the history and the links.
+//
+// Everything the three surfaces say about that surface is derived here — what
+// it can do with the row, what its history line reads, which links it offers —
+// for the reason every other derivation is here: a detail panel that offers a
+// Retry the TUI does not, or bills somebody in different words, is three
+// features rather than one.
+
+/// The issue text behind a row, fetched on demand (`ReadBoardTask`).
+///
+/// Deliberately *not* a field on [`TaskRow`]: `WatchBoard` republishes every
+/// row on every sync cycle, and a hundred issue bodies is a hundred kilobytes
+/// per frame relayed to a phone to render one truncated line. The body is read
+/// exactly when somebody opens a row, and only that row's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TaskDetail {
+    /// The task this answers for, so a reply that raced a newer selection is
+    /// dropped rather than shown under the wrong row.
+    pub id: String,
+    /// The issue's markdown body. `None` and empty mean the same thing: the
+    /// issue has no description, which is a fact worth rendering as one.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+/// What a detail surface says where the body would be, for an issue that has
+/// none. A blank panel reads as a failed fetch; this reads as an empty issue.
+pub const NO_BODY: &str = "No description on the issue.";
+
+/// One thing a surface offers to do with a row.
+///
+/// The set is closed and shared so the peek panel, the TUI's full-screen detail
+/// and the iOS sheet offer the same verbs on the same rows — and so the desktop
+/// row's own chips, which have had this rule hard-coded since gh#49, are drawn
+/// from it rather than beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    /// Release a ready task. The account picker rides this on every surface.
+    Dispatch,
+    /// Release again. On a `blocked` row this ends the live attempt first —
+    /// the deliberate exception to the one-live-attempt rule (gh#49).
+    Retry,
+    /// End the live attempt. The issue stays open.
+    Cancel,
+    /// Open the chat the attempt is running in.
+    OpenChat,
+    /// Open the issue upstream.
+    OpenIssue,
+    /// Open the pull request the attempt raised.
+    OpenPr,
+}
+
+impl RowAction {
+    /// The words every surface uses for it. One spelling, so an operator who
+    /// learned "Retry" on the desktop finds "Retry" on the phone.
+    pub fn label(self) -> &'static str {
+        match self {
+            RowAction::Dispatch => "Dispatch",
+            RowAction::Retry => "Retry",
+            RowAction::Cancel => "Cancel",
+            RowAction::OpenChat => "Open chat",
+            RowAction::OpenIssue => "Open issue",
+            RowAction::OpenPr => "Open PR",
+        }
+    }
+
+    /// The spelling for a chip riding beside a truncated title, where the full
+    /// label would crowd the thing it is an affordance for.
+    ///
+    /// Short, not different: an action a surface calls "Open PR" in one place
+    /// and "PR" in another is still one action, but one it calls "Retry" here
+    /// and "Redispatch" there is two.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            RowAction::OpenChat => "Open",
+            RowAction::OpenIssue => "Issue",
+            _ => self.label(),
+        }
+    }
+
+    /// Does this end somebody's work? Surfaces that colour a destructive action
+    /// differently (all three do) ask here rather than each keeping a list.
+    pub fn destructive(self) -> bool {
+        matches!(self, RowAction::Cancel)
+    }
+
+    /// Does this release an agent, and so need the account picker first?
+    ///
+    /// The picker is not decoration: a dispatch spends somebody's subscription
+    /// (gh#74), and a surface that skipped it would be the one place on the
+    /// board where nobody is asked.
+    pub fn releases(self) -> bool {
+        matches!(self, RowAction::Dispatch | RowAction::Retry)
+    }
+}
+
+/// The actions a row's own affordances offer — the desktop chips, the TUI's
+/// keys, the phone row's one chip.
+///
+/// Exactly the rule the desktop panel has drawn since gh#49, lifted so the
+/// other surfaces stop re-deriving it: a ready row releases, a live one opens
+/// and cancels, a blocked one may also retry (which replaces its attempt), a
+/// review offers its PR, and a failed attempt is retried or cleared away. An
+/// unroutable row offers no release on any surface — `dispatch` would refuse it.
+pub fn row_actions(row: &TaskRow) -> Vec<RowAction> {
+    let mut out = Vec::new();
+    match row.state() {
+        BoardState::Ready => {
+            if row.dispatchable {
+                out.push(RowAction::Dispatch);
+            }
+        }
+        BoardState::Working => {
+            out.push(RowAction::OpenChat);
+            out.push(RowAction::Cancel);
+        }
+        BoardState::Blocked => {
+            if row.dispatchable {
+                out.push(RowAction::Retry);
+            }
+            out.push(RowAction::OpenChat);
+            out.push(RowAction::Cancel);
+        }
+        BoardState::Review => {
+            if row.pr_url.as_deref().is_some_and(|u| !u.is_empty()) {
+                out.push(RowAction::OpenPr);
+            }
+        }
+        BoardState::Failed => {
+            if row.dispatchable {
+                out.push(RowAction::Retry);
+            }
+            out.push(RowAction::Cancel);
+        }
+        BoardState::Done => {}
+    }
+    out
+}
+
+/// Everything a *detail* surface offers: the row's own actions, plus the links
+/// a list has no room for.
+///
+/// The links come last and in one order — PR before issue, because a row that
+/// has a PR is a row whose PR is the thing you came to read. A row's actions
+/// are never dropped here: the detail is for reading, but nothing you could do
+/// from the list should require going back to it.
+pub fn detail_actions(row: &TaskRow) -> Vec<RowAction> {
+    let mut out = row_actions(row);
+    if row.pr_url.as_deref().is_some_and(|u| !u.is_empty()) && !out.contains(&RowAction::OpenPr) {
+        out.push(RowAction::OpenPr);
+    }
+    if !row.url.is_empty() {
+        out.push(RowAction::OpenIssue);
+    }
+    out
+}
+
+/// The URL an action opens, or `None` for the ones that are not links.
+pub fn action_url(row: &TaskRow, action: RowAction) -> Option<&str> {
+    match action {
+        RowAction::OpenIssue => Some(row.url.as_str()).filter(|u| !u.is_empty()),
+        RowAction::OpenPr => row.pr_url.as_deref().filter(|u| !u.is_empty()),
+        _ => None,
+    }
+}
+
+/// What has been tried on this row: `attempt 2 · last failed 3h ago · bills
+/// brede@tally.no`.
+///
+/// The one line the list has never had room for and the reason a detail surface
+/// earns its space — a `ready` row that has already failed twice is a different
+/// row from one nobody has touched, and the board draws them identically.
+///
+/// `None` on a row nothing has ever run on: "attempt 0" is not a fact, it is a
+/// blank where a fact would go.
+pub fn history_line(row: &TaskRow, now: DateTime<Utc>) -> Option<String> {
+    if row.attempts == 0 {
+        return None;
+    }
+    let mut parts = vec![format!("attempt {}", row.attempts)];
+    if let Some(outcome) = row.last_outcome.as_deref().filter(|o| !o.is_empty()) {
+        let when = row
+            .last_outcome_at
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| format_age((now - at.with_timezone(&Utc)).num_seconds()));
+        parts.push(match when {
+            Some(age) => format!("last {outcome} {age} ago"),
+            None => format!("last {outcome}"),
+        });
+    }
+    // gh#34's honesty field: the board closed this attempt and then found its
+    // agent still working. Rare, and the kind of thing you only ever want to
+    // read about the row you are already looking at.
+    if row.reopened > 0 {
+        parts.push(format!("reopened {}×", row.reopened));
+    }
+    // Whose subscription it spent, in the same words the pickers and the
+    // upstream comment use. Unconditional here, unlike the row's own sub-line
+    // ([`billing_note`], which speaks up only when somebody else is paying):
+    // the detail is the place you come to *ask*, and an answer that appears
+    // only when there is a problem cannot be trusted to mean anything.
+    if let Some(billed) = row.billed_to.as_deref().filter(|b| !b.trim().is_empty()) {
+        parts.push(bills_label(billed));
+    }
+    Some(parts.join(" · "))
+}
+
+/// Where this row's work is happening, for the detail's facts block: the route,
+/// the space, the runtime and the branch, each named only when it is known.
+///
+/// The list says at most two of these, and only ever in the sub-line's fixed
+/// columns; this is the same facts said in full, once, for the row you opened.
+pub fn placement_line(row: &TaskRow) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(route) = row.route.as_deref().filter(|r| !r.is_empty()) {
+        parts.push(route.to_string());
+    } else {
+        parts.push(NO_ROUTE.to_string());
+    }
+    if let Some(runtime) = row.runtime.as_deref().filter(|r| !r.is_empty()) {
+        parts.push(runtime.to_string());
+    }
+    if let Some(workspace) = row.workspace.as_deref().filter(|w| !w.is_empty()) {
+        parts.push(format!("ws:{workspace}"));
+    }
+    if let Some(branch) = row.branch.as_deref().filter(|b| !b.is_empty()) {
+        parts.push(branch.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+// ---------------------------------------------------------------------------
 // Live agents — the Active group's board half (gh#103)
 // ---------------------------------------------------------------------------
 //
@@ -2381,5 +2622,125 @@ mod tests {
             host_candidates(&devices, None),
             vec![None, Some("box".into())]
         );
+    }
+
+    // ---- the detail surface (gh#132) -------------------------------------
+
+    #[test]
+    fn a_ready_row_releases_and_an_unrouted_one_offers_nothing() {
+        let ready = row("1", BoardState::Ready);
+        assert_eq!(row_actions(&ready), vec![RowAction::Dispatch]);
+        let mut stranded = row("2", BoardState::Ready);
+        stranded.dispatchable = false;
+        assert!(row_actions(&stranded).is_empty());
+    }
+
+    #[test]
+    fn a_live_row_opens_and_cancels_and_a_blocked_one_may_also_retry() {
+        let working = row("1", BoardState::Working);
+        assert_eq!(
+            row_actions(&working),
+            vec![RowAction::OpenChat, RowAction::Cancel]
+        );
+        let blocked = row("2", BoardState::Blocked);
+        assert_eq!(
+            row_actions(&blocked),
+            vec![RowAction::Retry, RowAction::OpenChat, RowAction::Cancel]
+        );
+    }
+
+    #[test]
+    fn a_review_row_offers_its_pr_only_when_there_is_one() {
+        let mut review = row("1", BoardState::Review);
+        assert!(row_actions(&review).is_empty());
+        review.pr_url = Some("https://github.com/o/r/pull/9".into());
+        assert_eq!(row_actions(&review), vec![RowAction::OpenPr]);
+    }
+
+    #[test]
+    fn the_detail_adds_the_links_a_list_has_no_room_for() {
+        let mut ready = row("1", BoardState::Ready);
+        ready.pr_url = Some("https://github.com/o/r/pull/9".into());
+        assert_eq!(
+            detail_actions(&ready),
+            vec![RowAction::Dispatch, RowAction::OpenPr, RowAction::OpenIssue]
+        );
+        // Never twice: a review row already offers its PR as its own action.
+        let mut review = row("2", BoardState::Review);
+        review.pr_url = Some("https://github.com/o/r/pull/9".into());
+        assert_eq!(
+            detail_actions(&review),
+            vec![RowAction::OpenPr, RowAction::OpenIssue]
+        );
+    }
+
+    #[test]
+    fn a_done_row_still_opens_its_issue() {
+        let done = row("1", BoardState::Done);
+        assert!(row_actions(&done).is_empty());
+        assert_eq!(detail_actions(&done), vec![RowAction::OpenIssue]);
+        assert_eq!(
+            action_url(&done, RowAction::OpenIssue),
+            Some("https://github.com/o/r/issues/1")
+        );
+        assert_eq!(action_url(&done, RowAction::Dispatch), None);
+    }
+
+    #[test]
+    fn a_row_nobody_has_run_has_no_history_to_show() {
+        assert_eq!(history_line(&row("1", BoardState::Ready), now()), None);
+    }
+
+    #[test]
+    fn the_history_line_counts_attempts_and_names_the_last_outcome() {
+        let mut r = row("1", BoardState::Ready);
+        r.attempts = 2;
+        r.last_outcome = Some("failed".into());
+        r.last_outcome_at = Some("2026-08-01T09:00:00Z".into());
+        assert_eq!(
+            history_line(&r, now()).unwrap(),
+            "attempt 2 · last failed 3h ago"
+        );
+    }
+
+    #[test]
+    fn the_history_line_names_who_paid_even_when_it_was_you() {
+        let mut r = row("1", BoardState::Working);
+        r.attempts = 1;
+        r.billed_to = Some("brede@tally.no".into());
+        r.dispatched_by_user = Some("brede@tally.no".into());
+        // `billing_note` stays silent — nobody else is paying — but the detail
+        // answers the question it was opened to answer.
+        assert_eq!(billing_note(&r), None);
+        assert_eq!(
+            history_line(&r, now()).unwrap(),
+            "attempt 1 · bills brede@tally.no"
+        );
+    }
+
+    #[test]
+    fn a_reopened_attempt_says_so_where_there_is_room_for_it() {
+        let mut r = row("1", BoardState::Working);
+        r.attempts = 1;
+        r.reopened = 2;
+        assert_eq!(history_line(&r, now()).unwrap(), "attempt 1 · reopened 2×");
+    }
+
+    #[test]
+    fn placement_names_the_route_the_runtime_the_space_and_the_branch() {
+        let r = row("1", BoardState::Working);
+        assert_eq!(
+            placement_line(&r).unwrap(),
+            "offhand · claude-code · ws:offhand · board/gh-x"
+        );
+    }
+
+    #[test]
+    fn placement_says_no_route_rather_than_leading_with_a_runtime() {
+        let mut r = row("1", BoardState::Ready);
+        r.route = None;
+        r.workspace = None;
+        r.branch = None;
+        assert_eq!(placement_line(&r).unwrap(), "no route · claude-code");
     }
 }

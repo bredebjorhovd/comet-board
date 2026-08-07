@@ -100,6 +100,10 @@ icon_assets![
     (GLOBAL, "global"),
     (CHECKLIST, "checklist"),
     (WIDGET, "widget"),
+    // Hand-drawn wand in the Solar Linear style (like the terminal/plus/return
+    // ports) — the skill-invocation landmark (gh#134); the embedded set has no
+    // magic-stick.
+    (MAGIC_STICK, "magic-stick"),
     (CLOSE_CIRCLE, "close-circle"),
     // Hand-drawn info glyph in the Solar Linear style (like the terminal/
     // plus/return ports) — the embedded set has no info-circle.

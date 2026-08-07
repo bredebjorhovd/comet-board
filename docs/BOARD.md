@@ -68,7 +68,9 @@ nearly verbatim — it never depended on herdr:
 - `crates/board/src/gc.rs` — **new** (H12, gh#72): whose an attempt's checkout
   is (live / held / spent) and when it may go, pure — plus the worktree-root
   measurement `doctor` reports. The machinery is `sync.rs`'s
-  `collect_worktrees`, on the same interval clock.
+  `collect_worktrees`, on the same interval clock. `chat_standing` (H30,
+  gh#139) asks the same question about the attempt's *chat*, and
+  `sync.rs`'s `archive_chats` sweeps it beside the checkouts.
 - `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
@@ -145,6 +147,12 @@ bill?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
+`ReadBoardTask {taskId}` → `{id, body}` reads one row's issue text for the
+detail surfaces (gh#132). A call rather than a field on the streamed row,
+deliberately: `WatchBoard` republishes all hundred-odd rows on every sync cycle,
+and a hundred issue bodies riding along would make each frame two orders of
+magnitude larger — relayed to a phone — to draw one truncated line. It is read
+when somebody opens a row, and only that row's.
 `ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
 can be pointed at (the canonical set `build_spec` validates an override against)
 for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
@@ -186,6 +194,18 @@ into the same session) keeps spending it, and a steer arriving mid-turn cannot
 change it. An account that will not resolve **refuses** the dispatch before the
 chat exists, and refuses a later run rather than falling back — a silent
 fallback bills whoever the device's own login belongs to.
+
+One consequence the composer's `/` picker (gh#134) now makes visible: a slot
+IS the run's `CLAUDE_CONFIG_DIR`, so what a dispatched agent can invoke is what
+`{data_dir}/accounts/{slotId}/skills/` holds — the board's own skill that
+`materialize` stamps there (gh#133) and nothing else — plus whatever its
+checkout ships in `.claude/`. The user-level `~/.claude/skills` the operator
+sees in their own sessions is invisible from inside a slot.
+
+The picker reports that rather than offering the box user's list: offering a
+list the run cannot invoke is worse than a short one. So a skill an agent is
+*meant* to have belongs in the repo, or is installed the way the board's own is
+— written into every slot on every dispatch, byte-compared, never fatal.
 
 Deliberately not in v1, and still not: inferring an account from the WorkOS user
 who dispatched. §H12 now records who released the work by name as well as by
@@ -1445,7 +1465,9 @@ the top selected row of the whole panel. Five fixes, derived once in
   route it used to name — the group header and leading token now say it — 
   keeping only a workspace that differs from the route's name plus the
   `[enter to dispatch]` / `no route` affordances.
-- **Two-line titles under the cursor**: the desktop's selected/hovered row
+- **Two-line titles under the cursor** *(reverted by §H30 — gh#132: a row that
+  grows under the pointer reflows the list below it, which is what the operator
+  then reported as jank)*: the desktop's selected/hovered row
   wraps its title to two lines (`line_clamp(2)`, row height min not fixed);
   iOS already wrapped. The TUI stays one terminal row per line — a grid where
   one row is sometimes two makes the scroll arithmetic lie — but its title
@@ -1532,7 +1554,93 @@ place an agent reads from is written by something that already runs.
   `docs/agent-conventions.md`. [`docs/skill.md`](skill.md) is the operator-facing
   version of all of the above.
 
-### H30 — A chat lives in exactly one list — **done** (gh#138)
+### H30 — A row is a door, not a tooltip — **done** (gh#132)
+An operator report with a screenshot: "the animation feels a bit laggy or
+jagged … that it shows more text but isn't openable either as a modal or
+something doesn't sit right." Two faults with one root — §H27 answered "which
+Signicat issue?" by making the row *bigger*, which is both the jank and a
+promise the row could not keep.
+
+- **Hover never changes layout again.** §H27's `line_clamp(2)` + `min_h` meant
+  the row under the pointer grew and every row below it moved; the chips
+  appearing on hover added a few pixels more. The desktop row is now a
+  constant `ROW_H`, its two lines are constants too (`ROW_LINE_H` is the chip's
+  height, so a row with chips is exactly as tall as one without), and the title
+  is `truncate()` in every state. Of the issue's three options this is (c) —
+  and (c) is not a consolation prize once (2) exists: with the full title one
+  keypress away, a selected-row expansion would be the same sentence said
+  twice, and arrowing down the list would reflow it on every step.
+- **The row opens.** Desktop: a peek panel between the list and the footer —
+  `space` toggles it, a click on a row opens it, escape shuts it before it
+  shuts the board, and it follows the cursor once open. TUI: the help screen's
+  full-screen shape, because a 24-row terminal has no beside; it owns the
+  keyboard while up (`j`/`k` scroll the body) with **one deliberate exception**
+  — `enter` still dispatches from inside it. iOS: a sheet, which is what a tap
+  on a row now does. All three carry the whole title, the issue body as
+  markdown, the labels, where the work sits, what has been tried on it, and the
+  links.
+- **Reading is never on the way to releasing.** `enter` still dispatches from
+  the list on every surface, the phone row keeps its own Dispatch/Retry chip,
+  and a release started from a detail surface goes through the same account
+  picker — the detail must not become the one place on the board that skips the
+  question of whose subscription a run spends (§H17).
+- **The body is a call, not a field.** `ReadBoardTask {taskId}` → `{id, body}`,
+  forwardable to the board's host like every other board verb, served off the
+  loop thread that owns `board.db`. `WatchBoard` republishes every row on every
+  sync cycle; a hundred issue bodies riding along would make each frame two
+  orders of magnitude larger, relayed to a phone, to draw one truncated line.
+- **The actions are one rule.** `row_actions` (a row's own affordances) and
+  `detail_actions` (those plus the links a list has no room for) live in
+  `comet_proto::view::board`, ported to `BoardModels.swift`. The desktop's
+  per-state chip logic — hard-coded since §H12 — now reads from it, so the
+  three surfaces cannot drift into offering a Retry one of them does not.
+  `history_line` and `placement_line` join `row_metadata` as the shared
+  formatting. `history_line` names `billed_to` *unconditionally*, unlike the
+  row's own sub-line (`billing_note`, which speaks up only when somebody else
+  is paying): the detail is where you go to ask, and an answer that appears
+  only when there is a problem cannot be trusted to mean anything.
+
+### H31 — The shelf is not a landfill — **done** (gh#139)
+"Do all complete sessions just accumulate under the folder?" They did. gh#72
+reclaimed the *checkout* an attempt leaves behind and nothing reclaimed the
+other half: a board-dispatched chat was archived only by a hand, so at agent
+throughput a space's shelf silted up in days and the six chats somebody was
+actually working in were somewhere in it.
+
+`[defaults] archive_chats = "7d"` (per route, `off` honored), swept by
+`SyncEngine::archive_chats` beside `collect_worktrees` on the same interval.
+
+- **The same rule, not a second one.** `gc::chat_standing` is `gc::standing`
+  with two additions, and `gc::decide` ages both windows: a chat and a checkout
+  are one attempt's leavings, and a box that reclaimed the work while keeping
+  every conversation about it forever would have tidied half the mess. The
+  clock starts when the task leaves the board — merged, closed upstream, marked
+  done — and is stamped on `attempts.chat_archivable_at`.
+- **What it will not touch.** A live *or blocked* attempt (both are open
+  attempts, and the agent that stopped to ask at 02:00 is the worst chat to
+  file away). A task in review — review delivery asks `chat_alive` about
+  exactly this chat, so archiving one would break its own delivery loop,
+  silently, for the tasks a human is still working on. The pinned
+  orchestrator, which hears about every settle and is therefore never
+  finished. And a chat with no board attempt: the sweep walks attempts, so a
+  hand-made chat is never a candidate — those are the human's.
+- **Archiving is not deleting.** The mutation is the same `set_chat_archived`
+  the sidebar's own Archive writes, through a new `Runtime` verb, so every
+  surface updates off the workspace-doc watch with nothing told. The
+  transcript is intact, Settings → Archived unarchives, and the board
+  un-archives a chat itself when a wrongly-settled attempt goes back to work
+  (`rewatch_settled_attempts` — but only one it archived; a chat an operator
+  filed away is theirs).
+- **Per route**, unlike `retain_worktrees`: a shelf belongs to a space, routes
+  are how work is pointed at spaces, and the route running a hundred throwaway
+  fixes a week into a scratch space is not the route whose finished chats
+  somebody re-reads.
+- **`doctor` says what it costs.** A `chats` check reports how many board chats
+  are still on their shelves, how many are on the clock, the window, and how
+  many routes answer differently. Never red: keeping everything is a choice,
+  and `off` is worded as one.
+
+### H32 — A chat lives in exactly one list — **done** (gh#138)
 §H28's **Active** and gh#124's spaces tree answer different questions — "what
 is alive" and "what lives here" — and both answered with a full session row.
 Three agents working in one space therefore rendered twice inside one screen

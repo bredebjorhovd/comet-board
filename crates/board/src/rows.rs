@@ -17,7 +17,29 @@ use crate::sync::route_context;
 /// The row shape itself lives in proto (`comet_proto::view::board`) so the
 /// viewports can deserialize `WatchBoard` items without depending on this
 /// crate; it is re-exported here because this crate owns the contract.
-pub use comet_proto::view::board::TaskRow;
+pub use comet_proto::view::board::{TaskDetail, TaskRow};
+
+/// The issue text behind a row, for `ReadBoardTask` (gh#132).
+///
+/// Its own call rather than a field on [`TaskRow`] because the row is streamed
+/// and this is not: `WatchBoard` republishes all hundred-odd rows every sync
+/// cycle, and issue bodies would make each frame two orders of magnitude
+/// larger to render one truncated line. Read when a row is opened, for that row.
+///
+/// An empty body normalizes to `None` — a stored `""` and a missing description
+/// are the same fact, and a surface should not have to know which one the
+/// tracker sent.
+pub fn task_detail(task: &Task) -> TaskDetail {
+    TaskDetail {
+        id: task.id.clone(),
+        body: task
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string),
+    }
+}
 
 /// One task, in the shape callers are promised.
 ///
@@ -130,6 +152,33 @@ mod tests {
             updated_at: crate::db::now(),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn the_detail_carries_the_issue_text_and_normalizes_an_empty_one() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#1", "gh#1");
+        let task = db.get_task("gh:o/r#1").unwrap().unwrap();
+        // `seed` stores no body, and a row that has none says so by carrying
+        // none — the surfaces render "no description", which is a fact.
+        assert_eq!(task_detail(&task).body, None);
+
+        let with_body = Task {
+            body: Some("  ## why\nbecause  ".into()),
+            ..task.clone()
+        };
+        assert_eq!(
+            task_detail(&with_body).body.as_deref(),
+            Some("## why\nbecause"),
+        );
+
+        // A tracker that sent whitespace meant the same thing as one that sent
+        // nothing; no surface should have to know which.
+        let blank = Task {
+            body: Some("   \n ".into()),
+            ..task
+        };
+        assert_eq!(task_detail(&blank).body, None);
     }
 
     #[test]

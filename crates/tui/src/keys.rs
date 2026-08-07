@@ -59,6 +59,12 @@ pub enum Action {
     PickCheckout,
     /// Open the effort picker for the active model.
     PickReasoning,
+    /// Move the highlight in the composer's `/` skill picker (gh#134).
+    SkillStep(isize),
+    /// Complete the highlighted skill into the prompt.
+    SkillAccept,
+    /// Close the `/` picker, leaving the typed text alone.
+    SkillDismiss,
     /// Move the selection inside a floating panel.
     OverlayStep(isize),
     /// Activate the floating panel's selection.
@@ -136,6 +142,11 @@ pub enum Action {
     BoardFindEscape,
     /// `esc` / `h` / `B` from the board: back to the chat.
     BoardClose,
+    /// `space` — open the selected row for reading, or shut it again (gh#132).
+    /// A row is a door: `enter` releases, this one inspects.
+    BoardPeek,
+    /// `j`/`k` while a row is open: scroll its body.
+    BoardPeekScroll(isize),
 }
 
 /// A composer mutation. Separated from [`Action`] so the app can apply the whole
@@ -169,21 +180,29 @@ pub enum Edit {
 /// (quit, as in a shell); with text it would be a destructive surprise, so it
 /// is ignored.
 pub fn map(focus: Focus, overlay: bool, composer_empty: bool, key: KeyEvent) -> Option<Action> {
-    map_with(focus, overlay, composer_empty, false, false, key)
+    map_with(focus, overlay, composer_empty, false, false, false, false, key)
 }
 
 /// Like [`map`], plus whether the board's `/` field is open and swallowing the
-/// printable keys, and whether the overlay up is the help screen (whose list is
-/// longer than a pane and scrolls with `j`/`k`).
+/// printable keys, whether a board row is open for reading (gh#132, which owns
+/// the keyboard the way the help screen does), whether the overlay up is the
+/// help screen (whose list is longer than a pane and scrolls with `j`/`k`), and
+/// whether the composer's `/` skill picker is showing rows (gh#134).
 ///
-/// Split out so the event loop can pass the two live flags without the test
-/// suite having to repeat them everywhere. `map` keeps the three-flag shape.
+/// Split out so the event loop can pass the live flags without the test suite
+/// having to repeat them everywhere. `map` keeps the three-flag shape.
+// Five positional bools is past the point where a struct would read better —
+// they are one keypress's live state, not an API, but the next flag added here
+// should bundle them rather than make it six.
+#[allow(clippy::too_many_arguments)]
 pub fn map_with(
     focus: Focus,
     overlay: bool,
     composer_empty: bool,
     board_typing: bool,
+    board_peek: bool,
     help: bool,
+    skill_menu: bool,
     key: KeyEvent,
 ) -> Option<Action> {
     // Terminals with the kitty keyboard protocol report releases too; acting on
@@ -199,7 +218,17 @@ pub fn map_with(
         return map_overlay(ctrl, alt, key, help);
     }
     if focus == Focus::Board {
-        return map_board(board_typing, key);
+        return map_board(board_typing, board_peek, key);
+    }
+    // The `/` picker takes the navigation keys ahead of everything else in the
+    // composer — including Tab, which is a pane switch anywhere else. Typing
+    // falls through untouched: the picker filters on what you write, so it must
+    // never be the thing that swallows a keystroke.
+    if skill_menu
+        && focus == Focus::Composer
+        && let Some(action) = map_skill_menu(key)
+    {
+        return Some(action);
     }
 
     // ---- bindings that mean the same thing in every pane ----
@@ -243,7 +272,7 @@ pub fn map_with(
 /// `typing` is true while the `/` field is open: then the field takes every
 /// printable key and the navigation set shrinks to what closes or accepts it —
 /// the same shape as the composer, because the field is a line of text.
-fn map_board(typing: bool, key: KeyEvent) -> Option<Action> {
+fn map_board(typing: bool, peek: bool, key: KeyEvent) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     if typing {
@@ -252,6 +281,27 @@ fn map_board(typing: bool, key: KeyEvent) -> Option<Action> {
             KeyCode::Enter => Some(Action::BoardFindAccept),
             KeyCode::Backspace => Some(Action::BoardFindBackspace),
             KeyCode::Char(ch) if !ctrl && !alt => Some(Action::BoardFindType(ch)),
+            _ => None,
+        };
+    }
+    // An open row owns the keyboard, as the help screen does: it covers the
+    // list, so a `j` that walked a selection nobody can see would be a key
+    // press with no visible effect.
+    //
+    // `enter` is the exception, deliberately (gh#132): the detail is for
+    // reading and must never become a step on the way to a release, so the
+    // dispatch key still works from inside it. Everything else is swallowed —
+    // a stray `f` must not cycle a filter behind a panel.
+    if peek {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char(' ') => Some(Action::BoardPeek),
+            KeyCode::Enter => Some(Action::BoardEnter),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::BoardPeekScroll(1)),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::BoardPeekScroll(-1)),
+            KeyCode::PageDown => Some(Action::BoardPeekScroll(10)),
+            KeyCode::PageUp => Some(Action::BoardPeekScroll(-10)),
+            KeyCode::Char('c') if ctrl => Some(Action::Quit),
+            KeyCode::Char('?') => Some(Action::ToggleHelp),
             _ => None,
         };
     }
@@ -273,6 +323,9 @@ fn map_board(typing: bool, key: KeyEvent) -> Option<Action> {
         // `r` is reconnect everywhere, including here; retry takes the shifted
         // spelling, as `F` does beside `f`.
         KeyCode::Char('R') => Some(Action::BoardRetry),
+        // The door (gh#132). `enter` releases and must keep doing so from the
+        // list, so inspecting a row gets its own key.
+        KeyCode::Char(' ') => Some(Action::BoardPeek),
         KeyCode::Enter => Some(Action::BoardEnter),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::BoardDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::BoardUp),
@@ -321,6 +374,19 @@ fn map_overlay(ctrl: bool, alt: bool, key: KeyEvent, help: bool) -> Option<Actio
         KeyCode::Char('w') if ctrl => Some(Action::OverlayEdit(Edit::DeleteWordBack)),
         KeyCode::Char('u') if ctrl => Some(Action::OverlayEdit(Edit::DeleteToLineStart)),
         KeyCode::Char(ch) if !ctrl && !alt => Some(Action::OverlayEdit(Edit::Insert(ch))),
+        _ => None,
+    }
+}
+
+/// Keys the composer's `/` picker owns while it is open.
+fn map_skill_menu(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Up => Some(Action::SkillStep(-1)),
+        KeyCode::Down => Some(Action::SkillStep(1)),
+        KeyCode::Tab => Some(Action::SkillAccept),
+        KeyCode::BackTab => Some(Action::SkillStep(-1)),
+        KeyCode::Enter => Some(Action::SkillAccept),
+        KeyCode::Esc => Some(Action::SkillDismiss),
         _ => None,
     }
 }
@@ -444,6 +510,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("r", "reconnect now"),
     ("B", "the task board (B again, esc, h: back)"),
     ("enter", "board: dispatch a ready task, retry a failed one"),
+    ("space", "board: open the selected row (title, body, history, links)"),
     ("R", "board: retry — replaces a blocked task's live attempt"),
     ("f / F", "board: cycle the route filter / clear it"),
     ("/", "board: find as you type"),
@@ -646,12 +713,7 @@ mod tests {
         assert_eq!(Focus::Sidebar.next().next().next().next(), Focus::Sidebar);
         assert_eq!(Focus::Sidebar.previous(), Focus::Composer);
         assert_eq!(Focus::Transcript.previous(), Focus::Board);
-        for focus in [
-            Focus::Sidebar,
-            Focus::Board,
-            Focus::Transcript,
-            Focus::Composer,
-        ] {
+        for focus in [Focus::Sidebar, Focus::Board, Focus::Transcript, Focus::Composer] {
             assert_eq!(focus.next().previous(), focus);
         }
     }
@@ -718,29 +780,107 @@ mod tests {
         let typing = true;
         // Letters go to the query, not to the board.
         assert_eq!(
-            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Char('f'))),
+            map_with(Focus::Board, false, true, typing, false, false, false, press(KeyCode::Char('f'))),
             Some(Action::BoardFindType('f')),
             "with the field open, f must not filter"
         );
         assert_eq!(
-            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Char('q'))),
+            map_with(Focus::Board, false, true, typing, false, false, false, press(KeyCode::Char('q'))),
             Some(Action::BoardFindType('q')),
             "q must not quit while finding"
         );
         assert_eq!(
-            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Backspace)),
+            map_with(Focus::Board, false, true, typing, false, false, false, press(KeyCode::Backspace)),
             Some(Action::BoardFindBackspace)
         );
         assert_eq!(
-            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Enter)),
+            map_with(Focus::Board, false, true, typing, false, false, false, press(KeyCode::Enter)),
             Some(Action::BoardFindAccept)
         );
         assert_eq!(
-            map_with(Focus::Board, false, true, typing, false, press(KeyCode::Esc)),
+            map_with(Focus::Board, false, true, typing, false, false, false, press(KeyCode::Esc)),
             Some(Action::BoardFindEscape)
         );
         // Control chords are still dropped rather than typed.
-        assert_eq!(map_with(Focus::Board, false, true, typing, false, ctrl('p')), None);
+        assert_eq!(map_with(Focus::Board, false, true, typing, false, false, false, ctrl('p')), None);
+    }
+
+    #[test]
+    fn space_opens_a_row_and_enter_still_releases_it() {
+        // From the list: space inspects, enter releases (gh#132).
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Char(' '))),
+            Some(Action::BoardPeek)
+        );
+        assert_eq!(
+            map(Focus::Board, false, true, press(KeyCode::Enter)),
+            Some(Action::BoardEnter)
+        );
+    }
+
+    #[test]
+    fn an_open_row_owns_the_keyboard_but_never_the_dispatch_key() {
+        let peek = true;
+        let open = |code| map_with(Focus::Board, false, true, false, peek, false, false, press(code));
+        assert_eq!(open(KeyCode::Char(' ')), Some(Action::BoardPeek));
+        assert_eq!(open(KeyCode::Esc), Some(Action::BoardPeek));
+        assert_eq!(open(KeyCode::Char('j')), Some(Action::BoardPeekScroll(1)));
+        assert_eq!(open(KeyCode::Char('k')), Some(Action::BoardPeekScroll(-1)));
+        // The detail is for reading and must not become a step on the way to a
+        // release: enter still dispatches from inside it.
+        assert_eq!(open(KeyCode::Enter), Some(Action::BoardEnter));
+        // Everything else is swallowed — a stray `f` must not cycle a filter
+        // on a list the panel is covering.
+        assert_eq!(open(KeyCode::Char('f')), None);
+        assert_eq!(open(KeyCode::Char('/')), None);
+        assert_eq!(open(KeyCode::Char('R')), None);
+    }
+
+    #[test]
+    fn the_skill_picker_takes_navigation_but_never_the_typing() {
+        let menu = |key| map_with(Focus::Composer, false, true, false, false, false, true, key);
+        assert_eq!(menu(press(KeyCode::Down)), Some(Action::SkillStep(1)));
+        assert_eq!(menu(press(KeyCode::Up)), Some(Action::SkillStep(-1)));
+        assert_eq!(menu(press(KeyCode::Enter)), Some(Action::SkillAccept));
+        // Tab completes rather than switching pane — the picker outranks even
+        // the bindings that mean the same thing everywhere else.
+        assert_eq!(menu(press(KeyCode::Tab)), Some(Action::SkillAccept));
+        assert_eq!(menu(press(KeyCode::Esc)), Some(Action::SkillDismiss));
+        // Typing still filters: the picker must never swallow a keystroke.
+        assert_eq!(
+            menu(press(KeyCode::Char('c'))),
+            Some(Action::Edit(Edit::Insert('c')))
+        );
+        assert_eq!(
+            menu(press(KeyCode::Backspace)),
+            Some(Action::Edit(Edit::Backspace))
+        );
+
+        // Closed, every one of those keys means what it always did.
+        let plain = |key| map_with(Focus::Composer, false, true, false, false, false, false, key);
+        assert_eq!(plain(press(KeyCode::Enter)), Some(Action::Send));
+        assert_eq!(plain(press(KeyCode::Down)), Some(Action::Edit(Edit::Down)));
+        assert_eq!(plain(press(KeyCode::Tab)), Some(Action::FocusNext));
+        assert_eq!(
+            plain(press(KeyCode::Esc)),
+            Some(Action::Focus(Focus::Transcript))
+        );
+
+        // And the flag only reaches the composer: a picker cannot be open in
+        // another pane, so it must not be able to steal that pane's keys.
+        assert_eq!(
+            map_with(
+                Focus::Sidebar,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                press(KeyCode::Enter)
+            ),
+            Some(Action::Open)
+        );
     }
 
     #[test]
@@ -765,7 +905,12 @@ mod tests {
         assert_eq!(Focus::Board.next(), Focus::Transcript);
         assert_eq!(Focus::Composer.previous(), Focus::Transcript);
         assert_eq!(Focus::Board.previous(), Focus::Sidebar);
-        for focus in [Focus::Sidebar, Focus::Board, Focus::Transcript, Focus::Composer] {
+        for focus in [
+            Focus::Sidebar,
+            Focus::Board,
+            Focus::Transcript,
+            Focus::Composer,
+        ] {
             assert_eq!(focus.next().previous(), focus);
         }
     }

@@ -35,6 +35,15 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
+    /// The skills and slash commands a run in this chat could invoke, for the
+    /// composer's `/` picker (gh#134). Params: `{chatId?, cwd?, harness?}` →
+    /// `[SkillDescriptor]`.
+    ///
+    /// Forwardable, and it has to be: skills are files, they are files on the
+    /// device that hosts the chat, and the answer depends on which agent
+    /// account that chat names — a laptop enumerating its own `~/.claude` for a
+    /// chat running on the box would offer skills that run cannot invoke.
+    pub const LIST_SKILLS: &str = "ListSkills";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     pub const WATCH_CHATS: &str = "WatchChats";
@@ -135,6 +144,15 @@ pub mod methods {
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";
+    /// The issue text behind one row, for the detail surface (gh#132). Params:
+    /// `{taskId}` → `{id, body}`.
+    ///
+    /// A call rather than a field on the streamed row, deliberately.
+    /// [`WATCH_BOARD`] republishes every row on every sync cycle; a hundred
+    /// issue bodies riding along would make each frame two orders of magnitude
+    /// larger, relayed to a phone, to draw one truncated line. This is read
+    /// when somebody opens a row, and only that row's.
+    pub const READ_BOARD_TASK: &str = "ReadBoardTask";
     /// The board's `routing.toml` as it stands on its host: the text, its
     /// parse, and everything wrong with it — plus the repos that have a space
     /// on that device but nothing on the board watching them (gh#75). Params:

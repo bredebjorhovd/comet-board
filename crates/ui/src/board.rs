@@ -66,7 +66,7 @@ use gpui::{
     div, prelude::*, px,
 };
 
-use comet_proto::view::board::{self, BoardState, Filter, TaskRow};
+use comet_proto::view::board::{self, BoardState, Filter, RowAction, TaskDetail, TaskRow};
 use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
 use comet_rpc::methods;
@@ -445,6 +445,28 @@ fn group_row_id(state: BoardState, route: Option<&str>) -> String {
     )
 }
 
+/// A task row's height — **the same for every row, in every state** (gh#132).
+///
+/// gh#125 made it a minimum so the hovered row could wrap its title, which is
+/// how a hover came to reflow everything under it. It is a constant again, and
+/// the two lines inside it are constants too: nothing a pointer does may change
+/// the geometry of a list it is only passing over.
+const ROW_H: f32 = ROW_PAD_Y * 2.0 + ROW_LINE_H + ROW_LINE_GAP + META_LINE_H;
+/// The first line's height — the action chip's, so a row showing chips is
+/// exactly as tall as one that is not.
+const ROW_LINE_H: f32 = 20.0;
+/// The metadata line's height, held even when there is no metadata.
+const META_LINE_H: f32 = 15.0;
+/// The gap between a row's two lines, and its vertical padding — named because
+/// [`ROW_H`] is their sum and a row whose declared height disagreed with its
+/// content would clip one of them.
+const ROW_LINE_GAP: f32 = 2.0;
+const ROW_PAD_Y: f32 = 5.0;
+/// How tall the peek's issue body may get before it scrolls (gh#132). Capped
+/// rather than proportional: the list above is the thing being navigated, and a
+/// panel that grew with a long issue would push the cursor's own row off screen.
+const PEEK_BODY_MAX_H: f32 = 220.0;
+
 /// The accent a board state carries, matching the TUI's palette: blocked and
 /// failed share red (the glyph tells them apart), working is amber, review
 /// indigo, ready plain text, done dim.
@@ -455,6 +477,31 @@ fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
         BoardState::Review => theme.accent,
         BoardState::Ready => theme.text,
         BoardState::Done => theme.text_faint,
+    }
+}
+
+/// A stable element-id fragment per action — ids must be unique and constant
+/// across frames, and the label is not (it has a short form).
+fn action_key(action: RowAction) -> &'static str {
+    match action {
+        RowAction::Dispatch => "dispatch",
+        RowAction::Retry => "retry",
+        RowAction::Cancel => "cancel",
+        RowAction::OpenChat => "chat",
+        RowAction::OpenIssue => "issue",
+        RowAction::OpenPr => "pr",
+    }
+}
+
+/// What an action is coloured: the release reads as the row's own text, ending
+/// somebody's work reads as danger, a link reads as a link, and opening the
+/// chat stays quiet beside whichever of those it sits next to.
+fn action_color(action: RowAction, theme: &Theme) -> gpui::Hsla {
+    match action {
+        RowAction::Dispatch | RowAction::Retry => theme.text,
+        RowAction::Cancel => theme.danger,
+        RowAction::OpenPr => theme.accent,
+        RowAction::OpenChat | RowAction::OpenIssue => theme.text_muted,
     }
 }
 
@@ -833,6 +880,21 @@ pub struct BoardPanel {
     /// not read it, so the only honest way to ask "do you mean it" is to ask
     /// after the box has said it minds.
     pending_bill: Option<PendingBill>,
+    /// The peek panel is showing the selected row (gh#132). Sticky: it follows
+    /// the cursor once opened, so walking the board reads rather than needing a
+    /// keypress per row, and `space` (or escape) shuts it again.
+    peek: bool,
+    /// The issue text behind the row the peek last asked for, keyed by task id
+    /// so a reply that raced a newer selection is dropped rather than rendered
+    /// under the wrong title.
+    detail: Option<TaskDetail>,
+    /// The task a `ReadBoardTask` is in flight for — the fetch is idempotent
+    /// per row, and re-asking on every frame would be a call per repaint.
+    detail_pending: Option<String>,
+    /// Why the last detail fetch failed, said where the body would be.
+    detail_error: Option<SharedString>,
+    /// The peek's own scroll: an issue body is longer than the panel.
+    detail_scroll: ScrollHandle,
     /// Keeps the elapsed counters on working/blocked rows live.
     _ticker: Task<()>,
     _observe: Subscription,
@@ -858,7 +920,10 @@ impl BoardPanel {
                     }
                     cx.notify();
                 }
-                ComposerInputEvent::Submitted
+                // No `/` picker on a dispatch search box, so its navigation
+                // keys never become menu events.
+                ComposerInputEvent::Menu(_)
+                | ComposerInputEvent::Submitted
                 | ComposerInputEvent::PastedImages(_)
                 | ComposerInputEvent::PastedPaths(_) => {}
             });
@@ -925,6 +990,11 @@ impl BoardPanel {
             host_menu_dismissed_at: None,
             dispatch: None,
             pending_bill: None,
+            peek: false,
+            detail: None,
+            detail_pending: None,
+            detail_error: None,
+            detail_scroll: ScrollHandle::new(),
             _ticker: ticker,
             _observe: observe,
         }
@@ -1709,6 +1779,83 @@ impl BoardPanel {
         window.dispatch_action(Box::new(ToggleBoard), cx);
     }
 
+    // ---- the peek panel (gh#132) ----
+
+    /// Open the peek on whatever the cursor is on, and fetch its issue text.
+    ///
+    /// Idempotent: opening an already-open peek only re-points it, which is
+    /// what a click on a second row does.
+    fn open_peek(&mut self, cx: &mut Context<Self>) {
+        if self.model.selected_task().is_none() {
+            // A section or group header is not a door. Silently, because the
+            // click that landed here has already folded it.
+            return;
+        }
+        self.peek = true;
+        self.ensure_detail(cx);
+    }
+
+    /// `space`: open the peek on the selected row, or shut it.
+    fn toggle_peek(&mut self, cx: &mut Context<Self>) {
+        if self.peek {
+            self.peek = false;
+            cx.notify();
+        } else {
+            self.open_peek(cx);
+            cx.notify();
+        }
+    }
+
+    /// Fetch the selected row's issue text, unless it is already held or
+    /// already in flight.
+    ///
+    /// Called from every path that can change what the open peek is pointed at
+    /// — opening it, and moving the cursor while it is open — because the peek
+    /// follows the selection and a body from the previous row is worse than a
+    /// blank one.
+    fn ensure_detail(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.model.selected_task().map(|row| row.id.clone()) else {
+            return;
+        };
+        if self.detail.as_ref().is_some_and(|d| d.id == id)
+            || self.detail_pending.as_deref() == Some(id.as_str())
+        {
+            return;
+        }
+        // A new row: whatever is on screen belongs to the old one.
+        self.detail = None;
+        self.detail_error = None;
+        let Some(engine) = self.engine(cx) else {
+            self.detail_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.detail_pending = Some(id.clone());
+        let params = self.host_params(serde_json::json!({ "taskId": id }));
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<TaskDetail>(methods::READ_BOARD_TASK, params)
+                .await;
+            this.update(cx, |panel, cx| {
+                // A reply for a row the cursor has already left is stale by
+                // definition — the newer fetch owns the slot.
+                if panel.detail_pending.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                panel.detail_pending = None;
+                match result {
+                    Ok(detail) => panel.detail = Some(detail),
+                    Err(err) => panel.detail_error = Some(format!("{err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// `enter` on the board: dispatch a ready (or failed) task, fold a section
     /// header, or open a running task's chat.
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1990,6 +2137,24 @@ impl BoardPanel {
                 self.activate(window, cx);
                 cx.stop_propagation();
             }
+            // Open the selected row for reading, or shut it again (gh#132).
+            // `space` because `enter` is the release and must stay one keypress
+            // from the list: inspecting a row and dispatching it are different
+            // enough that they should never be the same key.
+            "space" => {
+                self.toggle_peek(cx);
+                cx.stop_propagation();
+            }
+            // Escape shuts the peek before it shuts the board: the last thing
+            // opened is the first thing closed. Only while it is actually
+            // drawn, though — on a header the peek renders nothing, and an
+            // escape that swallowed itself against invisible state would read
+            // as the key not working.
+            "escape" if self.peek && self.model.selected_task().is_some() => {
+                self.peek = false;
+                cx.notify();
+                cx.stop_propagation();
+            }
             "escape" => {
                 window.dispatch_action(Box::new(ToggleBoard), cx);
                 cx.stop_propagation();
@@ -2029,6 +2194,11 @@ impl BoardPanel {
                 .position(|line| line.id() == selected.as_deref().unwrap_or(""))
             {
                 self.scroll.scroll_to_item(ix);
+            }
+            // An open peek follows the cursor (gh#132) — otherwise walking the
+            // board would leave it showing a row you have left.
+            if self.peek {
+                self.ensure_detail(cx);
             }
             cx.notify();
         }
@@ -2611,6 +2781,13 @@ impl BoardPanel {
 
     /// One task row: glyph + identifier + title on the first line, the shared
     /// metadata underneath, and a state action on hover/selection.
+    ///
+    /// **Every row is exactly [`ROW_H`] tall, always** (gh#132). gh#125 gave the
+    /// row under the pointer a second title line, which meant the list reflowed
+    /// on every hover — the "laggy or jagged" the operator reported. Hover here
+    /// changes colour and nothing else; both lines are fixed-height, so even the
+    /// action chips appearing cannot grow the row. The full title lives in the
+    /// peek panel, which is what a click on the row opens.
     #[allow(clippy::too_many_arguments)]
     fn render_task(
         &mut self,
@@ -2635,15 +2812,16 @@ impl BoardPanel {
 
         div()
             .id(SharedString::from(format!("board-row-{}", row.id)))
-            // Min, not fixed (gh#125): the row under the cursor may wrap its
-            // title to a second line, and a fixed height would clip it.
-            .min_h(px(44.0))
-            .py(px(5.0))
+            // Fixed, not min (gh#132): a row that can grow is a row the list
+            // reflows around, and the only thing that ever grew one was the
+            // pointer passing over it.
+            .h(px(ROW_H))
+            .py(px(ROW_PAD_Y))
             .flex_none()
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(2.0))
+            .gap(px(ROW_LINE_GAP))
             .px(px(Theme::SPACE_LG))
             .cursor_pointer()
             .bg(motion::hover_blend(
@@ -2656,8 +2834,13 @@ impl BoardPanel {
                 },
             ))
             .on_hover(motion::hover_listener(&fade_key))
+            // A row is a door (gh#132): clicking one selects it AND opens the
+            // peek, because a truncated title that answers a click with nothing
+            // is what made the extra text feel like a tooltip. `enter` still
+            // releases — reading is never in the way of dispatching.
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.model.selected = Some(select_id.clone());
+                this.open_peek(cx);
                 cx.notify();
             }))
             .on_mouse_down(
@@ -2678,11 +2861,12 @@ impl BoardPanel {
                 }),
             )
             // Line 1: glyph + the repo-qualified identifier + title, then the
-            // actions. The cursor's row gets a second title line (gh#125):
-            // "which Signicat issue" should not cost a click.
+            // actions. Its height is the chip's, so a row whose chips appear on
+            // hover is exactly as tall as one whose chips do not (gh#132).
             .child(
                 div()
                     .w_full()
+                    .h(px(ROW_LINE_H))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -2711,13 +2895,9 @@ impl BoardPanel {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .map(|el| {
-                                if selected || hovered {
-                                    el.line_clamp(2)
-                                } else {
-                                    el.truncate()
-                                }
-                            })
+                            // One line, on every row, in every state (gh#132).
+                            // The whole title is in the peek panel.
+                            .truncate()
                             .text_size(px(12.0))
                             .text_color(if state == BoardState::Done {
                                 theme.text_faint
@@ -2730,168 +2910,103 @@ impl BoardPanel {
                     )
                     .child(actions),
             )
-            // Line 2: the shared metadata.
-            .when(!meta.is_empty(), |el| {
-                el.child(
-                    div()
-                        .w_full()
-                        .pl(px(19.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint.opacity(0.85))
-                        .truncate()
-                        .child(SharedString::from(meta)),
-                )
-            })
+            // Line 2: the shared metadata. Fixed-height and always present —
+            // an empty one holds its space rather than letting the row shrink,
+            // so a board of mixed rows scrolls at one rhythm.
+            .child(
+                div()
+                    .w_full()
+                    .h(px(META_LINE_H))
+                    .pl(px(19.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint.opacity(0.85))
+                    .truncate()
+                    .child(SharedString::from(meta)),
+            )
             .into_any_element()
     }
 
-    /// The row's state action, revealed on hover or selection: dispatch for a
-    /// ready task, cancel (with a separate open-chat affordance) for a running
-    /// one, and "Open PR" for a review waiting on you.
+    /// The row's state actions, revealed on hover or selection.
+    ///
+    /// *Which* actions a row has is [`board::row_actions`] — the shared rule the
+    /// TUI's keys and the phone's chip read too (gh#132). This decides only how
+    /// they look and what a click runs.
     fn render_row_actions(
         &mut self,
         row: &TaskRow,
         visible: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if !visible {
+        let actions = board::row_actions(row);
+        if !visible || actions.is_empty() {
             return gpui::Empty.into_any_element();
         }
         let theme = Theme::of(cx).clone();
         let id = row.id.clone();
-        let state = row.state();
-        let dispatch_id = id.clone();
-        let open_id = id.clone();
-        let cancel_id = id.clone();
-        let pr_url = row.pr_url.clone();
-        let chip = |key: String, label: &'static str, color: gpui::Hsla| {
-            div()
-                .id(key)
-                .flex_none()
-                .h(px(20.0))
-                .px(px(8.0))
-                .rounded(px(5.0))
-                .bg(theme.wash(0.12))
-                .flex()
-                .items_center()
-                .text_size(px(10.5))
-                .text_color(color)
-                .hover(|s| s.bg(theme.wash(0.18)))
-                .child(SharedString::from(label))
-        };
-        match state {
-            BoardState::Ready if row.dispatchable => chip(
-                format!("board-dispatch-{id}"),
-                "Dispatch",
-                theme.text,
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.dispatch(&dispatch_id, cx);
-            }))
-            .into_any_element(),
-            BoardState::Working => div()
-                .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0))
-                .child(
-                    chip(format!("board-open-{id}"), "Open", theme.text_muted)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.open_chat(&open_id, window, cx);
-                        })),
-                )
-                .child(
-                    chip(format!("board-cancel-{id}"), "Cancel", theme.danger)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.cancel(&cancel_id, cx);
-                        })),
-                )
-                .into_any_element(),
-            // A blocked row's agent is alive but waiting on input, and retrying
-            // must end it first — so the chip routes through the same release
-            // flow a `failed` Retry does, and the dispatch picker marks the
-            // release as a replace (gh#49). Open stays: the awaiting chat is
-            // where the answer often is, and `enter` opens it for the same
-            // reason (the agent is alive, unlike a `failed` one).
-            BoardState::Blocked => {
-                let mut actions = div()
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .children(actions.into_iter().map(|action| {
+                let target = id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "board-action-{}-{}",
+                        action_key(action),
+                        id
+                    )))
                     .flex_none()
+                    .h(px(ROW_LINE_H))
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .bg(theme.wash(0.12))
                     .flex()
-                    .flex_row()
                     .items_center()
-                    .gap(px(4.0));
-                if row.dispatchable {
-                    actions = actions.child(
-                        chip(format!("board-retry-{id}"), "Retry", theme.text)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.dispatch(&dispatch_id, cx);
-                            })),
-                    );
-                }
-                actions
-                    .child(
-                        chip(format!("board-open-{id}"), "Open", theme.text_muted)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_chat(&open_id, window, cx);
-                            })),
-                    )
-                    .child(
-                        chip(format!("board-cancel-{id}"), "Cancel", theme.danger)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.cancel(&cancel_id, cx);
-                            })),
-                    )
-                    .into_any_element()
-            }
-            BoardState::Review if pr_url.is_some() => {
-                let url = pr_url.clone().unwrap_or_default();
-                chip(format!("board-pr-{id}"), "Open PR", theme.accent)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .text_size(px(10.5))
+                    .text_color(action_color(action, &theme))
+                    .hover(|s| s.bg(theme.wash(0.18)))
+                    .child(SharedString::from(action.short_label()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.open_pr_url(&url, cx);
+                        this.run_action(&target, action, window, cx);
                     }))
-                    .into_any_element()
-            }
-            // A failed attempt is not the end of the issue: retry starts a new
-            // attempt (the same release flow a `ready` row uses), and cancel
-            // ends the dead attempt so the issue returns to `ready`.
-            BoardState::Failed => {
-                let mut actions = div()
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0));
-                if row.dispatchable {
-                    actions = actions.child(
-                        chip(format!("board-retry-{id}"), "Retry", theme.text)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.dispatch(&dispatch_id, cx);
-                            })),
-                    );
+            }))
+            .into_any_element()
+    }
+
+    /// Do one of the shared actions to a row.
+    ///
+    /// The single place this surface *performs* a board action, so the row's
+    /// chips and the peek panel's buttons cannot drift into meaning different
+    /// things by the same word. A release goes through the dispatch picker
+    /// exactly as `enter` does — reading a row never skips the account question.
+    fn run_action(
+        &mut self,
+        id: &str,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            RowAction::Dispatch | RowAction::Retry => self.dispatch(id, cx),
+            RowAction::Cancel => self.cancel(id, cx),
+            RowAction::OpenChat => self.open_chat(id, window, cx),
+            RowAction::OpenIssue | RowAction::OpenPr => {
+                let url = self
+                    .model
+                    .task(id)
+                    .and_then(|row| board::action_url(row, action))
+                    .map(str::to_string);
+                match url {
+                    Some(url) => self.open_pr_url(&url, cx),
+                    None => self.set_notice("Nothing to open there yet", cx),
                 }
-                actions
-                    .child(
-                        chip(format!("board-cancel-{id}"), "Cancel", theme.danger)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.cancel(&cancel_id, cx);
-                            })),
-                    )
-                    .into_any_element()
             }
-            _ => gpui::Empty.into_any_element(),
         }
     }
 
@@ -3356,6 +3471,229 @@ impl BoardPanel {
             .into_any_element()
     }
 
+    /// The peek panel: the selected row, in full (gh#132).
+    ///
+    /// What the list cannot say, said once and where you asked for it — the
+    /// whole title, the issue body as markdown, the labels, where the work sits,
+    /// what has been tried on it, and every action the row has anywhere else.
+    /// It is for *reading*: `enter` still releases from the list, and nothing
+    /// here is a step on the way to a dispatch.
+    fn render_peek(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let Some(row) = self.model.selected_task().cloned() else {
+            // The cursor is on a header. Draw nothing rather than a card about
+            // no row — the peek reopens itself the moment it lands on one.
+            return gpui::Empty.into_any_element();
+        };
+        let now = Utc::now();
+        let state = row.state();
+        let id = row.id.clone();
+        let loading = self.detail_pending.as_deref() == Some(id.as_str());
+        let body = self
+            .detail
+            .as_ref()
+            .filter(|d| d.id == id)
+            .and_then(|d| d.body.clone());
+        let error = self.detail_error.clone();
+
+        // Line 1 of the card: which row this is, and the way out.
+        let heading = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .text_color(state_color(state, &theme))
+                    .child(SharedString::from(state.glyph())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(row.display_identifier())),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("board-peek-close")
+                    .flex_none()
+                    .px(px(6.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint)
+                    .hover(|s| s.bg(theme.wash(0.12)))
+                    .child(SharedString::from("esc"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.peek = false;
+                        cx.notify();
+                    })),
+            );
+
+        // The whole title — the sentence gh#125 tried to fit into a second row
+        // of a list that then reflowed under the pointer.
+        let title = div()
+            .flex_none()
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .child(SharedString::from(row.title.clone()));
+
+        let facts: Vec<AnyElement> = [board::placement_line(&row), board::history_line(&row, now)]
+            .into_iter()
+            .flatten()
+            .map(|line| {
+                div()
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint.opacity(0.9))
+                    .child(SharedString::from(line))
+                    .into_any_element()
+            })
+            .collect();
+
+        // The issue's own labels — the one thing on the row the list has never
+        // had room for at all.
+        let labels: Option<AnyElement> = (!row.labels.is_empty()).then(|| {
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(4.0))
+                .children(row.labels.iter().map(|label| {
+                    div()
+                        .flex_none()
+                        .px(px(6.0))
+                        .h(px(16.0))
+                        .flex()
+                        .items_center()
+                        .rounded_full()
+                        .bg(theme.wash(0.08))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(label.clone()))
+                }))
+                .into_any_element()
+        });
+
+        // The body. Rendered with the transcript's markdown pipeline, so an
+        // issue reads here the way an agent's reply reads there.
+        let body_element: AnyElement = if let Some(message) = error {
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.warning)
+                .child(message)
+                .into_any_element()
+        } else if loading {
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("Reading the issue…"))
+                .into_any_element()
+        } else if let Some(text) = body {
+            let tree = crate::markdown::parser::parse_full(&text);
+            crate::markdown::render::render_tree(
+                &tree,
+                &crate::markdown::render::RenderOptions::settled(SharedString::from(format!(
+                    "board-peek-{id}"
+                ))),
+                &theme,
+                window,
+                &|_| None,
+            )
+        } else {
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(board::NO_BODY))
+                .into_any_element()
+        };
+
+        let actions = board::detail_actions(&row);
+        let action_row: Option<AnyElement> = (!actions.is_empty()).then(|| {
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(5.0))
+                .children(actions.into_iter().map(|action| {
+                    let target = id.clone();
+                    div()
+                        .id(SharedString::from(format!(
+                            "board-peek-{}-{}",
+                            action_key(action),
+                            id
+                        )))
+                        .flex_none()
+                        .h(px(22.0))
+                        .px(px(9.0))
+                        .rounded(px(6.0))
+                        .bg(theme.wash(0.12))
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.0))
+                        .text_color(action_color(action, &theme))
+                        .hover(|s| s.bg(theme.wash(0.18)))
+                        // The full spelling here: a panel has room, and a
+                        // button labelled "Open" beside another labelled
+                        // "Open PR" is a coin toss.
+                        .child(SharedString::from(action.label()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.run_action(&target, action, window, cx);
+                        }))
+                }))
+                .into_any_element()
+        });
+
+        let card = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_LG))
+            .py(px(8.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.wash(0.03))
+            .child(heading)
+            .child(title)
+            .children(facts)
+            .children(labels)
+            // The body is the only part that can outgrow the panel, so it is
+            // the only part that scrolls — bounded here rather than on the card
+            // (the model list next door is bounded the same way), so a short
+            // issue takes the room it needs and a long one stops at the cap
+            // instead of pushing the cursor's own row off screen.
+            .child(
+                div()
+                    .id("board-peek-body")
+                    .flex_none()
+                    .max_h(px(PEEK_BODY_MAX_H))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.detail_scroll)
+                    .flex()
+                    .flex_col()
+                    .child(body_element),
+            )
+            .children(action_row);
+
+        // Opening is a deliberate act and gets an entrance; nothing about the
+        // list beneath it moves, so there is no reflow to animate away.
+        motion::fade_quick(SharedString::from(format!("board-peek-in-{id}")), card)
+            .into_any_element()
+    }
+
     /// The footer: a transient dispatch/cancel message owns it until it
     /// expires, then the board's key hints take over.
     fn render_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3367,6 +3705,7 @@ impl BoardPanel {
         let on_section = self.model.on_section().is_some();
         let selected_task = self.model.selected_task().map(|r| r.state());
         let picking = self.dispatch.is_some();
+        let peek_open = self.peek;
 
         let content: SharedString = if let Some(notice) = notice {
             notice
@@ -3384,6 +3723,11 @@ impl BoardPanel {
                 Some(BoardState::Failed) => hints.push("enter to retry"),
                 Some(BoardState::Working | BoardState::Blocked) => hints.push("enter to open chat"),
                 _ => {}
+            }
+            // The door, named (gh#132) — an affordance nobody can find is one
+            // that does not exist.
+            if selected_task.is_some() {
+                hints.push(if peek_open { "space closes" } else { "space to open" });
             }
             hints.push("f filter · / find");
             if filter_active {
@@ -3528,6 +3872,12 @@ impl Render for BoardPanel {
                 el.child(self.render_dispatch_picker(cx))
             })
             .child(body)
+            // The peek sits between the list and the footer: the list keeps the
+            // top of the panel (it is what you are navigating), and the row you
+            // opened reads directly under it.
+            .when(self.peek, |el| {
+                el.child(self.render_peek(window, cx))
+            })
             .child(self.render_footer(cx))
             .into_any_element()
     }
@@ -3846,6 +4196,51 @@ mod tests {
         let mut f = row("f", BoardState::Failed);
         f.state = BoardState::Failed.as_str().into();
         assert_eq!(metadata(&f, now), "pane exited without completing");
+    }
+
+    /// gh#132: every row is the same height, whatever the pointer is doing.
+    /// The two lines are constants and they add up to the row — which is the
+    /// invariant, since a row that can grow is a row the list reflows around.
+    #[test]
+    fn a_row_cannot_change_height_under_the_pointer() {
+        // The declared height IS the content's: padding, two fixed lines and
+        // the gap between them. A row that declared less would clip a line;
+        // one that declared more would drift from what it draws.
+        assert_eq!(ROW_H, 47.0);
+        assert_eq!(ROW_H, ROW_PAD_Y * 2.0 + ROW_LINE_H + ROW_LINE_GAP + META_LINE_H);
+        // The first line is exactly the action chip's height, so a row showing
+        // chips on hover is exactly as tall as one that is not.
+        assert_eq!(ROW_LINE_H, 20.0);
+    }
+
+    /// The chips a row draws are the shared rule's, not a second copy of it —
+    /// so the peek panel, the TUI's keys and the phone's sheet cannot drift
+    /// into offering a row a verb the desktop does not.
+    #[test]
+    fn the_rows_chips_are_the_shared_action_set() {
+        use comet_proto::view::board::RowAction;
+        assert_eq!(
+            board::row_actions(&row("r", BoardState::Ready)),
+            vec![RowAction::Dispatch]
+        );
+        assert_eq!(
+            board::row_actions(&row("w", BoardState::Working)),
+            vec![RowAction::OpenChat, RowAction::Cancel]
+        );
+        // And every action this surface can draw has a colour and a stable
+        // element-id fragment — a missing arm would be a panic at paint time.
+        let theme = Theme::dark();
+        for action in [
+            RowAction::Dispatch,
+            RowAction::Retry,
+            RowAction::Cancel,
+            RowAction::OpenChat,
+            RowAction::OpenIssue,
+            RowAction::OpenPr,
+        ] {
+            assert!(!action_key(action).is_empty());
+            let _ = action_color(action, &theme);
+        }
     }
 
     fn runtimes() -> Vec<BoardRuntime> {
