@@ -109,6 +109,44 @@ final class DemoDataset {
                      planLabel: "Pro", active: true, displayName: nil),
     ]
 
+    /// The repo picker's world (gh#118), demo edition: the box hosts the board,
+    /// two of its spaces are checkouts, and the App can see a third repo nobody
+    /// has connected yet — which is the row the whole feature exists for.
+    ///
+    /// MOCK data: not real repos, and `bredebjorhovd/itsm-agent` is here as a
+    /// name to tap, not as a claim about anybody's GitHub.
+    static let repoLinks: [SpaceSlug] = [
+        SpaceSlug(spaceId: "space-comet", slug: "bredebjorhovd/comet-board"),
+        SpaceSlug(spaceId: "space-edge", slug: "bredebjorhovd/comet-edge"),
+    ]
+    static let repoOffers: [RepoOffer] = [
+        RepoOffer(slug: "bredebjorhovd/comet-board", private: false, archived: false,
+                  missing: nil),
+        RepoOffer(slug: "bredebjorhovd/comet-edge", private: false, archived: false,
+                  missing: nil),
+        RepoOffer(slug: "bredebjorhovd/itsm-agent", private: true, archived: false,
+                  missing: "both"),
+    ]
+
+    /// Onboard, demo edition: mint the space the box would have made, so the
+    /// picker's exit — standing in a repo you just connected — is explorable
+    /// with no infrastructure at all.
+    func onboard(slug: String) -> Onboarded {
+        let name = slug.split(separator: "/").last.map(String.init) ?? slug
+        let device = devices.first { $0.platform != "ios" }?.id ?? "dev-vps"
+        let path = "/srv/repos/\(name)"
+        if let existing = spaces.first(where: { $0.deviceId == device && $0.path == path }) {
+            return Onboarded(slug: slug, deviceId: device, path: path,
+                             spaceId: existing.id, spaceName: existing.displayName)
+        }
+        let id = "space-\(UUID().uuidString.lowercased().prefix(8))"
+        spaces.append(Space(id: id, deviceId: device, path: path, name: nil,
+                            gitDetected: true, gitCheckedAt: nowMs(), checkoutId: nil,
+                            createdAt: nowMs()))
+        return Onboarded(slug: slug, deviceId: device, path: path,
+                         spaceId: id, spaceName: name)
+    }
+
     /// Release a demo row: flip it to `working` on a fresh chat in the routed
     /// space, so the board, the Agents section and the transcript all agree.
     func dispatch(taskId: String, runtime: String?, account: String?) -> String? {

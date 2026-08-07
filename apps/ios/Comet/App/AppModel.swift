@@ -341,6 +341,33 @@ final class AppModel {
         return await board.cancel(taskId: taskId)
     }
 
+    // MARK: The repo picker (gh#118)
+
+    /// The board hosts, and what each knows about repos. Demo mode answers with
+    /// the dataset's own box, so the whole picker — including onboarding a repo
+    /// that has never been connected — is explorable with no infrastructure.
+    func repoHosts() async -> [BoardStore.RepoHost] {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 250_000_000)  // feel like a sweep
+            let box = demo.devices.first { $0.platform != "ios" }?.id ?? "dev-vps"
+            return [BoardStore.RepoHost(deviceId: box, links: DemoDataset.repoLinks,
+                                        offers: DemoDataset.repoOffers, note: nil)]
+        }
+        guard let board else { return [] }
+        return await board.repoHosts()
+    }
+
+    /// Clone a repo onto the board's host, give it a space, and put it on the
+    /// board — the gh#97 verb, run from the picker.
+    func onboardRepo(slug: String, host: String) async -> BoardStore.OnboardOutcome {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 900_000_000)  // it is a git clone
+            return .connected(demo.onboard(slug: slug))
+        }
+        guard let board else { return .failed("Not connected to a board") }
+        return await board.onboard(slug: slug, host: host)
+    }
+
     func deviceName(_ deviceId: String) -> String {
         (demo?.devices ?? workspace?.devices)?.first { $0.id == deviceId }?.name ?? deviceId
     }

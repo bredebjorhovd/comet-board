@@ -169,6 +169,22 @@ pub mod methods {
     /// authenticate for and the sync loop can poll, so a repo missing from it is
     /// a repo somebody has to go and install the App on.
     pub const LIST_APP_REPOS: &str = "ListAppRepos";
+    /// Everything a repo-first space picker needs, from the board's host, in one
+    /// call (gh#118). Params: `{}` → `{deviceId, spaces: [{spaceId, slug}],
+    /// repos: [Candidate], reposNote?}`.
+    ///
+    /// Two halves that only the host can answer, and answering them separately
+    /// would mean two round trips from a phone: which of *its* spaces are
+    /// checkouts of which GitHub repo (git, on its disk), and which repos its
+    /// App can see ([`LIST_APP_REPOS`], its credential). The picker joins them
+    /// against the workspace doc it already holds.
+    ///
+    /// `repos` degrades to empty with a `reposNote` rather than failing the
+    /// call: a board on a `GITHUB_TOKEN` has no installations to enumerate, and
+    /// its spaces are still spaces. Refused outright by a device that hosts no
+    /// board — the same "said nothing at all" contract the host sweep rules
+    /// candidates out with.
+    pub const LIST_REPO_SPACES: &str = "ListRepoSpaces";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";

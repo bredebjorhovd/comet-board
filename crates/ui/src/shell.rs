@@ -2956,7 +2956,7 @@ impl Shell {
                                 .text_size(px(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child(SharedString::from("Add a space to get started")),
+                                .child(SharedString::from("Pick a repo to get started")),
                         )
                         .child(
                             div()
@@ -2964,11 +2964,15 @@ impl Shell {
                                 .text_size(px(13.0))
                                 .text_color(theme.text_muted.opacity(0.7))
                                 .child(SharedString::from(
-                                    "A space is a folder on one of your devices.",
+                                    // gh#118: the picker's front door is repos,
+                                    // so the empty state names the same thing it
+                                    // will open on. The folders are still behind
+                                    // it; they are not what to lead with.
+                                    "Your GitHub repos, running on the box.",
                                 )),
                         )
                         .child(
-                            popover::btn_primary(&theme_owned, "Add a space")
+                            popover::btn_primary(&theme_owned, "Add a repo")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| {

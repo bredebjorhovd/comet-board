@@ -70,6 +70,10 @@ Board/
   DispatchSheet.swift   runtime + account pickers with billing chips (gh#74/#101)
                         and the `require-own` confirm
   AgentsSection.swift   gh#103's live-agents section, phone-shaped
+Models/
+  RepoRows.swift        view/repos.rs port (gh#118): the repo-first picker's
+                        union of spaces + the board App's grant, its box-first
+                        order, and the name-before-owner search rank
 Sync/
   LoroProtocol.swift    loro-protocol 0.3 wire codec (byte-compatible port of
                         the crate's encoding.rs: magic/varBytes/type/payload)
@@ -114,7 +118,10 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Composer `white_alpha(0.03)` pill + hairline | Liquid Glass pill (`glassEffect`) + hairline |
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |
-| Add-space palette (device + folder browser) | New-space sheet: device tabs + remote folder browser (ListFolders over the device-room relay, git repos badged) |
+| Add-space palette: repo list, folder browser behind it (gh#118) | "Add a repo" sheet: same repo list (search, connect-inline), folder browser one tap down |
+| Repo-first picker's host sweep (`ListRepoSpaces`, all answers kept) | Same sweep over each device's own room; one host clones silently, two ask |
+| Onboard inline from the palette (`OnboardRepo`) | Same, with the clone's spinner and its refusals on the row |
+| Folder browser: device tabs + remote listing | Same, as a pushed screen (ListFolders over the device-room relay, git repos badged) |
 | ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; unary `call` **and** streaming `subscribe` (`{item}`/`{done}`, `{id,cancel}` on drop); used for ListFolders, direct-to-host `Mutate {createSpace}`, and the board four |
 | Board panel (`ui/src/board.rs`) | Board screen: same sections/glyphs/metadata, dispatch + retry as a sheet (`Board/`) |
 | Sidebar Agents section (gh#103) | Same section on Home, between Spaces and Sessions |

@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::adopt::{Adopted, Missing, RepoPreview};
 use crate::config::{RoutingConfig, expand_tilde};
 use crate::sources::github_app::TokenProvider;
+use comet_proto::view::repos::SpaceSlug;
 
 /// Whether a step created something or found it already there.
 ///
@@ -406,6 +407,48 @@ pub fn candidates(
         .collect()
 }
 
+/// Which of this device's spaces are checkouts of which GitHub repo.
+///
+/// The workspace doc names a space by *folder*, which is the wrong name for a
+/// picker that asks "which repo?" (gh#118) — and the right one cannot be guessed
+/// from the folder: `~/src/comet` is a name, not an owner. Only the device
+/// holding the checkout can answer, by asking git for the remote, so this is
+/// what it answers with. The row shape lives in `comet_proto` because three
+/// frontends read it.
+///
+/// `probe_of` resolves a space *path* to what git says about it — injected for
+/// the same reason [`crate::adopt::detect`] injects it, and expected to be
+/// [`crate::adopt::probe`] in production. Callers pass only this device's
+/// spaces: another device's folder is on another disk.
+///
+/// Deliberately *not* filtered by the routing config: this answers "what repo is
+/// this space?", which is true whether or not the board watches it. Filtering by
+/// what is adopted is [`candidates`]'s job, and doing it twice in two places
+/// with two answers is the bug [`crate::adopt::missing_for`] exists to prevent.
+///
+/// Linked worktrees are skipped: an attempt's checkout is a copy of the project,
+/// not the place to land somebody who picked the project.
+pub fn space_links<F>(spaces: &[comet_proto::Space], probe_of: F) -> Vec<SpaceSlug>
+where
+    F: Fn(&str) -> Option<crate::adopt::SpaceRepo>,
+{
+    spaces
+        .iter()
+        .filter(|s| s.git_detected)
+        .filter_map(|s| {
+            let repo = probe_of(&s.path)?;
+            if repo.linked_worktree {
+                return None;
+            }
+            let slug = repo.remote.as_deref().and_then(crate::adopt::github_slug)?;
+            Some(SpaceSlug {
+                space_id: s.id.clone(),
+                slug,
+            })
+        })
+        .collect()
+}
+
 /// The labels a `--labels` / `--all-issues` pair means.
 ///
 /// `--all-issues` is `Some(vec![])`, which writes `labels = []` and *overrides*
@@ -663,5 +706,58 @@ mod tests {
         let notes = done.notes().join(" | ");
         assert!(notes.contains("archived"), "{notes}");
         assert!(notes.contains("issues are disabled"), "{notes}");
+    }
+
+    fn space(id: &str, path: &str, git: bool) -> comet_proto::Space {
+        comet_proto::Space {
+            id: id.into(),
+            device_id: "dev-box".into(),
+            path: path.into(),
+            name: None,
+            git_detected: git,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The picker names a space by its repo, so a space has to be resolvable to
+    /// one — and only the things that really are one.
+    #[test]
+    fn a_space_is_linked_to_the_repo_its_checkout_actually_points_at() {
+        let spaces = vec![
+            space("s-comet", "/box/src/comet-board", true),
+            space("s-notes", "/box/notes", false),
+            space("s-nogh", "/box/src/vendored", true),
+            space("s-tree", "/box/src/comet-board-wt", true),
+        ];
+        let probe = |path: &str| match path {
+            "/box/src/comet-board" => Some(crate::adopt::SpaceRepo {
+                root: "/box/src/comet-board".into(),
+                remote: Some("git@github.com:bredebjorhovd/comet-board.git".into()),
+                linked_worktree: false,
+            }),
+            // A git checkout whose remote is not GitHub names no `owner/repo`.
+            "/box/src/vendored" => Some(crate::adopt::SpaceRepo {
+                root: "/box/src/vendored".into(),
+                remote: Some("git@git.sr.ht:~x/vendored".into()),
+                linked_worktree: false,
+            }),
+            // An attempt's worktree is a copy of the project, not the project.
+            "/box/src/comet-board-wt" => Some(crate::adopt::SpaceRepo {
+                root: "/box/src/comet-board-wt".into(),
+                remote: Some("https://github.com/bredebjorhovd/comet-board".into()),
+                linked_worktree: true,
+            }),
+            _ => None,
+        };
+        let links = space_links(&spaces, probe);
+        assert_eq!(
+            links,
+            vec![SpaceSlug {
+                space_id: "s-comet".into(),
+                slug: "bredebjorhovd/comet-board".into(),
+            }]
+        );
     }
 }

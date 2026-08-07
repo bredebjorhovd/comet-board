@@ -837,6 +837,46 @@ impl EngineRpc {
         .map_err(|e| anyhow::anyhow!("listing the App's repos: {e}"))?
     }
 
+    /// Everything a repo-first space picker needs from this host (gh#118).
+    ///
+    /// The board check comes first and costs nothing, which is what makes the
+    /// picker's sweep affordable: a device hosting no board refuses here before
+    /// any git or GitHub work, exactly as it refuses `WatchBoard`, so asking
+    /// every device "are you the box?" is one cheap round trip each.
+    ///
+    /// The App's grant is best-effort. A board on a `GITHUB_TOKEN` has no
+    /// installations to enumerate (gh#97) — that is a supported board, not a
+    /// broken one, and its spaces are still the spaces a picker should offer. So
+    /// the failure becomes a note beside a list that is otherwise complete.
+    async fn list_repo_spaces(&self) -> anyhow::Result<serde_json::Value> {
+        let _board = self.board()?;
+        let device = self.doc_host.device_id().to_string();
+        let spaces: Vec<comet_proto::Space> = self
+            .workspace
+            .watch_spaces()
+            .borrow()
+            .iter()
+            .filter(|s| s.device_id == device)
+            .cloned()
+            .collect();
+        // `probe` shells out to git once per space. Off the reactor.
+        let links = tokio::task::spawn_blocking(move || {
+            comet_board::onboard::space_links(&spaces, comet_board::adopt::probe)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving spaces to repos: {e}"))?;
+        let (repos, note) = match self.list_app_repos().await {
+            Ok(repos) => (repos, None),
+            Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+        };
+        Ok(serde_json::json!({
+            "deviceId": device,
+            "spaces": links,
+            "repos": repos,
+            "reposNote": note,
+        }))
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -1046,6 +1086,10 @@ fn forwardable(method: &str) -> bool {
             // (gh#97).
             | methods::ONBOARD_REPO
             | methods::LIST_APP_REPOS
+            // Which of the host's spaces are checkouts of which repo is a
+            // question about the host's disk, asked by a picker that is
+            // usually running on a phone (gh#118).
+            | methods::LIST_REPO_SPACES
     )
 }
 
@@ -1409,6 +1453,14 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&repos)
             }
+            // The repo-first picker's whole world, from the box (gh#118).
+            methods::LIST_REPO_SPACES => {
+                let view = self
+                    .list_repo_spaces()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                Ok(RpcReply::Value(view))
+            }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }
@@ -1735,6 +1787,15 @@ mod tests {
         // relay's stream proxy, and neither has progress to report yet.
         assert!(!is_stream_method(methods::ONBOARD_REPO));
         assert!(!is_stream_method(methods::LIST_APP_REPOS));
+    }
+
+    /// gh#118: the repo-first picker asks the box which of *its* spaces are
+    /// which repo. Same reason as the rest — the disk being asked about is the
+    /// box's, and the picker is usually a phone.
+    #[test]
+    fn the_repo_pickers_list_reaches_the_box_too() {
+        assert!(forwardable(methods::LIST_REPO_SPACES));
+        assert!(!is_stream_method(methods::LIST_REPO_SPACES));
     }
 
     /// The params a picker and the CLI both send. `dir` and `labels` are absent
