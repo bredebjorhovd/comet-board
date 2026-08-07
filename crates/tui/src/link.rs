@@ -409,6 +409,12 @@ async fn session(
     let mut board_delivered = false;
     let (mut board, mut orchestrator) = open_board_pair(client, board_host.as_deref()).await;
     let mut board_retry: Option<tokio::time::Instant> = None;
+    // A host the automatic sweep held instead of settling on (gh#125): it
+    // delivered a frame, but a board with no dispatch evidence must lose to the
+    // org's active host if one answers. `board_settling` marks the return to
+    // that fallback once the sweep exhausts — its next frame settles regardless.
+    let mut board_fallback: Option<Option<String>> = None;
+    let mut board_settling = false;
     if updates
         .send(Update::BoardHostChanged {
             device: board_host.clone(),
@@ -497,6 +503,8 @@ async fn session(
                     board_host = board_pin.target();
                     board_delivered = false;
                     board_retry = None;
+                    board_fallback = None;
+                    board_settling = false;
                     (board, orchestrator) = open_board_pair(client, board_host.as_deref()).await;
                     // Another device is another board: clear the rows and the
                     // pin rather than leave one box's tasks — and one box's
@@ -609,16 +617,57 @@ async fn session(
                     Frame::Value(rows) => {
                         let first = !board_delivered;
                         board_delivered = true;
-                        if updates.send(Update::Board(rows)).is_err() {
-                            return SessionEnd::AppGone;
-                        }
-                        // This device really does host the board — say so once,
-                        // so the pane's header can stop hedging.
-                        if first && updates.send(Update::BoardHostChanged {
-                            device: board_host.clone(),
-                            live: true,
-                        }).is_err() {
-                            return SessionEnd::AppGone;
+                        // A frame proves a board exists, not that it is the
+                        // org's board (gh#125): an automatic sweep holds one
+                        // with no dispatch evidence as a fallback and keeps
+                        // asking, so a stale local test board loses to the box
+                        // everyone works from — and still shows when nobody
+                        // else answers.
+                        let hold = first
+                            && matches!(board_pin, BoardHost::Auto)
+                            && !board_settling
+                            && !board_view::board_dispatched(&rows);
+                        let next = hold
+                            .then(|| {
+                                let candidates = board_view::host_candidates(
+                                    &devices_seen,
+                                    local_device.as_deref(),
+                                );
+                                board_view::next_host_candidate(
+                                    &candidates,
+                                    board_host.as_deref(),
+                                )
+                            })
+                            .flatten();
+                        if let Some(target) = next {
+                            if board_fallback.is_none() {
+                                board_fallback = Some(board_host.clone());
+                            }
+                            board_host = target;
+                            board_delivered = false;
+                            (board, orchestrator) =
+                                open_board_pair(client, board_host.as_deref()).await;
+                            if updates.send(Update::BoardHostChanged {
+                                device: board_host.clone(),
+                                live: false,
+                            }).is_err() {
+                                return SessionEnd::AppGone;
+                            }
+                        } else {
+                            // Settled: this board is the panel's board.
+                            board_fallback = None;
+                            board_settling = false;
+                            if updates.send(Update::Board(rows)).is_err() {
+                                return SessionEnd::AppGone;
+                            }
+                            // This device really does host the board — say so
+                            // once, so the pane's header can stop hedging.
+                            if first && updates.send(Update::BoardHostChanged {
+                                device: board_host.clone(),
+                                live: true,
+                            }).is_err() {
+                                return SessionEnd::AppGone;
+                            }
                         }
                     }
                     Frame::Skip => {}
@@ -656,18 +705,32 @@ async fn session(
                         // round-trip each, and a backoff per device would make
                         // finding the box take a visible age.
                         Some(Some(target)) => {
+                            // A settle pass that found its host silent is over;
+                            // the sweep is back to judging frames on evidence.
+                            board_settling = false;
                             board_host = target;
                             (board, orchestrator) =
                                 open_board_pair(client, board_host.as_deref()).await;
                         }
-                        // Everyone was asked and nobody hosts a board: start the
+                        // Everyone was asked. A board held for want of dispatch
+                        // evidence is the best answer there is — settle on it
+                        // (gh#125). Otherwise nobody hosts a board: start the
                         // sweep over after the backoff, since the box may be
                         // booting. A pinned host (or one that dropped mid-
                         // stream) simply waits and is re-asked where it is.
-                        Some(None) => {
-                            board_host = None;
-                            board_retry = Some(tokio::time::Instant::now() + BOARD_RETRY);
-                        }
+                        Some(None) => match board_fallback.take() {
+                            Some(fallback) => {
+                                board_settling = true;
+                                board_host = fallback;
+                                (board, orchestrator) =
+                                    open_board_pair(client, board_host.as_deref()).await;
+                            }
+                            None => {
+                                board_host = None;
+                                board_retry =
+                                    Some(tokio::time::Instant::now() + BOARD_RETRY);
+                            }
+                        },
                         None => board_retry = Some(tokio::time::Instant::now() + BOARD_RETRY),
                     }
                     // Reported after the decision, so the header always names

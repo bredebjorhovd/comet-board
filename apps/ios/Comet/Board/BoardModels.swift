@@ -247,6 +247,43 @@ struct BoardAccount: Decodable, Hashable, Identifiable {
     }
 }
 
+// MARK: - The leading token (gh#125)
+
+/// The `owner/repo` a GitHub task id names — `gh:Florin-AS/tally#507` →
+/// `Florin-AS/tally`. Nil for a Linear id, which names no repo. Port of the
+/// Rust `gh_repo`; `!` is the pull-request form of the id.
+func ghRepo(_ taskId: String) -> String? {
+    guard taskId.hasPrefix("gh:") else { return nil }
+    return taskId.dropFirst(3)
+        .split(whereSeparator: { $0 == "#" || $0 == "!" })
+        .first.map(String.init)
+}
+
+/// Just the repository's name — `Florin-AS/tally` → `tally`. The owner is
+/// noise when you work with a handful of repos; the name is the part you read.
+func ghRepoName(_ taskId: String) -> String? {
+    ghRepo(taskId)?.split(separator: "/").last.map(String.init)
+}
+
+extension TaskRow {
+    /// The leading token a board row shows: the CLI's repo-qualified form,
+    /// humanized — `tally #507`, not `gh#507` (gh#125). GitHub numbers issues
+    /// per repository, so the bare identifier is ambiguous across repos. A
+    /// Linear identifier (`LIN-142`) is already unique and shows unchanged, as
+    /// does any id this rule cannot parse.
+    var displayIdentifier: String {
+        let number = id.split(whereSeparator: { $0 == "#" || $0 == "!" }).last
+            .map(String.init)
+            .flatMap { n in
+                !n.isEmpty && n.allSatisfy({ $0.isASCII && $0.isNumber }) ? n : nil
+            }
+        guard let repo = ghRepoName(id), !repo.isEmpty, let number else {
+            return identifier
+        }
+        return "\(repo) #\(number)"
+    }
+}
+
 // MARK: - Sections
 
 /// The board's sections in order, empty ones omitted.
@@ -259,6 +296,64 @@ func boardSections(_ rows: [TaskRow], now: Date = Date()) -> [(state: BoardState
             .filter { state != .done || finishedToday($0, now: now) }
         return section.isEmpty ? nil : (state, section)
     }
+}
+
+/// One route's rows inside a section — the unit a hundred-row board is scanned
+/// by (gh#125). Nil route is the `no route` group.
+struct BoardSectionGroup: Hashable {
+    var route: String?
+    var rows: [TaskRow]
+
+    /// What the group header says: the route's name, or `no route` — the words
+    /// the rows themselves use.
+    var label: String { route ?? noRouteLabel }
+
+    /// Unrouted rows are visibility-only by design, so their group starts
+    /// folded: worth a headline and a count, never pole position over rows a
+    /// tap can actually dispatch. (The phone has no `f`/`/` cycle, so the
+    /// Rust rule's filter half does not apply here.)
+    var startsCollapsed: Bool { route == nil }
+}
+
+/// `boardSections`, with each section's rows grouped by route — the port of
+/// `grouped_sections`. Biggest group first (the list reads as a ranking), ties
+/// alphabetical so equal groups do not trade places between frames, and
+/// `no route` last regardless of size: it must never hold the top of a section.
+func groupedBoardSections(_ rows: [TaskRow], now: Date = Date())
+    -> [(state: BoardState, groups: [BoardSectionGroup])]
+{
+    boardSections(rows, now: now).map { state, rows in
+        var groups: [BoardSectionGroup] = []
+        for row in rows {
+            if let ix = groups.firstIndex(where: { $0.route == row.route }) {
+                groups[ix].rows.append(row)
+            } else {
+                groups.append(BoardSectionGroup(route: row.route, rows: [row]))
+            }
+        }
+        groups.sort { a, b in
+            if (a.route == nil) != (b.route == nil) { return b.route == nil }
+            if a.rows.count != b.rows.count { return a.rows.count > b.rows.count }
+            return (a.route ?? "") < (b.route ?? "")
+        }
+        return (state, groups)
+    }
+}
+
+/// Whether a section draws group headers at all: one routed group is readable
+/// bare, a lone `no route` group still needs the header that keeps it folded.
+func boardGroupHeadersShown(_ groups: [BoardSectionGroup]) -> Bool {
+    groups.count > 1 || (groups.count == 1 && groups[0].route == nil)
+}
+
+/// Evidence that a board has ever been dispatched from: any row with an
+/// attempt on record (gh#125). This is what the automatic host sweep settles
+/// on — a frame proves a board *exists*, not that it is the org's board, and a
+/// stale test board must lose to the box everyone works from. `attempts`, not
+/// `chatId`: the chat id rides only the live attempt, and the box between
+/// dispatches must not read as furniture.
+func boardDispatched(_ rows: [TaskRow]) -> Bool {
+    rows.contains { $0.attempts > 0 }
 }
 
 /// Was this task closed today, in the operator's own timezone? Local midnight,
@@ -370,13 +465,14 @@ func boardRowDetail(_ row: TaskRow, now: Date = Date()) -> BoardRowDetail {
             text = "waiting on you"
         }
     case .ready:
-        // Where it would go, not where it came from: the routed workspace is
-        // the routing outcome, otherwise invisible until dispatch.
-        let repo = row.workspace ?? row.route ?? ""
+        // The route rides the group header and the repo the leading token
+        // (gh#125), so the sub-line keeps only what neither says: a routed
+        // workspace whose name differs from the route's.
+        let ws = (row.workspace != row.route ? row.workspace : nil) ?? ""
         if !row.dispatchable {
-            text = repo.isEmpty ? noRouteLabel : "\(repo) · \(noRouteLabel)"
+            text = ws.isEmpty ? noRouteLabel : "\(ws) · \(noRouteLabel)"
         } else {
-            text = repo
+            text = ws
         }
     case .done:
         // A row whose issue was deleted sits next to properly closed ones, and

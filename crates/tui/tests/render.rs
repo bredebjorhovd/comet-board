@@ -2177,6 +2177,55 @@ fn the_board_shows_sections_in_fixed_order_with_glyph_carried_state() {
     assert!(screen.contains("filter"), "{screen}");
 }
 
+/// gh#125: the leading token is the repo-qualified form (`tally #507`), rows
+/// group by route with counts, and the unrouted group draws folded at the
+/// bottom of its section instead of holding pole position.
+#[test]
+fn rows_lead_with_the_repo_and_group_by_route_with_no_route_folded() {
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    let mut a = board_row("507", comet_proto::view::board::BoardState::Ready);
+    a.id = "gh:Florin-AS/tally#507".into();
+    a.identifier = "gh#507".into();
+    a.route = Some("tally".into());
+    a.workspace = Some("tally".into());
+    let mut b = board_row("44", comet_proto::view::board::BoardState::Ready);
+    b.id = "gh:bredebjorhovd/herdr-board#44".into();
+    b.identifier = "gh#44".into();
+    let mut u = board_row("142", comet_proto::view::board::BoardState::Ready);
+    u.id = "linear:LIN-142".into();
+    u.identifier = "LIN-142".into();
+    u.route = None;
+    u.workspace = None;
+    u.dispatchable = false;
+    app.apply(Update::Board(vec![a, b, u]));
+
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+
+    // The identifier says which repo — `gh#507` alone is ambiguous across
+    // repos, `tally #507` is not.
+    assert!(screen.contains("tally #507"), "{screen}");
+    assert!(screen.contains("herdr-board #44"), "{screen}");
+
+    // Group headers with counts, `no route` folded at the bottom: its header
+    // shows, its row does not.
+    assert!(screen.contains("tally  1"), "{screen}");
+    assert!(screen.contains("no route  1 hidden"), "{screen}");
+    assert!(!screen.contains("LIN-142"), "a folded group hides its rows:\n{screen}");
+
+    // The header carries the whole count beside the pane's name — folded rows
+    // included, because they are still on the board.
+    assert!(screen.contains("· 3"), "{screen}");
+
+    // The cursor starts on a dispatchable row, never on `no route`.
+    assert_eq!(
+        app.board.selected.as_deref(),
+        Some("gh:bredebjorhovd/herdr-board#44"),
+        "first task of the first group (equal counts sort alphabetically)"
+    );
+}
+
 #[test]
 fn a_selected_ready_row_offers_dispatch_in_the_footer() {
     let mut app = boarded();

@@ -1122,11 +1122,15 @@ impl App {
         }
     }
 
-    /// `enter` on the board: dispatch a ready task, fold a section header, or
-    /// open a running task's chat.
+    /// `enter` on the board: dispatch a ready task, fold a section or group
+    /// header, or open a running task's chat.
     fn board_enter(&mut self) -> Effects {
         if let Some(state) = self.board.on_section() {
             self.board.toggle_collapsed(state);
+            return Vec::new();
+        }
+        if let Some((state, route)) = self.board.on_group() {
+            self.board.toggle_group(state, route.as_deref());
             return Vec::new();
         }
         let Some(row) = self.board.selected_task() else {
