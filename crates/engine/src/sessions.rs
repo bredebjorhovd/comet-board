@@ -456,17 +456,32 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors comet: harness teardown can await a
-        // parked question callback — a run stuck on a question would deadlock the stop).
+        // Tell the RUN TASK first (gh#111). Everything below this line — the
+        // unparked resolver, the cancelled token — is a way of ending the
+        // harness stream, and the run task classifies a stream that ends
+        // without a `Done` by whether it knows an interrupt is in flight: it
+        // is `Done{interrupted}` when `interrupted` is set and "harness stream
+        // ended without Done" (an Errored run, a visible error part) when it
+        // is not. A harness that reacts promptly — teardown on the token, or a
+        // CLI that exits the moment its parked question resolves empty — can
+        // close the stream before this watch is sent, and the run task's own
+        // `biased` select then reads a clean stop as a crash. Only the
+        // ordering here can close that window; sending first makes the flag
+        // visible on the very next poll, ahead of any stream end it causes.
+        //
+        // This also arms the engine-side grace deadline in the run task, so a
+        // harness that ignores its token still settles with a synthesized
+        // Done{interrupted}.
+        let _ = cancel.send(true);
+        // Unpark any blocked question BEFORE the token (mirrors comet: harness teardown
+        // can await a parked question callback — a run stuck on a question would
+        // deadlock the stop).
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
-        // Harness-level interrupt (protocol + child teardown) …
+        // Harness-level interrupt (protocol + child teardown).
         token.cancel();
-        // … plus the engine-side grace deadline in the run task, so a harness that
-        // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
             if !self.is_live(chat_id, &run_id) {

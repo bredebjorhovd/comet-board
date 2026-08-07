@@ -16,7 +16,8 @@
 //!    branch from the title and update the chat's branch row;
 //! 6. `rename_chat` in the workspace doc.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures::StreamExt;
 
@@ -39,6 +40,12 @@ struct Inner {
     workspace: WorkspaceHost,
     registry: Arc<HarnessRegistry>,
     repos: Repos,
+    /// Chats with a generation in flight — one titler per chat at a time (gh#111).
+    in_flight: Mutex<HashSet<String>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Clone)]
@@ -53,13 +60,28 @@ impl TitleGenerator {
                 workspace,
                 registry,
                 repos,
+                in_flight: Mutex::new(HashSet::new()),
             }),
         }
     }
 
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
     /// task after a completed exchange; runs detached so it never delays anything.
+    ///
+    /// ONE generation per chat at a time (gh#111). A run calls this twice — once
+    /// at dispatch, off the first prompt, and once at `Done` as the retry for a
+    /// generation that produced nothing — and "is it still untitled?" is a
+    /// check-then-act with a whole model run in the middle. Both calls used to
+    /// pass that check and race to `rename_chat`, and the loser wrote its title
+    /// AFTER the winner's: harmless when nothing happened in between, and a
+    /// silently reverted rename when the user named the chat themselves in that
+    /// window (step 4 of the flow above exists to let the user win, and a second
+    /// titler is exactly what defeats it). The Done-time retry keeps working —
+    /// a generation that finished, however it ended, is no longer in flight.
     pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
+        if !lock(&self.inner.in_flight).insert(chat_id.to_string()) {
+            return; // a generation for this chat is already running
+        }
         let this = self.clone();
         let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
@@ -68,6 +90,7 @@ impl TitleGenerator {
             if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
                 tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
             }
+            lock(&this.inner.in_flight).remove(&chat_id);
         });
     }
 
