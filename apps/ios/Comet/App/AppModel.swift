@@ -17,6 +17,7 @@ final class AppModel {
 
     var phase: Phase = .signedOut
     var workspace: WorkspaceStore?
+    var board: BoardStore?
     var demo: DemoDataset?
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
@@ -27,6 +28,10 @@ final class AppModel {
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
+    /// The signed-in email, when WorkOS gave us one. Only a board dispatch
+    /// reads it (gh#74's `viaUser`): a slot id or a WorkOS user id is not what
+    /// somebody reading an attempt row is looking for.
+    @ObservationIgnored @AppStorage("userEmail") var storedUserEmail = ""
 
     var deviceId: String {
         if storedDeviceId.isEmpty {
@@ -70,6 +75,11 @@ final class AppModel {
             Task { await E2ERunner.run(model: self) }
             return
         }
+        if let ix = args.firstIndex(of: "-e2e-board"), ix + 1 < args.count {
+            let repo = args[ix + 1]
+            Task { await E2ERunner.runBoard(model: self, repoPath: repo) }
+            return
+        }
         if args.contains("-e2e-live") {
             // Reuse the signed-in session, then probe the live relay paths.
             Task {
@@ -78,37 +88,44 @@ final class AppModel {
             }
             // fall through to the normal restore below
         }
+        // Route and sheet are rig args, not demo args: a board screenshot has
+        // to be reachable against a LIVE board too, which is where the rows
+        // that matter are. The demo-only extras (`-big`, `-stream`) stay inside
+        // the demo branch, since they drive the scripted dataset.
+        if let ix = args.firstIndex(of: "-route"), ix + 1 < args.count {
+            let spec = args[ix + 1]
+            if spec.hasPrefix("chat:") {
+                launchRoute = .chat(String(spec.dropFirst("chat:".count)))
+            } else if spec.hasPrefix("space:") {
+                launchRoute = .space(String(spec.dropFirst("space:".count)))
+            } else if spec == "board" {
+                launchRoute = .board
+            }
+        }
+        if let ix = args.firstIndex(of: "-sheet"), ix + 1 < args.count {
+            launchSheet = args[ix + 1]
+        }
         if args.contains("-demo") {
             enterDemoMode()
-            if let ix = args.firstIndex(of: "-route"), ix + 1 < args.count {
-                let spec = args[ix + 1]
-                if spec.hasPrefix("chat:") {
-                    let chatId = String(spec.dropFirst("chat:".count))
-                    launchRoute = .chat(chatId)
-                    if args.contains("-big"), let demo {
-                        // Scroll-settle stress. Injected BEFORE the transcript
-                        // appears, which is the warm-session case: rows are
-                        // already there at first layout, so neither the
-                        // rows-arrived nor the streamed-growth anchor ever
-                        // fires and `.task` is the only thing holding the
-                        // bottom — against hundreds of lazily-estimated rows.
-                        demo.sessionStore(for: chatId)
-                            .setEntries(BenchRunner.syntheticEntries(turns: 120))
-                    }
-                    if args.contains("-stream"), let demo {
-                        // Screenshot rig: kick off the scripted streaming reply.
-                        let store = demo.sessionStore(for: chatId)
-                        Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 2_000_000_000)
-                            store.demoResponder?("Show me the streamed reply path.")
-                        }
-                    }
-                } else if spec.hasPrefix("space:") {
-                    launchRoute = .space(String(spec.dropFirst("space:".count)))
+            if case .chat(let chatId)? = launchRoute, let demo {
+                if args.contains("-big") {
+                    // Scroll-settle stress. Injected BEFORE the transcript
+                    // appears, which is the warm-session case: rows are already
+                    // there at first layout, so neither the rows-arrived nor
+                    // the streamed-growth anchor ever fires and `.task` is the
+                    // only thing holding the bottom — against hundreds of
+                    // lazily-estimated rows.
+                    demo.sessionStore(for: chatId)
+                        .setEntries(BenchRunner.syntheticEntries(turns: 120))
                 }
-            }
-            if let ix = args.firstIndex(of: "-sheet"), ix + 1 < args.count {
-                launchSheet = args[ix + 1]
+                if args.contains("-stream") {
+                    // Screenshot rig: kick off the scripted streaming reply.
+                    let store = demo.sessionStore(for: chatId)
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        store.demoResponder?("Show me the streamed reply path.")
+                    }
+                }
             }
             launchAutosend = args.contains("-autosend")
             return
@@ -139,6 +156,7 @@ final class AppModel {
         edgeURLString = edgeURL.absoluteString
         authModeRaw = AppConfig.Mode.workos.rawValue
         storedUserId = user.id
+        storedUserEmail = user.email ?? ""
         let orgs = try await client.orgs(accessToken: tokens.accessToken)
         if let only = orgs.first, orgs.count == 1 {
             try await selectOrg(only, tokens: tokens)
@@ -180,6 +198,8 @@ final class AppModel {
     func signOut() {
         workspace?.stop()
         workspace = nil
+        board?.stop()
+        board = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
         config = nil
@@ -188,6 +208,7 @@ final class AppModel {
         Keychain.delete(key: "refreshToken")
         DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
         storedUserId = ""
+        storedUserEmail = ""
         storedOrgId = ""
         phase = .signedOut
     }
@@ -205,6 +226,12 @@ final class AppModel {
         let store = WorkspaceStore(config: config)
         workspace = store
         store.start()
+        // Standing, not opened with the board screen: the Agents section is
+        // presence, and presence that only works after you have visited the
+        // board is not presence (gh#103's correction to the desktop panel).
+        let boardStore = BoardStore(config: config) { [weak store] in store?.devices ?? [] }
+        board = boardStore
+        boardStore.start()
         phase = .ready
     }
 
@@ -249,6 +276,69 @@ final class AppModel {
 
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
         chats(in: spaceId).map { indicator(for: $0) }.min { $0.rawValue < $1.rawValue }
+    }
+
+    // MARK: Board (gh#114)
+
+    /// The board's rows. Empty in every case that is not "a host answered":
+    /// no board in the org, the sweep still running, demo mode without rows.
+    var boardRows: [TaskRow] { demo?.boardRows ?? board?.rows ?? [] }
+
+    /// Why the board is empty, when it is — nil while it is fine.
+    var boardStatus: String? { demo != nil ? nil : board?.status }
+
+    var boardAttached: Bool { demo != nil || board?.attached == true }
+
+    /// The live attempts, most urgent first (gh#103, phone-shaped). Joins the
+    /// three standing streams the app already holds.
+    var liveAgents: [AgentRow] {
+        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
+        let chats = demo?.chats ?? workspace?.chats ?? []
+        return agentRows(rows: boardRows, chats: chats, sessions: sessions)
+    }
+
+    /// The runtimes and logins a dispatch picker offers. Both belong to the
+    /// board's HOST — the run executes over there, so the catalog it picks from
+    /// and the subscription it can spend are the box's, never the phone's.
+    var boardRuntimes: [BoardRuntime] { demo != nil ? DemoDataset.runtimes : (board?.runtimes ?? []) }
+    var boardAccounts: [BoardAccount] { demo != nil ? DemoDataset.accounts : (board?.accounts ?? []) }
+
+    /// The email a dispatch claims as its releaser (gh#74's `viaUser`) and the
+    /// billing chips compare against. A claim, never authority — the box cannot
+    /// check it, and it is not a reason to spend anybody's subscription.
+    ///
+    /// Demo mode answers with the dataset's own operator, so the cross-billed
+    /// case the chips exist for is explorable with no infrastructure.
+    var viewerEmail: String? {
+        if demo != nil { return "brede@tally.no" }
+        return storedUserEmail.isEmpty ? nil : storedUserEmail
+    }
+
+    func boardAccounts(forHarness harness: String?) -> [BoardAccount] {
+        guard let harness, !harness.isEmpty else { return [] }
+        return boardAccounts.filter { $0.harness == harness }
+    }
+
+    func dispatchBoardTask(taskId: String, runtime: String?, account: BoardAccount?,
+                           replace: Bool, bill: String?,
+                           billedTo: String?) async -> BoardStore.DispatchOutcome {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            return .dispatched(chatId: demo.dispatch(taskId: taskId, runtime: runtime,
+                                                     account: account?.id))
+        }
+        guard let board else { return .failed("Not connected to a board") }
+        return await board.dispatch(taskId: taskId, runtime: runtime, account: account,
+                                    replace: replace, bill: bill, billedTo: billedTo)
+    }
+
+    func cancelBoardTask(taskId: String) async -> String? {
+        if let demo {
+            demo.cancelAttempt(taskId: taskId)
+            return nil
+        }
+        guard let board else { return "Not connected to a board" }
+        return await board.cancel(taskId: taskId)
     }
 
     func deviceName(_ deviceId: String) -> String {

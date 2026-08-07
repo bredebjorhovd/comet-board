@@ -13,6 +13,10 @@ final class DemoDataset {
     var spaces: [Space]
     var chats: [Chat]
     var sessions: [String: SessionRow]
+    /// The board (gh#114). Two live attempts wired to real demo chats, so the
+    /// Agents section and the board rows agree with each other and tapping a
+    /// row opens a transcript that exists.
+    var boardRows: [TaskRow] = []
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -52,8 +56,12 @@ final class DemoDataset {
                  config: claude, lastMessagePreview: "Porting the paint-only fade…",
                  lastMessageAt: now - 40_000, createdAt: now - 3_600_000,
                  spaceId: comet.id, lastSeenAt: now),
+            // The board's blocked attempt (AGE-14) — a dispatched agent is a
+            // chat among chats, which is the whole reason gh#103 exists.
             Chat(id: "chat-picker", deviceId: "dev-mac", title: "Model picker catalog sync",
-                 archived: false, cwd: comet.path, branch: "main", checkoutId: nil,
+                 archived: false,
+                 cwd: "/Users/dev/.comet-native/worktrees/comet-native-catalog-sync",
+                 branch: "fix/catalog-sync", checkoutId: nil,
                  config: claude, lastMessagePreview: "Which device owns the catalog?",
                  lastMessageAt: now - 120_000, createdAt: now - 7_200_000,
                  spaceId: comet.id, lastSeenAt: now - 130_000),
@@ -75,8 +83,132 @@ final class DemoDataset {
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
         ]
-        return DemoDataset(devices: [mac, vps], spaces: [comet, edge],
-                           chats: chats, sessions: sessions)
+        let dataset = DemoDataset(devices: [mac, vps], spaces: [comet, edge],
+                                  chats: chats, sessions: sessions)
+        dataset.boardRows = boardDemoRows(now: now)
+        return dataset
+    }
+
+    // MARK: Board (offline)
+
+    /// What `ListBoardRuntimes` answers on a box with the usual harnesses.
+    static let runtimes: [BoardRuntime] = [
+        BoardRuntime(name: "claude-code", label: "Claude Code", harness: "claude-code"),
+        BoardRuntime(name: "opencode", label: "OpenCode", harness: "opencode"),
+        BoardRuntime(name: "codex", label: "Codex", harness: "codex"),
+    ]
+
+    /// Two saved logins on the box, one of them somebody else's — the case the
+    /// billing chips exist for (gh#101). MOCK data: not a real account.
+    static let accounts: [BoardAccount] = [
+        BoardAccount(id: "slot-brede", harness: "claude-code", email: "brede@tally.no",
+                     planLabel: "Max", active: true, displayName: nil),
+        BoardAccount(id: "slot-ana", harness: "claude-code", email: "ana@tally.no",
+                     planLabel: "Max", active: false, displayName: nil),
+        BoardAccount(id: "slot-codex", harness: "codex", email: "brede@tally.no",
+                     planLabel: "Pro", active: true, displayName: nil),
+    ]
+
+    /// Release a demo row: flip it to `working` on a fresh chat in the routed
+    /// space, so the board, the Agents section and the transcript all agree.
+    func dispatch(taskId: String, runtime: String?, account: String?) -> String? {
+        guard let ix = boardRows.firstIndex(where: { $0.id == taskId }) else { return nil }
+        let row = boardRows[ix]
+        let space = spaces.first { $0.displayName == row.workspace } ?? spaces.first
+        guard let space else { return nil }
+        let chatId = "chat-\(UUID().uuidString.lowercased().prefix(8))"
+        let branch = row.branch ?? row.identifier.lowercased()
+            .replacingOccurrences(of: "#", with: "-")
+        chats.append(Chat(id: chatId, deviceId: space.deviceId, title: row.title,
+                          archived: false, cwd: space.path, branch: branch, checkoutId: nil,
+                          config: ChatConfig(harness: runtime ?? row.runtime ?? "claude-code",
+                                             model: nil, reasoning: nil,
+                                             sandbox: "workspace-write"),
+                          lastMessagePreview: nil, lastMessageAt: nil, createdAt: nowMs(),
+                          spaceId: space.id, lastSeenAt: nowMs()))
+        sessions[chatId] = SessionRow(chatId: chatId, deviceId: space.deviceId,
+                                      status: .working, startedAt: nowMs(), updatedAt: nowMs())
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let stamp = formatter.string(from: Date())
+        var updated = row
+        updated.state = BoardState.working.rawValue
+        updated.chatId = chatId
+        updated.branch = branch
+        updated.runtime = runtime ?? row.runtime
+        updated.account = account ?? row.account
+        updated.attempts += 1
+        updated.startedAt = stamp
+        updated.updatedAt = stamp
+        boardRows[ix] = updated
+        return chatId
+    }
+
+    /// End a demo attempt: the row derives back to `ready` and the chat is
+    /// archived — cancel ends attempts, never tasks.
+    func cancelAttempt(taskId: String) {
+        guard let ix = boardRows.firstIndex(where: { $0.id == taskId }) else { return }
+        if let chatId = boardRows[ix].chatId,
+           let chatIx = chats.firstIndex(where: { $0.id == chatId }) {
+            chats[chatIx].archived = true
+            sessions[chatId] = nil
+        }
+        boardRows[ix].state = BoardState.ready.rawValue
+        boardRows[ix].chatId = nil
+        boardRows[ix].startedAt = nil
+        boardRows[ix].lastOutcome = "cancelled"
+    }
+
+    /// One row per board state that has anything to say, in board order. The
+    /// two live attempts point at real demo chats so `agentRows` keeps them
+    /// (its membership rule drops a row whose chat has not synced).
+    private static func boardDemoRows(now: Int64) -> [TaskRow] {
+        func stamp(_ msAgo: Int64) -> String {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime]
+            return formatter.string(from: Date(timeIntervalSince1970: Double(now - msAgo) / 1000))
+        }
+        return [
+            TaskRow(id: "linear:AGE-14", identifier: "AGE-14",
+                    title: "Model picker catalog sync stalls on cold host",
+                    state: .blocked, source: "linear", route: "comet-native",
+                    workspace: "comet-native", runtime: "claude-code",
+                    chatId: "chat-picker", branch: "fix/catalog-sync",
+                    attempts: 1, updatedAt: stamp(400_000),
+                    startedAt: stamp(400_000), maxDurationSecs: 7200),
+            TaskRow(id: "gh:comet#118", identifier: "gh#118",
+                    title: "Streaming veil on transcript rows",
+                    state: .working, route: "comet-native",
+                    workspace: "comet-native", runtime: "claude-code",
+                    chatId: "chat-veil", branch: "veil-fade",
+                    attempts: 1, updatedAt: stamp(95_000), startedAt: stamp(95_000),
+                    account: "slot-ana", dispatchedByUser: "brede@tally.no",
+                    billedTo: "ana@tally.no", maxDurationSecs: 7200),
+            TaskRow(id: "gh:comet#121", identifier: "gh#121",
+                    title: "Board rows on the phone, dispatch from a parking lot",
+                    state: .ready, route: "comet-native", workspace: "comet-native",
+                    runtime: "claude-code", updatedAt: stamp(3_600_000)),
+            TaskRow(id: "gh:edge#42", identifier: "gh#42",
+                    title: "Hibernation-safe flush timer for SessionRoom",
+                    state: .ready, dispatchable: false, route: nil,
+                    updatedAt: stamp(7_200_000)),
+            TaskRow(id: "gh:comet#117", identifier: "gh#117",
+                    title: "Tool group header colors",
+                    state: .review, route: "comet-native", workspace: "comet-native",
+                    runtime: "codex", prUrl: "https://github.com/x/y/pull/117",
+                    prNumber: 117, branch: "fix/tool-colors",
+                    lastOutcome: "done", attempts: 1, updatedAt: stamp(900_000)),
+            TaskRow(id: "gh:edge#39", identifier: "gh#39",
+                    title: "Wrangler deploy hygiene",
+                    state: .failed, route: "edge", workspace: "edge",
+                    runtime: "claude-code", branch: "deploy-hygiene",
+                    lastOutcome: "failed", attempts: 2, updatedAt: stamp(86_400_000)),
+            TaskRow(id: "gh:comet#110", identifier: "gh#110",
+                    title: "Pin one chat as the orchestrator",
+                    state: .done, route: "comet-native", workspace: "comet-native",
+                    runtime: "claude-code", lastOutcome: "done", attempts: 1,
+                    updatedAt: stamp(5_400_000)),
+        ]
     }
 
     // MARK: Fake filesystem (folder browser demo)

@@ -9,6 +9,7 @@ enum Route: Hashable {
     case space(String)
     case chat(String)
     case newSession(spaceId: String)
+    case board
 }
 
 struct HomeView: View {
@@ -20,6 +21,9 @@ struct HomeView: View {
         NavigationStack(path: $path) {
             List {
                 spacesSection
+                // Between Spaces and the sessions, exactly where both desktop
+                // sidebars put it (gh#103).
+                AgentsSection(path: $path)
                 sessionsSection
             }
             .listStyle(.plain)
@@ -36,6 +40,7 @@ struct HomeView: View {
                 case .space(let id): SpaceView(spaceId: id, path: $path)
                 case .chat(let id): SessionView(chatId: id)
                 case .newSession(let spaceId): NewSessionView(spaceId: spaceId, path: $path)
+                case .board: BoardView(path: $path)
                 }
             }
             .toolbar {
@@ -51,6 +56,17 @@ struct HomeView: View {
                 }
                 // Bare spinner — no glass capsule behind it.
                 .sharedBackgroundVisibility(.hidden)
+                ToolbarItem(placement: .topBarLeading) {
+                    // The board is a place, not a mode: it lives beside the
+                    // shell rather than inside a session, and it is reachable
+                    // before anything on the list has been opened.
+                    Button {
+                        path.append(.board)
+                    } label: {
+                        Image(systemName: "square.stack.3d.up")
+                    }
+                    .accessibilityLabel("Board")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showNewSpace = true
