@@ -509,7 +509,9 @@ fn edge_health(
             .as_ref()
             .map(|state| *state.borrow()),
         workspace_room: online.then(|| workspace.connected()),
+        workspace_presence: online.then(|| workspace.presence_connected()),
         org_registry: online.then(|| workspace.org_devices_connected()),
+        org_presence: online.then(|| workspace.org_devices().presence_connected()),
         chat_rooms_open,
         chat_rooms_live,
     }

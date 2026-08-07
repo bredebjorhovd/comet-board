@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
+use crate::{AuthState, Chat, ChatIndicator, EdgeHealth, Session, SessionStatus, Space};
 
 pub mod board;
 pub mod needs;
@@ -45,6 +45,73 @@ pub enum Indicator {
 /// crashed backend must never show an eternal "Working" (feature-inventory
 /// §1.12). Engines heartbeat sessions well inside this window.
 pub const SESSION_STALE_MS: i64 = 45_000;
+
+// ---------------------------------------------------------------------------
+// Host presence (gh#126)
+// ---------------------------------------------------------------------------
+
+/// A device whose merged heartbeat is younger than this reads present.
+/// Engines beat every 15s, so this is ~4 missed beats — and comfortably wider
+/// than both the engine's own 45s freshness window and the UI's 15s
+/// [`EdgeHealth`] poll cadence.
+pub const PRESENCE_STALE_MS: i64 = 70_000;
+
+/// What a remote host's presence row may honestly claim.
+///
+/// The three states exist because "offline" is an ACCUSATION — it says the
+/// HOST is gone — and the loudest signal in the sidebar must not make it on
+/// evidence that equally fits "this viewer's own sync is down" (gh#126: eight
+/// amber rows indicted a box that was up, when the edge was refusing every
+/// connection to everyone, this viewer included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPresence {
+    /// Fresh heartbeat (or the local device, or no evidence either way).
+    Online,
+    /// The heartbeat lapsed WHILE this viewer could hear — a room of ours is
+    /// live, so absence of the beat is evidence about the host.
+    Offline,
+    /// The heartbeat lapsed while this viewer is deaf — its own engine holds
+    /// no live sync room, so it cannot tell a dead host from its own dead
+    /// pipe, and must indict the pipe (which is the thing it KNOWS is down).
+    SyncDown,
+}
+
+/// Host-presence verdict for a remote device row. Pure.
+///
+/// `last_seen` is the device row's heartbeat-overlaid `lastSeenAt`; `edge` is
+/// this viewer's OWN engine's census (`None` = not answered yet, treated as
+/// able to hear so behavior degrades to the pre-gh#126 read).
+pub fn host_presence(
+    is_local_device: bool,
+    last_seen: Option<DateTime<Utc>>,
+    edge: Option<&EdgeHealth>,
+    now: DateTime<Utc>,
+) -> HostPresence {
+    if is_local_device {
+        return HostPresence::Online;
+    }
+    // No evidence at all (registry row still arriving): say nothing rather
+    // than claim an outage nobody observed.
+    let Some(last_seen) = last_seen else {
+        return HostPresence::Online;
+    };
+    // A fresh beat outranks any health snapshot: heartbeats arriving IS
+    // hearing, whatever a 15s-old census believed.
+    if now.signed_duration_since(last_seen).num_milliseconds() <= PRESENCE_STALE_MS {
+        return HostPresence::Online;
+    }
+    // Stale beat: whether that indicts the host depends on whether WE can
+    // hear. Presence arrives on the workspace and org rooms; with neither
+    // live (down, signed out, or local mode) the beat's absence is expected.
+    let deaf = edge.is_some_and(|health| {
+        health.workspace_room != Some(true) && health.org_registry != Some(true)
+    });
+    if deaf {
+        HostPresence::SyncDown
+    } else {
+        HostPresence::Offline
+    }
+}
 
 /// Staleness-checked indicator for a session row. Pure.
 pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Indicator {
@@ -511,6 +578,91 @@ pub fn checkout_label(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> &'
                 "Current checkout"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+    use chrono::TimeDelta;
+
+    fn hearing() -> EdgeHealth {
+        EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            workspace_room: Some(true),
+            org_registry: Some(true),
+            ..EdgeHealth::default()
+        }
+    }
+
+    fn deaf() -> EdgeHealth {
+        EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            workspace_room: Some(false),
+            org_registry: Some(false),
+            ..EdgeHealth::default()
+        }
+    }
+
+    #[test]
+    fn fresh_beats_and_missing_evidence_read_online() {
+        let now = Utc::now();
+        let fresh = Some(now - TimeDelta::seconds(20));
+        assert_eq!(
+            host_presence(false, fresh, Some(&hearing()), now),
+            HostPresence::Online
+        );
+        // The local device is trivially online; no row yet says nothing.
+        assert_eq!(host_presence(true, None, None, now), HostPresence::Online);
+        assert_eq!(host_presence(false, None, Some(&deaf()), now), HostPresence::Online);
+    }
+
+    /// The window boundary the devices page has always used (70s).
+    #[test]
+    fn the_window_is_70s() {
+        let now = Utc::now();
+        let at = |s: i64| Some(now - TimeDelta::seconds(s));
+        let hearing = hearing();
+        assert_eq!(
+            host_presence(false, at(70), Some(&hearing), now),
+            HostPresence::Online
+        );
+        assert_eq!(
+            host_presence(false, at(71), Some(&hearing), now),
+            HostPresence::Offline
+        );
+    }
+
+    /// The gh#126 rule: a lapsed beat only indicts the HOST while this viewer
+    /// can hear. Deaf (both sync rooms down — the edge outage shape, or signed
+    /// out, or local mode) indicts the pipe instead.
+    #[test]
+    fn a_deaf_viewer_never_claims_the_host_is_offline() {
+        let now = Utc::now();
+        let stale = Some(now - TimeDelta::hours(8));
+        assert_eq!(
+            host_presence(false, stale, Some(&deaf()), now),
+            HostPresence::SyncDown
+        );
+        // One live room is enough to hear on: back to a real offline verdict.
+        let org_only = EdgeHealth {
+            workspace_room: Some(false),
+            org_registry: Some(true),
+            ..hearing()
+        };
+        assert_eq!(
+            host_presence(false, stale, Some(&org_only), now),
+            HostPresence::Offline
+        );
+        // No census at all (engine predates it / first poll pending): the
+        // pre-gh#126 read, so nothing regresses while the answer loads.
+        assert_eq!(host_presence(false, stale, None, now), HostPresence::Offline);
+        // A fresh beat outranks a deaf census — hearing it IS hearing.
+        let fresh = Some(now - TimeDelta::seconds(10));
+        assert_eq!(
+            host_presence(false, fresh, Some(&deaf()), now),
+            HostPresence::Online
+        );
     }
 }
 

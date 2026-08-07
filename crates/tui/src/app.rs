@@ -2216,7 +2216,10 @@ impl App {
             .and_then(|device| device.last_seen_at)
         {
             Some(seen) => {
-                now.signed_duration_since(seen).num_milliseconds() <= view::SESSION_STALE_MS
+                // The shared presence window — the gpui app's devices page and
+                // space rows use the same one, so the two surfaces can never
+                // disagree about the same device (gh#126).
+                now.signed_duration_since(seen).num_milliseconds() <= view::PRESENCE_STALE_MS
             }
             // No record yet (registry still arriving, or another user's device):
             // say nothing rather than claim an outage we cannot see.
