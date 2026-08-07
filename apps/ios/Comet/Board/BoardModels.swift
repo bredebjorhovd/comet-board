@@ -831,10 +831,11 @@ enum ActiveRow: Identifiable, Hashable {
 /// urgency, then longest-running, then the chat id, which every row carries
 /// and no two rows share.
 func activeRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
-                now: Date = Date()) -> [ActiveRow] {
+                orchestrator: String? = nil, now: Date = Date()) -> [ActiveRow] {
     var out = agentRows(rows: rows, chats: chats, sessions: sessions, now: now)
         .map(ActiveRow.agent)
-        + runningRows(rows: rows, chats: chats, sessions: sessions, now: now)
+        + runningRows(rows: rows, chats: chats, sessions: sessions,
+                      orchestrator: orchestrator, now: now)
         .map(ActiveRow.unmanaged)
     out.sort { a, b in
         if a.state.rank != b.state.rank { return a.state.rank < b.state.rank }

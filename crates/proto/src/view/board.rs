@@ -2182,7 +2182,7 @@ mod tests {
             started("c-adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
             started("c-orch", crate::SessionStatus::Working, "2026-08-01T09:00:00Z"), // 3h
         ];
-        let active = active_rows(&[attempt], &chats, &sessions, now());
+        let active = active_rows(&[attempt], &chats, &sessions, None, now());
         assert_eq!(
             active.iter().map(|r| r.chat_id()).collect::<Vec<_>>(),
             // The question first, wherever it came from; then the workers,
@@ -2207,7 +2207,7 @@ mod tests {
         live.chat_id = Some("c1".into());
         let chats = vec![chat("c1", None)];
         let sessions = vec![session("c1", crate::SessionStatus::Working, 0)];
-        let active = active_rows(&[live], &chats, &sessions, now());
+        let active = active_rows(&[live], &chats, &sessions, None, now());
         assert_eq!(active.len(), 1);
         assert!(matches!(&active[0], ActiveRow::Agent(_)));
     }
