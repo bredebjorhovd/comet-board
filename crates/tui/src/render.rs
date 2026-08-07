@@ -135,6 +135,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_main(frame, main, app, &theme);
 
+    // An open board row (gh#132), under the pickers: `enter` still dispatches
+    // from inside it, and the account picker that opens then has to draw over
+    // it rather than under.
+    if app.board_open && app.board.peek.is_some() {
+        let panel = Rect {
+            y: body.y + TAB_ROWS,
+            height: body.height.saturating_sub(TAB_ROWS),
+            ..body
+        };
+        app.push_hit(panel, Hit::Overlay);
+        draw_board_detail(frame, panel, app, &theme);
+    }
+
     if let Some(overlay) = &app.overlay {
         let panel = draw_overlay(frame, body, app, overlay, &theme);
         app.push_hit(body, Hit::Overlay);
@@ -2479,6 +2492,170 @@ fn draw_panel(frame: &mut Frame, panel: Rect, theme: &Theme, title: &str) -> Rec
         width: panel.width,
         height: panel.height - 2,
     }
+}
+
+/// One board row, opened for reading (gh#132) — the full title, the issue body,
+/// the labels, where the work sits, what has been tried on it, and the links.
+///
+/// The help screen's shape, deliberately: a cleared body under a centred panel
+/// is what this app already means by "read this, then go back", and a second
+/// spelling of a modal would be a second thing to learn. It draws over the
+/// board rather than beside it because a 24-row terminal has no beside.
+///
+/// Everything except the body is read live off the row, so a board frame
+/// landing under an open panel updates what it says.
+fn draw_board_detail(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let Some(peek) = app.board.peek.as_ref() else {
+        return;
+    };
+    // The row may have left the board under the open panel — settled, filtered,
+    // reaped. Say so rather than drawing a card about nothing.
+    let Some(row) = app.board.task(&peek.task_id).cloned() else {
+        frame.render_widget(Clear, area);
+        let panel = centred(area, 40.min(area.width), 3.min(area.height));
+        let inner = draw_panel(frame, panel, theme, "gone");
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  that row is no longer on the board",
+                theme.panel_hint(),
+            )),
+            Rect { height: 1, ..inner },
+        );
+        return;
+    };
+
+    frame.render_widget(Clear, area);
+    let width = area.width.saturating_sub(4).min(96);
+    let height = area.height.saturating_sub(2);
+    let panel = centred(area, width, height);
+    let inner = draw_panel(frame, panel, theme, &row.display_identifier());
+    if inner.height == 0 || inner.width < 8 {
+        return;
+    }
+    let text_width = inner.width.saturating_sub(4) as usize;
+    let text_x = inner.x + 2;
+
+    // The lines above the body never scroll: they are what the panel is *for*,
+    // and a title you have to scroll back up to is the truncation this issue
+    // was about.
+    let mut head: Vec<Line> = Vec::new();
+    for line in wrap::wrap(&row.title, text_width, "") {
+        head.push(Line::from(Span::styled(line, theme.body())));
+    }
+    for fact in [board::placement_line(&row), board::history_line(&row, chrono::Utc::now())]
+        .into_iter()
+        .flatten()
+    {
+        for line in wrap::wrap(&fact, text_width, "  ") {
+            head.push(Line::from(Span::styled(line, theme.hint())));
+        }
+    }
+    if !row.labels.is_empty() {
+        for line in wrap::wrap(&row.labels.join(", "), text_width, "  ") {
+            head.push(Line::from(Span::styled(line, theme.hint())));
+        }
+    }
+    head.push(Line::from(Span::styled(String::new(), theme.panel())));
+
+    // The body, wrapped. Markdown is rendered as its own source: a terminal
+    // panel has no room for a second markdown engine, and an issue's own
+    // backticks and bullets read fine as text.
+    let mut body: Vec<Line> = Vec::new();
+    if let Some(error) = peek.error.as_deref() {
+        for line in wrap::wrap(&format!("couldn't read the issue: {error}"), text_width, "  ") {
+            body.push(Line::from(Span::styled(
+                line,
+                theme.board_state(BoardState::Failed),
+            )));
+        }
+    } else if !peek.loaded {
+        body.push(Line::from(Span::styled(
+            "reading the issue…".to_string(),
+            theme.hint(),
+        )));
+    } else if let Some(text) = peek.body.as_deref() {
+        for source in text.lines() {
+            if source.trim().is_empty() {
+                body.push(Line::from(Span::styled(String::new(), theme.panel())));
+                continue;
+            }
+            for line in wrap::wrap(source, text_width, "  ") {
+                body.push(Line::from(Span::styled(line, theme.panel())));
+            }
+        }
+    } else {
+        body.push(Line::from(Span::styled(
+            board::NO_BODY.to_string(),
+            theme.hint(),
+        )));
+    }
+
+    // The actions, from the shared rule — the same verbs the desktop panel's
+    // buttons and the phone's sheet offer, so a row does not gain or lose an
+    // affordance on its way between surfaces. The keys beside them are this
+    // surface's own.
+    let mut foot: Vec<Line> = Vec::new();
+    let actions = board::detail_actions(&row);
+    if !actions.is_empty() {
+        let names: Vec<&str> = actions.iter().map(|a| a.label()).collect();
+        for line in wrap::wrap(&names.join(" · "), text_width, "  ") {
+            foot.push(Line::from(Span::styled(line, theme.hint())));
+        }
+    }
+
+    // One scroll region between two fixed blocks. The body is the only part
+    // that can outgrow the panel, so it is the only part that moves.
+    let room = inner.height as usize;
+    let fixed = head.len() + foot.len() + 1;
+    let body_room = room.saturating_sub(fixed);
+    let max_scroll = body.len().saturating_sub(body_room);
+    if let Some(peek) = app.board.peek.as_mut() {
+        peek.scroll = peek.scroll.min(max_scroll);
+    }
+    let scroll = app.board.peek.as_ref().map(|p| p.scroll).unwrap_or(0);
+
+    let mut y = inner.y;
+    let put = |frame: &mut Frame, line: Line<'static>, y: &mut u16| {
+        if *y >= inner.y + inner.height {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(line).style(theme.panel()),
+            Rect {
+                x: text_x,
+                y: *y,
+                width: text_width as u16,
+                height: 1,
+            },
+        );
+        *y += 1;
+    };
+    for line in head {
+        put(frame, line, &mut y);
+    }
+    for line in body.into_iter().skip(scroll).take(body_room.max(1)) {
+        put(frame, line, &mut y);
+    }
+    // The footer is pinned to the panel's last rows, not to wherever the body
+    // stopped: an action list that floats up a short issue reads as part of it.
+    let mut foot_y = inner.y + inner.height.saturating_sub(foot.len() as u16 + 1);
+    for line in foot {
+        put(frame, line, &mut foot_y);
+    }
+    let hint = if max_scroll > scroll {
+        format!(" j/k scroll · ↓{} · space closes ", max_scroll - scroll)
+    } else {
+        " enter dispatches · space closes ".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, theme.panel_hint())),
+        Rect {
+            x: panel.x + PANEL_PAD,
+            y: panel.y + panel.height.saturating_sub(1),
+            width: panel.width.saturating_sub(PANEL_PAD * 2),
+            height: 1,
+        },
+    );
 }
 
 fn centred(body: Rect, width: u16, height: u16) -> Rect {

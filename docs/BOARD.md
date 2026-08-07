@@ -145,6 +145,12 @@ bill?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
+`ReadBoardTask {taskId}` → `{id, body}` reads one row's issue text for the
+detail surfaces (gh#132). A call rather than a field on the streamed row,
+deliberately: `WatchBoard` republishes all hundred-odd rows on every sync cycle,
+and a hundred issue bodies riding along would make each frame two orders of
+magnitude larger — relayed to a phone — to draw one truncated line. It is read
+when somebody opens a row, and only that row's.
 `ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
 can be pointed at (the canonical set `build_spec` validates an override against)
 for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
@@ -1445,7 +1451,9 @@ the top selected row of the whole panel. Five fixes, derived once in
   route it used to name — the group header and leading token now say it — 
   keeping only a workspace that differs from the route's name plus the
   `[enter to dispatch]` / `no route` affordances.
-- **Two-line titles under the cursor**: the desktop's selected/hovered row
+- **Two-line titles under the cursor** *(reverted by §H30 — gh#132: a row that
+  grows under the pointer reflows the list below it, which is what the operator
+  then reported as jank)*: the desktop's selected/hovered row
   wraps its title to two lines (`line_clamp(2)`, row height min not fixed);
   iOS already wrapped. The TUI stays one terminal row per line — a grid where
   one row is sometimes two makes the scroll arithmetic lie — but its title
@@ -1531,6 +1539,52 @@ place an agent reads from is written by something that already runs.
   equivalent, so a Codex slot is left alone and still learns the board from
   `docs/agent-conventions.md`. [`docs/skill.md`](skill.md) is the operator-facing
   version of all of the above.
+
+### H30 — A row is a door, not a tooltip — **done** (gh#132)
+An operator report with a screenshot: "the animation feels a bit laggy or
+jagged … that it shows more text but isn't openable either as a modal or
+something doesn't sit right." Two faults with one root — §H27 answered "which
+Signicat issue?" by making the row *bigger*, which is both the jank and a
+promise the row could not keep.
+
+- **Hover never changes layout again.** §H27's `line_clamp(2)` + `min_h` meant
+  the row under the pointer grew and every row below it moved; the chips
+  appearing on hover added a few pixels more. The desktop row is now a
+  constant `ROW_H`, its two lines are constants too (`ROW_LINE_H` is the chip's
+  height, so a row with chips is exactly as tall as one without), and the title
+  is `truncate()` in every state. Of the issue's three options this is (c) —
+  and (c) is not a consolation prize once (2) exists: with the full title one
+  keypress away, a selected-row expansion would be the same sentence said
+  twice, and arrowing down the list would reflow it on every step.
+- **The row opens.** Desktop: a peek panel between the list and the footer —
+  `space` toggles it, a click on a row opens it, escape shuts it before it
+  shuts the board, and it follows the cursor once open. TUI: the help screen's
+  full-screen shape, because a 24-row terminal has no beside; it owns the
+  keyboard while up (`j`/`k` scroll the body) with **one deliberate exception**
+  — `enter` still dispatches from inside it. iOS: a sheet, which is what a tap
+  on a row now does. All three carry the whole title, the issue body as
+  markdown, the labels, where the work sits, what has been tried on it, and the
+  links.
+- **Reading is never on the way to releasing.** `enter` still dispatches from
+  the list on every surface, the phone row keeps its own Dispatch/Retry chip,
+  and a release started from a detail surface goes through the same account
+  picker — the detail must not become the one place on the board that skips the
+  question of whose subscription a run spends (§H17).
+- **The body is a call, not a field.** `ReadBoardTask {taskId}` → `{id, body}`,
+  forwardable to the board's host like every other board verb, served off the
+  loop thread that owns `board.db`. `WatchBoard` republishes every row on every
+  sync cycle; a hundred issue bodies riding along would make each frame two
+  orders of magnitude larger, relayed to a phone, to draw one truncated line.
+- **The actions are one rule.** `row_actions` (a row's own affordances) and
+  `detail_actions` (those plus the links a list has no room for) live in
+  `comet_proto::view::board`, ported to `BoardModels.swift`. The desktop's
+  per-state chip logic — hard-coded since §H12 — now reads from it, so the
+  three surfaces cannot drift into offering a Retry one of them does not.
+  `history_line` and `placement_line` join `row_metadata` as the shared
+  formatting. `history_line` names `billed_to` *unconditionally*, unlike the
+  row's own sub-line (`billing_note`, which speaks up only when somebody else
+  is paying): the detail is where you go to ask, and an answer that appears
+  only when there is a problem cannot be trusted to mean anything.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

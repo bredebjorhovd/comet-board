@@ -29,7 +29,7 @@ use comet_proto::{
 };
 use comet_rpc::methods;
 
-use crate::board::Board;
+use crate::board::{Board, Peek};
 use crate::composer::Composer;
 use crate::daemon::Attachment;
 use crate::keys::{Action, Edit, Focus};
@@ -749,6 +749,23 @@ impl App {
                 }
                 Vec::new()
             }
+            Update::TaskDetail {
+                task_id: for_task,
+                body,
+            } => {
+                // Only fills the panel it was asked for — a slow reply must not
+                // land the previous row's issue under the open one (gh#132).
+                if let Some(peek) = self.board.peek.as_mut()
+                    && peek.task_id == for_task
+                {
+                    peek.loaded = true;
+                    match body {
+                        Ok(text) => peek.body = text.filter(|t| !t.trim().is_empty()),
+                        Err(err) => peek.error = Some(err),
+                    }
+                }
+                Vec::new()
+            }
             Update::Notice(text) => {
                 // A notice while a picker is waiting means the fetch failed;
                 // close it rather than leaving a spinner forever.
@@ -1007,7 +1024,36 @@ impl App {
                 self.board.escape_find();
                 Vec::new()
             }
+            Action::BoardPeek => self.board_peek(),
+            Action::BoardPeekScroll(delta) => {
+                if let Some(peek) = self.board.peek.as_mut() {
+                    peek.scroll = peek.scroll.saturating_add_signed(delta);
+                }
+                Vec::new()
+            }
         }
+    }
+
+    /// `space` on the board: open the selected row for reading, or shut it
+    /// (gh#132).
+    ///
+    /// The fetch is the only reason this is not pure — the row itself is
+    /// already streamed, and everything except the issue body is read live off
+    /// it, so an open panel updates as the board does.
+    fn board_peek(&mut self) -> Effects {
+        if self.board.peek.is_some() {
+            self.board.peek = None;
+            return Vec::new();
+        }
+        let Some(row) = self.board.selected_task() else {
+            // A header is not a door. The cursor is on one after a fold, and
+            // saying so would be noise on a keypress that has a plain meaning
+            // one line away.
+            return Vec::new();
+        };
+        let task_id = row.id.clone();
+        self.board.peek = Some(Peek::new(task_id.clone()));
+        vec![Command::ReadBoardTask { task_id }]
     }
 
     fn edit(&mut self, edit: Edit) {
@@ -1088,6 +1134,10 @@ impl App {
     /// restarting.
     fn close_board(&mut self) {
         self.board_open = false;
+        // Leaving the board leaves whatever was open on it (gh#132): coming
+        // back to a panel over a list you have not looked at in an hour is a
+        // panel you have to dismiss before you can read anything.
+        self.board.peek = None;
         if self.focus == Focus::Board {
             // The composer is where a return to the chat usually lands; if the
             // board was opened from the sidebar, keep the cursor there.
@@ -3076,6 +3126,11 @@ impl App {
             }
             Some(Hit::Overlay) => {
                 self.help = false;
+                // An open board row dismisses the same way (gh#132): it is
+                // registered as an overlay hit, so a click that lands on it has
+                // to do something rather than fall through to a list it is
+                // covering.
+                self.board.peek = None;
                 Vec::new()
             }
             None => Vec::new(),
@@ -3897,6 +3952,109 @@ mod tests {
             Some("4"),
             "blocked is the first section, so it owns the cursor"
         );
+    }
+
+    #[test]
+    fn space_opens_the_selected_row_and_asks_the_host_for_its_issue_text() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("1", BoardState::Ready)]));
+        match app.act(Action::BoardPeek).first() {
+            Some(Command::ReadBoardTask { task_id }) => assert_eq!(task_id, "1"),
+            other => panic!("expected a detail fetch, got {other:?}"),
+        }
+        let peek = app.board.peek.as_ref().expect("a row is open");
+        assert_eq!(peek.task_id, "1");
+        assert!(!peek.loaded, "it says it is reading until the reply lands");
+
+        app.apply(Update::TaskDetail {
+            task_id: "1".into(),
+            body: Ok(Some("## why\nbecause".into())),
+        });
+        let peek = app.board.peek.as_ref().expect("still open");
+        assert!(peek.loaded);
+        assert_eq!(peek.body.as_deref(), Some("## why\nbecause"));
+
+        // Space again shuts it, and asks the host for nothing.
+        assert!(app.act(Action::BoardPeek).is_empty());
+        assert!(app.board.peek.is_none());
+    }
+
+    #[test]
+    fn an_issue_with_no_description_is_loaded_and_empty_not_still_loading() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("1", BoardState::Ready)]));
+        app.act(Action::BoardPeek);
+        // An empty string on the wire means the same thing as a missing one.
+        app.apply(Update::TaskDetail {
+            task_id: "1".into(),
+            body: Ok(Some("   ".into())),
+        });
+        let peek = app.board.peek.as_ref().expect("open");
+        assert!(peek.loaded, "the fetch answered");
+        assert_eq!(peek.body, None, "and the answer was: nothing to read");
+        assert_eq!(peek.error, None);
+    }
+
+    #[test]
+    fn a_reply_for_a_row_the_cursor_has_left_is_dropped() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![
+            board_row("1", BoardState::Ready),
+            board_row("2", BoardState::Ready),
+        ]));
+        app.board.selected = Some("1".into());
+        app.act(Action::BoardPeek);
+        app.act(Action::BoardPeek);
+        app.board.selected = Some("2".into());
+        app.act(Action::BoardPeek);
+        // The first row's slow reply must not land under the second's title.
+        app.apply(Update::TaskDetail {
+            task_id: "1".into(),
+            body: Ok(Some("the wrong issue".into())),
+        });
+        let peek = app.board.peek.as_ref().expect("open on row 2");
+        assert_eq!(peek.task_id, "2");
+        assert_eq!(peek.body, None);
+        assert!(!peek.loaded);
+    }
+
+    #[test]
+    fn a_failed_read_says_so_on_the_panel_rather_than_reading_as_an_empty_issue() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("1", BoardState::Ready)]));
+        app.act(Action::BoardPeek);
+        app.apply(Update::TaskDetail {
+            task_id: "1".into(),
+            body: Err("board loop is not running".into()),
+        });
+        let peek = app.board.peek.as_ref().expect("open");
+        assert_eq!(peek.error.as_deref(), Some("board loop is not running"));
+        assert_eq!(peek.body, None);
+    }
+
+    #[test]
+    fn a_header_is_not_a_door() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("1", BoardState::Ready)]));
+        app.board.selected = Some(crate::board::section_row_id(BoardState::Ready));
+        assert!(app.act(Action::BoardPeek).is_empty());
+        assert!(app.board.peek.is_none());
+    }
+
+    #[test]
+    fn leaving_the_board_leaves_what_was_open_on_it() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("1", BoardState::Ready)]));
+        app.act(Action::BoardPeek);
+        assert!(app.board.peek.is_some());
+        app.act(Action::BoardClose);
+        assert!(app.board.peek.is_none());
     }
 
     #[test]

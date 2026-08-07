@@ -135,6 +135,15 @@ pub mod methods {
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";
+    /// The issue text behind one row, for the detail surface (gh#132). Params:
+    /// `{taskId}` → `{id, body}`.
+    ///
+    /// A call rather than a field on the streamed row, deliberately.
+    /// [`WATCH_BOARD`] republishes every row on every sync cycle; a hundred
+    /// issue bodies riding along would make each frame two orders of magnitude
+    /// larger, relayed to a phone, to draw one truncated line. This is read
+    /// when somebody opens a row, and only that row's.
+    pub const READ_BOARD_TASK: &str = "ReadBoardTask";
     /// The board's `routing.toml` as it stands on its host: the text, its
     /// parse, and everything wrong with it — plus the repos that have a space
     /// on that device but nothing on the board watching them (gh#75). Params:

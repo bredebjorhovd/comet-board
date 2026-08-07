@@ -216,6 +216,29 @@ final class DemoDataset {
         boardRows[ix].lastOutcome = "cancelled"
     }
 
+    /// The issue text the demo's detail sheet reads (gh#132).
+    ///
+    /// Only some rows have one, on purpose: an issue with no description is the
+    /// common case on a real board, and the sheet's empty state should be
+    /// reachable in the demo rather than only in production.
+    static let boardBodies: [String: String] = [
+        "linear:AGE-14": """
+            The picker asks the host for its catalog on open. On a host that has \
+            just come up the answer is empty, and the picker caches the empty \
+            list for the session.
+
+            - repro: restart the box, open the picker within ~10s
+            - expected: a second ask once the harness has answered
+            """,
+        "gh:comet#121": """
+            The board is readable on the phone but not actionable: dispatching \
+            still means opening a laptop.
+
+            **Wanted:** the account picker as a sheet, and a release that names \
+            who is paying for it.
+            """,
+    ]
+
     /// One row per board state that has anything to say, in board order. The
     /// two live attempts point at real demo chats so `agentRows` keeps them
     /// (its membership rule drops a row whose chat has not synced).

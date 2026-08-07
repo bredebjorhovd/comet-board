@@ -68,6 +68,43 @@ pub struct Board {
     pub scroll: usize,
     /// Height of the last render, for paging and scroll clamping.
     pub height: usize,
+    /// The open row, in full (gh#132). `None` is the list.
+    pub peek: Option<Peek>,
+}
+
+/// One row, opened for reading — the terminal's answer to "a row is a door".
+///
+/// The full-screen shape the help screen uses, for the same reason it does: a
+/// 24-row terminal has no side panel to spare, and a centred card over a
+/// cleared body is the pattern this app already means "read this, then go back"
+/// by. It owns the keyboard while it is up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Peek {
+    /// The task this is about. Everything except the body is read live off the
+    /// row, so a board frame landing under an open peek updates it.
+    pub task_id: String,
+    /// The issue text, once `ReadBoardTask` answers. `None` while in flight or
+    /// when the issue has none — [`loaded`](Self::loaded) tells them apart.
+    pub body: Option<String>,
+    /// The fetch has answered (with a body or with nothing). Until it has, the
+    /// panel says it is reading rather than claiming the issue is empty.
+    pub loaded: bool,
+    /// Why the fetch failed, said where the body would be.
+    pub error: Option<String>,
+    /// First body line on screen. An issue is longer than a pane.
+    pub scroll: usize,
+}
+
+impl Peek {
+    pub fn new(task_id: String) -> Self {
+        Self {
+            task_id,
+            body: None,
+            loaded: false,
+            error: None,
+            scroll: 0,
+        }
+    }
 }
 
 impl Default for Board {
@@ -87,6 +124,7 @@ impl Board {
             group_folds: HashMap::new(),
             scroll: 0,
             height: 1,
+            peek: None,
         }
     }
 

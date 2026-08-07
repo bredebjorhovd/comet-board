@@ -37,7 +37,7 @@ use comet_board::dispatch::{
 };
 use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
-use comet_board::rows::{TaskRow, board_rows};
+use comet_board::rows::{TaskDetail, TaskRow, board_rows, task_detail};
 use comet_board::runtime::{Runtime, agent_status};
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_proto::view::board::OrchestratorPin;
@@ -68,6 +68,13 @@ enum Msg {
     Cancel {
         task_id: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Read one task's issue text (gh#132). On the loop's thread like every
+    /// other read, because that thread owns `board.db` — a second connection
+    /// opened per detail fetch would be a second owner of the store.
+    Detail {
+        task_id: String,
+        reply: oneshot::Sender<anyhow::Result<TaskDetail>>,
     },
     Shutdown,
 }
@@ -269,6 +276,24 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-cancel"))?
     }
 
+    /// One task's issue text, for a detail surface (gh#132).
+    ///
+    /// Errors when the board does not know the id, rather than answering with
+    /// an empty body: "this issue has no description" and "there is no such row
+    /// here" are different answers, and a reader that cannot tell them apart
+    /// will show the wrong one.
+    pub async fn task_detail(&self, task_id: &str) -> anyhow::Result<TaskDetail> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Detail {
+                task_id: task_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
+    }
+
     /// Stop the loop and wait for the in-flight cycle to finish, so shutdown
     /// never truncates a SQLite write mid-transaction.
     pub fn shutdown(&self) {
@@ -393,6 +418,18 @@ fn run_loop(
                     log.error(format!("cancel of {task_id} failed: {e:#}"));
                 }
                 publish_rows(&engine, &feeds.rows, &log);
+                let _ = reply.send(result);
+            }
+            // A read, so it publishes nothing and logs nothing: opening a row
+            // is not an event on the board.
+            Ok(Msg::Detail { task_id, reply }) => {
+                let result = engine
+                    .db
+                    .get_task(&task_id)
+                    .and_then(|task| {
+                        task.ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))
+                    })
+                    .map(|task| task_detail(&task));
                 let _ = reply.send(result);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

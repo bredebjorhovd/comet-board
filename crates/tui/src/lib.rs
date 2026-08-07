@@ -286,6 +286,7 @@ impl Loop {
                     self.app.overlay_open(),
                     self.app.composer.is_empty(),
                     self.app.board.typing,
+                    self.app.board.peek.is_some(),
                     self.app.help,
                     key,
                 ) {
