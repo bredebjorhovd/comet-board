@@ -29,13 +29,47 @@ desktop's pulldown-cmark config).
   the token with the `org_id` claim).
 - **Dev**: against an `AUTH_MODE=dev` edge (e.g. `wrangler dev`), enter a user
   id + org id; the bearer is `userId@orgId`.
-- **Demo mode**: fully offline dataset with a scripted streaming reply —
+- **Demo mode**: fully offline dataset with a scripted streaming reply and a
+  board (rows in every state, two live attempts wired to real demo chats) —
   explore the UI with no infrastructure. Launch args for screenshot rigs:
-  `-demo [-route chat:<id>|space:<id>] [-stream]`.
+  `-demo [-route chat:<id>|space:<id>|board] [-sheet dispatch] [-stream]`.
+  `-route`/`-sheet` work against a live edge too, which is where the rows that
+  matter are.
+
+### Verifying the board against a real box
+
+`-e2e-board <repoPath>` drives gh#114's exit criteria headlessly, against a dev
+edge (`wrangler dev --var AUTH_MODE:dev` on :8787) and a `comet headless` whose
+`routing.toml` routes to that repo: it makes the route's space, waits for the
+board to call a row dispatchable, releases it, watches the row go `working` with
+its branch cut, and then retries it with `replace`. Results land in
+`Documents/e2e.log` (read it with `simctl get_app_container`). The plain `-e2e`
+smoke also probes `WatchBoard` on every engine device, where a board-less device
+*refusing* is a pass — what that asserts is that a stream frame comes back at
+all.
+
+### Distribution
+
+Personal-device sideload via Xcode free provisioning works and re-signs every
+7 days. TestFlight needs the $99 Apple Developer account — the same one gh#100's
+signing tier wants, so it is one purchase for both.
 
 ## Architecture
 
 ```
+Board/
+  BoardModels.swift     view/board.rs port: BoardState + section order/glyphs,
+                        the `list --json` TaskRow (snake_case wire), the
+                        done-today bound, elapsed/cap spellings, the gh#101
+                        billing vocabulary, agent_rows whole
+  BoardStore.swift      standing `WatchBoard` over the device-room relay: the
+                        host sweep (each candidate's own room — no engine here
+                        to forward with `targetDeviceId`), dispatch/retry/cancel
+  BoardView.swift       sections in board order, blocked first; per-state row
+                        content, elapsed against the route's cap
+  DispatchSheet.swift   runtime + account pickers with billing chips (gh#74/#101)
+                        and the `require-own` confirm
+  AgentsSection.swift   gh#103's live-agents section, phone-shaped
 Sync/
   LoroProtocol.swift    loro-protocol 0.3 wire codec (byte-compatible port of
                         the crate's encoding.rs: magic/varBytes/type/payload)
@@ -81,7 +115,10 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Harness brand SVG marks (icons.rs) | Same path data via a native SVG path parser (`BrandMarks.swift`) |
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |
 | Add-space palette (device + folder browser) | New-space sheet: device tabs + remote folder browser (ListFolders over the device-room relay, git repos badged) |
-| ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; used for ListFolders + direct-to-host `Mutate {createSpace}` (local doc-write fallback when the host is offline) |
+| ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; unary `call` **and** streaming `subscribe` (`{item}`/`{done}`, `{id,cancel}` on drop); used for ListFolders, direct-to-host `Mutate {createSpace}`, and the board four |
+| Board panel (`ui/src/board.rs`) | Board screen: same sections/glyphs/metadata, dispatch + retry as a sheet (`Board/`) |
+| Sidebar Agents section (gh#103) | Same section on Home, between Spaces and Sessions |
+| Board host sweep with `targetDeviceId` | Same candidate order, dialling each device's room directly — the phone has no local engine to forward through |
 | Hover timestamps / copy | Context menus |
 | gpui `list()` sum-tree virtualization | `LazyVStack` + stable row ids + version fingerprints |
 | Stick-to-bottom spring, wheel-up breaks pin | Scroll-phase-gated pin + spring scrollTo, same 70/320pt thresholds |

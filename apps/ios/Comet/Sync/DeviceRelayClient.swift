@@ -8,6 +8,12 @@
 // RPC payloads are ndjson ControlRpc frames: {id, method, params} out,
 // {id, ok|err|item|done} back. Relay control frames (kind " relay" — leading
 // space is part of the constant) signal host_offline/host_closed.
+//
+// Two call shapes, exactly the ones `comet-rpc`'s client has: `call` (unary,
+// one `{ok}` or `{err}`) and `subscribe` (a stream of `{item}` until `{done}`
+// or `{err}`). The stream half is what `WatchBoard` needs — until gh#114 this
+// client only knew `{ok}`, so every `{item}` frame fell through to "unexpected
+// reply" and no subscription on the engine was reachable from the phone at all.
 
 import Foundation
 
@@ -39,6 +45,10 @@ actor DeviceRelayClient {
     private var pingTask: Task<Void, Never>?
     private var nextId: UInt64 = 1
     private var pending: [UInt64: CheckedContinuation<Result<Data, RelayError>, Never>] = [:]
+    /// Live subscriptions by request id — `{item}` frames feed these, `{done}`
+    /// and `{err}` retire them, and a teardown fails every one at once so a
+    /// standing watcher learns the link died instead of hanging forever.
+    private var streams: [UInt64: AsyncThrowingStream<Data, Error>.Continuation] = [:]
     private var connected = false
 
     init(deviceId: String, config: AppConfig) {
@@ -104,6 +114,11 @@ actor DeviceRelayClient {
         for (_, continuation) in waiting {
             continuation.resume(returning: .failure(error))
         }
+        let watchers = streams
+        streams.removeAll()
+        for (_, continuation) in watchers {
+            continuation.finish(throwing: error)
+        }
     }
 
     private func sendPing() async {
@@ -165,6 +180,71 @@ actor DeviceRelayClient {
         }
     }
 
+    // MARK: Streaming RPC
+
+    /// One streaming ControlRpc subscription (`WatchBoard` and friends): each
+    /// `{item}` is yielded as raw JSON, `{done}` finishes the stream and `{err}`
+    /// throws. No deadline — a watch is *supposed* to stay silent between
+    /// changes; the link dying is what ends it, and the caller resubscribes.
+    ///
+    /// Cancelling the consuming task (or breaking out of the `for await`) sends
+    /// `{id, cancel: true}`, which is how `comet-rpc`'s own client retires a
+    /// stream: without it the host keeps producing into a socket nobody reads.
+    func subscribe(method: String, params: [String: Any]) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            Task { await self.beginSubscription(method: method, params: params,
+                                                continuation: continuation) }
+        }
+    }
+
+    private func beginSubscription(
+        method: String,
+        params: [String: Any],
+        continuation: AsyncThrowingStream<Data, Error>.Continuation
+    ) async {
+        do {
+            try await connect()
+        } catch {
+            continuation.finish(throwing: RelayError.notConnected)
+            return
+        }
+        let id = nextId
+        nextId += 1
+        let frame: [String: Any] = ["id": id, "method": method, "params": params]
+        guard let payload = try? JSONSerialization.data(withJSONObject: frame) else {
+            continuation.finish(throwing: RelayError.rpc("could not encode \(method)"))
+            return
+        }
+        streams[id] = continuation
+        continuation.onTermination = { [weak self] termination in
+            guard case .cancelled = termination else { return }
+            Task { await self?.cancelSubscription(id: id) }
+        }
+        guard let socket else {
+            streams.removeValue(forKey: id)
+            continuation.finish(throwing: RelayError.notConnected)
+            return
+        }
+        do {
+            try await socket.send(.data(Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#,
+                                                         payload: payload)))
+        } catch {
+            streams.removeValue(forKey: id)
+            continuation.finish(throwing: RelayError.notConnected)
+            teardown(error: .notConnected)
+        }
+    }
+
+    /// Tell the host to stop producing for a stream the consumer walked away
+    /// from. Best-effort: a dead link has already ended the stream anyway.
+    private func cancelSubscription(id: UInt64) async {
+        guard streams.removeValue(forKey: id) != nil, let socket else { return }
+        let frame: [String: Any] = ["id": id, "cancel": true]
+        guard let payload = try? JSONSerialization.data(withJSONObject: frame) else { return }
+        try? await socket.send(.data(Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#,
+                                                      payload: payload)))
+    }
+
     private func send(_ data: Data, for id: UInt64) async {
         guard let socket else {
             failCall(id: id, error: .notConnected)
@@ -215,17 +295,47 @@ actor DeviceRelayClient {
         guard let text = String(data: payload, encoding: .utf8) else { return }
         for line in text.split(separator: "\n") {
             guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let id = (obj["id"] as? NSNumber)?.uint64Value,
-                  let continuation = pending.removeValue(forKey: id) else { continue }
-            if let err = obj["err"] as? String {
-                continuation.resume(returning: .failure(.rpc(err)))
-            } else if obj.keys.contains("ok"),
-                      let okData = try? JSONSerialization.data(withJSONObject: obj["ok"] ?? NSNull(),
-                                                               options: .fragmentsAllowed) {
-                continuation.resume(returning: .success(okData))
-            } else {
-                continuation.resume(returning: .failure(.rpc("unexpected reply")))
+                  let id = (obj["id"] as? NSNumber)?.uint64Value else { continue }
+            // A stream id and a call id are drawn from the same counter, so at
+            // most one of these two owns the frame.
+            if let watcher = streams[id] {
+                handleStreamFrame(obj, id: id, watcher: watcher)
+            } else if let continuation = pending.removeValue(forKey: id) {
+                handleCallFrame(obj, continuation: continuation)
             }
+        }
+    }
+
+    private func handleCallFrame(
+        _ obj: [String: Any],
+        continuation: CheckedContinuation<Result<Data, RelayError>, Never>
+    ) {
+        if let err = obj["err"] as? String {
+            continuation.resume(returning: .failure(.rpc(err)))
+        } else if obj.keys.contains("ok"),
+                  let okData = try? JSONSerialization.data(withJSONObject: obj["ok"] ?? NSNull(),
+                                                           options: .fragmentsAllowed) {
+            continuation.resume(returning: .success(okData))
+        } else {
+            continuation.resume(returning: .failure(.rpc("unexpected reply")))
+        }
+    }
+
+    private func handleStreamFrame(
+        _ obj: [String: Any],
+        id: UInt64,
+        watcher: AsyncThrowingStream<Data, Error>.Continuation
+    ) {
+        if let err = obj["err"] as? String {
+            streams.removeValue(forKey: id)
+            watcher.finish(throwing: RelayError.rpc(err))
+        } else if obj["done"] as? Bool == true {
+            streams.removeValue(forKey: id)
+            watcher.finish()
+        } else if obj.keys.contains("item"),
+                  let itemData = try? JSONSerialization.data(withJSONObject: obj["item"] ?? NSNull(),
+                                                             options: .fragmentsAllowed) {
+            watcher.yield(itemData)
         }
     }
 
