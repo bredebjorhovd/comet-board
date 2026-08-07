@@ -865,7 +865,10 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 const BOARD_COL_GUTTER: u16 = 1;
 const BOARD_COL_ID: u16 = 3;
 const BOARD_ID_WIDTH: u16 = 8;
-const BOARD_COL_TITLE: u16 = 13;
+/// The id column stretches to the widest repo-qualified token on screen
+/// (gh#125) — `herdr-board #118` needs more than herdr-board's eight cells —
+/// but no further than this: a pathological repo name must not eat the title.
+const BOARD_ID_MAX: u16 = 18;
 
 fn draw_board(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let last = area.height.saturating_sub(1);
@@ -899,6 +902,21 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     } else {
         let body_height = last.saturating_sub(body_top) as usize;
         app.board.ensure_visible(body_height);
+        // One width for every visible id, sized to the widest repo-qualified
+        // token — a column that clips `herdr-board #118` mid-name defeats the
+        // point of naming the repo (gh#125).
+        let id_width = lines
+            .iter()
+            .filter_map(|line| match line {
+                BoardRow::Task(id) => app
+                    .board
+                    .task(id)
+                    .map(|row| wrap::width_of(&row.display_identifier())),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(BOARD_ID_WIDTH as usize)
+            .clamp(BOARD_ID_WIDTH as usize, BOARD_ID_MAX as usize) as u16;
         for (index, line) in lines
             .iter()
             .enumerate()
@@ -918,9 +936,12 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 BoardRow::Section(state) => {
                     draw_board_section(frame, slot, *state, app, theme);
                 }
+                BoardRow::Group(state, route) => {
+                    draw_board_group(frame, slot, *state, route.as_deref(), app, theme);
+                }
                 BoardRow::Task(id) => {
                     if let Some(row) = app.board.task(id) {
-                        draw_board_task(frame, slot, row, selected, theme);
+                        draw_board_task(frame, slot, row, selected, id_width, theme);
                     }
                 }
             }
@@ -956,6 +977,22 @@ fn draw_board_header(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
         let w = wrap::width_of(&note) as u16;
         frame.render_widget(
             Paragraph::new(Span::styled(note, theme.hint())),
+            Rect {
+                x,
+                width: w,
+                height: 1,
+                ..area
+            },
+        );
+        x += w + 2;
+    }
+    // The count belongs in the title line (gh#125): "board on the-box · 124"
+    // is the sentence the rows only mean something under.
+    if !app.board.rows.is_empty() {
+        let count = format!("· {}", app.board.shown_tasks());
+        let w = wrap::width_of(&count) as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(count, theme.hint())),
             Rect {
                 x,
                 width: w,
@@ -1021,23 +1058,81 @@ fn draw_board_section(frame: &mut Frame, slot: Rect, state: BoardState, app: &mu
             ..slot
         },
     );
-    if app.board.is_collapsed(state) {
-        let hint = format!("{} hidden · enter to expand", app.board.section_len(state));
-        frame.render_widget(
-            Paragraph::new(Span::styled(hint, theme.hint())),
-            Rect {
-                x: slot.x + BOARD_COL_ID + label_w,
-                width: slot.width.saturating_sub(BOARD_COL_ID + label_w),
-                height: 1,
-                ..slot
-            },
-        );
+    // The count rides the header open or folded (gh#125): a section managing
+    // a hundred rows says how many before you scroll them.
+    let hint = if app.board.is_collapsed(state) {
+        format!("{} hidden · enter to expand", app.board.section_len(state))
+    } else {
+        app.board.section_len(state).to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, theme.hint())),
+        Rect {
+            x: slot.x + BOARD_COL_ID + label_w,
+            width: slot.width.saturating_sub(BOARD_COL_ID + label_w),
+            height: 1,
+            ..slot
+        },
+    );
+}
+
+/// A route's group header inside a section (gh#125): the route's name and its
+/// count, indented under the section it belongs to. `no route` is the trailing
+/// group and starts folded — visibility-only rows get a headline, never pole
+/// position.
+fn draw_board_group(
+    frame: &mut Frame,
+    slot: Rect,
+    state: BoardState,
+    route: Option<&str>,
+    app: &mut App,
+    theme: &Theme,
+) {
+    let selected =
+        app.board.selected.as_deref() == Some(&crate::board::group_row_id(state, route));
+    if selected {
+        fill(frame, slot, theme.selected());
     }
+    let label = route.unwrap_or(board::NO_ROUTE);
+    let len = app.board.group_len(state, route);
+    let text = if app.board.is_group_collapsed(state, route) {
+        format!("{label}  {len} hidden · enter to expand")
+    } else {
+        format!("{label}  {len}")
+    };
+    let style = if route.is_some() {
+        theme.label()
+    } else {
+        // The rows nothing routes, in the quiet tone of something you cannot
+        // dispatch.
+        theme.hint()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            wrap::truncate(&text, slot.width.saturating_sub(BOARD_COL_ID + 1) as usize),
+            style,
+        )),
+        Rect {
+            x: slot.x + BOARD_COL_ID,
+            width: slot.width.saturating_sub(BOARD_COL_ID + 1),
+            height: 1,
+            ..slot
+        },
+    );
 }
 
 /// Row hierarchy, in order of loudness: gutter (colour) → title (body) → id
-/// and metadata (dim). The gutter is the only colored cell in the row.
-fn draw_board_task(frame: &mut Frame, slot: Rect, row: &board::TaskRow, selected: bool, theme: &Theme) {
+/// and metadata (dim). The gutter is the only colored cell in the row. The id
+/// is the repo-qualified token (`tally #507`, gh#125), in the column width the
+/// caller sized to the widest one on screen.
+fn draw_board_task(
+    frame: &mut Frame,
+    slot: Rect,
+    row: &board::TaskRow,
+    selected: bool,
+    id_width: u16,
+    theme: &Theme,
+) {
     if selected {
         fill(frame, slot, theme.selected());
     }
@@ -1053,24 +1148,25 @@ fn draw_board_task(frame: &mut Frame, slot: Rect, row: &board::TaskRow, selected
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            wrap::truncate(&row.identifier, BOARD_ID_WIDTH as usize),
+            wrap::truncate(&row.display_identifier(), id_width as usize),
             theme.hint(),
         )),
         Rect {
             x: slot.x + BOARD_COL_ID,
-            width: BOARD_ID_WIDTH,
+            width: id_width,
             height: 1,
             ..slot
         },
     );
 
+    let title_col = BOARD_COL_ID + id_width + 2;
     let meta = board::row_metadata(row, selected, slot.width, chrono::Utc::now());
     let meta_w = wrap::width_of(&meta) as u16;
     let right = slot.x + slot.width.saturating_sub(1);
     let title_w = right
         .saturating_sub(meta_w)
         .saturating_sub(2)
-        .saturating_sub(slot.x + BOARD_COL_TITLE)
+        .saturating_sub(slot.x + title_col)
         .saturating_add(1);
     let title_style = if state == BoardState::Done {
         theme.hint()
@@ -1083,7 +1179,7 @@ fn draw_board_task(frame: &mut Frame, slot: Rect, row: &board::TaskRow, selected
             title_style,
         )),
         Rect {
-            x: slot.x + BOARD_COL_TITLE,
+            x: slot.x + title_col,
             width: title_w,
             height: 1,
             ..slot
@@ -1109,6 +1205,9 @@ fn board_footer_hints(app: &App) -> Vec<(&'static str, &'static str, char)> {
     let mut hints: Vec<(&'static str, &'static str, char)> = Vec::new();
     if let Some(state) = app.board.on_section() {
         let folded = app.board.is_collapsed(state);
+        hints.push(("enter", if folded { "expand" } else { "collapse" }, '\r'));
+    } else if let Some((state, route)) = app.board.on_group() {
+        let folded = app.board.is_group_collapsed(state, route.as_deref());
         hints.push(("enter", if folded { "expand" } else { "collapse" }, '\r'));
     } else if let Some(row) = app.board.selected_task() {
         match row.state() {
