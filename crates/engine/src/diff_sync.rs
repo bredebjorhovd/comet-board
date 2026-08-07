@@ -684,11 +684,6 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     } else {
         &head
     };
-    let branch = repos
-        .current_branch(root)
-        .await
-        .unwrap_or_else(|_| "HEAD".into());
-
     let names = capture_git(
         root,
         &["diff", "--name-status", "-z", "--find-renames", base, "--"],
@@ -800,6 +795,20 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
             binary,
         });
     }
+
+    // Branch LAST, not first (gh#111). This value does not just describe the
+    // snapshot — `sync_entry` writes it straight onto every chat row of the
+    // checkout, so it competes with whoever else names the branch. Auto-titling
+    // is the one that loses: it renames the worktree branch and sets the row in
+    // the same breath, and a branch read taken before five git subprocesses and
+    // the untracked-file reads is stale by the time this snapshot reaches the
+    // row — it reverts a fresher, authoritative write to the name the branch
+    // had a second ago. Reading here leaves nothing but the doc write between
+    // the observation and its use.
+    let branch = repos
+        .current_branch(root)
+        .await
+        .unwrap_or_else(|_| "HEAD".into());
 
     let additions: u32 = files.iter().map(|f| f.additions).sum();
     let deletions: u32 = files.iter().map(|f| f.deletions).sum();

@@ -396,7 +396,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     // viewer-queued durable command (based_on = the streaming entry = current turn).
     wait_for(
         || {
-            entries(&core)
+            entries_now(&core)
                 .iter()
                 .any(|e| e.status == Some(MessageStatus::Streaming))
         },
@@ -409,13 +409,20 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         SessionCommandPayload::Interrupt {},
     );
 
+    // Three writes on two tasks settle this interrupt, and only their eventual
+    // state is ordered: the run task stamps the doc, then deregisters the run,
+    // which is what lets `interrupt` return — and only then does the executor
+    // write the command's outcome and the run task the session status. Await
+    // the whole settled state; reading it in stamp order is a coin flip.
     wait_for(
         || {
-            entries(&core)
+            entries_now(&core)
                 .iter()
                 .any(|e| e.status == Some(MessageStatus::Aborted))
+                && command_status(&core, "cmd-int-1") == Some((SessionCommandStatus::Applied, None))
+                && core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle)
         },
-        "aborted stamp",
+        "interrupt settled: aborted stamp, applied command, idle session",
     )
     .await;
 
@@ -1289,17 +1296,37 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
         start.elapsed() < std::time::Duration::from_secs(3),
         "interrupt settled via the unparked resolver, not the grace timeout"
     );
+    // The abort stamp and the question's resolve stamp are separate writes, so
+    // await the settled state rather than assuming one implies the other.
     wait_for(
         || {
-            entries_now(&core)
+            let entries = entries_now(&core);
+            entries
                 .iter()
                 .any(|e| e.status == Some(MessageStatus::Aborted))
+                && entries.iter().all(|e| {
+                    e.parts.iter().all(|p| {
+                        !matches!(
+                            p,
+                            MessagePart::Input {
+                                resolved: false,
+                                ..
+                            }
+                        )
+                    })
+                })
         },
-        "entry stamped aborted",
+        "entry stamped aborted with no unresolved question left",
     )
     .await;
     // The chip is terminal — no dangling unresolved question survives the run.
-    assert!(entries(&core).iter().all(|e| {
+    let settled = entries(&core);
+    assert!(
+        settled
+            .iter()
+            .any(|e| e.status == Some(MessageStatus::Aborted))
+    );
+    assert!(settled.iter().all(|e| {
         e.parts.iter().all(|p| {
             !matches!(
                 p,
@@ -1310,6 +1337,24 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
             )
         })
     }));
+    // gh#111: the stop must READ as a stop. The harness ends its stream with no
+    // `Done` — the same shape a crashed CLI has — so the run task can only tell
+    // the two apart by knowing an interrupt is in flight before the stream
+    // closes. When it doesn't, the turn settles Errored with a visible "harness
+    // stream ended without Done" on a run the user themselves stopped.
+    assert!(
+        settled.iter().all(|e| {
+            e.parts
+                .iter()
+                .all(|p| !matches!(p, MessagePart::Error { .. }))
+        }),
+        "interrupt settled clean, not as a crash: {settled:?}"
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session idle after the interrupt",
+    )
+    .await;
 
     // And the session is usable: the next run completes.
     queue_as_viewer(
