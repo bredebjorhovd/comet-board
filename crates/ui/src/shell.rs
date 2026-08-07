@@ -29,7 +29,7 @@ use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
+use crate::motion::{self, AnimationExt as _, RESIZE, SPLASH_OUT};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
@@ -312,49 +312,6 @@ impl NavHistory {
     }
 }
 
-/// Sidebar resort glide (feature-inventory §1.6): 260ms
-/// `cubic-bezier(0.22,1,0.36,1)` per-row translate, the View Transitions
-/// equivalent.
-pub const RESORT: MotionSpec = MotionSpec::new(260, motion::EASE_RESORT);
-
-/// FLIP diff for a keyed list: given the previously rendered order and the new
-/// order (key + row height), return each surviving key's paint-only start
-/// offset `old_y - new_y` (only keys whose position actually moved). `gap` is
-/// the flex gap between rows. Pure — drives the sidebar resort glide.
-pub fn resort_offsets(
-    old: &[(String, f32)],
-    new: &[(String, f32)],
-    gap: f32,
-) -> std::collections::HashMap<String, f32> {
-    let mut old_y = std::collections::HashMap::new();
-    let mut y = 0.0_f32;
-    for (key, height) in old {
-        old_y.insert(key.as_str(), y);
-        y += height + gap;
-    }
-    let mut offsets = std::collections::HashMap::new();
-    let mut y = 0.0_f32;
-    for (key, height) in new {
-        if let Some(prev) = old_y.get(key.as_str()) {
-            let dy = prev - y;
-            if dy.abs() > 0.5 {
-                offsets.insert(key.clone(), dy);
-            }
-        }
-        y += height + gap;
-    }
-    offsets
-}
-
-/// Estimated sidebar row height for the resort diff (title line 17px inside
-/// 6px vertical padding + the location subline's 14px line + 2px gap — Active
-/// rows always carry the folder · device subline).
-/// Session row height (FLIP estimate): space line + title + meta line
-/// (harness mark, plus branch for worktrees).
-const CHAT_ROW_HEIGHT: f32 = 61.0;
-/// Flex gap between sidebar list items.
-const SIDEBAR_LIST_GAP: f32 = 2.0;
-
 /// Ramp height of the glass sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
@@ -534,15 +491,15 @@ pub struct Shell {
     panels: SessionPanels,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
-    /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
-    /// for the §1.6 resort glide.
-    sidebar_prev_order: Vec<(String, f32)>,
-    /// Per-key paint offsets of the resort in flight, keyed elements restart on
-    /// `resort_epoch` bumps.
-    sidebar_resort: std::collections::HashMap<String, f32>,
-    /// Keys that just appeared in a live list (fade in, no glide).
-    sidebar_new_keys: std::collections::HashSet<String>,
-    resort_epoch: usize,
+    /// Membership fingerprint (space ids + device ids) of the last slug sweep —
+    /// the trigger for re-asking hosts for `space → repo` links (gh#124).
+    slug_sweep_seen: Option<Vec<String>>,
+    /// The sweep in flight; dropping it cancels (one sweep at a time).
+    slug_task: Option<Task<()>>,
+    /// The chat selection last revealed in the sidebar — edge detector for
+    /// auto-expanding the selected chat's space (a later manual collapse of
+    /// that space is respected until the selection moves again).
+    revealed_chat: Option<String>,
     /// Dev/testing knobs (`COMET_OPEN_DIALOG`, `COMET_FORCE_GATE`) — see
     /// [`Shell::new`].
     debug_dialog: Option<String>,
@@ -722,10 +679,9 @@ impl Shell {
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
-            sidebar_prev_order: Vec::new(),
-            sidebar_resort: std::collections::HashMap::new(),
-            sidebar_new_keys: std::collections::HashSet::new(),
-            resort_epoch: 0,
+            slug_sweep_seen: None,
+            slug_task: None,
+            revealed_chat: None,
             debug_dialog,
             debug_gate,
             sidebar_tween: None,
@@ -810,6 +766,41 @@ impl Shell {
                     && let Some(sound) = crate::sound::sound_for_transition(prev, status)
                 {
                     crate::sound::play(sound);
+                }
+            }
+        }
+        // Repo-first space rows (gh#124): re-ask the hosts for `space → repo`
+        // links whenever the space/device MEMBERSHIP changes (never on
+        // heartbeats — the fingerprint is ids only). Engine-gated so the first
+        // real frame after connect still sweeps.
+        if state.read(cx).engine().is_some() {
+            let fingerprint: Vec<String> = {
+                let s = state.read(cx);
+                s.spaces
+                    .iter()
+                    .map(|space| space.id.clone())
+                    .chain(s.devices.iter().map(|d| d.id.clone()))
+                    .collect()
+            };
+            if self.slug_sweep_seen.as_ref() != Some(&fingerprint) {
+                self.slug_sweep_seen = Some(fingerprint);
+                self.refresh_space_slugs(cx);
+            }
+        }
+        // Selecting a chat reveals it: the sidebar expands the chat's space so
+        // the selection is never held by a row that is not on screen. Edge-
+        // triggered — collapsing the space afterwards sticks until the
+        // selection moves again.
+        {
+            let selected_chat = state.read(cx).selected_chat.clone();
+            if selected_chat != self.revealed_chat {
+                self.revealed_chat = selected_chat;
+                if let Some(space) = state
+                    .read(cx)
+                    .selected_chat_row()
+                    .and_then(|c| c.space_id.clone())
+                {
+                    self.expand_space(&space, cx);
                 }
             }
         }
@@ -1979,185 +1970,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row (comet session-row.tsx): status rail on the left
-    /// (a live 2×3 mini spinner while working, a dot otherwise), title +
-    /// relative time on the first line, "folder · device" underneath aligned
-    /// to the title. Click selects; right-click opens the context menu.
-    #[allow(clippy::too_many_arguments)]
-    fn render_chat_row(
-        &self,
-        id: String,
-        title: SharedString,
-        time_ago: SharedString,
-        space_name: SharedString,
-        branch: Option<SharedString>,
-        harness: Option<comet_proto::HarnessId>,
-        status: comet_proto::ChatIndicator,
-        selected: bool,
-        // The board's pinned orchestrator (gh#104) — marked, and drawn first in
-        // the list by `AppState::overview_chats`.
-        orchestrator: bool,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        // Status is a rail, not a word (comet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
-        let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == comet_proto::ChatIndicator::Working {
-            div()
-                .w(px(6.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                ))
-                .into_any_element()
-        } else {
-            div()
-                .size(px(6.0))
-                .rounded_full()
-                .flex_none()
-                .bg(dot_color)
-                .into_any_element()
-        };
-        let (hover, text) = (theme.element_hover, theme.text);
-        let selected_wash = theme.glass_selected_bg();
-        let subline = theme.text_muted.opacity(0.5);
-        let select_id = id.clone();
-        let menu_id = id.clone();
-        // Hover fades over transition-colors (comet session-row.tsx) — both
-        // the wash and the title brighten ride the same 150ms blend.
-        let fade_key = format!("chat-row-{id}");
-        let rest_bg = if selected {
-            selected_wash
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected { text } else { text.opacity(0.8) };
-        div()
-            .id(SharedString::from(format!("chat-{id}")))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover))
-            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-            .on_hover(motion::hover_listener(fade_key))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.chat_menu = Some((menu_id.clone(), event.position));
-                    cx.notify();
-                }),
-            )
-            // Line 1: status rail, space name, time-ago.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(status_rail)
-                    // The mark sits between the status rail and the space name:
-                    // the rail still says what the agent is doing, and this
-                    // says which agent this is. Shape-distinct rather than
-                    // colour-only, on the same rule the board glyphs follow.
-                    .when(orchestrator, |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.0))
-                                .line_height(px(14.0))
-                                .text_color(theme.accent)
-                                .child(SharedString::from(
-                                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
-                                )),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(subline)
-                            .child(time_ago),
-                    ),
-            )
-            // Line 2: the session title, aligned under the folder icon
-            // (rail 6 + gap 8).
-            .child(
-                div()
-                    .w_full()
-                    .pl(px(14.0))
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .child(title),
-            )
-            // Line 3 (always): harness brand mark; worktree sessions append
-            // the branch icon + name.
-            .child(
-                div()
-                    .w_full()
-                    .pl(px(14.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
-                    )
-                    .when_some(branch, |el, branch| {
-                        el.child(
-                            icon(icons::GIT_BRANCH)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(subline),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
     /// Which sidebar-list edges have hidden overflow (offset from the LAST
     /// frame — the invisible one-frame lag every fade here rides).
     pub(super) fn sidebar_fade_zones(&self) -> (bool, bool) {
@@ -2166,66 +1978,12 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
-    /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
-    /// section (folder + device rows, add-space), the global Active sessions
-    /// list, the notice strip, and the UserMenu (§1.6).
+    /// Chat-mode sidebar (gh#124): the Needs-you inbox, the orchestrator slot,
+    /// the Spaces section — each space disclosing its own sessions inline, the
+    /// ONE authoritative session surface — then the live-work groups (Agents /
+    /// Running), the notice strip, and the UserMenu (§1.6).
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let user = self.state.read(cx).auth_user().cloned();
-
-        // Keyed rows: (stable key, estimated height, element) — the key + height
-        // list drives the §1.6 resort FLIP diff below (attention-bucket
-        // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_session_rows(theme, cx);
-
-        // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
-        // list changes (new activity resort, grouping flip), surviving rows
-        // glide from their old y to the new one — layout is already at the new
-        // position; the offset is a paint-only relative inset animated to 0
-        // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
-        // just go (matching the original). First fill and chat switches (which
-        // don't reorder) never animate.
-        let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
-        if self.sidebar_prev_order != order {
-            if !self.sidebar_prev_order.is_empty() {
-                let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
-                let prev_keys: std::collections::HashSet<&str> = self
-                    .sidebar_prev_order
-                    .iter()
-                    .map(|(k, _)| k.as_str())
-                    .collect();
-                let new_keys: std::collections::HashSet<String> = order
-                    .iter()
-                    .filter(|(k, _)| !prev_keys.contains(k.as_str()))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !offsets.is_empty() || !new_keys.is_empty() {
-                    self.resort_epoch += 1;
-                    self.sidebar_resort = offsets;
-                    self.sidebar_new_keys = new_keys;
-                }
-            }
-            self.sidebar_prev_order = order;
-        }
-        let epoch = self.resort_epoch;
-        let list_items: Vec<AnyElement> = keyed
-            .into_iter()
-            .map(|(key, _, element)| {
-                if let Some(dy) = self.sidebar_resort.get(&key).copied() {
-                    let id = SharedString::from(format!("resort-{epoch}-{key}"));
-                    div()
-                        .child(element)
-                        .with_animation(id, RESORT.animation(), move |el, t| {
-                            el.relative().top(px(dy * (1.0 - t)))
-                        })
-                        .into_any_element()
-                } else if self.sidebar_new_keys.contains(&key) {
-                    let id = SharedString::from(format!("row-in-{epoch}-{key}"));
-                    motion::fade_quick(id, div().child(element)).into_any_element()
-                } else {
-                    element
-                }
-            })
-            .collect();
 
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -2247,13 +2005,15 @@ impl Shell {
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
         // First, the inbox (gh#122): does anything want me — in words, and it
-        // cannot miss. Then the orchestrator's pinned slot, above Spaces.
+        // cannot miss. Then the orchestrator's pinned slot, then the live-work
+        // groups (gh#103/gh#117) — everything active sits ABOVE the spaces
+        // tree (gh#124), which is the calm, complete enumeration underneath.
         let needs_section = self.render_needs_section(theme, cx);
         let orchestrator_slot = self.render_orchestrator_slot(theme, cx);
         let spaces_section = self.render_spaces_section(theme, cx);
-        // Between the spaces and the sessions: everything alive in one Active
-        // group (gh#123) — board attempts (gh#103) and the runs the board
-        // never released (gh#117), needs-you first.
+        // Above the spaces tree: everything alive in one Active group
+        // (gh#123) — board attempts and the runs the board never released,
+        // needs-you first.
         let active_section = self.render_active_section(theme, cx);
 
         div()
@@ -2285,35 +2045,9 @@ impl Shell {
                             .flex_col()
                             .child(needs_section)
                             .children(orchestrator_slot)
-                            .child(spaces_section)
                             .children(active_section)
-                    .child(
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from("Sessions")),
-                    )
-                    .child(if !list_items.is_empty() {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(Theme::SPACE_SM))
-                            .children(list_items)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pb(px(Theme::SPACE_SM))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from("No sessions yet"))
-                            .into_any_element()
-                    }),
+                            .child(spaces_section)
+                            .child(div().pb(px(Theme::SPACE_SM))),
                     )
                     .when(lists_fade_top && !glass, |el| {
                         el.child(
@@ -4352,64 +4086,6 @@ mod tests {
             }
         );
         assert_eq!(panels.get("b"), ChatPanels::default());
-    }
-
-    // ---- sidebar resort FLIP diff (§1.6) ----
-
-    fn keys(list: &[(&str, f32)]) -> Vec<(String, f32)> {
-        list.iter().map(|(k, h)| (k.to_string(), *h)).collect()
-    }
-
-    #[test]
-    fn resort_offsets_empty_when_order_unchanged() {
-        let order = keys(&[("a", 29.0), ("b", 29.0), ("c", 45.0)]);
-        assert!(resort_offsets(&order, &order, 2.0).is_empty());
-    }
-
-    #[test]
-    fn resort_offsets_activity_moves_row_to_top() {
-        // c (bottom, y=62) jumps to top: c glides down-from-above? No — c's
-        // old y is 62, new y is 0 → starts +62 below… offset = old - new = +62,
-        // painted at +62 decaying to 0 (a glide UP into place). a and b shift
-        // down by c's height + gap (31).
-        let old = keys(&[("a", 29.0), ("b", 29.0), ("c", 29.0)]);
-        let new = keys(&[("c", 29.0), ("a", 29.0), ("b", 29.0)]);
-        let offsets = resort_offsets(&old, &new, 2.0);
-        assert_eq!(offsets.get("c"), Some(&62.0));
-        assert_eq!(offsets.get("a"), Some(&-31.0));
-        assert_eq!(offsets.get("b"), Some(&-31.0));
-    }
-
-    #[test]
-    fn resort_offsets_respect_heights_and_gap() {
-        // Tall row (45px) swaps with a short one (29px).
-        let old = keys(&[("tall", 45.0), ("short", 29.0)]);
-        let new = keys(&[("short", 29.0), ("tall", 45.0)]);
-        let offsets = resort_offsets(&old, &new, 2.0);
-        // short: old y 47 → new y 0; tall: old y 0 → new y 31.
-        assert_eq!(offsets.get("short"), Some(&47.0));
-        assert_eq!(offsets.get("tall"), Some(&-31.0));
-    }
-
-    #[test]
-    fn resort_offsets_ignore_added_and_removed_keys() {
-        let old = keys(&[("a", 29.0), ("gone", 29.0), ("b", 29.0)]);
-        let new = keys(&[("new", 29.0), ("a", 29.0), ("b", 29.0)]);
-        let offsets = resort_offsets(&old, &new, 2.0);
-        // "new" has no old position (fades in instead); "gone" just goes.
-        assert!(!offsets.contains_key("new"));
-        assert!(!offsets.contains_key("gone"));
-        // a: old 0 → new 31 (pushed down by the insert); b: 62 → 62 (gone's
-        // slot replaced by "new" of equal height — no move, no entry).
-        assert_eq!(offsets.get("a"), Some(&-31.0));
-        assert_eq!(offsets.get("b"), None);
-    }
-
-    #[test]
-    fn resort_glide_spec_matches_original() {
-        // §1.6: 260ms cubic-bezier(0.22, 1, 0.36, 1).
-        assert_eq!(RESORT.duration_ms, 260);
-        assert_eq!(RESORT.curve, motion::EASE_RESORT);
     }
 
     // ---- navigation history (titlebar back/forward) ----

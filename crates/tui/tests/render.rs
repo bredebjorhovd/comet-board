@@ -185,12 +185,12 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
         rows[1]
     );
 
-    // Sidebar: two sections.
+    // Sidebar: the spaces tree is the one session surface (gh#124) — the
+    // space's host device named once as a group header, the space row, and
+    // its sessions nested under it.
     assert!(screen.contains("Spaces"), "{screen}");
-    assert!(screen.contains("Sessions"), "{screen}");
-    // Session rows carry a "space@device" sub-line under the title — where the
-    // work happens, not which branch it happens on.
-    assert!(screen.contains("comet@"), "sub-line missing:\n{screen}");
+    assert!(!screen.contains("Sessions"), "the flat list is retired:\n{screen}");
+    assert!(screen.contains("@ dev"), "device header missing:\n{screen}");
 
     // Transcript: the user turn, the assistant text, the tool row, the fenced
     // code, and the bullet.
@@ -395,7 +395,9 @@ fn an_empty_workspace_says_what_to_do() {
     let screen = joined(&snapshot(&mut app, 80, 20));
     assert!(screen.contains("No session open"), "{screen}");
     assert!(screen.contains("No spaces yet"), "{screen}");
-    assert!(screen.contains("No sessions yet"), "{screen}");
+    // No global sessions list any more (gh#124) — with no spaces there is
+    // nowhere for sessions to live, and no second empty state to say so.
+    assert!(!screen.contains("No sessions yet"), "{screen}");
 }
 
 #[test]
@@ -542,9 +544,9 @@ fn drawing_twice_with_no_changes_touches_nothing() {
 
 #[test]
 fn the_sidebar_follows_the_desktop_order() {
-    // The reference sidebar reads: device, New session, rule, "Sessions", then a
-    // faint space heading with its two-line session rows, and the user pinned to
-    // the bottom (docs/reference/original-comet.png).
+    // gh#124's order: the "Spaces" header, the host device named ONCE as a
+    // group header, the space row, and the space's sessions nested under it —
+    // one session surface, with the user pinned to the bottom.
     let mut app = populated();
     let rows = snapshot(&mut app, 100, 24);
     let sidebar = sidebar_of(&rows, 100);
@@ -555,27 +557,39 @@ fn the_sidebar_follows_the_desktop_order() {
             .position(|row| row.contains(needle))
             .unwrap_or_else(|| panic!("{needle:?} missing from sidebar:\n{sidebar:#?}"))
     };
-    // Two sections, in comet-native's order: Spaces, then a flat global
-    // Sessions list. Not one list grouped by project — that was the original
-    // Electron app.
     let spaces = index("Spaces");
-    let space_row = index("comet ");
-    let sessions = index("Sessions");
-    let session = index("Rework the diff");
+    let device = index("@ dev");
+    let space_row = index("comet");
+    let first_session = index("Rework the diff");
+    let second_session = index("Chase the flaky");
     assert!(
-        spaces < space_row && space_row < sessions && sessions < session,
+        spaces < device && device < space_row && space_row < first_session,
         "sidebar order wrong:\n{sidebar:#?}"
     );
     // The Spaces header carries its add affordance, right-aligned.
     assert!(sidebar[spaces].trim_end().ends_with('+'), "{sidebar:#?}");
-    // Two-line session rows: the sub-line is directly under its title.
+    // Nested one-line session rows, directly under their space, in tab order.
+    assert_eq!(
+        second_session,
+        first_session + 1,
+        "sessions must sit consecutively under their space:\n{sidebar:#?}"
+    );
+    // No flat global list, and no repeated device tag: the host is named once.
     assert!(
-        sidebar[session + 1].contains("comet@"),
-        "sub-line must follow the title:\n{sidebar:#?}"
+        !sidebar.iter().any(|row| row.contains("Sessions")),
+        "{sidebar:#?}"
+    );
+    assert_eq!(
+        sidebar
+            .iter()
+            .filter(|row| row.contains("dev"))
+            .count(),
+        1,
+        "the device is named once:\n{sidebar:#?}"
     );
     // The user row is pinned to the bottom of the sidebar, not inline.
     let user = index("w@example.com");
-    assert!(user > session, "user row must be last:\n{sidebar:#?}");
+    assert!(user > second_session, "user row must be last:\n{sidebar:#?}");
     assert!(
         user >= sidebar.len() - 3,
         "user row must be pinned to the bottom:\n{sidebar:#?}"
@@ -705,19 +719,28 @@ fn the_working_strip_reports_elapsed_time() {
 }
 
 #[test]
-fn the_space_row_names_its_host_device() {
+fn the_device_is_named_once_and_only_when_remote() {
     let mut app = populated();
-    // The fixture's chats are hosted on "dev"; this engine is someone else.
+    // The fixture's spaces are hosted on "dev"; this engine is someone else.
     app.apply(Update::LocalDevice("laptop".into()));
-    // The space row names the host device, which is where "whose machine is
-    // this running on" lives in comet-native.
-    let screen = joined(&snapshot(&mut app, 100, 24));
-    assert!(screen.contains("dev"), "host device missing:\n{screen}");
+    // A remote host gets ONE group header above its spaces (gh#124) — not a
+    // suffix repeated on every row.
+    let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
+    assert_eq!(
+        sidebar.iter().filter(|row| row.contains("@ dev")).count(),
+        1,
+        "the host is named once:\n{sidebar:#?}"
+    );
 
-    // Hosted here: the row says so.
+    // Hosted here: your own machine is not an address, so no header at all.
     app.apply(Update::LocalDevice("dev".into()));
-    let screen = joined(&snapshot(&mut app, 100, 24));
-    assert!(screen.contains("this device"), "{screen}");
+    let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
+    assert!(
+        !sidebar
+            .iter()
+            .any(|row| row.contains("@ dev") || row.contains("this device")),
+        "{sidebar:#?}"
+    );
 }
 
 #[test]
@@ -831,10 +854,10 @@ fn a_selected_row_keeps_its_status_colour() {
 }
 
 #[test]
-fn the_sessions_list_is_flat_and_global_not_grouped_by_space() {
-    // comet-native's Sessions list answers "what needs me right now" across
-    // every space. Grouping it by project — which the original Electron app did
-    // — buries exactly that.
+fn each_session_nests_under_its_own_space() {
+    // gh#124: a space's row CONTAINS its sessions. A session shows up exactly
+    // once, under the space it belongs to — recency never interleaves two
+    // spaces' sessions, because there is no global list left to interleave in.
     let mut app = App::with_theme(Theme::dark());
     app.apply(Update::Connection(ConnectionStatus::Ready));
     app.apply(Update::Spaces(vec![
@@ -854,23 +877,21 @@ fn the_sessions_list_is_flat_and_global_not_grouped_by_space() {
     app.apply(Update::Chats(vec![in_alpha, in_beta]));
 
     let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
-    let sessions = sidebar
-        .iter()
-        .position(|row| row.contains("Sessions"))
-        .expect("Sessions header");
-    let beta = sidebar.iter().position(|r| r.contains("Beta session"));
-    let alpha = sidebar.iter().position(|r| r.contains("Alpha session"));
-    let (beta, alpha) = (beta.expect("beta"), alpha.expect("alpha"));
-
-    // Both sessions sit under the single Sessions header…
-    assert!(beta > sessions && alpha > sessions, "{sidebar:#?}");
-    // …in recency order, and adjacent: title + sub-line each, with no space
-    // heading spliced between them.
-    assert!(beta < alpha, "recency order:\n{sidebar:#?}");
-    assert_eq!(
-        alpha,
-        beta + 2,
-        "the rows must be consecutive (title, sub-line, title, sub-line):\n{sidebar:#?}"
+    let at = |needle: &str| {
+        sidebar
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar:#?}"))
+    };
+    // Each session sits directly under its own space's row — even though Beta
+    // is the more recent chat, it does not float above Alpha's space.
+    assert_eq!(at("Alpha session"), at("alpha") + 1, "{sidebar:#?}");
+    assert_eq!(at("Beta session"), at("beta") + 1, "{sidebar:#?}");
+    assert!(at("alpha") < at("beta"), "spaces keep creation order:\n{sidebar:#?}");
+    // And no second surface: the flat Sessions header is gone.
+    assert!(
+        !sidebar.iter().any(|row| row.contains("Sessions")),
+        "{sidebar:#?}"
     );
 }
 
@@ -986,6 +1007,20 @@ fn cell_of(app: &mut App, width: u16, height: u16, needle: &str) -> (u16, u16) {
     (x, y as u16)
 }
 
+/// Like [`cell_of`], but the LAST matching row: a session title shows up in
+/// the tab strip (top of the frame) AND as its space's nested sidebar row
+/// (gh#124), truncated at both widths — targeting the sidebar means taking
+/// the lower match.
+fn sidebar_cell_of(app: &mut App, width: u16, height: u16, needle: &str) -> (u16, u16) {
+    let rows = snapshot(app, width, height);
+    let y = rows
+        .iter()
+        .rposition(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{}", joined(&rows)));
+    let x = column_of(&rows[y], rows[y].find(needle).unwrap_or(0));
+    (x, y as u16)
+}
+
 #[test]
 fn clicking_a_session_row_opens_it() {
     let mut app = populated();
@@ -1073,8 +1108,8 @@ fn clicking_plus_starts_a_session_and_the_panes_take_focus() {
     let rows = snapshot(&mut app, 100, 24);
     let header = rows
         .iter()
-        .position(|row| row.trim_start().starts_with("Sessions"))
-        .expect("the Sessions header") as u16;
+        .position(|row| row.trim_start().starts_with("Spaces"))
+        .expect("the Spaces header") as u16;
     let before = app.selected_chat.clone();
     app.click(4, header);
     assert_eq!(app.focus, Focus::Sidebar);
@@ -1131,7 +1166,7 @@ fn the_spaces_plus_explains_itself_rather_than_doing_nothing() {
 #[test]
 fn right_click_opens_a_context_menu_with_the_desktop_verbs() {
     let mut app = populated();
-    let (x, y) = cell_of(&mut app, 100, 26, "Chase the flaky room");
+    let (x, y) = sidebar_cell_of(&mut app, 100, 26, "Chase the flaky");
     app.right_click(x, y);
 
     let screen = joined(&snapshot(&mut app, 100, 26));
@@ -1152,7 +1187,7 @@ fn right_click_opens_a_context_menu_with_the_desktop_verbs() {
 #[test]
 fn a_space_menu_offers_space_verbs_only() {
     let mut app = populated();
-    let (x, y) = cell_of(&mut app, 100, 26, "comet ");
+    let (x, y) = cell_of(&mut app, 100, 26, "comet");
     app.right_click(x, y);
     let screen = joined(&snapshot(&mut app, 100, 26));
     assert!(screen.contains("Rename space"), "{screen}");
@@ -1163,7 +1198,7 @@ fn a_space_menu_offers_space_verbs_only() {
 #[test]
 fn archiving_from_the_menu_issues_the_mutation() {
     let mut app = populated();
-    let (x, y) = cell_of(&mut app, 100, 26, "Chase the flaky room");
+    let (x, y) = sidebar_cell_of(&mut app, 100, 26, "Chase the flaky");
     app.right_click(x, y);
     // Walk to "Archive" and confirm.
     app.act(Action::OverlayStep(1));
@@ -1182,7 +1217,7 @@ fn archiving_from_the_menu_issues_the_mutation() {
 #[test]
 fn renaming_opens_a_prompt_seeded_with_the_current_title() {
     let mut app = populated();
-    let (x, y) = cell_of(&mut app, 100, 26, "Chase the flaky room");
+    let (x, y) = sidebar_cell_of(&mut app, 100, 26, "Chase the flaky");
     app.right_click(x, y);
     let effects = app.act(Action::OverlayConfirm); // "Rename…" is first
     assert!(effects.is_empty(), "opening a prompt makes no RPC");
@@ -1212,7 +1247,7 @@ fn renaming_opens_a_prompt_seeded_with_the_current_title() {
 #[test]
 fn an_empty_rename_is_refused_rather_than_wiping_the_title() {
     let mut app = populated();
-    let (x, y) = cell_of(&mut app, 100, 26, "Chase the flaky room");
+    let (x, y) = sidebar_cell_of(&mut app, 100, 26, "Chase the flaky");
     app.right_click(x, y);
     app.act(Action::OverlayConfirm); // open the prompt
     app.act(Action::OverlayEdit(
@@ -2332,7 +2367,7 @@ fn the_board_render_pane_is_the_main_pane_not_a_third_column() {
     let rows = snapshot(&mut app, 100, 26);
     let screen = joined(&rows);
     // The sidebar survives…
-    assert!(screen.contains("Sessions"), "{screen}");
+    assert!(screen.contains("Spaces"), "{screen}");
     // …but the chat body is gone: no transcript, no composer.
     assert!(
         !screen.contains("why is the room test flaky?"),
@@ -2445,8 +2480,8 @@ fn live_agents_draw_in_the_sidebar_with_the_board_closed() {
     };
     assert!(at("gh#3") < at("gh#1"), "blocked floats:\n{sidebar}");
     assert!(at("gh#1") < at("gh#2"), "then longest-running:\n{sidebar}");
-    // And it sits above the chat list, where the eye lands first.
-    assert!(at("Active") < at("Sessions"), "{sidebar}");
+    // And it sits above the spaces tree, where the eye lands first (gh#124).
+    assert!(at("Active") < at("comet"), "{sidebar}");
 }
 
 /// Nothing dispatched and nothing running by hand: no header, no gap, no
@@ -2508,9 +2543,9 @@ fn unmanaged_runs_draw_in_the_sidebar_with_no_board_at_all() {
     };
     // Blocked floats, and the group sits above the sessions.
     assert!(at("Altinn docs") < at("Orchestrator"), "{sidebar}");
-    assert!(at("Active") < at("Sessions"), "{sidebar}");
-    // An idle chat is not a run — it is a session row and nothing more.
-    assert!(at("Old chat") > at("Sessions"), "{sidebar}");
+    assert!(at("Active") < at("comet"), "{sidebar}");
+    // An idle chat is not a run — it is a nested session row and nothing more.
+    assert!(at("Old chat") > at("comet"), "{sidebar}");
 }
 
 /// The merge itself, drawn (gh#123): one attempt and one hand-started run
@@ -2569,7 +2604,9 @@ fn attempts_and_unmanaged_runs_share_the_active_group() {
     // Needs-you-rank first inside Active: the hand-started question above the
     // working attempt.
     assert!(docs_in_active < after(active, "gh#1"), "{sidebar}");
-    assert!(after(active, "gh#1") < after(active, "Sessions"), "{sidebar}");
+    // The flat "Sessions" header is retired (gh#124): sessions nest under
+    // their space, so the Active group simply precedes the spaces tree.
+    assert!(after(active, "gh#1") < after(active, "Spaces"), "{sidebar}");
 }
 
 /// Nothing working: no header, no gap, no reminder that agents exist.

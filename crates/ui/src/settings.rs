@@ -63,6 +63,12 @@ pub struct UiSettings {
     /// are skipped; new spaces append in creation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
+    /// Spaces whose sidebar sessions are disclosed (gh#124; device-local).
+    /// Activating a space or selecting one of its chats adds it; the chevron
+    /// removes it. Ids of deleted spaces are inert (rows render off the live
+    /// space list).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_spaces: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `COMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -89,6 +95,7 @@ impl Default for UiSettings {
             last_space_id: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
+            expanded_spaces: Vec::new(),
             sound_enabled: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
@@ -358,6 +365,7 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            expanded_spaces: vec!["space-1".to_string()],
             sound_enabled: false,
             right_pane_width: 700.0,
             right_pane_open: true,

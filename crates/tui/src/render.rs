@@ -336,12 +336,25 @@ fn draw_sidebar_row(
                 }
             }
         }
+        // The device-group header (gh#124): the ONE line that names a host.
+        // "offline" is a warning and colored like one — but said once, here,
+        // not repeated per space row.
+        Row::Device { name, offline } => {
+            let label = format!("@ {name}");
+            let mut spans = vec![Span::styled(
+                wrap::truncate(&label, width.saturating_sub(if *offline { 10 } else { 0 })),
+                theme.hint(),
+            )];
+            if *offline {
+                spans.push(Span::styled(
+                    " · offline".to_string(),
+                    Style::default().fg(theme.warning),
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        }
         Row::Space {
-            label,
-            device,
-            attention,
-            offline,
-            ..
+            label, attention, ..
         } => {
             let base = if selected {
                 theme.selected()
@@ -357,18 +370,11 @@ fn draw_sidebar_row(
                 Some(status) => status_dot(*status, app, theme, base),
                 None => (" ".to_string(), base),
             };
-            let device = if *offline {
-                format!("{device} · offline")
-            } else {
-                device.clone()
-            };
-            let device_width = wrap::width_of(&device);
-            let label_width = width.saturating_sub(3 + device_width).max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(dot.to_string(), dot_style),
                     Span::styled(
-                        format!(" {}", wrap::truncate(label, label_width)),
+                        format!(" {}", wrap::truncate(label, width.saturating_sub(2))),
                         base.patch(if selected {
                             theme.body()
                         } else {
@@ -378,24 +384,6 @@ fn draw_sidebar_row(
                 ])),
                 area,
             );
-            let tail = device_width as u16;
-            if tail < area.width {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        device.clone(),
-                        base.patch(if *offline {
-                            Style::default().fg(theme.warning)
-                        } else {
-                            theme.hint()
-                        }),
-                    )),
-                    Rect {
-                        x: area.x + area.width - tail,
-                        width: tail,
-                        ..area
-                    },
-                );
-            }
         }
         Row::Blank => {}
         Row::Empty { label } => {
@@ -701,10 +689,12 @@ fn draw_sidebar_row(
                 );
             }
         }
+        // A nested session (gh#124): indented under its space row — the indent
+        // IS the containment — dot + title + time on one line. No
+        // "space@device" sub-line: the nesting already says both.
         Row::Chat {
             id,
             title,
-            location,
             indicator,
             archived,
             activity,
@@ -729,12 +719,17 @@ fn draw_sidebar_row(
             } else {
                 String::new()
             };
-            // dot(1) + gap(1) + a column of air + the time column, less the mark.
+            let badge = if *archived { " · archived" } else { "" };
+            // indent(2) + dot(1) + gap(1) + a column of air + the time column,
+            // less the mark and the archived badge.
             let title_width = width
-                .saturating_sub(3 + wrap::width_of(&when) + wrap::width_of(&mark))
+                .saturating_sub(
+                    5 + wrap::width_of(&when) + wrap::width_of(&mark) + wrap::width_of(badge),
+                )
                 .max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
+                    Span::raw("  "),
                     {
                         let (glyph, style) = status_dot(*indicator, app, theme, base);
                         Span::styled(glyph, style)
@@ -744,6 +739,7 @@ fn draw_sidebar_row(
                         format!(" {}", wrap::truncate(title, title_width)),
                         base.patch(if open { theme.body() } else { theme.subtle() }),
                     ),
+                    Span::styled(badge.to_string(), base.patch(theme.hint())),
                 ])),
                 Rect { height: 1, ..area },
             );
@@ -754,30 +750,6 @@ fn draw_sidebar_row(
                     Rect {
                         x: area.x + area.width - time_width,
                         width: time_width,
-                        height: 1,
-                        ..area
-                    },
-                );
-            }
-            // The sub-line sits under the title, aligned past the dot.
-            if area.height > 1 {
-                let mut sub = location.clone().unwrap_or_default();
-                if *archived {
-                    sub = if sub.is_empty() {
-                        "archived".into()
-                    } else {
-                        format!("{sub} · archived")
-                    };
-                }
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        // Aligned past the dot and its gap, so the sub-line hangs
-                        // under the title rather than under the status column.
-                        format!("  {}", wrap::truncate(&sub, width.saturating_sub(2))),
-                        base.patch(theme.hint()),
-                    )),
-                    Rect {
-                        y: area.y + 1,
                         height: 1,
                         ..area
                     },
