@@ -63,6 +63,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use comet_proto::view::board::{self, BoardState};
 use comet_proto::view::needs::{self as needs_view};
 use comet_proto::view::skills as skills_view;
+use comet_proto::view::spaces;
 use comet_proto::view::{ConnectionStatus, GatePhase};
 
 use crate::app::{App, ChipKind, Hit, Overlay, Row};
@@ -368,7 +369,10 @@ fn draw_sidebar_row(
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
         }
         Row::Space {
-            label, attention, ..
+            label,
+            attention,
+            running,
+            ..
         } => {
             let base = if selected {
                 theme.selected()
@@ -384,25 +388,50 @@ fn draw_sidebar_row(
                 Some(status) => status_dot(*status, app, theme, base),
                 None => (" ".to_string(), base),
             };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(dot.to_string(), dot_style),
-                    Span::styled(
-                        format!(" {}", wrap::truncate(label, width.saturating_sub(2))),
-                        base.patch(if selected {
-                            theme.body()
-                        } else {
-                            theme.subtle()
-                        }),
+            // "· 3 running" (gh#138): where this space's live rows went. It
+            // takes its columns before the name does, because a truncated
+            // count would be a lie about the count rather than a shortened
+            // name.
+            let count = spaces::running_label(*running)
+                .map(|label| format!(" {label}"))
+                .unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(dot.to_string(), dot_style),
+                Span::styled(
+                    format!(
+                        " {}",
+                        wrap::truncate(
+                            label,
+                            width.saturating_sub(2 + wrap::width_of(&count))
+                        )
                     ),
-                ])),
-                area,
-            );
+                    base.patch(if selected {
+                        theme.body()
+                    } else {
+                        theme.subtle()
+                    }),
+                ),
+            ];
+            if !count.is_empty() {
+                spans.push(Span::styled(count, base.patch(theme.hint())));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
         }
         Row::Blank => {}
         Row::Empty { label } => {
             frame.render_widget(
                 Paragraph::new(Span::styled(label.clone(), theme.hint())),
+                area,
+            );
+        }
+        // Indented like the session rows it stands in for (gh#138), so it
+        // reads as this space's answer and not as a section of its own.
+        Row::ShelfNote { label } => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  {}", wrap::truncate(label, width.saturating_sub(2))),
+                    theme.hint(),
+                )),
                 area,
             );
         }

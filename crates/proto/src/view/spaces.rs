@@ -9,11 +9,20 @@
 //!   (gh#118): the `owner/repo` slug names it whenever a host has supplied the
 //!   link, an explicit rename still wins, and the folder basename is the
 //!   fallback for the scratch directory that is nobody's repo.
+//! - [`space_titles`] — the same name, made UNIQUE within a device group
+//!   (gh#138). A slug is not a folder: `~/dev/attn` and a board worktree at
+//!   `~/.comet-native/worktrees/attn/board-gh-10-attn` are two real spaces on
+//!   one machine that `space_title` calls `bredebjorhovd/attn` twice, which
+//!   reads as a duplicated row. Colliding rows gain the shortest path tail
+//!   that tells them apart.
 //! - [`device_groups`] — where the device's name goes: once, as a group
 //!   header above the spaces it hosts, instead of riding along on every row.
 //!   The local device leads; remaining groups keep the spaces' given order.
+//! - [`space_shelf`] — which of a space's chats its nested shelf draws
+//!   (gh#138): the ones the Active list is NOT already drawing above.
 
-use crate::Space;
+use super::board::ActiveRow;
+use crate::{Chat, Space};
 
 /// One device's spaces, in the caller's (manual/creation) order.
 ///
@@ -64,6 +73,191 @@ pub fn space_title<'a>(space: &'a Space, slug: Option<&'a str>) -> &'a str {
         return slug;
     }
     space.display_name()
+}
+
+/// Row titles for ONE device group: [`space_title`] for each, made unique
+/// within the group.
+///
+/// The repo-first name is a good name and a poor identifier — a repo has one
+/// slug and any number of checkouts, so the moment a second folder on the same
+/// machine points at it (a worktree the board cut, a second clone), two rows
+/// carry one word and the sidebar looks like it is repeating itself (gh#138).
+/// Colliding rows therefore append the shortest path tail that separates them,
+/// at a uniform depth so the group reads at one level:
+///
+/// ```text
+/// bredebjorhovd/attn · attn
+/// bredebjorhovd/attn · board-gh-10-attn
+/// ```
+///
+/// Uniqueness is per group, not global, because that is the scope a reader
+/// scans: the same repo checked out on the laptop AND on the box is told apart
+/// by the device header above each group, and re-saying it on the row would
+/// undo gh#124.
+///
+/// Pure and index-preserving: `out[i]` names `rows[i]`. Two rows for literally
+/// the same path keep the same title — there is no fact left to separate them
+/// with, and that IS a duplicate.
+pub fn space_titles(rows: &[(&Space, Option<&str>)]) -> Vec<String> {
+    let bases: Vec<&str> = rows
+        .iter()
+        .map(|(space, slug)| space_title(space, *slug))
+        .collect();
+    let mut out: Vec<String> = bases.iter().map(|base| (*base).to_string()).collect();
+    let mut done: Vec<&str> = Vec::new();
+    for base in &bases {
+        if done.contains(base) {
+            continue;
+        }
+        done.push(base);
+        let clash: Vec<usize> = bases
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| *other == base)
+            .map(|(ix, _)| ix)
+            .collect();
+        if clash.len() < 2 {
+            continue;
+        }
+        let deepest = clash
+            .iter()
+            .map(|ix| segments(&rows[*ix].0.path).len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        // The shallowest tail that separates every colliding row — one depth
+        // for the whole clash, so the qualifiers line up.
+        let depth = (1..=deepest)
+            .find(|depth| {
+                let mut tails: Vec<String> = clash
+                    .iter()
+                    .map(|ix| path_tail(&rows[*ix].0.path, *depth))
+                    .collect();
+                tails.sort();
+                let total = tails.len();
+                tails.dedup();
+                tails.len() == total
+            })
+            .unwrap_or(deepest);
+        for ix in clash {
+            let tail = path_tail(&rows[ix].0.path, depth);
+            if !tail.is_empty() {
+                out[ix] = format!("{base} · {tail}");
+            }
+        }
+    }
+    out
+}
+
+fn segments(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|s| !s.is_empty()).collect()
+}
+
+/// The last `depth` path segments, `/`-joined. Empty for a path with none.
+fn path_tail(path: &str, depth: usize) -> String {
+    let segments = segments(path);
+    let start = segments.len().saturating_sub(depth.max(1));
+    segments[start..].join("/")
+}
+
+// ---------------------------------------------------------------------------
+// One full row per chat (gh#138)
+// ---------------------------------------------------------------------------
+//
+// Active and the spaces tree answer different questions — "what is alive" and
+// "what lives here" — and gh#124 let both answer with a full session row. When
+// the box's whole load sits in one space, which is the common case, that space
+// expands into a verbatim copy of the list directly above it: three agents,
+// six rows, one screen height.
+//
+// So the surfaces divide the chats instead of the questions: **Active owns a
+// chat while its session is live; the space's shelf shows it once it is idle.**
+// The tree still answers what lives here — it just stops re-listing what Active
+// has already said is alive, and says so in the two places a reader would
+// otherwise see a hole: a count on the space row, and the shelf's own note.
+
+/// Where every row the Active list draws actually lives: `(chat id, space id)`.
+///
+/// [`super::board::AgentRow`] carries no space — an attempt is named by its
+/// issue, not its folder — so the join happens here, once, rather than three
+/// times in three viewports.
+pub fn active_placements<'a>(
+    active: &'a [ActiveRow],
+    chats: &'a [Chat],
+) -> Vec<(&'a str, Option<&'a str>)> {
+    active
+        .iter()
+        .map(|row| {
+            let chat_id = row.chat_id();
+            let space = chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .and_then(|chat| chat.space_id.as_deref());
+            (chat_id, space)
+        })
+        .collect()
+}
+
+/// What a space's nested shelf draws, and what it defers to Active.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpaceShelf<'a> {
+    /// The chats the shelf draws, in the caller's (tab) order: the space's
+    /// own, minus every chat Active is drawing above.
+    pub idle: Vec<&'a str>,
+    /// How many of this space's chats Active holds — the count the space row
+    /// carries so the reader can see where the missing rows went.
+    pub running: usize,
+}
+
+/// Split a space's chats between the Active list and its own shelf.
+///
+/// `order` is the space's shelf order (the tab strip's, so the two agree);
+/// `active` is [`active_placements`] for the whole sidebar. The count is taken
+/// from the placements rather than from `order` on purpose: an archived chat
+/// that is working anyway is in Active (the board half never hides a live run)
+/// and out of the tab order, and the space row should still admit it exists.
+pub fn space_shelf<'a>(
+    space_id: &str,
+    order: impl IntoIterator<Item = &'a str>,
+    active: &[(&str, Option<&str>)],
+) -> SpaceShelf<'a> {
+    SpaceShelf {
+        idle: order
+            .into_iter()
+            .filter(|chat| !active.iter().any(|(held, _)| held == chat))
+            .collect(),
+        running: active
+            .iter()
+            .filter(|(_, space)| *space == Some(space_id))
+            .count(),
+    }
+}
+
+/// The space row's compact tie to the Active list — `· 3 running` — or `None`
+/// when the space has nothing up there.
+///
+/// It rides beside the aggregate dot, which says WHAT the most urgent member is
+/// doing; this says how many members are doing it, which is the fact a
+/// collapsed row used to hide and an expanded row used to prove by repeating
+/// the list.
+pub fn running_label(running: usize) -> Option<String> {
+    (running > 0).then(|| format!("· {running} running"))
+}
+
+/// What an expanded shelf says INSTEAD of rows when Active holds all of them.
+///
+/// `None` when the shelf has rows to draw, or when it is empty for the ordinary
+/// reason (the space has no sessions at all) — that case is the caller's own
+/// empty state. Expanding a space and finding a gap would read as a bug; the
+/// shelf answers with its own truth instead.
+pub fn shelf_note(shelf: &SpaceShelf<'_>) -> Option<String> {
+    if !shelf.idle.is_empty() || shelf.running == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} running above · no idle sessions",
+        shelf.running
+    ))
 }
 
 #[cfg(test)]
@@ -142,5 +336,161 @@ mod tests {
         let mut s = space("s1", "box", "/srv/comet-board");
         s.name = Some("  ".into());
         assert_eq!(space_title(&s, Some("  ")), "comet-board");
+    }
+
+    // -- unique titles within a group (gh#138) ------------------------------
+
+    #[test]
+    fn one_repo_two_local_folders_are_told_apart() {
+        // The screenshot's second finding: a checkout and the board worktree
+        // cut from it, both on this Mac, both slugged `bredebjorhovd/attn`.
+        let checkout = space("s1", "mac", "/Users/brede/dev/attn");
+        let worktree = space(
+            "s2",
+            "mac",
+            "/Users/brede/.comet-native/worktrees/attn/board-gh-10-attn",
+        );
+        let slug = Some("bredebjorhovd/attn");
+        let titles = space_titles(&[(&checkout, slug), (&worktree, slug)]);
+        assert_eq!(
+            titles,
+            [
+                "bredebjorhovd/attn · attn",
+                "bredebjorhovd/attn · board-gh-10-attn"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_title_that_stands_alone_is_left_alone() {
+        let one = space("s1", "mac", "/Users/brede/dev/attn");
+        let two = space("s2", "mac", "/Users/brede/dev/comet");
+        let titles = space_titles(&[
+            (&one, Some("brede/attn")),
+            (&two, Some("brede/comet-native")),
+        ]);
+        assert_eq!(titles, ["brede/attn", "brede/comet-native"]);
+    }
+
+    #[test]
+    fn the_tail_deepens_until_it_separates() {
+        // Same basename: one segment says nothing, so both rows take two.
+        let one = space("s1", "mac", "/Users/brede/dev/attn/api");
+        let two = space("s2", "mac", "/Users/brede/work/web/api");
+        let titles = space_titles(&[(&one, Some("brede/api")), (&two, Some("brede/api"))]);
+        assert_eq!(titles, ["brede/api · attn/api", "brede/api · web/api"]);
+    }
+
+    #[test]
+    fn identical_paths_have_nothing_left_to_separate_them() {
+        let one = space("s1", "mac", "/Users/brede/dev/attn");
+        let two = space("s2", "mac", "/Users/brede/dev/attn");
+        let titles = space_titles(&[(&one, Some("brede/attn")), (&two, Some("brede/attn"))]);
+        assert_eq!(titles[0], titles[1]);
+    }
+
+    #[test]
+    fn a_rename_that_collides_is_disambiguated_too() {
+        let mut one = space("s1", "mac", "/Users/brede/dev/attn");
+        let mut two = space("s2", "mac", "/Users/brede/scratch/attn-2");
+        one.name = Some("Attn".into());
+        two.name = Some("Attn".into());
+        let titles = space_titles(&[(&one, None), (&two, None)]);
+        assert_eq!(titles, ["Attn · attn", "Attn · attn-2"]);
+    }
+
+    // -- one full row per chat (gh#138) -------------------------------------
+
+    fn chat(id: &str, space_id: Option<&str>) -> Chat {
+        Chat {
+            id: id.into(),
+            device_id: "mac".into(),
+            title: Some(format!("chat {id}")),
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: space_id.map(str::to_string),
+            last_seen_at: None,
+        }
+    }
+
+    fn agent_row(chat_id: &str) -> ActiveRow {
+        ActiveRow::Agent(super::super::board::AgentRow {
+            task_id: format!("t-{chat_id}"),
+            chat_id: chat_id.into(),
+            identifier: "gh#25".into(),
+            branch: None,
+            state: super::super::board::AgentState::Working,
+            started_at: None,
+            cap_secs: None,
+        })
+    }
+
+    #[test]
+    fn placements_find_the_space_an_attempt_never_names() {
+        let chats = vec![chat("c1", Some("s1")), chat("c2", None)];
+        let active = vec![agent_row("c1"), agent_row("c2"), agent_row("gone")];
+        let placements = active_placements(&active, &chats);
+        assert_eq!(
+            placements,
+            [("c1", Some("s1")), ("c2", None), ("gone", None)]
+        );
+    }
+
+    #[test]
+    fn the_shelf_shows_what_active_is_not_showing() {
+        let active = [("c1", Some("s1")), ("c2", Some("s1"))];
+        let shelf = space_shelf("s1", ["c1", "c2", "c3"], &active);
+        assert_eq!(shelf.idle, ["c3"]);
+        assert_eq!(shelf.running, 2);
+        // Rows remain: the count still links the surfaces, but the shelf has
+        // its own truth to draw and says nothing extra.
+        assert_eq!(shelf_note(&shelf), None);
+        assert_eq!(running_label(shelf.running).as_deref(), Some("· 2 running"));
+    }
+
+    #[test]
+    fn a_wholly_active_space_says_so_instead_of_a_gap() {
+        let active = [("c1", Some("s1")), ("c2", Some("s1"))];
+        let shelf = space_shelf("s1", ["c1", "c2"], &active);
+        assert!(shelf.idle.is_empty());
+        assert_eq!(
+            shelf_note(&shelf).as_deref(),
+            Some("2 running above · no idle sessions")
+        );
+    }
+
+    #[test]
+    fn an_empty_space_keeps_its_own_empty_state() {
+        let shelf = space_shelf("s1", Vec::<&str>::new(), &[]);
+        assert_eq!(shelf.running, 0);
+        assert_eq!(shelf_note(&shelf), None);
+        assert_eq!(running_label(0), None);
+    }
+
+    #[test]
+    fn another_spaces_runs_are_never_counted_here() {
+        let active = [("c1", Some("other")), ("c2", Some("s1"))];
+        let shelf = space_shelf("s1", ["c2", "c3"], &active);
+        assert_eq!(shelf.idle, ["c3"]);
+        assert_eq!(shelf.running, 1);
+    }
+
+    #[test]
+    fn an_archived_run_counts_even_though_no_shelf_row_holds_it() {
+        // Archiving is a decision about a FINISHED chat; one that is working
+        // anyway stays in Active and out of the tab order. The space row must
+        // still admit it.
+        let active = [("archived", Some("s1"))];
+        let shelf = space_shelf("s1", ["c1"], &active);
+        assert_eq!(shelf.idle, ["c1"]);
+        assert_eq!(shelf.running, 1);
     }
 }

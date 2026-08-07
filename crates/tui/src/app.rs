@@ -108,6 +108,11 @@ const PENDING_CHAT_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 /// switcher competing with the tab strip, and neither was authoritative. The
 /// tab strip above the transcript ([`App::tabs`]) stays as in-space
 /// navigation, reading the same per-space order these nested rows use.
+///
+/// Since gh#138 a chat draws ONE full row: Active owns it while its session is
+/// live, and the space's nested rows pick it back up when it goes idle. The
+/// space row carries the count of what Active took (`· 3 running`), and a
+/// space with nothing left to nest says so rather than showing a gap.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     /// A section header: label left, optional affordance right.
@@ -127,9 +132,15 @@ pub enum Row {
     /// A space: repo/folder name, containing its nested [`Row::Chat`]s.
     Space {
         id: String,
+        /// Unique within its device group (gh#138) — a repo slug names a repo,
+        /// not a folder, and one machine can hold several of the same one.
         label: String,
         /// Most urgent status among this space's sessions, if any is live.
         attention: Option<ChatIndicator>,
+        /// How many of this space's chats the Active group is drawing above
+        /// (gh#138). Reads as "· 3 running": the dot says how urgent, this
+        /// says how many, and the shelf below no longer repeats their rows.
+        running: usize,
     },
     /// One thing waiting on a human (gh#122): kind glyph + WHO on the first
     /// line, the one-line WHAT indented under it. First section in the
@@ -213,6 +224,11 @@ pub enum Row {
     },
     /// Placeholder text for an empty section.
     Empty { label: String },
+    /// What a space says where its nested rows would be, when Active is
+    /// holding all of them (gh#138). Indented like the rows it stands in for:
+    /// a space that discloses nothing at all reads as broken, and this is the
+    /// true answer — they are alive, and drawn above.
+    ShelfNote { label: String },
     /// Vertical air between sections (the desktop sidebar's 12px lead-in).
     Blank,
     /// The signed-in user, pinned at the bottom.
@@ -1410,6 +1426,7 @@ impl App {
             | Some(Row::Section { .. })
             | Some(Row::Device { .. })
             | Some(Row::Empty { .. })
+            | Some(Row::ShelfNote { .. })
             | Some(Row::AllClear)
             | Some(Row::User { .. })
             | None => Vec::new(),
@@ -2203,7 +2220,20 @@ impl App {
         // an empty section here would be a permanent reminder that a board
         // exists on a box that has none. The board pane (`B`) stays the deep
         // view; this is the glance.
+        //
+        // Since gh#138 this list OWNS the chats in it: a live session's full
+        // row is here, and its space's shelf below picks it back up when the
+        // run ends. The placements are what the tree subtracts by.
         let active = board_view::active_rows(&self.board.rows, &self.chats, &self.sessions, self.orchestrator.as_deref(), now);
+        let placed: Vec<(String, Option<String>)> =
+            spaces_view::active_placements(&active, &self.chats)
+                .into_iter()
+                .map(|(chat, space)| (chat.to_string(), space.map(str::to_string)))
+                .collect();
+        let placements: Vec<(&str, Option<&str>)> = placed
+            .iter()
+            .map(|(chat, space)| (chat.as_str(), space.as_deref()))
+            .collect();
         if !active.is_empty() {
             let blocked = board_view::active_needing_attention(&active);
             rows.push(Row::Blank);
@@ -2247,7 +2277,8 @@ impl App {
         // Grouped by device, the device named ONCE per group — and only for a
         // remote host (gh#124): your own machine is not an address worth a
         // line. Each space CONTAINS its sessions as nested rows, in the tab
-        // strip's order, so the sidebar is the one authoritative surface.
+        // strip's order — minus the ones Active is already drawing (gh#138),
+        // which the space row counts instead.
         for group in spaces_view::device_groups(&self.spaces, self.local_device_id.as_deref()) {
             if self.local_device_id.as_deref() != Some(group.device_id) {
                 rows.push(Row::Device {
@@ -2255,12 +2286,17 @@ impl App {
                     offline: !self.device_online(group.device_id, now),
                 });
             }
-            for space in group.spaces {
-                rows.push(Row::Space {
-                    id: space.id.clone(),
-                    label: space.display_name().to_string(),
-                    attention: attention.get(&space.id).copied(),
-                });
+            // Names unique within the group: two folders on one machine can
+            // be one repo (a checkout and a board worktree), and two rows
+            // reading the same word look like one row drawn twice.
+            let titles = spaces_view::space_titles(
+                &group
+                    .spaces
+                    .iter()
+                    .map(|space| (*space, None))
+                    .collect::<Vec<_>>(),
+            );
+            for (ix, space) in group.spaces.iter().enumerate() {
                 let mut chats: Vec<&Chat> = self
                     .chats
                     .iter()
@@ -2268,7 +2304,15 @@ impl App {
                     .filter(|chat| self.show_archived || !chat.archived)
                     .collect();
                 view::sort_tabs(&mut chats);
-                for chat in chats {
+                let order: Vec<&str> = chats.iter().map(|chat| chat.id.as_str()).collect();
+                let shelf = spaces_view::space_shelf(&space.id, order, &placements);
+                rows.push(Row::Space {
+                    id: space.id.clone(),
+                    label: titles[ix].clone(),
+                    attention: attention.get(&space.id).copied(),
+                    running: shelf.running,
+                });
+                for chat in chats.iter().filter(|chat| shelf.idle.contains(&chat.id.as_str())) {
                     rows.push(Row::Chat {
                         id: chat.id.clone(),
                         space_id: chat.space_id.clone(),
@@ -2282,6 +2326,11 @@ impl App {
                         activity: chat.last_message_at.or(Some(chat.created_at)),
                         orchestrator: self.orchestrator.as_deref() == Some(chat.id.as_str()),
                     });
+                }
+                // A space whose sessions are ALL up in Active would otherwise
+                // read as an empty container. It says where they went instead.
+                if let Some(note) = spaces_view::shelf_note(&shelf) {
+                    rows.push(Row::ShelfNote { label: note });
                 }
             }
         }
@@ -2308,7 +2357,7 @@ impl App {
             .or_else(|| {
                 self.selected_chat
                     .as_deref()
-                    .and_then(|id| self.rows.iter().position(|row| row.id() == Some(id)))
+                    .and_then(|id| self.row_holding(id))
             })
             .unwrap_or_else(|| self.first_selectable());
         // A rebuild can land the cursor on decoration (its row vanished); walk
@@ -2319,6 +2368,25 @@ impl App {
                 .or_else(|| self.next_selectable(self.cursor, -1))
                 .unwrap_or(0);
         }
+    }
+
+    /// Which row currently holds a chat — its nested session row, or the
+    /// Active row that took it while its run is live (gh#138).
+    ///
+    /// The two never coexist, so there is nothing to choose between; the
+    /// lookup exists because a chat that starts working CHANGES which row
+    /// holds it, and the cursor has to follow rather than fall to the top of
+    /// the pane under the reader's hands. The inbox and the orchestrator's
+    /// slot are excluded on purpose: they are fixtures pointing at a chat, not
+    /// the chat's own row.
+    fn row_holding(&self, chat_id: &str) -> Option<usize> {
+        self.rows.iter().position(|row| match row {
+            Row::Chat { id, .. } => id == chat_id,
+            Row::Agent { chat_id: held, .. } | Row::Running { chat_id: held, .. } => {
+                held == chat_id
+            }
+            _ => false,
+        })
     }
 
     /// The selected space's non-archived sessions, as the tab strip above the
@@ -4086,10 +4154,14 @@ mod tests {
             session("c1", SessionStatus::Working, 1),
             session("c2", SessionStatus::AwaitingInput, 1),
         ]));
-        // The Spaces section carries the aggregate dot; the Sessions list below
-        // is flat and global.
+        // The space row carries the aggregate dot AND, since gh#138, the count
+        // of its chats that Active is drawing above — because the shelf below
+        // no longer repeats their rows.
         let Some(Row::Space {
-            label, attention, ..
+            label,
+            attention,
+            running,
+            ..
         }) = app.rows.iter().find(|row| row.id() == Some("s1"))
         else {
             panic!("expected the space row");
@@ -4100,19 +4172,43 @@ mod tests {
             Some(ChatIndicator::AwaitingInput),
             "the space row surfaces its most urgent session"
         );
-        let statuses: Vec<ChatIndicator> = app
+        assert_eq!(*running, 2, "both live sessions are up in Active");
+        // Both chats are alive, so neither has a nested row: one full row per
+        // chat. The shelf says where they went instead of showing a gap.
+        assert!(
+            !app.rows.iter().any(|row| matches!(row, Row::Chat { .. })),
+            "a live chat's row belongs to Active:\n{:#?}",
+            app.rows
+        );
+        assert!(
+            app.rows.iter().any(
+                |row| matches!(row, Row::ShelfNote { label } if label == "2 running above · no idle sessions")
+            ),
+            "the shelf answers with its own truth:\n{:#?}",
+            app.rows
+        );
+
+        // The moment a run ends its row comes back down under its space.
+        app.apply(Update::Sessions(vec![session(
+            "c2",
+            SessionStatus::AwaitingInput,
+            1,
+        )]));
+        let nested: Vec<&str> = app
             .rows
             .iter()
             .filter_map(|row| match row {
-                Row::Chat { indicator, .. } => Some(*indicator),
+                Row::Chat { id, .. } => Some(id.as_str()),
                 _ => None,
             })
             .collect();
-        assert!(statuses.contains(&ChatIndicator::Working), "{statuses:?}");
-        assert!(
-            statuses.contains(&ChatIndicator::AwaitingInput),
-            "{statuses:?}"
-        );
+        assert_eq!(nested, ["c1"], "the idle chat is the space's again");
+        let Some(Row::Space { running, .. }) =
+            app.rows.iter().find(|row| row.id() == Some("s1"))
+        else {
+            panic!("expected the space row");
+        };
+        assert_eq!(*running, 1);
     }
 
     #[test]
@@ -4968,29 +5064,26 @@ mod tests {
         );
     }
 
-    /// An agent row and its session row address the same chat. The cursor has to
-    /// be able to tell them apart, or a rebuild slides it between the two lists.
+    /// gh#138: while an attempt is live its chat has exactly ONE row — the
+    /// agent's — and the space's shelf takes the row back when it ends. The
+    /// cursor rides that handover without sliding onto a different chat.
     #[test]
-    fn the_cursor_does_not_slide_between_an_agent_and_its_session_row() {
+    fn a_live_chat_has_one_row_and_the_shelf_takes_it_back() {
         let mut app = seeded();
         app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
         let mut live = board_row("a", BoardState::Working);
         live.chat_id = Some("chat-a".into());
         app.apply(Update::Board(vec![live.clone()]));
 
-        // Park on the session row, then let a board frame rebuild the sidebar.
-        app.cursor = app
-            .rows
-            .iter()
-            .position(|row| matches!(row, Row::Chat { id, .. } if id == "chat-a"))
-            .unwrap();
-        app.apply(Update::Board(vec![live]));
         assert!(
-            matches!(app.rows.get(app.cursor), Some(Row::Chat { .. })),
-            "the cursor stayed in the Sessions list"
+            !app.rows
+                .iter()
+                .any(|row| matches!(row, Row::Chat { id, .. } if id == "chat-a")),
+            "the attempt owns the row while it runs:\n{:#?}",
+            app.rows
         );
 
-        // And from the agent row, the same in reverse.
+        // Park on the agent row; a board frame must not move the cursor off it.
         app.cursor = app
             .rows
             .iter()
@@ -5000,6 +5093,53 @@ mod tests {
         again.chat_id = Some("chat-a".into());
         app.apply(Update::Board(vec![again]));
         assert!(matches!(app.rows.get(app.cursor), Some(Row::Agent { .. })));
+
+        // The attempt lands in review — no longer live — and the chat's row
+        // reappears under its space, exactly once.
+        let mut settled = board_row("a", BoardState::Review);
+        settled.chat_id = Some("chat-a".into());
+        app.apply(Update::Board(vec![settled]));
+        assert_eq!(
+            app.rows
+                .iter()
+                .filter(|row| matches!(row, Row::Chat { id, .. } if id == "chat-a"))
+                .count(),
+            1,
+            "the shelf takes the row back:\n{:#?}",
+            app.rows
+        );
+    }
+
+    /// The row holding a chat changes surfaces when its run starts. The cursor
+    /// follows it instead of falling to the top of the pane.
+    #[test]
+    fn the_cursor_follows_a_chat_across_the_handover() {
+        let mut app = seeded();
+        app.select_chat(Some("c1".into()));
+        app.cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Chat { id, .. } if id == "c1"))
+            .expect("the nested row");
+
+        app.apply(Update::Sessions(vec![session(
+            "c1",
+            SessionStatus::Working,
+            1,
+        )]));
+        assert!(
+            matches!(app.rows.get(app.cursor), Some(Row::Running { chat_id, .. }) if chat_id == "c1"),
+            "the cursor rode the handover into Active:\n{:#?}",
+            app.rows
+        );
+
+        // …and back down when the run ends.
+        app.apply(Update::Sessions(vec![]));
+        assert!(
+            matches!(app.rows.get(app.cursor), Some(Row::Chat { id, .. }) if id == "c1"),
+            "…and back to the shelf:\n{:#?}",
+            app.rows
+        );
     }
 
     #[test]

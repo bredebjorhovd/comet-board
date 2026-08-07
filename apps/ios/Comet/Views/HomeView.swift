@@ -153,11 +153,19 @@ struct HomeView: View {
 
     // MARK: Sessions
 
+    /// The sessions below Active, minus the ones Active is already drawing
+    /// (gh#138): three agents working used to fill this screen twice over, the
+    /// same full rows in both lists. A chat lives in exactly one of them —
+    /// Active while it runs, here when it is idle.
     private var sessionsSection: some View {
         Section {
-            let chats = model.overviewChats
+            let held = Set(model.activeRowPlacements.map(\.chatId))
+            let chats = model.overviewChats.filter { !held.contains($0.id) }
             if chats.isEmpty {
-                Text("No sessions yet")
+                // Say where they went rather than leaving a gap under a header
+                // that the list above just proved is busy.
+                let shelf = SpaceShelf(idle: chats.map(\.id), running: held.count)
+                Text(shelfNote(shelf) ?? "No sessions yet")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
@@ -213,10 +221,22 @@ struct SpaceRow: View {
             Image(systemName: "folder")
                 .font(.system(size: 13))
                 .foregroundStyle(Theme.textMuted)
-            Text(space.displayName)
+            // Unique within its device's spaces (gh#138): a repo slug names a
+            // repo, and one machine can hold a checkout AND a worktree of it.
+            Text(model.spaceTitlesById[space.id] ?? space.displayName)
                 .font(Theme.sans(13, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
+            // "· 3 running" — where this space's live rows went. The dot said
+            // how urgent; this says how many, and the sessions list below no
+            // longer repeats them.
+            if let running = runningLabel(model.spaceRunning(space.id)) {
+                Text(running)
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
             Spacer(minLength: 8)
             deviceTag
             Image(systemName: "chevron.right")

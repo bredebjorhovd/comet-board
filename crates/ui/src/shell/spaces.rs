@@ -14,6 +14,16 @@
 //! competing with the tab strip, and neither was authoritative. The tab strip
 //! stays as in-space navigation with the titlebar duties.
 //!
+//! ## One full row per chat (gh#138)
+//!
+//! Active and the tree still answer different questions, but only one of them
+//! draws a chat at a time: **Active owns it while its session is live, the
+//! space's shelf shows it when idle.** Otherwise a box whose whole load sits
+//! in one space renders that space as a verbatim copy of the list above it.
+//! Two things keep the surfaces tied — the space row's `· 3 running` count,
+//! and the shelf's own note when Active holds every one of its sessions
+//! ([`spaces_view::space_shelf`]).
+//!
 //! A space row is named repo-first: `owner/repo` where a host has supplied the
 //! gh#118 link ([`Shell::refresh_space_slugs`]), the folder basename otherwise.
 //! The device's name appears ONCE, as a group header above the spaces it
@@ -385,12 +395,27 @@ impl Shell {
     /// The "Spaces" section: tracked header + add button, then the spaces
     /// grouped by device — the device named ONCE per group — with each space's
     /// sessions disclosed inline under its row (gh#124).
-    pub(super) fn render_spaces_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    ///
+    /// `active` is [`spaces_view::active_placements`] for the whole sidebar:
+    /// which chats the Active list above is drawing, and where each lives. The
+    /// tree answers "what lives here" WITHOUT re-listing what Active already
+    /// says is alive (gh#138) — a space row carries the count instead, and a
+    /// space whose sessions are all up there says so where its rows would be.
+    pub(super) fn render_spaces_section(
+        &mut self,
+        active: &[(String, Option<String>)],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // A drag that ended off-list (no drop event) must not strand the
         // sibling slide offsets.
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
+        let borrowed_active: Vec<(&str, Option<&str>)> = active
+            .iter()
+            .map(|(chat, space)| (chat.as_str(), space.as_deref()))
+            .collect();
         let (spaces, selected, device_names, device_presence, attention, slugs, local_device) = {
             let now = Utc::now();
             let state = self.state.read(cx);
@@ -581,16 +606,34 @@ impl Shell {
                     .as_ref()
                     .filter(|d| d.device == device_id)
                     .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+                // Repo-first names, made unique inside this group (gh#138): a
+                // repo has one slug and any number of checkouts on a machine,
+                // and two rows reading `owner/repo` look like one row drawn
+                // twice.
+                let titles = spaces_view::space_titles(
+                    &group
+                        .iter()
+                        .map(|space| (space, slugs.get(&space.id).map(String::as_str)))
+                        .collect::<Vec<_>>(),
+                );
                 let mut rows: Vec<AnyElement> = Vec::new();
                 for (ix, space) in group.into_iter().enumerate() {
                     let id = space.id.clone();
                     let is_selected = selected.as_deref() == Some(space.id.as_str());
                     let space_attention = attention.get(&space.id).copied();
                     let slug = slugs.get(&space.id).map(String::as_str);
-                    let title: SharedString =
-                        spaces_view::space_title(&space, slug).to_string().into();
+                    let title: SharedString = titles[ix].clone().into();
                     let repo = slug.is_some();
                     let expanded = self.space_expanded(&space.id) && !drag_active;
+                    // What Active holds for this space — the count the row
+                    // wears, and the rows the shelf therefore skips.
+                    let order = self.tab_ids(&id, cx);
+                    let shelf = spaces_view::space_shelf(
+                        &id,
+                        order.iter().map(String::as_str),
+                        &borrowed_active,
+                    );
+                    let running = shelf.running;
                     let row = self.render_space_row(
                         ix,
                         device_id.clone(),
@@ -600,6 +643,7 @@ impl Shell {
                         expanded,
                         is_selected,
                         space_attention,
+                        running,
                         theme,
                         cx,
                     );
@@ -626,10 +670,11 @@ impl Shell {
                             .into_any_element(),
                         _ => row.into_any_element(),
                     });
-                    // The disclosure: the space's sessions, inline under its
-                    // row — the one authoritative session surface (gh#124).
+                    // The disclosure: the space's IDLE sessions, inline under
+                    // its row (gh#124's containment, gh#138's division of
+                    // labour — the live ones have their row in Active).
                     if expanded {
-                        rows.push(self.render_space_sessions(&id, theme, cx));
+                        rows.push(self.render_space_sessions(&shelf, theme, cx));
                     }
                 }
                 let group_device = device_id.clone();
@@ -801,6 +846,11 @@ impl Shell {
     /// chevron. No device suffix — the device is named once per group
     /// ([`Self::render_device_header`]). Click activates (and discloses);
     /// the chevron toggles disclosure without activating.
+    ///
+    /// `running` is how many of the space's chats the Active list is drawing
+    /// (gh#138). It reads as a compact `· 3 running` beside the title — the
+    /// fact that keeps the two surfaces tied together now that the shelf below
+    /// no longer repeats those rows.
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
@@ -812,6 +862,7 @@ impl Shell {
         expanded: bool,
         selected: bool,
         attention: Option<ChatIndicator>,
+        running: usize,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -900,6 +951,20 @@ impl Shell {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(title),
             )
+            // "· 3 running" (gh#138): where the space's live rows went. Muted
+            // and after the name — the dot already said how urgent, this says
+            // how many, and neither needs to shout.
+            .when_some(spaces_view::running_label(running), |el, label| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .line_height(px(17.0))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(theme.text_muted.opacity(0.6))
+                        .child(SharedString::from(label)),
+                )
+            })
             .child(div().flex_1())
             // The disclosure chevron: glyph-swapped like the Changes-pane fold
             // (gpui at this rev has no rotation transform). Click toggles
@@ -938,16 +1003,21 @@ impl Shell {
 
     /// A space's disclosed sessions: the tab strip's order (creation + manual
     /// drag), vertical, inset under an indent rule so the containment is
-    /// visible. The one place a session row lives in the sidebar — no space
-    /// name repeated on the row, because the row is IN the space.
+    /// visible. No space name repeated on the row, because the row is IN the
+    /// space.
+    ///
+    /// The shelf draws what Active is NOT drawing (gh#138). When Active holds
+    /// every one of them it says so ([`spaces_view::shelf_note`]) rather than
+    /// disclosing into a gap — expanding a space must always answer with
+    /// something true about what lives here.
     fn render_space_sessions(
         &self,
-        space_id: &str,
+        shelf: &spaces_view::SpaceShelf<'_>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let now = Utc::now();
-        let order = self.tab_ids(space_id, cx);
+        let order = &shelf.idle;
         let rows: Vec<AnyElement> = {
             let (selected, pinned) = {
                 let state = self.state.read(cx);
@@ -958,15 +1028,15 @@ impl Shell {
                 .filter_map(|chat_id| {
                     let (chat, status) = {
                         let state = self.state.read(cx);
-                        let chat = state.visible_chats().find(|c| &c.id == chat_id)?.clone();
+                        let chat = state.visible_chats().find(|c| c.id == *chat_id)?.clone();
                         let status = state.display_status_for(&chat, now);
                         (chat, status)
                     };
                     Some(self.render_space_session_row(
                         &chat,
                         status,
-                        selected.as_deref() == Some(chat_id.as_str()),
-                        pinned.as_deref() == Some(chat_id.as_str()),
+                        selected.as_deref() == Some(*chat_id),
+                        pinned.as_deref() == Some(*chat_id),
                         now,
                         theme,
                         cx,
@@ -975,12 +1045,17 @@ impl Shell {
                 .collect()
         };
         let body: AnyElement = if rows.is_empty() {
+            // Either the space has no sessions, or Active is holding all of
+            // them — and the difference is exactly what a reader who just
+            // expanded an obviously-busy space needs told.
+            let note = spaces_view::shelf_note(shelf)
+                .unwrap_or_else(|| "No sessions yet".to_string());
             div()
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No sessions yet"))
+                .child(SharedString::from(note))
                 .into_any_element()
         } else {
             div()
@@ -1505,14 +1580,20 @@ impl Shell {
     /// The rows come from the board panel's standing `WatchBoard` stream joined
     /// to chats and sessions ([`BoardPanel::active`]); the board dock stays the
     /// deep view, and this is the glance.
+    ///
+    /// Since gh#138 this list OWNS its chats: while a session is live its full
+    /// row is here and nowhere else, and the space's shelf below picks it back
+    /// up when it goes idle. So `active` arrives from the caller rather than
+    /// being derived here — the spaces tree is derived from the same value on
+    /// the same frame ([`Shell::render_chat_sidebar`]).
     pub(super) fn render_active_section(
         &mut self,
+        active: Vec<comet_proto::view::board::ActiveRow>,
+        now: DateTime<Utc>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         use comet_proto::view::board::ActiveRow;
-        let now = Utc::now();
-        let active = self.board.read(cx).active(cx, now);
         if active.is_empty() {
             return None;
         }

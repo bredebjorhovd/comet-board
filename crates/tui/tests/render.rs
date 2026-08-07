@@ -821,13 +821,12 @@ fn a_selected_row_keeps_its_status_colour() {
     // row exists to carry.
     let mut app = populated();
     app.focus = Focus::Sidebar;
-    app.apply(Update::Sessions(vec![Session {
-        chat_id: "c1".into(),
-        device_id: "dev".into(),
-        status: SessionStatus::AwaitingInput,
-        started_at: None,
-        updated_at: Utc::now(),
-    }]));
+    // An unseen, finished session — nested under its space, since gh#138 gives
+    // Active every chat whose run is still live.
+    let mut done = chat("c1", "Rework the diff sidebar");
+    done.last_message_at = Some(Utc::now());
+    done.last_seen_at = Some(Utc::now() - chrono::Duration::hours(1));
+    app.apply(Update::Chats(vec![done]));
     // Park the cursor on that session.
     app.cursor = app
         .rows
@@ -847,7 +846,7 @@ fn a_selected_row_keeps_its_status_colour() {
         .find(|cell| cell.symbol() == comet_tui::theme::DOT && cell.bg == app.theme.selection)
         .expect("a status dot on the selected row");
     assert_eq!(
-        dot.fg, app.theme.dot_awaiting,
+        dot.fg, app.theme.dot_completed,
         "the dot must keep its hue under the selection wash"
     );
     assert_eq!(dot.bg, app.theme.selection, "…and still sit on the wash");
@@ -892,6 +891,97 @@ fn each_session_nests_under_its_own_space() {
     assert!(
         !sidebar.iter().any(|row| row.contains("Sessions")),
         "{sidebar:#?}"
+    );
+}
+
+#[test]
+fn a_running_session_draws_one_row_and_the_space_says_where() {
+    // gh#138: three agents working in one space used to render twice within a
+    // screen height — full rows in Active, the same rows again under the
+    // expanded space. Active owns a chat while it runs; the shelf takes it
+    // back when it goes idle.
+    let mut app = populated();
+    app.apply(Update::Sessions(vec![Session {
+        chat_id: "c1".into(),
+        device_id: "dev".into(),
+        status: SessionStatus::Working,
+        started_at: Some(Utc::now()),
+        updated_at: Utc::now(),
+    }]));
+    let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
+    let title = "Rework the diff";
+    assert_eq!(
+        sidebar.iter().filter(|row| row.contains(title)).count(),
+        1,
+        "a running chat draws one full row:\n{sidebar:#?}"
+    );
+    // And that row is Active's, above the space it lives in.
+    let at = |needle: &str| {
+        sidebar
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar:#?}"))
+    };
+    assert!(at("Active") < at(title), "{sidebar:#?}");
+    assert!(at(title) < at("Spaces"), "{sidebar:#?}");
+    // The space row keeps the reader's thread between the two surfaces.
+    assert!(
+        sidebar.iter().any(|row| row.contains("· 1 running")),
+        "the space row must count what Active took:\n{sidebar:#?}"
+    );
+    // The idle sibling is still the space's, right under it.
+    assert_eq!(
+        at("Chase the flaky"),
+        at("comet") + 1,
+        "{sidebar:#?}"
+    );
+
+    // With every session live, the shelf answers rather than leaving a gap.
+    app.apply(Update::Sessions(vec![
+        Session {
+            chat_id: "c1".into(),
+            device_id: "dev".into(),
+            status: SessionStatus::Working,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        },
+        Session {
+            chat_id: "c2".into(),
+            device_id: "dev".into(),
+            status: SessionStatus::AwaitingInput,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        },
+    ]));
+    let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
+    assert!(
+        sidebar.iter().any(|row| row.contains("2 running above")),
+        "an all-active space says so:\n{sidebar:#?}"
+    );
+}
+
+#[test]
+fn one_repo_in_two_folders_reads_as_two_rows() {
+    // gh#138's second finding: `~/dev/attn` and the board worktree cut from it
+    // are two real spaces on one machine, and the repo-first name calls both
+    // of them the same thing. The row says which folder.
+    let mut app = App::with_theme(Theme::dark());
+    app.apply(Update::Connection(ConnectionStatus::Ready));
+    app.apply(Update::Spaces(vec![
+        space("s1", "/Users/brede/dev/attn"),
+        space("s2", "/Users/brede/.comet-native/worktrees/attn/board-gh-10-attn"),
+    ]));
+    let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
+    assert!(
+        sidebar.iter().any(|row| row.contains("board-gh-10-attn")),
+        "the worktree names itself:\n{sidebar:#?}"
+    );
+    // Both spaces are on ONE device, so both rows sit in one group — the
+    // grouping never split them, and the device header is still said once.
+    assert_eq!(
+        sidebar.iter().filter(|row| row.contains("@ dev")).count(),
+        1,
+        "one device, one header:\n{sidebar:#?}"
     );
 }
 

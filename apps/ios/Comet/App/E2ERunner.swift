@@ -255,6 +255,13 @@ enum E2ERunner {
             log(unmanaged.contains { $0.chatId == live.chatId }
                 ? "FAIL the dispatched chat is an unmanaged row as well as an agent"
                 : "OK unmanaged (non-board): \(unmanaged.map(\.title).joined(separator: ", "))")
+            // One full row per chat (gh#138): Active owns it while it runs, so
+            // the sessions list below must not draw it a second time.
+            let held = Set(model.activeRowPlacements.map(\.chatId))
+            let below = model.overviewChats.filter { !held.contains($0.id) }
+            log(below.contains { $0.id == live.chatId }
+                ? "FAIL the dispatched chat draws in Active AND in the sessions list"
+                : "OK the dispatched chat draws once, in Active")
             // The blocked row's Retry (gh#49): end the live attempt and release
             // a fresh one. Driven here against a `working` row because the
             // engine's `replace` means exactly "end what is live first" — which
