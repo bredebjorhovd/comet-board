@@ -22,6 +22,10 @@ struct BoardView: View {
     /// being rebuilt — the same trade the TUI makes (`App::counting`).
     @State private var now = Date()
     @State private var dispatching: DispatchTarget?
+    /// The row opened for reading (gh#132). A task id, not a row: the sheet
+    /// reads the row live off the board so a frame landing under it moves the
+    /// panel on with the work.
+    @State private var opened: OpenedRow?
     @State private var notice: String?
     /// Per-group fold overrides (gh#125), keyed `state:route`. Absent means the
     /// group's default — open for a named route, folded for `no route`.
@@ -91,6 +95,16 @@ struct BoardView: View {
                 notice = message
             }
         }
+        .sheet(item: $opened) { row in
+            BoardDetailSheet(taskId: row.id,
+                             onResult: { notice = $0 },
+                             onDispatch: { row in
+                                 afterDetail { dispatching = target(for: row) }
+                             },
+                             onOpenChat: { chatId in
+                                 afterDetail { path.append(.chat(chatId)) }
+                             })
+        }
         .overlay(alignment: .bottom) {
             if let notice {
                 NoticeBar(text: notice) { self.notice = nil }
@@ -121,13 +135,31 @@ struct BoardView: View {
 
     // MARK: Actions
 
-    /// A live attempt opens its chat; anything else opens the dispatch sheet
-    /// when it can be released, and does nothing when it cannot.
+    /// Tapping a row opens it for reading (gh#132).
+    ///
+    /// It used to open the row's *chat*, or its dispatch sheet, or nothing at
+    /// all depending on state — three answers to one gesture, and on an
+    /// unroutable row the answer was silence. Now a tap always does the same
+    /// thing, and the sheet offers every one of those as a named action.
+    ///
+    /// Releasing stays one tap from the list: the row keeps its own Dispatch /
+    /// Retry chip, which goes straight to the account picker.
     private func open(_ row: TaskRow) {
-        if let chatId = row.chatId, model.chat(id: chatId) != nil {
-            path.append(.chat(chatId))
-        } else if row.dispatchable {
-            dispatching = target(for: row)
+        opened = OpenedRow(id: row.id)
+    }
+
+    /// Leave the detail sheet for something else on this screen.
+    ///
+    /// SwiftUI will not present a second sheet while the first is still
+    /// dismissing, and a push that races the dismissal animation lands
+    /// unreliably — so the next thing waits for this one to be gone. The
+    /// alternative (stacking the account picker on top of the detail) would put
+    /// two modals between a thumb and a release.
+    private func afterDetail(_ next: @escaping () -> Void) {
+        opened = nil
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            next()
         }
     }
 

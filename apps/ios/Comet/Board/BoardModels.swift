@@ -421,6 +421,15 @@ func agentElapsedLabel(startedAt: Date?, capSecs: Int?, now: Date) -> String? {
     return "\(elapsed) / \(formatCap(cap))"
 }
 
+/// Coarser form for a fact that is not counting up — `12s`, `4m`, `3h`. Ported
+/// from `format_age`.
+func formatAge(_ secs: Int) -> String {
+    let s = max(0, secs)
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return "\(s / 60)m" }
+    return "\(s / 3600)h"
+}
+
 // MARK: - What rows say
 
 /// What the route column renders for a row nothing routes.
@@ -483,6 +492,161 @@ func boardRowDetail(_ row: TaskRow, now: Date = Date()) -> BoardRowDetail {
     }
     return BoardRowDetail(text: text, elapsed: elapsed, overCap: overCap,
                           billing: billingNote(row))
+}
+
+// MARK: - The detail sheet — a row is a door (gh#132)
+//
+// A board row shows a truncated title and nothing else you can open. The sheet
+// is where the rest of it lives: the whole title, the issue body, the labels,
+// where the work sits, what has been tried on it, and the links. Everything
+// here is ported from `comet_proto::view::board` so the phone offers a row the
+// same verbs the desktop panel and the TUI do — an action that exists on one
+// surface and not another is a bug, not a platform difference.
+
+/// The issue text behind a row, as `ReadBoardTask` answers.
+///
+/// Deliberately not a field on `TaskRow`: `WatchBoard` republishes every row on
+/// every sync cycle, and a hundred issue bodies relayed to a phone to draw one
+/// truncated line is the wrong trade. Read when a row is opened.
+struct TaskDetail: Decodable {
+    var id: String
+    var body: String?
+}
+
+/// What the sheet says where the body would be, for an issue that has none. A
+/// blank panel reads as a failed fetch; this reads as an empty issue.
+let noBodyText = "No description on the issue."
+
+/// What a detail fetch came back with.
+///
+/// Three states, not two: an issue with no description and a read that did not
+/// happen are different facts, and a sheet that showed both as an empty body
+/// would be lying about one of them. `nil` — no value at all — is still reading.
+enum TaskBody: Equatable {
+    case text(String)
+    /// The issue has no description.
+    case empty
+    /// The read failed, with what the host (or the relay) said.
+    case failed(String)
+}
+
+/// The row a detail sheet is open on, as `sheet(item:)` wants it: an identity,
+/// not the row itself. The sheet re-reads the row off the board every frame, so
+/// holding a copy here would be a second, staler board.
+struct OpenedRow: Identifiable, Hashable {
+    var id: String
+}
+
+/// One thing a surface offers to do with a row. Ported from `RowAction`.
+enum BoardRowAction: Hashable {
+    case dispatch
+    case retry
+    case cancel
+    case openChat
+    case openIssue
+    case openPR
+
+    /// The words every surface uses for it.
+    var label: String {
+        switch self {
+        case .dispatch: return "Dispatch"
+        case .retry: return "Retry"
+        case .cancel: return "Cancel"
+        case .openChat: return "Open chat"
+        case .openIssue: return "Open issue"
+        case .openPR: return "Open PR"
+        }
+    }
+
+    /// SF Symbol, this surface's own — the vocabulary is shared, the glyphs
+    /// are the platform's.
+    var symbol: String {
+        switch self {
+        case .dispatch, .retry: return "play.fill"
+        case .cancel: return "stop.circle"
+        case .openChat: return "bubble.left.and.text.bubble.right"
+        case .openIssue: return "arrow.up.right.square"
+        case .openPR: return "arrow.triangle.pull"
+        }
+    }
+
+    /// Does this end somebody's work?
+    var destructive: Bool { self == .cancel }
+
+    /// Does this release an agent, and so need the account picker first? The
+    /// picker is not decoration — a dispatch spends somebody's subscription.
+    var releases: Bool { self == .dispatch || self == .retry }
+}
+
+/// The actions a row's own affordances offer — the desktop chips, the TUI's
+/// keys, this row's one chip. Ported from `row_actions`.
+func boardRowActions(_ row: TaskRow) -> [BoardRowAction] {
+    switch row.boardState {
+    case .ready:
+        return row.dispatchable ? [.dispatch] : []
+    case .working:
+        return [.openChat, .cancel]
+    case .blocked:
+        return (row.dispatchable ? [.retry] : []) + [.openChat, .cancel]
+    case .review:
+        return nonEmpty(row.prUrl) != nil ? [.openPR] : []
+    case .failed:
+        return (row.dispatchable ? [.retry] : []) + [.cancel]
+    case .done:
+        return []
+    }
+}
+
+/// Everything the detail sheet offers: the row's own actions, plus the links a
+/// list has no room for. Ported from `detail_actions`.
+func boardDetailActions(_ row: TaskRow) -> [BoardRowAction] {
+    var out = boardRowActions(row)
+    if nonEmpty(row.prUrl) != nil, !out.contains(.openPR) { out.append(.openPR) }
+    if !row.url.isEmpty { out.append(.openIssue) }
+    return out
+}
+
+/// The URL an action opens, or nil for the ones that are not links.
+func boardActionURL(_ row: TaskRow, _ action: BoardRowAction) -> URL? {
+    switch action {
+    case .openIssue: return nonEmpty(row.url).flatMap(URL.init(string:))
+    case .openPR: return nonEmpty(row.prUrl).flatMap(URL.init(string:))
+    default: return nil
+    }
+}
+
+/// What has been tried on this row: `attempt 2 · last failed 3h ago · bills
+/// brede@tally.no`. Ported from `history_line`.
+///
+/// Nil on a row nothing has ever run on: "attempt 0" is not a fact, it is a
+/// blank where a fact would go.
+func boardHistoryLine(_ row: TaskRow, now: Date = Date()) -> String? {
+    guard row.attempts > 0 else { return nil }
+    var parts = ["attempt \(row.attempts)"]
+    if let outcome = nonEmpty(row.lastOutcome) {
+        if let at = rfc3339(row.lastOutcomeAt) {
+            parts.append("last \(outcome) \(formatAge(Int(now.timeIntervalSince(at)))) ago")
+        } else {
+            parts.append("last \(outcome)")
+        }
+    }
+    if row.reopened > 0 { parts.append("reopened \(row.reopened)×") }
+    // Whose subscription it spent, unconditionally — unlike the row's own
+    // sub-line, which speaks up only when somebody else is paying. The sheet is
+    // where you come to ask, and an answer that appears only when there is a
+    // problem cannot be trusted to mean anything.
+    if let billed = nonEmpty(row.billedTo) { parts.append(billsLabel(billed)) }
+    return parts.joined(separator: " · ")
+}
+
+/// Where this row's work is happening: route, runtime, space, branch — each
+/// named only when it is known. Ported from `placement_line`.
+func boardPlacementLine(_ row: TaskRow) -> String? {
+    var parts = [nonEmpty(row.route) ?? noRouteLabel]
+    if let runtime = nonEmpty(row.runtime) { parts.append(runtime) }
+    if let workspace = nonEmpty(row.workspace) { parts.append("ws:\(workspace)") }
+    if let branch = nonEmpty(row.branch) { parts.append(branch) }
+    return parts.isEmpty ? nil : parts.joined(separator: " · ")
 }
 
 // MARK: - Whose subscription a run spends (gh#101)

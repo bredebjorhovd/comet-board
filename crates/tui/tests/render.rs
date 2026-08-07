@@ -2400,6 +2400,66 @@ fn clicking_a_board_row_selects_it() {
     assert_eq!(app.focus, Focus::Board);
 }
 
+/// gh#132: a row is a door. `space` opens it over the list with the whole
+/// title, the issue body, the labels, the history and the actions — and the
+/// list underneath is untouched, so nothing about opening one reflows anything.
+#[test]
+fn space_opens_a_row_over_the_board_with_everything_the_list_cannot_say() {
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    let mut row = board_row("507", comet_proto::view::board::BoardState::Ready);
+    row.title =
+        "Signicat: the callback drops the assurance level when the session is resumed".into();
+    row.labels = vec!["board".into(), "M".into()];
+    row.attempts = 2;
+    row.last_outcome = Some("failed".into());
+    row.last_outcome_at = Some(Utc::now().to_rfc3339());
+    app.apply(Update::Board(vec![row]));
+    app.board.selected = Some("507".into());
+    app.act(Action::BoardPeek);
+    app.apply(Update::TaskDetail {
+        task_id: "507".into(),
+        body: Ok(Some("The resume path re-reads the session but not the LoA.".into())),
+    });
+
+    let screen = joined(&snapshot(&mut app, 100, 26));
+    // The whole title, not the list's truncation of it.
+    assert!(
+        screen.contains("assurance level when the session is resumed"),
+        "the full title:\n{screen}"
+    );
+    assert!(
+        screen.contains("The resume path re-reads the session"),
+        "the issue body:\n{screen}"
+    );
+    assert!(screen.contains("board, M"), "the labels:\n{screen}");
+    assert!(screen.contains("attempt 2"), "the history:\n{screen}");
+    assert!(screen.contains("last failed"), "the last outcome:\n{screen}");
+    // The actions the row has anywhere else, in the shared vocabulary.
+    assert!(screen.contains("Dispatch"), "the actions:\n{screen}");
+    assert!(screen.contains("Open issue"), "the links:\n{screen}");
+    assert!(screen.contains("space closes"), "the way out:\n{screen}");
+}
+
+#[test]
+fn an_open_row_that_leaves_the_board_says_so_rather_than_drawing_a_stale_card() {
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    app.apply(Update::Board(vec![board_row(
+        "1",
+        comet_proto::view::board::BoardState::Ready,
+    )]));
+    app.board.selected = Some("1".into());
+    app.act(Action::BoardPeek);
+    // Reaped, settled, filtered away — the panel outlived its row.
+    app.apply(Update::Board(vec![]));
+    let screen = joined(&snapshot(&mut app, 100, 26));
+    assert!(
+        screen.contains("no longer on the board"),
+        "the panel must not draw a card about nothing:\n{screen}"
+    );
+}
+
 #[test]
 fn the_board_find_field_counts_matches_as_you_type() {
     let mut app = boarded();

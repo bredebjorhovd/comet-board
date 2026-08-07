@@ -347,6 +347,23 @@ final class BoardStore {
         }
     }
 
+    /// The issue text behind one row, for the detail sheet (gh#132).
+    ///
+    /// An issue with no description and a read that did not happen are
+    /// different answers — see [`TaskBody`] — because a sheet that drew both as
+    /// a blank body would be lying about one of them.
+    func taskDetail(taskId: String) async -> TaskBody {
+        guard let host = hostDeviceId else { return .failed("No board host") }
+        do {
+            let reply: TaskDetail = try await relay(for: host).call(method: "ReadBoardTask",
+                                                                    params: ["taskId": taskId])
+            let body = reply.body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return body.isEmpty ? .empty : .text(body)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks.
     func cancel(taskId: String) async -> String? {

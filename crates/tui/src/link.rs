@@ -79,6 +79,16 @@ pub enum Update {
         /// without one there is no reliable way to pick it out (gh#101).
         harness: Option<comet_proto::HarnessId>,
     },
+    /// The issue text behind one board row, answering
+    /// [`Command::ReadBoardTask`] (gh#132). Carries the task id for the same
+    /// reason [`Update::DispatchAccounts`] does: a reply that raced the cursor
+    /// moving on is dropped rather than rendered under the wrong title.
+    TaskDetail {
+        task_id: String,
+        /// `Ok(None)` is an issue with no description — a fact. `Err` is a
+        /// fetch that failed, which is a different one.
+        body: Result<Option<String>, String>,
+    },
     /// A drafted session became real: the chat exists and its prompt is queued.
     SessionStarted {
         chat_id: String,
@@ -163,6 +173,12 @@ pub enum Command {
         /// the run cannot use is refused by the engine, but a picker with no
         /// rows at all cannot even be argued with.
         runtime: Option<String>,
+    },
+    /// The issue text behind one board row, for the detail panel (gh#132).
+    /// Answered as [`Update::TaskDetail`]. Targets the board's host, like every
+    /// other board call — the store is on that box and nowhere else.
+    ReadBoardTask {
+        task_id: String,
     },
     /// Point the board pane at a device, or hand the choice back to the sweep
     /// (gh#55). Survives reconnects, so a pinned box stays pinned across a
@@ -483,6 +499,15 @@ async fn session(
                             via_user,
                             replace,
                         },
+                        board_host.clone(),
+                    );
+                }
+                Some(Command::ReadBoardTask { task_id }) => {
+                    // The board's store is on its host, so the read is too.
+                    spawn_task_detail(
+                        client.clone(),
+                        updates.clone(),
+                        task_id,
                         board_host.clone(),
                     );
                 }
@@ -1156,6 +1181,39 @@ fn spawn_dispatch(
 /// runtime catalog that fails to load is not fatal: the picker then offers every
 /// login and the engine refuses a slot the harness cannot use, which is a worse
 /// message but a live one.
+/// Read one row's issue text off the board's host (gh#132).
+///
+/// A failure comes back as an error *on the panel* rather than as a status-line
+/// notice: the panel is what asked, it is what is on screen, and a notice that
+/// scrolls away under an empty body would leave the reader thinking the issue
+/// had no description.
+fn spawn_task_detail(
+    client: Arc<RpcClient>,
+    updates: mpsc::UnboundedSender<Update>,
+    task_id: String,
+    target_device: Option<String>,
+) {
+    tokio::spawn(async move {
+        let mut params = serde_json::json!({ "taskId": task_id });
+        if let (Some(device), Some(object)) = (&target_device, params.as_object_mut()) {
+            object.insert(
+                "targetDeviceId".into(),
+                serde_json::Value::String(device.clone()),
+            );
+        }
+        let body = client
+            .call(methods::READ_BOARD_TASK, params)
+            .await
+            .map_err(|err| format!("{err}"))
+            .and_then(|value| {
+                serde_json::from_value::<board_view::TaskDetail>(value)
+                    .map(|detail| detail.body)
+                    .map_err(|err| format!("malformed reply: {err}"))
+            });
+        let _ = updates.send(Update::TaskDetail { task_id, body });
+    });
+}
+
 fn spawn_dispatch_accounts(
     client: Arc<RpcClient>,
     updates: mpsc::UnboundedSender<Update>,
