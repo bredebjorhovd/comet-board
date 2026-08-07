@@ -89,7 +89,8 @@ final class DemoDataset {
             "chat-picker": SessionRow(chatId: "chat-picker", deviceId: "dev-mac",
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
-            // No board row points here, so it lands in Running (gh#117).
+            // No board row points here, so it is an unmanaged Active row
+            // (gh#117) — bare title, no chip.
             "chat-orchestrator": SessionRow(chatId: "chat-orchestrator", deviceId: "dev-mac",
                                             status: .working, startedAt: now - 6_600_000,
                                             updatedAt: now - 2_000),

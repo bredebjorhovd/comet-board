@@ -776,7 +776,7 @@ impl BoardPanel {
                 | ComposerInputEvent::PastedPaths(_) => {}
             });
         let ticker = cx.spawn(async move |this, cx| {
-            // Whether the last tick found anything live. The Running group's
+            // Whether the last tick found anything live. An unmanaged row's
             // membership is staleness-gated, and staleness passes with no frame
             // to announce it — a backend that died mid-run sends nothing ever
             // again. Redrawing one more time after the last live thing goes
@@ -788,10 +788,10 @@ impl BoardPanel {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |panel, cx| {
                     // Keep the elapsed counters live while something is running
-                    // — on the board pane, and on the sidebar's Agents rows,
+                    // — on the board pane, and on the sidebar's Active rows,
                     // which are drawn off the same rows with the dock shut.
                     let attempts = panel.model.rows.iter().any(|row| row.state().holds_pane());
-                    // ...and on the Running rows (gh#117), which no board row
+                    // ...and on the unmanaged rows (gh#117), which no board row
                     // accounts for: a box hosting no board at all can still
                     // have a counter on screen that has to move.
                     let now = Utc::now();
@@ -845,29 +845,19 @@ impl BoardPanel {
         self.focus_handle.clone()
     }
 
-    /// The live attempts, joined to this device's chats and sessions — what the
-    /// sidebar's Agents section draws (gh#103).
+    /// Everything alive, joined to this device's chats and sessions — what the
+    /// sidebar's Active group draws (gh#103's attempts and gh#117's unmanaged
+    /// runs, one list since gh#123).
     ///
     /// On the panel rather than in `AppState` because the panel is what holds a
     /// board subscription, host sweep included: there is exactly one place that
     /// knows which device's rows these are, and a second copy in app state would
-    /// be a second thing to keep pointed at the same box.
-    pub fn agents(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::AgentRow> {
+    /// be a second thing to keep pointed at the same box. A device hosting no
+    /// board still answers — `self.model.rows` is empty, nothing is subtracted,
+    /// and every live chat is an unmanaged row.
+    pub fn active(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::ActiveRow> {
         let state = self.state.read(cx);
-        board::agent_rows(&self.model.rows, &state.chats, &state.sessions, now)
-    }
-
-    /// The working chats no attempt accounts for — the sidebar's Running group
-    /// (gh#117).
-    ///
-    /// Beside [`BoardPanel::agents`] because the two partition one list and
-    /// splitting them across owners is how a chat ends up in both: this needs
-    /// the board rows only to *subtract* them. A device hosting no board still
-    /// answers — `self.model.rows` is empty, nothing is subtracted, and every
-    /// live chat is running.
-    pub fn running(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::RunningRow> {
-        let state = self.state.read(cx);
-        board::running_rows(&self.model.rows, &state.chats, &state.sessions, now)
+        board::active_rows(&self.model.rows, &state.chats, &state.sessions, now)
     }
 
     /// Shell toggle hook. Opening starts the watch; closing keeps the rows so

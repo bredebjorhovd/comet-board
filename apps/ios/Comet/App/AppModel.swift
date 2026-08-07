@@ -289,23 +289,15 @@ final class AppModel {
 
     var boardAttached: Bool { demo != nil || board?.attached == true }
 
-    /// The live attempts, most urgent first (gh#103, phone-shaped). Joins the
-    /// three standing streams the app already holds.
-    var liveAgents: [AgentRow] {
+    /// The home screen's Active group (gh#123): everything alive, most urgent
+    /// first — live board attempts (gh#103) and the working chats no attempt
+    /// accounts for (gh#117), one list. Joins the three standing streams the
+    /// app already holds; the board rows are read only to subtract the
+    /// attempts, so a phone attached to no board at all still answers.
+    var activeChats: [ActiveRow] {
         let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
         let chats = demo?.chats ?? workspace?.chats ?? []
-        return agentRows(rows: boardRows, chats: chats, sessions: sessions)
-    }
-
-    /// The working chats no attempt accounts for (gh#117) — the orchestrator,
-    /// an ad-hoc agent chat, anything somebody started by hand. Beside
-    /// `liveAgents` because the two partition one list; the board rows are read
-    /// only to subtract the attempts, so a phone attached to no board at all
-    /// still answers.
-    var runningChats: [RunningRow] {
-        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
-        let chats = demo?.chats ?? workspace?.chats ?? []
-        return runningRows(rows: boardRows, chats: chats, sessions: sessions)
+        return activeRows(rows: boardRows, chats: chats, sessions: sessions)
     }
 
     /// The runtimes and logins a dispatch picker offers. Both belong to the

@@ -406,6 +406,9 @@ fn draw_sidebar_row(
         // A live board attempt (gh#103): the same two-line shape as a session
         // row, with the board's own state glyph and colours where the session
         // dot would be — the row means the same thing here as in the board pane.
+        // Since gh#123 it shares the Active group with unmanaged runs, and the
+        // issue identifier draws as a chip: in a mixed list, the chip is what
+        // says "the board released this" at a glance.
         Row::Agent {
             chat_id,
             identifier,
@@ -439,13 +442,24 @@ fn draw_sidebar_row(
             let elapsed =
                 board::agent_elapsed_label(*started_at, *cap_secs, now).unwrap_or_default();
             let elapsed_width = wrap::width_of(&elapsed);
-            let title_width = width.saturating_sub(3 + elapsed_width).max(1);
+            // Two columns more than a bare title: the chip's own padding.
+            let title_width = width.saturating_sub(5 + elapsed_width).max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(glyph, glyph_style),
+                    Span::raw(" "),
+                    // The identifier as a chip — element fill, the ramp's "a
+                    // thing you act on" level, held even on the cursor row so
+                    // origin survives selection. `NO_COLOR` has no fills and
+                    // simply reads the identifier, which the branch sub-line
+                    // backs up.
                     Span::styled(
-                        format!(" {}", wrap::truncate(identifier, title_width)),
-                        base.patch(if open { theme.body() } else { theme.subtle() }),
+                        format!(" {} ", wrap::truncate(identifier, title_width)),
+                        base.patch(if open {
+                            theme.element()
+                        } else {
+                            theme.element_subtle()
+                        }),
                     ),
                 ])),
                 Rect { height: 1, ..area },

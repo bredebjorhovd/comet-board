@@ -2175,7 +2175,7 @@ impl Shell {
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+        let keyed: Vec<(String, f32, AnyElement)> = self.render_session_rows(theme, cx);
 
         // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
         // list changes (new activity resort, grouping flip), surviving rows
@@ -2247,11 +2247,10 @@ impl Shell {
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
         let spaces_section = self.render_spaces_section(theme, cx);
-        // Between the spaces and the sessions: the live board attempts, when
-        // there are any (gh#103), and under them everything else that is
-        // working without one (gh#117).
-        let agents_section = self.render_agents_section(theme, cx);
-        let running_section = self.render_running_section(theme, cx);
+        // Between the spaces and the sessions: everything alive in one Active
+        // group (gh#123) — board attempts (gh#103) and the runs the board
+        // never released (gh#117), needs-you first.
+        let active_section = self.render_active_section(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2260,7 +2259,7 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            // Spaces + the global Active list share one scroll region. On
+            // Spaces + the global Sessions list share one scroll region. On
             // glass the whole region paints inside an EdgeFade scope — a true
             // per-glyph gradient at active overflow edges.
             .child(crate::edge_fade::edge_faded(
@@ -2281,8 +2280,7 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
-                            .children(agents_section)
-                            .children(running_section)
+                            .children(active_section)
                     .child(
                         div()
                             .px(px(Theme::SPACE_SM))
