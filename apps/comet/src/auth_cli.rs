@@ -83,6 +83,29 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long to wait for a running engine to answer `EdgeHealth`. Short: a
+/// status command must not hang on a wedged engine, and "it did not answer" is
+/// itself a reportable state.
+const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ask a running engine which edge connections it actually holds (gh#116).
+///
+/// Over IPC rather than by inspecting local files, because the whole point is
+/// live sockets — and over the local port rather than the relay, because an
+/// engine whose relay is down is exactly the case this is for.
+async fn edge_health(port: u16) -> anyhow::Result<comet_proto::EdgeHealth> {
+    let ask = async {
+        let client = comet_rpc::connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
+        let reply = client
+            .call(comet_rpc::methods::EDGE_HEALTH, serde_json::json!({}))
+            .await?;
+        Ok::<_, anyhow::Error>(serde_json::from_value(reply)?)
+    };
+    tokio::time::timeout(HEALTH_TIMEOUT, ask)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {}s", HEALTH_TIMEOUT.as_secs()))?
+}
+
 /// `comet status`: report auth + engine liveness. Exits nonzero when a sign-in
 /// is needed, so scripts (and service health checks) can gate on it.
 pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
@@ -135,6 +158,24 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
         },
         config.ipc_port
     );
+    // The gh#116 line. An engine can be running, signed in and answering IPC
+    // while holding not one live edge socket — locally perfect, remotely
+    // nonexistent — and until now the only way to see that was journald.
+    if ipc.is_ok() {
+        match edge_health(config.ipc_port).await {
+            Ok(health) => {
+                println!("Rooms:    {}", health.summary());
+                if health.dark() {
+                    println!(
+                        "          Remote viewers cannot see this device. It should recover \
+                         on its own within a few minutes; if it does not, restart the engine \
+                         (`comet daemon restart`)."
+                    );
+                }
+            }
+            Err(err) => println!("Rooms:    could not ask the engine ({err:#})"),
+        }
+    }
     if !signed_in {
         std::process::exit(1);
     }

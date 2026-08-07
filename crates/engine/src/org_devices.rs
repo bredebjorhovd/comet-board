@@ -150,8 +150,12 @@ impl OrgDevices {
         );
     }
 
+    /// Is the org registry room joined RIGHT NOW? (Not "do we hold a client" —
+    /// see [`comet_sync::RoomClient::connected`], gh#116.)
     pub fn connected(&self) -> bool {
-        lock(&self.inner.room).is_some()
+        lock(&self.inner.room)
+            .as_ref()
+            .is_some_and(|client| client.connected())
     }
 
     /// The underlying doc — what the room syncs (and what tests bridge).

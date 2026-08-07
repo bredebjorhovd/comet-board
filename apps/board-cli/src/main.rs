@@ -662,8 +662,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => {
-            let (engine, spaces, accounts) = match runtime.block_on(fetch_spaces(port)) {
-                Ok((device, spaces, accounts)) => (
+            let (engine, spaces, accounts, edge) = match runtime.block_on(fetch_spaces(port)) {
+                Ok((device, spaces, accounts, edge)) => (
                     EngineStatus {
                         reachable: true,
                         detail: format!(
@@ -673,6 +673,7 @@ fn main() -> Result<()> {
                     },
                     Some(spaces),
                     Some(accounts),
+                    edge,
                 ),
                 Err(e) => (
                     EngineStatus {
@@ -684,6 +685,7 @@ fn main() -> Result<()> {
                     },
                     None,
                     None,
+                    None,
                 ),
             };
             let checks = comet_board::doctor::doctor(
@@ -691,6 +693,7 @@ fn main() -> Result<()> {
                 &engine,
                 spaces.as_deref(),
                 accounts.as_deref(),
+                edge.as_ref(),
             )?;
             if !comet_board::doctor::print_doctor(&checks) {
                 std::process::exit(1);
@@ -698,7 +701,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Init { force } => {
-            let (_, spaces, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
+            let (_, spaces, _, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
                 format!(
                     "listing spaces from the engine on 127.0.0.1:{port} — \
                      start `comet` or `comet headless` first"
@@ -748,7 +751,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let (_, spaces, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
+            let (_, spaces, _, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
                 format!(
                     "listing spaces from the engine on 127.0.0.1:{port} — \
                      start `comet` or `comet headless` first"
@@ -1014,8 +1017,17 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
 /// This device's spaces, from the engine: `LocalDevice` for the device id, the
 /// first `WatchSpaces` snapshot for the rows, filtered to spaces this device
 /// owns — a route's `repo =` is a local path, and another device's folders are
-/// not on this disk.
-async fn fetch_spaces(port: u16) -> Result<(String, Vec<Space>, Vec<comet_proto::AgentAccount>)> {
+/// not on this disk. Plus the engine's live edge-connection census (gh#116),
+/// which is the one fact this loopback conversation cannot otherwise reveal.
+#[allow(clippy::type_complexity)] // one doctor fixture, deliberately not a struct
+async fn fetch_spaces(
+    port: u16,
+) -> Result<(
+    String,
+    Vec<Space>,
+    Vec<comet_proto::AgentAccount>,
+    Option<comet_proto::EdgeHealth>,
+)> {
     let fetch = async {
         let client: RpcClient = connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
         let device = client
@@ -1047,7 +1059,14 @@ async fn fetch_spaces(port: u16) -> Result<(String, Vec<Space>, Vec<comet_proto:
             .and_then(|v| serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(v).ok())
             .map(|s| s.accounts)
             .unwrap_or_default();
-        Ok::<_, anyhow::Error>((device, local, accounts))
+        // Best-effort, like the accounts above: an engine too old to know the
+        // method leaves doctor saying "not checked" rather than failing.
+        let edge: Option<comet_proto::EdgeHealth> = client
+            .call(methods::EDGE_HEALTH, serde_json::json!({}))
+            .await
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok());
+        Ok::<_, anyhow::Error>((device, local, accounts, edge))
     };
     tokio::time::timeout(FETCH_TIMEOUT, fetch)
         .await
