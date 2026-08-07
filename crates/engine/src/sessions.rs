@@ -795,23 +795,42 @@ impl Inner {
         ))
     }
 
-    /// What this chat's runs push with (gh#68).
+    /// What this chat's runs push with (gh#68), and whose name their commits
+    /// carry (gh#107).
     ///
-    /// Read off the chat row for the same reason the account is: the repo is a
-    /// property of the attempt, and a review comment landing next week starts a
-    /// new run in the same chat that has to be able to push the fix. A chat
-    /// nobody dispatched carries no repo and gets nothing, which leaves the
-    /// agent on the box's own git credentials.
+    /// Read off the chat row for the same reason the account is: both are
+    /// properties of the attempt, and a review comment landing next week starts
+    /// a new run in the same chat that has to be able to push the fix — under
+    /// the same author as the first commit. A chat nobody dispatched carries
+    /// neither and gets nothing, which leaves the agent on the box's own git
+    /// credentials and identity.
+    ///
+    /// The two halves are independent on purpose. A board with an author for
+    /// the dispatcher but no App credential still authors correctly (it just
+    /// pushes as the box user), and a board with the credential but no `[users]`
+    /// entry pushes as the App and commits as the box — which is what every
+    /// board did before this.
     ///
     /// Never fatal, unlike a named account that will not resolve: a missing
     /// credential means the push falls back to what it used before, and
     /// refusing the run would take away the agent that could still do the work.
     fn push_for(&self, chat_id: &str) -> Option<comet_harness::PushCredentials> {
-        let repo = self
-            .workspace()
-            .and_then(|ws| ws.chat_config(chat_id))
-            .and_then(|c| c.push_repo)?;
-        self.push.get()?.for_repo(&repo)
+        let config = self.workspace().and_then(|ws| ws.chat_config(chat_id))?;
+        let mut creds = config
+            .push_repo
+            .as_deref()
+            .and_then(|repo| self.push.get()?.for_repo(repo));
+        let Some(author) = config.git_author.as_ref() else {
+            return creds;
+        };
+        let env = comet_board::git_identity::author_env(author);
+        match &mut creds {
+            Some(creds) => creds.env.extend(env),
+            None => {
+                creds = Some(comet_harness::PushCredentials { env, bin_dir: None });
+            }
+        }
+        creds
     }
 
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.

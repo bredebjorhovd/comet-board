@@ -5,6 +5,10 @@
 //! what the harness child would actually be spawned with: askpass wiring for
 //! `git push`, a `gh` wrapper on PATH for `gh pr create`, the repo the attempt
 //! belongs to, and no token anywhere in either.
+//!
+//! gh#107 added the second thing that rides the same hop: `GIT_AUTHOR_*` for
+//! whoever released the work, so a teammate's dispatch commits as the teammate
+//! while the box stays the committer.
 
 use std::sync::{Arc, Mutex};
 
@@ -17,8 +21,8 @@ use comet_engine::push_credentials::PushCredentials;
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AgentEvent, ChatConfig, DoneStatus, GitAuthor, HarnessId, Model, ReasoningLevel, RunRequest,
+    SandboxLevel, SteeringMode,
 };
 
 /// A harness that records the controls it was handed and ends the run. Keyed
@@ -82,7 +86,7 @@ fn run_request(cwd: &str) -> RunRequest {
     }
 }
 
-fn chat_config(push_repo: Option<&str>) -> ChatConfig {
+fn chat_config(push_repo: Option<&str>, git_author: Option<GitAuthor>) -> ChatConfig {
     ChatConfig {
         harness: HarnessId::Mock,
         model: None,
@@ -91,6 +95,7 @@ fn chat_config(push_repo: Option<&str>) -> ChatConfig {
         sandbox: SandboxLevel::WorkspaceWrite,
         account: None,
         push_repo: push_repo.map(str::to_string),
+        git_author,
     }
 }
 
@@ -133,7 +138,13 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         .create_chat(
             "chat-dispatched",
             "space-1",
-            Some(chat_config(Some("owner/widget"))),
+            Some(chat_config(
+                Some("owner/widget"),
+                Some(GitAuthor {
+                    name: "Ana Ruiz".into(),
+                    email: "22494697+ana@users.noreply.github.com".into(),
+                }),
+            )),
             Some("/tmp".into()),
         )
         .unwrap();
@@ -147,13 +158,35 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         .await
         .expect("run dispatches");
 
+    // A dispatch by somebody the `[users]` map names, on a board with no repo
+    // to authenticate for (a Linear ticket in a space with no GitHub remote):
+    // the two halves are independent, so the commits are still theirs.
+    core.workspace
+        .create_chat(
+            "chat-authored",
+            "space-1",
+            Some(chat_config(
+                None,
+                Some(GitAuthor {
+                    name: "Sam Ito".into(),
+                    email: "8134+samito@users.noreply.github.com".into(),
+                }),
+            )),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.sessions
+        .dispatch("chat-authored", HarnessId::Mock, run_request("/tmp"), None)
+        .await
+        .expect("run dispatches");
+
     // A chat somebody opened themselves: no repo, no credentials, and the
     // agent keeps pushing with whatever git the box has.
     core.workspace
         .create_chat(
             "chat-plain",
             "space-1",
-            Some(chat_config(None)),
+            Some(chat_config(None, None)),
             Some("/tmp".into()),
         )
         .unwrap();
@@ -173,7 +206,7 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let chats: Vec<_> = recorded().into_iter().filter_map(|(id, _)| id).collect();
-        if ["chat-dispatched", "chat-plain"]
+        if ["chat-dispatched", "chat-authored", "chat-plain"]
             .iter()
             .all(|c| chats.iter().any(|id| id == c))
         {
@@ -235,6 +268,33 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     assert!(
         !env.contains_key("GH_TOKEN"),
         "a token was exported into the agent's environment: {env:?}"
+    );
+
+    // Whose commits these are (gh#107). The author is the teammate the board
+    // resolved at dispatch; the committer is left unset, so git falls back to
+    // the box's own pinned identity — "they wrote it, this box committed it".
+    assert_eq!(
+        env.get("GIT_AUTHOR_NAME").map(String::as_str),
+        Some("Ana Ruiz")
+    );
+    assert_eq!(
+        env.get("GIT_AUTHOR_EMAIL").map(String::as_str),
+        Some("22494697+ana@users.noreply.github.com")
+    );
+    assert!(
+        !env.keys().any(|k| k.starts_with("GIT_COMMITTER")),
+        "the box commits: {env:?}"
+    );
+
+    let authored = for_chat("chat-authored").expect("an author with no repo is still an author");
+    let env: std::collections::BTreeMap<_, _> = authored.env.iter().cloned().collect();
+    assert_eq!(
+        env.get("GIT_AUTHOR_EMAIL").map(String::as_str),
+        Some("8134+samito@users.noreply.github.com")
+    );
+    assert!(
+        !env.contains_key("GIT_ASKPASS"),
+        "there is no repo to authenticate for: {env:?}"
     );
 
     assert!(
