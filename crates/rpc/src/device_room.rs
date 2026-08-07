@@ -237,6 +237,11 @@ impl HostRelayConfig {
 /// so the superseded process backs off and retries, mirroring comet's DeviceRoomHost).
 pub struct HostRelay {
     task: tokio::task::JoinHandle<()>,
+    /// Is the host socket up right now? The supervisor below is immortal, so a
+    /// live `HostRelay` says nothing about reachability — this does (gh#116:
+    /// the box's host socket died with an edge redeploy and the only way to
+    /// learn that was grepping journald).
+    connected: watch::Receiver<bool>,
 }
 
 impl HostRelay {
@@ -245,6 +250,7 @@ impl HostRelay {
         service: Arc<dyn RpcService>,
         on_nudge: NudgeHandler,
     ) -> Self {
+        let (connected_tx, connected_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let mut wake = comet_sync::wake::subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
@@ -264,7 +270,8 @@ impl HostRelay {
                         &token,
                     );
                     let started = tokio::time::Instant::now();
-                    let outcome = host_session(&url, &service, &on_nudge).await;
+                    let outcome = host_session(&url, &service, &on_nudge, &connected_tx).await;
+                    connected_tx.send_replace(false);
                     let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
                     match outcome {
                         Ok(()) => {
@@ -291,7 +298,20 @@ impl HostRelay {
                 }
             }
         });
-        Self { task }
+        Self {
+            task,
+            connected: connected_rx,
+        }
+    }
+
+    /// Is this device's DeviceRoom host socket up right now?
+    pub fn connected(&self) -> bool {
+        *self.connected.borrow()
+    }
+
+    /// Watch [`Self::connected`].
+    pub fn watch_connected(&self) -> watch::Receiver<bool> {
+        self.connected.clone()
     }
 }
 
@@ -362,11 +382,13 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    connected: &watch::Sender<bool>,
 ) -> Result<(), RpcError> {
     let (ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
     tracing::info!("device-room: host connected");
+    connected.send_replace(true);
     let (mut sink, mut stream) = ws.split();
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);

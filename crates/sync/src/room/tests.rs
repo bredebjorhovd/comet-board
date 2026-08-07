@@ -535,6 +535,61 @@ async fn reconnects_with_backoff_and_rejoins_after_connection_loss() {
     client.shutdown().await.unwrap();
 }
 
+/// gh#116: holding a `RoomClient` is not holding a room. The flag has to track
+/// the SESSION — false the moment the socket dies, true again only when a join
+/// is answered — because every "is this device online" answer above it (the
+/// engine's edge-health census, `comet status`, doctor) is read from here.
+/// Before this existed, a supervisor could only ask "do I have a client", and a
+/// box whose edge sockets all died answered yes for 25 minutes.
+#[tokio::test]
+async fn connected_tracks_the_session_not_the_existence_of_a_client() {
+    let edge = FakeEdge::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new())
+        .await
+        .expect("connect");
+    assert!(client.connected(), "a joined client reports connected");
+
+    edge.kick_all();
+    wait_until(|| !client.connected()).await;
+
+    // The client is untouched — only the socket died — and the redial restores
+    // the flag with no help from anyone.
+    wait_until(|| client.connected()).await;
+    client.shutdown().await.unwrap();
+}
+
+/// The supervisor's death certificate: when the actor task ends, its flag drops
+/// and the watch CLOSES. That is the only way a layer above can tell "still
+/// redialing" from "will never dial again" — the event channel cannot say it,
+/// because the client holds a sender of its own and so it never closes.
+#[tokio::test]
+async fn the_health_watch_closes_when_the_actor_ends() {
+    let edge = FakeEdge::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new())
+        .await
+        .expect("connect");
+    let mut health = client.watch_connected();
+    assert!(*health.borrow_and_update());
+
+    client.shutdown().await.unwrap();
+
+    // Drains the final `false` (if it has not been observed yet), then errors.
+    let closed = tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if health.changed().await.is_err() {
+                return true;
+            }
+        }
+    })
+    .await
+    .expect("the watch must close, not hang");
+    assert!(closed);
+    assert!(
+        !*health.borrow(),
+        "a closed watch must read as disconnected, never as the last live value"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_sends_leave() {
     let edge = FakeEdge::new();
@@ -687,7 +742,10 @@ async fn hung_dial_times_out_and_redials() {
     // retried on backoff. A wedged dial would freeze the count at 2.
     tokio::time::sleep(Duration::from_secs(120)).await;
     let dials = connector.dials.load(Ordering::SeqCst);
-    assert!(dials >= 4, "hung dials must time out and be retried; saw {dials}");
+    assert!(
+        dials >= 4,
+        "hung dials must time out and be retried; saw {dials}"
+    );
     drop(client);
 }
 

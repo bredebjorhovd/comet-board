@@ -284,6 +284,36 @@ async fn pump(
     }
 }
 
+/// Live-connection flag shared by the actor and its [`RoomClient`].
+///
+/// The `RoomEvent` broadcast says what just happened and is lossy by design
+/// (receivers may lag); this says what is true right now, and a supervisor can
+/// poll or await it. Two things make it more than a convenience:
+///
+/// - it is the difference between "we hold a `RoomClient`" and "we hold a room"
+///   — the state gh#116 went dark in, where every slot was `Some(client)` and
+///   not one socket was alive;
+/// - dropping it (which the actor does on ANY exit, including a panic) closes
+///   the watch, so `changed()` erroring is the actor's death certificate. A
+///   supervisor cannot get that from the event channel: the `RoomClient` holds
+///   a sender of its own, so events never close while the client is alive.
+struct ConnectedFlag(watch::Sender<bool>);
+
+impl ConnectedFlag {
+    fn set(&self, connected: bool) {
+        self.0.send_replace(connected);
+    }
+}
+
+impl Drop for ConnectedFlag {
+    fn drop(&mut self) {
+        // Publish the truth before the channel closes, so a watcher that reads
+        // `borrow()` after the actor is gone sees "not connected" rather than
+        // the last live value.
+        self.0.send_replace(false);
+    }
+}
+
 /// A live room membership for one Loro doc.
 ///
 /// Owns a background task that keeps `doc` converged with the room: pushes
@@ -296,6 +326,7 @@ pub struct RoomClient {
     doc: LoroDoc,
     eph: EphemeralStore,
     events: broadcast::Sender<RoomEvent>,
+    connected: watch::Receiver<bool>,
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// Doc + ephemeral local-update subscriptions (drop = unsubscribe).
@@ -351,6 +382,7 @@ impl RoomClient {
 
         let (events, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (connected_tx, connected_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let actor = RoomActor {
@@ -361,6 +393,7 @@ impl RoomClient {
             local_rx,
             eph_rx,
             events: events.clone(),
+            connected: Arc::new(ConnectedFlag(connected_tx)),
             shutdown: shutdown_rx,
         };
         let task = tokio::spawn(actor.run(ready_tx));
@@ -370,6 +403,7 @@ impl RoomClient {
                 doc,
                 eph,
                 events,
+                connected: connected_rx,
                 shutdown: shutdown_tx,
                 task: Some(task),
                 _subs: vec![sub_doc, sub_eph],
@@ -399,6 +433,25 @@ impl RoomClient {
     /// Subscribe to connection/sync lifecycle events.
     pub fn events(&self) -> broadcast::Receiver<RoomEvent> {
         self.events.subscribe()
+    }
+
+    /// Is this client joined to the room RIGHT NOW?
+    ///
+    /// Holding a `RoomClient` is not the same as holding a room: the actor
+    /// keeps redialing across drops, and between a lost socket and the next
+    /// `JoinResponseOk` this reads false. Every "am I online" answer the engine
+    /// gives — `comet status`, doctor, the device overlay — has to come from
+    /// here rather than from the existence of the client (gh#116).
+    pub fn connected(&self) -> bool {
+        *self.connected.borrow()
+    }
+
+    /// Watch [`Self::connected`]. The channel CLOSES when the actor task ends
+    /// for any reason (clean shutdown, or a panic that would otherwise leave a
+    /// client that can never reconnect), so `changed()` returning `Err` is the
+    /// supervisor's cue to rebuild this client rather than wait forever.
+    pub fn watch_connected(&self) -> watch::Receiver<bool> {
+        self.connected.clone()
     }
 
     /// Leave the room (protocol `Leave` frames + close handshake) and stop the
@@ -437,6 +490,10 @@ struct RoomActor {
     local_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     eph_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     events: broadcast::Sender<RoomEvent>,
+    /// Live-connection truth for the client (and its supervisor). Held as an
+    /// `Arc` so the per-connection `Session` can raise it the moment the join
+    /// is answered; dropped with the actor, which closes the watch.
+    connected: Arc<ConnectedFlag>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -477,7 +534,22 @@ impl RoomActor {
                 }
             };
             match end {
-                SessionEnd::Shutdown => return,
+                SessionEnd::Shutdown => {
+                    // `local_rx`/`eph_rx` closing reaches here too — the doc or
+                    // ephemeral subscription is gone, so this actor can never
+                    // publish another local commit. Say so: before gh#116 it
+                    // returned in silence while the `RoomClient` lived on
+                    // looking connected, which is precisely the shape of a box
+                    // that is up and invisible. The dropped `connected` flag
+                    // tells the supervisor to rebuild.
+                    if !*self.shutdown.borrow() {
+                        tracing::error!(
+                            room = %self.room_id,
+                            "room actor lost its local-update channel; the room needs rebuilding"
+                        );
+                    }
+                    return;
+                }
                 SessionEnd::Evicted(reason) => {
                     if let Some(tx) = ready.take() {
                         let _ = tx.send(Err(SyncError::JoinRefused(reason)));
@@ -540,6 +612,7 @@ impl RoomActor {
             room_id: self.room_id.clone(),
             tx: pipe.tx.clone(),
             events: self.events.clone(),
+            connected: self.connected.clone(),
             pending: HashMap::new(),
             fragments: HashMap::new(),
             joined_lor: false,
@@ -679,6 +752,9 @@ impl RoomActor {
             }
         };
         let joined = sess.joined_lor;
+        // The session is over whatever the reason; nothing is live again until
+        // the next JoinResponseOk raises this.
+        self.connected.set(false);
         (end, joined)
     }
 }
@@ -698,6 +774,10 @@ struct Session {
     room_id: String,
     tx: mpsc::Sender<Vec<u8>>,
     events: broadcast::Sender<RoomEvent>,
+    /// Raised on every answered `%LOR` join (probe answers included — an
+    /// answered probe IS proof the room is live); lowered by the actor when the
+    /// session ends.
+    connected: Arc<ConnectedFlag>,
     /// Sent-but-unacked outbound batches, kept for FragmentTimeout resends.
     pending: HashMap<BatchId, Vec<Vec<u8>>>,
     /// Inbound reassembly buffers.
@@ -892,6 +972,7 @@ impl Session {
                 self.join_sent_at = None; // join answered — disarm the deadline
                 let was_probe = std::mem::take(&mut self.join_is_probe);
                 self.joined_lor = true;
+                self.connected.set(true);
                 // Resubmit-from-VV: push everything the server lacks. This
                 // covers both fresh docs (first upload) and updates that went
                 // unacked across a reconnect or stale-peer resync. Gated on

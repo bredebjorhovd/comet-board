@@ -16,7 +16,7 @@ use crate::git_identity;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
-use comet_proto::{AgentAccount, Space};
+use comet_proto::{AgentAccount, EdgeHealth, Space};
 
 pub struct Check {
     pub name: String,
@@ -39,12 +39,14 @@ pub struct EngineStatus {
 /// `spaces` is this device's space list, and `accounts` its saved agent
 /// logins, or `None` when the engine could not be asked. Route checks against
 /// a `None` say "not checked" rather than failing every route over one dead
-/// engine — the engine check itself is the one that fails loudly.
+/// engine — the engine check itself is the one that fails loudly. `edge` is
+/// the same engine's live edge-connection census (gh#116).
 pub fn doctor(
     paths: &Paths,
     engine: &EngineStatus,
     spaces: Option<&[Space]>,
     accounts: Option<&[AgentAccount]>,
+    edge: Option<&EdgeHealth>,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
@@ -107,6 +109,13 @@ pub fn doctor(
         ok: engine.reachable,
         detail: engine.detail.clone(),
     });
+
+    // Reachable from this shell is not the same as reachable from anywhere
+    // else (gh#116). Every other check on this box runs over the loopback IPC
+    // port, which stays perfectly healthy while the edge sockets are dead —
+    // the exact state the box was in for 25 minutes after an edge redeploy,
+    // dispatching happily and invisible to every remote viewer.
+    checks.push(edge_connections_check(edge));
 
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
@@ -385,6 +394,36 @@ pub fn doctor(
     )));
 
     Ok(checks)
+}
+
+/// Which edge connections the engine on this box actually holds (gh#116).
+///
+/// Fails on exactly one state — [`EdgeHealth::dark`]: an engine wired to an
+/// edge, holding none of it. That is the state nobody could see. A room or two
+/// down is reported and not failed, because a client that has just dropped is
+/// already redialing and doctor must not cry wolf at every edge deploy; an
+/// engine that could not be asked is not failed either, since the `engine`
+/// check above already says so, loudly and once.
+fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
+    let Some(edge) = edge else {
+        return Check {
+            name: "edge connections".into(),
+            ok: true,
+            detail: "not checked — the engine did not answer".into(),
+        };
+    };
+    let mut detail = edge.summary();
+    if edge.dark() {
+        detail.push_str(
+            ". A remote viewer sees no board on this device. Recovery is automatic within \
+             a few minutes; if this persists, restart the engine (`comet daemon restart`)",
+        );
+    }
+    Check {
+        name: "edge connections".into(),
+        ok: !edge.dark(),
+        detail,
+    }
 }
 
 /// Does this box have a git identity, and will GitHub attribute what it signs
@@ -1368,10 +1407,76 @@ mod tests {
     #[test]
     fn doctor_reports_a_missing_routing_file_without_panicking() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
+    }
+
+    fn edge_check_in(checks: &[Check]) -> &Check {
+        checks
+            .iter()
+            .find(|c| c.name == "edge connections")
+            .expect("edge connections is always reported")
+    }
+
+    /// gh#116: the state the box was actually in — engine up, IPC answering,
+    /// every edge socket dead. Doctor has to fail on it, because nothing else
+    /// on this box can tell.
+    #[test]
+    fn an_engine_holding_no_edge_connections_fails() {
+        let (_d, p) = tmp();
+        let dark = EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            host_relay: Some(false),
+            workspace_room: Some(false),
+            org_registry: Some(false),
+            chat_rooms_open: 1,
+            chat_rooms_live: 0,
+        };
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark)).unwrap();
+        let check = edge_check_in(&checks);
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("0 of 4 live"), "{}", check.detail);
+        assert!(
+            check.detail.contains("no board on this device"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// One room down while others are live is a client mid-redial, not an
+    /// outage — reported, never failed, or every edge deploy would fail doctor.
+    #[test]
+    fn one_room_down_is_reported_but_does_not_fail() {
+        let (_d, p) = tmp();
+        let partial = EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            host_relay: Some(true),
+            workspace_room: Some(false),
+            org_registry: Some(true),
+            chat_rooms_open: 0,
+            chat_rooms_live: 0,
+        };
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial)).unwrap();
+        let check = edge_check_in(&checks);
+        assert!(check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("workspace room down"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// No answer from the engine is the `engine` check's failure to report, not
+    /// this one's — one dead engine must not produce two red lines.
+    #[test]
+    fn an_unaskable_engine_leaves_the_edge_check_unchecked() {
+        let (_d, p) = tmp();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let check = edge_check_in(&checks);
+        assert!(check.ok);
+        assert!(check.detail.contains("not checked"), "{}", check.detail);
     }
 
     #[test]
@@ -1387,7 +1492,7 @@ mod tests {
             reachable: false,
             detail: "connection refused".into(),
         };
-        let checks = doctor(&p, &down, None, Some(&[])).unwrap();
+        let checks = doctor(&p, &down, None, Some(&[]), None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
         // The route's space is "not checked", not failed: one dead engine must
         // not fail every route and bury its own report.
@@ -1434,13 +1539,15 @@ mod tests {
         };
 
         routing("origin/HEAD");
-        let (ok, detail) = base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap());
+        let (ok, detail) =
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap());
         assert!(!ok, "{detail}");
         assert!(detail.contains("origin"), "{detail}");
         assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
 
         routing("HEAD");
-        let (ok, detail) = base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap());
+        let (ok, detail) =
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap());
         assert!(ok, "{detail}");
     }
 
@@ -1490,14 +1597,14 @@ mod tests {
             comet_proto::HarnessId::ClaudeCode,
         )];
 
-        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved)).unwrap();
+        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None).unwrap();
         let c = account_check_in(&ok);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("sam@example.com"), "{}", c.detail);
 
         // An id this device has never saved: named, along with what it does have.
         routing_with_account(&p, "claude-code", "ffffffffffffffff");
-        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved)).unwrap();
+        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None).unwrap();
         let c = account_check_in(&bad);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("ffffffffffffffff"), "{}", c.detail);
@@ -1515,7 +1622,7 @@ mod tests {
             "sam@example.com",
             comet_proto::HarnessId::ClaudeCode,
         )];
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None).unwrap();
         let c = account_check_in(&checks);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("claude-code"), "{}", c.detail);
@@ -1533,11 +1640,11 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         assert!(!checks.iter().any(|c| c.name == "route w: account"));
 
         routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
-        let checks = doctor(&p, &engine_up(), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("not checked"), "{}", c.detail);
@@ -1553,7 +1660,7 @@ mod tests {
         )
         .unwrap();
         let spaces = [space("Tally")];
-        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None).unwrap();
         // Case-insensitive, like every other name match on the board.
         let c = checks
             .iter()
@@ -1561,7 +1668,7 @@ mod tests {
             .unwrap();
         assert!(c.ok, "{}", c.detail);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "route tally: space")
@@ -1583,7 +1690,7 @@ mod tests {
              runtime = \"gpt-piloted-typewriter\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let alias = checks
             .iter()
             .find(|c| c.name == "route w: runtime" && c.ok)
@@ -1613,7 +1720,7 @@ mod tests {
              runtime = \"claude\"\nmax_duration = \"off\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let detail = |name: &str| {
             checks
                 .iter()
@@ -1764,7 +1871,7 @@ mod tests {
     fn doctor_emits_the_billing_guard_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "billing guard")
@@ -1780,7 +1887,7 @@ mod tests {
             "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "settle notice")
@@ -1795,7 +1902,7 @@ mod tests {
     fn doctor_says_when_no_agent_is_running_the_board() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "orchestrator")
@@ -1813,7 +1920,7 @@ mod tests {
             "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
@@ -1868,7 +1975,7 @@ mod tests {
         db.set_attempt_pane(a, "chat-9").unwrap();
         drop(db);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
@@ -2022,7 +2129,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         assert!(
             !checks.iter().any(|c| c.name == "linear review state"),
             "a board with no Linear anywhere must not be handed a Linear setting"
@@ -2041,7 +2148,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[])).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
         assert!(checks.iter().any(|c| c.name == "linear review state"));
     }
 
