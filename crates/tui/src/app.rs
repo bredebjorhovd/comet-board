@@ -137,6 +137,21 @@ pub enum Row {
         started_at: Option<DateTime<Utc>>,
         cap_secs: Option<u64>,
     },
+    /// A working chat with no attempt behind it (gh#117): state glyph + the
+    /// chat's own title + elapsed. One line — there is no branch promised and
+    /// no issue to name, so a second line would be an empty one.
+    Running {
+        /// Namespaced in [`Row::key`] like [`Row::Agent`], for the same reason:
+        /// the same chat also has a row in the Sessions list.
+        chat_id: String,
+        space_id: Option<String>,
+        title: String,
+        /// `Working` or `Blocked` only — membership is the live indicator.
+        state: AgentState,
+        /// When the RUN started, off the session mirror. The instant, not the
+        /// age, so the counter moves on a redraw.
+        started_at: Option<DateTime<Utc>>,
+    },
     /// A session: dot + title + time, then an indented "space@device".
     Chat {
         id: String,
@@ -162,10 +177,10 @@ pub enum Row {
 
 impl Row {
     /// What this row *addresses* — a space, or a chat in the Sessions list.
-    /// Decoration addresses nothing, and neither does an agent row: it points
-    /// at a chat the Sessions list already answers for, and two rows answering
-    /// to one id would let "put the cursor on chat X" land on either.
-    /// Cursor identity is [`Row::key`].
+    /// Decoration addresses nothing, and neither does an agent or running row:
+    /// each points at a chat the Sessions list already answers for, and two
+    /// rows answering to one id would let "put the cursor on chat X" land on
+    /// either. Cursor identity is [`Row::key`].
     pub fn id(&self) -> Option<&str> {
         match self {
             Row::Space { id, .. } | Row::Chat { id, .. } => Some(id),
@@ -175,12 +190,13 @@ impl Row {
 
     /// Which row this *is*, for the identity-preserving cursor across rebuilds.
     ///
-    /// An agent row shares its chat with the Sessions list, so its key is
-    /// namespaced with the NUL prefix the board pane's section headers use —
-    /// otherwise a rebuild would slide the cursor between the two lists.
+    /// An agent or running row shares its chat with the Sessions list, so its
+    /// key is namespaced with the NUL prefix the board pane's section headers
+    /// use — otherwise a rebuild would slide the cursor between the lists.
     pub fn key(&self) -> Option<String> {
         match self {
             Row::Agent { chat_id, .. } => Some(format!("\u{0}agent:{chat_id}")),
+            Row::Running { chat_id, .. } => Some(format!("\u{0}running:{chat_id}")),
             other => other.id().map(str::to_string),
         }
     }
@@ -196,6 +212,9 @@ impl Row {
             // Identifier over branch — the same two-line shape, so the two
             // lists read as one pane rather than two designs.
             Row::Agent { .. } => 2,
+            // One line: the sub-line under an agent row carries its branch, and
+            // an unmanaged run has none to carry.
+            Row::Running { .. } => 1,
             // An account with no display name is one line, not one line and a
             // blank: the second row exists to carry the email *under* a name.
             Row::User { name, email } => {
@@ -213,7 +232,7 @@ impl Row {
     pub fn selectable(&self) -> bool {
         matches!(
             self,
-            Row::Space { .. } | Row::Chat { .. } | Row::Agent { .. }
+            Row::Space { .. } | Row::Chat { .. } | Row::Agent { .. } | Row::Running { .. }
         )
     }
 }
@@ -1263,6 +1282,19 @@ impl App {
                 self.focus = Focus::Composer;
                 effects
             }
+            // Same again for an unmanaged run, which already carries the space
+            // it belongs to: opening it is opening its transcript, which is
+            // where answering it happens.
+            Some(Row::Running {
+                chat_id, space_id, ..
+            }) => {
+                if space_id.is_some() {
+                    self.selected_space = space_id.clone();
+                }
+                let effects = self.select_chat(Some(chat_id));
+                self.focus = Focus::Composer;
+                effects
+            }
         }
     }
 
@@ -1853,6 +1885,31 @@ impl App {
             }
         }
 
+        // Running, under them: everything working that the board did NOT
+        // release (gh#117) — the pinned orchestrator, an ad-hoc agent chat, a
+        // session somebody started by hand. Same shape, separate group, because
+        // these have no issue, branch, cap or bill behind them; the board rows
+        // are read only to subtract the attempts, so a box hosting no board
+        // fills this group all the same.
+        let running = board_view::running_rows(&self.board.rows, &self.chats, &self.sessions, now);
+        if !running.is_empty() {
+            let blocked = board_view::running_needing_attention(&running);
+            rows.push(Row::Blank);
+            rows.push(Row::Section {
+                label: "Running".into(),
+                action: (blocked > 0).then(|| format!("{blocked} blocked")),
+            });
+            for run in running {
+                rows.push(Row::Running {
+                    chat_id: run.chat_id,
+                    space_id: run.space_id,
+                    title: run.title,
+                    state: run.state,
+                    started_at: run.started_at,
+                });
+            }
+        }
+
         rows.push(Row::Blank);
         rows.push(Row::Section {
             label: "Sessions".into(),
@@ -2269,19 +2326,23 @@ impl App {
         })
     }
 
-    /// A second-resolution counter is on screen: the sidebar's Agents section
-    /// (or the board pane) is showing elapsed times, and they have to move.
+    /// A second-resolution counter is on screen: the sidebar's Agents or
+    /// Running section (or the board pane) is showing elapsed times, and they
+    /// have to move.
     ///
     /// Separate from [`App::animating`], which paces the spinner at animation
-    /// framerate. This wants one wake-up a second, and only while an attempt is
-    /// actually live — a *blocked* agent animates nothing and would otherwise
-    /// sit at the age it had when the last frame happened to land.
+    /// framerate. This wants one wake-up a second, and only while something is
+    /// actually live — a *blocked* row animates nothing and would otherwise sit
+    /// at the age it had when the last frame happened to land.
     pub fn counting(&self) -> bool {
         matches!(self.gate(), GatePhase::Ready)
             && self.rows.iter().any(|row| {
                 matches!(
                     row,
                     Row::Agent {
+                        started_at: Some(_),
+                        ..
+                    } | Row::Running {
                         started_at: Some(_),
                         ..
                     }
@@ -4348,6 +4409,216 @@ mod tests {
         app.apply(Update::Board(vec![live]));
         assert!(!app.animating(), "a blocked agent spins nothing");
         assert!(app.counting(), "but its age still has to move");
+    }
+
+    // ---- the Running group (gh#117) ---------------------------------------
+
+    fn running_rows_in_sidebar(app: &App) -> Vec<(String, AgentState)> {
+        app.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Running { title, state, .. } => Some((title.clone(), *state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The gh#117 case exactly: an orchestrator raises in-chat subagents rather
+    /// than dispatching, so real work runs with no attempt row anywhere. It has
+    /// to be visible without a board having heard of it.
+    #[test]
+    fn a_working_chat_the_board_never_released_still_shows() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![
+            chat("orchestrator", "s1", 1),
+            chat("adhoc", "s1", 2),
+            chat("quiet", "s1", 3),
+        ]));
+        app.apply(Update::Sessions(vec![
+            session("orchestrator", SessionStatus::Working, 0),
+            session("adhoc", SessionStatus::AwaitingInput, 0),
+        ]));
+
+        assert!(!app.board_open, "nobody opened the board pane");
+        assert!(
+            app.board.rows.is_empty(),
+            "and there is no board here to have released them"
+        );
+        let running = running_rows_in_sidebar(&app);
+        assert_eq!(
+            running,
+            vec![
+                ("chat adhoc".to_string(), AgentState::Blocked),
+                ("chat orchestrator".to_string(), AgentState::Working),
+            ],
+            "blocked floats, and the quiet chat is not a run"
+        );
+        assert!(app.rows.iter().any(|row| matches!(
+            row,
+            Row::Section { label, action: Some(count) }
+                if label == "Running" && count == "1 blocked"
+        )));
+    }
+
+    /// The two groups partition the box's load — a dispatched chat is the
+    /// Agents group's, and drawing it twice would double-count what is running.
+    #[test]
+    fn a_dispatched_chat_is_an_agent_and_not_also_running() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![
+            chat("chat-a", "s1", 1),
+            chat("chat-b", "s1", 2),
+        ]));
+        let mut live = board_row("a", BoardState::Working);
+        live.chat_id = Some("chat-a".into());
+        app.apply(Update::Board(vec![live]));
+        app.apply(Update::Sessions(vec![
+            session("chat-a", SessionStatus::Working, 0),
+            session("chat-b", SessionStatus::Working, 0),
+        ]));
+
+        assert_eq!(
+            agent_rows_in_sidebar(&app)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["gh#a".to_string()]
+        );
+        assert_eq!(
+            running_rows_in_sidebar(&app)
+                .into_iter()
+                .map(|(title, _)| title)
+                .collect::<Vec<_>>(),
+            vec!["chat chat-b".to_string()]
+        );
+    }
+
+    /// The group appears with the run and leaves with it, within one watch
+    /// frame either way — and leaves nothing behind when it goes.
+    #[test]
+    fn the_running_group_appears_and_leaves_with_the_run() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        assert!(running_rows_in_sidebar(&app).is_empty(), "nothing running");
+
+        app.apply(Update::Sessions(vec![session(
+            "chat-a",
+            SessionStatus::Working,
+            0,
+        )]));
+        assert_eq!(running_rows_in_sidebar(&app).len(), 1);
+
+        app.apply(Update::Sessions(vec![session(
+            "chat-a",
+            SessionStatus::Idle,
+            0,
+        )]));
+        assert!(running_rows_in_sidebar(&app).is_empty());
+        assert!(
+            app.rows.iter().any(|row| row.id() == Some("chat-a")),
+            "the session row outlives the run"
+        );
+        assert!(
+            !app.rows
+                .iter()
+                .any(|row| matches!(row, Row::Section { label, .. } if label == "Running")),
+            "an empty Running header is a permanent reminder of nothing"
+        );
+    }
+
+    /// A crashed backend sends no frame to say it died, so the row has to
+    /// expire against the clock — the same staleness gate the dots use.
+    #[test]
+    fn a_dead_run_leaves_the_group_on_staleness_alone() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        app.apply(Update::Sessions(vec![session(
+            "chat-a",
+            SessionStatus::Working,
+            (comet_proto::view::SESSION_STALE_MS / 1000) + 1,
+        )]));
+        assert!(
+            running_rows_in_sidebar(&app).is_empty(),
+            "a session nothing has heartbeated is not a live run"
+        );
+    }
+
+    /// A running row and its session row address the same chat, so the cursor
+    /// has to be able to tell them apart across a rebuild.
+    #[test]
+    fn the_cursor_does_not_slide_between_a_running_row_and_its_session_row() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        app.apply(Update::Sessions(vec![session(
+            "chat-a",
+            SessionStatus::Working,
+            0,
+        )]));
+        app.cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Running { .. }))
+            .unwrap();
+        app.apply(Update::Sessions(vec![session(
+            "chat-a",
+            SessionStatus::AwaitingInput,
+            0,
+        )]));
+        assert!(matches!(app.rows.get(app.cursor), Some(Row::Running { .. })));
+    }
+
+    #[test]
+    fn opening_a_running_row_opens_its_chat_in_its_space() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![
+            chat("chat-a", "s1", 1),
+            chat("chat-b", "s2", 2),
+        ]));
+        app.apply(Update::Spaces(vec![
+            space("s1", "/dev/one", 0),
+            space("s2", "/dev/two", 1),
+        ]));
+        app.apply(Update::Sessions(vec![session(
+            "chat-b",
+            SessionStatus::AwaitingInput,
+            0,
+        )]));
+        app.selected_space = Some("s1".into());
+
+        app.cursor = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Running { .. }))
+            .unwrap();
+        let effects = app.act(Action::Open);
+        assert_eq!(app.selected_chat.as_deref(), Some("chat-b"));
+        // Answering a blocked run means typing at it, so focus lands there.
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.selected_space.as_deref(), Some("s2"));
+        assert!(effects.iter().any(|c| is_watch(c, Some("chat-b"))));
+    }
+
+    /// A blocked unmanaged run animates nothing, and its age still has to move.
+    #[test]
+    fn a_running_row_owes_the_loop_a_second_by_second_redraw() {
+        let mut app = seeded();
+        app.apply(Update::Auth(Box::new(AuthState::SignedIn {
+            user: comet_proto::UserProfile {
+                id: "u".into(),
+                email: "b@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org".into()),
+        })));
+        app.connection = ConnectionStatus::Ready;
+        app.apply(Update::Chats(vec![chat("chat-a", "s1", 1)]));
+        assert!(!app.counting(), "nothing running, no wake-ups owed");
+
+        app.apply(Update::Sessions(vec![Session {
+            started_at: Some(Utc::now()),
+            ..session("chat-a", SessionStatus::AwaitingInput, 0)
+        }]));
+        assert!(app.counting());
     }
 
     #[test]

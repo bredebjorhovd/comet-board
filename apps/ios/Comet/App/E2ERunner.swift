@@ -240,6 +240,13 @@ enum E2ERunner {
             log(agents.isEmpty
                 ? "note: no agent row yet (chat still syncing to this device)"
                 : "OK agent row: \(agents.map { "\($0.identifier)/\($0.state.label)" }.joined(separator: ", "))")
+            // The other half of the list (gh#117). The dispatched chat must NOT
+            // be in it — the two groups partition what is running, and a chat
+            // in both would double-count the box's load.
+            let running = model.runningChats
+            log(running.contains { $0.chatId == live.chatId }
+                ? "FAIL the dispatched chat is in Running as well as Agents"
+                : "OK running (non-board): \(running.map(\.title).joined(separator: ", "))")
             // The blocked row's Retry (gh#49): end the live attempt and release
             // a fresh one. Driven here against a `working` row because the
             // engine's `replace` means exactly "end what is live first" — which

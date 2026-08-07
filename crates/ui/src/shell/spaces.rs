@@ -584,36 +584,7 @@ impl Shell {
         let blocked = comet_proto::view::board::agents_needing_attention(&agents);
         let selected = self.state.read(cx).selected_chat.clone();
 
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px(px(Theme::SPACE_SM))
-            .pt(px(12.0))
-            .pb(px(4.0))
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("Agents")),
-            )
-            // The count is what you look for first: three running, one of them
-            // stuck on a question you have not answered.
-            .when(blocked > 0, |el| {
-                el.child(
-                    div()
-                        .px(px(5.0))
-                        .py(px(1.0))
-                        .rounded(px(5.0))
-                        .bg(theme.danger.opacity(0.16))
-                        .text_size(px(10.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.danger)
-                        .child(SharedString::from(format!("{blocked} blocked"))),
-                )
-            });
+        let header = Self::render_agents_header("Agents", blocked, theme);
 
         let rows: Vec<AnyElement> = agents
             .into_iter()
@@ -633,6 +604,203 @@ impl Shell {
         )
     }
 
+    /// A section header for the two live-work groups: the label, and the count
+    /// of rows under it that want a human.
+    ///
+    /// One header for both groups because they are read as one thing — "what is
+    /// running, and which of it is stuck" — and a badge that meant `blocked` in
+    /// one and something else two rows down would have to be read twice.
+    fn render_agents_header(label: &'static str, blocked: usize, theme: &Theme) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(Theme::SPACE_SM))
+            .pt(px(12.0))
+            .pb(px(4.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(label)),
+            )
+            // The count is what you look for first: three running, one of them
+            // stuck on a question you have not answered.
+            .when(blocked > 0, |el| {
+                el.child(
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(5.0))
+                        .bg(theme.danger.opacity(0.16))
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.danger)
+                        .child(SharedString::from(format!("{blocked} blocked"))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The leading rail both live-work rows carry: a spinner while working (the
+    /// session-row idiom, and the one state where motion says something no
+    /// glyph can), the board's own glyph otherwise — so a row means the same
+    /// thing here as it does one keystroke away in the board pane.
+    fn render_agent_rail(
+        key: &str,
+        state: comet_proto::view::board::AgentState,
+        accent: gpui::Hsla,
+    ) -> AnyElement {
+        use comet_proto::view::board::AgentState;
+        if state == AgentState::Working {
+            div()
+                .w(px(8.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(loaders::mini_gradient_spinner(key.to_string(), 2.0))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(8.0))
+                .flex_none()
+                .text_size(px(9.0))
+                .text_color(accent)
+                .child(SharedString::from(state.glyph()))
+                .into_any_element()
+        }
+    }
+
+    /// The "Running" section (gh#117): every working chat that is NOT a live
+    /// board attempt — the pinned orchestrator, an ad-hoc agent chat, anything
+    /// somebody started by hand.
+    ///
+    /// Below Agents rather than mixed into it, because the two answer different
+    /// questions: one row has an issue, a branch, a cap and a bill behind it,
+    /// and the other is a run somebody is responsible for that the board has
+    /// never heard of. Mixing them would make the second look like the first.
+    ///
+    /// `None` when nothing unmanaged is running, on the same rule the Agents
+    /// section follows — an empty header is a permanent reminder of nothing.
+    pub(super) fn render_running_section(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let now = Utc::now();
+        let running = self.board.read(cx).running(cx, now);
+        if running.is_empty() {
+            return None;
+        }
+        let blocked = comet_proto::view::board::running_needing_attention(&running);
+        let selected = self.state.read(cx).selected_chat.clone();
+        let header = Self::render_agents_header("Running", blocked, theme);
+        let rows: Vec<AnyElement> = running
+            .into_iter()
+            .map(|row| {
+                let is_selected = selected.as_deref() == Some(row.chat_id.as_str());
+                self.render_running_row(&row, is_selected, now, theme, cx)
+            })
+            .collect();
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(div().flex().flex_col().gap(px(2.0)).children(rows))
+                .into_any_element(),
+        )
+    }
+
+    /// One unmanaged run: state rail, the chat's own title, elapsed since the
+    /// run started. One line, not two — there is no branch promised and no
+    /// issue behind it, and a second line of nothing would make an agent row's
+    /// second line look like it means less than it does.
+    fn render_running_row(
+        &self,
+        row: &comet_proto::view::board::RunningRow,
+        selected: bool,
+        now: DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let accent = crate::board::agent_state_color(row.state, theme);
+        let rail = Self::render_agent_rail(
+            &format!("running-working-{}", row.chat_id),
+            row.state,
+            accent,
+        );
+        let subline = theme.text_muted.opacity(0.6);
+        let fade_key = format!("running-row-{}", row.chat_id);
+        let rest_bg = if selected {
+            theme.glass_selected_bg()
+        } else {
+            theme.wash(0.0)
+        };
+        let rest_text = if selected {
+            theme.text
+        } else {
+            theme.text.opacity(0.8)
+        };
+        let chat_id = row.chat_id.clone();
+
+        div()
+            .id(SharedString::from(format!("running-{}", row.chat_id)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
+            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
+            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
+            .on_hover(motion::hover_listener(fade_key))
+            .cursor_pointer()
+            // Opening it opens the transcript, which is where answering it
+            // happens. `select_chat` lands in the chat's own space on its own,
+            // exactly as the agent row and the Sessions list rely on.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let id = chat_id.clone();
+                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+            }))
+            .child(rail)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .line_height(px(17.0))
+                    .child(SharedString::from(transcript::single_line(&row.title))),
+            )
+            // A blocked run says so in words: it has no issue identifier to
+            // recognise it by, so the glyph alone is doing too much work.
+            .when(row.state.needs_attention(), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(accent.opacity(0.9))
+                        .child(SharedString::from(row.state.label())),
+                )
+            })
+            .when_some(row.elapsed_label(now), |el, label| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(subline)
+                        .child(SharedString::from(label)),
+                )
+            })
+            .into_any_element()
+    }
+
     /// One live attempt: state glyph, the issue identifier, elapsed against the
     /// route's cap, and the branch underneath. Click opens the chat.
     fn render_agent_row(
@@ -643,33 +811,12 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use comet_proto::view::board::AgentState;
-
         let accent = crate::board::agent_state_color(agent.state, theme);
-        // Working spins (the session-row idiom, and the one state where motion
-        // says something no glyph can); the rest carry the board's own glyph, so
-        // a row means the same thing here as it does one keystroke away.
-        let rail: AnyElement = if agent.state == AgentState::Working {
-            div()
-                .w(px(8.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("agent-working-{}", agent.chat_id),
-                    2.0,
-                ))
-                .into_any_element()
-        } else {
-            div()
-                .w(px(8.0))
-                .flex_none()
-                .text_size(px(9.0))
-                .text_color(accent)
-                .child(SharedString::from(agent.state.glyph()))
-                .into_any_element()
-        };
+        let rail = Self::render_agent_rail(
+            &format!("agent-working-{}", agent.chat_id),
+            agent.state,
+            accent,
+        );
 
         let (hover, text) = (theme.element_hover, theme.text);
         let subline = theme.text_muted.opacity(0.6);

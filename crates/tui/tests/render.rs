@@ -2411,6 +2411,95 @@ fn the_agents_section_is_absent_when_nothing_is_running() {
     assert!(!sidebar.contains("Agents"), "{sidebar}");
 }
 
+// ---------------------------------------------------------------------------
+// The sidebar's Running section (gh#117)
+// ---------------------------------------------------------------------------
+
+/// The gh#117 case, drawn: an orchestrator working with no attempt behind it,
+/// an ad-hoc chat waiting on a question, and a board row taking neither of them
+/// — with no board on this box at all.
+#[test]
+fn unmanaged_runs_draw_in_the_sidebar_under_the_agents() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![
+        chat("c1", "Orchestrator"),
+        chat("c2", "Altinn docs"),
+        chat("c3", "Old chat"),
+    ]));
+    let running = |chat_id: &str, status, started: i64| Session {
+        chat_id: chat_id.into(),
+        device_id: "dev".into(),
+        status,
+        started_at: Some(Utc::now() - chrono::Duration::minutes(started)),
+        updated_at: Utc::now(),
+    };
+    app.apply(Update::Sessions(vec![
+        running("c1", SessionStatus::Working, 110),
+        running("c2", SessionStatus::AwaitingInput, 4),
+        running("c3", SessionStatus::Idle, 0),
+    ]));
+
+    let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
+    assert!(sidebar.contains("Running"), "{sidebar}");
+    assert!(sidebar.contains("1 blocked"), "the header count:\n{sidebar}");
+    // The chat's own title, since there is no issue behind it to name.
+    assert!(sidebar.contains("Orchestrator"), "{sidebar}");
+    assert!(sidebar.contains("Altinn docs"), "{sidebar}");
+    // Elapsed since the RUN started, and no cap — nothing bounds these.
+    assert!(sidebar.contains("1h50m"), "{sidebar}");
+    assert!(!sidebar.contains("1h50m /"), "no cap to read against:\n{sidebar}");
+
+    let at = |needle: &str| {
+        sidebar
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar}"))
+    };
+    // Blocked floats, and the group sits between the agents and the sessions.
+    assert!(at("Altinn docs") < at("Orchestrator"), "{sidebar}");
+    assert!(at("Running") < at("Sessions"), "{sidebar}");
+    // An idle chat is not a run — it is a session row and nothing more.
+    assert!(at("Old chat") > at("Sessions"), "{sidebar}");
+}
+
+/// Nothing working: no header, no gap, no reminder that agents exist.
+#[test]
+fn the_running_section_is_absent_when_nothing_is_working() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![chat("c1", "Old chat")]));
+    app.apply(Update::Sessions(vec![Session {
+        chat_id: "c1".into(),
+        device_id: "dev".into(),
+        status: SessionStatus::Idle,
+        started_at: None,
+        updated_at: Utc::now(),
+    }]));
+    let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
+    assert!(!sidebar.contains("Running"), "{sidebar}");
+}
+
+/// Clicking a running row opens its chat — the click that answers "are they
+/// even alive" without an ssh session.
+#[test]
+fn clicking_a_running_row_opens_its_chat() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![
+        chat("c1", "Orchestrator"),
+        chat("c2", "Altinn docs"),
+    ]));
+    app.apply(Update::Sessions(vec![Session {
+        chat_id: "c2".into(),
+        device_id: "dev".into(),
+        status: SessionStatus::AwaitingInput,
+        started_at: Some(Utc::now()),
+        updated_at: Utc::now(),
+    }]));
+
+    let (x, y) = cell_of(&mut app, 100, 30, "Altinn docs");
+    app.click(x, y);
+    assert_eq!(app.selected_chat.as_deref(), Some("c2"));
+}
+
 /// Clicking an agent row opens its chat — the click that replaces going to the
 /// board pane and finding the row there.
 #[test]

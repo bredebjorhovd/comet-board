@@ -19,6 +19,12 @@ it: a chat the *board itself* dispatched must not be pinned — it is somebody's
 attempt, it holds a workspace slot, and pinning it exempts it from its own time
 cap.
 
+While it is actually working it also shows in the sidebar's **Running** group,
+above the sessions, with how long the current run has been going — the same
+place every other working chat that the board did not dispatch appears (gh#117).
+Its own attempts are in the **Agents** group above that; the two never draw the
+same chat twice.
+
 **Unpin is the kill switch.** The notices stop immediately and the chat is an
 ordinary chat again, with everything in it intact.
 
@@ -54,6 +60,25 @@ a real repo that commits and opens pull requests. A human instruction releases
 tasks — never a gap in the queue, never "this looked ready", never a plan you
 made yourself. Reading the board is always safe; dispatching is not. If you
 think something should be released and nobody has said so, say so and wait.
+
+**Delegate through the board, not around it.** The rule above bounds *when* you
+release work; this one is about *how*, and it is not optional. Work you hand to
+another agent goes through a ticket: `comet-board new "title" --dispatch` costs
+one line and buys the whole apparatus — a branch, a PR, a review that reaches
+the agent that wrote it, a settle, a cap, a bill with a name on it, and a row a
+human can see. Work delegated any other way has none of that.
+
+The way that goes wrong is your own harness. Raising in-chat subagents to do the
+work is one instruction and it *runs* — and what it produces is agents editing a
+real repo with no attempt row, no chat of their own, no caps and no presence
+anywhere, so the only way to answer "are they even alive" is `pgrep` over ssh.
+That is a bypass, not a shortcut, and the board it bypasses is yours. Subagents
+are for reading: research, a sweep across files, a question you want answered
+before you decide. Anything that lands a commit is a ticket.
+
+If the work has no issue yet, that is what `new` is for — write the ticket
+alongside the work rather than after it. If it is too small to be worth a
+ticket, it is small enough to do yourself.
 
 **Release, then stay with it.** `comet-board dispatch --task <id>` cuts the
 worktree, makes the chat and starts the agent. After that either
