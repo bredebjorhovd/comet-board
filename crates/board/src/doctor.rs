@@ -12,6 +12,7 @@ use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_ke
 use crate::db::Db;
 use crate::gc;
 use crate::git_credentials;
+use crate::git_identity;
 use crate::runtime::harness_for_runtime;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
@@ -186,6 +187,12 @@ pub fn doctor(
             // settle — and because an unpinned board is the one state where
             // nobody hears about work an operator released by hand.
             checks.push(orchestrator_check(&cfg.defaults, db_ok.as_ref().ok()));
+
+            // Whose name a teammate's dispatch commits under (gh#107). Beside
+            // the box's own identity below, and always printed for the same
+            // reason the duration cap is: with no map every dispatch commits as
+            // the box, which looks exactly like a map that is working.
+            checks.push(dispatch_authorship_check(&cfg));
 
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
@@ -373,8 +380,145 @@ pub fn doctor(
     }
 
     checks.push(dispatched_push_check(paths));
+    checks.push(git_identity_check(&git_identity::box_identity(
+        &paths.config_dir,
+    )));
 
     Ok(checks)
+}
+
+/// Does this box have a git identity, and will GitHub attribute what it signs
+/// (gh#107)?
+///
+/// The failure it exists for is a box that has none: git does not stop at a
+/// missing `user.email`, it invents one from the box user and hostname (or the
+/// harness's own setup writes one), and the first dispatched agent commits
+/// under an address belonging to no account. Nothing rejects the commit — it
+/// just attributes to nobody, and a contributor gate on the deploy side
+/// (Vercel's) refuses to build the push. That is the one state worth failing:
+/// an anonymous box is not a preference, it is a box nobody has finished
+/// setting up.
+///
+/// A configured address that is not GitHub's noreply form is `ok` with
+/// guidance, never a failure, because this check *cannot know*: whether an
+/// address is on somebody's account is answered by `GET /user/emails`, which is
+/// a user-scoped call the board's App may not make. Failing every board whose
+/// operator uses their real (verified, perfectly attributable) work address
+/// would be the gh#96 false alarm again.
+fn git_identity_check(id: &git_identity::BoxIdentity) -> Check {
+    let name = "git identity".to_string();
+    let (Some(who), Some(email)) = (&id.name, &id.email) else {
+        return Check {
+            name,
+            ok: false,
+            detail: format!(
+                "not configured ({}) — git invents an author from the box user and \
+                 hostname, so dispatched agents commit as nobody and deploy gates that \
+                 check the author refuse the push. \
+                 `git config --global user.name \"…\"` and `git config --global \
+                 user.email \"<id>+<login>{}\"` (from https://github.com/settings/emails)",
+                match (&id.name, &id.email) {
+                    (None, None) => "no user.name, no user.email",
+                    (None, Some(_)) => "no user.name",
+                    _ => "no user.email",
+                },
+                git_identity::NOREPLY_SUFFIX
+            ),
+        };
+    };
+    if git_identity::is_github_noreply(email) {
+        return Check {
+            name,
+            ok: true,
+            detail: format!(
+                "{who} <{email}> — GitHub attributes what this box commits to @{}",
+                git_identity::noreply_login(email).unwrap_or("that account")
+            ),
+        };
+    }
+    Check {
+        name,
+        ok: true,
+        detail: format!(
+            "{who} <{email}> — not a GitHub noreply address. Attribution works only if \
+             this address is on the account's verified list, which nothing here can \
+             check (the board's App cannot read anybody's emails); if it is not, \
+             commits attribute to nobody and deploy gates that check the author refuse \
+             the push. `<id>+<login>{}` always works",
+            git_identity::NOREPLY_SUFFIX
+        ),
+    }
+}
+
+/// Whose name a *teammate's* dispatch commits under (gh#107).
+///
+/// The box's identity answers for the operator; it does not answer for #66's
+/// teammate driving the same board from a laptop. Their attempt records who
+/// they are (gh#74) and, with an address for that person here, the harness
+/// child is stamped with it — so their commits read as theirs on GitHub and
+/// pass the same contributor gate the box's own do.
+///
+/// Always printed, never a failure. No map is the single-operator default and
+/// is exactly right on a box only one person dispatches from; what it must not
+/// do is stay invisible, because "everything lands as the box" and "the map is
+/// working" look identical on GitHub until somebody reads the commit list.
+fn dispatch_authorship_check(cfg: &RoutingConfig) -> Check {
+    let name = "dispatch authorship".to_string();
+    if cfg.users.is_empty() {
+        return Check {
+            name,
+            ok: true,
+            detail: "no `[users]` map — every dispatch commits under this box's own git \
+                     identity, whoever released it. Map a teammate's sign-in email to \
+                     their GitHub address to have their work land as theirs: \
+                     `[users]` / `\"ana@example.com\" = \
+                     \"22494697+ana@users.noreply.github.com\"`"
+                .into(),
+        };
+    }
+    // Named, with what each one resolves to, because the mapping is the part
+    // that is silently wrong: an address for the wrong account still commits,
+    // still pushes, and attributes to somebody else entirely.
+    let mut entries = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut unlinked = Vec::new();
+    for (who, value) in &cfg.users {
+        match git_identity::parse_author(value) {
+            Some(author) => {
+                if !git_identity::is_github_noreply(&author.email) {
+                    unlinked.push(who.clone());
+                }
+                entries.push(format!("{who} → {} <{}>", author.name, author.email));
+            }
+            None => unresolved.push(format!("{who} = \"{value}\"")),
+        }
+    }
+    let mut sentences = Vec::new();
+    if !entries.is_empty() {
+        sentences.push(entries.join(" · "));
+    }
+    if !unlinked.is_empty() {
+        sentences.push(format!(
+            "Not a GitHub noreply address for {} — attribution depends on the address \
+             being on that account, which nothing here can check",
+            unlinked.join(", ")
+        ));
+    }
+    if !unresolved.is_empty() {
+        sentences.push(format!(
+            "Not an address at all: {} — those dispatches commit as the box",
+            unresolved.join(", ")
+        ));
+    }
+    let detail = sentences.join(". ");
+    Check {
+        name,
+        // The unparseable entries are `routing.toml`'s own failure (they are in
+        // `problems()`, so the `routing.toml` check above is already red); this
+        // line names them rather than failing twice for one mistake.
+        ok: true,
+        detail,
+    }
 }
 
 /// What the attempts have left on the disk, and what will reclaim it (gh#72).
@@ -2056,6 +2200,130 @@ mod tests {
     fn a_personal_access_token_has_no_token_checks_to_report() {
         let rest = HttpRest::new(Some("ghp_x".into())).unwrap();
         assert!(app_token_checks(&["o/r".into()], Some(&rest)).is_empty());
+    }
+
+    // ── git identity (gh#107) ───────────────────────────────────────────────
+
+    /// The one state worth failing: a box with no identity at all. Git does not
+    /// stop there — it invents one — so the first dispatched agent commits
+    /// under an address belonging to no account, and a deploy gate that checks
+    /// the author refuses the push. A fresh box has to refuse to look anonymous.
+    #[test]
+    fn a_box_with_no_git_identity_fails_and_says_what_to_type() {
+        let c = git_identity_check(&git_identity::BoxIdentity::default());
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("no user.name, no user.email"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("git config --global user.email"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("users.noreply.github.com"),
+            "{}",
+            c.detail
+        );
+
+        // Half of one is still anonymous, and says which half is missing.
+        let half = git_identity::BoxIdentity {
+            name: Some("The Box".into()),
+            email: None,
+        };
+        let c = git_identity_check(&half);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no user.email"), "{}", c.detail);
+    }
+
+    /// A noreply address is attributable by construction — GitHub minted it —
+    /// so the line names the account rather than offering advice.
+    #[test]
+    fn a_noreply_identity_passes_and_names_the_account_it_attributes_to() {
+        let c = git_identity_check(&git_identity::BoxIdentity {
+            name: Some("The Box".into()),
+            email: Some("22494697+ana@users.noreply.github.com".into()),
+        });
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("@ana"), "{}", c.detail);
+    }
+
+    /// The case `doctor` cannot decide: whether an ordinary address is on that
+    /// account's verified list is a `GET /user/emails` away, and the board's App
+    /// may not make that call. Guidance, not a failure — failing every operator
+    /// who uses their real work address is the gh#96 false alarm again.
+    #[test]
+    fn an_address_that_might_not_be_linked_is_guidance_rather_than_a_failure() {
+        let c = git_identity_check(&git_identity::BoxIdentity {
+            name: Some("Ana Ruiz".into()),
+            email: Some("ana@example.com".into()),
+        });
+        assert!(c.ok, "a preference is not a failure: {}", c.detail);
+        assert!(
+            c.detail.contains("not a GitHub noreply address"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("nothing here can check"), "{}", c.detail);
+    }
+
+    /// With no `[users]` map every dispatch commits as the box — which looks
+    /// exactly like a map that is working, right up until somebody reads the
+    /// commit list. Said out loud, in both states, like the duration cap.
+    #[test]
+    fn doctor_says_whose_name_a_teammates_dispatch_commits_under() {
+        let empty = dispatch_authorship_check(&RoutingConfig::default());
+        assert!(empty.ok, "{}", empty.detail);
+        assert!(
+            empty.detail.starts_with("no `[users]` map"),
+            "{}",
+            empty.detail
+        );
+
+        let cfg: RoutingConfig = toml::from_str(
+            "[users]\n\"ana@example.com\" = \"22494697+ana@users.noreply.github.com\"\n\
+             \"sam@example.com\" = \"Sam Ito <sam@corp.example>\"\n\
+             \"kim@example.com\" = \"kim\"\n",
+        )
+        .unwrap();
+        let c = dispatch_authorship_check(&cfg);
+        assert!(c.ok, "{}", c.detail);
+        // Every entry named, with what it resolves to: an address for the wrong
+        // account commits and pushes exactly as happily as the right one.
+        assert!(
+            c.detail
+                .contains("ana@example.com → ana <22494697+ana@users.noreply.github.com>"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail
+                .contains("sam@example.com → Sam Ito <sam@corp.example>"),
+            "{}",
+            c.detail
+        );
+        // The two weaker forms are called out rather than passed over.
+        assert!(
+            c.detail
+                .contains("Not a GitHub noreply address for sam@example.com"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("Not an address at all: kim@example.com"),
+            "{}",
+            c.detail
+        );
+        // And the config itself refuses to load with that last one in it.
+        assert!(
+            cfg.problems()
+                .iter()
+                .any(|p| p.contains("[users] \"kim@example.com\"")),
+            "{:?}",
+            cfg.problems()
+        );
     }
 
     /// These checks read the provider, never the wire. Answering at all would

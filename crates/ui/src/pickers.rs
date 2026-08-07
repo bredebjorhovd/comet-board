@@ -112,6 +112,7 @@ impl ResolvedRunConfig {
             // Same story for push credentials: a chat somebody opened pushes
             // with the device's own git, not with the board's App (gh#68).
             push_repo: None,
+            git_author: None,
         })
     }
 }

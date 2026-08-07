@@ -1548,6 +1548,7 @@ mod tests {
             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
             account: None,
             push_repo: None,
+            git_author: None,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -1574,6 +1575,7 @@ mod tests {
                 sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                 account: None,
                 push_repo: None,
+                git_author: None,
             },
         );
     }

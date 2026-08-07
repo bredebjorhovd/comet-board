@@ -228,6 +228,17 @@ retain_worktrees = "7d"
 # means review. `doctor` checks whatever you write here resolves.
 # review_state = "In Review"
 
+# Who drives this board, on GitHub. A dispatch records the email of whoever
+# released it; with an address here, their dispatches commit as them — GitHub
+# attributes the work to their account, and a deploy gate that checks the commit
+# author (Vercel's does) lets their push through. Without an entry, everything
+# commits under this box's own git identity, whoever released it — which is
+# right on a box only you dispatch from. The `<id>+<login>@users.noreply.github.com`
+# form is on https://github.com/settings/emails and always attributes; a plain
+# address works too, as long as it is verified on that account.
+[users]
+# "ana@example.com" = "22494697+ana@users.noreply.github.com"
+
 # Repos polled for issues and pull requests. Private repos need a credential in
 # .env — either GITHUB_TOKEN (a personal access token: simplest, and writes are
 # attributed to you), or a GitHub App: GITHUB_APP_ID plus

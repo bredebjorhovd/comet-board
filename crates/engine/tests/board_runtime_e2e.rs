@@ -134,6 +134,10 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         model: None,
         account: None,
         push_repo: Some("o/widget".into()),
+        git_author: Some(comet_proto::GitAuthor {
+            name: "Ana Ruiz".into(),
+            email: "22494697+ana@users.noreply.github.com".into(),
+        }),
         prompt: "do the thing".into(),
     };
     let rt = runtime.clone();
@@ -170,6 +174,15 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     assert_eq!(
         chat.config.as_ref().and_then(|c| c.push_repo.as_deref()),
         Some("o/widget")
+    );
+    // And whose name its commits carry (gh#107), on the chat for the same
+    // reason: that later fix should be by the same person as the first commit.
+    assert_eq!(
+        chat.config
+            .as_ref()
+            .and_then(|c| c.git_author.as_ref())
+            .map(|a| a.email.as_str()),
+        Some("22494697+ana@users.noreply.github.com")
     );
 
     // The brief is not just queued — the host executor runs it.
@@ -241,6 +254,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         model: None,
         account: Some("ffffffffffffffff".into()),
         push_repo: None,
+        git_author: None,
         prompt: "should never be sent".into(),
     };
     let err = tokio::task::spawn_blocking(move || rt.dispatch(&bogus))

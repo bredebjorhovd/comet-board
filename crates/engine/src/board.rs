@@ -540,7 +540,16 @@ fn handle_dispatch(
                 route.workspace
             )
         })?;
-    let spec = build_spec(&engine.cfg, route, &task, &space, overrides)?;
+    // `origin.user` decides one thing here: whose name the commits carry
+    // (gh#107). Provenance, never authority — see `DispatchOrigin`.
+    let spec = build_spec(
+        &engine.cfg,
+        route,
+        &task,
+        &space,
+        overrides,
+        origin.user.as_deref(),
+    )?;
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
 
