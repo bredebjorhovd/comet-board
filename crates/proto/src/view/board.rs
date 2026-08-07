@@ -984,7 +984,9 @@ pub fn agent_rows(
 }
 
 /// What the session mirror says about this attempt, falling back to the board.
-fn agent_state(
+/// `pub(crate)` for the Needs-you inbox ([`crate::view::needs`]), which must
+/// reach the same verdict about the same attempt.
+pub(crate) fn agent_state(
     state: BoardState,
     session: Option<&crate::Session>,
     now: DateTime<Utc>,
@@ -1015,10 +1017,11 @@ pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
 // [`agent_rows`] answers "what has the board released", which is a smaller
 // question than "what is working on this box". An orchestrator that raised
 // in-chat subagents instead of dispatching, an ad-hoc chat somebody started by
-// hand, the orchestrator itself: all of them are real runs holding a real
-// checkout, and none of them has an attempt row, so the Agents section shows
-// nothing and the only honest answer to "are they even alive" was `pgrep` over
-// ssh. This is the other half of the list.
+// hand: all of them are real runs holding a real checkout, and none of them
+// has an attempt row, so the Agents section shows nothing and the only honest
+// answer to "are they even alive" was `pgrep` over ssh. This is the other half
+// of the list. (The pinned orchestrator, which used to lead this group, now
+// has a fixed slot of its own — gh#122 — and is subtracted here.)
 //
 // The join is the same one gh#103 does, minus the board row — which is exactly
 // why it is cheap: the session watch already streams a status for every chat,
@@ -1088,6 +1091,9 @@ impl RunningRow {
 /// - **Archived is not a reason to hide a run.** Archiving is a decision about
 ///   a *finished* chat; one that is working anyway is the exact invisible run
 ///   this group exists to surface.
+/// - **The pinned orchestrator is subtracted too** (gh#122): it has a fixed
+///   slot of its own above Spaces, which carries its live state — a second
+///   row here would report the same run twice.
 ///
 /// A board is not required. `rows` empty — no board on this box, the host sweep
 /// still running, a phone that has not attached — subtracts nothing, and the
@@ -1096,6 +1102,7 @@ pub fn running_rows(
     rows: &[TaskRow],
     chats: &[crate::Chat],
     sessions: &[crate::Session],
+    orchestrator: Option<&str>,
     now: DateTime<Utc>,
 ) -> Vec<RunningRow> {
     let dispatched: Vec<&str> = rows
@@ -1106,6 +1113,7 @@ pub fn running_rows(
     let mut out: Vec<RunningRow> = chats
         .iter()
         .filter(|chat| !dispatched.contains(&chat.id.as_str()))
+        .filter(|chat| orchestrator != Some(chat.id.as_str()))
         .filter_map(|chat| {
             let session = sessions.iter().find(|s| s.chat_id == chat.id);
             let state = match crate::view::effective_indicator(session, now) {
@@ -1663,7 +1671,7 @@ mod tests {
             started("orchestrator", crate::SessionStatus::Working, "2026-08-01T11:30:00Z"),
             started("adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
         ];
-        let running = running_rows(&[], &chats, &sessions, now());
+        let running = running_rows(&[], &chats, &sessions, None, now());
         assert_eq!(
             running.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
             // Blocked floats; the idle chat is not a run at all.
@@ -1691,7 +1699,7 @@ mod tests {
             session("errored", crate::SessionStatus::Errored, 0),
             session("archived", crate::SessionStatus::Working, 0),
         ];
-        let running = running_rows(&[], &chats, &sessions, now());
+        let running = running_rows(&[], &chats, &sessions, None, now());
         assert_eq!(
             running.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
             vec!["archived"],
@@ -1717,7 +1725,7 @@ mod tests {
         ];
         let rows = vec![live, settled];
         assert_eq!(
-            running_rows(&rows, &chats, &sessions, now())
+            running_rows(&rows, &chats, &sessions, None, now())
                 .iter()
                 .map(|r| r.chat_id.as_str())
                 .collect::<Vec<_>>(),
@@ -1744,7 +1752,7 @@ mod tests {
         // agent_rows keeps it (the chat synced) — but the subtraction must not
         // depend on that having happened.
         assert!(!agent_rows(std::slice::from_ref(&live), &chats, &sessions, now()).is_empty());
-        assert!(running_rows(&[live], &chats, &sessions, now()).is_empty());
+        assert!(running_rows(&[live], &chats, &sessions, None, now()).is_empty());
     }
 
     /// What the row can say: the chat's own title, the run's age, a badge.
@@ -1761,7 +1769,7 @@ mod tests {
             // counting up from the epoch.
             session("blank", crate::SessionStatus::Working, 0),
         ];
-        let running = running_rows(&[], &chats, &sessions, now());
+        let running = running_rows(&[], &chats, &sessions, None, now());
         assert_eq!(running[0].title, "some title the agent wrote");
         assert_eq!(running[0].elapsed_label(now()).as_deref(), Some("1h00m"));
         assert_eq!(running[1].title, UNTITLED_CHAT);
@@ -1775,7 +1783,25 @@ mod tests {
     fn no_board_subtracts_nothing() {
         let chats = vec![chat("c1", None)];
         let sessions = vec![session("c1", crate::SessionStatus::Working, 0)];
-        assert_eq!(running_rows(&[], &chats, &sessions, now()).len(), 1);
+        assert_eq!(running_rows(&[], &chats, &sessions, None, now()).len(), 1);
+    }
+
+    /// The pinned orchestrator has a slot of its own (gh#122) — a working
+    /// orchestrator is the slot's news, not a Running row.
+    #[test]
+    fn the_pinned_orchestrator_is_the_slots_not_runnings() {
+        let chats = vec![chat("orch", None), chat("adhoc", None)];
+        let sessions = vec![
+            session("orch", crate::SessionStatus::Working, 0),
+            session("adhoc", crate::SessionStatus::Working, 0),
+        ];
+        assert_eq!(
+            running_rows(&[], &chats, &sessions, Some("orch"), now())
+                .iter()
+                .map(|r| r.chat_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["adhoc"]
+        );
     }
 
     // ---- whose subscription (gh#101) ------------------------------------

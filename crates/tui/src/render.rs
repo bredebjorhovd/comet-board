@@ -61,6 +61,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 use comet_proto::view::board::{self, BoardState};
+use comet_proto::view::needs::{self as needs_view};
 use comet_proto::view::{ConnectionStatus, GatePhase};
 
 use crate::app::{App, ChipKind, Hit, Overlay, Row};
@@ -402,6 +403,140 @@ fn draw_sidebar_row(
                 Paragraph::new(Span::styled(label.clone(), theme.hint())),
                 area,
             );
+        }
+        // The inbox's empty state (gh#122): a quiet check, in words. The
+        // reward for a clear morning is being told so, not an absent section.
+        Row::AllClear => {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("✓ ", theme.dot(comet_proto::ChatIndicator::Completed)),
+                    Span::styled(needs_view::ALL_CLEAR.to_string(), theme.hint()),
+                ])),
+                area,
+            );
+        }
+        // One thing waiting on a human (gh#122): WHO on the first line, the
+        // one-line WHAT under it. No dots — the kind glyph is the board's own
+        // shape family, and everything else is words.
+        Row::Need {
+            who, what, kind, ..
+        } => {
+            let base = if selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            if selected {
+                fill(frame, bleed, theme.selected());
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(kind.glyph().to_string(), base.patch(theme.need_kind(*kind))),
+                    Span::styled(
+                        format!(" {}", wrap::truncate(who, width.saturating_sub(2))),
+                        base.patch(theme.subtle()),
+                    ),
+                ])),
+                Rect { height: 1, ..area },
+            );
+            if area.height > 1 {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("  {}", wrap::truncate(what, width.saturating_sub(2))),
+                        base.patch(theme.hint()),
+                    )),
+                    Rect {
+                        y: area.y + 1,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+        }
+        // The orchestrator's slot (gh#122): a pinned thread. The ◆ is
+        // identity; STATE is carried honestly — the spinner while a turn
+        // runs, "new" while a report sits unread, the report's own words
+        // underneath, and "No reports yet" before it has ever spoken.
+        Row::Orchestrator {
+            chat_id,
+            preview,
+            unseen,
+            indicator,
+            last_at,
+            ..
+        } => {
+            let base = if selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            if selected {
+                fill(frame, bleed, theme.selected());
+            }
+            let open = app.selected_chat.as_deref() == Some(chat_id.as_str());
+            let (glyph, glyph_style) = if *indicator == comet_proto::ChatIndicator::Working {
+                let (glyph, tint) = loaders::mini_spinner(app.elapsed());
+                (glyph, base.patch(Style::default().fg(tint)))
+            } else {
+                (
+                    board::ORCHESTRATOR_GLYPH.to_string(),
+                    base.patch(theme.orchestrator()),
+                )
+            };
+            // The right column: the badge while something is unread, the time
+            // it last spoke otherwise. Words either way.
+            let (tail, tail_style) = if *unseen {
+                (
+                    "new".to_string(),
+                    base.patch(theme.dot(comet_proto::ChatIndicator::Completed)),
+                )
+            } else {
+                (app.relative_time(*last_at), base.patch(theme.hint()))
+            };
+            let tail_width = wrap::width_of(&tail);
+            let name_width = width.saturating_sub(3 + tail_width).max(1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(glyph, glyph_style),
+                    Span::styled(
+                        format!(
+                            " {}",
+                            wrap::truncate(needs_view::ORCHESTRATOR_NAME, name_width)
+                        ),
+                        base.patch(if open { theme.body() } else { theme.subtle() }),
+                    ),
+                ])),
+                Rect { height: 1, ..area },
+            );
+            if tail_width > 0 && (tail_width as u16) < area.width {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(tail, tail_style)),
+                    Rect {
+                        x: area.x + area.width - tail_width as u16,
+                        width: tail_width as u16,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+            if area.height > 1 {
+                let sub = preview
+                    .clone()
+                    .unwrap_or_else(|| needs_view::NO_REPORTS.to_string());
+                // The latest report is the payload: brighter while unread.
+                let sub_style = if *unseen { theme.subtle() } else { theme.hint() };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("  {}", wrap::truncate(&sub, width.saturating_sub(2))),
+                        base.patch(sub_style),
+                    )),
+                    Rect {
+                        y: area.y + 1,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
         }
         // A live board attempt (gh#103): the same two-line shape as a session
         // row, with the board's own state glyph and colours where the session

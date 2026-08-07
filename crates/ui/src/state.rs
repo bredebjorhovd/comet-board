@@ -31,6 +31,7 @@ use serde::de::DeserializeOwned;
 use comet_doc::SessionMessageEntry;
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::view::board::{self as board_view, OrchestratorPin};
+use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -601,17 +602,22 @@ impl AppState {
             .map(|c| (display_status(c, self.session_for(&c.id), now), c))
             .collect();
         sort_active(&mut rows);
-        // The orchestrator is pinned in the literal sense (gh#104): every other
-        // row's position is recency, and this one's position is the
-        // designation — a board's driver that slid down the list whenever two
-        // children spoke would stop being the thing you talk to.
-        if let Some(pinned) = self.orchestrator.as_deref()
-            && let Some(at) = rows.iter().position(|(_, c)| c.id == pinned)
-        {
-            let row = rows.remove(at);
-            rows.insert(0, row);
-        }
+        // The orchestrator is NOT floated here any more (gh#122): its pinned
+        // place is the fixed slot above Spaces, and this list treats its chat
+        // like any other — at the recency it earned, still wearing the ◆ mark
+        // so the two are recognisably one thing.
         rows
+    }
+
+    /// The orchestrator's fixed slot (gh#122), or `None` when no orchestrator
+    /// is pinned or its chat has not synced here.
+    pub fn orchestrator_slot(&self, now: DateTime<Utc>) -> Option<needs_view::OrchestratorSlot> {
+        needs_view::orchestrator_slot(
+            self.orchestrator.as_deref(),
+            &self.chats,
+            &self.sessions,
+            now,
+        )
     }
 
     /// Is this the chat the board has pinned as its orchestrator?
@@ -1484,16 +1490,17 @@ mod tests {
         assert_eq!(overview, ["old", "new"]);
     }
 
-    /// gh#104: every other row's position is attention-and-recency; the
-    /// orchestrator's position *is* the designation. A board's driver that slid
-    /// down the list whenever two children spoke would stop being the thing you
-    /// talk to.
+    /// gh#122: the pin's place is the fixed slot above Spaces, not a float in
+    /// the sessions list — which stays pure recency for everyone, the
+    /// orchestrator included.
     #[test]
-    fn the_pinned_orchestrator_leads_the_overview() {
+    fn the_pin_is_a_slot_not_a_float() {
         let mut state = AppState::new();
         state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
         let mut boss = chat("boss", 1, None);
         boss.space_id = Some("s1".into());
+        boss.last_message_preview = Some("PR 576 green".into());
+        boss.last_message_at = Some(Utc::now());
         let mut recent = chat("recent", 9, None);
         recent.space_id = Some("s1".into());
         state.apply_chats(vec![boss, recent]);
@@ -1505,21 +1512,22 @@ mod tests {
                 .map(|(_, c)| c.id.clone())
                 .collect()
         };
-        assert_eq!(ids(&state), ["recent", "boss"]);
+        assert_eq!(ids(&state), ["boss", "recent"]);
+        assert!(state.orchestrator_slot(now).is_none());
 
         state.orchestrator = Some("boss".into());
+        // The list is untouched — the slot is where the pin shows.
         assert_eq!(ids(&state), ["boss", "recent"]);
         assert!(state.is_orchestrator("boss"));
-        assert!(!state.is_orchestrator("recent"));
+        let slot = state.orchestrator_slot(now).expect("pinned and synced");
+        assert_eq!(slot.chat_id, "boss");
+        assert_eq!(slot.preview.as_deref(), Some("PR 576 green"));
+        assert!(slot.unseen);
 
-        // A stale pin — the chat was archived, or the id in `routing.toml` is
-        // from a chat that is gone — reorders nothing and invents nothing.
+        // A stale pin — the chat was archived away, or the id in
+        // `routing.toml` is from a chat that is gone — invents nothing.
         state.orchestrator = Some("nobody".into());
-        assert_eq!(ids(&state), ["recent", "boss"]);
-
-        // And unpinning hands the list straight back to recency.
-        state.orchestrator = None;
-        assert_eq!(ids(&state), ["recent", "boss"]);
+        assert!(state.orchestrator_slot(now).is_none());
     }
 
     #[test]

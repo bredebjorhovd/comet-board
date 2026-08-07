@@ -297,15 +297,40 @@ final class AppModel {
         return agentRows(rows: boardRows, chats: chats, sessions: sessions)
     }
 
-    /// The working chats no attempt accounts for (gh#117) — the orchestrator,
-    /// an ad-hoc agent chat, anything somebody started by hand. Beside
-    /// `liveAgents` because the two partition one list; the board rows are read
-    /// only to subtract the attempts, so a phone attached to no board at all
-    /// still answers.
+    /// The working chats no attempt accounts for (gh#117) — an ad-hoc agent
+    /// chat, anything somebody started by hand. Beside `liveAgents` because
+    /// the two partition one list; the board rows are read only to subtract
+    /// the attempts, so a phone attached to no board at all still answers.
+    /// The pinned orchestrator is subtracted too — its slot carries its live
+    /// state (gh#122).
     var runningChats: [RunningRow] {
         let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
         let chats = demo?.chats ?? workspace?.chats ?? []
-        return runningRows(rows: boardRows, chats: chats, sessions: sessions)
+        return runningRows(rows: boardRows, chats: chats, sessions: sessions,
+                           orchestrator: orchestratorChatId)
+    }
+
+    /// Which chat the board has pinned as its orchestrator (gh#104), off the
+    /// host the board sweep settled on.
+    var orchestratorChatId: String? {
+        demo != nil ? demo?.orchestratorChatId : board?.orchestratorChatId
+    }
+
+    /// The "Needs you" inbox (gh#122): everything waiting on a human, most
+    /// owed first, joined from the four streams the app already holds.
+    var needsYouRows: [NeedRow] {
+        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
+        let chats = demo?.chats ?? workspace?.chats ?? []
+        return needsYou(orchestrator: orchestratorChatId, rows: boardRows,
+                        chats: chats, sessions: sessions)
+    }
+
+    /// The orchestrator's pinned slot (gh#122), or `nil` when none is pinned.
+    var orchestratorSlotRow: OrchestratorSlot? {
+        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
+        let chats = demo?.chats ?? workspace?.chats ?? []
+        return orchestratorSlot(orchestrator: orchestratorChatId,
+                                chats: chats, sessions: sessions)
     }
 
     /// The runtimes and logins a dispatch picker offers. Both belong to the
