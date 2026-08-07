@@ -1606,6 +1606,7 @@ impl App {
             sandbox: SandboxLevel::WorkspaceWrite,
             account: None,
             push_repo: None,
+            git_author: None,
         });
         effects.push(Command::StartSession(Box::new(crate::link::StartSession {
             chat_id,
@@ -2546,6 +2547,7 @@ impl App {
             sandbox: SandboxLevel::WorkspaceWrite,
             account: None,
             push_repo: None,
+            git_author: None,
         });
         config.reasoning = Some(level);
         let Ok(value) = serde_json::to_value(&config) else {
@@ -2578,6 +2580,7 @@ impl App {
             sandbox: SandboxLevel::WorkspaceWrite,
             account: None,
             push_repo: None,
+            git_author: None,
         });
         config.model = Some(model.id.clone());
         // Keep the reasoning level only if the new model offers it.

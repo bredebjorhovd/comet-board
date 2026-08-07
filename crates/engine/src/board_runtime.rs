@@ -118,6 +118,10 @@ impl Runtime for CometRuntime {
             // (gh#68): the fix for a review comment three days from now is a
             // new run in this chat, and it has to reach the same branch.
             push_repo: spec.push_repo.clone(),
+            // And whose name is on what it commits (gh#107) — same reasoning
+            // again: that later fix should be by the same person as the first
+            // commit, not by whoever the box is.
+            git_author: spec.git_author.clone(),
         };
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;

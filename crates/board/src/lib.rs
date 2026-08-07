@@ -20,6 +20,7 @@ pub mod dispatch;
 pub mod doctor;
 pub mod gc;
 pub mod git_credentials;
+pub mod git_identity;
 pub mod init;
 pub mod log;
 pub mod model;

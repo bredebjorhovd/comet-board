@@ -100,6 +100,34 @@ pub struct ChatConfig {
     /// to push the fix too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_repo: Option<String>,
+    /// Who this chat's commits are *by* (comet-board `git_identity`, gh#107).
+    /// Set, the engine stamps `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` on the
+    /// harness child, so a teammate's dispatch produces commits GitHub
+    /// attributes to the teammate while the box's own pinned identity stays
+    /// the committer. Unset — every chat a person opened, and every dispatch
+    /// by somebody the board has no GitHub address for — the box's identity
+    /// authors, as it always has.
+    ///
+    /// On the chat for the same reason `push_repo` is: the fix for a review
+    /// comment three days from now is a new run in this chat, and it should be
+    /// by the same person as the first commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_author: Option<GitAuthor>,
+}
+
+/// A git author: the two fields `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` carry
+/// (gh#107).
+///
+/// Not a credential and not authority — a commit's author is a claim anyone can
+/// write. What it decides is *attribution*: GitHub links a commit to an account
+/// when the address is one that account owns, which is what makes a teammate's
+/// dispatch read as the teammate, and what contributor gates on the deploy side
+/// (Vercel's, notably) check before they will build a push.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitAuthor {
+    pub name: String,
+    pub email: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

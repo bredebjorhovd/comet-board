@@ -720,6 +720,7 @@ mod tests {
                 sandbox: SandboxLevel::WorkspaceWrite,
                 account: None,
                 push_repo: None,
+                git_author: None,
             }),
             last_message_preview: None,
             last_message_at: None,
@@ -784,6 +785,7 @@ mod tests {
             // a full-config replace, so it has to survive the round trip or a
             // dispatched agent silently loses its push credentials (gh#68).
             push_repo: Some("Florin-AS/tripletex-mcp".into()),
+            git_author: None,
         };
         assert!(ws.set_chat_config("chat-1", &config).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");

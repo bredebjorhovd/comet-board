@@ -209,6 +209,28 @@ pub struct RoutingConfig {
     pub linear: LinearConfig,
     #[serde(default)]
     pub adopt: AdoptConfig,
+    /// Who the people driving this board are, on GitHub (gh#107).
+    ///
+    /// Keyed by the identity a dispatch arrives with — the email the
+    /// dispatching frontend reports its signed-in user as (gh#74) — and valued
+    /// with that person's git author address, ideally the GitHub noreply form
+    /// (`<id>+<login>@users.noreply.github.com`, from
+    /// <https://github.com/settings/emails>):
+    ///
+    /// ```toml
+    /// [users]
+    /// "ana@example.com" = "22494697+ana@users.noreply.github.com"
+    /// "sam@example.com" = "Sam Ito <8134+samito@users.noreply.github.com>"
+    /// ```
+    ///
+    /// A file, not a directory service, because a two-person box does not need
+    /// one — and because the mapping is a decision (which GitHub account is
+    /// this person?) that nothing on the box can answer on its own: the board's
+    /// App may not read anybody's email addresses.
+    ///
+    /// Empty is the single-operator default: every dispatch commits as the box.
+    #[serde(default)]
+    pub users: BTreeMap<String, String>,
 }
 
 /// What the board offers to adopt, and what it has been told to stop offering.
@@ -859,7 +881,41 @@ impl RoutingConfig {
                 ));
             }
         }
+        // A `[users]` value that is not an address is worse than no entry: the
+        // engine would stamp it onto `GIT_AUTHOR_EMAIL` and every commit that
+        // teammate's dispatches produce would be unattributable — which is the
+        // exact failure the table exists to remove (gh#107).
+        for (who, author) in &self.users {
+            if crate::git_identity::parse_author(author).is_none() {
+                out.push(format!(
+                    "[users] \"{who}\" = \"{author}\" is not a git author — write an \
+                     email address, or `Name <email>`. GitHub attributes commits to \
+                     the account owning the address; \
+                     `<id>+<login>@users.noreply.github.com` from \
+                     https://github.com/settings/emails always works."
+                ));
+            }
+        }
         out
+    }
+
+    /// The git author for whoever released a dispatch (gh#107), or `None` when
+    /// this board has no address for them — in which case the box's own
+    /// identity authors, exactly as it did before the map existed.
+    ///
+    /// Case-insensitive on the key: the value arrives from whichever frontend
+    /// the teammate signed in on, and an email is not case-sensitive in the
+    /// half that matters. An unparseable value is `None` rather than a guess;
+    /// [`RoutingConfig::problems`] reports it as the config error it is.
+    pub fn git_author_for(&self, user: &str) -> Option<comet_proto::GitAuthor> {
+        let user = user.trim();
+        if user.is_empty() {
+            return None;
+        }
+        self.users
+            .iter()
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(user))
+            .and_then(|(_, v)| crate::git_identity::parse_author(v))
     }
 
     /// The Linear teams this config actually dispatches for, deduplicated.

@@ -214,12 +214,19 @@ pub fn route_for<'a>(cfg: &'a RoutingConfig, task: &Task) -> Result<&'a Route> {
 /// names which space work goes to, and in comet the space owns its path on the
 /// host device. `route.repo` is kept as the fallback for a space the workspace
 /// doc has not stamped a path for.
+///
+/// `by_user` is [`DispatchOrigin::user`] — who the dispatching frontend says
+/// released this. Provenance, never authority (see [`DispatchOrigin`]): all it
+/// decides here is the commit *author*, which is a claim anybody could write by
+/// hand anyway, and the alternative is a teammate's work landing under the
+/// box's name (gh#107).
 pub fn build_spec(
     cfg: &RoutingConfig,
     route: &Route,
     task: &Task,
     space: &SpaceRef,
     overrides: &DispatchOverrides,
+    by_user: Option<&str>,
 ) -> Result<DispatchSpec> {
     let runtime = overrides.runtime.as_deref().unwrap_or(&route.runtime);
     let harness = harness_for_runtime(runtime).ok_or_else(|| {
@@ -241,11 +248,16 @@ pub fn build_spec(
     let push_repo = crate::model::gh_repo(&task.id)
         .map(str::to_string)
         .or_else(|| crate::git_credentials::repo_for_checkout(&repo_path));
+    // And whose name goes on the commits (gh#107). Resolved at dispatch time
+    // rather than at commit time because that is when the dispatcher is known:
+    // the agent that does the committing knows nothing about who released it.
+    let git_author = by_user.and_then(|u| cfg.git_author_for(u));
     Ok(DispatchSpec {
         identifier: task.identifier.clone(),
         space_id: space.id.clone(),
         device_id: space.device_id.clone(),
         push_repo,
+        git_author,
         repo_path,
         prompt: resolve_prompt(route, task, &branch),
         branch,
@@ -353,6 +365,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(spec.branch, "board/gh-7-widget");
@@ -366,6 +379,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
@@ -384,6 +398,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(spec.repo_path, "/home/x/dev/widget");
@@ -396,7 +411,15 @@ mod tests {
     /// touch the checkout to know it.
     #[test]
     fn a_github_task_names_the_repo_its_agent_pushes_to() {
-        let spec = build_spec(&RoutingConfig::default(), &route(), &task(), &space(), &DispatchOverrides::default()).unwrap();
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(spec.push_repo.as_deref(), Some("owner/widget"));
     }
 
@@ -411,8 +434,50 @@ mod tests {
         t.source = Source::Linear;
         let mut s = space();
         s.path = "/nonexistent/not-a-checkout".into();
-        let spec = build_spec(&RoutingConfig::default(), &route(), &t, &s, &DispatchOverrides::default()).unwrap();
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &t,
+            &s,
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(spec.push_repo, None);
+    }
+
+    /// gh#107: the teammate who released the work is the author of what comes
+    /// back. Their sign-in email is the key; the case it arrives in is the
+    /// frontend's business, not the map's.
+    #[test]
+    fn a_mapped_dispatcher_becomes_the_author_of_the_attempts_commits() {
+        let mut cfg = RoutingConfig::default();
+        cfg.users.insert(
+            "ana@example.com".into(),
+            "22494697+ana@users.noreply.github.com".into(),
+        );
+        let author = |user: Option<&str>| {
+            build_spec(
+                &cfg,
+                &route(),
+                &task(),
+                &space(),
+                &DispatchOverrides::default(),
+                user,
+            )
+            .unwrap()
+            .git_author
+        };
+
+        let ana = author(Some("Ana@Example.com")).expect("the map names her");
+        assert_eq!(ana.email, "22494697+ana@users.noreply.github.com");
+        assert_eq!(ana.name, "ana");
+
+        // Everyone else authors as the box, which is what every dispatch did
+        // before the map existed — including a dispatch that named nobody.
+        assert_eq!(author(Some("sam@example.com")), None);
+        assert_eq!(author(Some("")), None);
+        assert_eq!(author(None), None);
     }
 
     #[test]
@@ -425,6 +490,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -446,6 +512,7 @@ mod tests {
             &task(),
             &space(),
             &overrides,
+            None,
         )
         .unwrap();
         assert_eq!(spec.harness, comet_proto::HarnessId::Opencode);
@@ -466,6 +533,7 @@ mod tests {
             &task(),
             &space(),
             &overrides,
+            None,
         )
         .unwrap();
         assert_eq!(spec.model.as_deref(), Some("sonnet-4"));
@@ -486,6 +554,7 @@ mod tests {
             &task(),
             &space(),
             &overrides,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -506,6 +575,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(plain.account, None);
@@ -518,6 +588,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(from_route.account.as_deref(), Some("8f2c1d0a7b6e4539"));
@@ -531,6 +602,7 @@ mod tests {
                 account: Some("0011223344556677".into()),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
         assert_eq!(overridden.account.as_deref(), Some("0011223344556677"));
@@ -548,6 +620,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(spec.account, None);
@@ -565,6 +638,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(spec.base, "origin/HEAD");
@@ -582,14 +656,22 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         assert_eq!(from_defaults.base, "origin/develop");
 
         let mut r = route();
         r.base = Some("release".into());
-        let from_route =
-            build_spec(&cfg, &r, &task(), &space(), &DispatchOverrides::default()).unwrap();
+        let from_route = build_spec(
+            &cfg,
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(from_route.base, "release");
     }
 
@@ -765,6 +847,7 @@ mod tests {
             &task(),
             &space(),
             &DispatchOverrides::default(),
+            None,
         )
         .unwrap();
         // Unresolved (and legible) until the executor knows the checkout…

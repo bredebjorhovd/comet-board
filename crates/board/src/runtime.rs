@@ -214,6 +214,13 @@ pub struct DispatchSpec {
     /// no GitHub remote at all, which is the case that keeps its own
     /// credentials.
     pub push_repo: Option<String>,
+    /// Who the attempt's commits are by (gh#107) — the `[users]` entry for
+    /// whoever released it, when this board has one. The engine stamps it on
+    /// the harness child as `GIT_AUTHOR_*`, leaving the box's pinned identity
+    /// as the committer, so a teammate's dispatch produces commits GitHub
+    /// attributes to the teammate. `None` — an operator the map does not name,
+    /// or a board that keeps no map — authors as the box, as it always did.
+    pub git_author: Option<comet_proto::GitAuthor>,
     /// The brief: task title, body, links, and the board conventions
     /// (commit as you go, open a PR, `comet-board list --json` to poll).
     /// `{worktree}` may still be unresolved — see [`DispatchSpec::prompt_at`].
