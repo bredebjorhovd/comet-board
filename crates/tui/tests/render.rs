@@ -2553,10 +2553,23 @@ fn attempts_and_unmanaged_runs_share_the_active_group() {
     // One header for the whole live list — neither of the old ones survives.
     assert_eq!(sidebar.matches("Active").count(), 1, "{sidebar}");
     assert!(!sidebar.contains("Agents"), "{sidebar}");
-    assert!(at("Active") < at("Altinn docs"), "{sidebar}");
-    // Needs-you first: the hand-started question above the working attempt.
-    assert!(at("Altinn docs") < at("gh#1"), "{sidebar}");
-    assert!(at("gh#1") < at("Sessions"), "{sidebar}");
+    // The blocked chat rightly appears twice — once in the Needs-you inbox
+    // (gh#122, above Spaces) and once in Active — so the group-order
+    // assertions anchor to occurrences AFTER the Active header.
+    let after = |from: usize, needle: &str| {
+        sidebar
+            .lines()
+            .enumerate()
+            .position(|(i, line)| i > from && line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing after line {from}:\n{sidebar}"))
+    };
+    assert!(at("Needs you") < at("Spaces"), "{sidebar}");
+    let active = at("Active");
+    let docs_in_active = after(active, "Altinn docs");
+    // Needs-you-rank first inside Active: the hand-started question above the
+    // working attempt.
+    assert!(docs_in_active < after(active, "gh#1"), "{sidebar}");
+    assert!(after(active, "gh#1") < after(active, "Sessions"), "{sidebar}");
 }
 
 /// Nothing working: no header, no gap, no reminder that agents exist.
