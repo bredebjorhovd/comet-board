@@ -597,6 +597,101 @@ func agentsNeedingAttention(_ rows: [AgentRow]) -> Int {
     rows.filter { $0.state.needsAttention }.count
 }
 
+// MARK: - Running — every working chat the board is NOT running (gh#117)
+
+/// What a chat with no title is called — `Chat.displayTitle`'s spelling, pinned
+/// here so the Running group cannot drift from the sessions list a few rows
+/// down.
+let untitledChat = "New session"
+
+/// One working chat that no board attempt accounts for — a port of
+/// `view::board::RunningRow`.
+///
+/// Deliberately thinner than `AgentRow`: no issue, no branch promised, no cap
+/// and no attempt behind it, so the row says only what is knowable.
+struct RunningRow: Identifiable, Hashable {
+    var chatId: String
+    /// The chat's own title (`untitledChat` when it has none). The agent wrote
+    /// it about itself, which is the best there is when no issue exists.
+    var title: String
+    /// `working` or `blocked` and never `errored` — membership is the live
+    /// indicator, and an errored run is not a working one.
+    var state: AgentState
+    /// When the RUN started, off the session mirror — not when the chat was
+    /// created, which for a long-lived orchestrator is days ago.
+    var startedAt: Date?
+
+    var id: String { chatId }
+
+    /// Bare elapsed: nothing caps these runs, so there is no second number to
+    /// read it against.
+    func elapsedLabel(now: Date) -> String? {
+        agentElapsedLabel(startedAt: startedAt, capSecs: nil, now: now)
+    }
+}
+
+/// Every working chat that is not a live board attempt, most urgent first — a
+/// port of `view::board::running_rows`.
+///
+/// `agentRows` answers "what has the board released", which is a smaller
+/// question than "what is working". An orchestrator that raised in-chat
+/// subagents instead of dispatching, an ad-hoc chat somebody started by hand,
+/// the orchestrator itself: real runs with no attempt row, and so nothing in
+/// the Agents section at all.
+///
+/// - Membership is the session mirror and nothing else: `working` or
+///   `awaitingInput`, staleness-gated, so the group fills within one watch
+///   frame of a run starting and empties within one of it stopping.
+/// - A live attempt is subtracted, not re-drawn: that chat belongs to the
+///   Agents group, which knows its issue, branch and cap. The subtraction reads
+///   the board rows rather than `agentRows`'s output, so a claimed chat stays
+///   out even in the case that drops it from the other list.
+/// - Archived is not a reason to hide a run. Archiving is a decision about a
+///   *finished* chat; one working anyway is the invisible run this surfaces.
+///
+/// No board is required — `rows` empty (no board in the org, the sweep still
+/// running, a phone that has not attached) subtracts nothing.
+func runningRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
+                 now: Date = Date()) -> [RunningRow] {
+    let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
+    let dispatched = Set(rows.filter { $0.boardState.holdsPane }.compactMap(\.chatId))
+    var out: [RunningRow] = chats.compactMap { chat in
+        guard !dispatched.contains(chat.id) else { return nil }
+        let session = sessions[chat.id]
+        let state: AgentState
+        switch effectiveStatus(session, now: nowMillis) {
+        case .some(.working): state = .working
+        case .some(.awaitingInput): state = .blocked
+        // Errored and idle are not runs. A dead chat is the sessions list's to
+        // report, at the recency it earned.
+        default: return nil
+        }
+        let title = chat.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return RunningRow(
+            chatId: chat.id,
+            title: title.isEmpty ? untitledChat : title,
+            state: state,
+            startedAt: session?.startedAt.map { Date(timeIntervalSince1970: Double($0) / 1000) })
+    }
+    // The same order the Agents group uses: a question outranks work going fine,
+    // and under that longest-running first, which is stable because start order
+    // never changes under a viewer. The chat id breaks the final tie — titles
+    // are not unique and change under the reader as an agent renames its chat.
+    out.sort { a, b in
+        if a.state.rank != b.state.rank { return a.state.rank < b.state.rank }
+        if let x = a.startedAt, let y = b.startedAt, x != y { return x < y }
+        if a.startedAt != nil && b.startedAt == nil { return true }
+        if a.startedAt == nil && b.startedAt != nil { return false }
+        return a.chatId < b.chatId
+    }
+    return out
+}
+
+/// How many of these want a human — the Running header's count badge.
+func runningNeedingAttention(_ rows: [RunningRow]) -> Int {
+    rows.filter { $0.state.needsAttention }.count
+}
+
 // MARK: - Which device hosts the board (gh#55)
 
 /// The devices to try, in order, when the operator has pinned none.

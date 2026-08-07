@@ -22,8 +22,10 @@ struct HomeView: View {
             List {
                 spacesSection
                 // Between Spaces and the sessions, exactly where both desktop
-                // sidebars put it (gh#103).
+                // sidebars put it (gh#103) — and under it everything working
+                // that no attempt accounts for (gh#117).
                 AgentsSection(path: $path)
+                RunningSection(path: $path)
                 sessionsSection
             }
             .listStyle(.plain)

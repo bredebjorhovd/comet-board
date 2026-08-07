@@ -263,6 +263,12 @@ impl Loop {
         // Same rule for the agent counters: the row carries the start instant,
         // and the draw reads the clock.
         if self.app.counting() && self.last_draw.elapsed() >= COUNTER_TICK {
+            // ...but the Running group's *membership* is staleness-gated
+            // (gh#117), and staleness passes with no frame to announce it: a
+            // backend that died mid-run sends nothing ever again, so the row
+            // has to be rebuilt against the clock or it never leaves. The
+            // cursor survives — `rebuild_rows` re-homes it by key.
+            self.app.rebuild_rows();
             self.dirty = true;
         }
         if self.app.expire_notice() {

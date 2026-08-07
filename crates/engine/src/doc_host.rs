@@ -147,7 +147,10 @@ pub struct ChatDocHandle {
     device_id: String,
     doc: Arc<SessionDoc>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
-    room: Mutex<Option<RoomClient>>,
+    /// The session room, supervised by [`crate::workspace_host::spawn_room_join`].
+    /// An `Arc` because the supervisor holds a `Weak` to it: dropping the handle
+    /// is what ends the supervision (and, with it, the room client).
+    room: Arc<Mutex<Option<RoomClient>>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -170,8 +173,12 @@ impl ChatDocHandle {
         self.messages_tx.subscribe()
     }
 
+    /// Is this chat's session room joined RIGHT NOW? (Not "do we hold a client"
+    /// — see [`comet_sync::RoomClient::connected`], gh#116.)
     pub fn connected(&self) -> bool {
-        lock(&self.room).is_some()
+        lock(&self.room)
+            .as_ref()
+            .is_some_and(|client| client.connected())
     }
 
     /// Write a complete user message entry, idempotent by id (the client-minted message
@@ -288,6 +295,23 @@ impl DocHost {
         ids
     }
 
+    /// Is this engine configured to sync chats to an edge at all?
+    pub fn edge_enabled(&self) -> bool {
+        self.inner.config.edge.is_some()
+    }
+
+    /// `(open chat docs, of which hold a LIVE session room)` — the chat half of
+    /// [`comet_proto::EdgeHealth`]. Every open chat is meant to hold a room, so
+    /// a gap between the two numbers is rooms that need to come back.
+    pub fn room_census(&self) -> (usize, usize) {
+        if !self.edge_enabled() {
+            return (0, 0);
+        }
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        let live = handles.iter().filter(|h| h.connected()).count();
+        (handles.len(), live)
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -317,7 +341,7 @@ impl DocHost {
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
             messages_tx,
-            room: Mutex::new(None),
+            room: Arc::new(Mutex::new(None)),
             _sub: sub,
         });
         {
@@ -332,25 +356,21 @@ impl DocHost {
         // knows not to execute its commands (gh#66).
         self.stamp_host(&handle);
 
-        // Edge room join — offline-tolerant: a failed join logs and stays local-first.
+        // Edge room join — offline-tolerant AND supervised (gh#116). A one-shot
+        // join left an open chat permanently roomless whenever the first dial
+        // lost a race with an edge deploy or a token refresh: the handle stays
+        // in `handles`, so re-opening it (a nudge, a watcher) hands back the
+        // same roomless handle forever. The supervisor retries the first join
+        // and rebuilds a client that stops reconnecting.
         if let Some(edge) = &self.inner.config.edge {
-            let url = edge.room_url(format!("/session/{chat_id}/ws"));
-            let room_doc = doc.doc().clone();
-            let chat = chat_id.to_string();
-            let weak = Arc::downgrade(&handle);
-            tokio::spawn(async move {
-                match RoomClient::connect_via(url, &chat, room_doc).await {
-                    Ok(client) => {
-                        if let Some(handle) = weak.upgrade() {
-                            *lock(&handle.room) = Some(client);
-                            tracing::info!(chat = %chat, "session room joined");
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(chat = %chat, error = %err, "session room join failed; staying offline");
-                    }
-                }
-            });
+            crate::workspace_host::spawn_room_join(
+                edge.room_url(format!("/session/{chat_id}/ws")),
+                chat_id.to_string(),
+                doc.doc().clone(),
+                Arc::downgrade(&handle.room),
+                Arc::new(|_: &RoomClient| {}),
+                Arc::new(|| {}),
+            );
         }
 
         tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));

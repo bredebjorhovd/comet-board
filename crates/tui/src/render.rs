@@ -487,6 +487,71 @@ fn draw_sidebar_row(
                 );
             }
         }
+        // A working chat with no attempt behind it (gh#117): the same glyph and
+        // colours an agent row carries, one line, and the chat's own title
+        // where an issue identifier would be. A blocked one says so in words —
+        // there is no identifier here to recognise it by, so the glyph alone
+        // would be doing too much.
+        Row::Running {
+            chat_id,
+            title,
+            state,
+            started_at,
+            ..
+        } => {
+            let base = if selected {
+                theme.selected()
+            } else {
+                Style::default()
+            };
+            if selected {
+                fill(frame, bleed, theme.selected());
+            }
+            let now = chrono::Utc::now();
+            let open = app.selected_chat.as_deref() == Some(chat_id.as_str());
+            let (glyph, glyph_style) = if *state == board::AgentState::Working {
+                let (glyph, tint) = loaders::mini_spinner(app.elapsed());
+                (glyph, base.patch(Style::default().fg(tint)))
+            } else {
+                (
+                    state.glyph().to_string(),
+                    base.patch(theme.agent_state(*state)),
+                )
+            };
+            // No cap: nothing bounds a run the board never released, so there
+            // is no second number to read the elapsed against.
+            let elapsed = board::agent_elapsed_label(*started_at, None, now).unwrap_or_default();
+            let badge = if state.needs_attention() {
+                format!(" {}", state.label())
+            } else {
+                String::new()
+            };
+            let right = wrap::width_of(&elapsed) + wrap::width_of(&badge);
+            let title_width = width.saturating_sub(3 + right).max(1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(glyph, glyph_style),
+                    Span::styled(
+                        format!(" {}", wrap::truncate(title, title_width)),
+                        base.patch(if open { theme.body() } else { theme.subtle() }),
+                    ),
+                    Span::styled(badge, base.patch(theme.agent_state(*state))),
+                ])),
+                Rect { height: 1, ..area },
+            );
+            let elapsed_width = wrap::width_of(&elapsed);
+            if elapsed_width > 0 && (elapsed_width as u16) < area.width {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(elapsed, base.patch(theme.hint()))),
+                    Rect {
+                        x: area.x + area.width - elapsed_width as u16,
+                        width: elapsed_width as u16,
+                        height: 1,
+                        ..area
+                    },
+                );
+            }
+        }
         Row::Chat {
             id,
             title,

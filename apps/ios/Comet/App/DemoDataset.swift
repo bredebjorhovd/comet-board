@@ -65,6 +65,13 @@ final class DemoDataset {
                  config: claude, lastMessagePreview: "Which device owns the catalog?",
                  lastMessageAt: now - 120_000, createdAt: now - 7_200_000,
                  spaceId: comet.id, lastSeenAt: now - 130_000),
+            // Working with no attempt behind it — the gh#117 case, and the one
+            // the board could never report: a long-lived chat driving the box.
+            Chat(id: "chat-orchestrator", deviceId: "dev-mac", title: "Board orchestrator",
+                 archived: false, cwd: comet.path, branch: "main", checkoutId: nil,
+                 config: claude, lastMessagePreview: "Two agents up in the tally space…",
+                 lastMessageAt: now - 20_000, createdAt: now - 86_400_000 * 3,
+                 spaceId: comet.id, lastSeenAt: now - 20_000),
             Chat(id: "chat-tabs", deviceId: "dev-mac", title: "Tool group header colors",
                  archived: false, cwd: comet.path, branch: "main", checkoutId: nil,
                  config: codex, lastMessagePreview: "Done — failed children stay quiet.",
@@ -82,6 +89,10 @@ final class DemoDataset {
             "chat-picker": SessionRow(chatId: "chat-picker", deviceId: "dev-mac",
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
+            // No board row points here, so it lands in Running (gh#117).
+            "chat-orchestrator": SessionRow(chatId: "chat-orchestrator", deviceId: "dev-mac",
+                                            status: .working, startedAt: now - 6_600_000,
+                                            updatedAt: now - 2_000),
         ]
         let dataset = DemoDataset(devices: [mac, vps], spaces: [comet, edge],
                                   chats: chats, sessions: sessions)

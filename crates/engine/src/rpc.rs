@@ -438,7 +438,14 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
     board: Option<std::sync::Arc<crate::board::BoardService>>,
+    /// Live edge-connection census (gh#116). A closure rather than the pieces,
+    /// because the host-relay socket is owned by the core, not by anything this
+    /// struct holds — and the answer must be recomputed per call, never cached.
+    edge_health: Option<EdgeHealthProbe>,
 }
+
+/// Reads [`crate::EngineCore::edge_health`] on demand.
+pub type EdgeHealthProbe = std::sync::Arc<dyn Fn() -> comet_proto::EdgeHealth + Send + Sync>;
 
 impl EngineRpc {
     #[allow(clippy::too_many_arguments)] // engine assembly seam, not a public API
@@ -467,6 +474,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             board: None,
+            edge_health: None,
         }
     }
 
@@ -491,6 +499,12 @@ impl EngineRpc {
     /// Attach the board service (WatchBoard / DispatchTask / CancelTask).
     pub fn with_board(mut self, board: std::sync::Arc<crate::board::BoardService>) -> Self {
         self.board = Some(board);
+        self
+    }
+
+    /// Attach the edge-connection census (the `EdgeHealth` method, gh#116).
+    pub fn with_edge_health(mut self, probe: EdgeHealthProbe) -> Self {
+        self.edge_health = Some(probe);
         self
     }
 
@@ -1351,6 +1365,17 @@ impl RpcService for EngineRpc {
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+            }
+            methods::EDGE_HEALTH => {
+                // Absent only in bare-core test assemblies; an engine that
+                // cannot answer reports an unwired edge rather than an error,
+                // so a status line never fails over a missing probe.
+                let health = self
+                    .edge_health
+                    .as_ref()
+                    .map(|probe| probe())
+                    .unwrap_or_default();
+                RpcReply::value(&health)
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {

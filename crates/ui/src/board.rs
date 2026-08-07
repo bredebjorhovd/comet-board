@@ -776,15 +776,37 @@ impl BoardPanel {
                 | ComposerInputEvent::PastedPaths(_) => {}
             });
         let ticker = cx.spawn(async move |this, cx| {
+            // Whether the last tick found anything live. The Running group's
+            // membership is staleness-gated, and staleness passes with no frame
+            // to announce it — a backend that died mid-run sends nothing ever
+            // again. Redrawing one more time after the last live thing goes
+            // quiet is what paints the frame the row is gone from; without it
+            // a crashed run would sit in the sidebar until something unrelated
+            // moved. It also bounds the ticking: quiet stays quiet.
+            let mut was_live = false;
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |panel, cx| {
                     // Keep the elapsed counters live while something is running
                     // — on the board pane, and on the sidebar's Agents rows,
                     // which are drawn off the same rows with the dock shut.
-                    if panel.model.rows.iter().any(|row| row.state().holds_pane()) {
+                    let attempts = panel.model.rows.iter().any(|row| row.state().holds_pane());
+                    // ...and on the Running rows (gh#117), which no board row
+                    // accounts for: a box hosting no board at all can still
+                    // have a counter on screen that has to move.
+                    let now = Utc::now();
+                    let unmanaged = panel.state.read(cx).sessions.iter().any(|session| {
+                        matches!(
+                            comet_proto::view::effective_indicator(Some(session), now),
+                            comet_proto::view::Indicator::Working
+                                | comet_proto::view::Indicator::AwaitingInput
+                        )
+                    });
+                    let live = attempts || unmanaged;
+                    if live || was_live {
                         cx.notify();
                     }
+                    was_live = live;
                 });
                 if alive.is_err() {
                     break;
@@ -833,6 +855,19 @@ impl BoardPanel {
     pub fn agents(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::AgentRow> {
         let state = self.state.read(cx);
         board::agent_rows(&self.model.rows, &state.chats, &state.sessions, now)
+    }
+
+    /// The working chats no attempt accounts for — the sidebar's Running group
+    /// (gh#117).
+    ///
+    /// Beside [`BoardPanel::agents`] because the two partition one list and
+    /// splitting them across owners is how a chat ends up in both: this needs
+    /// the board rows only to *subtract* them. A device hosting no board still
+    /// answers — `self.model.rows` is empty, nothing is subtracted, and every
+    /// live chat is running.
+    pub fn running(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<board::RunningRow> {
+        let state = self.state.read(cx);
+        board::running_rows(&self.model.rows, &state.chats, &state.sessions, now)
     }
 
     /// Shell toggle hook. Opening starts the watch; closing keeps the rows so

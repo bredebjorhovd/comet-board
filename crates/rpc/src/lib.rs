@@ -49,6 +49,15 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
+    /// Which edge connections this engine holds right now →
+    /// [`comet_proto::EdgeHealth`] (gh#116).
+    ///
+    /// Never relay-forwarded, for the same reason as [`LOCAL_DEVICE`] and one
+    /// more: the answer travels over the very socket it reports on, so a
+    /// forwarded "am I reachable" is either true or unanswerable. It is asked
+    /// locally — over IPC, by `comet status` and `comet-board doctor` — which
+    /// is exactly where the gh#116 box was reachable and invisible at once.
+    pub const EDGE_HEALTH: &str = "EdgeHealth";
     pub const AUTH_STATUS: &str = "AuthStatus";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";
