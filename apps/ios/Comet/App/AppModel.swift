@@ -250,6 +250,33 @@ final class AppModel {
         return workspace?.overviewChats ?? []
     }
 
+    /// Every chat this app holds, archived ones included — the join
+    /// `activePlacements` needs, since an attempt names an issue and not a
+    /// folder, and a chat that is working anyway may well be archived.
+    var allChats: [Chat] { demo?.chats ?? workspace?.chats ?? [] }
+
+    /// Where each Active row lives (gh#138): what the lists below subtract by,
+    /// so a chat draws one full row — Active's while it runs, its own when idle.
+    var activeRowPlacements: [(chatId: String, spaceId: String?)] {
+        activePlacements(activeChats, chats: allChats)
+    }
+
+    /// Row titles, made unique within each device's spaces (gh#138): a repo
+    /// slug names a repo, and one machine can hold several checkouts of it.
+    var spaceTitlesById: [String: String] {
+        var out: [String: String] = [:]
+        for (_, group) in Dictionary(grouping: spaces, by: \.deviceId) {
+            let titles = spaceTitles(group)
+            for (ix, space) in group.enumerated() { out[space.id] = titles[ix] }
+        }
+        return out
+    }
+
+    /// How many of a space's chats the Active group is drawing above it.
+    func spaceRunning(_ spaceId: String) -> Int {
+        activeRowPlacements.filter { $0.spaceId == spaceId }.count
+    }
+
     func chats(in spaceId: String) -> [Chat] {
         if let demo {
             return sortActive(demo.chats.filter { !$0.archived && $0.spaceId == spaceId })

@@ -790,7 +790,9 @@ impl Shell {
         // Selecting a chat reveals it: the sidebar expands the chat's space so
         // the selection is never held by a row that is not on screen. Edge-
         // triggered — collapsing the space afterwards sticks until the
-        // selection moves again.
+        // selection moves again. A chat opened from Active reveals its space
+        // the same way, and the shelf below says where its row went (gh#138) —
+        // one gesture, one outcome, whichever surface it came from.
         {
             let selected_chat = state.read(cx).selected_chat.clone();
             if selected_chat != self.revealed_chat {
@@ -2010,11 +2012,23 @@ impl Shell {
         // tree (gh#124), which is the calm, complete enumeration underneath.
         let needs_section = self.render_needs_section(theme, cx);
         let orchestrator_slot = self.render_orchestrator_slot(theme, cx);
-        let spaces_section = self.render_spaces_section(theme, cx);
-        // Above the spaces tree: everything alive in one Active group
-        // (gh#123) — board attempts and the runs the board never released,
-        // needs-you first.
-        let active_section = self.render_active_section(theme, cx);
+        // Everything alive in one Active group (gh#123) — board attempts and
+        // the runs the board never released, needs-you first — derived ONCE
+        // here, because since gh#138 the spaces tree below is defined by it:
+        // Active owns a chat's row while its session is live, and the tree
+        // shows it when idle. One derivation, so the two can never disagree
+        // about which surface a chat is on this frame.
+        let active_now = Utc::now();
+        let active = self.board.read(cx).active(cx, active_now);
+        let placements: Vec<(String, Option<String>)> = {
+            let state = self.state.read(cx);
+            comet_proto::view::spaces::active_placements(&active, &state.chats)
+                .into_iter()
+                .map(|(chat, space)| (chat.to_string(), space.map(str::to_string)))
+                .collect()
+        };
+        let spaces_section = self.render_spaces_section(&placements, theme, cx);
+        let active_section = self.render_active_section(active, active_now, theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))

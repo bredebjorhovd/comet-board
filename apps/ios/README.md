@@ -77,6 +77,9 @@ Models/
   RepoRows.swift        view/repos.rs port (gh#118): the repo-first picker's
                         union of spaces + the board App's grant, its box-first
                         order, and the name-before-owner search rank
+  SpaceRows.swift       view/spaces.rs port (gh#138): names made unique within a
+                        device's spaces, and the split that gives a chat one
+                        full row — Active's while it runs, its own when idle
 Sync/
   LoroProtocol.swift    loro-protocol 0.3 wire codec (byte-compatible port of
                         the crate's encoding.rs: magic/varBytes/type/payload)
