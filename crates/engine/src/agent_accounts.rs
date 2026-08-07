@@ -380,7 +380,28 @@ impl AgentAccounts {
                 if existing.as_ref() != Some(&cfg) {
                     write_file_atomic(&identity, cfg.to_string().as_bytes(), false)?;
                 }
+                // The board's own skill, beside the credentials (gh#133).
+                //
+                // This dir *is* `CLAUDE_CONFIG_DIR` for every run pointed at
+                // the slot, and Claude Code discovers skills under the config
+                // dir — so the copy in the box user's `~/.claude` is invisible
+                // to exactly the agents the board dispatches. Without this, a
+                // dispatched agent is the one agent on the box that has never
+                // heard of the board it came from, and the fix used to be a
+                // by-hand loop over the slots that existed that night.
+                //
+                // Written on every materialize (so, every dispatch) and
+                // byte-compared first: a slot tracks whatever binary is running
+                // with no install step, and a re-materialize that changes
+                // nothing writes nothing. Never fatal — a dispatch that can run
+                // is worth more than a skill file that could not be written.
+                if let Err(err) = comet_board::skill::install_into(&dir) {
+                    tracing::warn!(slot = %slot.id, error = %err, "skill install into slot failed");
+                }
             }
+            // Nothing for Codex: skills are a Claude Code discovery mechanism,
+            // and `CODEX_HOME` has no equivalent. A Codex slot learns the board
+            // from `docs/agent-conventions.md` the way it always has.
             HarnessId::Codex => {
                 let file = dir.join("auth.json");
                 if is_stale(&file, harness, &slot.credentials) {
@@ -1969,6 +1990,34 @@ mod tests {
         );
         // And the live config dir is untouched: that is the swap this replaces.
         assert!(!tmp.0.join("live-claude").exists());
+    }
+
+    /// gh#133: the slot dir is the dispatched agent's whole `CLAUDE_CONFIG_DIR`,
+    /// so the board's skill has to be in it — the copy under `~/.claude` is the
+    /// one thing a slot run cannot see.
+    #[test]
+    fn a_materialized_slot_carries_the_board_skill() {
+        let tmp = TempDir::new("skill");
+        let service = accounts(&tmp.0);
+        let slot = claude_slot("teammate-a", claude_creds(9_000, "r1"));
+        service.write_slot(&slot).unwrap();
+
+        let dir = service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+        assert!(comet_board::skill::status_of(&dir).is_current());
+        // Same call again on the next dispatch: nothing rewritten under a CLI
+        // that may be reading it.
+        let before = std::fs::metadata(comet_board::skill::path_in(&dir))
+            .and_then(|m| m.modified())
+            .unwrap();
+        service
+            .materialize(HarnessId::ClaudeCode, &slot.id)
+            .unwrap();
+        let after = std::fs::metadata(comet_board::skill::path_in(&dir))
+            .and_then(|m| m.modified())
+            .unwrap();
+        assert_eq!(before, after);
     }
 
     /// Two teammates, two dirs. One box, two subscriptions.

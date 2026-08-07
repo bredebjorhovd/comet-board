@@ -14,9 +14,11 @@ use crate::gc;
 use crate::git_credentials;
 use crate::git_identity;
 use crate::runtime::harness_for_runtime;
+use crate::skill;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
 use comet_proto::{AgentAccount, EdgeHealth, Space};
+use std::path::{Path, PathBuf};
 
 pub struct Check {
     pub name: String,
@@ -393,7 +395,78 @@ pub fn doctor(
         &paths.config_dir,
     )));
 
+    // What the agents on this machine have been taught about the board
+    // (gh#133). Last because it is about the harness rather than the board,
+    // and because the fix is one command.
+    checks.push(agent_skill_check(
+        &skill::user_config_dir(),
+        &crate::config::agent_account_dirs(),
+    ));
+
     Ok(checks)
+}
+
+/// Does the skill the agents read match the binary whose flags it documents
+/// (gh#133)?
+///
+/// Two populations, and only one of them is anybody's job. `user_dir` is the
+/// machine's own Claude config dir, written by `comet-board skill install` and
+/// by nothing else — a stale copy there stays stale until somebody re-installs,
+/// so that is the state worth failing on. The slot dirs are re-stamped by
+/// `AgentAccounts::materialize` on every dispatch, so a stale one repairs
+/// itself the next time it is used: reported, never failed, or every doctor run
+/// after a version bump would go red over a file the next dispatch fixes.
+fn agent_skill_check(user_dir: &Path, slot_dirs: &[PathBuf]) -> Check {
+    let name = "agent skill".to_string();
+    let fix = "run `comet-board skill install`";
+    let stale_slots = slot_dirs
+        .iter()
+        .filter(|d| !skill::status_of(d).is_current())
+        .count();
+    // Only ever an addition to the detail: see the doc comment.
+    let slots = match (slot_dirs.len(), stale_slots) {
+        (0, _) => String::new(),
+        (total, 0) => format!(" · {total} agent-account slot(s), all current"),
+        (total, stale) => format!(
+            " · {stale} of {total} agent-account slot(s) behind — the next dispatch \
+             re-stamps them"
+        ),
+    };
+    let path = skill::path_in(user_dir);
+    match skill::status_of(user_dir) {
+        skill::State::Current => Check {
+            name,
+            ok: true,
+            detail: format!("{} is v{}{slots}", path.display(), skill::VERSION),
+        },
+        skill::State::Missing => Check {
+            name,
+            ok: false,
+            detail: format!(
+                "not installed — agents here do not know the board's conventions \
+                 ({fix}, writes {}){slots}",
+                path.display()
+            ),
+        },
+        skill::State::Stale { version } => Check {
+            name,
+            ok: false,
+            detail: format!(
+                "{} is {}, this binary ships v{} — {fix}{slots}",
+                path.display(),
+                match &version {
+                    Some(v) => format!("v{v}"),
+                    None => "not the shipped text".into(),
+                },
+                skill::VERSION
+            ),
+        },
+        skill::State::Unreadable(e) => Check {
+            name,
+            ok: false,
+            detail: format!("{}: {e}{slots}", path.display()),
+        },
+    }
 }
 
 /// Which edge connections the engine on this box actually holds (gh#116).
@@ -2432,6 +2505,75 @@ mod tests {
                 .any(|p| p.contains("[users] \"kim@example.com\"")),
             "{:?}",
             cfg.problems()
+        );
+    }
+
+    // ── the agent skill (gh#133) ────────────────────────────────────────────
+
+    #[test]
+    fn a_missing_skill_fails_and_names_the_one_command_that_fixes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = agent_skill_check(dir.path(), &[]);
+        assert!(!c.ok);
+        assert!(
+            c.detail.contains("comet-board skill install"),
+            "{}",
+            c.detail
+        );
+        // No slots configured is not a sentence about slots.
+        assert!(!c.detail.contains("slot"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_current_skill_passes_and_says_which_version() {
+        let dir = tempfile::tempdir().unwrap();
+        skill::install_into(dir.path()).unwrap();
+        let c = agent_skill_check(dir.path(), &[]);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains(&format!("v{}", skill::VERSION)));
+    }
+
+    #[test]
+    fn a_stale_skill_fails_naming_both_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill::path_in(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old\n<!-- comet-board skill 0.0.1 -->\n").unwrap();
+        let c = agent_skill_check(dir.path(), &[]);
+        assert!(!c.ok);
+        assert!(c.detail.contains("v0.0.1"), "{}", c.detail);
+        assert!(
+            c.detail.contains(&format!("ships v{}", skill::VERSION)),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// The rule the doc comment states: a slot behind the binary is reported,
+    /// never failed, because the next dispatch re-stamps it. Failing here would
+    /// turn every version bump into a red doctor over a self-healing file.
+    #[test]
+    fn a_stale_slot_is_reported_but_does_not_fail_the_check() {
+        let user = tempfile::tempdir().unwrap();
+        skill::install_into(user.path()).unwrap();
+        let good = tempfile::tempdir().unwrap();
+        skill::install_into(good.path()).unwrap();
+        let bad = tempfile::tempdir().unwrap();
+
+        let slots = [good.path().to_path_buf(), bad.path().to_path_buf()];
+        let c = agent_skill_check(user.path(), &slots);
+        assert!(c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("1 of 2 agent-account slot(s) behind"),
+            "{}",
+            c.detail
+        );
+
+        let c = agent_skill_check(user.path(), &slots[..1]);
+        assert!(
+            c.detail.contains("1 agent-account slot(s), all current"),
+            "{}",
+            c.detail
         );
     }
 

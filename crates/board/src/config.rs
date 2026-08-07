@@ -18,15 +18,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn discover() -> Result<Paths> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        // `~/.comet-native/board` — inside the engine's data dir on purpose:
-        // one directory to back up, and its lifetime is already the engine's.
-        // `COMET_DATA_DIR` follows the engine's dev-mode override.
-        let data_dir = match std::env::var("COMET_DATA_DIR") {
-            Ok(v) if !v.is_empty() => PathBuf::from(v),
-            _ => PathBuf::from(&home).join(".comet-native"),
-        };
-        Self::under(&data_dir)
+        Self::under(&data_dir())
     }
 
     /// The board directories under an already-resolved engine data dir — the
@@ -69,6 +61,45 @@ impl Paths {
     pub fn logfile(&self) -> PathBuf {
         self.state_dir.join("syncd.log")
     }
+}
+
+/// The engine's data dir — `$COMET_DATA_DIR`, else `~/.comet-native`.
+///
+/// The board's own directories hang off it (`board/`, and `board/state/`) on
+/// purpose: one directory to back up, and its lifetime is already the
+/// engine's. `COMET_DATA_DIR` follows the engine's dev-mode override.
+pub fn data_dir() -> PathBuf {
+    match std::env::var("COMET_DATA_DIR") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".comet-native")
+        }
+    }
+}
+
+/// The per-slot agent config dirs a dispatch runs under — `{data_dir}/accounts/*`
+/// (gh#59), one per agent-account slot that has ever been materialized.
+///
+/// The engine's `agent_accounts` owns that layout and resolves it from its own
+/// `data_dir`; this reads the same place from outside, because `doctor` has to
+/// answer a question about dirs it does not create — whether the skill the
+/// agents in them see is this binary's (gh#133). Missing root, or none
+/// materialized yet, is an empty list and not an error: a board whose
+/// dispatches all run on the box's own login has no slots at all.
+pub fn agent_account_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(data_dir().join("accounts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        // `.login-*` are throwaway CODEX_HOME dirs from a login flow in
+        // progress; nothing dispatches into one.
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 /// Where attempt checkouts live — the engine's worktree root, named here
