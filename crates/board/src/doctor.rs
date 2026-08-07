@@ -77,6 +77,11 @@ pub fn doctor(
         db_ok.as_ref().ok(),
     ));
 
+    // The other half of what an attempt leaves behind (gh#139). Beside the
+    // checkouts because it is the same question asked of the shelf instead of
+    // the disk, and the two retentions are set in the same table.
+    checks.push(chats_check(paths, db_ok.as_ref().ok()));
+
     // Read once and used three times below — the credential's own check, the
     // review-state check, and the decision whether to mention Linear at all.
     let linear_key = linear_api_key(paths);
@@ -688,6 +693,67 @@ fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Ch
         name: "worktrees".into(),
         ok: !usage.alarming(),
         detail,
+    }
+}
+
+/// What the attempts have left on the space shelves, and what will clear it
+/// (gh#139).
+///
+/// The mirror of [`worktrees_check`] on the other half of a dispatch's
+/// leavings. Nothing here is measured off the disk: a chat costs a row, not a
+/// gigabyte, and the cost this reports is attention — the six chats somebody is
+/// working in, lost among two hundred finished ones.
+///
+/// Never `ok: false`. A board keeping every chat forever is a board configured
+/// to, which is why the window is named either way and `off` is worded as the
+/// choice it is rather than as a fault.
+fn chats_check(paths: &Paths, db: Option<&Db>) -> Check {
+    let held = db
+        .and_then(|db| db.archivable_chat_attempts().ok())
+        .map(|attempts| {
+            let marked = attempts
+                .iter()
+                .filter(|a| a.chat_archivable_at.is_some())
+                .count();
+            format!(
+                "{} board chat(s) still on their shelves, {marked} on the archive clock",
+                attempts.len()
+            )
+        });
+    let retention = match RoutingConfig::load_unvalidated(&paths.routing()) {
+        Ok(cfg) => {
+            // The board-wide window, plus a count of the routes that answer
+            // differently — quoting one number for a per-route setting would be
+            // quoting it at whoever reads it about the wrong route.
+            let overrides = cfg
+                .routes
+                .iter()
+                .filter(|r| r.archive_chats.is_some())
+                .count();
+            let window = match cfg.archive_chats_secs(None) {
+                Some(secs) => format!(
+                    "archived {} after their task leaves the board",
+                    gc::human_window(secs)
+                ),
+                None => "archive_chats = off — chats stay on the shelf forever".to_string(),
+            };
+            match overrides {
+                0 => window,
+                n => format!("{window} ({n} route(s) set their own)"),
+            }
+        }
+        // Same as the worktree check's: a routing.toml that will not parse is
+        // the loud check above, and here it only means the window is unquotable.
+        Err(_) => "retention unknown — routing.toml did not parse".to_string(),
+    };
+    Check {
+        name: "chats".into(),
+        ok: true,
+        detail: [held, Some(retention)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · "),
     }
 }
 
@@ -2286,6 +2352,36 @@ mod tests {
         let check = worktrees_check(&p, &_d.path().join("nothing-here"), None);
         assert!(check.detail.contains("ever collected"), "{}", check.detail);
         // An empty root is still not a failure — nothing has been dispatched.
+        assert!(check.ok);
+    }
+
+    /// The shelf's half of the same report (gh#139): the window, and the fact
+    /// that routes may answer differently — quoting one number for a per-route
+    /// setting would be quoting it about the wrong route.
+    #[test]
+    fn the_chat_check_names_the_window_and_the_routes_that_differ() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\narchive_chats = \"14d\"\n\n\
+             [[route]]\nmatch = { label = \"keep\" }\nworkspace = \"w\"\n\
+             repo = \"/tmp\"\nruntime = \"claude\"\narchive_chats = \"off\"\n",
+        )
+        .unwrap();
+        let check = chats_check(&p, None);
+        assert!(check.ok);
+        assert!(check.detail.contains("14d"), "{}", check.detail);
+        assert!(check.detail.contains("1 route(s)"), "{}", check.detail);
+    }
+
+    /// Keeping every chat forever is a choice; the check is where its cost
+    /// shows — and it is a cost, never a failure.
+    #[test]
+    fn chat_archiving_off_is_said_out_loud() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\narchive_chats = \"off\"\n").unwrap();
+        let check = chats_check(&p, None);
+        assert!(check.detail.contains("forever"), "{}", check.detail);
         assert!(check.ok);
     }
 

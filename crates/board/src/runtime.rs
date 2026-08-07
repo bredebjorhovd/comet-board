@@ -321,6 +321,27 @@ pub trait Runtime {
         anyhow::bail!("this runtime cannot reclaim worktrees")
     }
 
+    /// Put a chat on or off its space's shelf (gh#139) — the archive half of
+    /// [`Runtime::cancel`], without the interrupt.
+    ///
+    /// `cancel` archives because the attempt is being ended; this archives
+    /// because the attempt ended a week ago and nobody is coming back to the
+    /// conversation. Nothing is deleted either way: an archived chat keeps its
+    /// transcript, Settings → Archived puts it back, and the board un-archives
+    /// one itself if the attempt it belongs to is re-opened.
+    ///
+    /// Idempotent by contract — archiving an archived chat is `Ok(())`, and so
+    /// is un-archiving a live one — because the board's record of what it
+    /// archived and the shelf itself are two states that can drift.
+    ///
+    /// The default is a refusal rather than a no-op, like
+    /// [`Runtime::reclaim_worktree`]'s: a runtime that cannot do this must not
+    /// have the board recording chats as archived that are still on the shelf.
+    fn set_chat_archived(&self, chat_id: &str, archived: bool) -> anyhow::Result<()> {
+        let _ = (chat_id, archived);
+        anyhow::bail!("this runtime cannot archive chats")
+    }
+
     /// Whose subscription a dispatch on `account` would spend, as an email
     /// (gh#101).
     ///

@@ -275,6 +275,31 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         .expect("prompt queues");
     wait_for(|| complete_turns(&doc) == 2, "the follow-up to execute").await;
 
+    // ── shelf (archive without interrupting, and back again) ────────────────
+    // gh#139's verb: the retention sweep files a finished chat away a week
+    // after its task leaves the board, and a re-opened attempt brings it back.
+    // Both directions against a real workspace doc, because the whole point is
+    // that this is the same mutation the sidebar's own Archive writes.
+    let archived = |doc: &comet_doc::WorkspaceDoc| {
+        doc.chat(&handle.chat_id)
+            .unwrap()
+            .expect("chat row remains")
+            .archived
+    };
+    runtime
+        .set_chat_archived(&handle.chat_id, true)
+        .expect("archive");
+    assert!(archived(core.workspace.doc()), "the chat is off the shelf");
+    assert!(
+        !runtime.chat_alive(&handle.chat_id).unwrap(),
+        "which is exactly why review delivery must never be archived out from under"
+    );
+    runtime
+        .set_chat_archived(&handle.chat_id, false)
+        .expect("unarchive");
+    assert!(!archived(core.workspace.doc()), "and back on it");
+    assert!(runtime.chat_alive(&handle.chat_id).unwrap());
+
     // ── cancel (interrupt + archive) ────────────────────────────────────────
     runtime.cancel(&handle.chat_id).expect("cancel");
     let chat = core

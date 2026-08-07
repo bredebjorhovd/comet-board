@@ -217,6 +217,17 @@ impl Runtime for CometRuntime {
         Ok(())
     }
 
+    /// Move a chat on or off its space's shelf (gh#139) — the same workspace
+    /// mutation the sidebar's own Archive writes, so every surface watching the
+    /// doc updates without the board telling any of them.
+    fn set_chat_archived(&self, chat_id: &str, archived: bool) -> anyhow::Result<()> {
+        // `false` is a chat the doc no longer has — deleted by hand, or on a
+        // device that has gone. It is off every shelf already, so the verb has
+        // done what it was asked; only a real mutation failure is an error.
+        self.workspace.set_chat_archived(chat_id, archived)?;
+        Ok(())
+    }
+
     fn session(&self, chat_id: &str) -> anyhow::Result<Option<Session>> {
         Ok(self
             .sessions

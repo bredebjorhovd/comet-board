@@ -15,6 +15,12 @@
 //!   finished with it, or nobody's.
 //! - [`decide`] — what to do about it now, given how long it has been nobody's.
 //!
+//! An attempt leaves two things behind, and gh#139 added the second: the
+//! checkout on the disk, and the chat on its space's shelf. [`chat_standing`]
+//! is the same ownership question asked about the chat, and [`decide`] does not
+//! care which it is aging — one rule, two windows, so a box cannot end up
+//! reclaiming the work while keeping the conversation about it forever.
+//!
 //! The discipline is the duration cap's ([`crate::overrun`]): the sweep rides
 //! the interval sync, so the retention window is aged in wall time and a burst
 //! of watch events cannot run the clock faster than the clock.
@@ -67,7 +73,8 @@ pub enum Verdict {
     /// dispatched, a pull request went back into review. Stop the clock, so a
     /// task that finishes for good next month gets its full window then.
     Unmark,
-    /// The window has run out. Delete the checkout and the branch.
+    /// The window has run out. Reclaim it — delete the checkout and its
+    /// branch, or archive the chat off its shelf (gh#139).
     Collect,
 }
 
@@ -93,6 +100,36 @@ pub fn standing(task: &Task, attempt: &Attempt) -> Standing {
         return Standing::Spent;
     }
     Standing::Held
+}
+
+/// Whose the *chat* of `attempt` is (gh#139) — the same question
+/// [`standing`] answers about its checkout, plus the two things that are true
+/// of chats and not of directories.
+///
+/// A chat and a checkout are the same attempt's leavings, so the rule is
+/// deliberately the same rule and not a second one: live is untouchable,
+/// review holds (delivery calls `chat_alive` on exactly this chat, and an
+/// archived chat reads as gone), an issue still owed holds, and only a task
+/// that has left the board is spent. What is added here:
+///
+/// - **The pinned orchestrator is never archived.** It is the board's own
+///   standing agent ([`crate::config::Defaults::orchestrator_chat`]) — it
+///   hears about every settle on the board, so it is *always* somebody's,
+///   whatever the attempt it was once dispatched as. `Held`, not a skip, so a
+///   mark left from before it was pinned is cleared.
+/// - **A chatless attempt has nothing to archive.** A dispatch whose chat
+///   never got recorded is `Held` for want of anything to do.
+///
+/// Hand-made chats need no rule: the sweep walks attempts, and a chat nobody
+/// dispatched has none.
+pub fn chat_standing(task: &Task, attempt: &Attempt, orchestrator: Option<&str>) -> Standing {
+    let Some(chat) = attempt.pane_id.as_deref() else {
+        return Standing::Held;
+    };
+    if orchestrator.is_some_and(|pinned| pinned == chat) {
+        return Standing::Held;
+    }
+    standing(task, attempt)
 }
 
 /// What to do about a checkout that has been [`Standing::Spent`] for
@@ -283,6 +320,8 @@ mod tests {
             billed_to: None,
             collectable_at: None,
             collected_at: None,
+            chat_archivable_at: None,
+            chat_archived_at: None,
         }
     }
 
@@ -370,6 +409,85 @@ mod tests {
         // Nothing to undo, nothing to do.
         assert_eq!(decide(Standing::Live, None, WEEK), Verdict::Keep);
         assert_eq!(decide(Standing::Held, None, WEEK), Verdict::Keep);
+    }
+
+    // ---- the chat's standing (gh#139) ------------------------------------
+
+    /// A chat is archived on exactly the terms its checkout is collected on.
+    /// Stated as a test because the two are configured apart, and a board that
+    /// reclaimed the work while keeping every conversation about it forever
+    /// would be tidying half the mess.
+    #[test]
+    fn a_chat_is_owed_for_as_long_as_its_checkout_is() {
+        for upstream in [
+            UpstreamState::Unstarted,
+            UpstreamState::Started,
+            UpstreamState::Terminal,
+            UpstreamState::Gone,
+        ] {
+            for outcome in [None, Some(Outcome::Done), Some(Outcome::Failed)] {
+                for pr_open in [false, true] {
+                    let mut t = task(upstream);
+                    t.pr_open = pr_open;
+                    t.attempts = vec![attempt(1, outcome)];
+                    assert_eq!(
+                        chat_standing(&t, &t.attempts[0], None),
+                        standing(&t, &t.attempts[0]),
+                        "{upstream:?} {outcome:?} pr_open={pr_open}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Review delivery asks `chat_alive` about this exact chat, and an archived
+    /// chat answers no. Archiving one in review would break the loop that
+    /// carries a human's comments to the agent that wrote the pull request —
+    /// silently, for exactly the tasks somebody is still working on.
+    #[test]
+    fn a_chat_in_review_is_never_archived() {
+        let mut t = task(UpstreamState::Terminal);
+        t.pr_open = true;
+        t.attempts = vec![attempt(1, Some(Outcome::Done))];
+        assert_eq!(chat_standing(&t, &t.attempts[0], None), Standing::Held);
+    }
+
+    /// A blocked agent is a live attempt — outcome still open — so the chat
+    /// where it stopped to ask is the one chat it would be worst to file away.
+    #[test]
+    fn a_blocked_attempts_chat_is_never_archived() {
+        let mut t = task(UpstreamState::Terminal);
+        t.attempts = vec![attempt(1, None)];
+        assert_eq!(chat_standing(&t, &t.attempts[0], None), Standing::Live);
+    }
+
+    /// The pinned orchestrator hears about every settle on the board, so it is
+    /// never finished — whatever the attempt it was once dispatched as. `Held`
+    /// rather than skipped, so a clock started before it was pinned stops.
+    #[test]
+    fn the_pinned_orchestrator_is_never_archived() {
+        let mut t = task(UpstreamState::Terminal);
+        t.attempts = vec![attempt(1, Some(Outcome::Done))];
+        assert_eq!(
+            chat_standing(&t, &t.attempts[0], Some("chat-1")),
+            Standing::Held
+        );
+        // Somebody else's pin leaves this chat exactly as spent as it was.
+        assert_eq!(
+            chat_standing(&t, &t.attempts[0], Some("chat-other")),
+            Standing::Spent
+        );
+    }
+
+    /// A dispatch whose chat was never recorded has nothing to archive, and
+    /// must not read as spent — there is no id to send anywhere.
+    #[test]
+    fn an_attempt_with_no_chat_has_nothing_to_archive() {
+        let mut t = task(UpstreamState::Terminal);
+        let mut a = attempt(1, Some(Outcome::Done));
+        a.pane_id = None;
+        t.attempts = vec![a];
+        assert_eq!(chat_standing(&t, &t.attempts[0], None), Standing::Held);
     }
 
     #[test]
