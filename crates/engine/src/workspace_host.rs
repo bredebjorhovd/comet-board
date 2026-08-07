@@ -68,6 +68,18 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// their retries into a thundering herd on the cold DO.
 const JOIN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
 const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a supervised `RoomClient` may hold ZERO live connections before it
+/// is thrown away and rebuilt (gh#116).
+///
+/// The client's own redial loop backs off to 30s, so an ordinary edge deploy is
+/// back inside a minute and never reaches this. Three minutes dark means the
+/// actor is not making progress — a wedge this layer cannot see into (a write
+/// blocked on a half-open socket, a poisoned dial, a task that died) — and the
+/// only cure that worked in production was a process restart. This is that
+/// restart, scoped to one room: drop the client, dial a fresh one with fresh
+/// credentials. Cheap enough that a genuinely offline box paying it every three
+/// minutes costs one extra connect attempt per room.
+const ROOM_DARK_REBUILD: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Cheap decorrelation jitter (0–500ms) without pulling in a rng — derived from
 /// the sub-nanosecond wall clock. Mirrors the device relay's `jitter()`.
@@ -129,19 +141,42 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Why a supervised room client was abandoned — both reasons mean "build a new
+/// one", never "give up".
+enum RoomExit {
+    /// The client's actor task is gone (clean shutdown, or a panic / lost
+    /// local-update channel that leaves a client which can never reconnect).
+    ActorGone,
+    /// The client is alive and has held no live connection for
+    /// [`ROOM_DARK_REBUILD`]. Its own redial loop caps at 30s, so this is not
+    /// slowness — it is a stuck actor (gh#116), and a fresh client with fresh
+    /// credentials is the way out.
+    DarkTooLong,
+}
+
 /// Join `room_id` and hold it in `slot` for the joiner's life — the shared
-/// machinery behind both the per-user workspace room and the org device
-/// registry room.
+/// machinery behind the per-user workspace room, the org device registry room,
+/// and every per-chat session room.
 ///
-/// `RoomClient` only self-reconnects AFTER a first successful join; an INITIAL
-/// failure (a 500 from an overloaded DO, a token racing a refresh, an edge
-/// deploy) used to end the task and leave the device offline until an app
-/// restart — presence stuck "offline" while the relay and per-chat rooms worked
-/// fine. The first join therefore retries on a capped, jittered backoff.
+/// This is a SUPERVISOR, not a one-shot join, because every layer under it can
+/// fail in a way that looks like success from here:
+///
+/// - `RoomClient` only self-reconnects AFTER a first successful join; an
+///   INITIAL failure (a 500 from an overloaded DO, a token racing a refresh, an
+///   edge deploy) used to end the task and leave the device offline until an
+///   app restart — presence stuck "offline" while the relay and per-chat rooms
+///   worked fine. The first join therefore retries on a capped, jittered
+///   backoff.
+/// - An ESTABLISHED client whose actor dies, or wedges, used to be invisible:
+///   the slot still held `Some(client)`, so every "connected?" answer stayed
+///   true while zero sockets were alive. That is the gh#116 incident — an edge
+///   redeploy cycled the DOs at 10:06 and the box was dark until somebody
+///   restarted the daemon 25 minutes later. Both shapes now end the client and
+///   rebuild it here.
 ///
 /// `slot` is held weakly: dropping the host drops its room Arc, which is what
-/// ends this task. `on_joined` runs once per successful join (the first
-/// presence beat); `on_event` runs on every ephemeral update.
+/// ends this task. `on_joined` runs on every successful (re)join; `on_event`
+/// runs on every ephemeral update.
 pub(crate) fn spawn_room_join(
     url: Arc<dyn comet_sync::UrlProvider>,
     room_id: String,
@@ -159,37 +194,115 @@ pub(crate) fn spawn_room_join(
             match RoomClient::connect_via(url.clone(), &room_id, doc.clone()).await {
                 Ok(client) => {
                     on_joined(&client);
-                    let mut events = client.events();
+                    // Health handles are taken BEFORE the client moves into the
+                    // slot, so supervision never has to hold the slot lock.
+                    let events = client.events();
+                    let health = client.watch_connected();
+                    let connected = client.connected();
                     let Some(room) = slot.upgrade() else { return };
                     *lock(&room) = Some(client);
                     tracing::info!(room = %room_id, "room joined");
                     drop(room);
-                    // Ends only when the RoomClient closes (host shutdown),
-                    // which drops us out to clear the slot.
-                    loop {
-                        match events.recv().await {
-                            Ok(comet_sync::RoomEvent::EphemeralUpdate) => on_event(),
-                            Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    // A join landed: the next failure starts from the floor.
+                    backoff = JOIN_RETRY_BASE;
+                    let exit = supervise_room(
+                        &room_id, events, health, connected, &on_joined, &on_event, &slot,
+                    )
+                    .await;
+                    let Some(room) = slot.upgrade() else { return };
+                    // Dropping the client aborts its actor and closes its
+                    // sockets; the next loop turn dials a brand-new one.
+                    let previous = lock(&room).take();
+                    drop(room);
+                    drop(previous);
+                    match exit {
+                        RoomExit::ActorGone => {
+                            tracing::warn!(room = %room_id, "room client ended; rebuilding")
                         }
+                        RoomExit::DarkTooLong => tracing::warn!(
+                            room = %room_id,
+                            dark_s = ROOM_DARK_REBUILD.as_secs(),
+                            "room held no live connection; rebuilding the client"
+                        ),
                     }
-                    // The established client gave up (host shutdown): clear the
-                    // slot and stop — nothing to rejoin into.
-                    if let Some(room) = slot.upgrade() {
-                        *lock(&room) = None;
-                    }
-                    return;
                 }
                 Err(err) => {
-                    tracing::warn!(room = %room_id, error = %err, backoff_ms = backoff.as_millis() as u64,
-                        "room join failed; retrying");
+                    // Taper the level once the backoff has reached its cap.
+                    // Every open chat is supervised now, so a box that loses
+                    // its uplink for a night would otherwise write one WARN per
+                    // chat per 30s into journald forever — the first handful of
+                    // attempts is the part anyone reads.
+                    if backoff < JOIN_RETRY_CAP {
+                        tracing::warn!(room = %room_id, error = %err, backoff_ms = backoff.as_millis() as u64,
+                            "room join failed; retrying");
+                    } else {
+                        tracing::debug!(room = %room_id, error = %err, "room join still failing; retrying");
+                    }
                 }
             }
             tokio::time::sleep(backoff + join_retry_jitter()).await;
             backoff = (backoff * 2).min(JOIN_RETRY_CAP);
         }
     });
+}
+
+/// Watch one established client until it needs replacing.
+///
+/// Returns on actor death or on [`ROOM_DARK_REBUILD`] without a live
+/// connection. A client that merely drops and redials — the ordinary edge
+/// deploy — is left alone: its own backoff loop is faster than anything this
+/// could do, and the reconnect is logged rather than acted on.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_room(
+    room_id: &str,
+    mut events: tokio::sync::broadcast::Receiver<comet_sync::RoomEvent>,
+    mut health: tokio::sync::watch::Receiver<bool>,
+    initially_connected: bool,
+    on_joined: &Arc<dyn Fn(&RoomClient) + Send + Sync>,
+    on_event: &Arc<dyn Fn() + Send + Sync>,
+    slot: &Weak<Mutex<Option<RoomClient>>>,
+) -> RoomExit {
+    let mut dark_since = (!initially_connected).then(tokio::time::Instant::now);
+    loop {
+        let dark_deadline = dark_since.map(|at| at + ROOM_DARK_REBUILD);
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(comet_sync::RoomEvent::EphemeralUpdate) => on_event(),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return RoomExit::ActorGone,
+            },
+            changed = health.changed() => {
+                if changed.is_err() {
+                    return RoomExit::ActorGone; // the actor dropped its flag
+                }
+                let connected = *health.borrow_and_update();
+                if connected {
+                    if dark_since.is_some() {
+                        tracing::info!(room = %room_id, "room reconnected");
+                    }
+                    dark_since = None;
+                    // Re-run the join side effects (the presence beat): after a
+                    // long outage the ephemeral store's 30s TTL has forgotten
+                    // our entry, so a rejoin has nothing to re-upload.
+                    let Some(room) = slot.upgrade() else { return RoomExit::ActorGone };
+                    let guard = lock(&room);
+                    if let Some(client) = guard.as_ref() {
+                        on_joined(client);
+                    }
+                } else {
+                    tracing::warn!(room = %room_id, "room connection down; client is redialing");
+                    dark_since = Some(tokio::time::Instant::now());
+                }
+            }
+            _ = async {
+                match dark_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return RoomExit::DarkTooLong,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -356,8 +469,12 @@ impl WorkspaceHost {
         self.inner.doc.clone()
     }
 
+    /// Is the workspace room joined RIGHT NOW? Holding a client is not holding
+    /// a room — see [`comet_sync::RoomClient::connected`].
     pub fn connected(&self) -> bool {
-        lock(&self.inner.room).is_some()
+        lock(&self.inner.room)
+            .as_ref()
+            .is_some_and(|client| client.connected())
     }
 
     // ── watches (WatchChats / WatchDevices / merged WatchSessions) ──────────
@@ -940,15 +1057,16 @@ fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<S
 /// point the device is, for every purpose the app has, genuinely offline.
 /// Steady state (healthy room, fresh heartbeats) probes nothing.
 async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
-    let mut tick =
-        tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
     let client = reqwest::Client::new();
     loop {
         tick.tick().await;
         let Some(inner) = weak.upgrade() else { return };
-        let Some(edge) = inner.config.edge.clone() else { return };
+        let Some(edge) = inner.config.edge.clone() else {
+            return;
+        };
         let self_id = inner.config.device_id.clone();
         let now = now_ms();
         let stale: Vec<String> = {
@@ -996,7 +1114,11 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
             let Ok(body) = response.json::<serde_json::Value>().await else {
                 continue;
             };
-            if body.get("hostConnected").and_then(serde_json::Value::as_bool) == Some(true) {
+            if body
+                .get("hostConnected")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
                 let Some(inner) = weak.upgrade() else { return };
                 lock(&inner.presence_seen).insert(device_id.clone(), now_ms());
                 tracing::debug!(device = %device_id, "presence: relay-verified alive");

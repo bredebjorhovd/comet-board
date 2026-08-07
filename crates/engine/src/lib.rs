@@ -132,6 +132,9 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    /// The edge this engine syncs against, if any — `None` is local mode, in
+    /// which holding zero edge connections is correct rather than a fault.
+    edge_url: Option<String>,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -143,6 +146,15 @@ pub struct EngineCore {
     /// the sync loop over `board.db`, serving `WatchBoard` / `DispatchTask` /
     /// `CancelTask` through [`rpc::EngineRpc`].
     board: std::sync::Mutex<Option<Arc<board::BoardService>>>,
+    /// Liveness of the DeviceRoom host socket, registered by
+    /// [`Self::start_host_relay`]. The relay handle itself lives in
+    /// [`EngineRuntime`], but the question "can anyone remote reach this box"
+    /// has to be answerable from the RPC surface — see [`Self::edge_health`].
+    ///
+    /// Shared (`Arc`) because the probe handed to `EngineRpc` is built BEFORE
+    /// the relay exists — `start_host_relay` builds an RPC service of its own
+    /// to serve — so it has to read this slot live rather than snapshot it.
+    host_relay: Arc<std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -234,6 +246,7 @@ impl EngineCore {
             registry.clone(),
             repos.clone(),
         ));
+        let edge_url = edge.as_ref().map(|edge| edge.url.clone());
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
@@ -248,10 +261,12 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            edge_url,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
             board: std::sync::Mutex::new(None),
+            host_relay: Arc::new(std::sync::Mutex::new(None)),
             _instance_lock: lock,
         })
     }
@@ -361,7 +376,36 @@ impl EngineCore {
                 }
             }
         });
-        comet_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        let relay = comet_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge);
+        *self
+            .host_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(relay.watch_connected());
+        relay
+    }
+
+    /// Which edge connections this engine holds RIGHT NOW (gh#116).
+    ///
+    /// Every field is read live from the thing that owns the socket, never from
+    /// a cached "we started it" flag — the whole point is to be able to
+    /// contradict the engine's own optimism.
+    pub fn edge_health(&self) -> comet_proto::EdgeHealth {
+        edge_health(
+            &self.edge_url,
+            &self.host_relay,
+            &self.workspace,
+            &self.doc_host,
+        )
+    }
+
+    /// [`Self::edge_health`] as a closure the RPC service can hold — see
+    /// [`rpc::EdgeHealthProbe`].
+    fn edge_health_probe(&self) -> rpc::EdgeHealthProbe {
+        let edge_url = self.edge_url.clone();
+        let host_relay = self.host_relay.clone();
+        let workspace = self.workspace.clone();
+        let doc_host = self.doc_host.clone();
+        Arc::new(move || edge_health(&edge_url, &host_relay, &workspace, &doc_host))
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
@@ -386,7 +430,7 @@ impl EngineCore {
         if let Some(board) = self.board() {
             rpc = rpc.with_board(board);
         }
-        Arc::new(rpc)
+        Arc::new(rpc.with_edge_health(self.edge_health_probe()))
     }
 
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
@@ -444,6 +488,30 @@ impl EngineCore {
                 workspace.shutdown();
             })
         })
+    }
+}
+
+/// The census behind [`EngineCore::edge_health`], over the cloneable pieces so
+/// the RPC probe can hold them without holding the core.
+fn edge_health(
+    edge_url: &Option<String>,
+    host_relay: &std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    workspace: &WorkspaceHost,
+    doc_host: &DocHost,
+) -> comet_proto::EdgeHealth {
+    let (chat_rooms_open, chat_rooms_live) = doc_host.room_census();
+    let online = edge_url.is_some();
+    comet_proto::EdgeHealth {
+        edge_url: edge_url.clone(),
+        host_relay: host_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|state| *state.borrow()),
+        workspace_room: online.then(|| workspace.connected()),
+        org_registry: online.then(|| workspace.org_devices_connected()),
+        chat_rooms_open,
+        chat_rooms_live,
     }
 }
 

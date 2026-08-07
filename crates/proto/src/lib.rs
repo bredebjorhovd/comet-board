@@ -6,8 +6,10 @@
 
 pub mod agent;
 pub mod entities;
+pub mod health;
 pub mod motion;
 pub mod view;
 
 pub use agent::*;
 pub use entities::*;
+pub use health::EdgeHealth;
