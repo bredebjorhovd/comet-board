@@ -1,113 +1,53 @@
-// Live agents on the home screen — gh#103's sidebar section, phone-shaped.
+// The Active group on the home screen — gh#123's one live list, phone-shaped.
 //
-// The problem it solves is the same one it solved on the desktop, and worse
-// here: a dispatched agent is a chat among chats, so three of them are three
-// rows somewhere in a recency-sorted list, indistinguishable from the session
-// you opened yesterday. On a phone that list is also the only thing on screen.
+// gh#103 put live board attempts on the home screen and gh#117 added the runs
+// the board never released, each under its own header — a split by how a run
+// started, which is a mechanism distinction the reader's question does not
+// contain: "what is working, and which of it wants me" has one answer. So one
+// group, needs-you first, then working, blind to origin in the order and
+// visible on the row — an attempt wears its issue identifier as a chip and
+// keeps its branch and cap, an unmanaged run is its own bare title.
 //
-// One row per live attempt: the issue identifier as the title (what the agent
-// is *for* — a better name than the chat's, which the agent writes about
-// itself), the branch underneath, elapsed against the route's cap on the right.
-// Blocked floats, with a count on the header. Pure presentation: everything
-// drawn was already streamed, and a tap opens the chat and nothing else —
-// retry and cancel live on the board, which is the deep view and has the
-// confirmations.
+// On a phone this is the surface that matters most: it is the whole answer to
+// "are they even alive", which otherwise took an ssh session and `pgrep`.
+// Pure presentation: everything drawn was already streamed, and a tap opens
+// the chat and nothing else — retry and cancel live on the board, which is
+// the deep view and has the confirmations.
 
 import SwiftUI
 
-struct AgentsSection: View {
+struct ActiveSection: View {
     @Environment(AppModel.self) private var model
     @Binding var path: [Route]
 
     /// One tick a second while the section is on screen: the rows carry the
-    /// start instant, not the age, so a *blocked* agent — which animates
+    /// start instant, not the age, so a *blocked* row — which animates
     /// nothing — would otherwise sit at whatever the last frame caught.
     @State private var now = Date()
 
     var body: some View {
-        let agents = model.liveAgents
-        if !agents.isEmpty {
+        let active = model.activeChats
+        if !active.isEmpty {
             Section {
-                ForEach(agents) { agent in
-                    Button {
-                        path.append(.chat(agent.chatId))
-                    } label: {
-                        AgentRowView(agent: agent, now: now)
-                    }
-                    .buttonStyle(PressWashButtonStyle())
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
-                }
-                .motionAnimation(Motion.resort, value: agents.map(\.id))
-            } header: {
-                header(needing: agentsNeedingAttention(agents))
-            }
-            .task {
-                while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    now = Date()
-                }
-            }
-        }
-    }
-
-    private func header(needing: Int) -> some View {
-        HStack(spacing: 6) {
-            Text("Agents")
-                .font(Theme.sans(11, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.6))
-            if needing > 0 {
-                Text("\(needing)")
-                    .font(Theme.mono(10, weight: .medium))
-                    .foregroundStyle(Theme.danger)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Theme.danger.opacity(0.14), in: Capsule())
-            }
-            Spacer(minLength: 0)
-        }
-        .textCase(nil)
-        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
-    }
-}
-
-/// The other half of the list (gh#117): every working chat the board did NOT
-/// release — the orchestrator, an ad-hoc agent chat, anything started by hand.
-///
-/// Below the Agents rather than mixed in, because the two answer different
-/// questions: one row has an issue, a branch, a cap and a bill behind it, and
-/// the other is a run somebody is responsible for that the board has never
-/// heard of. Mixing them would make the second look like the first.
-///
-/// On the phone this is the surface that matters most: it is the whole answer
-/// to "are they even alive", which otherwise took an ssh session and `pgrep`.
-struct RunningSection: View {
-    @Environment(AppModel.self) private var model
-    @Binding var path: [Route]
-
-    /// One tick a second, same as the Agents section: these rows carry the
-    /// start instant, not the age.
-    @State private var now = Date()
-
-    var body: some View {
-        let running = model.runningChats
-        if !running.isEmpty {
-            Section {
-                ForEach(running) { row in
+                ForEach(active) { row in
                     Button {
                         path.append(.chat(row.chatId))
                     } label: {
-                        RunningRowView(row: row, now: now)
+                        switch row {
+                        case .agent(let agent):
+                            AgentRowView(agent: agent, now: now)
+                        case .unmanaged(let run):
+                            RunningRowView(row: run, now: now)
+                        }
                     }
                     .buttonStyle(PressWashButtonStyle())
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
                 }
-                .motionAnimation(Motion.resort, value: running.map(\.id))
+                .motionAnimation(Motion.resort, value: active.map(\.id))
             } header: {
-                header(needing: runningNeedingAttention(running))
+                header(needing: activeNeedingAttention(active))
             }
             .task {
                 while !Task.isCancelled {
@@ -118,9 +58,11 @@ struct RunningSection: View {
         }
     }
 
+    /// The count is what you look for first: three running, one of them stuck
+    /// on a question you have not answered.
     private func header(needing: Int) -> some View {
         HStack(spacing: 6) {
-            Text("Running")
+            Text("Active")
                 .font(Theme.sans(11, weight: .medium))
                 .foregroundStyle(Theme.textMuted.opacity(0.6))
             if needing > 0 {
@@ -138,9 +80,11 @@ struct RunningSection: View {
     }
 }
 
-/// One unmanaged run: state glyph, the chat's own title, elapsed since the run
-/// started. One line — no branch is promised and no issue names it, so a second
-/// line would be an empty one.
+/// One unmanaged run (gh#117): state glyph, the chat's own title, elapsed since
+/// the run started. One line — no branch is promised and no issue names it, so
+/// a second line would be an empty one. The bare title is also the origin
+/// telling: an attempt wears an identifier chip, and this row deliberately
+/// does not.
 struct RunningRowView: View {
     let row: RunningRow
     let now: Date
@@ -187,6 +131,10 @@ struct RunningRowView: View {
     }
 }
 
+/// One live attempt (gh#103): the issue identifier as a chip — in a mixed
+/// Active list, the chip is what says "the board released this" at a glance
+/// (gh#123) — the branch underneath, elapsed against the route's cap on the
+/// right.
 struct AgentRowView: View {
     let agent: AgentRow
     let now: Date
@@ -211,10 +159,15 @@ struct AgentRowView: View {
                 .foregroundStyle(accent)
                 .frame(width: 10)
             VStack(alignment: .leading, spacing: 2) {
+                // The chip fill is the white-wash language, not an accent
+                // tint — the accent stays on the state glyph.
                 Text(agent.identifier)
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(12, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Theme.elementActive, in: RoundedRectangle(cornerRadius: 5))
                 HStack(spacing: 4) {
                     if let branch = agent.branch {
                         LineIconView(.gitBranch, size: 11, color: subline)

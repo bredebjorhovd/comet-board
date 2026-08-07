@@ -130,13 +130,14 @@ nearly verbatim — it never depended on herdr:
   `TaskRow` (moved, wire contract), plus `Filter`, `sections`,
   `routes_present`/`filter_cycle`, `finished_today`, `row_metadata` — so the
   TUI and the gpui app derive the same rows. `AgentState`/`agent_rows`
-  (gh#103) joins those rows to the chats and the session watch for the
-  sidebar's Agents section, on both surfaces.
+  (gh#103) joins those rows to the chats and the session watch;
+  `active_rows` (gh#123) merges them with gh#117's `running_rows` into the
+  one **Active** group every frontend's sidebar draws.
 - `crates/tui/src/board.rs` + the board section of `crates/tui/src/render.rs` —
   **new** (H7): the board pane (`B`), consuming `WatchBoard`, dispatching over
   `DispatchTask`. See §H7 below. The same stream also feeds the sidebar's
-  Agents section in both frontends (`Row::Agent` here,
-  `Shell::render_agents_section` in `crates/ui/src/shell/spaces.rs` — §H17).
+  Active group in both frontends (`Row::Agent` here,
+  `Shell::render_active_section` in `crates/ui/src/shell/spaces.rs` — §H17).
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
 `DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?,
@@ -1065,6 +1066,8 @@ click returns rather than on the board's next reread; the loop's reread still
 covers an `$EDITOR` over ssh.
 
 ### H20 — Live agents in the sidebar — **done** (gh#103)
+*(Since gh#123 — §H26 — this group and §H24's draw as one **Active** section;
+every rule below is unchanged, minus the header.)*
 In herdr every working agent was a pane, so the pane list *was* the presence
 list and presence cost nothing. Here a dispatched agent is a chat among chats:
 three of them are three rows somewhere in a recency-sorted list, indistinguishable
@@ -1241,6 +1244,8 @@ Apple Developer account — the same one gh#100's signing tier wants, so it is o
 purchase for both.
 
 ### H24 — Unmanaged runs are visible, and delegation goes through the board — **done** (gh#117)
+*(Since gh#123 — §H26 — this group and §H20's draw as one **Active** section;
+every rule below is unchanged, minus the header.)*
 The first real orchestrator session asked for two agents in a space, and the
 orchestrator raised two of its harness's *own* in-chat subagents inside its run
 instead of dispatching. Work was genuinely running on the box — editing a repo,
@@ -1357,6 +1362,133 @@ is otherwise complete.
 - **Not done: the TUI.** It has no add-space surface at all today — spaces get
   made from the desktop, the phone, or `comet-board onboard` — so "the TUI's
   picker follows if cheap" was not cheap; it is a new screen, not a re-shaped one.
+
+### H26 — Presence tells the truth, or says it cannot know — **done** (gh#126)
+
+Eight space rows read "@Tokenmaxxer9000 · offline" (amber) while the box's
+orchestrator had run for eight hours. Live diagnosis found the actual outage
+one layer down: the Cloudflare account is on the Workers **free** plan, and the
+15s presence beats keep the workspace/org Durable Objects permanently awake
+(they can never hibernate), so the free tier's daily DO *duration* allowance
+burns out mid-afternoon — from then until the daily reset the edge answers
+every DO request with a 500 (`Exceeded allowed duration in Durable Objects
+free tier`, caught live via `wrangler tail`). All rooms on all devices die at
+once: the box goes genuinely unreachable, the Mac goes deaf, and the sidebar's
+loudest signal accuses the box. The plan upgrade is the operational cure; the
+code changes make the *label* stop lying whatever the outage:
+
+- **The read is three-state now** (`comet_proto::view::host_presence`, pure +
+  tested): a lapsed heartbeat is `Offline` (amber) only while THIS viewer's
+  engine can hear — at least one sync room live. Deaf (both rooms down, signed
+  out, local mode) renders `SyncDown` — "@ box · sync down", muted — indicting
+  the pipe, which is the thing the viewer actually knows is broken. The gpui
+  app polls its own engine's `EdgeHealth` every 15s to know which it is. One
+  presence window (70s) is now shared by every surface via
+  `view::PRESENCE_STALE_MS` — the TUI's was 45s, a real cross-surface
+  disagreement.
+- **The beat lost its silent failure mode** (`crates/sync/src/room.rs`): the
+  `%EPH` presence sub-join was fire-and-forget — sent once per session; a
+  `JoinError` only warned, an unanswered join left `joined_eph` false forever,
+  and every outbound heartbeat was then dropped while doc sync stayed
+  perfectly healthy. The session now re-sends the join every 15s until it
+  lands (and on liveness-probe answers). Room test: swallow the join twice,
+  presence must still come up.
+- **The census names presence** (gh#116's `EdgeHealth`): new
+  `workspacePresence`/`orgPresence` fields, read from the room clients' new
+  `%EPH`-joined flag. `summary()` calls out "presence dead on … (doc sync is
+  up; this device will read offline elsewhere)" — the wedge that used to be
+  indistinguishable from 4-of-4-live. `comet status` and doctor inherit it.
+- **The exit criterion is a test**: the gh#116 fake edge now broadcasts room
+  frames between members, and a two-engine test (box + viewer, same user)
+  asserts the box's heartbeat lands in the viewer's device row, survives a
+  full edge redeploy unattended, and carries the presence census the whole
+  way (`edge_reconnect.rs`).
+
+The per-row device-suffix rendering itself still moves with gh#124; this issue
+fixed what the suffix is allowed to claim.
+
+### H27 — Readable at 124 rows — **done** (gh#125)
+An operator report with screenshots: at 124 rows the panel was "messy and hard
+to read", the host chip whispered "This device ●" while showing the Mac's own
+stale test board instead of the box's, and an undispatchable `no route` row was
+the top selected row of the whole panel. Five fixes, derived once in
+`comet_proto::view::board` and drawn by all three viewports:
+
+- **Groups within sections** (`grouped_sections`): rows group by route — the
+  same field `f` and `Filter::Route` partition on — biggest group first, ties
+  alphabetical, each group collapsible. One routed group draws no header
+  (`group_headers_shown`); a flat three-row WORKING section stays flat.
+- **`no route` is a trailing, folded group** (`group_starts_collapsed`):
+  visibility-only rows get a headline and a count, never pole position. The
+  default fold applies only on the unfiltered board — `f` to the `no route`
+  position or `/` matching an unrouted title must show what it asked for, so
+  under any active filter the group opens.
+- **Honest hosts.** The host moved from a corner chip into the panel's title —
+  "Board on Tokenmaxxer9000 · 124" — on desktop (clicking it opens the old
+  pin menu); the TUI header gained the count beside its host note; iOS already
+  titled itself this way. And the automatic sweep stopped settling on the first
+  frame: a frame proves a board *exists*, not that it is the org's board.
+  `board_dispatched` (any row with an attempt on record — not `chat_id`, which
+  only rides the live attempt) is the evidence the sweep settles on; a board
+  without it is held as a *fallback* while the remaining candidates are asked,
+  and settled on only when nobody with evidence answers. A lone device and a
+  fresh install still see their own board; a laptop's stale test board loses to
+  the box. All three sweeps (desktop watch loop, TUI link loop, iOS
+  `BoardStore`) carry the same hold-and-return shape.
+- **The leading token is repo-qualified** (`TaskRow::display_identifier`):
+  `tally #507`, the CLI's form humanized, because `gh#507` vs `gh#44` are
+  different repos distinguishable only by a muted sub-line. `gh_repo` /
+  `gh_repo_name` moved from `comet_board::model` into proto (re-exported) so
+  the viewports and the board crate parse one id format once. Linear ids show
+  unchanged. `/` matches the rendered form. The TUI's id column stretches to
+  the widest token on screen (capped), and the Ready sub-line dropped the
+  route it used to name — the group header and leading token now say it — 
+  keeping only a workspace that differs from the route's name plus the
+  `[enter to dispatch]` / `no route` affordances.
+- **Two-line titles under the cursor**: the desktop's selected/hovered row
+  wraps its title to two lines (`line_clamp(2)`, row height min not fixed);
+  iOS already wrapped. The TUI stays one terminal row per line — a grid where
+  one row is sometimes two makes the scroll arithmetic lie — but its title
+  column got wider with the metadata cuts above. Desktop section headers also
+  took on the weight of what they manage: bold, always-visible counts, a
+  chevron instead of a 10 px text button.
+
+### H28 — One Active group — **done** (gh#123)
+§H20 gave the sidebar an **Agents** group and §H24 added **Running** under it —
+a split by how a run started: the board released it, or somebody (or some
+orchestrator) just started it. That is a mechanism distinction, and the
+reader's question does not contain it: "what is working, and which of it wants
+me" has one answer. Now it gets one group — **Active**, needs-you first, then
+working, blind to origin in the order — on all three frontends.
+
+- **`comet_proto::view::board::active_rows` is the merge, and it is small.**
+  Membership already partitioned (`running_rows` subtracts every chat a live
+  attempt claims — §H24), so the union never draws a chat twice and the merge
+  is only an order: the key both halves already sorted by (urgency rank, then
+  longest-running, then the chat id), applied once across the union. Without
+  that one sort, concatenated halves would put a working attempt above a
+  blocked hand-started run — the exact order the merge exists to end.
+  `ActiveRow` is the two-variant row (`Agent`/`Unmanaged`);
+  `active_needing_attention` feeds the one header badge, replacing the two
+  per-group counters. Ported whole to Swift in `BoardModels.swift`, as the
+  halves were.
+- **All three frontends dropped a header, not a row shape.** The TUI's
+  `Row::Agent`/`Row::Running`, the desktop's
+  `render_agent_row`/`render_running_row` and the phone's
+  `AgentRowView`/`RunningRowView` all survive; only the section build changed
+  (one "Active" header, one blocked count). The desktop's
+  `BoardPanel::active()` replaced `agents()`/`running()`, and the sessions
+  list's `render_active_rows` was renamed `render_session_rows` so "active"
+  means exactly one thing in that file.
+- **The chip is the origin telling.** In the split world, which header a row
+  sat under said "board" or "not"; merged, that job moves onto the row. The
+  issue identifier draws as a chip — element/wash fill, the "thing you act on"
+  level, never an accent tint (the accent stays on the state rail) — and an
+  unmanaged run deliberately wears none: its bare title *is* the other half of
+  the telling. The board rows keep their branch/cap sub-line unchanged.
+- **Everything else is inherited.** Membership, staleness expiry, the
+  no-empty-header rule, open-only click behavior, the second-by-second
+  counter debt: all exactly as §H20 and §H24 state them, per half.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

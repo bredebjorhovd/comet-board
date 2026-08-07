@@ -1173,11 +1173,15 @@ impl App {
         }
     }
 
-    /// `enter` on the board: dispatch a ready task, fold a section header, or
-    /// open a running task's chat.
+    /// `enter` on the board: dispatch a ready task, fold a section or group
+    /// header, or open a running task's chat.
     fn board_enter(&mut self) -> Effects {
         if let Some(state) = self.board.on_section() {
             self.board.toggle_collapsed(state);
+            return Vec::new();
+        }
+        if let Some((state, route)) = self.board.on_group() {
+            self.board.toggle_group(state, route.as_deref());
             return Vec::new();
         }
         let Some(row) = self.board.selected_task() else {
@@ -1960,62 +1964,43 @@ impl App {
             });
         }
 
-        // Agents, above the spaces tree (gh#124): one row per live board
-        // attempt (gh#103).
-        // Omitted entirely when nothing is running — an empty section here would
-        // be a permanent reminder that a board exists on a box that has none.
-        // The board pane (`B`) stays the deep view; this is the glance.
-        let agents = board_view::agent_rows(&self.board.rows, &self.chats, &self.sessions, now);
-        if !agents.is_empty() {
-            let blocked = board_view::agents_needing_attention(&agents);
+        // Active, above the spaces tree (gh#124): everything alive on the box in one group
+        // (gh#123) — board attempts (gh#103) and the runs the board never
+        // released (gh#117), needs-you first, then working, blind to how each
+        // one started. Origin still shows on the row: an attempt wears its
+        // issue identifier as a chip and keeps its branch and cap, an unmanaged
+        // run is its own bare title. Omitted entirely when nothing is running —
+        // an empty section here would be a permanent reminder that a board
+        // exists on a box that has none. The board pane (`B`) stays the deep
+        // view; this is the glance.
+        let active = board_view::active_rows(&self.board.rows, &self.chats, &self.sessions, self.orchestrator.as_deref(), now);
+        if !active.is_empty() {
+            let blocked = board_view::active_needing_attention(&active);
             rows.push(Row::Blank);
             rows.push(Row::Section {
-                label: "Agents".into(),
+                label: "Active".into(),
                 // The count is on the header because it is what you look for
                 // first: three running, one of them stuck on a question.
                 action: (blocked > 0).then(|| format!("{blocked} blocked")),
             });
-            for agent in agents {
-                rows.push(Row::Agent {
-                    chat_id: agent.chat_id,
-                    identifier: agent.identifier,
-                    branch: agent.branch,
-                    state: agent.state,
-                    started_at: agent.started_at,
-                    cap_secs: agent.cap_secs,
-                });
-            }
-        }
-
-        // Running, under them: everything working that the board did NOT
-        // release (gh#117) — an ad-hoc agent chat, a session somebody started
-        // by hand. Same shape, separate group, because these have no issue,
-        // branch, cap or bill behind them; the board rows are read only to
-        // subtract the attempts, so a box hosting no board fills this group
-        // all the same. The pinned orchestrator is subtracted too — its slot
-        // above Spaces carries its live state (gh#122).
-        let running = board_view::running_rows(
-            &self.board.rows,
-            &self.chats,
-            &self.sessions,
-            self.orchestrator.as_deref(),
-            now,
-        );
-        if !running.is_empty() {
-            let blocked = board_view::running_needing_attention(&running);
-            rows.push(Row::Blank);
-            rows.push(Row::Section {
-                label: "Running".into(),
-                action: (blocked > 0).then(|| format!("{blocked} blocked")),
-            });
-            for run in running {
-                rows.push(Row::Running {
-                    chat_id: run.chat_id,
-                    space_id: run.space_id,
-                    title: run.title,
-                    state: run.state,
-                    started_at: run.started_at,
-                });
+            for item in active {
+                match item {
+                    board_view::ActiveRow::Agent(agent) => rows.push(Row::Agent {
+                        chat_id: agent.chat_id,
+                        identifier: agent.identifier,
+                        branch: agent.branch,
+                        state: agent.state,
+                        started_at: agent.started_at,
+                        cap_secs: agent.cap_secs,
+                    }),
+                    board_view::ActiveRow::Unmanaged(run) => rows.push(Row::Running {
+                        chat_id: run.chat_id,
+                        space_id: run.space_id,
+                        title: run.title,
+                        state: run.state,
+                        started_at: run.started_at,
+                    }),
+                }
             }
         }
 
@@ -2205,7 +2190,10 @@ impl App {
             .and_then(|device| device.last_seen_at)
         {
             Some(seen) => {
-                now.signed_duration_since(seen).num_milliseconds() <= view::SESSION_STALE_MS
+                // The shared presence window — the gpui app's devices page and
+                // space rows use the same one, so the two surfaces can never
+                // disagree about the same device (gh#126).
+                now.signed_duration_since(seen).num_milliseconds() <= view::PRESENCE_STALE_MS
             }
             // No record yet (registry still arriving, or another user's device):
             // say nothing rather than claim an outage we cannot see.
@@ -4411,7 +4399,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The sidebar's Agents section (gh#103)
+    // Live board attempts in the sidebar (gh#103; under "Active" since gh#123)
     // -----------------------------------------------------------------------
 
     /// The rows a live board attempt puts in the sidebar, with the board pane
@@ -4457,7 +4445,7 @@ mod tests {
         assert!(app.rows.iter().any(|row| matches!(
             row,
             Row::Section { label, action: Some(count) }
-                if label == "Agents" && count == "1 blocked"
+                if label == "Active" && count == "1 blocked"
         )));
     }
 
@@ -4485,8 +4473,8 @@ mod tests {
         assert!(
             !app.rows
                 .iter()
-                .any(|row| matches!(row, Row::Section { label, .. } if label == "Agents")),
-            "an empty Agents header is a permanent reminder of nothing"
+                .any(|row| matches!(row, Row::Section { label, .. } if label == "Active")),
+            "an empty Active header is a permanent reminder of nothing"
         );
     }
 
@@ -4582,7 +4570,7 @@ mod tests {
         assert!(app.counting(), "but its age still has to move");
     }
 
-    // ---- the Running group (gh#117) ---------------------------------------
+    // ---- unmanaged runs (gh#117; under "Active" since gh#123) -------------
 
     fn running_rows_in_sidebar(app: &App) -> Vec<(String, AgentState)> {
         app.rows
@@ -4627,12 +4615,12 @@ mod tests {
         assert!(app.rows.iter().any(|row| matches!(
             row,
             Row::Section { label, action: Some(count) }
-                if label == "Running" && count == "1 blocked"
+                if label == "Active" && count == "1 blocked"
         )));
     }
 
-    /// The two groups partition the box's load — a dispatched chat is the
-    /// Agents group's, and drawing it twice would double-count what is running.
+    /// The two halves partition the box's load — a dispatched chat draws once,
+    /// as the attempt that claimed it; twice would double-count what is running.
     #[test]
     fn a_dispatched_chat_is_an_agent_and_not_also_running() {
         let mut app = seeded();
@@ -4664,6 +4652,49 @@ mod tests {
         );
     }
 
+    /// One group, one order (gh#123): a hand-started run asking a question
+    /// sits above a board attempt that is working fine, under one header that
+    /// counts them both — origin decides the row's shape, never its place.
+    #[test]
+    fn the_active_group_interleaves_attempts_and_unmanaged_runs() {
+        let mut app = seeded();
+        app.apply(Update::Chats(vec![
+            chat("chat-a", "s1", 1),
+            chat("chat-b", "s1", 2),
+        ]));
+        let mut live = board_row("a", BoardState::Working);
+        live.chat_id = Some("chat-a".into());
+        app.apply(Update::Board(vec![live]));
+        app.apply(Update::Sessions(vec![
+            session("chat-a", SessionStatus::Working, 0),
+            session("chat-b", SessionStatus::AwaitingInput, 0),
+        ]));
+
+        let agent_at = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Agent { .. }))
+            .unwrap();
+        let running_at = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Running { .. }))
+            .unwrap();
+        assert!(
+            running_at < agent_at,
+            "the blocked run outranks the working attempt, origin be damned"
+        );
+        assert_eq!(
+            app.rows
+                .iter()
+                .filter(|row| matches!(row, Row::Section { label, .. }
+                    if label == "Active" || label == "Agents" || label == "Running"))
+                .count(),
+            1,
+            "one header over the whole live list"
+        );
+    }
+
     /// The group appears with the run and leaves with it, within one watch
     /// frame either way — and leaves nothing behind when it goes.
     #[test]
@@ -4692,8 +4723,8 @@ mod tests {
         assert!(
             !app.rows
                 .iter()
-                .any(|row| matches!(row, Row::Section { label, .. } if label == "Running")),
-            "an empty Running header is a permanent reminder of nothing"
+                .any(|row| matches!(row, Row::Section { label, .. } if label == "Active")),
+            "an empty Active header is a permanent reminder of nothing"
         );
     }
 

@@ -236,17 +236,25 @@ enum E2ERunner {
         }) {
             log("OK row is \(live.state) on chat \(live.chatId ?? "?") "
                 + "branch=\(live.branch ?? "-") started=\(live.startedAt ?? "-")")
-            let agents = model.liveAgents
+            // One Active group (gh#123): the dispatched chat must draw exactly
+            // once, as the agent variant — the two halves partition what is
+            // running, and a chat in both would double-count the box's load.
+            let active = model.activeChats
+            let agents = active.compactMap { row -> AgentRow? in
+                if case .agent(let agent) = row { return agent } else { return nil }
+            }
+            let unmanaged = active.compactMap { row -> RunningRow? in
+                if case .unmanaged(let run) = row { return run } else { return nil }
+            }
             log(agents.isEmpty
                 ? "note: no agent row yet (chat still syncing to this device)"
                 : "OK agent row: \(agents.map { "\($0.identifier)/\($0.state.label)" }.joined(separator: ", "))")
-            // The other half of the list (gh#117). The dispatched chat must NOT
-            // be in it — the two groups partition what is running, and a chat
-            // in both would double-count the box's load.
-            let running = model.runningChats
-            log(running.contains { $0.chatId == live.chatId }
-                ? "FAIL the dispatched chat is in Running as well as Agents"
-                : "OK running (non-board): \(running.map(\.title).joined(separator: ", "))")
+            log(active.filter { $0.chatId == live.chatId }.count > 1
+                ? "FAIL the dispatched chat draws twice in the Active group"
+                : "OK the dispatched chat draws at most once in Active")
+            log(unmanaged.contains { $0.chatId == live.chatId }
+                ? "FAIL the dispatched chat is an unmanaged row as well as an agent"
+                : "OK unmanaged (non-board): \(unmanaged.map(\.title).joined(separator: ", "))")
             // The blocked row's Retry (gh#49): end the live attempt and release
             // a fresh one. Driven here against a `working` row because the
             // engine's `replace` means exactly "end what is live first" — which

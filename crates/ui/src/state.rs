@@ -299,9 +299,10 @@ impl EngineHandle {
 // with this one — a sort order that differs per surface is a bug. Re-exported
 // here because every call site in this crate reads them as `state::…`.
 pub use comet_proto::view::{
-    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    ChatGroup, ConnectionStatus, GatePhase, HostPresence, Indicator, SESSION_STALE_MS,
+    attention_rank, chat_location, display_status, effective_indicator, format_time_ago,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats,
+    sort_spaces, sort_tabs,
 };
 
 // ---------------------------------------------------------------------------
@@ -384,6 +385,11 @@ pub struct AppState {
     pub orchestrator: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<comet_update::UpdateStatus>,
+    /// This engine's own edge census, polled every 15s (gh#126). What lets the
+    /// sidebar tell "that host is offline" from "I can't hear anyone" — the
+    /// two states the amber suffix used to conflate. `None` until the first
+    /// poll answers (or forever, against an engine that predates the RPC).
+    pub edge_health: Option<comet_proto::EdgeHealth>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -415,6 +421,7 @@ impl AppState {
             local_device_id: None,
             orchestrator: None,
             update: None,
+            edge_health: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -598,6 +605,22 @@ impl AppState {
         }
     }
 
+    /// The three-state host verdict (gh#126): a lapsed heartbeat is only
+    /// "offline" while THIS app's engine can hear — with our own sync rooms
+    /// down the honest claim is [`HostPresence::SyncDown`], indicting the pipe
+    /// rather than the host. See [`comet_proto::view::host_presence`].
+    pub fn host_presence(&self, device_id: &str, now: DateTime<Utc>) -> HostPresence {
+        let is_local = self.local_device_id.as_deref() == Some(device_id);
+        // An unknown device reads as no evidence (`None`), which the shared
+        // derivation already treats as "say nothing" — don't cry wolf.
+        let last_seen = self
+            .devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.last_seen_at);
+        comet_proto::view::host_presence(is_local, last_seen, self.edge_health.as_ref(), now)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {
@@ -725,6 +748,7 @@ impl AppState {
             ),
             spawn_orchestrator_watch(cx, handle.clone()),
             spawn_local_device_probe(cx, handle.clone()),
+            spawn_edge_health_poll(cx, handle.clone()),
         ];
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
@@ -1003,6 +1027,40 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
                 cx.notify();
             })
             .ok();
+        }
+    })
+}
+
+/// Poll cadence for this engine's own edge census — see
+/// [`AppState::edge_health`]. Matches the engine's presence tick, and sits
+/// well inside the 70s presence window it gates.
+const EDGE_HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Standing poll of the unary `EdgeHealth` RPC (gh#126). A poll rather than a
+/// watch because the census is computed on demand engine-side; 15s staleness
+/// is invisible behind the 70s presence window, and a fresh heartbeat outranks
+/// the census anyway (`view::host_presence`). Errors keep the last answer — an
+/// engine mid-restart must not flip every row's verdict on its way down.
+fn spawn_edge_health_poll(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            if let Ok(value) = handle
+                .client()
+                .call(methods::EDGE_HEALTH, serde_json::json!({}))
+                .await
+                && let Ok(health) = serde_json::from_value::<comet_proto::EdgeHealth>(value)
+                && this
+                    .update(cx, |state, cx| {
+                        if state.edge_health.as_ref() != Some(&health) {
+                            state.edge_health = Some(health.clone());
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+            {
+                return; // app state dropped
+            }
+            cx.background_executor().timer(EDGE_HEALTH_POLL).await;
         }
     })
 }

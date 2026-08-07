@@ -2010,9 +2010,11 @@ impl Shell {
         // tree (gh#124), which is the calm, complete enumeration underneath.
         let needs_section = self.render_needs_section(theme, cx);
         let orchestrator_slot = self.render_orchestrator_slot(theme, cx);
-        let agents_section = self.render_agents_section(theme, cx);
-        let running_section = self.render_running_section(theme, cx);
         let spaces_section = self.render_spaces_section(theme, cx);
+        // Above the spaces tree: everything alive in one Active group
+        // (gh#123) — board attempts and the runs the board never released,
+        // needs-you first.
+        let active_section = self.render_active_section(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2021,7 +2023,7 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            // Spaces + the global Active list share one scroll region. On
+            // Spaces + the global Sessions list share one scroll region. On
             // glass the whole region paints inside an EdgeFade scope — a true
             // per-glyph gradient at active overflow edges.
             .child(crate::edge_fade::edge_faded(
@@ -2043,8 +2045,7 @@ impl Shell {
                             .flex_col()
                             .child(needs_section)
                             .children(orchestrator_slot)
-                            .children(agents_section)
-                            .children(running_section)
+                            .children(active_section)
                             .child(spaces_section)
                             .child(div().pb(px(Theme::SPACE_SM))),
                     )

@@ -308,25 +308,18 @@ impl Task {
     }
 }
 
-/// The `owner/repo` a GitHub task id names — `gh:Florin-AS/tripletex-mcp#2` →
-/// `Florin-AS/tripletex-mcp`. `None` for a Linear id, which names no repo.
+/// The `owner/repo` (and bare-name) parsers a GitHub task id answers to.
 ///
 /// GitHub numbers issues per repository, so the repo is the half of a task id
 /// that makes it unique. Anything keyed on the *identifier* alone — `gh#2`, and
 /// the `board/gh-2` branch that used to come from it — is keyed on something
 /// two repos can both answer to.
-pub fn gh_repo(task_id: &str) -> Option<&str> {
-    // `!` is the pull-request form of the id: `gh:owner/repo!508`.
-    task_id.strip_prefix("gh:")?.split(['#', '!']).next()
-}
-
-/// Just the repository's name — `Florin-AS/tripletex-mcp` → `tripletex-mcp`.
 ///
-/// The owner is noise when you work with a handful of repos; the name is the
-/// part you read, and so the part that names branches and panes.
-pub fn gh_repo_name(task_id: &str) -> Option<&str> {
-    gh_repo(task_id)?.rsplit('/').next()
-}
+/// The parsers themselves moved to proto (gh#125): the viewports key each row's
+/// leading token on the repo name now, and two parsers of one id format is one
+/// too many. Re-exported here because board-side code keys branches and panes
+/// on them.
+pub use comet_proto::view::board::{gh_repo, gh_repo_name};
 
 #[derive(Debug, Clone)]
 pub struct Attempt {

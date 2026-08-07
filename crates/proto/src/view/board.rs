@@ -296,6 +296,47 @@ impl TaskRow {
     pub fn state(&self) -> BoardState {
         BoardState::parse(&self.state).unwrap_or(BoardState::Ready)
     }
+
+    /// The leading token a board row shows: the CLI's repo-qualified form,
+    /// humanized — `tally #507`, not `gh#507` (gh#125).
+    ///
+    /// GitHub numbers issues per repository, so `gh#507` and `gh#44` can be
+    /// different repos distinguishable only by a muted sub-line. The repo name
+    /// is the half of the id that makes the identifier readable on its own; the
+    /// owner stays out for the same reason it stays out of branch names. A
+    /// Linear identifier (`LIN-142`) is already unique across the board and is
+    /// shown unchanged, as is any id this rule cannot parse.
+    pub fn display_identifier(&self) -> String {
+        let number = self
+            .id
+            .rsplit(['#', '!'])
+            .next()
+            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        match (gh_repo_name(&self.id), number) {
+            (Some(repo), Some(n)) if !repo.is_empty() => format!("{repo} #{n}"),
+            _ => self.identifier.clone(),
+        }
+    }
+}
+
+/// The `owner/repo` a GitHub task id names — `gh:Florin-AS/tally#507` →
+/// `Florin-AS/tally`. `None` for a Linear id, which names no repo.
+///
+/// Lives here (and is re-exported by `comet_board::model`) because both the
+/// board crate and every viewport read it: the board keys branches and panes on
+/// it, the viewports key the row's leading token on it, and two parsers of one
+/// id format is one too many.
+pub fn gh_repo(task_id: &str) -> Option<&str> {
+    // `!` is the pull-request form of the id: `gh:owner/repo!508`.
+    task_id.strip_prefix("gh:")?.split(['#', '!']).next()
+}
+
+/// Just the repository's name — `Florin-AS/tally` → `tally`.
+///
+/// The owner is noise when you work with a handful of repos; the name is the
+/// part you read, and so the part that names branches, panes and board rows.
+pub fn gh_repo_name(task_id: &str) -> Option<&str> {
+    gh_repo(task_id)?.rsplit('/').next()
 }
 
 /// Showing less than everything.
@@ -342,6 +383,9 @@ impl Filter {
                 let q = q.trim();
                 q.is_empty()
                     || contains(&row.identifier, q)
+                    // The row renders `tally #507`, so `/tally` must reach it —
+                    // matching what is rendered is the least surprising rule.
+                    || contains(&row.display_identifier(), q)
                     || contains(&row.title, q)
                     || row.route.as_deref().is_some_and(|r| contains(r, q))
                     // The route column renders `no route` on such a row, and
@@ -468,6 +512,88 @@ pub fn sections<'a>(
         .collect()
 }
 
+/// One route's rows inside a section — the unit a hundred-row board is scanned
+/// by (gh#125).
+#[derive(Debug, PartialEq)]
+pub struct SectionGroup<'a> {
+    /// The route the group collects, keyed on the same field [`Filter::Route`]
+    /// and the `f` cycle partition on. `None` is the `no route` group.
+    pub route: Option<String>,
+    pub rows: Vec<&'a TaskRow>,
+}
+
+impl SectionGroup<'_> {
+    /// What the group header says: the route's name, or [`NO_ROUTE`] — the
+    /// words the rows themselves use.
+    pub fn label(&self) -> &str {
+        self.route.as_deref().unwrap_or(NO_ROUTE)
+    }
+}
+
+/// Whether a group starts folded, absent an operator's own toggle.
+///
+/// Unrouted rows are visibility-only by design — on the board, deliberately
+/// undispatchable — so their group starts folded: worth a headline and a
+/// count, never pole position over rows an `enter` can actually release. But
+/// only on the unfiltered board: a filter is the operator asking for specific
+/// rows, and a default fold that hides what was just asked for (`f` to the
+/// `no route` position, `/` matching an unrouted title) fights the ask.
+pub fn group_starts_collapsed(filter: &Filter, route: Option<&str>) -> bool {
+    matches!(filter, Filter::All) && route.is_none()
+}
+
+/// [`sections`], with each section's rows grouped by route.
+///
+/// A flat section of a hundred rows cannot be scanned; the same rows as
+/// "tally 34 · herdr-board 12 · …" can. Biggest group first — the summary reads
+/// as a ranking — with ties alphabetical so equal groups do not trade places
+/// between frames, and rows in board order within each group. `no route` sits
+/// last regardless of size: it must never hold the top of a section, which is
+/// the first selected row of the whole panel.
+pub fn grouped_sections<'a>(
+    rows: &'a [TaskRow],
+    filter: &Filter,
+    now: DateTime<Utc>,
+) -> Vec<(BoardState, Vec<SectionGroup<'a>>)> {
+    sections(rows, filter, now)
+        .into_iter()
+        .map(|(state, rows)| {
+            let mut groups: Vec<SectionGroup<'a>> = Vec::new();
+            for row in rows {
+                match groups.iter_mut().find(|g| g.route == row.route) {
+                    Some(group) => group.rows.push(row),
+                    None => groups.push(SectionGroup {
+                        route: row.route.clone(),
+                        rows: vec![row],
+                    }),
+                }
+            }
+            groups.sort_by(|a, b| {
+                a.route
+                    .is_none()
+                    .cmp(&b.route.is_none())
+                    .then(b.rows.len().cmp(&a.rows.len()))
+                    .then_with(|| a.route.cmp(&b.route))
+            });
+            (state, groups)
+        })
+        .collect()
+}
+
+/// Whether a section draws group headers at all.
+///
+/// One routed group needs none — three WORKING rows from one repo are readable
+/// bare, and a header repeating what every row's leading token says is noise.
+/// On the unfiltered board a lone `no route` group still draws its header: the
+/// header is what keeps those rows folded, and folded rows need a headline to
+/// be findable. Under a filter that lone header would only repeat what the
+/// filter chip already says.
+pub fn group_headers_shown(filter: &Filter, groups: &[SectionGroup]) -> bool {
+    groups.len() > 1
+        || (matches!(filter, Filter::All)
+            && groups.first().is_some_and(|g| g.route.is_none()))
+}
+
 /// Was this task closed today, in the operator's own timezone?
 ///
 /// Local midnight, not a rolling 24 hours: "today" is a thing a person means,
@@ -585,29 +711,31 @@ fn state_metadata(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
             (None, None) => "waiting on you".into(),
         },
         BoardState::Ready => {
-            // Where it would go, not where it came from: the routed workspace
-            // is the routing outcome, otherwise invisible until dispatch.
-            let repo = row
+            // The route rides the group header and the repo the leading token
+            // (gh#125), so the sub-line keeps only what neither says: a routed
+            // workspace whose name differs from the route's, and the cursor's
+            // one affordance.
+            let ws = row
                 .workspace
                 .as_deref()
-                .or(row.route.as_deref())
+                .filter(|w| row.route.as_deref() != Some(w))
                 .unwrap_or_default();
             if !row.dispatchable {
                 // A property of the issue, not an affordance for the cursor —
                 // so it shows on every such row, selected or not.
-                if repo.is_empty() {
+                if ws.is_empty() {
                     NO_ROUTE.into()
                 } else {
-                    format!("{repo} · {NO_ROUTE}")
+                    format!("{ws} · {NO_ROUTE}")
                 }
             } else if selected {
-                if repo.is_empty() {
+                if ws.is_empty() {
                     "[enter to dispatch]".into()
                 } else {
-                    format!("{repo} · [enter to dispatch]")
+                    format!("{ws} · [enter to dispatch]")
                 }
             } else {
-                repo.to_string()
+                ws.to_string()
             }
         }
         BoardState::Done => {
@@ -770,7 +898,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Live agents — the sidebar's Agents section (gh#103)
+// Live agents — the Active group's board half (gh#103)
 // ---------------------------------------------------------------------------
 //
 // herdr gave presence away: a working agent was a pane, and the pane list was
@@ -780,6 +908,9 @@ pub fn truncate(s: &str, max: usize) -> String {
 // off the session watch. Pure presentation: nothing here dispatches, settles or
 // decides anything, and a row leaves the list only because the attempt it names
 // stopped being live.
+//
+// These rows drew under their own "Agents" heading until gh#123 folded them
+// into the single Active group — see [`active_rows`], which owns the order.
 
 /// What a live attempt's agent is doing right now.
 ///
@@ -1005,13 +1136,8 @@ pub(crate) fn agent_state(
     }
 }
 
-/// How many live agents want a human — the section header's count badge.
-pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
-    rows.iter().filter(|row| row.state.needs_attention()).count()
-}
-
 // ---------------------------------------------------------------------------
-// Running — every working chat the board is NOT running (gh#117)
+// Unmanaged runs — every working chat the board is NOT running (gh#117)
 // ---------------------------------------------------------------------------
 //
 // [`agent_rows`] answers "what has the board released", which is a smaller
@@ -1028,7 +1154,7 @@ pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
 // and a box hosting no board at all still fills this group.
 
 /// What a chat with no title is called — the spelling all three sessions lists
-/// already use, pinned here so the Running group cannot drift from them.
+/// already use, pinned here so an unmanaged row cannot drift from them.
 ///
 /// The two lists are a few rows apart, and one untitled chat reading
 /// `New session` in one and something else in the other looks like two chats.
@@ -1083,7 +1209,7 @@ impl RunningRow {
 ///   so the group fills within one watch frame of a run starting and empties
 ///   within one of it stopping. No board row is consulted to get *in*.
 /// - **A live attempt is subtracted, not re-drawn.** Any chat claimed by a
-///   `working`/`blocked` row belongs to the Agents group, which knows its
+///   `working`/`blocked` row is [`agent_rows`]'s to draw — that half knows its
 ///   issue, branch and cap; showing it twice would double-count the box's
 ///   load. The subtraction reads the board rows directly rather than
 ///   [`agent_rows`]'s output, so a claimed chat stays out of this group even
@@ -1158,14 +1284,131 @@ pub fn running_rows(
     out
 }
 
-/// How many of these want a human — the Running header's count badge.
-pub fn running_needing_attention(rows: &[RunningRow]) -> usize {
-    rows.iter().filter(|row| row.state.needs_attention()).count()
+// ---------------------------------------------------------------------------
+// Active — the one group everything alive draws under (gh#123)
+// ---------------------------------------------------------------------------
+//
+// [`agent_rows`] and [`running_rows`] split the live list by how a run started
+// — the board released it, or somebody (or some orchestrator) just started it.
+// That is a mechanism distinction, and the reader's question does not contain
+// it: "what is working, and which of it wants me" has one answer, not two. So
+// one group, needs-you first, then working, origin-blind in the order and
+// visible on the row — an attempt wears its issue identifier and keeps its
+// branch and cap, an unmanaged run is its own title and nothing more.
+
+/// One row of the sidebar's Active group: a live board attempt, or a working
+/// chat no attempt accounts for.
+///
+/// The two memberships partition by construction — [`running_rows`] subtracts
+/// every chat a live attempt claims — so the union never draws a chat twice,
+/// and merging them is only a matter of order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveRow {
+    /// The board released this: it has an issue, a branch, a cap and a bill.
+    Agent(AgentRow),
+    /// A run the board never heard of: the orchestrator, an ad-hoc chat,
+    /// anything started by hand.
+    Unmanaged(RunningRow),
+}
+
+impl ActiveRow {
+    /// Where the click goes, and the row's identity — unique across both
+    /// variants, because the partition never claims a chat twice.
+    pub fn chat_id(&self) -> &str {
+        match self {
+            ActiveRow::Agent(row) => &row.chat_id,
+            ActiveRow::Unmanaged(row) => &row.chat_id,
+        }
+    }
+
+    pub fn state(&self) -> AgentState {
+        match self {
+            ActiveRow::Agent(row) => row.state,
+            ActiveRow::Unmanaged(row) => row.state,
+        }
+    }
+
+    pub fn started_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            ActiveRow::Agent(row) => row.started_at,
+            ActiveRow::Unmanaged(row) => row.started_at,
+        }
+    }
+}
+
+/// Everything alive, most urgent first, blind to how it started.
+///
+/// The halves arrive pre-sorted, but concatenating them would put a working
+/// attempt above a blocked hand-started run — the exact order the merge exists
+/// to end — so the union is sorted once, by the key both halves already use:
+/// urgency, then longest-running (stable, since start order never changes
+/// under a viewer), then the chat id, which every row carries and no two rows
+/// share.
+pub fn active_rows(
+    rows: &[TaskRow],
+    chats: &[crate::Chat],
+    sessions: &[crate::Session],
+    orchestrator: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<ActiveRow> {
+    let mut out: Vec<ActiveRow> = agent_rows(rows, chats, sessions, now)
+        .into_iter()
+        .map(ActiveRow::Agent)
+        .chain(
+            // The pinned orchestrator is subtracted with the rest of the
+            // unmanaged membership rules (gh#122): its slot above Spaces
+            // carries its live state, and a second row here would report
+            // the same run twice.
+            running_rows(rows, chats, sessions, orchestrator, now)
+                .into_iter()
+                .map(ActiveRow::Unmanaged),
+        )
+        .collect();
+    out.sort_by(|a, b| {
+        a.state()
+            .rank()
+            .cmp(&b.state().rank())
+            .then_with(|| match (a.started_at(), b.started_at()) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.chat_id().cmp(b.chat_id()))
+    });
+    out
+}
+
+/// How many active rows want a human — the group header's count badge.
+pub fn active_needing_attention(rows: &[ActiveRow]) -> usize {
+    rows.iter()
+        .filter(|row| row.state().needs_attention())
+        .count()
 }
 
 // ---------------------------------------------------------------------------
 // Which device hosts the board (gh#55)
 // ---------------------------------------------------------------------------
+
+/// Evidence that a board has ever been dispatched from: any row with an attempt
+/// on record (gh#125).
+///
+/// This is what an automatic host sweep settles on. A board *service* answers
+/// `WatchBoard` wherever `COMET_BOARD` is unset, so "delivered a frame" proves
+/// only that a board exists — a laptop's stale test board answers as readily as
+/// the box the org actually works from, and it answers *first* because the
+/// sweep asks this device before the others. Dispatch is the difference: a
+/// board somebody has released work from is the org's board; one that only ever
+/// collected rows is furniture. The sweep therefore holds a frame with no
+/// dispatch evidence as a *fallback* and keeps asking, settling on it only when
+/// no candidate with evidence answers — so a lone device, and a genuinely
+/// fresh install, still see their own board.
+///
+/// `attempts`, not `chat_id`: the chat id rides only the live attempt, and the
+/// box's board between dispatches must not read as furniture.
+pub fn board_dispatched(rows: &[TaskRow]) -> bool {
+    rows.iter().any(|row| row.attempts > 0)
+}
 
 /// The devices a board pane tries, in order, when the operator has pinned none.
 /// `None` means this device — no `targetDeviceId` passthrough.
@@ -1174,9 +1417,10 @@ pub fn running_needing_attention(rows: &[RunningRow]) -> usize {
 /// is correct while one box hosts the board), and the board RPCs are
 /// relay-forwardable, so a viewport that finds no board locally is not out of
 /// options — it just has to ask the other devices. This device comes first
-/// because a local board must always win over a remote one; the rest follow in
-/// registration order, which is stable across heartbeats (the same order the
-/// device switcher lists them in), so the sweep visits them the same way twice.
+/// because asking locally is free; whether its answer *settles* the sweep is
+/// [`board_dispatched`]'s question. The rest follow in registration order,
+/// which is stable across heartbeats (the same order the device switcher lists
+/// them in), so the sweep visits them the same way twice.
 ///
 /// A candidate is ruled out by its `WatchBoard` stream ending without ever
 /// delivering a frame — the engine refuses the subscription outright when it
@@ -1390,12 +1634,18 @@ mod tests {
     }
 
     #[test]
-    fn ready_metadata_names_the_route_and_offers_dispatch_on_selection() {
+    fn ready_metadata_keeps_only_what_the_grouping_does_not_already_say() {
+        // The route is the group header and the repo the leading token
+        // (gh#125): a workspace matching the route's name adds nothing.
         let rows = [row("a", BoardState::Ready)];
-        // Unselected: the workspace the row would go to.
-        assert!(row_metadata(&rows[0], false, 80, now()).contains("offhand"));
+        assert_eq!(row_metadata(&rows[0], false, 80, now()), "");
         // Selected: the one action the cursor can take.
         assert!(row_metadata(&rows[0], true, 80, now()).contains("[enter to dispatch]"));
+
+        // A workspace the route's name does not say survives on the sub-line.
+        let mut renamed = row("b", BoardState::Ready);
+        renamed.route = Some("tally".into());
+        assert_eq!(row_metadata(&renamed, false, 80, now()), "offhand");
 
         // Nothing routes: the same words the filter uses.
         let mut unrouted = row("u", BoardState::Ready);
@@ -1403,6 +1653,112 @@ mod tests {
         unrouted.workspace = None;
         unrouted.dispatchable = false;
         assert_eq!(row_metadata(&unrouted, false, 80, now()), "no route");
+    }
+
+    #[test]
+    fn the_leading_token_is_the_repo_qualified_form_humanized() {
+        let mut r = row("507", BoardState::Ready);
+        r.id = "gh:Florin-AS/tally#507".into();
+        r.identifier = "gh#507".into();
+        assert_eq!(r.display_identifier(), "tally #507");
+        // The pull-request form of the id parses the same way.
+        r.id = "gh:Florin-AS/tally!508".into();
+        assert_eq!(r.display_identifier(), "tally #508");
+        // A Linear identifier is already unique across the board.
+        r.id = "linear:LIN-142".into();
+        r.identifier = "LIN-142".into();
+        assert_eq!(r.display_identifier(), "LIN-142");
+        // An id this rule cannot parse degrades to the identifier, never to
+        // half a lockup.
+        r.id = "gh:mangled".into();
+        r.identifier = "gh#9".into();
+        assert_eq!(r.display_identifier(), "gh#9");
+        // What is rendered is what `/` matches.
+        r.id = "gh:Florin-AS/tally#507".into();
+        assert!(Filter::Text("tally #5".into()).matches(&r));
+    }
+
+    #[test]
+    fn groups_rank_by_size_with_no_route_last_and_folded() {
+        let mut rows = vec![
+            row("t1", BoardState::Ready),
+            row("t2", BoardState::Ready),
+            row("u", BoardState::Ready),
+            row("h1", BoardState::Ready),
+        ];
+        rows[0].route = Some("tally".into());
+        rows[1].route = Some("tally".into());
+        rows[2].route = None;
+        rows[2].dispatchable = false;
+        rows[3].route = Some("herdr-board".into());
+        let grouped = grouped_sections(&rows, &Filter::All, now());
+        assert_eq!(grouped.len(), 1);
+        let (state, groups) = &grouped[0];
+        assert_eq!(*state, BoardState::Ready);
+        let labels: Vec<&str> = groups.iter().map(|g| g.label()).collect();
+        // Biggest first, `no route` last regardless of size — never pole
+        // position.
+        assert_eq!(labels, vec!["tally", "herdr-board", "no route"]);
+        assert!(
+            group_starts_collapsed(&Filter::All, None),
+            "unrouted rows start folded"
+        );
+        assert!(!group_starts_collapsed(&Filter::All, Some("tally")));
+        assert!(group_headers_shown(&Filter::All, groups));
+    }
+
+    #[test]
+    fn a_filter_unfolds_what_it_asked_for() {
+        // `f` to the `no route` position: the rows must show, not sit behind
+        // the very fold the filter was meant to reach past.
+        assert!(!group_starts_collapsed(&Filter::NoRoute, None));
+        // `/` matching an unrouted title: a search that hides its own match
+        // reads as no match at all.
+        assert!(!group_starts_collapsed(&Filter::Text("signicat".into()), None));
+        // And the lone group under that filter needs no header repeating what
+        // the filter chip already says.
+        let mut unrouted = vec![row("u", BoardState::Ready)];
+        unrouted[0].route = None;
+        let grouped = grouped_sections(&unrouted, &Filter::NoRoute, now());
+        assert!(!group_headers_shown(&Filter::NoRoute, &grouped[0].1));
+    }
+
+    #[test]
+    fn equal_sized_groups_hold_alphabetical_order_between_frames() {
+        let mut rows = vec![row("b1", BoardState::Ready), row("a1", BoardState::Ready)];
+        rows[0].route = Some("zeta".into());
+        rows[1].route = Some("alpha".into());
+        let grouped = grouped_sections(&rows, &Filter::All, now());
+        let labels: Vec<&str> = grouped[0].1.iter().map(|g| g.label()).collect();
+        assert_eq!(labels, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn a_single_routed_group_draws_no_header_but_a_lone_no_route_group_does() {
+        let rows = vec![row("a", BoardState::Working)];
+        let grouped = grouped_sections(&rows, &Filter::All, now());
+        assert!(
+            !group_headers_shown(&Filter::All, &grouped[0].1),
+            "one routed group is readable bare"
+        );
+
+        let mut unrouted = vec![row("u", BoardState::Ready)];
+        unrouted[0].route = None;
+        let grouped = grouped_sections(&unrouted, &Filter::All, now());
+        assert!(
+            group_headers_shown(&Filter::All, &grouped[0].1),
+            "the header is what keeps unrouted rows folded"
+        );
+    }
+
+    #[test]
+    fn dispatch_evidence_is_any_attempt_on_record_not_a_live_chat() {
+        let mut rows = vec![row("a", BoardState::Ready), row("b", BoardState::Done)];
+        assert!(!board_dispatched(&rows), "a board that only collected rows is furniture");
+        // The box between dispatches: nothing live, history on record.
+        rows[1].attempts = 3;
+        assert!(board_dispatched(&rows));
+        assert!(!board_dispatched(&[]), "an empty board proves nothing either way");
     }
 
     #[test]
@@ -1598,7 +1954,8 @@ mod tests {
             // A question, then a dead run, then the longest-running worker.
             vec!["ask", "died", "slow", "fast"]
         );
-        assert_eq!(agents_needing_attention(&agents), 2);
+        let active: Vec<ActiveRow> = agents.into_iter().map(ActiveRow::Agent).collect();
+        assert_eq!(active_needing_attention(&active), 2);
     }
 
     /// "That one's been at it 1h50 of 2h" — a glance, which needs both numbers.
@@ -1774,7 +2131,8 @@ mod tests {
         assert_eq!(running[0].elapsed_label(now()).as_deref(), Some("1h00m"));
         assert_eq!(running[1].title, UNTITLED_CHAT);
         assert_eq!(running[1].elapsed_label(now()), None);
-        assert_eq!(running_needing_attention(&running), 1);
+        let active: Vec<ActiveRow> = running.into_iter().map(ActiveRow::Unmanaged).collect();
+        assert_eq!(active_needing_attention(&active), 1);
     }
 
     /// A box with no board is the case this group matters most on — nothing to
@@ -1802,6 +2160,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["adhoc"]
         );
+    }
+
+    // ---- the Active group (gh#123) ----------------------------------------
+
+    /// The order the merge exists for: a hand-started run asking a question
+    /// outranks a board attempt working fine. Needs-you first, then working,
+    /// and inside a rank the longest-running first — origin never consulted.
+    #[test]
+    fn the_active_group_orders_by_urgency_not_by_origin() {
+        let mut attempt = row("live", BoardState::Working);
+        attempt.chat_id = Some("c-attempt".into());
+        attempt.started_at = Some("2026-08-01T11:00:00Z".into()); // 1h
+        let chats = vec![
+            chat("c-attempt", None),
+            chat("c-adhoc", None),
+            chat("c-orch", None),
+        ];
+        let sessions = vec![
+            session("c-attempt", crate::SessionStatus::Working, 0),
+            started("c-adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
+            started("c-orch", crate::SessionStatus::Working, "2026-08-01T09:00:00Z"), // 3h
+        ];
+        let active = active_rows(&[attempt], &chats, &sessions, None, now());
+        assert_eq!(
+            active.iter().map(|r| r.chat_id()).collect::<Vec<_>>(),
+            // The question first, wherever it came from; then the workers,
+            // longest-running first, the attempt's origin buying it nothing.
+            vec!["c-adhoc", "c-orch", "c-attempt"]
+        );
+        assert_eq!(active_needing_attention(&active), 1);
+        // Origin still shows on the row: the attempt kept its issue, branch
+        // and cap by staying the Agent variant.
+        assert!(matches!(
+            &active[2],
+            ActiveRow::Agent(a) if a.identifier == "gh#live"
+        ));
+        assert!(matches!(&active[0], ActiveRow::Unmanaged(_)));
+    }
+
+    /// The merge changes the order, never the membership: a dispatched chat
+    /// draws once, as the attempt that claimed it.
+    #[test]
+    fn a_dispatched_chat_draws_once_in_the_active_group() {
+        let mut live = row("live", BoardState::Working);
+        live.chat_id = Some("c1".into());
+        let chats = vec![chat("c1", None)];
+        let sessions = vec![session("c1", crate::SessionStatus::Working, 0)];
+        let active = active_rows(&[live], &chats, &sessions, None, now());
+        assert_eq!(active.len(), 1);
+        assert!(matches!(&active[0], ActiveRow::Agent(_)));
     }
 
     // ---- whose subscription (gh#101) ------------------------------------

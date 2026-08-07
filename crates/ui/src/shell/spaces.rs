@@ -391,7 +391,7 @@ impl Shell {
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
-        let (spaces, selected, device_names, offline_devices, attention, slugs, local_device) = {
+        let (spaces, selected, device_names, device_presence, attention, slugs, local_device) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             let spaces = state.spaces.clone();
@@ -407,13 +407,20 @@ impl Shell {
                     )
                 })
                 .collect();
-            // Host-presence (the revived "Remote" signal): a remote space whose
-            // device heartbeat lapsed shows offline — a host outage, not slow sync.
-            let offline_devices: std::collections::HashSet<String> = spaces
-                .iter()
-                .map(|s| s.device_id.clone())
-                .filter(|id| !state.device_online(id, now))
-                .collect();
+            // Host-presence (the revived "Remote" signal), three-state (gh#126):
+            // a lapsed heartbeat reads "offline" (a host outage, not slow sync)
+            // only while THIS app's engine can hear — with our own sync rooms
+            // down the row indicts the pipe instead of the box.
+            let device_presence: std::collections::HashMap<String, crate::state::HostPresence> =
+                spaces
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.device_id.clone(),
+                            state.host_presence(&s.device_id, now),
+                        )
+                    })
+                    .collect();
             // Spaces with a live/awaiting session get an aggregate dot (the
             // most urgent member status wins) so the attention signal survives
             // a collapsed row.
@@ -445,7 +452,7 @@ impl Shell {
                 spaces,
                 state.selected_space.clone(),
                 device_names,
-                offline_devices,
+                device_presence,
                 attention,
                 state.space_slugs.clone(),
                 state.local_device_id.clone(),
@@ -558,10 +565,13 @@ impl Shell {
                         .get(&device_id)
                         .cloned()
                         .unwrap_or_else(|| "Unknown device".to_string());
-                    let host_offline = offline_devices.contains(&device_id);
+                    let presence = device_presence
+                        .get(&device_id)
+                        .copied()
+                        .unwrap_or(crate::state::HostPresence::Online);
                     column = column.child(Self::render_device_header(
                         device_name,
-                        host_offline,
+                        presence,
                         theme,
                     ));
                 }
@@ -674,7 +684,12 @@ impl Shell {
     /// the ONLY place the sidebar names a device (gh#124) — it used to ride on
     /// every space row, the sidebar's loudest element spent on its least
     /// differentiating fact.
-    fn render_device_header(name: String, offline: bool, theme: &Theme) -> AnyElement {
+    fn render_device_header(
+        name: String,
+        presence: crate::state::HostPresence,
+        theme: &Theme,
+    ) -> AnyElement {
+        use crate::state::HostPresence;
         div()
             .flex()
             .flex_row()
@@ -691,12 +706,23 @@ impl Shell {
                     .text_color(theme.text_muted.opacity(0.5))
                     .child(SharedString::from(format!("@ {name}"))),
             )
-            .when(offline, |el| {
+            // Three-state (gh#126), said ONCE per group: amber "offline" only
+            // when this app's engine can hear and the host's beat lapsed;
+            // muted "sync down" when our own pipe is the broken thing.
+            .when(matches!(presence, HostPresence::Offline), |el| {
                 el.child(
                     div()
                         .flex_none()
                         .text_color(theme.warning.opacity(0.8))
                         .child(SharedString::from("· offline")),
+                )
+            })
+            .when(matches!(presence, HostPresence::SyncDown), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from("· sync down")),
                 )
             })
             .into_any_element()
@@ -1467,34 +1493,46 @@ impl Shell {
         )
     }
 
-    /// The "Agents" section (gh#103): one row per live board attempt, blocked
-    /// first, with a count badge on the header.
+    /// The "Active" section (gh#123): everything alive on the box in one
+    /// group — live board attempts (gh#103) and the working chats the board
+    /// never released (gh#117), needs-you first, then working, blind to how
+    /// each one started. Origin still shows on the row: an attempt wears its
+    /// issue identifier as a chip and keeps its branch and cap, an unmanaged
+    /// run is its own bare title.
     ///
     /// `None` when nothing is running — an empty section here would be a
     /// permanent reminder that a board exists, on a machine that may host none.
     /// The rows come from the board panel's standing `WatchBoard` stream joined
-    /// to chats and sessions ([`BoardPanel::agents`]); the board dock stays the
+    /// to chats and sessions ([`BoardPanel::active`]); the board dock stays the
     /// deep view, and this is the glance.
-    pub(super) fn render_agents_section(
+    pub(super) fn render_active_section(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        use comet_proto::view::board::ActiveRow;
         let now = Utc::now();
-        let agents = self.board.read(cx).agents(cx, now);
-        if agents.is_empty() {
+        let active = self.board.read(cx).active(cx, now);
+        if active.is_empty() {
             return None;
         }
-        let blocked = comet_proto::view::board::agents_needing_attention(&agents);
+        let blocked = comet_proto::view::board::active_needing_attention(&active);
         let selected = self.state.read(cx).selected_chat.clone();
 
-        let header = Self::render_agents_header("Agents", blocked, theme);
+        let header = Self::render_active_header(blocked, theme);
 
-        let rows: Vec<AnyElement> = agents
+        let rows: Vec<AnyElement> = active
             .into_iter()
-            .map(|agent| {
-                let is_selected = selected.as_deref() == Some(agent.chat_id.as_str());
-                self.render_agent_row(&agent, is_selected, now, theme, cx)
+            .map(|row| {
+                let is_selected = selected.as_deref() == Some(row.chat_id());
+                match row {
+                    ActiveRow::Agent(agent) => {
+                        self.render_agent_row(&agent, is_selected, now, theme, cx)
+                    }
+                    ActiveRow::Unmanaged(run) => {
+                        self.render_running_row(&run, is_selected, now, theme, cx)
+                    }
+                }
             })
             .collect();
 
@@ -1508,13 +1546,9 @@ impl Shell {
         )
     }
 
-    /// A section header for the two live-work groups: the label, and the count
-    /// of rows under it that want a human.
-    ///
-    /// One header for both groups because they are read as one thing — "what is
-    /// running, and which of it is stuck" — and a badge that meant `blocked` in
-    /// one and something else two rows down would have to be read twice.
-    fn render_agents_header(label: &'static str, blocked: usize, theme: &Theme) -> AnyElement {
+    /// The Active header: one label over the whole live list, and the count of
+    /// rows under it that want a human.
+    fn render_active_header(blocked: usize, theme: &Theme) -> AnyElement {
         div()
             .flex()
             .flex_row()
@@ -1528,7 +1562,7 @@ impl Shell {
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from(label)),
+                    .child(SharedString::from("Active")),
             )
             // The count is what you look for first: three running, one of them
             // stuck on a question you have not answered.
@@ -1578,51 +1612,12 @@ impl Shell {
         }
     }
 
-    /// The "Running" section (gh#117): every working chat that is NOT a live
-    /// board attempt — the pinned orchestrator, an ad-hoc agent chat, anything
-    /// somebody started by hand.
-    ///
-    /// Below Agents rather than mixed into it, because the two answer different
-    /// questions: one row has an issue, a branch, a cap and a bill behind it,
-    /// and the other is a run somebody is responsible for that the board has
-    /// never heard of. Mixing them would make the second look like the first.
-    ///
-    /// `None` when nothing unmanaged is running, on the same rule the Agents
-    /// section follows — an empty header is a permanent reminder of nothing.
-    pub(super) fn render_running_section(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let now = Utc::now();
-        let running = self.board.read(cx).running(cx, now);
-        if running.is_empty() {
-            return None;
-        }
-        let blocked = comet_proto::view::board::running_needing_attention(&running);
-        let selected = self.state.read(cx).selected_chat.clone();
-        let header = Self::render_agents_header("Running", blocked, theme);
-        let rows: Vec<AnyElement> = running
-            .into_iter()
-            .map(|row| {
-                let is_selected = selected.as_deref() == Some(row.chat_id.as_str());
-                self.render_running_row(&row, is_selected, now, theme, cx)
-            })
-            .collect();
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .child(header)
-                .child(div().flex().flex_col().gap(px(2.0)).children(rows))
-                .into_any_element(),
-        )
-    }
-
-    /// One unmanaged run: state rail, the chat's own title, elapsed since the
-    /// run started. One line, not two — there is no branch promised and no
-    /// issue behind it, and a second line of nothing would make an agent row's
-    /// second line look like it means less than it does.
+    /// One unmanaged run (gh#117): state rail, the chat's own title, elapsed
+    /// since the run started. One line, not two — there is no branch promised
+    /// and no issue behind it, and a second line of nothing would make an agent
+    /// row's second line look like it means less than it does. The bare title
+    /// is also the origin telling: an attempt wears an identifier chip, and
+    /// this row deliberately does not.
     fn render_running_row(
         &self,
         row: &comet_proto::view::board::RunningRow,
@@ -1757,7 +1752,11 @@ impl Shell {
                 let id = chat_id.clone();
                 this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
             }))
-            // Line 1: state glyph, the issue identifier, elapsed / cap.
+            // Line 1: state glyph, the issue identifier as a chip, elapsed /
+            // cap. The chip is the origin telling (gh#123): in a mixed Active
+            // list it is what says "the board released this" at a glance, and
+            // its fill is the sidebar's wash language, not an accent tint —
+            // the accent stays on the state rail.
             .child(
                 div()
                     .w_full()
@@ -1767,13 +1766,17 @@ impl Shell {
                     .gap(px(6.0))
                     .child(rail)
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .child(SharedString::from(agent.identifier.clone())),
+                        div().flex_1().min_w_0().flex().flex_row().child(
+                            div()
+                                .max_w_full()
+                                .truncate()
+                                .px(px(5.0))
+                                .rounded(px(5.0))
+                                .bg(theme.wash(0.11))
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .child(SharedString::from(agent.identifier.clone())),
+                        ),
                     )
                     .when_some(agent.elapsed_label(now), |el, label| {
                         el.child(

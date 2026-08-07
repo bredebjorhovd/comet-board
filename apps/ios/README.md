@@ -61,7 +61,8 @@ Board/
   BoardModels.swift     view/board.rs port: BoardState + section order/glyphs,
                         the `list --json` TaskRow (snake_case wire), the
                         done-today bound, elapsed/cap spellings, the gh#101
-                        billing vocabulary, agent_rows whole
+                        billing vocabulary, agent_rows/running_rows/active_rows
+                        whole
   BoardStore.swift      standing `WatchBoard` over the device-room relay: the
                         host sweep (each candidate's own room — no engine here
                         to forward with `targetDeviceId`), dispatch/retry/cancel
@@ -69,7 +70,9 @@ Board/
                         content, elapsed against the route's cap
   DispatchSheet.swift   runtime + account pickers with billing chips (gh#74/#101)
                         and the `require-own` confirm
-  AgentsSection.swift   gh#103's live-agents section, phone-shaped
+  ActiveSection.swift   the one live group (gh#103 + gh#117, merged by gh#123),
+                        phone-shaped: attempts with identifier chips, unmanaged
+                        runs by bare title, needs-you first
 Models/
   RepoRows.swift        view/repos.rs port (gh#118): the repo-first picker's
                         union of spaces + the board App's grant, its box-first

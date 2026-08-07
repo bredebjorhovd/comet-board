@@ -2213,6 +2213,55 @@ fn the_board_shows_sections_in_fixed_order_with_glyph_carried_state() {
     assert!(screen.contains("filter"), "{screen}");
 }
 
+/// gh#125: the leading token is the repo-qualified form (`tally #507`), rows
+/// group by route with counts, and the unrouted group draws folded at the
+/// bottom of its section instead of holding pole position.
+#[test]
+fn rows_lead_with_the_repo_and_group_by_route_with_no_route_folded() {
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    let mut a = board_row("507", comet_proto::view::board::BoardState::Ready);
+    a.id = "gh:Florin-AS/tally#507".into();
+    a.identifier = "gh#507".into();
+    a.route = Some("tally".into());
+    a.workspace = Some("tally".into());
+    let mut b = board_row("44", comet_proto::view::board::BoardState::Ready);
+    b.id = "gh:bredebjorhovd/herdr-board#44".into();
+    b.identifier = "gh#44".into();
+    let mut u = board_row("142", comet_proto::view::board::BoardState::Ready);
+    u.id = "linear:LIN-142".into();
+    u.identifier = "LIN-142".into();
+    u.route = None;
+    u.workspace = None;
+    u.dispatchable = false;
+    app.apply(Update::Board(vec![a, b, u]));
+
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+
+    // The identifier says which repo — `gh#507` alone is ambiguous across
+    // repos, `tally #507` is not.
+    assert!(screen.contains("tally #507"), "{screen}");
+    assert!(screen.contains("herdr-board #44"), "{screen}");
+
+    // Group headers with counts, `no route` folded at the bottom: its header
+    // shows, its row does not.
+    assert!(screen.contains("tally  1"), "{screen}");
+    assert!(screen.contains("no route  1 hidden"), "{screen}");
+    assert!(!screen.contains("LIN-142"), "a folded group hides its rows:\n{screen}");
+
+    // The header carries the whole count beside the pane's name — folded rows
+    // included, because they are still on the board.
+    assert!(screen.contains("· 3"), "{screen}");
+
+    // The cursor starts on a dispatchable row, never on `no route`.
+    assert_eq!(
+        app.board.selected.as_deref(),
+        Some("gh:bredebjorhovd/herdr-board#44"),
+        "first task of the first group (equal counts sort alphabetically)"
+    );
+}
+
 #[test]
 fn a_selected_ready_row_offers_dispatch_in_the_footer() {
     let mut app = boarded();
@@ -2363,7 +2412,7 @@ fn the_board_find_field_counts_matches_as_you_type() {
 }
 
 // ---------------------------------------------------------------------------
-// The sidebar's Agents section (gh#103)
+// Live board attempts in the sidebar (gh#103; the Active group since gh#123)
 // ---------------------------------------------------------------------------
 
 /// Three agents running, and the sidebar says so with the board pane shut.
@@ -2413,7 +2462,7 @@ fn live_agents_draw_in_the_sidebar_with_the_board_closed() {
     let sidebar = joined(&sidebar_of(&rows, 100));
 
     // The section, with the count of what wants a human on its header.
-    assert!(sidebar.contains("Agents"), "{sidebar}");
+    assert!(sidebar.contains("Active"), "{sidebar}");
     assert!(sidebar.contains("1 blocked"), "{sidebar}");
     // One row per live attempt, titled by its issue, branch underneath.
     for needle in ["gh#1", "gh#2", "gh#3", "board/gh-103"] {
@@ -2435,27 +2484,28 @@ fn live_agents_draw_in_the_sidebar_with_the_board_closed() {
     assert!(at("Agents") < at("comet"), "{sidebar}");
 }
 
-/// Nothing dispatched: no header, no gap, no reminder that a board exists.
+/// Nothing dispatched and nothing running by hand: no header, no gap, no
+/// reminder that a board exists.
 #[test]
-fn the_agents_section_is_absent_when_nothing_is_running() {
+fn the_active_section_is_absent_when_nothing_is_running() {
     let mut app = populated();
     app.apply(Update::Board(vec![board_row(
         "1",
         comet_proto::view::board::BoardState::Ready,
     )]));
     let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
-    assert!(!sidebar.contains("Agents"), "{sidebar}");
+    assert!(!sidebar.contains("Active"), "{sidebar}");
 }
 
 // ---------------------------------------------------------------------------
-// The sidebar's Running section (gh#117)
+// Unmanaged runs in the sidebar (gh#117; the Active group since gh#123)
 // ---------------------------------------------------------------------------
 
 /// The gh#117 case, drawn: an orchestrator working with no attempt behind it,
 /// an ad-hoc chat waiting on a question, and a board row taking neither of them
 /// — with no board on this box at all.
 #[test]
-fn unmanaged_runs_draw_in_the_sidebar_under_the_agents() {
+fn unmanaged_runs_draw_in_the_sidebar_with_no_board_at_all() {
     let mut app = populated();
     app.apply(Update::Chats(vec![
         chat("c1", "Orchestrator"),
@@ -2476,7 +2526,7 @@ fn unmanaged_runs_draw_in_the_sidebar_under_the_agents() {
     ]));
 
     let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
-    assert!(sidebar.contains("Running"), "{sidebar}");
+    assert!(sidebar.contains("Active"), "{sidebar}");
     assert!(sidebar.contains("1 blocked"), "the header count:\n{sidebar}");
     // The chat's own title, since there is no issue behind it to name.
     assert!(sidebar.contains("Orchestrator"), "{sidebar}");
@@ -2491,16 +2541,75 @@ fn unmanaged_runs_draw_in_the_sidebar_under_the_agents() {
             .position(|line| line.contains(needle))
             .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar}"))
     };
-    // Blocked floats, and the group sits between the agents and the sessions.
+    // Blocked floats, and the group sits above the sessions.
     assert!(at("Altinn docs") < at("Orchestrator"), "{sidebar}");
     assert!(at("Running") < at("comet"), "{sidebar}");
     // An idle chat is not a run — it is a nested session row and nothing more.
     assert!(at("Old chat") > at("comet"), "{sidebar}");
 }
 
+/// The merge itself, drawn (gh#123): one attempt and one hand-started run
+/// share the one Active header, ordered by urgency alone — the blocked run
+/// above the working attempt, whose origin buys it a chip, not a better seat.
+#[test]
+fn attempts_and_unmanaged_runs_share_the_active_group() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![
+        chat("c1", "Rework the diff sidebar"),
+        chat("c2", "Altinn docs"),
+    ]));
+    let mut live = board_row("1", comet_proto::view::board::BoardState::Working);
+    live.chat_id = Some("c1".into());
+    app.apply(Update::Board(vec![live]));
+    app.apply(Update::Sessions(vec![
+        Session {
+            chat_id: "c1".into(),
+            device_id: "dev".into(),
+            status: SessionStatus::Working,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        },
+        Session {
+            chat_id: "c2".into(),
+            device_id: "dev".into(),
+            status: SessionStatus::AwaitingInput,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        },
+    ]));
+
+    let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
+    let at = |needle: &str| {
+        sidebar
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{sidebar}"))
+    };
+    // One header for the whole live list — neither of the old ones survives.
+    assert_eq!(sidebar.matches("Active").count(), 1, "{sidebar}");
+    assert!(!sidebar.contains("Agents"), "{sidebar}");
+    // The blocked chat rightly appears twice — once in the Needs-you inbox
+    // (gh#122, above Spaces) and once in Active — so the group-order
+    // assertions anchor to occurrences AFTER the Active header.
+    let after = |from: usize, needle: &str| {
+        sidebar
+            .lines()
+            .enumerate()
+            .position(|(i, line)| i > from && line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing after line {from}:\n{sidebar}"))
+    };
+    assert!(at("Needs you") < at("Spaces"), "{sidebar}");
+    let active = at("Active");
+    let docs_in_active = after(active, "Altinn docs");
+    // Needs-you-rank first inside Active: the hand-started question above the
+    // working attempt.
+    assert!(docs_in_active < after(active, "gh#1"), "{sidebar}");
+    assert!(after(active, "gh#1") < after(active, "Sessions"), "{sidebar}");
+}
+
 /// Nothing working: no header, no gap, no reminder that agents exist.
 #[test]
-fn the_running_section_is_absent_when_nothing_is_working() {
+fn the_active_section_is_absent_when_nothing_is_working() {
     let mut app = populated();
     app.apply(Update::Chats(vec![chat("c1", "Old chat")]));
     app.apply(Update::Sessions(vec![Session {
@@ -2511,7 +2620,7 @@ fn the_running_section_is_absent_when_nothing_is_working() {
         updated_at: Utc::now(),
     }]));
     let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
-    assert!(!sidebar.contains("Running"), "{sidebar}");
+    assert!(!sidebar.contains("Active"), "{sidebar}");
 }
 
 /// Clicking a running row opens its chat — the click that answers "are they

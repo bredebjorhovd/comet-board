@@ -96,6 +96,8 @@ final class DemoDataset {
                                       updatedAt: now - 10_000),
             // No board row points here; being the pinned orchestrator, its
             // live state shows on the slot above Spaces (gh#122).
+            // No board row points here, so it is an unmanaged Active row
+            // (gh#117) — bare title, no chip.
             "chat-orchestrator": SessionRow(chatId: "chat-orchestrator", deviceId: "dev-mac",
                                             status: .working, startedAt: now - 6_600_000,
                                             updatedAt: now - 2_000),
