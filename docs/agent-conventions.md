@@ -30,6 +30,14 @@ branch, PR, review, closure. Several changes landed under no ticket at all is
 the thing that has to be reconstructed later. `--dispatch` creates and releases
 in one go.
 
+**Work you delegate goes through the board.** A ticket buys a branch, a PR, a
+review that reaches the agent that wrote it, a settle, a cap and a bill with a
+name on it. Delegating any other way — your own harness's in-chat subagents
+being the easy one — buys none of it: agents editing a real repo with no row,
+no caps, and no presence in any frontend, so nobody can see that they are
+running at all. Subagents are for reading (research, a sweep across files, a
+question to answer before deciding); anything that lands a commit is a ticket.
+
 **Releasing work and waiting for it.** `wait` blocks until the work settles, so
 an orchestrator does not have to poll or, worse, go quiet until a human prods
 it:

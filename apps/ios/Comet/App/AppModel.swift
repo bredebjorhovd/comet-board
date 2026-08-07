@@ -297,6 +297,17 @@ final class AppModel {
         return agentRows(rows: boardRows, chats: chats, sessions: sessions)
     }
 
+    /// The working chats no attempt accounts for (gh#117) — the orchestrator,
+    /// an ad-hoc agent chat, anything somebody started by hand. Beside
+    /// `liveAgents` because the two partition one list; the board rows are read
+    /// only to subtract the attempts, so a phone attached to no board at all
+    /// still answers.
+    var runningChats: [RunningRow] {
+        let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
+        let chats = demo?.chats ?? workspace?.chats ?? []
+        return runningRows(rows: boardRows, chats: chats, sessions: sessions)
+    }
+
     /// The runtimes and logins a dispatch picker offers. Both belong to the
     /// board's HOST — the run executes over there, so the catalog it picks from
     /// and the subscription it can spend are the box's, never the phone's.

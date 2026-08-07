@@ -2248,8 +2248,10 @@ impl Shell {
 
         let spaces_section = self.render_spaces_section(theme, cx);
         // Between the spaces and the sessions: the live board attempts, when
-        // there are any (gh#103).
+        // there are any (gh#103), and under them everything else that is
+        // working without one (gh#117).
         let agents_section = self.render_agents_section(theme, cx);
+        let running_section = self.render_running_section(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2280,6 +2282,7 @@ impl Shell {
                             .flex_col()
                             .child(spaces_section)
                             .children(agents_section)
+                            .children(running_section)
                     .child(
                         div()
                             .px(px(Theme::SPACE_SM))

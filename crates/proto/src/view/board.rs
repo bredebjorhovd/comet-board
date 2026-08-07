@@ -1009,6 +1009,153 @@ pub fn agents_needing_attention(rows: &[AgentRow]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Running — every working chat the board is NOT running (gh#117)
+// ---------------------------------------------------------------------------
+//
+// [`agent_rows`] answers "what has the board released", which is a smaller
+// question than "what is working on this box". An orchestrator that raised
+// in-chat subagents instead of dispatching, an ad-hoc chat somebody started by
+// hand, the orchestrator itself: all of them are real runs holding a real
+// checkout, and none of them has an attempt row, so the Agents section shows
+// nothing and the only honest answer to "are they even alive" was `pgrep` over
+// ssh. This is the other half of the list.
+//
+// The join is the same one gh#103 does, minus the board row — which is exactly
+// why it is cheap: the session watch already streams a status for every chat,
+// and a box hosting no board at all still fills this group.
+
+/// What a chat with no title is called — the spelling all three sessions lists
+/// already use, pinned here so the Running group cannot drift from them.
+///
+/// The two lists are a few rows apart, and one untitled chat reading
+/// `New session` in one and something else in the other looks like two chats.
+pub const UNTITLED_CHAT: &str = "New session";
+
+/// One working chat that no board attempt accounts for.
+///
+/// Deliberately thinner than [`AgentRow`]: there is no issue, no branch
+/// promised, no cap and no attempt behind it, so the row says only what is
+/// knowable — what the chat calls itself, how long its run has been going, and
+/// whether it is waiting on a person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningRow {
+    /// Where the click goes, and this row's identity.
+    pub chat_id: String,
+    /// The chat's own title ([`UNTITLED_CHAT`] when it has none). The agent
+    /// wrote it about itself, which is second-best to an issue identifier and
+    /// the best thing there is when no issue exists.
+    pub title: String,
+    /// The space to land in when the row is opened, as the chat records it.
+    pub space_id: Option<String>,
+    /// `Working` or `Blocked` and never `Errored` — membership is the live
+    /// indicator, and an errored run is not a working one.
+    pub state: AgentState,
+    /// When the *run* started, off the session mirror — not when the chat was
+    /// created, which for a long-lived orchestrator is days ago and says
+    /// nothing about the work in front of it. `None` where the mirror carries
+    /// no start (an engine that predates the field).
+    ///
+    /// The instant rather than the age, on the same rule [`AgentRow`] follows:
+    /// a viewport re-reads the clock on its own frames instead of rebuilding
+    /// this list once a second to move a counter.
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+impl RunningRow {
+    pub fn elapsed_secs(&self, now: DateTime<Utc>) -> Option<i64> {
+        agent_elapsed_secs(self.started_at, now)
+    }
+
+    /// Bare elapsed — nothing caps these runs, so there is no second number to
+    /// read it against. `None` where the mirror cannot say when it started.
+    pub fn elapsed_label(&self, now: DateTime<Utc>) -> Option<String> {
+        agent_elapsed_label(self.started_at, None, now)
+    }
+}
+
+/// Every working chat that is not a live board attempt, most urgent first.
+///
+/// - **Membership is the session watch and nothing else.** `Working` or
+///   `AwaitingInput`, staleness-gated by [`crate::view::effective_indicator`],
+///   so the group fills within one watch frame of a run starting and empties
+///   within one of it stopping. No board row is consulted to get *in*.
+/// - **A live attempt is subtracted, not re-drawn.** Any chat claimed by a
+///   `working`/`blocked` row belongs to the Agents group, which knows its
+///   issue, branch and cap; showing it twice would double-count the box's
+///   load. The subtraction reads the board rows directly rather than
+///   [`agent_rows`]'s output, so a claimed chat stays out of this group even
+///   in the case that drops it from the other one.
+/// - **Archived is not a reason to hide a run.** Archiving is a decision about
+///   a *finished* chat; one that is working anyway is the exact invisible run
+///   this group exists to surface.
+///
+/// A board is not required. `rows` empty — no board on this box, the host sweep
+/// still running, a phone that has not attached — subtracts nothing, and the
+/// group is the whole live list.
+pub fn running_rows(
+    rows: &[TaskRow],
+    chats: &[crate::Chat],
+    sessions: &[crate::Session],
+    now: DateTime<Utc>,
+) -> Vec<RunningRow> {
+    let dispatched: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.state().holds_pane())
+        .filter_map(|row| row.chat_id.as_deref())
+        .collect();
+    let mut out: Vec<RunningRow> = chats
+        .iter()
+        .filter(|chat| !dispatched.contains(&chat.id.as_str()))
+        .filter_map(|chat| {
+            let session = sessions.iter().find(|s| s.chat_id == chat.id);
+            let state = match crate::view::effective_indicator(session, now) {
+                crate::view::Indicator::Working => AgentState::Working,
+                crate::view::Indicator::AwaitingInput => AgentState::Blocked,
+                // Errored and None are not runs. A dead chat is the sessions
+                // list's to report, at the recency it earned.
+                _ => return None,
+            };
+            Some(RunningRow {
+                chat_id: chat.id.clone(),
+                title: chat
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(UNTITLED_CHAT)
+                    .to_string(),
+                space_id: chat.space_id.clone(),
+                state,
+                started_at: session.and_then(|s| s.started_at),
+            })
+        })
+        .collect();
+    // The same order the Agents group uses, for the same reason: a question
+    // outranks work going fine, and under that, longest-running first is stable
+    // because start order never changes under a viewer. The chat id breaks the
+    // final tie so the sort is total — titles are not unique and change under
+    // the reader as an agent renames its own chat.
+    out.sort_by(|a, b| {
+        a.state
+            .rank()
+            .cmp(&b.state.rank())
+            .then_with(|| match (a.started_at, b.started_at) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.chat_id.cmp(&b.chat_id))
+    });
+    out
+}
+
+/// How many of these want a human — the Running header's count badge.
+pub fn running_needing_attention(rows: &[RunningRow]) -> usize {
+    rows.iter().filter(|row| row.state.needs_attention()).count()
+}
+
+// ---------------------------------------------------------------------------
 // Which device hosts the board (gh#55)
 // ---------------------------------------------------------------------------
 
@@ -1492,6 +1639,143 @@ mod tests {
         assert_eq!(agents[0].branch.as_deref(), Some("board/gh-103-renamed"));
         let agents = agent_rows(&[r], &[chat("c1", None)], &[], now());
         assert_eq!(agents[0].branch.as_deref(), Some("board/gh-103"));
+    }
+
+    // ---- running, non-board chats (gh#117) --------------------------------
+
+    fn started(chat_id: &str, status: crate::SessionStatus, started: &str) -> crate::Session {
+        crate::Session {
+            started_at: Some(
+                DateTime::parse_from_rfc3339(started)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            ..session(chat_id, status, 0)
+        }
+    }
+
+    /// The whole point: a chat working with no attempt behind it is presence
+    /// the board cannot report, and it shows anyway.
+    #[test]
+    fn a_working_chat_with_no_attempt_is_a_running_row() {
+        let chats = vec![chat("orchestrator", None), chat("adhoc", None), chat("idle", None)];
+        let sessions = vec![
+            started("orchestrator", crate::SessionStatus::Working, "2026-08-01T11:30:00Z"),
+            started("adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
+        ];
+        let running = running_rows(&[], &chats, &sessions, now());
+        assert_eq!(
+            running.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
+            // Blocked floats; the idle chat is not a run at all.
+            vec!["adhoc", "orchestrator"]
+        );
+        assert_eq!(running[0].state, AgentState::Blocked);
+        assert_eq!(running[1].elapsed_label(now()).as_deref(), Some("30m00s"));
+    }
+
+    /// Every membership edge in one place: stale is dead, errored is not a run,
+    /// and archiving a chat that is working anyway does not hide it.
+    #[test]
+    fn membership_is_the_live_session_watch_and_nothing_else() {
+        let mut archived = chat("archived", None);
+        archived.archived = true;
+        let chats = vec![
+            chat("stale", None),
+            chat("errored", None),
+            chat("never", None),
+            archived,
+        ];
+        let sessions = vec![
+            // A crashed backend must not leave an eternal row here either.
+            session("stale", crate::SessionStatus::Working, crate::view::SESSION_STALE_MS + 1_000),
+            session("errored", crate::SessionStatus::Errored, 0),
+            session("archived", crate::SessionStatus::Working, 0),
+        ];
+        let running = running_rows(&[], &chats, &sessions, now());
+        assert_eq!(
+            running.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
+            vec!["archived"],
+            "archiving is a decision about a finished chat, not about a live run"
+        );
+    }
+
+    /// The two groups partition the box's load: a dispatched chat is the Agents
+    /// group's, and counting it twice would misreport what is running.
+    #[test]
+    fn a_live_attempts_chat_belongs_to_agents_and_not_to_running() {
+        let mut live = row("live", BoardState::Working);
+        live.chat_id = Some("c-live".into());
+        // A settled attempt released its chat — if the operator kept talking in
+        // it, that IS an unmanaged run and belongs here.
+        let mut settled = row("settled", BoardState::Review);
+        settled.chat_id = Some("c-settled".into());
+
+        let chats = vec![chat("c-live", None), chat("c-settled", None)];
+        let sessions = vec![
+            session("c-live", crate::SessionStatus::Working, 0),
+            session("c-settled", crate::SessionStatus::Working, 0),
+        ];
+        let rows = vec![live, settled];
+        assert_eq!(
+            running_rows(&rows, &chats, &sessions, now())
+                .iter()
+                .map(|r| r.chat_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c-settled"]
+        );
+        // And it is in exactly one of the two groups, not neither.
+        assert_eq!(
+            agent_rows(&rows, &chats, &sessions, now())
+                .iter()
+                .map(|a| a.chat_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c-live"]
+        );
+    }
+
+    /// A chat claimed by an attempt stays out even when the Agents group drops
+    /// it — the subtraction reads the board rows, not the other list.
+    #[test]
+    fn a_dispatched_chat_the_agents_group_dropped_is_still_not_running() {
+        let mut live = row("live", BoardState::Blocked);
+        live.chat_id = Some("c1".into());
+        let chats = vec![chat("c1", None)];
+        let sessions = vec![session("c1", crate::SessionStatus::Working, 0)];
+        // agent_rows keeps it (the chat synced) — but the subtraction must not
+        // depend on that having happened.
+        assert!(!agent_rows(std::slice::from_ref(&live), &chats, &sessions, now()).is_empty());
+        assert!(running_rows(&[live], &chats, &sessions, now()).is_empty());
+    }
+
+    /// What the row can say: the chat's own title, the run's age, a badge.
+    #[test]
+    fn a_running_row_says_the_title_the_age_and_who_wants_a_human() {
+        let untitled = crate::Chat {
+            title: Some("   ".into()),
+            ..chat("blank", None)
+        };
+        let chats = vec![chat("named", None), untitled];
+        let sessions = vec![
+            started("named", crate::SessionStatus::AwaitingInput, "2026-08-01T11:00:00Z"),
+            // No `started_at`: the row draws without a counter rather than
+            // counting up from the epoch.
+            session("blank", crate::SessionStatus::Working, 0),
+        ];
+        let running = running_rows(&[], &chats, &sessions, now());
+        assert_eq!(running[0].title, "some title the agent wrote");
+        assert_eq!(running[0].elapsed_label(now()).as_deref(), Some("1h00m"));
+        assert_eq!(running[1].title, UNTITLED_CHAT);
+        assert_eq!(running[1].elapsed_label(now()), None);
+        assert_eq!(running_needing_attention(&running), 1);
+    }
+
+    /// A box with no board is the case this group matters most on — nothing to
+    /// subtract, and the whole live list shows.
+    #[test]
+    fn no_board_subtracts_nothing() {
+        let chats = vec![chat("c1", None)];
+        let sessions = vec![session("c1", crate::SessionStatus::Working, 0)];
+        assert_eq!(running_rows(&[], &chats, &sessions, now()).len(), 1);
     }
 
     // ---- whose subscription (gh#101) ------------------------------------
