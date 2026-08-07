@@ -157,6 +157,28 @@ pub enum ToolCall {
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
+    /// A skill / slash command the agent invoked (gh#134).
+    ///
+    /// Split out of [`ToolCall::Unknown`] because it is not a tool in the sense
+    /// the rest of this enum means: the others are *how* an agent works, and
+    /// this is *which playbook it decided to follow* — the thing somebody
+    /// scrolling a long session is looking for. Every viewport renders it as a
+    /// landmark rather than a row in a tool group.
+    ///
+    /// A viewport too old to know this variant degrades it to an empty part
+    /// (`from_doc_part` maps an undecodable call to blank text) rather than
+    /// failing the doc — one missing row until it updates, never a corrupt
+    /// transcript.
+    Skill {
+        /// Bare name, no leading slash — `comet-board`, `vercel:deploy`.
+        name: String,
+        /// Whatever rode the invocation, if anything. Kept (unlike the other
+        /// free-form inputs the render policy strips) because it is the
+        /// secondary line of the chip: `/comet-board list --state ready` says
+        /// what happened and `/comet-board` does not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
+    },
     Unknown {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]

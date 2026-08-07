@@ -920,7 +920,10 @@ impl BoardPanel {
                     }
                     cx.notify();
                 }
-                ComposerInputEvent::Submitted
+                // No `/` picker on a dispatch search box, so its navigation
+                // keys never become menu events.
+                ComposerInputEvent::Menu(_)
+                | ComposerInputEvent::Submitted
                 | ComposerInputEvent::PastedImages(_)
                 | ComposerInputEvent::PastedPaths(_) => {}
             });

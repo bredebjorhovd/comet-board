@@ -441,6 +441,27 @@ impl AgentAccounts {
         self.inner.config.accounts_dir().join(slot_id)
     }
 
+    /// The config dir a run pointed at `account_id` reads — WITHOUT creating or
+    /// seeding it, unlike [`AgentAccounts::materialize`].
+    ///
+    /// For questions *about* a run rather than preparation for one: what skills
+    /// it can invoke (gh#134) is answered by looking in the dir the child's
+    /// `CLAUDE_CONFIG_DIR` will point at, and asking that question must not
+    /// mint an account dir for a chat nobody has run yet.
+    pub fn config_dir_for(&self, account_id: &str) -> Option<PathBuf> {
+        is_slot_id(account_id).then(|| self.account_dir(account_id))
+    }
+
+    /// The CLI's own config dir — `$CLAUDE_CONFIG_DIR` or `~/.claude` — which
+    /// is what a run with no account named reads.
+    pub fn default_config_dir(&self, harness: HarnessId) -> Option<PathBuf> {
+        match harness {
+            HarnessId::ClaudeCode => Some(self.inner.config.claude_config_dir.clone()),
+            HarnessId::Codex => Some(self.inner.config.codex_home.clone()),
+            _ => None,
+        }
+    }
+
     /// The live credentials file inside a materialized dir, when there is one.
     fn materialized(&self, slot: &Slot) -> Option<serde_json::Value> {
         let dir = self.account_dir(&slot.id);

@@ -17,15 +17,17 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use comet_proto::view::board::{self as board_view, AgentState, BoardState};
+use comet_proto::view::needs::{self as needs_view, NeedKind};
+use comet_proto::view::skills as skills_view;
+use comet_proto::view::spaces as spaces_view;
 use comet_proto::view::{
     self, CheckoutKind, CheckoutPlan, ConnectionStatus, GatePhase, Indicator, display_status,
     format_time_ago,
 };
-use comet_proto::view::board::{self as board_view, AgentState, BoardState};
-use comet_proto::view::needs::{self as needs_view, NeedKind};
-use comet_proto::view::spaces as spaces_view;
 use comet_proto::{
-    AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, Space,
+    AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, SkillDescriptor,
+    Space,
 };
 use comet_rpc::methods;
 
@@ -454,6 +456,27 @@ pub struct ComposerFooter {
     pub checkout_live: bool,
 }
 
+/// The composer's `/` skill picker (gh#134).
+///
+/// Open/closed is not a field: it is derived from the buffer by
+/// [`App::skill_menu`], so the menu can never disagree with the text it is
+/// completing. The only remembered state is which chat the catalog is about,
+/// where the highlight is, and whether Escape shut it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SkillPicker {
+    /// What a run started from this composer could invoke, as the chat's HOST
+    /// answered — not this device's own config dir.
+    pub available: Vec<SkillDescriptor>,
+    /// The composer key `available` describes; `None` before the first ask.
+    pub key: Option<String>,
+    pub selected: usize,
+    /// First row drawn — kept so arrowing back up retraces the same rows.
+    pub first: usize,
+    /// Offset of a token Escape closed the picker on; see
+    /// [`App::dismiss_skill_menu`].
+    dismissed: Option<usize>,
+}
+
 /// One row of a context menu.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MenuItem {
@@ -521,6 +544,8 @@ pub struct App {
 
     pub transcript: Transcript,
     pub composer: Composer,
+    /// The composer's `/` skill picker (gh#134).
+    pub skills: SkillPicker,
     pub help: bool,
     /// Where the help overlay is scrolled to. Its list is longer than a pane,
     /// and a reference that silently stops halfway is how keys stay unknown.
@@ -609,6 +634,7 @@ impl App {
             sidebar_visible: true,
             transcript: Transcript::new(),
             composer: Composer::default(),
+            skills: SkillPicker::default(),
             help: false,
             help_scroll: 0,
             board: Board::new(),
@@ -709,6 +735,14 @@ impl App {
             Update::Refs(refs) => {
                 if let Some(draft) = &mut self.draft {
                     draft.refs = Some(refs);
+                }
+                Vec::new()
+            }
+            Update::Skills { key, skills } => {
+                // A reply for a chat the composer has since left is stale;
+                // dropping it is what keeps the menu about what is on screen.
+                if self.skills.key.as_deref() == Some(key.as_str()) {
+                    self.skills.available = skills;
                 }
                 Vec::new()
             }
@@ -1031,6 +1065,18 @@ impl App {
                 }
                 Vec::new()
             }
+            Action::SkillStep(delta) => {
+                self.step_skill(delta);
+                Vec::new()
+            }
+            Action::SkillAccept => {
+                self.accept_skill();
+                Vec::new()
+            }
+            Action::SkillDismiss => {
+                self.dismiss_skill_menu();
+                Vec::new()
+            }
         }
     }
 
@@ -1087,6 +1133,9 @@ impl App {
             Edit::BufferStart => self.composer.to_start(),
             Edit::BufferEnd => self.composer.to_end(),
         }
+        // Every path into the buffer lands here, which is the one place the
+        // `/` picker's derived state has to be re-checked (gh#134).
+        self.sync_skill_menu();
     }
 
     /// Tab past a pane that isn't on screen.
@@ -1699,6 +1748,137 @@ impl App {
             params: serde_json::json!({ "chatId": chat_id, "command": command }),
             context: "Couldn't interrupt the run",
         }]
+    }
+
+    // -----------------------------------------------------------------------
+    // The composer's `/` skill picker (gh#134)
+    // -----------------------------------------------------------------------
+
+    /// Ask the chat's host what a run from here could invoke, once per target.
+    ///
+    /// Prefetched rather than fetched on the first `/`: the round trip may
+    /// cross the relay to the box, and a menu that appeared after the name was
+    /// already typed would train people to stop waiting for it.
+    pub fn ensure_skills(&mut self) -> Effects {
+        // The chat's host answers about the chat; a draft has only its space,
+        // so it asks about that folder on that space's device.
+        let (chat_id, cwd, device) = match self.selected_chat.as_deref() {
+            Some(id) => match self.chats.iter().find(|chat| chat.id == id) {
+                Some(chat) => (Some(chat.id.clone()), None, Some(chat.device_id.clone())),
+                None => (None, None, None),
+            },
+            None => match self.draft_space().or_else(|| self.selected_space_row()) {
+                Some(space) => (
+                    None,
+                    Some(space.path.clone()),
+                    Some(space.device_id.clone()),
+                ),
+                None => (None, None, None),
+            },
+        };
+        // Keyed on what the answer is ABOUT, not on the selected chat: with no
+        // chat open the selection is `None` for every space, and a key that
+        // could not tell two spaces apart would keep offering the first one's
+        // repo-level skills after you switched.
+        let key = match (&chat_id, &cwd) {
+            (Some(chat), _) => format!("chat:{chat}"),
+            (None, Some(cwd)) => format!("cwd:{cwd}"),
+            // Nothing to ask about yet. Left unclaimed, so the first chat or
+            // space to arrive triggers the ask.
+            (None, None) => return Vec::new(),
+        };
+        if self.skills.key.as_deref() == Some(key.as_str()) {
+            return Vec::new();
+        }
+        // Claim it first: the supervisor calls this every loop, and a second
+        // request for the same target would be a request per frame.
+        self.skills = SkillPicker {
+            key: Some(key.clone()),
+            ..SkillPicker::default()
+        };
+        vec![Command::ListSkills {
+            key,
+            chat_id,
+            cwd,
+            target_device: device.and_then(|d| self.remote_device(&d)),
+            harness: None,
+        }]
+    }
+
+    /// The `/…` token under the caret and the rows matching it, or `None`
+    /// whenever the picker should be closed — including when nothing matches,
+    /// since an empty menu would say nothing and still eat Enter.
+    pub fn skill_menu(&self) -> Option<(skills_view::SlashToken, Vec<SkillDescriptor>)> {
+        if self.focus != Focus::Composer || self.overlay_open() || self.skills.available.is_empty()
+        {
+            return None;
+        }
+        let token = skills_view::slash_token(self.composer.text(), self.composer.cursor())?;
+        if self.skills.dismissed == Some(token.start) {
+            return None;
+        }
+        let rows = skills_view::filter(&token.query, &self.skills.available);
+        (!rows.is_empty()).then_some((token, rows))
+    }
+
+    fn step_skill(&mut self, delta: isize) {
+        let Some((_, rows)) = self.skill_menu() else {
+            return;
+        };
+        self.skills.selected = skills_view::step(self.skills.selected, delta, rows.len());
+        let (first, _) = skills_view::window(
+            self.skills.first,
+            self.skills.selected,
+            rows.len(),
+            skills_view::PICKER_MAX_ROWS,
+        );
+        self.skills.first = first;
+    }
+
+    /// Complete the highlighted row into the prompt.
+    fn accept_skill(&mut self) {
+        let Some((token, rows)) = self.skill_menu() else {
+            return;
+        };
+        let Some(skill) = rows.get(self.skills.selected) else {
+            return;
+        };
+        let (text, cursor) = skills_view::complete(self.composer.text(), &token, &skill.name);
+        self.composer.set_text_with_cursor(text, cursor);
+        self.skills.selected = 0;
+        self.skills.first = 0;
+    }
+
+    /// Escape closes the picker and leaves the text alone — somebody who typed
+    /// `/tmp/x` and wants no menu about it must not have their prompt rewritten
+    /// to make one go away.
+    ///
+    /// Remembered as the dismissed token's offset rather than a bare flag: the
+    /// menu is derived from the buffer, so a flag would have to be cleared from
+    /// every edit path to keep the two in step. Keyed this way, typing on
+    /// inside the same token keeps it shut and the next `/` opens afresh.
+    fn dismiss_skill_menu(&mut self) {
+        if let Some(token) = skills_view::slash_token(self.composer.text(), self.composer.cursor())
+        {
+            self.skills.dismissed = Some(token.start);
+        }
+    }
+
+    /// Forget a dismissal once the caret has left the token it was about, and
+    /// re-home the highlight when the row set changes under it.
+    fn sync_skill_menu(&mut self) {
+        if self.skills.dismissed.is_some() {
+            let inside = skills_view::slash_token(self.composer.text(), self.composer.cursor())
+                .is_some_and(|t| Some(t.start) == self.skills.dismissed);
+            if !inside {
+                self.skills.dismissed = None;
+            }
+        }
+        let len = self.skill_menu().map_or(0, |(_, rows)| rows.len());
+        if self.skills.selected >= len {
+            self.skills.selected = 0;
+            self.skills.first = 0;
+        }
     }
 
     /// Queue the composer's text. Mirrors the gpui composer's send path: a
@@ -3212,6 +3392,158 @@ mod tests {
             Command::Call { params, .. } => params.get("op")?.as_str(),
             _ => None,
         }
+    }
+
+    fn skill(name: &str) -> SkillDescriptor {
+        SkillDescriptor {
+            name: name.into(),
+            description: Some(format!("{name} does things")),
+            source: comet_proto::SkillSource::Personal,
+        }
+    }
+
+    /// A seeded app with a loaded skill catalogue and the composer focused,
+    /// parked on `c1` so navigation in these tests is unambiguous.
+    fn with_skills(names: &[&str]) -> App {
+        let mut app = seeded();
+        app.apply(Update::LocalDevice("dev".into()));
+        app.focus = Focus::Composer;
+        app.select_chat(Some("c1".into()));
+        let effects = app.ensure_skills();
+        let key = match effects.first() {
+            Some(Command::ListSkills { key, .. }) => key.clone(),
+            other => panic!("expected a ListSkills command, got {other:?}"),
+        };
+        app.apply(Update::Skills {
+            key,
+            skills: names.iter().copied().map(skill).collect(),
+        });
+        app
+    }
+
+    #[test]
+    fn the_catalogue_is_asked_for_once_per_chat_and_targets_its_host() {
+        let mut app = seeded();
+        app.apply(Update::LocalDevice("dev".into()));
+        app.select_chat(Some("c1".into()));
+        let effects = app.ensure_skills();
+        match effects.as_slice() {
+            [
+                Command::ListSkills {
+                    chat_id,
+                    cwd,
+                    target_device,
+                    ..
+                },
+            ] => {
+                assert_eq!(chat_id.as_deref(), app.selected_chat.as_deref());
+                assert!(cwd.is_none(), "an open chat's host resolves its own cwd");
+                // The seeded chat is hosted here, so nothing is forwarded…
+                assert!(target_device.is_none());
+            }
+            other => panic!("expected exactly one ListSkills, got {other:?}"),
+        }
+        // Asked once: the supervisor calls this every loop.
+        assert!(app.ensure_skills().is_empty());
+        // Navigating re-asks, about the chat you moved to.
+        app.select_chat(Some("c2".into()));
+        assert!(matches!(
+            app.ensure_skills().as_slice(),
+            [Command::ListSkills { chat_id, .. }] if chat_id.as_deref() == Some("c2")
+        ));
+
+        // …and a chat hosted elsewhere is asked over the relay: its skills are
+        // files on the box, and this device's own would be a different list.
+        let mut remote = chat("c3", "s1", 3);
+        remote.device_id = "box".into();
+        app.apply(Update::Chats(vec![chat("c1", "s1", 1), remote]));
+        app.select_chat(Some("c3".into()));
+        assert!(matches!(
+            app.ensure_skills().as_slice(),
+            [Command::ListSkills { target_device, .. }]
+                if target_device.as_deref() == Some("box")
+        ));
+    }
+
+    #[test]
+    fn a_reply_for_a_chat_you_left_is_dropped() {
+        let mut app = with_skills(&["comet-board"]);
+        app.select_chat(Some("c2".into()));
+        app.ensure_skills();
+        app.apply(Update::Skills {
+            key: "chat:c1".into(),
+            skills: vec![skill("stale")],
+        });
+        assert!(
+            app.skills.available.is_empty(),
+            "the previous chat's answer must not populate this one's menu"
+        );
+    }
+
+    #[test]
+    fn typing_a_slash_opens_the_picker_and_enter_completes_it() {
+        let mut app = with_skills(&["comet-board", "commit", "debug"]);
+        assert!(app.skill_menu().is_none(), "no slash, no menu");
+
+        for ch in "/com".chars() {
+            app.act(Action::Edit(Edit::Insert(ch)));
+        }
+        let (_, rows) = app.skill_menu().expect("`/com` opens the picker");
+        assert_eq!(
+            rows.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["comet-board", "commit"],
+            "filtered as typed"
+        );
+
+        app.act(Action::SkillAccept);
+        assert_eq!(app.composer.text(), "/comet-board ");
+        assert_eq!(app.composer.cursor(), app.composer.text().len());
+        assert!(
+            app.skill_menu().is_none(),
+            "the completion left a space, so the token — and the menu — is gone"
+        );
+    }
+
+    #[test]
+    fn the_highlight_moves_and_wraps_and_escape_closes_without_editing() {
+        let mut app = with_skills(&["comet-board", "commit"]);
+        for ch in "/com".chars() {
+            app.act(Action::Edit(Edit::Insert(ch)));
+        }
+        app.act(Action::SkillStep(1));
+        assert_eq!(app.skills.selected, 1);
+        app.act(Action::SkillStep(1));
+        assert_eq!(app.skills.selected, 0, "wraps at the end");
+
+        app.act(Action::SkillDismiss);
+        assert!(app.skill_menu().is_none());
+        assert_eq!(app.composer.text(), "/com", "Escape edits nothing");
+        // Typing on inside the same token keeps it shut…
+        app.act(Action::Edit(Edit::Insert('m')));
+        assert!(app.skill_menu().is_none());
+        // …and a fresh token elsewhere opens again.
+        app.act(Action::Edit(Edit::Insert(' ')));
+        app.act(Action::Edit(Edit::Insert('/')));
+        assert!(app.skill_menu().is_some());
+    }
+
+    #[test]
+    fn a_path_in_the_prompt_never_summons_a_menu() {
+        let mut app = with_skills(&["comet-board"]);
+        for ch in "look at src/comet".chars() {
+            app.act(Action::Edit(Edit::Insert(ch)));
+        }
+        assert!(
+            app.skill_menu().is_none(),
+            "a slash mid-word is a path separator, not a command"
+        );
+        // A query nothing matches closes the menu rather than leaving an empty
+        // one to eat the next Enter.
+        app.composer.clear();
+        for ch in "/zzz".chars() {
+            app.act(Action::Edit(Edit::Insert(ch)));
+        }
+        assert!(app.skill_menu().is_none());
     }
 
     #[test]

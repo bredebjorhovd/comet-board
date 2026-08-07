@@ -210,6 +210,10 @@ impl Loop {
             // coalescing that makes a stream cheap: N frames arriving inside one
             // frame budget produce one layout pass and one draw.
             self.pump(&mut effects);
+            // One place, after everything settles: the `/` picker's catalog is
+            // about whichever chat the composer ended up on, and asking here
+            // means no navigation path has to remember to ask (gh#134).
+            effects.extend(self.app.ensure_skills());
 
             for command in effects {
                 self.link.send(command);
@@ -288,6 +292,7 @@ impl Loop {
                     self.app.board.typing,
                     self.app.board.peek.is_some(),
                     self.app.help,
+                    self.app.skill_menu().is_some(),
                     key,
                 ) {
                     effects.extend(self.app.act(action));

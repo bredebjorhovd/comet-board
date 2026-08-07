@@ -348,8 +348,11 @@ impl Pickers {
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
-            // Pasted images/files don't apply to a search box.
-            ComposerInputEvent::PastedImages(_) | ComposerInputEvent::PastedPaths(_) => {}
+            // Pasted images/files don't apply to a search box, and a palette
+            // hosts no `/` picker, so no menu events reach here either.
+            ComposerInputEvent::Menu(_)
+            | ComposerInputEvent::PastedImages(_)
+            | ComposerInputEvent::PastedPaths(_) => {}
         });
         // Chat selection / config changes must re-render the chips (child views
         // only re-render on their own notify). A selection change also drops
@@ -459,6 +462,13 @@ impl Pickers {
         let state = self.state.read(cx);
         let device = state.selected_space_row()?.device_id.clone();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+    }
+
+    /// The harness a run started from here would use — what the composer's
+    /// skill picker asks the engine about on the new-chat canvas, where there
+    /// is no chat row to read it off (gh#134).
+    pub fn harness(&self, cx: &App) -> Option<HarnessId> {
+        self.effective_harness(cx)
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.

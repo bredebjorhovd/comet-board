@@ -221,6 +221,9 @@ struct TranscriptView: View {
                     }
                 }
 
+            case .skillChip(let name, let args, let isError, let resolved):
+                SkillChipView(name: name, args: args, isError: isError, resolved: resolved)
+
             case .inputChip(let header, let resolved):
                 InputChipView(header: header, resolved: resolved)
 
@@ -453,6 +456,56 @@ struct ErrorChipView: View {
         .frame(height: 34)
         .background(Theme.danger.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.danger.opacity(0.16), lineWidth: 1))
+    }
+}
+
+/// The skill-invocation landmark (gh#134).
+///
+/// Deliberately unlike a tool chip in every dimension a glance registers: it
+/// keeps the accent, it is taller, and its name is 13pt medium in full-strength
+/// text where a tool chip's label is 12pt muted. That is the whole feature —
+/// scrolling a session at speed, the accent-tinted blocks are where the agent
+/// picked up a playbook.
+struct SkillChipView: View {
+    let name: String
+    let args: String?
+    let isError: Bool
+    let resolved: Bool
+
+    private var tint: Color { isError ? Theme.danger : Theme.accent }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 12))
+                .foregroundStyle(tint)
+                .frame(width: 22, height: 22)
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+            // The name leads with its slash: `/comet-board` is what both the
+            // operator and the agent call it.
+            Text("/" + name)
+                .font(Theme.sans(13, weight: .medium))
+                .foregroundStyle(isError ? Theme.danger : Theme.text)
+            if let args, !args.isEmpty {
+                Text(args)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.textMuted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            // Resolution removes the note rather than recoloring anything — a
+            // landmark that changed colour on completion would read as a
+            // status, which it is not.
+            if !resolved && !isError {
+                Text("running…")
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted.opacity(0.8))
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(tint.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(tint.opacity(0.22), lineWidth: 1))
     }
 }
 

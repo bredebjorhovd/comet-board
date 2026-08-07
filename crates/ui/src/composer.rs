@@ -13,17 +13,19 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PaintQuad, PathPromptOptions, Pixels, Point, SharedString, Style, StyledImage as _,
-    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, img, point, prelude::*, px, relative, size,
+    AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
+    SharedString, Style, StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, relative,
+    size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use comet_proto::{RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
+use comet_proto::view::skills as view_skills;
+use comet_proto::{RunRequest, SandboxLevel, SkillDescriptor, UserInputAnswer, UserInputQuestion};
 use comet_rpc::methods;
 
 use crate::attachments::{self, StagedAttachment};
@@ -596,11 +598,23 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
+/// Where a keypress moves a completion menu the input is hosting (gh#134).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuNav {
+    Up,
+    Down,
+    /// Enter with the menu up: complete the highlighted row, do not send.
+    Accept,
+}
+
 /// Events the composer wrapper listens for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerInputEvent {
     Submitted,
     Edited,
+    /// A navigation key arrived while a completion menu was up — the wrapper
+    /// owns the menu, so the input only reports the intent.
+    Menu(MenuNav),
     /// Images pasted from the clipboard (screenshots / copied image data) —
     /// the wrapper stages them as attachments (use-attachments.ts onPaste).
     PastedImages(Vec<gpui::Image>),
@@ -621,6 +635,11 @@ pub struct ComposerInput {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
+    /// A completion menu is up (the wrapper's `/` picker, gh#134): up/down/
+    /// Enter belong to it, not to the caret. Set by the wrapper, because the
+    /// menu's contents — and therefore whether there is one — depend on state
+    /// the input has no business holding.
+    menu_active: bool,
     /// Vertical scroll inside the input once content exceeds the max height.
     scroll_top: f32,
     // -- measured state (written during layout/paint) --
@@ -665,6 +684,7 @@ impl ComposerInput {
             selection_reversed: false,
             marked_range: None,
             is_selecting: false,
+            menu_active: false,
             scroll_top: 0.0,
             last_lines: Vec::new(),
             line_starts: vec![0],
@@ -712,6 +732,34 @@ impl ComposerInput {
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    /// Caret byte offset (the selection's active end).
+    pub fn caret(&self) -> usize {
+        self.cursor_offset()
+    }
+
+    /// Tell the input a completion menu is up; see [`ComposerInput::menu_active`].
+    pub fn set_menu_active(&mut self, active: bool) {
+        self.menu_active = active;
+    }
+
+    /// Replace the buffer AND place the caret — the completion path, which
+    /// (unlike [`ComposerInput::set_text`]) has somewhere specific to leave it.
+    pub fn set_text_with_caret(
+        &mut self,
+        text: impl Into<String>,
+        caret: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.content = text.into();
+        let caret = caret.min(self.content.len());
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -869,10 +917,18 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_active {
+            cx.emit(ComposerInputEvent::Menu(MenuNav::Up));
+            return;
+        }
         self.move_vertical(-1.0, cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_active {
+            cx.emit(ComposerInputEvent::Menu(MenuNav::Down));
+            return;
+        }
         self.move_vertical(1.0, cx);
     }
 
@@ -984,6 +1040,14 @@ impl ComposerInput {
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        // With a completion menu up, Enter completes rather than sends. gpui
+        // dispatches bound actions before raw key listeners, so this is the
+        // only place that decision can be made — a listener on the composer
+        // frame would never see the key.
+        if self.menu_active {
+            cx.emit(ComposerInputEvent::Menu(MenuNav::Accept));
+            return;
+        }
         cx.emit(ComposerInputEvent::Submitted);
     }
 
@@ -1589,6 +1653,20 @@ pub struct Composer {
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     current_key: String,
+    /// Skills invocable by a run started from here (gh#134), as the chat's HOST
+    /// answered — never this device's own `~/.claude`, which for a chat on the
+    /// box, or one naming an agent account, is a different list entirely.
+    skills: Vec<SkillDescriptor>,
+    /// Which composer key `skills` describes; `None` until the first answer.
+    skills_key: Option<String>,
+    skills_task: Option<Task<()>>,
+    /// Highlighted row of the `/` picker, and the first row drawn — kept
+    /// across keystrokes so arrowing back up retraces the same rows.
+    skill_selected: usize,
+    skill_first: usize,
+    /// Offset of a `/` token Escape closed the picker on; see
+    /// [`Composer::dismiss_skill_menu`].
+    skill_dismissed: Option<usize>,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -1645,7 +1723,19 @@ impl Composer {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
-            ComposerInputEvent::Edited => cx.notify(),
+            // Recomputed on every edit rather than only on render: the input
+            // asks `menu_active` while dispatching the NEXT keystroke, so a
+            // flag that lagged a frame would send the prompt on the Enter that
+            // was meant to complete it.
+            ComposerInputEvent::Edited => {
+                this.sync_skill_menu(cx);
+                cx.notify();
+            }
+            ComposerInputEvent::Menu(nav) => match nav {
+                MenuNav::Up => this.step_skill(-1, cx),
+                MenuNav::Down => this.step_skill(1, cx),
+                MenuNav::Accept => this.accept_skill(cx),
+            },
             ComposerInputEvent::PastedImages(images) => {
                 let staged = images
                     .iter()
@@ -1665,6 +1755,12 @@ impl Composer {
             preview: None,
             picker_task: None,
             current_key,
+            skills: Vec::new(),
+            skills_key: None,
+            skills_task: None,
+            skill_selected: 0,
+            skill_first: 0,
+            skill_dismissed: None,
             sending: false,
             failure: None,
             wizard: None,
@@ -1953,6 +2049,195 @@ impl Composer {
                 }
             }
         }
+        self.ensure_skills(cx);
+        cx.notify();
+    }
+
+    // ---- the `/` skill picker (gh#134) ----
+
+    /// Load the skills invocable from this composer, once per chat.
+    ///
+    /// Prefetched on navigation rather than fetched when `/` is first typed:
+    /// the round trip may cross the relay to the box, and a picker that
+    /// appeared a beat after the slash — or worse, after the name was already
+    /// typed — would train people not to wait for it.
+    fn ensure_skills(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let chat = state.selected_chat_row().cloned();
+        // The chat's host answers about the chat; the new-chat canvas has only
+        // the space, so it asks about the space's folder on the space's device.
+        let (chat_id, cwd, device) = match &chat {
+            Some(chat) => (Some(chat.id.clone()), None, Some(chat.device_id.clone())),
+            None => match state.selected_space_row() {
+                Some(space) => (
+                    None,
+                    Some(space.path.clone()),
+                    Some(space.device_id.clone()),
+                ),
+                None => (None, None, None),
+            },
+        };
+        // Keyed on what the answer is ABOUT, not on the composer's draft key:
+        // on the new-chat canvas the draft key is `""` for every space, and a
+        // key that could not tell two spaces apart would keep offering the
+        // first one's repo-level skills after you switched.
+        let key = match (&chat_id, &cwd) {
+            (Some(chat), _) => format!("chat:{chat}"),
+            (None, Some(cwd)) => format!("cwd:{cwd}"),
+            // Nothing to ask about yet. Left unclaimed so the first space or
+            // chat to arrive triggers the ask.
+            (None, None) => return,
+        };
+        if self.skills_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let target = device.filter(|d| state.local_device_id.as_deref() != Some(d.as_str()));
+        let harness = self.pickers.read(cx).harness(cx);
+        // Claim the key before the call so a re-entrant render cannot queue a
+        // second load for the same chat.
+        self.skills_key = Some(key.clone());
+        self.skills = Vec::new();
+        self.skill_selected = 0;
+        self.skill_first = 0;
+        self.skill_dismissed = None;
+
+        self.skills_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            let mut put = |k: &str, v: Option<String>| {
+                if let Some(v) = v {
+                    params.insert(k.into(), serde_json::Value::String(v));
+                }
+            };
+            put("chatId", chat_id);
+            put("cwd", cwd);
+            put("targetDeviceId", target);
+            if let Some(harness) = harness {
+                params.insert(
+                    "harness".into(),
+                    serde_json::to_value(harness).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            let result = engine
+                .client()
+                .call(methods::LIST_SKILLS, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |composer, cx| {
+                // A reply for a chat the composer has since navigated away
+                // from is stale — dropping it is what keeps the menu about the
+                // chat you are looking at.
+                if composer.skills_key.as_deref() != Some(key.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<SkillDescriptor>>(value) {
+                        Ok(skills) => composer.skills = skills,
+                        // Never surfaced: an empty picker and a picker that
+                        // could not load look the same to somebody typing, and
+                        // a notice under the composer for it would be noise on
+                        // a device with no skills installed at all.
+                        Err(err) => tracing::warn!(error = %err, "ListSkills decode failed"),
+                    },
+                    Err(err) => tracing::warn!(error = %err, "ListSkills failed"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The `/…` token under the caret and the rows matching it — `None`
+    /// whenever the picker should be closed, including when nothing matches
+    /// (an empty menu hanging under a composer says nothing and eats Enter).
+    fn skill_menu(&self, cx: &App) -> Option<(view_skills::SlashToken, Vec<SkillDescriptor>)> {
+        if self.wizard.is_some() || self.skills.is_empty() {
+            return None;
+        }
+        let input = self.input.read(cx);
+        let token = view_skills::slash_token(input.text(), input.caret())?;
+        if self.skill_dismissed == Some(token.start) {
+            return None;
+        }
+        let rows = view_skills::filter(&token.query, &self.skills);
+        (!rows.is_empty()).then_some((token, rows))
+    }
+
+    /// Re-derive the picker's open state after an edit: clamp the selection to
+    /// the new row set and tell the input whose keys the arrows are.
+    fn sync_skill_menu(&mut self, cx: &mut Context<Self>) {
+        // Forget a dismissal once the caret has left the token it was about,
+        // so the next `/` — even one typed at the same offset after clearing
+        // the line — opens a menu again.
+        if self.skill_dismissed.is_some() {
+            let input = self.input.read(cx);
+            let inside = view_skills::slash_token(input.text(), input.caret())
+                .is_some_and(|t| Some(t.start) == self.skill_dismissed);
+            if !inside {
+                self.skill_dismissed = None;
+            }
+        }
+        let len = self.skill_menu(cx).map_or(0, |(_, rows)| rows.len());
+        if self.skill_selected >= len {
+            self.skill_selected = 0;
+            self.skill_first = 0;
+        }
+        self.input
+            .update(cx, |input, _| input.set_menu_active(len > 0));
+    }
+
+    fn step_skill(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some((_, rows)) = self.skill_menu(cx) else {
+            return;
+        };
+        self.skill_selected = view_skills::step(self.skill_selected, delta, rows.len());
+        let (first, _) = view_skills::window(
+            self.skill_first,
+            self.skill_selected,
+            rows.len(),
+            view_skills::PICKER_MAX_ROWS,
+        );
+        self.skill_first = first;
+        cx.notify();
+    }
+
+    /// Complete the highlighted row into the buffer.
+    fn accept_skill(&mut self, cx: &mut Context<Self>) {
+        let Some((token, rows)) = self.skill_menu(cx) else {
+            return;
+        };
+        let Some(skill) = rows.get(self.skill_selected) else {
+            return;
+        };
+        let (text, caret) = view_skills::complete(self.input.read(cx).text(), &token, &skill.name);
+        self.input
+            .update(cx, |input, cx| input.set_text_with_caret(text, caret, cx));
+        self.skill_selected = 0;
+        self.skill_first = 0;
+        // The completion left a trailing space, so the token is gone and the
+        // menu closes — but say so explicitly rather than relying on the
+        // `Edited` event's ordering with the next keystroke.
+        self.sync_skill_menu(cx);
+        cx.notify();
+    }
+
+    /// Escape closes the picker and leaves the text alone — somebody who typed
+    /// `/tmp/x` and does not want a menu about it must not have their prompt
+    /// rewritten to make the menu go away.
+    ///
+    /// Remembered as the dismissed token's offset rather than a bare flag: the
+    /// menu is derived from the buffer, so a flag would have to be cleared from
+    /// every edit path to avoid disagreeing with it. Keyed this way, typing on
+    /// inside the same token keeps it shut and the next `/` elsewhere opens
+    /// afresh, with no bookkeeping anywhere else.
+    fn dismiss_skill_menu(&mut self, cx: &mut Context<Self>) {
+        let input = self.input.read(cx);
+        let Some(token) = view_skills::slash_token(input.text(), input.caret()) else {
+            return;
+        };
+        self.skill_dismissed = Some(token.start);
+        self.sync_skill_menu(cx);
         cx.notify();
     }
 
@@ -2712,6 +2997,112 @@ impl Composer {
             .into_any_element()
     }
 
+    /// The `/` picker: a floating list above the pill, sharing the composer's
+    /// chrome so it reads as part of the same control rather than a dialog.
+    ///
+    /// Rows are name-first with the description trailing, because the name is
+    /// what you are typing toward and the description is what confirms you
+    /// picked the right one. The source tag sits on the right edge, quiet, and
+    /// exists to answer "why is this offered here" — a repo-level skill and a
+    /// personal one behave identically until you switch chats.
+    fn render_skill_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, rows) = self.skill_menu(cx)?;
+        let theme = Theme::of(cx).clone();
+        let (first, visible) = view_skills::window(
+            self.skill_first,
+            self.skill_selected,
+            rows.len(),
+            view_skills::PICKER_MAX_ROWS,
+        );
+        let hidden = rows.len().saturating_sub(visible);
+        let selected = self.skill_selected;
+
+        let list = div()
+            .flex()
+            .flex_col()
+            .p(px(4.0))
+            .children(
+                rows.iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(visible)
+                    .map(|(ix, skill)| {
+                        let active = ix == selected;
+                        let name: SharedString = format!("/{}", skill.name).into();
+                        div()
+                            .id(SharedString::from(format!("skill-row-{ix}")))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .rounded(px(8.0))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .cursor_pointer()
+                            .when(active, |el| el.bg(theme.white_alpha(0.07)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.skill_selected = ix;
+                                this.accept_skill(cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if active {
+                                        theme.text
+                                    } else {
+                                        theme.text.opacity(0.85)
+                                    })
+                                    .child(name),
+                            )
+                            .when_some(skill.description.clone(), |el, description| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(description)),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .ml_auto()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(skill.source.label())),
+                            )
+                    }),
+            )
+            // Never silently truncate: a menu that showed 7 of 30 without
+            // saying so reads as "these are all the skills there are".
+            .when(hidden > 0, |el| {
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child(SharedString::from(format!("{hidden} more — keep typing"))),
+                )
+            });
+
+        Some(
+            div()
+                .mx(px(4.0))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(theme.white_alpha(0.08))
+                .bg(theme.surface_raised)
+                .shadow_lg()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -3139,10 +3530,38 @@ impl Render for Composer {
                         ),
                 )
         };
+        // The `/` picker (gh#134) floats directly above the pill and shares
+        // its chrome. Rendered before the input in the column so it opens
+        // upward, away from the caret — a menu covering the line being typed
+        // is a menu you close to see what you wrote.
+        let container = match self.render_skill_menu(cx) {
+            Some(menu) => container.child(motion::fade_quick("composer-skills", div().child(menu))),
+            None => container,
+        };
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
-        let container = container.child(motion::fade_quick("composer-input", body));
+        let container = container
+            // Escape and Tab are unbound in the Composer keymap, so they
+            // arrive here as raw keys — which is exactly where they belong:
+            // both are about the menu, and the menu is the wrapper's.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.skill_menu(cx).is_none() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.dismiss_skill_menu(cx);
+                        cx.stop_propagation();
+                    }
+                    "tab" => {
+                        this.accept_skill(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(motion::fade_quick("composer-input", body));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.

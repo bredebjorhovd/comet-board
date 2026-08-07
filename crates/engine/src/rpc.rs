@@ -137,6 +137,21 @@ struct ListModelsParams {
     harness: HarnessId,
 }
 
+/// `ListSkills` (gh#134). Every field optional: the composer on the new-chat
+/// canvas has no chat yet and asks with the space's folder as `cwd`, while an
+/// open chat names itself and lets the host resolve both halves.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSkillsParams {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Which harness the run will use, when no chat pins one.
+    #[serde(default)]
+    harness: Option<HarnessId>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
@@ -506,6 +521,47 @@ impl EngineRpc {
     pub fn with_edge_health(mut self, probe: EdgeHealthProbe) -> Self {
         self.edge_health = Some(probe);
         self
+    }
+
+    /// The skills a run in this chat could invoke (gh#134).
+    ///
+    /// The config dir is resolved the way the harness child's env will be, not
+    /// the way this device's shell is: a chat naming an agent account reads
+    /// that account's dir, because a slot overrides `CLAUDE_CONFIG_DIR` and
+    /// listing the box user's skills for it would be listing skills the run
+    /// cannot invoke. A chat that names none reads the CLI's own dir, which is
+    /// every chat on a single-account box.
+    ///
+    /// Never fails: an unknown chat, a harness with no skills, an unreadable
+    /// dir all produce an empty list. The picker's honest answer to "nothing is
+    /// installed" and to "I could not look" is the same menu, and an error
+    /// would only put a red box under a composer mid-keystroke.
+    fn list_skills(&self, params: ListSkillsParams) -> Vec<comet_proto::SkillDescriptor> {
+        let chat = params
+            .chat_id
+            .as_deref()
+            .and_then(|id| self.workspace.chat(id));
+        let config = chat.as_ref().and_then(|c| c.config.clone());
+        let harness = config
+            .as_ref()
+            .map(|c| c.harness)
+            .or(params.harness)
+            .unwrap_or(HarnessId::ClaudeCode);
+        if !crate::skills::harness_has_skills(harness) {
+            return Vec::new();
+        }
+        let config_dir = match config.as_ref().and_then(|c| c.account.as_deref()) {
+            Some(account) => self.agent_accounts.config_dir_for(account),
+            None => self.agent_accounts.default_config_dir(harness),
+        };
+        // The chat's own cwd is the worktree the agent works in, which is where
+        // its repo-level skills are. `params.cwd` covers the new-chat canvas,
+        // where the space's folder is all there is.
+        let cwd = chat
+            .and_then(|c| c.cwd)
+            .or(params.cwd)
+            .map(std::path::PathBuf::from);
+        crate::skills::list(&crate::skills::SkillRoots { config_dir, cwd })
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1037,6 +1093,10 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::LIST_HARNESSES
             | methods::LIST_MODELS
+            // Skills are files on the chat's host, and which files depends on
+            // the agent account that chat names (gh#134) — a laptop answering
+            // from its own `~/.claude` would offer what the run cannot invoke.
+            | methods::LIST_SKILLS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
             // Repos/worktrees/folders are device-local filesystem state.
@@ -1332,6 +1392,7 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
+            methods::LIST_SKILLS => RpcReply::value(&self.list_skills(parse_params(params)?)),
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
@@ -1809,10 +1870,36 @@ mod tests {
         assert!(!p.replace);
     }
 
+    /// gh#134: both composers ask with only what they know. An open chat sends
+    /// its id and lets the host resolve the rest; the new-chat canvas has no
+    /// chat and sends the space's folder instead.
+    #[test]
+    fn list_skills_params_accept_both_composer_shapes() {
+        let p: ListSkillsParams =
+            parse_params(serde_json::json!({ "chatId": "c1", "targetDeviceId": "box" }))
+                .expect("open chat");
+        assert_eq!(p.chat_id.as_deref(), Some("c1"));
+        assert_eq!(p.cwd, None);
+        assert_eq!(p.harness, None);
+
+        let p: ListSkillsParams =
+            parse_params(serde_json::json!({ "cwd": "/dev/comet", "harness": "claude-code" }))
+                .expect("new-chat canvas");
+        assert_eq!(p.cwd.as_deref(), Some("/dev/comet"));
+        assert_eq!(p.harness, Some(HarnessId::ClaudeCode));
+
+        // And an empty ask is legal: nothing known yet is an empty menu, not
+        // a bad-params error under a composer mid-keystroke.
+        assert!(parse_params::<ListSkillsParams>(serde_json::json!({})).is_ok());
+    }
+
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        // Skills are files on the chat's host, and which files depends on the
+        // agent account that chat names (gh#134).
+        assert!(forwardable(methods::LIST_SKILLS));
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a

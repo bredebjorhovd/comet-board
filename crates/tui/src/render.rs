@@ -62,6 +62,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 use comet_proto::view::board::{self, BoardState};
 use comet_proto::view::needs::{self as needs_view};
+use comet_proto::view::skills as skills_view;
 use comet_proto::view::{ConnectionStatus, GatePhase};
 
 use crate::app::{App, ChipKind, Hit, Overlay, Row};
@@ -851,6 +852,120 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     draw_transcript(frame, transcript, app, theme);
     draw_status_strip(frame, strip, app, theme);
     draw_composer(frame, composer, text_rows, app, theme);
+    // Last, and over the transcript: the `/` picker floats above the prompt
+    // rather than displacing it (gh#134). Displacing would move the line being
+    // typed out from under the cursor on the very keystroke that opened the
+    // menu — the transcript is the surface that can afford to be covered.
+    draw_skill_picker(frame, transcript, strip, app, theme);
+}
+
+/// The composer's `/` skill picker: a floating list stacked upward from just
+/// above the prompt, filtered by what has been typed after the slash.
+///
+/// Rows are name-first with the description trailing, because the name is what
+/// you are typing toward and the description is what confirms you reached the
+/// right one. The source tag on the right answers "why is this offered here" —
+/// a repo-level skill and a personal one behave identically until you switch
+/// chats.
+fn draw_skill_picker(
+    frame: &mut Frame,
+    transcript: Rect,
+    strip: Rect,
+    app: &mut App,
+    theme: &Theme,
+) {
+    let Some((_, rows)) = app.skill_menu() else {
+        return;
+    };
+    // The picker may cover the transcript and the status strip, never the
+    // prompt: it grows upward from the strip's last row. Fitting the row count
+    // to the space FIRST (rather than clipping a fixed seven) keeps the
+    // highlight inside whatever the pane could actually draw.
+    let ceiling = transcript.height + strip.height;
+    let max_rows = (ceiling.saturating_sub(1) as usize).min(skills_view::PICKER_MAX_ROWS);
+    if max_rows == 0 {
+        return;
+    }
+    let (first, visible) =
+        skills_view::window(app.skills.first, app.skills.selected, rows.len(), max_rows);
+    let hidden = rows.len().saturating_sub(visible);
+    // A title row, the visible rows, and a footer only when something is
+    // hidden AND there is a row left to say so in — a menu that showed 7 of 30
+    // in silence would read as "these are all the skills there are".
+    let footer = u16::from(hidden > 0 && ceiling as usize > visible + 1);
+    let height = visible as u16 + 1 + footer;
+    let panel = Rect {
+        x: transcript.x,
+        y: strip.y + strip.height - height,
+        width: transcript.width,
+        height,
+    };
+    let body = draw_panel(frame, panel, theme, "Skills");
+    // `draw_panel` reserves a trailing row for the panels that have a footer of
+    // their own; this one fills every row it was given.
+    let body = Rect {
+        height: height.saturating_sub(1),
+        ..body
+    };
+    let detail_col = rows
+        .iter()
+        .skip(first)
+        .take(visible)
+        .map(|s| wrap::width_of(&s.name) + 3)
+        .max()
+        .unwrap_or(0)
+        .min(28);
+    for (offset, (index, skill)) in rows
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+        .enumerate()
+    {
+        if offset as u16 >= body.height {
+            break;
+        }
+        let slot = Rect {
+            y: body.y + offset as u16,
+            height: 1,
+            ..body
+        };
+        // The source rides the description so one row carries both without a
+        // third column the narrow panes have no room for.
+        let detail = match &skill.description {
+            Some(description) => format!("{description}  ({})", skill.source.label()),
+            None => format!("({})", skill.source.label()),
+        };
+        draw_panel_row(
+            frame,
+            slot,
+            theme,
+            &format!("/{}", skill.name),
+            Some(&detail),
+            false,
+            detail_col,
+            index == app.skills.selected,
+        );
+    }
+    if footer == 1 && body.height > visible as u16 {
+        let slot = Rect {
+            y: body.y + visible as u16,
+            height: 1,
+            ..body
+        };
+        fill(frame, slot, theme.panel());
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{hidden} more — keep typing"),
+                theme.panel_hint(),
+            )),
+            Rect {
+                x: slot.x + PANEL_PAD,
+                width: slot.width.saturating_sub(PANEL_PAD * 2),
+                ..slot
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

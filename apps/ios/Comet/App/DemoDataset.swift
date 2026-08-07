@@ -402,6 +402,10 @@ final class DemoDataset {
                     > The curve is `1 − (1−p)^1.6` — fast attack, soft landing.
                     """),
                     .tool(id: "tool1", call: RenderToolCall(tag: "readFile", fields: ["path": "crates/ui/src/markdown/veil.rs"]), isError: false, resolved: true),
+                    // A skill between two tool groups: the shape that shows the
+                    // gh#134 landmark breaking a run in half, which is the whole
+                    // point of rendering it differently.
+                    .tool(id: "skill1", call: RenderToolCall(tag: "skill", fields: ["name": "comet-board", "args": "list --state ready"]), isError: false, resolved: true),
                     .tool(id: "tool2", call: RenderToolCall(tag: "editFile", fields: ["path": "Comet/Transcript/Veil.swift"]), isError: false, resolved: true),
                     .tool(id: "tool3", call: RenderToolCall(tag: "exec", fields: ["command": "xcodebuild -scheme Comet build"]), isError: false, resolved: true),
                     .text(id: "t1", text: """

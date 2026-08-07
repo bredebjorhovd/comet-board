@@ -35,6 +35,15 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
+    /// The skills and slash commands a run in this chat could invoke, for the
+    /// composer's `/` picker (gh#134). Params: `{chatId?, cwd?, harness?}` →
+    /// `[SkillDescriptor]`.
+    ///
+    /// Forwardable, and it has to be: skills are files, they are files on the
+    /// device that hosts the chat, and the answer depends on which agent
+    /// account that chat names — a laptop enumerating its own `~/.claude` for a
+    /// chat running on the box would offer skills that run cannot invoke.
+    pub const LIST_SKILLS: &str = "ListSkills";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     pub const WATCH_CHATS: &str = "WatchChats";

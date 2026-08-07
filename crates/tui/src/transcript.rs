@@ -448,7 +448,21 @@ fn render_entry(
                 MessagePart::Error { message, .. } => {
                     render_error(message, width, theme, &mut lines)
                 }
-                // Handled by PartGroup::Tools.
+                MessagePart::Tool {
+                    call: ToolCall::Skill { name, args },
+                    is_error,
+                    resolved,
+                    ..
+                } => render_skill(
+                    name,
+                    args.as_deref(),
+                    *is_error,
+                    *resolved,
+                    width,
+                    theme,
+                    &mut lines,
+                ),
+                // Every other tool is handled by PartGroup::Tools.
                 MessagePart::Tool { .. } => {}
             },
             PartGroup::Tools(tools) => {
@@ -499,6 +513,14 @@ fn group_parts(parts: &[MessagePart]) -> Vec<PartGroup<'_>> {
     let mut groups: Vec<PartGroup<'_>> = Vec::new();
     for part in parts {
         match part {
+            // A skill invocation is a landmark, not a member of a group: it
+            // stands alone, and it ends whatever group ran before it, so the
+            // tools it goes on to run read as its work rather than as more of
+            // the previous run's (gh#134).
+            MessagePart::Tool {
+                call: ToolCall::Skill { .. },
+                ..
+            } => groups.push(PartGroup::Single(part)),
             MessagePart::Tool {
                 call,
                 is_error,
@@ -697,6 +719,60 @@ fn render_tool_group(
         ]));
     }
 }
+
+/// A skill invocation (gh#134): the one row in the transcript that gets the
+/// accent and a marker of its own.
+///
+/// The tool group deliberately has no fill and no bar — an agent's bookkeeping
+/// should not look like a panel. This is the exception, and it earns it by
+/// being the thing somebody scrolling back is looking for: the accent marker
+/// is findable at a flick, and the name beside it says which playbook without
+/// expanding anything. Arguments trail in the hint style on the same row, so
+/// the landmark stays one line tall however long they are.
+fn render_skill(
+    name: &str,
+    args: Option<&str>,
+    is_error: bool,
+    resolved: bool,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<Line<'static>>,
+) {
+    let marker_style = Style::default().fg(if is_error { theme.danger } else { theme.accent });
+    let label = format!("/{name}");
+    let mut spans = vec![
+        Span::styled(format!("{SKILL_MARKER} "), marker_style),
+        Span::styled(
+            label.clone(),
+            Style::default()
+                .fg(if is_error { theme.danger } else { theme.muted })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    // "Skill" spelled out only while it is still running: the trailing note is
+    // how an unresolved invocation says so, and a resolved one needs no status.
+    let trailer = match (resolved, args) {
+        (_, Some(args)) if !args.trim().is_empty() => Some(args.to_string()),
+        (false, _) => Some("running…".to_string()),
+        _ => None,
+    };
+    if let Some(trailer) = trailer {
+        let used = INSET.len() + wrap::width_of(SKILL_MARKER) + 1 + wrap::width_of(&label) + 1;
+        spans.push(Span::styled(
+            format!(
+                " {}",
+                wrap::truncate(&wrap::sanitize(&trailer), width.saturating_sub(used))
+            ),
+            theme.hint(),
+        ));
+    }
+    out.push(indented(spans));
+}
+
+/// The glyph that marks a skill invocation. A filled diamond: nothing else in
+/// the transcript uses it, which is the entire requirement — it has to be
+/// findable by shape while scrolling past text too fast to read.
+const SKILL_MARKER: &str = "◆";
 
 fn render_error(message: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {
     for row in wrap::wrap(&wrap::sanitize(message), width.saturating_sub(1), "") {
@@ -1048,6 +1124,91 @@ mod tests {
             before[19], after[19],
             "the streaming message must be re-laid out"
         );
+    }
+
+    #[test]
+    fn a_skill_invocation_stands_alone_and_breaks_the_group_around_it() {
+        let tool = |id: &str, command: &str| MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Exec {
+                command: command.into(),
+            },
+            is_error: false,
+            resolved: true,
+        };
+        let entry = SessionMessageEntry {
+            parts: vec![
+                tool("a", "ls"),
+                MessagePart::Tool {
+                    id: "s".into(),
+                    call: ToolCall::Skill {
+                        name: "comet-board".into(),
+                        args: Some("list --state ready".into()),
+                    },
+                    is_error: false,
+                    resolved: true,
+                },
+                tool("b", "git status"),
+            ],
+            ..text_entry("m", MessageRole::Assistant, "")
+        };
+        let lines = render_entry(&entry, 80, true, &theme());
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let landmark = text
+            .iter()
+            .position(|row| row.contains(SKILL_MARKER))
+            .expect("the invocation gets a marked row of its own");
+        assert!(
+            text[landmark].contains("/comet-board") && text[landmark].contains("list --state"),
+            "name leads, arguments trail: {:?}",
+            text[landmark]
+        );
+        // One summary before it and one after — the tools it ran are its work,
+        // not more of the previous run's.
+        let summaries: Vec<usize> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("Ran 1 command"))
+            .map(|(ix, _)| ix)
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            2,
+            "the group is broken, not joined: {text:?}"
+        );
+        assert!(summaries[0] < landmark && summaries[1] > landmark);
+    }
+
+    #[test]
+    fn an_unresolved_skill_says_it_is_still_running() {
+        let entry = SessionMessageEntry {
+            parts: vec![MessagePart::Tool {
+                id: "s".into(),
+                call: ToolCall::Skill {
+                    name: "debug".into(),
+                    args: None,
+                },
+                is_error: false,
+                resolved: false,
+            }],
+            ..text_entry("m", MessageRole::Assistant, "")
+        };
+        let lines = render_entry(&entry, 80, true, &theme());
+        let row: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(row.contains("/debug"), "{row:?}");
+        assert!(row.contains("running…"), "{row:?}");
     }
 
     #[test]
