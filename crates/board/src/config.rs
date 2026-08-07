@@ -489,6 +489,23 @@ pub struct Defaults {
     /// and what `doctor`'s worktree check exists to make visible.
     #[serde(default = "default_retain_worktrees")]
     pub retain_worktrees: String,
+    /// How long a board-dispatched chat is kept on its space's shelf before the
+    /// board archives it (gh#139). The same clock
+    /// [`retain_worktrees`](Self::retain_worktrees) runs on — it starts when
+    /// the attempt is closed *and* its task has left the board — and for the
+    /// same reason: a chat whose task is still owed something is a chat
+    /// somebody is still using. Overridden per route.
+    ///
+    /// A week by default, matching the checkout its work happened in: the two
+    /// are the same attempt's leavings, and a box that keeps one without the
+    /// other is a box where half the evidence has been thrown away. `off` (or
+    /// `0`) keeps every chat on the shelf forever, which is what every board
+    /// did before this existed — and what the operator question behind gh#139
+    /// ("do all complete sessions just accumulate under the folder?") was
+    /// about. Archiving is not deleting: the Archived page unarchives, and the
+    /// transcript is untouched either way.
+    #[serde(default = "default_archive_chats")]
+    pub archive_chats: String,
     /// What the board does about a dispatch that spends somebody else's
     /// subscription (gh#101): `warn` (the default), `require-own`, or `off`.
     /// Overridden per route.
@@ -533,6 +550,10 @@ fn default_retain_worktrees() -> String {
     "7d".into()
 }
 
+fn default_archive_chats() -> String {
+    "7d".into()
+}
+
 fn default_new_source() -> String {
     "linear".into()
 }
@@ -566,6 +587,7 @@ impl Default for Defaults {
             new_source: default_new_source(),
             max_duration: default_max_duration(),
             retain_worktrees: default_retain_worktrees(),
+            archive_chats: default_archive_chats(),
             billing_guard: default_billing_guard(),
         }
     }
@@ -791,6 +813,17 @@ pub struct Route {
     /// looks.
     #[serde(default)]
     pub max_duration: Option<String>,
+    /// Per-route override of `defaults.archive_chats` (gh#139) — how long this
+    /// route's finished chats stay on their space's shelf, e.g. `"30d"`, or
+    /// `"off"` to keep them there.
+    ///
+    /// Per route because a shelf belongs to a space, and routes are how work is
+    /// pointed at spaces: the route that runs a hundred throwaway fixes a week
+    /// into a scratch space is not the route into the repo whose finished chats
+    /// somebody actually re-reads, and a single window has to be set by
+    /// whichever of them you would most regret losing.
+    #[serde(default)]
+    pub archive_chats: Option<String>,
     /// Per-route override of `defaults.billing_guard` (gh#101).
     ///
     /// Per route because the answer is a property of the work, not of the box:
@@ -945,6 +978,17 @@ impl RoutingConfig {
                     r.display_name()
                 ));
             }
+            // A typo here reads as "keep every chat forever" (gh#139), which
+            // is the shelf silting up again behind a key somebody did set.
+            if let Some(a) = &r.archive_chats
+                && let Err(e) = parse_retention(a)
+            {
+                out.push(format!(
+                    "route {} ({}) has archive_chats {e}",
+                    i + 1,
+                    r.display_name()
+                ));
+            }
             // And here a typo reads as `warn` — the default — which is the one
             // spelling that would silently un-arm a route somebody deliberately
             // set to `require-own` (gh#101).
@@ -969,6 +1013,9 @@ impl RoutingConfig {
         // exactly as they did before gh#72.
         if let Err(e) = parse_retention(&self.defaults.retain_worktrees) {
             out.push(format!("[defaults] retain_worktrees {e}"));
+        }
+        if let Err(e) = parse_retention(&self.defaults.archive_chats) {
+            out.push(format!("[defaults] archive_chats {e}"));
         }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
@@ -1123,6 +1170,25 @@ impl RoutingConfig {
     pub fn retain_worktrees_secs(&self) -> Option<u64> {
         parse_retention(&self.defaults.retain_worktrees)
             .unwrap_or_else(|_| parse_retention(&default_retain_worktrees()).ok().flatten())
+    }
+
+    /// How long a finished attempt's chat stays on its space's shelf, in
+    /// seconds — the route's own `archive_chats`, else
+    /// `defaults.archive_chats`. `None` is "forever": archiving off (gh#139).
+    ///
+    /// Per route, unlike [`Self::retain_worktrees_secs`], because a chat lives
+    /// on a *space's* shelf and a route is what points work at a space — see
+    /// [`Route::archive_chats`]. `route` is an `Option` for the same reason
+    /// [`Self::max_duration_secs`]'s is: the sweep runs long after dispatch,
+    /// over attempts whose route may since have been renamed or deleted, and no
+    /// route means the board-wide window rather than "never". An unparseable
+    /// value falls back to the default window, never to "forever".
+    pub fn archive_chats_secs(&self, route: Option<&Route>) -> Option<u64> {
+        let raw = route
+            .and_then(|r| r.archive_chats.as_deref())
+            .unwrap_or(&self.defaults.archive_chats);
+        parse_retention(raw)
+            .unwrap_or_else(|_| parse_retention(&default_archive_chats()).ok().flatten())
     }
 }
 
@@ -1768,6 +1834,87 @@ runtime = "claude"
                 .unwrap_err()
                 .to_string()
                 .contains("[defaults] max_duration")
+        );
+    }
+
+    // ---- the chat shelf (gh#139) -----------------------------------------
+
+    #[test]
+    fn finished_chats_are_archived_after_a_week_unless_told_otherwise() {
+        // The same week the checkout gets: the two are one attempt's leavings,
+        // and a default that kept chats forever is the landfill gh#139 is about.
+        let c = RoutingConfig::default();
+        assert_eq!(c.archive_chats_secs(None), Some(7 * 86_400));
+        assert_eq!(c.archive_chats_secs(None), c.retain_worktrees_secs());
+    }
+
+    #[test]
+    fn a_route_sets_its_own_shelf_window_over_the_default() {
+        let c = github(
+            r#"
+[defaults]
+archive_chats = "3d"
+
+[[route]]
+match = { label = "keep" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+archive_chats = "30d"
+
+[[route]]
+match = { label = "scratch" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+archive_chats = "off"
+
+[[route]]
+match = { label = "plain" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+"#,
+        );
+        assert_eq!(c.archive_chats_secs(Some(&c.routes[0])), Some(30 * 86_400));
+        assert_eq!(
+            c.archive_chats_secs(Some(&c.routes[1])),
+            None,
+            "a route may opt out of archiving entirely"
+        );
+        assert_eq!(c.archive_chats_secs(Some(&c.routes[2])), Some(3 * 86_400));
+        // A route renamed or deleted under a finished attempt falls back to the
+        // board-wide window, never to "never".
+        assert_eq!(c.archive_chats_secs(None), Some(3 * 86_400));
+    }
+
+    #[test]
+    fn off_is_how_chat_archiving_is_turned_off() {
+        for spelling in ["off", "OFF", "none", "never", "0"] {
+            let c = github(&format!("[defaults]\narchive_chats = \"{spelling}\"\n"));
+            assert_eq!(c.archive_chats_secs(None), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_mistyped_shelf_window_is_refused_rather_than_read_as_forever() {
+        // The typo and the deliberate `off` behave identically, and only one of
+        // them is what somebody meant — so it is a config error.
+        let c: RoutingConfig = toml::from_str(
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"w\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\narchive_chats = \"a fortnight\"\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("archive_chats"), "{err}");
+        assert!(err.contains("a fortnight"), "it names the offender: {err}");
+
+        let c: RoutingConfig = toml::from_str("[defaults]\narchive_chats = \"someday\"\n").unwrap();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("[defaults] archive_chats")
         );
     }
 

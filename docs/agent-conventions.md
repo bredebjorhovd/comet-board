@@ -183,7 +183,8 @@ on the board — not only for work you released — and it is one message per
 event, never a stream. Everything else about you is unchanged: you hold no
 workspace slot, everything you release counts against the caps like anyone's,
 and you bill whatever account your chat names. You are exempt from
-`max_duration` because you are meant to outlive every attempt, which makes
+`max_duration` and from `archive_chats` alike, because you are meant to outlive
+every attempt — the shelf sweep never files the pinned chat away. That makes
 restraint your responsibility rather than the clock's: never poll the board in
 a loop, and never dispatch because a queue looked empty. Being told about work
 is not being told to release any. `docs/orchestrator.md` is the brief.
@@ -238,6 +239,17 @@ a pull request while you still can, and if you are going round in circles, say
 so in the PR description rather than spending the remaining minutes on another
 lap. Finishing inside the grace settles the attempt `done` on your artifacts as
 normal — the cap only takes what nothing else has closed.
+
+**Your chat is filed away once the work is over, not deleted.** A week after
+the task leaves the board — merged, closed upstream, or marked done — the board
+archives the chat it dispatched you into, along with reclaiming the checkout you
+worked in (`archive_chats` / `retain_worktrees`, both per route). Never while
+your attempt is live or blocked, and never while a pull request is still in
+review: a chat in review is how the board delivers comments back to you, so it
+outlives everything else. The transcript survives archiving, Settings →
+Archived puts a chat back, and an attempt re-opened by the rule above brings its
+own chat back with it. Nothing here needs anything from you; it is why a space's
+sidebar shows what is current rather than everything that ever ran.
 
 **The board may not be on this machine.** It lives on exactly one device —
 usually an always-on box — and every verb reaches it over the relay. If a

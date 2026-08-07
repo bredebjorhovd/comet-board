@@ -249,6 +249,10 @@ impl SyncEngine {
         // retention clock this cycle; on the interval only, like every other
         // clocked decision (gh#72).
         self.collect_worktrees(runtime);
+        // Beside it, on the same clock and the same rule: the two are one
+        // attempt's leavings, and a box that reclaimed the checkout while
+        // keeping the chat forever would have tidied half the mess (gh#139).
+        self.archive_chats(runtime);
         self.drain_writebacks();
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
         Ok(pulls)
@@ -926,7 +930,7 @@ impl SyncEngine {
         self.enforce_duration_cap(runtime)?;
         // Last, because it may re-open an attempt: doing it first would hand
         // the live pass above a row it has already decided about.
-        self.rewatch_settled_attempts(statuses)?;
+        self.rewatch_settled_attempts(statuses, runtime)?;
         Ok(())
     }
 
@@ -1256,6 +1260,146 @@ impl SyncEngine {
             task.identifier,
             worktree,
             attempt.branch.as_deref().unwrap_or("(none recorded)"),
+        ));
+        Ok(())
+    }
+
+    // ---- clearing the shelf (gh#139) -------------------------------------
+
+    /// Archive the chat of every attempt nobody is coming back to, once it has
+    /// sat unclaimed for its route's `archive_chats`.
+    ///
+    /// Every dispatch creates a chat, and nothing but a hand ever archived one:
+    /// at agent throughput a space's shelf is a landfill within days, and the
+    /// six chats a person is actually working in are somewhere in it. The
+    /// decisions are [`gc::chat_standing`] and [`gc::decide`] — the *same*
+    /// decisions the worktree sweep makes, because a chat and a checkout are
+    /// the same attempt's leavings and the honest rule is one rule.
+    ///
+    /// What the sweep will not touch, in the order it matters:
+    ///
+    /// - **A live or blocked attempt.** Both are open attempts, so
+    ///   [`gc::standing`] reads them `Live`. An agent that stopped to ask at
+    ///   02:00 is the single worst chat to archive.
+    /// - **A task in review.** Review delivery ([`crate::review`]) asks
+    ///   `chat_alive` before queueing comments into the author's chat, and an
+    ///   archived chat answers no — archiving here would break the delivery
+    ///   loop from under itself, silently, for exactly the tasks a human is
+    ///   still working on.
+    /// - **The pinned orchestrator**, whatever attempt it was dispatched as: it
+    ///   is told about every settle on the board, so it is never finished.
+    /// - **A chat with no board attempt.** The sweep walks attempts, so a chat
+    ///   somebody made by hand is never even a candidate. Those are theirs.
+    ///
+    /// Archiving is not deleting. The transcript is untouched, Settings →
+    /// Archived puts it back, and a wrongly-settled attempt that goes back to
+    /// work un-archives its own chat ([`SyncEngine::rewatch_settled_attempts`]).
+    /// That is why this needs no grace beyond the window and no confirmation:
+    /// the worst case is a shelf entry somebody restores in one click.
+    ///
+    /// Failure is never fatal to the cycle: an error is logged and the attempt
+    /// is left unstamped, so the next sweep tries again.
+    fn archive_chats(&self, runtime: Option<&dyn Runtime>) {
+        // A board that archives nothing anywhere pays for nothing: `off` on
+        // `[defaults]` with no route asking otherwise ends the sweep here,
+        // before a task is read.
+        if !self.archives_anything() {
+            return;
+        }
+        let now = chrono::Utc::now();
+        let orchestrator = self.cfg.defaults.orchestrator();
+        let tasks = match self.db.load_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .error(format!("chat archiving: reading the board: {e}"));
+                return;
+            }
+        };
+        for task in &tasks {
+            // Per route, resolved now rather than stamped at dispatch: the
+            // window is a property of the shelf the chat sits on, and an
+            // attempt outlives the config that released it. A route since
+            // renamed or deleted reads as the board-wide window, never as
+            // "never" — see [`RoutingConfig::archive_chats_secs`].
+            let route = self.cfg.resolve(&route_context(task));
+            let Some(window) = self.cfg.archive_chats_secs(route) else {
+                continue;
+            };
+            for attempt in &task.attempts {
+                if attempt.chat_archived_at.is_some() || attempt.pane_id.is_none() {
+                    continue;
+                }
+                let spent = attempt
+                    .chat_archivable_at
+                    .as_deref()
+                    .map(|t| secs_since(t, now).unwrap_or(0));
+                let standing = gc::chat_standing(task, attempt, orchestrator);
+                if let Err(e) = match gc::decide(standing, spent, window) {
+                    gc::Verdict::Keep => Ok(()),
+                    gc::Verdict::Mark => self.mark_chat_archivable(task, attempt, window),
+                    gc::Verdict::Unmark => self.db.set_attempt_chat_archivable(attempt.id, false),
+                    gc::Verdict::Collect => self.archive_one_chat(runtime, task, attempt),
+                } {
+                    self.log.warn(format!(
+                        "{}: chat archiving on attempt {}: {e:#}",
+                        task.identifier, attempt.id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Does any route on this board archive its chats at all?
+    ///
+    /// The whole-sweep opt-out. `archive_chats` is per route, so `[defaults]
+    /// archive_chats = "off"` alone does not settle it — a route may still
+    /// name a window of its own, and one that does must still be swept.
+    fn archives_anything(&self) -> bool {
+        self.cfg.archive_chats_secs(None).is_some()
+            || self
+                .cfg
+                .routes
+                .iter()
+                .any(|r| self.cfg.archive_chats_secs(Some(r)).is_some())
+    }
+
+    /// Start the shelf clock, and say so — the one notice anybody gets before a
+    /// chat leaves the sidebar a week later.
+    fn mark_chat_archivable(&self, task: &Task, attempt: &Attempt, window: u64) -> Result<()> {
+        self.db.set_attempt_chat_archivable(attempt.id, true)?;
+        self.log.info(format!(
+            "{}: nothing is owed on chat {} any more — it archives in {}",
+            task.identifier,
+            attempt.pane_id.as_deref().unwrap_or("(none)"),
+            gc::human_window(window),
+        ));
+        Ok(())
+    }
+
+    /// The window ran out: archive the chat through the runtime, and record it.
+    ///
+    /// A cycle run without a runtime marks and unmarks but archives nothing —
+    /// the same split [`SyncEngine::collect_one`] makes, and for the same
+    /// reason: only the process that hosts the workspace doc may mutate it, and
+    /// everything else is welcome to keep the clock.
+    fn archive_one_chat(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+    ) -> Result<()> {
+        let Some(chat_id) = attempt.pane_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+        runtime.set_chat_archived(chat_id, true)?;
+        self.db.set_attempt_chat_archived(attempt.id)?;
+        self.log.info(format!(
+            "{}: archived chat {chat_id} — its transcript is in Settings → Archived",
+            task.identifier,
         ));
         Ok(())
     }
@@ -1813,7 +1957,11 @@ impl SyncEngine {
     /// equivalent either: chat ids are never reused, and the chat *is* the
     /// attempt's, so whoever prompts it (review feedback, an operator's
     /// follow-up) is continuing this attempt.
-    fn rewatch_settled_attempts(&self, statuses: &SessionStatuses) -> Result<bool> {
+    fn rewatch_settled_attempts(
+        &self,
+        statuses: &SessionStatuses,
+        runtime: Option<&dyn Runtime>,
+    ) -> Result<bool> {
         let mut changed = false;
         for attempt in self.db.settled_attempts()? {
             let Some(chat_id) = attempt.pane_id.as_deref() else {
@@ -1849,6 +1997,12 @@ impl SyncEngine {
             self.db
                 .set_attempt_status(attempt.id, AgentStatus::Working)?;
             self.db.set_saw_working(attempt.id)?;
+            // And back onto the shelf, in the same motion (gh#139): the work
+            // is live again, so the chat it is happening in belongs in the
+            // sidebar rather than in Settings → Archived. Its clock is cleared
+            // with it, so the next time this attempt finishes it is owed a
+            // whole window.
+            self.unarchive_chat(runtime, &task, &attempt)?;
             self.log.warn(format!(
                 "{} was closed as {} but chat {chat_id} is working again — \
                  attempt re-opened ({} time(s) now)",
@@ -1859,6 +2013,39 @@ impl SyncEngine {
             changed = true;
         }
         Ok(changed)
+    }
+
+    /// Put a re-opened attempt's chat back on its space's shelf (gh#139).
+    ///
+    /// Only for a chat the *board* archived — `chat_archived_at` is the record
+    /// of that. A chat an operator archived by hand is theirs, and un-archiving
+    /// it here would be the board arguing with them about their own sidebar.
+    ///
+    /// The stamps are cleared whether or not the un-archive lands: the board's
+    /// claim on this chat is over either way, and a stamp left behind would
+    /// keep an attempt out of the sweep forever. A failure is a warning, not an
+    /// error — the reopen itself has already happened and is worth more than
+    /// where the chat sits.
+    fn unarchive_chat(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+    ) -> Result<()> {
+        if attempt.chat_archived_at.is_none() && attempt.chat_archivable_at.is_none() {
+            return Ok(());
+        }
+        if attempt.chat_archived_at.is_some()
+            && let (Some(runtime), Some(chat_id)) = (runtime, attempt.pane_id.as_deref())
+            && let Err(e) = runtime.set_chat_archived(chat_id, false)
+        {
+            self.log.warn(format!(
+                "{}: chat {chat_id} is working again but could not be un-archived: {e:#} \
+                 — Settings → Archived still has it",
+                task.identifier
+            ));
+        }
+        self.db.clear_attempt_chat_archived(attempt.id)
     }
 
     /// Refresh the board from the session watch, the moment things happen.
@@ -1933,7 +2120,7 @@ impl SyncEngine {
                 }
             }
         }
-        if self.rewatch_settled_attempts(statuses)? {
+        if self.rewatch_settled_attempts(statuses, runtime)? {
             changed = true;
         }
         if changed {
@@ -5947,6 +6134,335 @@ max_duration = "{max_duration}"
         e.collect_worktrees(None);
         assert!(attempt_row(&e, a).collectable_at.is_some());
         assert!(attempt_row(&e, a).collected_at.is_none());
+    }
+
+    // ---- clearing the shelf (gh#139) -------------------------------------
+
+    /// A runtime that records what the shelf sweep asked it to archive, and
+    /// can be told to refuse — the one thing this sweep does to the world
+    /// outside the database.
+    #[derive(Default)]
+    struct Shelf {
+        archived: std::cell::RefCell<Vec<(String, bool)>>,
+        refuse: bool,
+    }
+
+    impl Runtime for Shelf {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("the shelf sweep never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("archiving is not cancelling — nothing is interrupted")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+        fn set_chat_archived(&self, chat_id: &str, archived: bool) -> anyhow::Result<()> {
+            self.archived
+                .borrow_mut()
+                .push((chat_id.to_string(), archived));
+            if self.refuse {
+                anyhow::bail!("the workspace doc said no");
+            }
+            Ok(())
+        }
+    }
+
+    /// A closed attempt with a chat, on a task whose issue is closed upstream.
+    fn spent_chat(e: &SyncEngine) -> i64 {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        let a = dispatch(e, "linear:LIN-142", "chat-9");
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        a
+    }
+
+    /// Move the shelf clock back, as wall time would have.
+    fn age_shelf_mark(e: &SyncEngine, attempt_id: i64, secs: i64) {
+        let stamp = crate::db::rfc3339(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET chat_archivable_at = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, stamp],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_finished_attempts_chat_is_marked_then_archived_a_week_later() {
+        let e = engine(None);
+        let a = spent_chat(&e);
+        let shelf = Shelf::default();
+
+        // The sweep that finds it finished only starts the clock.
+        e.archive_chats(Some(&shelf));
+        let row = attempt_row(&e, a);
+        assert!(row.chat_archivable_at.is_some(), "the clock has to start");
+        assert!(row.chat_archived_at.is_none());
+        assert!(
+            shelf.archived.borrow().is_empty(),
+            "nothing goes on day one"
+        );
+
+        // Six days in, still on the shelf.
+        age_shelf_mark(&e, a, 6 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(shelf.archived.borrow().is_empty(), "the window is a week");
+
+        age_shelf_mark(&e, a, 7 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert_eq!(
+            shelf.archived.borrow().as_slice(),
+            [("chat-9".to_string(), true)]
+        );
+        assert!(attempt_row(&e, a).chat_archived_at.is_some());
+
+        // And it is not offered again — the row says where it went.
+        e.archive_chats(Some(&shelf));
+        assert_eq!(shelf.archived.borrow().len(), 1);
+    }
+
+    /// The exit criterion's sharpest edge: review delivery calls `chat_alive`
+    /// on this chat, and an archived one answers no. Archiving here would break
+    /// the delivery loop from under itself.
+    #[test]
+    fn a_chat_in_review_is_never_archived_out_from_under_its_delivery_loop() {
+        let e = engine(None);
+        let a = spent_chat(&e);
+        let shelf = Shelf::default();
+        e.archive_chats(Some(&shelf));
+        assert!(attempt_row(&e, a).chat_archivable_at.is_some());
+
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET pr_open = 1 WHERE id = 'linear:LIN-142'",
+                [],
+            )
+            .unwrap();
+        age_shelf_mark(&e, a, 30 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(shelf.archived.borrow().is_empty(), "review holds the chat");
+        assert!(
+            attempt_row(&e, a).chat_archivable_at.is_none(),
+            "and the window starts over when the pull request lands"
+        );
+    }
+
+    /// An agent that stopped to ask at 02:00 is the single worst chat to file
+    /// away: its attempt is still open, so the sweep never considers it.
+    #[test]
+    fn a_live_or_blocked_attempt_keeps_its_chat_however_finished_the_task_looks() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_status(a, AgentStatus::Blocked).unwrap();
+        let shelf = Shelf::default();
+        // However long the board has been up, an open attempt's chat is not a
+        // candidate at all: its clock never starts, so it can never run out.
+        for _ in 0..3 {
+            e.archive_chats(Some(&shelf));
+        }
+        assert!(shelf.archived.borrow().is_empty());
+        assert!(attempt_row(&e, a).chat_archivable_at.is_none());
+    }
+
+    /// The orchestrator hears about every settle on the board, so it is never
+    /// finished — even though it was dispatched as an attempt like any other.
+    #[test]
+    fn the_pinned_orchestrator_is_never_archived() {
+        let mut e = engine(None);
+        e.cfg.defaults.orchestrator_chat = Some("chat-9".into());
+        let a = spent_chat(&e);
+        let shelf = Shelf::default();
+        e.archive_chats(Some(&shelf));
+        assert!(
+            attempt_row(&e, a).chat_archivable_at.is_none(),
+            "the clock never starts on the board's own agent"
+        );
+        age_shelf_mark(&e, a, 365 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(shelf.archived.borrow().is_empty());
+        assert!(
+            attempt_row(&e, a).chat_archivable_at.is_none(),
+            "and a mark from before it was pinned is cleared"
+        );
+    }
+
+    #[test]
+    fn archiving_off_keeps_every_chat_on_the_shelf() {
+        let mut e = engine(None);
+        e.cfg.defaults.archive_chats = "off".into();
+        let a = spent_chat(&e);
+        let shelf = Shelf::default();
+        e.archive_chats(Some(&shelf));
+        assert!(
+            attempt_row(&e, a).chat_archivable_at.is_none(),
+            "the clock never starts"
+        );
+        // Not even one left over from before the operator turned it off.
+        age_shelf_mark(&e, a, 365 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(shelf.archived.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_route_can_keep_its_own_chats_longer_than_the_board_does() {
+        // The window is read per route at sweep time, not stamped at dispatch.
+        let mut e = engine(None);
+        e.cfg.defaults.archive_chats = "1d".into();
+        e.cfg.routes = vec![
+            toml::from_str(
+                r#"
+                match = { linear_team = "LIN" }
+                workspace = "offhand"
+                repo = "/tmp"
+                runtime = "claude-code"
+                archive_chats = "30d"
+                "#,
+            )
+            .unwrap(),
+        ];
+        let a = spent_chat(&e);
+        let shelf = Shelf::default();
+        e.archive_chats(Some(&shelf));
+        age_shelf_mark(&e, a, 7 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(
+            shelf.archived.borrow().is_empty(),
+            "a week is nothing to a route that asked for thirty days"
+        );
+        age_shelf_mark(&e, a, 30 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert_eq!(shelf.archived.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_cycle_without_a_runtime_marks_but_never_archives() {
+        // Only the process hosting the workspace doc may mutate it; anything
+        // else running the cycle is welcome to keep the clock.
+        let e = engine(None);
+        let a = spent_chat(&e);
+        e.archive_chats(None);
+        age_shelf_mark(&e, a, 30 * 86_400);
+        e.archive_chats(None);
+        assert!(attempt_row(&e, a).chat_archivable_at.is_some());
+        assert!(attempt_row(&e, a).chat_archived_at.is_none());
+    }
+
+    #[test]
+    fn an_archive_that_fails_is_tried_again_next_cycle() {
+        let e = engine(None);
+        let a = spent_chat(&e);
+        let shelf = Shelf {
+            refuse: true,
+            ..Default::default()
+        };
+        e.archive_chats(Some(&shelf));
+        age_shelf_mark(&e, a, 30 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(
+            attempt_row(&e, a).chat_archived_at.is_none(),
+            "the stamp is what says the chat is off the shelf"
+        );
+        e.archive_chats(Some(&shelf));
+        assert_eq!(
+            shelf.archived.borrow().len(),
+            2,
+            "and again the cycle after"
+        );
+    }
+
+    /// The one way an archived chat comes back by itself: the settle was wrong
+    /// and the agent is working in it again (§H4's inverse). Nobody should have
+    /// to go to Settings → Archived to find the chat the board just re-opened.
+    #[test]
+    fn a_reopened_attempt_gets_its_chat_back_off_the_shelf() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_saw_working(a).unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        // Archived while the task looked done, then the operator re-opened the
+        // issue and the agent picked the work back up.
+        e.db.set_attempt_chat_archivable(a, true).unwrap();
+        e.db.set_attempt_chat_archived(a).unwrap();
+
+        let shelf = Shelf::default();
+        let working = statuses(&[("chat-9", AgentStatus::Working)]);
+        assert!(
+            e.rewatch_settled_attempts(&working, Some(&shelf)).unwrap(),
+            "a working chat re-opens its settled attempt"
+        );
+        assert_eq!(
+            shelf.archived.borrow().as_slice(),
+            [("chat-9".to_string(), false)],
+            "and the chat goes back on the shelf in the same motion"
+        );
+        let row = attempt_row(&e, a);
+        assert!(row.chat_archived_at.is_none());
+        assert!(
+            row.chat_archivable_at.is_none(),
+            "the next time it finishes it is owed a whole window"
+        );
+    }
+
+    /// A chat the *operator* archived is theirs. The board only ever un-archives
+    /// what its own record says it archived.
+    #[test]
+    fn a_reopen_does_not_argue_with_a_chat_somebody_archived_by_hand() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_saw_working(a).unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+
+        let shelf = Shelf::default();
+        assert!(
+            e.rewatch_settled_attempts(
+                &statuses(&[("chat-9", AgentStatus::Working)]),
+                Some(&shelf)
+            )
+            .unwrap()
+        );
+        assert!(shelf.archived.borrow().is_empty());
+    }
+
+    /// gh#139's exit criterion, end to end on one task: a week after it merged,
+    /// its chat is archived and its checkout is collected — and both happened
+    /// on the same sweep, from the same rule.
+    #[test]
+    fn a_task_finished_a_week_ago_leaves_neither_a_chat_nor_a_checkout() {
+        let e = engine(None);
+        let a = spent_attempt(&e);
+        let gc = Collector::default();
+        let shelf = Shelf::default();
+
+        e.collect_worktrees(Some(&gc));
+        e.archive_chats(Some(&shelf));
+        age_mark(&e, a, 7 * 86_400);
+        age_shelf_mark(&e, a, 7 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        e.archive_chats(Some(&shelf));
+
+        let row = attempt_row(&e, a);
+        assert!(row.collected_at.is_some(), "the checkout is reclaimed");
+        assert!(row.chat_archived_at.is_some(), "and the chat is filed away");
+        assert_eq!(gc.reclaimed.borrow().len(), 1);
+        assert_eq!(
+            shelf.archived.borrow().as_slice(),
+            [("chat-9".to_string(), true)]
+        );
     }
 
     // ---- the full cycle --------------------------------------------------

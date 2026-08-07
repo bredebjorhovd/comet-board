@@ -19,7 +19,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
      blocked_count,
      overrun_warned_at, repo_path, collectable_at, collected_at,
-     dispatched_by_device, dispatched_by_user, billed_to";
+     dispatched_by_device, dispatched_by_user, billed_to, \
+     chat_archivable_at, chat_archived_at";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -59,6 +60,8 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         dispatched_by_device: r.get(28)?,
         dispatched_by_user: r.get(29)?,
         billed_to: r.get(30)?,
+        chat_archivable_at: r.get(31)?,
+        chat_archived_at: r.get(32)?,
     })
 }
 
@@ -199,7 +202,13 @@ impl Db {
               -- dispatch named no slot. Resolved once at dispatch — the slot id
               -- above means nothing to a reader who has not saved that login,
               -- and the box's own login can be switched under a live run.
-              billed_to TEXT
+              billed_to TEXT,
+              -- When this attempt's chat first became nobody's, and when the
+              -- board archived it off its space's shelf (gh#139). The same two
+              -- columns `collectable_at`/`collected_at` are for the checkout,
+              -- kept apart because the windows are configured apart.
+              chat_archivable_at TEXT,
+              chat_archived_at TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -329,6 +338,13 @@ impl Db {
                 // now would answer with today's logins about a run that spent
                 // whatever was live months ago.
                 ("billed_to", "TEXT"),
+                // Chat archiving (gh#139). Existing rows keep NULL on both,
+                // which reads as "never marked, never archived" — so the chats
+                // already silted up on the shelves are archived on the same
+                // terms as new ones, from the first sweep that finds their task
+                // finished. That is the backlog this feature is about.
+                ("chat_archivable_at", "TEXT"),
+                ("chat_archived_at", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -693,6 +709,71 @@ impl Db {
             params![attempt_id, now()],
         )?;
         Ok(())
+    }
+
+    /// Start or stop the shelf clock on an attempt's chat (gh#139).
+    ///
+    /// Stamps *now* only if nothing is stamped, for the same reason
+    /// [`Self::set_attempt_collectable`] does: the window is measured from when
+    /// the chat first became nobody's, and re-stamping every sweep would push
+    /// the archive a cycle further out forever.
+    pub fn set_attempt_chat_archivable(&self, attempt_id: i64, archivable: bool) -> Result<()> {
+        if archivable {
+            self.conn.execute(
+                "UPDATE attempts SET chat_archivable_at = ?2
+                  WHERE id = ?1 AND chat_archivable_at IS NULL",
+                params![attempt_id, now()],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE attempts SET chat_archivable_at = NULL WHERE id = ?1",
+                params![attempt_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record that this attempt's chat is off the shelf (gh#139). `pane_id` is
+    /// kept: an archived chat still exists, and a row that forgot its id could
+    /// neither name it nor put it back.
+    pub fn set_attempt_chat_archived(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET chat_archived_at = ?2 WHERE id = ?1",
+            params![attempt_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget that the board archived this attempt's chat (gh#139) — the
+    /// re-open path, which puts the chat back on the shelf in the same motion.
+    /// Both stamps go: the attempt is live again, so it is owed a whole window
+    /// when it next finishes.
+    pub fn clear_attempt_chat_archived(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET chat_archived_at = NULL, chat_archivable_at = NULL
+              WHERE id = ?1",
+            params![attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Closed attempts whose chat is still on a shelf — `doctor`'s census of
+    /// what the board is holding there (gh#139).
+    ///
+    /// The mirror of [`Self::collectable_attempts`], on the chat instead of the
+    /// checkout, and read for the same reason: the sweep itself walks tasks
+    /// (it needs each task's route to know the window), so this exists to
+    /// answer "how many, and how many are on the clock" in one query.
+    pub fn archivable_chat_attempts(&self) -> Result<Vec<Attempt>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts
+              WHERE outcome IS NOT NULL
+                AND pane_id IS NOT NULL
+                AND chat_archived_at IS NULL
+              ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], read_attempt)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Closed attempts still holding a checkout the board could reclaim — the

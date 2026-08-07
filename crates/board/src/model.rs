@@ -429,6 +429,19 @@ pub struct Attempt {
     /// spend. `None` on attempts from before this existed, and on a box that
     /// could not name the login at all.
     pub billed_to: Option<String>,
+    /// When this attempt's *chat* first became nobody's (gh#139) — the same
+    /// moment [`collectable_at`](Self::collectable_at) records for its
+    /// checkout, kept separately because the two windows are configured
+    /// separately and a box may want one without the other.
+    ///
+    /// Cleared if the task comes back to life, so the next window starts whole.
+    pub chat_archivable_at: Option<String>,
+    /// When the board archived this attempt's chat off its space's shelf
+    /// (gh#139). Non-`None` means the chat is *archived*, not gone: the
+    /// transcript is intact and Settings → Archived puts it back. Cleared when
+    /// a wrongly-settled attempt is re-opened, which un-archives the chat in
+    /// the same motion.
+    pub chat_archived_at: Option<String>,
 }
 
 impl Attempt {
