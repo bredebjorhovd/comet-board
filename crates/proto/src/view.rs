@@ -19,6 +19,7 @@ use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
 pub mod board;
 pub mod needs;
 pub mod repos;
+pub mod spaces;
 
 // ---------------------------------------------------------------------------
 // Connection + status

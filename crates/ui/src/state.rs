@@ -355,6 +355,11 @@ pub struct AppState {
     pub devices: Vec<Device>,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
+    /// `space id → owner/repo` links from the latest host sweep (gh#124). Only
+    /// the device holding a checkout can ask git, so these arrive out-of-band
+    /// (`ListRepoSpaces`, the gh#118 contract) rather than on the synced
+    /// [`Space`] row; the shell re-sweeps when the space/device set changes.
+    pub space_slugs: HashMap<String, String>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
@@ -400,6 +405,7 @@ impl AppState {
             auth: None,
             devices: Vec::new(),
             spaces: Vec::new(),
+            space_slugs: HashMap::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
             selected_space: None,
@@ -465,6 +471,21 @@ impl AppState {
 
     pub fn apply_devices(&mut self, devices: Vec<Device>) {
         self.devices = devices;
+    }
+
+    /// Fold in a completed host sweep's `space → slug` links (gh#124). The
+    /// sweep is global — every host's answer concatenated — so the map is
+    /// replaced wholesale; a space no host names anymore loses its slug.
+    pub fn apply_space_slugs(&mut self, links: Vec<comet_proto::view::repos::SpaceSlug>) {
+        self.space_slugs = links
+            .into_iter()
+            .map(|link| (link.space_id, link.slug))
+            .collect();
+    }
+
+    /// The `owner/repo` slug a host reported for this space, if any.
+    pub fn space_slug(&self, space_id: &str) -> Option<&str> {
+        self.space_slugs.get(space_id).map(String::as_str)
     }
 
     pub fn apply_update(&mut self, status: comet_update::UpdateStatus) {
@@ -588,26 +609,9 @@ impl AppState {
         display_status(chat, self.session_for(&chat.id), now)
     }
 
-    /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
-    /// on any device — idle included — in pure recency order (status drives
-    /// the dot, never the position; see [`sort_active`]).
-    pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
-        let mut rows: Vec<(ChatIndicator, &Chat)> = self
-            .visible_chats()
-            .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
-            })
-            .map(|c| (display_status(c, self.session_for(&c.id), now), c))
-            .collect();
-        sort_active(&mut rows);
-        // The orchestrator is NOT floated here any more (gh#122): its pinned
-        // place is the fixed slot above Spaces, and this list treats its chat
-        // like any other — at the recency it earned, still wearing the ◆ mark
-        // so the two are recognisably one thing.
-        rows
-    }
+    // (The global "Sessions" overview list is retired — gh#124: sessions live
+    // under their space's disclosed row, and [`Self::chats_in_space`] is the
+    // per-space enumeration both the sidebar and the tab strip read.)
 
     /// The orchestrator's fixed slot (gh#122), or `None` when no orchestrator
     /// is pinned or its chat has not synced here.
@@ -1479,15 +1483,6 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        // The overview shows every live-space chat (idle included) — chats of
-        // unknown spaces stay hidden. Completed ("old") outranks idle ("new").
-        let now = Utc::now();
-        let overview: Vec<&str> = state
-            .overview_chats(now)
-            .iter()
-            .map(|(_, c)| c.id.as_str())
-            .collect();
-        assert_eq!(overview, ["old", "new"]);
     }
 
     /// gh#122: the pin's place is the fixed slot above Spaces, not a float in
@@ -1507,16 +1502,17 @@ mod tests {
         let now = Utc::now();
         let ids = |state: &AppState| -> Vec<String> {
             state
-                .overview_chats(now)
+                .chats_in_space("s1")
                 .iter()
-                .map(|(_, c)| c.id.clone())
+                .map(|c| c.id.clone())
                 .collect()
         };
         assert_eq!(ids(&state), ["boss", "recent"]);
         assert!(state.orchestrator_slot(now).is_none());
 
         state.orchestrator = Some("boss".into());
-        // The list is untouched — the slot is where the pin shows.
+        // The per-space enumeration is untouched — the slot is where the pin
+        // shows (and the disclosed row just wears the ◆ mark).
         assert_eq!(ids(&state), ["boss", "recent"]);
         assert!(state.is_orchestrator("boss"));
         let slot = state.orchestrator_slot(now).expect("pinned and synced");

@@ -1,9 +1,23 @@
-//! Spaces sidebar: the spaces list (folder + device rows), the global
-//! Sessions list, and the add-space palette (⌘K).
+//! Spaces sidebar: repo-named space rows that disclose their sessions inline
+//! (gh#124), and the add-space palette (⌘K).
 //!
 //! A space = a synced (device, folder) pair; the sidebar's job is switching
 //! between them and surfacing which sessions want attention. Child module of
 //! `shell` so it renders straight off `Shell`'s private state.
+//!
+//! ## One session surface (gh#124)
+//!
+//! The sidebar is the authoritative enumeration of sessions: each space row
+//! contains its sessions, disclosed inline under the row (click activates and
+//! disclosing follows; the chevron toggles without activating). The old global
+//! "Sessions" flat list is retired — it was a second session switcher
+//! competing with the tab strip, and neither was authoritative. The tab strip
+//! stays as in-space navigation with the titlebar duties.
+//!
+//! A space row is named repo-first: `owner/repo` where a host has supplied the
+//! gh#118 link ([`Shell::refresh_space_slugs`]), the folder basename otherwise.
+//! The device's name appears ONCE, as a group header above the spaces it
+//! hosts — not repeated on every row ([`spaces_view::device_groups`]).
 //!
 //! ## The palette has two doors (gh#118)
 //!
@@ -27,6 +41,7 @@ use chrono::DateTime;
 use comet_proto::view::board;
 use comet_proto::view::needs::{self as needs_view};
 use comet_proto::view::repos::{self, RepoOffer, RepoRow, SpaceSlug};
+use comet_proto::view::spaces as spaces_view;
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
 
@@ -53,22 +68,31 @@ const SPACE_ROW_SLOT: f32 = 31.0;
 
 /// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
 /// animation restarts (the session-tab idiom, vertical).
+///
+/// Device-scoped (gh#124): a space cannot change its device by being dragged,
+/// so a drag lives entirely inside one device group and the indices are
+/// group-local. While any drag is live the nested session rows collapse, so
+/// the drop-index math stays uniform ([`SPACE_ROW_SLOT`]).
 pub(super) struct SpaceDragState {
+    device: String,
     from: usize,
     over: usize,
     epoch: usize,
     prev_over: usize,
 }
 
-/// The dragged-row payload (gpui drag-and-drop).
+/// The dragged-row payload (gpui drag-and-drop), device-group-scoped.
 struct SpaceDragPayload {
+    device: String,
     from: usize,
     name: SharedString,
+    repo: bool,
 }
 
 /// The floating row rendered at the cursor while dragging.
 struct SpaceGhost {
     name: SharedString,
+    repo: bool,
 }
 
 impl Render for SpaceGhost {
@@ -90,10 +114,14 @@ impl Render for SpaceGhost {
             .text_color(theme.text)
             .opacity(0.85)
             .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
+                icon(if self.repo {
+                    icons::GITHUB_MARK
+                } else {
+                    icons::FOLDER
+                })
+                .size(px(16.0))
+                .flex_none()
+                .text_color(theme.text_muted),
             )
             .child(div().truncate().child(self.name.clone()))
     }
@@ -266,31 +294,108 @@ impl Shell {
                 })
         };
         self.state.update(cx, |s, cx| s.select_chat(target, cx));
+        // Activation discloses: what actually changed (this space's sessions
+        // now fill the tab strip) is what the sidebar shows changing.
+        self.expand_space(&space_id, cx);
         self.settings.last_space_id = Some(space_id);
         self.schedule_save(cx);
         cx.notify();
     }
 
+    // ---- disclosure (gh#124) ----
+
+    pub(super) fn space_expanded(&self, space_id: &str) -> bool {
+        self.settings
+            .expanded_spaces
+            .iter()
+            .any(|id| id == space_id)
+    }
+
+    /// Disclose a space's sessions (idempotent). Persisted device-local.
+    pub(super) fn expand_space(&mut self, space_id: &str, cx: &mut Context<Self>) {
+        if !self.space_expanded(space_id) {
+            self.settings.expanded_spaces.push(space_id.to_string());
+            self.schedule_save(cx);
+            cx.notify();
+        }
+    }
+
+    /// The chevron's toggle — collapse if disclosed, disclose if not. Does not
+    /// activate the space; that is the row's job.
+    fn toggle_space_disclosure(&mut self, space_id: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .settings
+            .expanded_spaces
+            .iter()
+            .position(|id| id == space_id)
+        {
+            self.settings.expanded_spaces.remove(ix);
+        } else {
+            self.settings.expanded_spaces.push(space_id.to_string());
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    // ---- repo links (gh#124) ----
+
+    /// Sweep the hosts for `space → owner/repo` links and fold them into
+    /// standing state ([`AppState::apply_space_slugs`]) — the same
+    /// [`methods::LIST_REPO_SPACES`] contract the ⌘K palette uses, run
+    /// whenever the space/device membership changes so the sidebar can name
+    /// spaces by their repo without opening the palette first.
+    pub(super) fn refresh_space_slugs(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let (devices, local) = {
+            let state = self.state.read(cx);
+            (state.devices.clone(), state.local_device_id.clone())
+        };
+        let candidates = board::host_candidates(&devices, local.as_deref());
+        self.slug_task = Some(cx.spawn(async move |this, cx| {
+            let mut links: Vec<SpaceSlug> = Vec::new();
+            for candidate in candidates {
+                let mut params = serde_json::json!({});
+                if let (Some(target), Some(object)) = (candidate.as_deref(), params.as_object_mut())
+                {
+                    object.insert("targetDeviceId".into(), serde_json::json!(target));
+                }
+                let Ok(value) = engine.client().call(methods::LIST_REPO_SPACES, params).await
+                else {
+                    continue;
+                };
+                let Ok(reply) = serde_json::from_value::<RepoSpacesReply>(value) else {
+                    continue;
+                };
+                links.extend(reply.spaces);
+            }
+            this.update(cx, |shell, cx| {
+                shell
+                    .state
+                    .update(cx, |s, _| s.apply_space_slugs(links));
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     // ---- sidebar sections ----
 
-    /// The "Spaces" section: tracked header + add button, then a row per space.
+    /// The "Spaces" section: tracked header + add button, then the spaces
+    /// grouped by device — the device named ONCE per group — with each space's
+    /// sessions disclosed inline under its row (gh#124).
     pub(super) fn render_spaces_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         // A drag that ended off-list (no drop event) must not strand the
         // sibling slide offsets.
         if self.space_drag.is_some() && !cx.has_active_drag() {
             self.space_drag = None;
         }
-        let (spaces, selected, device_names, offline_devices, attention): (
-            Vec<Space>,
-            Option<String>,
-            std::collections::HashMap<String, String>,
-            std::collections::HashSet<String>,
-            std::collections::HashMap<String, ChatIndicator>,
-        ) = {
+        let (spaces, selected, device_names, offline_devices, attention, slugs, local_device) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             let spaces = state.spaces.clone();
-            let device_names = spaces
+            let device_names: std::collections::HashMap<String, String> = spaces
                 .iter()
                 .map(|s| {
                     (
@@ -304,14 +409,14 @@ impl Shell {
                 .collect();
             // Host-presence (the revived "Remote" signal): a remote space whose
             // device heartbeat lapsed shows offline — a host outage, not slow sync.
-            let offline_devices = spaces
+            let offline_devices: std::collections::HashSet<String> = spaces
                 .iter()
                 .map(|s| s.device_id.clone())
                 .filter(|id| !state.device_online(id, now))
                 .collect();
             // Spaces with a live/awaiting session get an aggregate dot (the
             // most urgent member status wins) so the attention signal survives
-            // even with the Sessions list scrolled off.
+            // a collapsed row.
             let mut attention: std::collections::HashMap<String, ChatIndicator> =
                 std::collections::HashMap::new();
             for chat in state.visible_chats() {
@@ -342,6 +447,8 @@ impl Shell {
                 device_names,
                 offline_devices,
                 attention,
+                state.space_slugs.clone(),
+                state.local_device_id.clone(),
             )
         };
         // Manual (drag) order overrides the synced creation order — device-
@@ -428,36 +535,67 @@ impl Shell {
                     .child(SharedString::from("Add a repo")),
             );
         } else {
-            let count = spaces.len();
-            let drag = self
-                .space_drag
-                .as_ref()
-                .map(|d| (d.from, d.over, d.epoch, d.prev_over));
-            let rows: Vec<AnyElement> = spaces
-                .into_iter()
-                .enumerate()
-                .map(|(ix, space)| {
-                    let id = space.id.clone();
+            // While a drag is live every space renders collapsed, so a device
+            // group's rows are uniform [`SPACE_ROW_SLOT`]s and the drop-index
+            // math holds.
+            let drag_active = self.space_drag.is_some();
+            let groups: Vec<(String, Vec<Space>)> =
+                spaces_view::device_groups(&spaces, local_device.as_deref())
+                    .into_iter()
+                    .map(|g| {
+                        (
+                            g.device_id.to_string(),
+                            g.spaces.into_iter().cloned().collect(),
+                        )
+                    })
+                    .collect();
+            for (device_id, group) in groups {
+                // The device's name appears ONCE, over the spaces it hosts —
+                // and only for a REMOTE host: it is an address, and your own
+                // machine needs none. Offline rides here too, said once.
+                if local_device.as_deref() != Some(device_id.as_str()) {
                     let device_name = device_names
-                        .get(&space.device_id)
+                        .get(&device_id)
                         .cloned()
                         .unwrap_or_else(|| "Unknown device".to_string());
-                    let host_offline = offline_devices.contains(&space.device_id);
-                    let is_selected = selected.as_deref() == Some(space.id.as_str());
-                    let attention = attention.get(&space.id).copied();
-                    let row = self.render_space_row(
-                        ix,
-                        space,
+                    let host_offline = offline_devices.contains(&device_id);
+                    column = column.child(Self::render_device_header(
                         device_name,
                         host_offline,
+                        theme,
+                    ));
+                }
+                let count = group.len();
+                let drag = self
+                    .space_drag
+                    .as_ref()
+                    .filter(|d| d.device == device_id)
+                    .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+                let mut rows: Vec<AnyElement> = Vec::new();
+                for (ix, space) in group.into_iter().enumerate() {
+                    let id = space.id.clone();
+                    let is_selected = selected.as_deref() == Some(space.id.as_str());
+                    let space_attention = attention.get(&space.id).copied();
+                    let slug = slugs.get(&space.id).map(String::as_str);
+                    let title: SharedString =
+                        spaces_view::space_title(&space, slug).to_string().into();
+                    let repo = slug.is_some();
+                    let expanded = self.space_expanded(&space.id) && !drag_active;
+                    let row = self.render_space_row(
+                        ix,
+                        device_id.clone(),
+                        space,
+                        title,
+                        repo,
+                        expanded,
                         is_selected,
-                        attention,
+                        space_attention,
                         theme,
                         cx,
                     );
                     // Sliding transform while a sibling is dragged over —
                     // the session-tab idiom, vertical.
-                    match drag {
+                    rows.push(match drag {
                         Some((from, over, epoch, prev_over)) if ix != from => {
                             let target = slide_offset(ix, from, over) * SPACE_ROW_SLOT;
                             let start = slide_offset(ix, from, prev_over) * SPACE_ROW_SLOT;
@@ -477,44 +615,104 @@ impl Shell {
                             .flex_none()
                             .into_any_element(),
                         _ => row.into_any_element(),
+                    });
+                    // The disclosure: the space's sessions, inline under its
+                    // row — the one authoritative session surface (gh#124).
+                    if expanded {
+                        rows.push(self.render_space_sessions(&id, theme, cx));
                     }
-                })
-                .collect();
-            column = column.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .on_drag_move::<SpaceDragPayload>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
-                            let from = event.drag(cx).from;
-                            let rel_y = f32::from(event.event.position.y)
-                                - f32::from(event.bounds.top());
-                            let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
-                            this.update_space_drag_over(from, over, cx);
-                        },
-                    ))
-                    .on_drop::<SpaceDragPayload>(cx.listener(
-                        move |this, payload: &SpaceDragPayload, _, cx| {
-                            let to = this
-                                .space_drag
-                                .as_ref()
-                                .map(|d| d.over)
-                                .unwrap_or(payload.from);
-                            this.commit_space_reorder(payload.from, to, cx);
-                        },
-                    ))
-                    .children(rows),
-            );
+                }
+                let group_device = device_id.clone();
+                column = column.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .on_drag_move::<SpaceDragPayload>(cx.listener({
+                            let device = device_id.clone();
+                            move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
+                                let payload = event.drag(cx);
+                                // A drag only lives inside its own device
+                                // group — a space cannot switch devices.
+                                if payload.device != device {
+                                    return;
+                                }
+                                let from = payload.from;
+                                let rel_y = f32::from(event.event.position.y)
+                                    - f32::from(event.bounds.top());
+                                let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
+                                this.update_space_drag_over(device.clone(), from, over, cx);
+                            }
+                        }))
+                        .on_drop::<SpaceDragPayload>(cx.listener(
+                            move |this, payload: &SpaceDragPayload, _, cx| {
+                                if payload.device != group_device {
+                                    return;
+                                }
+                                let to = this
+                                    .space_drag
+                                    .as_ref()
+                                    .map(|d| d.over)
+                                    .unwrap_or(payload.from);
+                                this.commit_space_reorder(
+                                    group_device.clone(),
+                                    payload.from,
+                                    to,
+                                    cx,
+                                );
+                            },
+                        ))
+                        .children(rows),
+                );
+            }
         }
         column.into_any_element()
     }
 
-    /// Track the drop slot while a space row is dragged over the list (150ms
-    /// sibling slides restart per committed `over` change).
-    fn update_space_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
+    /// A device group's one-line header: "@ name", with "· offline" appended
+    /// in the warning tone when the host's presence heartbeat lapsed. This is
+    /// the ONLY place the sidebar names a device (gh#124) — it used to ride on
+    /// every space row, the sidebar's loudest element spent on its least
+    /// differentiating fact.
+    fn render_device_header(name: String, offline: bool, theme: &Theme) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(Theme::SPACE_SM))
+            .pt(px(6.0))
+            .pb(px(2.0))
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(SharedString::from(format!("@ {name}"))),
+            )
+            .when(offline, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.warning.opacity(0.8))
+                        .child(SharedString::from("· offline")),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Track the drop slot while a space row is dragged over its device group
+    /// (150ms sibling slides restart per committed `over` change).
+    fn update_space_drag_over(
+        &mut self,
+        device: String,
+        from: usize,
+        over: usize,
+        cx: &mut Context<Self>,
+    ) {
         match &mut self.space_drag {
-            Some(drag) if drag.from == from => {
+            Some(drag) if drag.device == device && drag.from == from => {
                 if drag.over != over {
                     drag.prev_over = drag.over;
                     drag.over = over;
@@ -524,6 +722,7 @@ impl Shell {
             }
             _ => {
                 self.space_drag = Some(SpaceDragState {
+                    device,
                     from,
                     over,
                     epoch: 0,
@@ -534,41 +733,63 @@ impl Shell {
         }
     }
 
-    /// Commit a drag: persist the new visual order (device-local).
-    fn commit_space_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let created: Vec<String> = self
-            .state
-            .read(cx)
-            .spaces
-            .iter()
-            .map(|s| s.id.clone())
-            .collect();
-        let mut order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
-        if from < order.len() {
-            reorder_tabs(&mut order, from, to);
-            self.settings.space_order = order;
-            self.schedule_save(cx);
+    /// Commit a drag: persist the new visual order. The indices are local to
+    /// the device group ([`SpaceDragState`]); the persisted order is the
+    /// groups' orders concatenated in display order, which round-trips through
+    /// [`super::tabs::resolve_tab_order`] + [`spaces_view::device_groups`].
+    fn commit_space_reorder(
+        &mut self,
+        device: String,
+        from: usize,
+        to: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let (spaces, local_device) = {
+            let state = self.state.read(cx);
+            (state.spaces.clone(), state.local_device_id.clone())
+        };
+        // Same resolution the render used, so the indices agree with what was
+        // on screen.
+        let ordered: Vec<Space> = {
+            let created: Vec<String> = spaces.iter().map(|s| s.id.clone()).collect();
+            let order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
+            let mut by_id: std::collections::HashMap<String, Space> =
+                spaces.into_iter().map(|s| (s.id.clone(), s)).collect();
+            order.iter().filter_map(|id| by_id.remove(id)).collect()
+        };
+        let mut new_order: Vec<String> = Vec::new();
+        for group in spaces_view::device_groups(&ordered, local_device.as_deref()) {
+            let mut ids: Vec<String> = group.spaces.iter().map(|s| s.id.clone()).collect();
+            if group.device_id == device && from < ids.len() {
+                reorder_tabs(&mut ids, from, to);
+            }
+            new_order.extend(ids);
         }
+        self.settings.space_order = new_order;
+        self.schedule_save(cx);
         self.space_drag = None;
         cx.notify();
     }
 
-    /// One space row: folder icon + folder name, device name subline.
-    /// `host_offline` marks a remote host whose presence heartbeat lapsed.
+    /// One space row: repo glyph + repo-first title, trailing disclosure
+    /// chevron. No device suffix — the device is named once per group
+    /// ([`Self::render_device_header`]). Click activates (and discloses);
+    /// the chevron toggles disclosure without activating.
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
         ix: usize,
+        device: String,
         space: Space,
-        device_name: String,
-        host_offline: bool,
+        title: SharedString,
+        repo: bool,
+        expanded: bool,
         selected: bool,
         attention: Option<ChatIndicator>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let id = space.id.clone();
-        let name: SharedString = space.display_name().to_string().into();
         let fade_key = format!("space-row-{id}");
         let rest_bg = if selected {
             theme.glass_selected_bg()
@@ -582,9 +803,8 @@ impl Shell {
         };
         let select_id = id.clone();
         let menu_id = id.clone();
-        // One line: "name @ device" — the folder name carries the weight, the
-        // device tag rides along slightly muted. Long names truncate; the
-        // device tag stays visible.
+        let chevron_id = id.clone();
+        let chevron_key = format!("space-disclose-{id}");
         div()
             .id(SharedString::from(format!("space-{id}")))
             .flex()
@@ -611,13 +831,16 @@ impl Shell {
             )
             .on_drag(
                 SpaceDragPayload {
+                    device,
                     from: ix,
-                    name: name.clone(),
+                    name: title.clone(),
+                    repo,
                 },
                 |payload, _point, _, cx| {
                     let name = payload.name.clone();
+                    let repo = payload.repo;
                     cx.stop_propagation();
-                    cx.new(|_| SpaceGhost { name })
+                    cx.new(|_| SpaceGhost { name, repo })
                 },
             )
             // Status dot LEADS the row (like session rows) so its position is
@@ -632,8 +855,12 @@ impl Shell {
                         .map(|status| status_dot_color(status, theme))
                         .unwrap_or_else(|| theme.white_alpha(0.14))),
             )
+            // The glyph says what a space IS in a repo-first product: a repo
+            // (a host supplied the gh#118 link), or a plain folder for the
+            // scratch directory that is nobody's repo. Not the OS symbol for
+            // "opens" — this row is a container, and the chevron carries that.
             .child(
-                icon(icons::FOLDER)
+                icon(if repo { icons::GITHUB_MARK } else { icons::FOLDER })
                     .size(px(16.0))
                     .flex_none()
                     .text_color(theme.text_muted),
@@ -645,27 +872,275 @@ impl Shell {
                     .text_size(px(13.0))
                     .line_height(px(17.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(name),
+                    .child(title),
             )
             .child(div().flex_1())
+            // The disclosure chevron: glyph-swapped like the Changes-pane fold
+            // (gpui at this rev has no rotation transform). Click toggles
+            // without activating the space.
             .child(
                 div()
+                    .id(SharedString::from(chevron_key.clone()))
+                    .size(px(18.0))
                     .flex_none()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.0))
-                    .line_height(px(17.0))
-                    .text_color(if host_offline {
-                        theme.warning.opacity(0.8)
-                    } else {
-                        theme.text_muted.opacity(0.6)
-                    })
-                    .child(SharedString::from(if host_offline {
-                        format!("@ {device_name} · offline")
-                    } else {
-                        format!("@ {device_name}")
-                    })),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &chevron_key,
+                        theme.wash(0.0),
+                        theme.wash(0.14),
+                    ))
+                    .on_hover(motion::hover_listener(chevron_key))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_space_disclosure(&chevron_id, cx);
+                    }))
+                    .child(
+                        icon(if expanded {
+                            icons::ALT_ARROW_DOWN
+                        } else {
+                            icons::ALT_ARROW_RIGHT
+                        })
+                        .size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                    ),
             )
+    }
+
+    /// A space's disclosed sessions: the tab strip's order (creation + manual
+    /// drag), vertical, inset under an indent rule so the containment is
+    /// visible. The one place a session row lives in the sidebar — no space
+    /// name repeated on the row, because the row is IN the space.
+    fn render_space_sessions(
+        &self,
+        space_id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let now = Utc::now();
+        let order = self.tab_ids(space_id, cx);
+        let rows: Vec<AnyElement> = {
+            let (selected, pinned) = {
+                let state = self.state.read(cx);
+                (state.selected_chat.clone(), state.orchestrator.clone())
+            };
+            order
+                .iter()
+                .filter_map(|chat_id| {
+                    let (chat, status) = {
+                        let state = self.state.read(cx);
+                        let chat = state.visible_chats().find(|c| &c.id == chat_id)?.clone();
+                        let status = state.display_status_for(&chat, now);
+                        (chat, status)
+                    };
+                    Some(self.render_space_session_row(
+                        &chat,
+                        status,
+                        selected.as_deref() == Some(chat_id.as_str()),
+                        pinned.as_deref() == Some(chat_id.as_str()),
+                        now,
+                        theme,
+                        cx,
+                    ))
+                })
+                .collect()
+        };
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .px(px(Theme::SPACE_SM))
+                .py(px(4.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("No sessions yet"))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(rows)
+                .into_any_element()
+        };
+        // The indent rule starts under the space row's status dot and hands
+        // the rows a visible left edge: these BELONG to the row above.
+        div()
+            .ml(px(11.0))
+            .pl(px(6.0))
+            .my(px(2.0))
+            .border_l_1()
+            .border_color(theme.white_alpha(0.08))
+            .flex()
+            .flex_col()
+            .child(body)
+            .into_any_element()
+    }
+
+    /// One disclosed session: status rail + title + time-ago, harness/branch
+    /// underneath. Two lines, not three — the space line is gone because the
+    /// nesting already says it (gh#124's "no information twice").
+    #[allow(clippy::too_many_arguments)]
+    fn render_space_session_row(
+        &self,
+        chat: &comet_proto::Chat,
+        status: ChatIndicator,
+        selected: bool,
+        orchestrator: bool,
+        now: DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = chat.id.clone();
+        let title: SharedString = transcript::single_line(
+            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+        )
+        .into();
+        let time_ago: SharedString =
+            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+        let harness = chat.config.as_ref().map(|c| c.harness);
+        let branch: Option<SharedString> = chat
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(|b| SharedString::from(b.to_string()));
+        let subline = theme.text_muted.opacity(0.5);
+        let status_rail: AnyElement = if status == ChatIndicator::Working {
+            div()
+                .w(px(6.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(loaders::mini_gradient_spinner(
+                    format!("chat-working-{id}"),
+                    2.0,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .size(px(6.0))
+                .rounded_full()
+                .flex_none()
+                .bg(status_dot_color(status, theme))
+                .into_any_element()
+        };
+        let fade_key = format!("chat-row-{id}");
+        let rest_bg = if selected {
+            theme.glass_selected_bg()
+        } else {
+            theme.wash(0.0)
+        };
+        let rest_text = if selected {
+            theme.text
+        } else {
+            theme.text.opacity(0.8)
+        };
+        let select_id = id.clone();
+        let menu_id = id.clone();
+        div()
+            .id(SharedString::from(format!("chat-{id}")))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
+            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
+            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
+            .on_hover(motion::hover_listener(fade_key))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let id = select_id.clone();
+                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.chat_menu = Some((menu_id.clone(), event.position));
+                    cx.notify();
+                }),
+            )
+            // Line 1: status rail, ◆ for the orchestrator's chat, title, time.
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .child(status_rail)
+                    .when(orchestrator, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .line_height(px(14.0))
+                                .text_color(theme.accent)
+                                .child(SharedString::from(
+                                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .line_height(px(17.0))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(subline)
+                            .child(time_ago),
+                    ),
+            )
+            // Line 2: harness brand mark; sessions with a branch append it.
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(14.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when_some(
+                        harness.map(crate::pickers::harness_brand_icon),
+                        |el, (path, tint)| {
+                            el.child(
+                                icon(path)
+                                    .size(px(11.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                            )
+                        },
+                    )
+                    .when_some(branch, |el, branch| {
+                        el.child(
+                            icon(icons::GIT_BRANCH)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(subline),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(subline)
+                                .child(branch),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 
     /// The "Needs you" inbox (gh#122): the first section, and the one that
@@ -1348,68 +1823,6 @@ impl Shell {
                     }),
             )
             .into_any_element()
-    }
-
-    /// The global "Sessions" list: every session across all spaces (idle
-    /// included), attention-sorted. Rows are keyed for the FLIP resort glide.
-    pub(super) fn render_active_rows(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Vec<(String, f32, AnyElement)> {
-        let now = Utc::now();
-        let rows: Vec<(ChatIndicator, comet_proto::Chat, String, Option<String>)> = {
-            let state = self.state.read(cx);
-            state
-                .overview_chats(now)
-                .into_iter()
-                .map(|(status, chat)| {
-                    let space = state.space_for_chat(chat);
-                    let folder = space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
-                    let branch = chat
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
-                })
-                .collect()
-        };
-        let (selected, pinned) = {
-            let state = self.state.read(cx);
-            (state.selected_chat.clone(), state.orchestrator.clone())
-        };
-        rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
-                let harness = chat.config.as_ref().map(|c| c.harness);
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    harness,
-                    status,
-                    is_selected,
-                    pinned.as_deref() == Some(chat.id.as_str()),
-                    theme,
-                    cx,
-                );
-                (format!("c:{}", chat.id), height, element)
-            })
-            .collect()
     }
 
     // ---- add-space flow (the ⌘K palette) ----

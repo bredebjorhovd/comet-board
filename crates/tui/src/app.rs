@@ -23,6 +23,7 @@ use comet_proto::view::{
 };
 use comet_proto::view::board::{self as board_view, AgentState, BoardState};
 use comet_proto::view::needs::{self as needs_view, NeedKind};
+use comet_proto::view::spaces as spaces_view;
 use comet_proto::{
     AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, Space,
 };
@@ -92,19 +93,19 @@ const PENDING_CHAT_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 
 /// One row of the flattened sidebar.
 ///
-/// This is comet-native's information architecture, not the original Electron
-/// app's: **two sections**, not one grouped list. The desktop shell
-/// (`comet-ui/src/shell.rs::render_chat_sidebar`) reads
+/// The information architecture is gh#124's: **one session surface**. The
+/// desktop shell (`comet-ui/src/shell.rs::render_chat_sidebar`) reads
 ///
-/// - **Spaces** — the (device, folder) pairs, each one line of "name · device",
-///   carrying an aggregate attention dot so a live session is visible even when
-///   the Sessions list is scrolled away;
-/// - **Sessions** — a *flat, global, attention-sorted* list of every visible
-///   session across every space. Deliberately not grouped: the point of the
-///   list is "what needs me right now", which grouping would bury.
+/// - **Needs you / orchestrator / Agents / Running** — the attention groups,
+///   unchanged;
+/// - **Spaces** — the (device, folder) pairs, grouped under a per-device
+///   header ([`Row::Device`], the ONE place a device is named), each space
+///   CONTAINING its sessions as nested [`Row::Chat`]s in tab order.
 ///
-/// The selected space's sessions appear separately, as the tab strip above the
-/// transcript ([`App::tabs`]).
+/// The old flat, global "Sessions" list is retired: it was a second session
+/// switcher competing with the tab strip, and neither was authoritative. The
+/// tab strip above the transcript ([`App::tabs`]) stays as in-space
+/// navigation, reading the same per-space order these nested rows use.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     /// A section header: label left, optional affordance right.
@@ -112,15 +113,21 @@ pub enum Row {
         label: String,
         action: Option<String>,
     },
-    /// A space: folder name plus the device hosting it.
+    /// A device-group header (gh#124): the host's name, said once above the
+    /// spaces it hosts — never repeated per row. Only remote devices get one;
+    /// your own machine is not an address worth a line.
+    Device {
+        name: String,
+        /// The host's presence heartbeat has lapsed — said here, once, instead
+        /// of on every space row.
+        offline: bool,
+    },
+    /// A space: repo/folder name, containing its nested [`Row::Chat`]s.
     Space {
         id: String,
         label: String,
-        device: String,
         /// Most urgent status among this space's sessions, if any is live.
         attention: Option<ChatIndicator>,
-        /// The host's presence heartbeat has lapsed.
-        offline: bool,
     },
     /// One thing waiting on a human (gh#122): kind glyph + WHO on the first
     /// line, the one-line WHAT indented under it. First section in the
@@ -129,7 +136,7 @@ pub enum Row {
     /// cannot miss.
     Need {
         /// Where opening the row goes — namespaced in [`Row::key`], since the
-        /// same chat also answers in the Sessions list.
+        /// same chat also answers as a nested session row.
         chat_id: String,
         space_id: Option<String>,
         who: String,
@@ -177,7 +184,7 @@ pub enum Row {
     /// no issue to name, so a second line would be an empty one.
     Running {
         /// Namespaced in [`Row::key`] like [`Row::Agent`], for the same reason:
-        /// the same chat also has a row in the Sessions list.
+        /// the same chat also has a nested row under its space.
         chat_id: String,
         space_id: Option<String>,
         title: String,
@@ -187,19 +194,19 @@ pub enum Row {
         /// age, so the counter moves on a redraw.
         started_at: Option<DateTime<Utc>>,
     },
-    /// A session: dot + title + time, then an indented "space@device".
+    /// A session, nested under its space's row (gh#124): dot + title + time,
+    /// one line. No "space@device" sub-line — the nesting already says both,
+    /// and saying them again with a different truncation was the bug.
     Chat {
         id: String,
         space_id: Option<String>,
         title: String,
-        location: Option<String>,
         indicator: ChatIndicator,
         archived: bool,
         activity: Option<DateTime<Utc>>,
-        /// The board's pinned orchestrator (gh#104) — first in the list and
-        /// marked, because it is the one session that is about the board rather
-        /// than about a task, and losing it in a recency-sorted list is how it
-        /// stops being the thing you talk to.
+        /// The board's pinned orchestrator (gh#104) — marked with the ◆, so
+        /// the nested row and the pinned slot above Spaces are recognisably
+        /// one thing.
         orchestrator: bool,
     },
     /// Placeholder text for an empty section.
@@ -211,9 +218,9 @@ pub enum Row {
 }
 
 impl Row {
-    /// What this row *addresses* — a space, or a chat in the Sessions list.
+    /// What this row *addresses* — a space, or a chat nested under one.
     /// Decoration addresses nothing, and neither does an agent or running row:
-    /// each points at a chat the Sessions list already answers for, and two
+    /// each points at a chat the nested rows already answer for, and two
     /// rows answering to one id would let "put the cursor on chat X" land on
     /// either. Cursor identity is [`Row::key`].
     pub fn id(&self) -> Option<&str> {
@@ -225,7 +232,7 @@ impl Row {
 
     /// Which row this *is*, for the identity-preserving cursor across rebuilds.
     ///
-    /// An agent or running row shares its chat with the Sessions list, so its
+    /// An agent or running row shares its chat with the nested session rows, so its
     /// key is namespaced with the NUL prefix the board pane's section headers
     /// use — otherwise a rebuild would slide the cursor between the lists.
     pub fn key(&self) -> Option<String> {
@@ -243,11 +250,9 @@ impl Row {
     /// Lines this row occupies.
     pub fn height(&self) -> u16 {
         match self {
-            // Title and sub-line, with no row of air between entries: at one
-            // blank row per session the list reads as a set of loose cards
-            // rather than a list, and a terminal has no half-row to spend
-            // instead. The breathing room comes from the pane's own padding.
-            Row::Chat { .. } => 2,
+            // One line since gh#124: the "space@device" sub-line is gone — the
+            // nesting says both — so a session is dot + title + time.
+            Row::Chat { .. } => 1,
             // Identifier over branch — the same two-line shape, so the two
             // lists read as one pane rather than two designs.
             Row::Agent { .. } => 2,
@@ -1300,6 +1305,7 @@ impl App {
             // cursor; a defensive arm keeps this total.
             Some(Row::Blank)
             | Some(Row::Section { .. })
+            | Some(Row::Device { .. })
             | Some(Row::Empty { .. })
             | Some(Row::AllClear)
             | Some(Row::User { .. })
@@ -1880,7 +1886,7 @@ impl App {
         });
 
         // Aggregate attention per space: the most urgent live member wins, so a
-        // running session stays visible when the Sessions list is scrolled off.
+        // running session stays visible even at a glance over collapsed rows.
         let mut attention: HashMap<String, ChatIndicator> = HashMap::new();
         for chat in self.chats.iter().filter(|chat| !chat.archived) {
             let status = display_status(chat, self.session_for(&chat.id), now);
@@ -1954,27 +1960,8 @@ impl App {
             });
         }
 
-        rows.push(Row::Blank);
-        rows.push(Row::Section {
-            label: "Spaces".into(),
-            action: Some("+".into()),
-        });
-        if self.spaces.is_empty() {
-            rows.push(Row::Empty {
-                label: "No spaces yet".into(),
-            });
-        }
-        for space in &self.spaces {
-            rows.push(Row::Space {
-                id: space.id.clone(),
-                label: space.display_name().to_string(),
-                device: self.device_label(&space.device_id),
-                attention: attention.get(&space.id).copied(),
-                offline: !self.device_online(&space.device_id, now),
-            });
-        }
-
-        // Agents, above the sessions: one row per live board attempt (gh#103).
+        // Agents, above the spaces tree (gh#124): one row per live board
+        // attempt (gh#103).
         // Omitted entirely when nothing is running — an empty section here would
         // be a permanent reminder that a board exists on a box that has none.
         // The board pane (`B`) stays the deep view; this is the glance.
@@ -2034,43 +2021,59 @@ impl App {
 
         rows.push(Row::Blank);
         rows.push(Row::Section {
-            label: "Sessions".into(),
-            action: self.show_archived.then(|| "archived".to_string()),
+            label: "Spaces".into(),
+            action: Some("+".into()),
         });
-        // Flat and global, ordered by `sort_active` — the same recency order the
-        // desktop list uses, so the two surfaces agree row for row.
-        let mut active: Vec<(ChatIndicator, &Chat)> = self
-            .chats
-            .iter()
-            .filter(|chat| self.show_archived || !chat.archived)
-            .map(|chat| (display_status(chat, self.session_for(&chat.id), now), chat))
-            .collect();
-        view::sort_active(&mut active);
-        // The orchestrator is NOT floated here any more (gh#122): its pinned
-        // place is the slot above Spaces, and this list treats its chat like
-        // any other — at the recency it earned, still wearing the ◆ mark so
-        // the two are recognisably one thing.
-        if active.is_empty() {
+        if self.spaces.is_empty() {
             rows.push(Row::Empty {
-                label: "No sessions yet".into(),
+                label: "No spaces yet".into(),
             });
         }
-        for (indicator, chat) in active {
-            rows.push(Row::Chat {
-                id: chat.id.clone(),
-                space_id: chat.space_id.clone(),
-                title: chat
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or_else(|| "New session".to_string()),
-                location: self.space_at_device(chat.space_id.as_deref()),
-                indicator,
-                archived: chat.archived,
-                activity: chat.last_message_at.or(Some(chat.created_at)),
-                orchestrator: self.orchestrator.as_deref() == Some(chat.id.as_str()),
-            });
+        // Grouped by device, the device named ONCE per group — and only for a
+        // remote host (gh#124): your own machine is not an address worth a
+        // line. Each space CONTAINS its sessions as nested rows, in the tab
+        // strip's order, so the sidebar is the one authoritative surface.
+        for group in spaces_view::device_groups(&self.spaces, self.local_device_id.as_deref()) {
+            if self.local_device_id.as_deref() != Some(group.device_id) {
+                rows.push(Row::Device {
+                    name: self.device_label(group.device_id),
+                    offline: !self.device_online(group.device_id, now),
+                });
+            }
+            for space in group.spaces {
+                rows.push(Row::Space {
+                    id: space.id.clone(),
+                    label: space.display_name().to_string(),
+                    attention: attention.get(&space.id).copied(),
+                });
+                let mut chats: Vec<&Chat> = self
+                    .chats
+                    .iter()
+                    .filter(|chat| chat.space_id.as_deref() == Some(space.id.as_str()))
+                    .filter(|chat| self.show_archived || !chat.archived)
+                    .collect();
+                view::sort_tabs(&mut chats);
+                for chat in chats {
+                    rows.push(Row::Chat {
+                        id: chat.id.clone(),
+                        space_id: chat.space_id.clone(),
+                        title: chat
+                            .title
+                            .clone()
+                            .filter(|title| !title.trim().is_empty())
+                            .unwrap_or_else(|| "New session".to_string()),
+                        indicator: display_status(chat, self.session_for(&chat.id), now),
+                        archived: chat.archived,
+                        activity: chat.last_message_at.or(Some(chat.created_at)),
+                        orchestrator: self.orchestrator.as_deref() == Some(chat.id.as_str()),
+                    });
+                }
+            }
         }
+
+        // (The global "Sessions" section is retired — gh#124: every session
+        // already answers under its space, and the attention groups above
+        // carry "what needs me". One surface, one truncation.)
 
         if let Some((name, email)) = user_row {
             // Air, not a hairline: the user row is already pinned to the bottom
@@ -2104,11 +2107,12 @@ impl App {
     }
 
     /// The selected space's non-archived sessions, as the tab strip above the
-    /// transcript. This is where a space's own sessions live in comet-native —
-    /// the sidebar's Sessions list is global and answers a different question.
+    /// transcript — in-space navigation (gh#124): the sidebar's nested rows
+    /// are the authoritative enumeration, and this strip walks the same set.
     ///
     /// Tab order is creation order (`sort_tabs`): activity must never reorder
-    /// tabs under the pointer.
+    /// tabs under the pointer, and the nested sidebar rows use the same order
+    /// so the two surfaces agree.
     pub fn tabs(&self) -> Vec<Tab> {
         let Some(space_id) = self.selected_space.as_deref() else {
             return Vec::new();
@@ -2173,21 +2177,6 @@ impl App {
         let effects = self.select_chat(Some(id));
         self.rebuild_rows();
         effects
-    }
-
-    /// A session's sub-line: `space@device` — where the work actually happens.
-    /// The branch lives on the session itself and changes mid-run; the machine
-    /// and folder are the stable facts worth carrying under every title.
-    fn space_at_device(&self, space_id: Option<&str>) -> Option<String> {
-        let space = self
-            .spaces
-            .iter()
-            .find(|space| Some(space.id.as_str()) == space_id)?;
-        Some(format!(
-            "{}@{}",
-            space.display_name(),
-            self.device_label(&space.device_id)
-        ))
     }
 
     /// A device's display name, falling back to its id's head when the registry
@@ -4054,11 +4043,11 @@ mod tests {
     // ---- the pinned orchestrator (gh#104) --------------------------------
 
     /// The pin's place is the fixed slot above Spaces (gh#122) — a pinned
-    /// thread, not a decorated session row. The sessions list keeps recency
-    /// order for everyone, orchestrator included; the ◆ mark alone says which
-    /// chat the slot is.
+    /// thread, not a decorated session row. The nested session rows keep the
+    /// tab order for everyone, orchestrator included (gh#124); the ◆ mark
+    /// alone says which chat the slot is.
     #[test]
-    fn pinning_creates_the_slot_and_leaves_the_sessions_list_to_recency() {
+    fn pinning_creates_the_slot_and_leaves_the_nested_rows_alone() {
         let mut app = seeded();
         let slot = |app: &App| {
             app.rows.iter().find_map(|row| match row {
@@ -4079,9 +4068,10 @@ mod tests {
                 })
                 .expect("a chat row")
         };
-        // Unpinned: no slot, and c2 (the more recent) leads the sessions.
+        // Unpinned: no slot, and c1 (created first) leads its space's nested
+        // rows — tab order, the same the strip shows (gh#124).
         assert_eq!(slot(&app), None);
-        assert_eq!(first_chat(&app), ("c2".into(), false));
+        assert_eq!(first_chat(&app), ("c1".into(), false));
 
         app.apply(Update::Orchestrator(Some("c1".into())));
         // The slot exists — before the orchestrator has ever spoken, as the
@@ -4099,9 +4089,9 @@ mod tests {
             .position(|row| matches!(row, Row::Section { label, .. } if label == "Spaces"))
             .unwrap();
         assert!(slot_at < spaces_at, "the slot lives above Spaces");
-        // The sessions list is untouched: recency still leads, and the pinned
-        // chat wears the mark where it is.
-        assert_eq!(first_chat(&app), ("c2".into(), false));
+        // The nested rows are untouched: tab order still leads, and the
+        // pinned chat wears the mark where it is (c1 — which IS pinned now).
+        assert_eq!(first_chat(&app), ("c1".into(), true));
 
         // Unpinning removes the fixture.
         app.apply(Update::Orchestrator(None));

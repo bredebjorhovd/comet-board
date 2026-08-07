@@ -6,6 +6,11 @@
 //! the old header's titlebar duties: 44px tall, drag region, animated
 //! window-controls inset, and the toggle-changes button (git spaces only).
 //!
+//! Since gh#124 the strip is IN-SPACE NAVIGATION, not a session switcher: the
+//! sidebar's disclosed space rows are the authoritative session surface, and
+//! this strip only walks the selected space's tabs (same order — see
+//! [`Shell::tab_ids`]) while carrying the titlebar.
+//!
 //! Styling and drag-reorder mirror the terminal tab bar
 //! (`terminal/panel.rs::render_tab_bar`) — same fixed-width tabs, drop-index
 //! math, 150ms sibling slide, and drag ghost. The manual order is device-local
@@ -108,8 +113,10 @@ pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String>
 }
 
 impl Shell {
-    /// The space's tabs in VISUAL order (manual drag order over creation order).
-    fn tab_ids(&self, space_id: &str, cx: &App) -> Vec<String> {
+    /// The space's tabs in VISUAL order (manual drag order over creation
+    /// order). Also the order of the sidebar's disclosed session rows
+    /// (gh#124) — the two surfaces must agree.
+    pub(super) fn tab_ids(&self, space_id: &str, cx: &App) -> Vec<String> {
         let created: Vec<String> = self
             .state
             .read(cx)
