@@ -158,6 +158,15 @@ impl OrgDevices {
             .is_some_and(|client| client.connected())
     }
 
+    /// Is the org room's `%EPH` presence sub-room joined RIGHT NOW? This is
+    /// the channel a teammate's online dot rides — see
+    /// [`crate::workspace_host::WorkspaceHost::presence_connected`] (gh#126).
+    pub fn presence_connected(&self) -> bool {
+        lock(&self.inner.room)
+            .as_ref()
+            .is_some_and(|client| client.presence_joined())
+    }
+
     /// The underlying doc — what the room syncs (and what tests bridge).
     pub fn doc_arc(&self) -> Arc<WorkspaceDoc> {
         self.inner.doc.clone()

@@ -31,6 +31,7 @@ use serde::de::DeserializeOwned;
 use comet_doc::SessionMessageEntry;
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::view::board::{self as board_view, OrchestratorPin};
+use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -298,9 +299,10 @@ impl EngineHandle {
 // with this one — a sort order that differs per surface is a bug. Re-exported
 // here because every call site in this crate reads them as `state::…`.
 pub use comet_proto::view::{
-    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    ChatGroup, ConnectionStatus, GatePhase, HostPresence, Indicator, SESSION_STALE_MS,
+    attention_rank, chat_location, display_status, effective_indicator, format_time_ago,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats,
+    sort_spaces, sort_tabs,
 };
 
 // ---------------------------------------------------------------------------
@@ -378,6 +380,11 @@ pub struct AppState {
     pub orchestrator: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<comet_update::UpdateStatus>,
+    /// This engine's own edge census, polled every 15s (gh#126). What lets the
+    /// sidebar tell "that host is offline" from "I can't hear anyone" — the
+    /// two states the amber suffix used to conflate. `None` until the first
+    /// poll answers (or forever, against an engine that predates the RPC).
+    pub edge_health: Option<comet_proto::EdgeHealth>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -408,6 +415,7 @@ impl AppState {
             local_device_id: None,
             orchestrator: None,
             update: None,
+            edge_health: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -576,6 +584,22 @@ impl AppState {
         }
     }
 
+    /// The three-state host verdict (gh#126): a lapsed heartbeat is only
+    /// "offline" while THIS app's engine can hear — with our own sync rooms
+    /// down the honest claim is [`HostPresence::SyncDown`], indicting the pipe
+    /// rather than the host. See [`comet_proto::view::host_presence`].
+    pub fn host_presence(&self, device_id: &str, now: DateTime<Utc>) -> HostPresence {
+        let is_local = self.local_device_id.as_deref() == Some(device_id);
+        // An unknown device reads as no evidence (`None`), which the shared
+        // derivation already treats as "say nothing" — don't cry wolf.
+        let last_seen = self
+            .devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.last_seen_at);
+        comet_proto::view::host_presence(is_local, last_seen, self.edge_health.as_ref(), now)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {
@@ -601,17 +625,22 @@ impl AppState {
             .map(|c| (display_status(c, self.session_for(&c.id), now), c))
             .collect();
         sort_active(&mut rows);
-        // The orchestrator is pinned in the literal sense (gh#104): every other
-        // row's position is recency, and this one's position is the
-        // designation — a board's driver that slid down the list whenever two
-        // children spoke would stop being the thing you talk to.
-        if let Some(pinned) = self.orchestrator.as_deref()
-            && let Some(at) = rows.iter().position(|(_, c)| c.id == pinned)
-        {
-            let row = rows.remove(at);
-            rows.insert(0, row);
-        }
+        // The orchestrator is NOT floated here any more (gh#122): its pinned
+        // place is the fixed slot above Spaces, and this list treats its chat
+        // like any other — at the recency it earned, still wearing the ◆ mark
+        // so the two are recognisably one thing.
         rows
+    }
+
+    /// The orchestrator's fixed slot (gh#122), or `None` when no orchestrator
+    /// is pinned or its chat has not synced here.
+    pub fn orchestrator_slot(&self, now: DateTime<Utc>) -> Option<needs_view::OrchestratorSlot> {
+        needs_view::orchestrator_slot(
+            self.orchestrator.as_deref(),
+            &self.chats,
+            &self.sessions,
+            now,
+        )
     }
 
     /// Is this the chat the board has pinned as its orchestrator?
@@ -715,6 +744,7 @@ impl AppState {
             ),
             spawn_orchestrator_watch(cx, handle.clone()),
             spawn_local_device_probe(cx, handle.clone()),
+            spawn_edge_health_poll(cx, handle.clone()),
         ];
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
@@ -993,6 +1023,40 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
                 cx.notify();
             })
             .ok();
+        }
+    })
+}
+
+/// Poll cadence for this engine's own edge census — see
+/// [`AppState::edge_health`]. Matches the engine's presence tick, and sits
+/// well inside the 70s presence window it gates.
+const EDGE_HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Standing poll of the unary `EdgeHealth` RPC (gh#126). A poll rather than a
+/// watch because the census is computed on demand engine-side; 15s staleness
+/// is invisible behind the 70s presence window, and a fresh heartbeat outranks
+/// the census anyway (`view::host_presence`). Errors keep the last answer — an
+/// engine mid-restart must not flip every row's verdict on its way down.
+fn spawn_edge_health_poll(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            if let Ok(value) = handle
+                .client()
+                .call(methods::EDGE_HEALTH, serde_json::json!({}))
+                .await
+                && let Ok(health) = serde_json::from_value::<comet_proto::EdgeHealth>(value)
+                && this
+                    .update(cx, |state, cx| {
+                        if state.edge_health.as_ref() != Some(&health) {
+                            state.edge_health = Some(health.clone());
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+            {
+                return; // app state dropped
+            }
+            cx.background_executor().timer(EDGE_HEALTH_POLL).await;
         }
     })
 }
@@ -1484,16 +1548,17 @@ mod tests {
         assert_eq!(overview, ["old", "new"]);
     }
 
-    /// gh#104: every other row's position is attention-and-recency; the
-    /// orchestrator's position *is* the designation. A board's driver that slid
-    /// down the list whenever two children spoke would stop being the thing you
-    /// talk to.
+    /// gh#122: the pin's place is the fixed slot above Spaces, not a float in
+    /// the sessions list — which stays pure recency for everyone, the
+    /// orchestrator included.
     #[test]
-    fn the_pinned_orchestrator_leads_the_overview() {
+    fn the_pin_is_a_slot_not_a_float() {
         let mut state = AppState::new();
         state.apply_spaces(vec![space("s1", "dev", "/a", 1)]);
         let mut boss = chat("boss", 1, None);
         boss.space_id = Some("s1".into());
+        boss.last_message_preview = Some("PR 576 green".into());
+        boss.last_message_at = Some(Utc::now());
         let mut recent = chat("recent", 9, None);
         recent.space_id = Some("s1".into());
         state.apply_chats(vec![boss, recent]);
@@ -1505,21 +1570,22 @@ mod tests {
                 .map(|(_, c)| c.id.clone())
                 .collect()
         };
-        assert_eq!(ids(&state), ["recent", "boss"]);
+        assert_eq!(ids(&state), ["boss", "recent"]);
+        assert!(state.orchestrator_slot(now).is_none());
 
         state.orchestrator = Some("boss".into());
+        // The list is untouched — the slot is where the pin shows.
         assert_eq!(ids(&state), ["boss", "recent"]);
         assert!(state.is_orchestrator("boss"));
-        assert!(!state.is_orchestrator("recent"));
+        let slot = state.orchestrator_slot(now).expect("pinned and synced");
+        assert_eq!(slot.chat_id, "boss");
+        assert_eq!(slot.preview.as_deref(), Some("PR 576 green"));
+        assert!(slot.unseen);
 
-        // A stale pin — the chat was archived, or the id in `routing.toml` is
-        // from a chat that is gone — reorders nothing and invents nothing.
+        // A stale pin — the chat was archived away, or the id in
+        // `routing.toml` is from a chat that is gone — invents nothing.
         state.orchestrator = Some("nobody".into());
-        assert_eq!(ids(&state), ["recent", "boss"]);
-
-        // And unpinning hands the list straight back to recency.
-        state.orchestrator = None;
-        assert_eq!(ids(&state), ["recent", "boss"]);
+        assert!(state.orchestrator_slot(now).is_none());
     }
 
     #[test]

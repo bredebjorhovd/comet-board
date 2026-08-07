@@ -22,6 +22,11 @@ import Observation
 final class BoardStore {
     /// The board's rows, newest frame wins. Empty until a host answers.
     private(set) var rows: [TaskRow] = []
+    /// Which chat the board has pinned as its orchestrator (gh#104/gh#122) —
+    /// the `WatchBoardOrchestrator` stream, ridden on the same host the board
+    /// sweep settled on. `nil` is a board with no orchestrator, which is a
+    /// legitimate way to run one.
+    private(set) var orchestratorChatId: String?
     /// The device currently serving this board, once the sweep has settled.
     private(set) var hostDeviceId: String?
     /// True once any host has ever delivered a frame — the difference between
@@ -40,6 +45,7 @@ final class BoardStore {
     private let devices: () -> [DeviceRow]
     private var relayClients: [String: DeviceRelayClient] = [:]
     private var watchTask: Task<Void, Never>?
+    private var pinTask: Task<Void, Never>?
 
     init(config: AppConfig, devices: @escaping () -> [DeviceRow]) {
         self.config = config
@@ -56,6 +62,8 @@ final class BoardStore {
     func stop() {
         watchTask?.cancel()
         watchTask = nil
+        pinTask?.cancel()
+        pinTask = nil
         let clients = relayClients.values
         relayClients.removeAll()
         Task { for client in clients { await client.close() } }
@@ -161,6 +169,11 @@ final class BoardStore {
                     // The pickers' data belongs to the host that will run the
                     // dispatch — reload it whenever the host changes.
                     Task { [weak self] in await self?.loadPickerCatalogs(host: deviceId) }
+                    // The pin rides the same host: it answers a question about
+                    // this board, and the sidebar's orchestrator slot needs it
+                    // before any board screen has been opened (gh#122).
+                    pinTask?.cancel()
+                    pinTask = watchPin(deviceId: deviceId)
                 }
             }
         } catch {
@@ -168,7 +181,35 @@ final class BoardStore {
             // link, not a verdict — `delivered` keeps that distinction.
             if delivered { status = "Board connection dropped — retrying" }
         }
+        // The board stream ended, so the pin stream's host is over too; the
+        // last-known pin is kept, exactly as the rows are, until the next host
+        // answers with a fresh one.
+        pinTask?.cancel()
+        pinTask = nil
         return delivered ? .settled : .notMe
+    }
+
+    /// The `WatchBoardOrchestrator` stream (gh#104): the current pin first,
+    /// then every change. A frame that will not decode is schema skew — keep
+    /// the last good value, the same discipline the row stream keeps.
+    private func watchPin(deviceId: String) -> Task<Void, Never> {
+        Task { [weak self] in
+            guard let self else { return }
+            struct Pin: Decodable { var chatId: String? }
+            let stream = await self.relay(for: deviceId)
+                .subscribe(method: "WatchBoardOrchestrator", params: [:])
+            do {
+                for try await item in stream {
+                    guard !Task.isCancelled else { return }
+                    if let pin = try? JSONDecoder().decode(Pin.self, from: item) {
+                        self.orchestratorChatId = pin.chatId
+                    }
+                }
+            } catch {
+                // A dropped pin stream is not a verdict on the board; the row
+                // stream's own lifecycle drives the resweep.
+            }
+        }
     }
 
     // MARK: Picker catalogs

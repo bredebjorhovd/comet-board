@@ -16,9 +16,10 @@ use crate::popover;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-/// A device that pinged within this window shows a presence dot (engines
-/// heartbeat every 15s; 70s tolerates a couple of missed beats).
-pub const DEVICE_ONLINE_WINDOW_SECS: i64 = 70;
+/// A device that pinged within this window shows a presence dot. The window
+/// itself is the shared [`comet_proto::view::PRESENCE_STALE_MS`] — one window
+/// for every surface, or two screens could disagree about the same device.
+pub const DEVICE_ONLINE_WINDOW_SECS: i64 = comet_proto::view::PRESENCE_STALE_MS / 1000;
 
 /// Presence: last-seen within the online window (future timestamps count). Pure.
 pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {

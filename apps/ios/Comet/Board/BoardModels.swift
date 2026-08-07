@@ -748,11 +748,15 @@ struct RunningRow: Identifiable, Hashable {
 /// No board is required — `rows` empty (no board in the org, the sweep still
 /// running, a phone that has not attached) subtracts nothing.
 func runningRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
-                 now: Date = Date()) -> [RunningRow] {
+                 orchestrator: String? = nil, now: Date = Date()) -> [RunningRow] {
     let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
     let dispatched = Set(rows.filter { $0.boardState.holdsPane }.compactMap(\.chatId))
     var out: [RunningRow] = chats.compactMap { chat in
         guard !dispatched.contains(chat.id) else { return nil }
+        // The pinned orchestrator has a fixed slot of its own (gh#122), which
+        // carries its live state — a second row here would report the same run
+        // twice.
+        guard chat.id != orchestrator else { return nil }
         let session = sessions[chat.id]
         let state: AgentState
         switch effectiveStatus(session, now: nowMillis) {
@@ -786,6 +790,196 @@ func runningRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
 /// How many of these want a human — the Running header's count badge.
 func runningNeedingAttention(_ rows: [RunningRow]) -> Int {
     rows.filter { $0.state.needsAttention }.count
+}
+
+// MARK: - "Needs you" and the orchestrator's slot (gh#122)
+
+/// One spelling everywhere, ports of `view::needs`'s constants: the product's
+/// voice with three names is three voices.
+let orchestratorName = "Orchestrator"
+let needsYouTitle = "Needs you"
+/// The inbox's empty state, in words — a quiet check, never an omitted section.
+let needsAllClear = "Nothing needs you"
+/// What the slot says when the pinned orchestrator has never spoken.
+let orchestratorNoReports = "No reports yet"
+
+/// Why a row is in the inbox — a port of `view::needs::NeedKind`.
+enum NeedKind {
+    /// Somebody is waiting on your answer: a question, or a permission prompt.
+    case question
+    /// A run died and is waiting on a retry.
+    case deadRun
+    /// The orchestrator finished a turn you have not seen.
+    case report
+
+    /// Inbox order — a question outranks a corpse, and both outrank news.
+    var rank: Int {
+        switch self {
+        case .question: return 0
+        case .deadRun: return 1
+        case .report: return 2
+        }
+    }
+
+    /// The board's own shape families: pointed is stuck, crossed is dead,
+    /// checked is done-and-for-you.
+    var glyph: String {
+        switch self {
+        case .question: return "▲"
+        case .deadRun: return "✕"
+        case .report: return "✓"
+        }
+    }
+
+    /// What the row says when the chat has no last words to quote.
+    var fallback: String {
+        switch self {
+        case .question: return "waiting on your answer"
+        case .deadRun: return "its run died — open to retry"
+        case .report: return "finished a turn you haven't seen"
+        }
+    }
+}
+
+/// One thing waiting on a human: WHO, and one line of WHAT, in words — a port
+/// of `view::needs::NeedRow`.
+struct NeedRow: Identifiable, Hashable {
+    /// Where the tap goes. Always a chat that exists here.
+    var chatId: String
+    var spaceId: String?
+    /// `orchestratorName`, an issue identifier (`gh#503`), or the chat's title.
+    var who: String
+    /// The chat's last words, or the kind's own words.
+    var what: String
+    var kind: NeedKind
+    /// When this started waiting, best known.
+    var since: Date?
+
+    var id: String { chatId }
+}
+
+/// Model-written text collapsed onto one line — `view::single_line`.
+private func singleLine(_ text: String?) -> String {
+    (text ?? "").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
+/// Everything waiting on a human, most owed first — a port of
+/// `view::needs::needs_you`; membership and order are documented there. The
+/// inputs are the four standing streams the app already holds: the pin,
+/// `WatchBoard` rows, the chat rows, the session mirror.
+func needsYou(orchestrator: String?, rows: [TaskRow], chats: [Chat],
+              sessions: [String: SessionRow], now: Date = Date()) -> [NeedRow] {
+    let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
+    var out: [NeedRow] = []
+
+    func date(_ ms: Int64?) -> Date? {
+        ms.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+    }
+    func whatLine(_ chat: Chat, _ kind: NeedKind) -> String {
+        let preview = singleLine(chat.lastMessagePreview)
+        return preview.isEmpty ? kind.fallback : preview
+    }
+
+    // The orchestrator, by every door: question, dead run, unseen report.
+    if let pin = orchestrator, let chat = chats.first(where: { $0.id == pin }) {
+        let session = sessions[pin]
+        let kind: NeedKind?
+        switch chatIndicator(chat: chat, live: effectiveStatus(session, now: nowMillis)) {
+        case .awaitingInput: kind = .question
+        case .errored: kind = .deadRun
+        case .completed: kind = .report
+        case .working, .idle: kind = nil
+        }
+        if let kind {
+            let since: Int64? = kind == .report
+                ? chat.lastMessageAt
+                : (session.map(\.updatedAt) ?? chat.lastMessageAt)
+            out.append(NeedRow(chatId: chat.id, spaceId: chat.spaceId,
+                               who: orchestratorName, what: whatLine(chat, kind),
+                               kind: kind, since: date(since)))
+        }
+    }
+
+    // Live board attempts whose agent wants a human, named by their issue.
+    for row in rows where row.boardState.holdsPane {
+        guard let chatId = row.chatId, chatId != orchestrator,
+              let chat = chats.first(where: { $0.id == chatId }) else { continue }
+        let session = sessions[chatId]
+        let kind: NeedKind
+        switch agentState(row: row.boardState, session: session, now: nowMillis) {
+        case .blocked: kind = .question
+        case .errored: kind = .deadRun
+        case .working: continue
+        }
+        // When the live session drove the verdict, its last transition is when
+        // the waiting started; a board-only verdict knows the attempt's start.
+        let live = effectiveStatus(session, now: nowMillis)
+        let since: Date? = (live != nil && live != .idle)
+            ? date(session?.updatedAt)
+            : row.startedAtDate
+        out.append(NeedRow(chatId: chatId, spaceId: chat.spaceId,
+                           who: row.identifier, what: whatLine(chat, kind),
+                           kind: kind, since: since))
+    }
+
+    // Everything else that is asking. Archived is not a reason to hide a
+    // question — the rule the Running group already keeps.
+    let claimed = Set(rows.filter { $0.boardState.holdsPane }.compactMap(\.chatId))
+    for chat in chats where chat.id != orchestrator && !claimed.contains(chat.id) {
+        let session = sessions[chat.id]
+        guard effectiveStatus(session, now: nowMillis) == .awaitingInput else { continue }
+        out.append(NeedRow(chatId: chat.id, spaceId: chat.spaceId,
+                           who: chat.displayTitle, what: whatLine(chat, .question),
+                           kind: .question, since: date(session?.updatedAt)))
+    }
+
+    out.sort { a, b in
+        if a.kind.rank != b.kind.rank { return a.kind.rank < b.kind.rank }
+        if let x = a.since, let y = b.since, x != y { return x < y }
+        if a.since != nil && b.since == nil { return true }
+        if a.since == nil && b.since != nil { return false }
+        return a.chatId < b.chatId
+    }
+    return out
+}
+
+/// The orchestrator as a pinned thread — a port of
+/// `view::needs::OrchestratorSlot`.
+struct OrchestratorSlot: Hashable {
+    /// The pinned chat. Opening it marks it seen — the synced marker that
+    /// clears `unseen` on every device.
+    var chatId: String
+    var spaceId: String?
+    /// The latest report, one line. `nil` = never spoke, and the slot says
+    /// `orchestratorNoReports` instead of vanishing.
+    var preview: String?
+    var unseen: Bool
+    /// Live status, so a turn running now can never be mistaken for an
+    /// 8h-old report.
+    var indicator: ChatIndicator
+    /// When it last spoke (epoch ms).
+    var lastAt: Int64?
+}
+
+/// The slot, or `nil` when no orchestrator is pinned or its chat has not
+/// synced here. A pinned-but-silent orchestrator is NOT `nil`: that is the
+/// empty fixture, and it renders.
+func orchestratorSlot(orchestrator: String?, chats: [Chat],
+                      sessions: [String: SessionRow],
+                      now: Date = Date()) -> OrchestratorSlot? {
+    guard let pin = orchestrator, let chat = chats.first(where: { $0.id == pin }) else {
+        return nil
+    }
+    let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
+    let preview = singleLine(chat.lastMessagePreview)
+    return OrchestratorSlot(
+        chatId: chat.id,
+        spaceId: chat.spaceId,
+        preview: preview.isEmpty ? nil : preview,
+        unseen: chat.unseen,
+        indicator: chatIndicator(chat: chat,
+                                 live: effectiveStatus(sessions[pin], now: nowMillis)),
+        lastAt: chat.lastMessageAt)
 }
 
 // MARK: - Which device hosts the board (gh#55)

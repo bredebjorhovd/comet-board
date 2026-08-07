@@ -477,6 +477,16 @@ impl WorkspaceHost {
             .is_some_and(|client| client.connected())
     }
 
+    /// Is the workspace room's `%EPH` presence sub-room joined RIGHT NOW?
+    /// Narrower than [`Self::connected`]: a doc-live room with dead presence
+    /// silently drops every heartbeat this device sends (gh#126), and the
+    /// health census has to be able to say so.
+    pub fn presence_connected(&self) -> bool {
+        lock(&self.inner.room)
+            .as_ref()
+            .is_some_and(|client| client.presence_joined())
+    }
+
     // ── watches (WatchChats / WatchDevices / merged WatchSessions) ──────────
 
     pub fn watch_chats(&self) -> watch::Receiver<Vec<Chat>> {

@@ -22,6 +22,7 @@ use comet_proto::view::{
     format_time_ago,
 };
 use comet_proto::view::board::{self as board_view, AgentState, BoardState};
+use comet_proto::view::needs::{self as needs_view, NeedKind};
 use comet_proto::{
     AuthState, Chat, ChatIndicator, Device, RunRequest, SandboxLevel, Session, Space,
 };
@@ -121,6 +122,40 @@ pub enum Row {
         /// The host's presence heartbeat has lapsed.
         offline: bool,
     },
+    /// One thing waiting on a human (gh#122): kind glyph + WHO on the first
+    /// line, the one-line WHAT indented under it. First section in the
+    /// sidebar, because "does anything want me" is the question the pane is
+    /// opened with — everything below may stay calm forever because this
+    /// cannot miss.
+    Need {
+        /// Where opening the row goes — namespaced in [`Row::key`], since the
+        /// same chat also answers in the Sessions list.
+        chat_id: String,
+        space_id: Option<String>,
+        who: String,
+        what: String,
+        kind: NeedKind,
+    },
+    /// The quiet check under an empty "Needs you" header: the empty state is
+    /// the reward, said in words, never an omitted section.
+    AllClear,
+    /// The orchestrator's fixed slot above Spaces (gh#122): a pinned thread —
+    /// name, unseen badge, latest-report preview — not a decorated session
+    /// row. Rendered even before the orchestrator has ever spoken, so the
+    /// place to look exists before the first notice arrives.
+    Orchestrator {
+        chat_id: String,
+        space_id: Option<String>,
+        /// Latest report, one line; `None` = it has never spoken.
+        preview: Option<String>,
+        /// Unread activity — opening the chat clears it everywhere.
+        unseen: bool,
+        /// Live status: working spins, so an 8h-old report can never be
+        /// mistaken for a turn that is running now.
+        indicator: ChatIndicator,
+        /// When it last spoke, for the time column.
+        last_at: Option<DateTime<Utc>>,
+    },
     /// A live board attempt: state glyph + issue identifier + elapsed, then an
     /// indented branch. Above the sessions, because an agent that is stuck is
     /// the one thing on this pane worth interrupting a person for (gh#103).
@@ -195,6 +230,10 @@ impl Row {
     /// use — otherwise a rebuild would slide the cursor between the lists.
     pub fn key(&self) -> Option<String> {
         match self {
+            Row::Need { chat_id, .. } => Some(format!("\u{0}need:{chat_id}")),
+            // The slot's identity is the slot, not its chat: repinning the
+            // orchestrator moves the cursor with the fixture, not the chat.
+            Row::Orchestrator { .. } => Some("\u{0}orchestrator".to_string()),
             Row::Agent { chat_id, .. } => Some(format!("\u{0}agent:{chat_id}")),
             Row::Running { chat_id, .. } => Some(format!("\u{0}running:{chat_id}")),
             other => other.id().map(str::to_string),
@@ -212,6 +251,8 @@ impl Row {
             // Identifier over branch — the same two-line shape, so the two
             // lists read as one pane rather than two designs.
             Row::Agent { .. } => 2,
+            // WHO over WHAT / name over preview: the same shape again.
+            Row::Need { .. } | Row::Orchestrator { .. } => 2,
             // One line: the sub-line under an agent row carries its branch, and
             // an unmanaged run has none to carry.
             Row::Running { .. } => 1,
@@ -232,7 +273,12 @@ impl Row {
     pub fn selectable(&self) -> bool {
         matches!(
             self,
-            Row::Space { .. } | Row::Chat { .. } | Row::Agent { .. } | Row::Running { .. }
+            Row::Space { .. }
+                | Row::Chat { .. }
+                | Row::Agent { .. }
+                | Row::Running { .. }
+                | Row::Need { .. }
+                | Row::Orchestrator { .. }
         )
     }
 }
@@ -1259,6 +1305,7 @@ impl App {
             Some(Row::Blank)
             | Some(Row::Section { .. })
             | Some(Row::Empty { .. })
+            | Some(Row::AllClear)
             | Some(Row::User { .. })
             | None => Vec::new(),
             Some(Row::Chat { id, space_id, .. }) => {
@@ -1281,6 +1328,23 @@ impl App {
                     .and_then(|chat| chat.space_id.clone())
                 {
                     self.selected_space = Some(space);
+                }
+                let effects = self.select_chat(Some(chat_id));
+                self.focus = Focus::Composer;
+                effects
+            }
+            // An inbox row and the orchestrator's slot are their chats too:
+            // answering, retrying and reading the report all happen in the
+            // transcript, and opening the chat is also what marks it seen —
+            // the synced marker that clears the slot's badge everywhere.
+            Some(Row::Need {
+                chat_id, space_id, ..
+            })
+            | Some(Row::Orchestrator {
+                chat_id, space_id, ..
+            }) => {
+                if space_id.is_some() {
+                    self.selected_space = space_id.clone();
                 }
                 let effects = self.select_chat(Some(chat_id));
                 self.focus = Focus::Composer;
@@ -1843,7 +1907,58 @@ impl App {
                 .or_insert(status);
         }
 
-        let mut rows = Vec::with_capacity(self.spaces.len() + self.chats.len() + 6);
+        let mut rows = Vec::with_capacity(self.spaces.len() + self.chats.len() + 10);
+
+        // "Needs you" (gh#122): the inbox, first. Always rendered — when it is
+        // empty the empty state is the reward, a quiet check in words rather
+        // than a gap. Every row says WHO and WHAT; nothing here is a dot.
+        let needs = needs_view::needs_you(
+            self.orchestrator.as_deref(),
+            &self.board.rows,
+            &self.chats,
+            &self.sessions,
+            now,
+        );
+        rows.push(Row::Section {
+            label: needs_view::NEEDS_YOU_TITLE.into(),
+            // The count is the header's whole answer: how many things want me.
+            action: (!needs.is_empty()).then(|| needs.len().to_string()),
+        });
+        if needs.is_empty() {
+            rows.push(Row::AllClear);
+        }
+        for need in needs {
+            rows.push(Row::Need {
+                chat_id: need.chat_id,
+                space_id: need.space_id,
+                who: need.who,
+                what: need.what,
+                kind: need.kind,
+            });
+        }
+
+        // The orchestrator's fixed slot, above Spaces (gh#122): the board's
+        // voice as a pinned thread. Absent only when no orchestrator is pinned
+        // (or its chat has not synced here) — never merely because it has not
+        // spoken yet.
+        if let Some(slot) = needs_view::orchestrator_slot(
+            self.orchestrator.as_deref(),
+            &self.chats,
+            &self.sessions,
+            now,
+        ) {
+            rows.push(Row::Blank);
+            rows.push(Row::Orchestrator {
+                chat_id: slot.chat_id,
+                space_id: slot.space_id,
+                preview: slot.preview,
+                unseen: slot.unseen,
+                indicator: slot.indicator,
+                last_at: slot.last_at,
+            });
+        }
+
+        rows.push(Row::Blank);
         rows.push(Row::Section {
             label: "Spaces".into(),
             action: Some("+".into()),
@@ -1890,12 +2005,19 @@ impl App {
         }
 
         // Running, under them: everything working that the board did NOT
-        // release (gh#117) — the pinned orchestrator, an ad-hoc agent chat, a
-        // session somebody started by hand. Same shape, separate group, because
-        // these have no issue, branch, cap or bill behind them; the board rows
-        // are read only to subtract the attempts, so a box hosting no board
-        // fills this group all the same.
-        let running = board_view::running_rows(&self.board.rows, &self.chats, &self.sessions, now);
+        // release (gh#117) — an ad-hoc agent chat, a session somebody started
+        // by hand. Same shape, separate group, because these have no issue,
+        // branch, cap or bill behind them; the board rows are read only to
+        // subtract the attempts, so a box hosting no board fills this group
+        // all the same. The pinned orchestrator is subtracted too — its slot
+        // above Spaces carries its live state (gh#122).
+        let running = board_view::running_rows(
+            &self.board.rows,
+            &self.chats,
+            &self.sessions,
+            self.orchestrator.as_deref(),
+            now,
+        );
         if !running.is_empty() {
             let blocked = board_view::running_needing_attention(&running);
             rows.push(Row::Blank);
@@ -1928,15 +2050,10 @@ impl App {
             .map(|chat| (display_status(chat, self.session_for(&chat.id), now), chat))
             .collect();
         view::sort_active(&mut active);
-        // ...and then the orchestrator on top of it, if this board has one. It
-        // is pinned in the literal sense: recency decides every other row's
-        // position and this one's position is the designation.
-        if let Some(pinned) = self.orchestrator.as_deref()
-            && let Some(at) = active.iter().position(|(_, chat)| chat.id == pinned)
-        {
-            let row = active.remove(at);
-            active.insert(0, row);
-        }
+        // The orchestrator is NOT floated here any more (gh#122): its pinned
+        // place is the slot above Spaces, and this list treats its chat like
+        // any other — at the recency it earned, still wearing the ◆ mark so
+        // the two are recognisably one thing.
         if active.is_empty() {
             rows.push(Row::Empty {
                 label: "No sessions yet".into(),
@@ -2103,7 +2220,10 @@ impl App {
             .and_then(|device| device.last_seen_at)
         {
             Some(seen) => {
-                now.signed_duration_since(seen).num_milliseconds() <= view::SESSION_STALE_MS
+                // The shared presence window — the gpui app's devices page and
+                // space rows use the same one, so the two surfaces can never
+                // disagree about the same device (gh#126).
+                now.signed_duration_since(seen).num_milliseconds() <= view::PRESENCE_STALE_MS
             }
             // No record yet (registry still arriving, or another user's device):
             // say nothing rather than claim an outage we cannot see.
@@ -3940,12 +4060,21 @@ mod tests {
 
     // ---- the pinned orchestrator (gh#104) --------------------------------
 
-    /// Every other row's position is recency; the orchestrator's position *is*
-    /// the designation, so it does not slide down the list the moment two other
-    /// sessions say something.
+    /// The pin's place is the fixed slot above Spaces (gh#122) — a pinned
+    /// thread, not a decorated session row. The sessions list keeps recency
+    /// order for everyone, orchestrator included; the ◆ mark alone says which
+    /// chat the slot is.
     #[test]
-    fn the_pinned_orchestrator_sits_at_the_top_of_the_sessions_list() {
+    fn pinning_creates_the_slot_and_leaves_the_sessions_list_to_recency() {
         let mut app = seeded();
+        let slot = |app: &App| {
+            app.rows.iter().find_map(|row| match row {
+                Row::Orchestrator {
+                    chat_id, preview, ..
+                } => Some((chat_id.clone(), preview.clone())),
+                _ => None,
+            })
+        };
         let first_chat = |app: &App| {
             app.rows
                 .iter()
@@ -3957,15 +4086,70 @@ mod tests {
                 })
                 .expect("a chat row")
         };
-        // c2 is the more recent, so it leads before anything is pinned.
+        // Unpinned: no slot, and c2 (the more recent) leads the sessions.
+        assert_eq!(slot(&app), None);
         assert_eq!(first_chat(&app), ("c2".into(), false));
 
         app.apply(Update::Orchestrator(Some("c1".into())));
-        assert_eq!(first_chat(&app), ("c1".into(), true));
-
-        // And unpinning hands the list straight back to recency.
-        app.apply(Update::Orchestrator(None));
+        // The slot exists — before the orchestrator has ever spoken, as the
+        // empty fixture (c1 has no last message in the seed).
+        assert_eq!(slot(&app), Some(("c1".into(), None)));
+        // The slot sits above the Spaces header.
+        let slot_at = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Orchestrator { .. }))
+            .unwrap();
+        let spaces_at = app
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Section { label, .. } if label == "Spaces"))
+            .unwrap();
+        assert!(slot_at < spaces_at, "the slot lives above Spaces");
+        // The sessions list is untouched: recency still leads, and the pinned
+        // chat wears the mark where it is.
         assert_eq!(first_chat(&app), ("c2".into(), false));
+
+        // Unpinning removes the fixture.
+        app.apply(Update::Orchestrator(None));
+        assert_eq!(slot(&app), None);
+    }
+
+    /// The inbox is the first section, and it never goes missing (gh#122):
+    /// quiet is the all-clear in words, and a question is a row that says who
+    /// and what — opening it lands in the chat where answering happens.
+    #[test]
+    fn needs_you_leads_the_sidebar_and_opens_what_asks() {
+        let mut app = seeded();
+        // Quiet: the header leads, the check under it says so in words.
+        assert!(
+            matches!(&app.rows[0], Row::Section { label, action } if label == "Needs you" && action.is_none())
+        );
+        assert!(matches!(&app.rows[1], Row::AllClear));
+
+        // c1 starts asking: the check gives way to a who + what row, and the
+        // header counts it.
+        let mut asking = chat("c1", "s1", 1);
+        asking.last_message_preview = Some("which auth semantics?".into());
+        app.apply(Update::Chats(vec![asking, chat("c2", "s1", 2)]));
+        app.apply(Update::Sessions(vec![session(
+            "c1",
+            SessionStatus::AwaitingInput,
+            0,
+        )]));
+        assert!(
+            matches!(&app.rows[0], Row::Section { action: Some(count), .. } if count == "1")
+        );
+        let Row::Need { who, what, .. } = &app.rows[1] else {
+            panic!("expected a need row, got {:?}", app.rows[1]);
+        };
+        assert_eq!(who, "chat c1");
+        assert_eq!(what, "which auth semantics?");
+
+        // Opening the row opens the chat.
+        app.cursor = 1;
+        app.act(Action::Open);
+        assert_eq!(app.selected_chat.as_deref(), Some("c1"));
     }
 
     /// A pin the board does not know about — an archived chat, a stale id left
