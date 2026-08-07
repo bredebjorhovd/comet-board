@@ -1087,6 +1087,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_BOARD_ORCHESTRATOR
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
+            | methods::READ_BOARD_TASK
             | methods::LIST_BOARD_RUNTIMES
             // `routing.toml` is a file on the board's device, which is exactly
             // why it is forwarded (gh#75): the alternative for a teammate who
@@ -1438,6 +1439,22 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            // The issue text behind one row (gh#132) — read when a detail
+            // surface opens it, never streamed with the rows.
+            methods::READ_BOARD_TASK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let detail = self
+                    .board()?
+                    .task_detail(&p.task_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&detail)
             }
             // The routing surface (gh#75). Served off the board's own paths, so
             // this answers about the config the running loop reads — and keeps

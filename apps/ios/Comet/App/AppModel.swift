@@ -359,6 +359,22 @@ final class AppModel {
                                     replace: replace, bill: bill, billedTo: billedTo)
     }
 
+    /// The issue text behind one row, for the detail sheet (gh#132).
+    ///
+    /// An issue with no description and a read that did not happen come back
+    /// differently, because a blank panel that could mean either is a panel
+    /// nobody can trust.
+    func boardTaskDetail(taskId: String) async -> TaskBody {
+        if demo != nil {
+            // Feel like a read, so the sheet's loading state is explorable.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard let body = DemoDataset.boardBodies[taskId] else { return .empty }
+            return .text(body)
+        }
+        guard let board else { return .failed("Not connected to a board") }
+        return await board.taskDetail(taskId: taskId)
+    }
+
     func cancelBoardTask(taskId: String) async -> String? {
         if let demo {
             demo.cancelAttempt(taskId: taskId)

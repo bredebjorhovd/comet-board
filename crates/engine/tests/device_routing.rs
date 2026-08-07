@@ -557,7 +557,8 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
             source_id: "1".into(),
             identifier: "gh#55".into(),
             title: "relay-forward the board RPCs".into(),
-            body: None,
+            // gh#132: the detail read has to bring this back across the relay.
+            body: Some("The store is on the box; the panel is on the laptop.".into()),
             url: "https://github.com/o/r/issues/55".into(),
             labels: vec![],
             source_state: Some("open".into()),
@@ -691,6 +692,47 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
             "cancel must reach B's board: {err}"
         );
     }
+
+    // gh#132: and so does the detail read. The issue text is in B's store, and
+    // the panel asking for it is on A — the row it draws came over this same
+    // relay, so the body has to be able to follow it.
+    let detail = client
+        .call(
+            methods::READ_BOARD_TASK,
+            serde_json::json!({ "taskId": "task-on-the-box", "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote ReadBoardTask");
+    assert_eq!(
+        detail["id"].as_str(),
+        Some("task-on-the-box"),
+        "the detail is B's row's: {detail}"
+    );
+    assert_eq!(
+        detail["body"].as_str(),
+        Some("The store is on the box; the panel is on the laptop."),
+        "the issue text has to cross the relay too, or the panel that drew the \
+         row over it cannot read the row: {detail}"
+    );
+    // And it stays OFF the streamed rows: a hundred bodies per sync cycle is
+    // exactly the frame this call exists to avoid.
+    assert!(
+        rows[0].get("body").is_none(),
+        "the body must not ride WatchBoard: {rows}"
+    );
+    // An id B has never seen is refused by B, naming the row — not by A saying
+    // it has no board.
+    let missing = client
+        .call(
+            methods::READ_BOARD_TASK,
+            serde_json::json!({ "taskId": "nothing-here", "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect_err("an unknown row is refused");
+    assert!(
+        missing.to_string().contains("nothing-here"),
+        "the refusal must name the row B looked for: {missing}"
+    );
 
     // gh#75: so does the config. `routing.toml` is a file on B's disk, and A
     // is the teammate with no ssh account on B — reading and writing it over
