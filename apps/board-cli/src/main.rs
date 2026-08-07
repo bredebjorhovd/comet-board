@@ -27,6 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod ops;
+// Test-only: it renders the shipped skill's verb table from the clap tree
+// below and fails the build when the committed file disagrees. Nothing at
+// runtime reads it — `skill show` prints the asset, which this keeps honest.
+#[cfg(test)]
+mod skill_doc;
 
 /// Same default as `apps/comet` and `comet-tui`.
 const DEFAULT_IPC_PORT: u16 = 27654;
@@ -284,6 +289,18 @@ enum Command {
         #[arg(long, requires = "slug")]
         ignore: bool,
     },
+    /// Install this skill — the one you are reading — where agents on this
+    /// machine will find it.
+    ///
+    /// The skill is compiled into this binary, so the copy it writes documents
+    /// exactly the flags above. A box installs it from the setup wizard and
+    /// each agent-account slot gets its own on every dispatch; this is the verb
+    /// for the third case — a laptop that drives the board with `--device` and
+    /// whose sessions should speak the same conventions.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// git's askpass helper: print the credential for pushing to the repo named
     /// by COMET_BOARD_ASKPASS_REPO (gh#58).
     ///
@@ -304,6 +321,24 @@ enum Command {
     /// already an hour old when the agent got round to opening the PR.
     #[command(hide = true)]
     GhToken,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Write it into a Claude config dir (default `$CLAUDE_CONFIG_DIR`, else
+    /// `~/.claude`).
+    Install {
+        /// The config dir to install into, when it is not this shell's.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Where the skill is installed, and whether it matches this binary.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the skill this binary ships, stamped with its version.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -434,6 +469,9 @@ fn main() -> Result<()> {
             println!("{}", comet_board::git_credentials::token(&paths, &repo)?);
             Ok(())
         }
+        // Also answered without the engine: the skill is compiled in, and a
+        // laptop installing it has no board of its own to dial (gh#133).
+        Command::Skill { command } => skill(command),
         Command::List {
             state,
             source,
@@ -839,6 +877,94 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+/// `comet-board skill …` — put the shipped skill where agents read it (gh#133).
+///
+/// No engine, no board, no network: everything here is a file the binary is
+/// carrying. That is deliberate — the machine most in need of this verb is a
+/// teammate's laptop, which has no board of its own and reaches the box with
+/// `--device`.
+fn skill(command: SkillCommand) -> Result<()> {
+    use comet_board::skill;
+    match command {
+        SkillCommand::Install { dir } => {
+            let this_shells = dir.is_none();
+            let dir = dir.unwrap_or_else(skill::user_config_dir);
+            let was = skill::status_of(&dir);
+            let installed = skill::install_into(&dir)
+                .with_context(|| format!("installing the skill into {}", dir.display()))?;
+            let path = installed.path.display();
+            match (installed.changed, was) {
+                (false, _) => println!("already v{} · {path}", skill::VERSION),
+                (true, skill::State::Missing) => {
+                    println!("installed v{} · {path}", skill::VERSION)
+                }
+                (true, _) => println!("updated to v{} · {path}", skill::VERSION),
+            }
+            // Only when this is the dir sessions here actually read: told a
+            // `--dir` it would be a claim about somebody else's machine.
+            if this_shells {
+                println!(
+                    "Sessions on this machine discover it on their next start. \
+                     Agent-account slots get their own copy on every dispatch."
+                );
+            }
+            Ok(())
+        }
+        SkillCommand::Status { json } => {
+            let dir = skill::user_config_dir();
+            let slots = comet_board::config::agent_account_dirs();
+            if json {
+                let row = |d: &std::path::Path| {
+                    serde_json::json!({
+                        "dir": d.display().to_string(),
+                        "path": skill::path_in(d).display().to_string(),
+                        "state": describe(&skill::status_of(d)),
+                    })
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "version": skill::VERSION,
+                        "user": row(&dir),
+                        "slots": slots.iter().map(|d| row(d)).collect::<Vec<_>>(),
+                    }))?
+                );
+                return Ok(());
+            }
+            println!("comet-board skill v{} (this binary)", skill::VERSION);
+            println!(
+                "  {:<9} {}",
+                describe(&skill::status_of(&dir)),
+                skill::path_in(&dir).display()
+            );
+            for slot in &slots {
+                println!(
+                    "  {:<9} {} (agent-account slot)",
+                    describe(&skill::status_of(slot)),
+                    skill::path_in(slot).display()
+                );
+            }
+            Ok(())
+        }
+        SkillCommand::Show => {
+            print!("{}", skill::rendered());
+            Ok(())
+        }
+    }
+}
+
+/// One word per state, the same word in `--json` and in the printed column.
+fn describe(state: &comet_board::skill::State) -> String {
+    use comet_board::skill::State;
+    match state {
+        State::Current => "current".into(),
+        State::Stale { version: Some(v) } => format!("v{v}"),
+        State::Stale { version: None } => "edited".into(),
+        State::Missing => "missing".into(),
+        State::Unreadable(e) => format!("unreadable ({e})"),
     }
 }
 

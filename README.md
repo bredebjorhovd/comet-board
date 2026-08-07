@@ -13,6 +13,11 @@ dispatch, review, retry and report while your job reduces to reading its
 summaries. [docs/orchestrator.md](docs/orchestrator.md) is the brief to open
 that chat with.
 
+Sessions on your own machine learn the board's conventions from a skill that
+ships inside the binary — `comet-board skill install` writes it into
+`~/.claude/skills/`, and dispatched agents get their own copy automatically
+([docs/skill.md](docs/skill.md)).
+
 Board code lives in `crates/board`; the port's status, design mapping, and
 remaining work are in [docs/BOARD.md](docs/BOARD.md). Upstream comet is the
 `upstream` remote; everything below this section is its README.

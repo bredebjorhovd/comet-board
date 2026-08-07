@@ -1,0 +1,97 @@
+---
+name: comet-board
+description: Read and drive the comet board — the task board fed by GitHub/Linear that dispatches coding agents into comet chats on the box. Use when asked what work is queued/ready/blocked, to pick up or release a task, to check on a running agent, or when an issue should become an agent. Dispatching starts real agents that commit and open PRs.
+---
+
+The board is one global queue: GitHub (and optionally Linear) issues in, comet
+chats running coding agents out. The board lives on ONE host device (the box);
+`comet-board` speaks to it over the local IPC, or from any other machine with
+`--device <box-name>`.
+
+**Read before acting. Never read board.db directly.**
+
+```bash
+comet-board list --state ready  --json     # what can be picked up
+comet-board list --state review --json     # finished, PR waiting on a human
+comet-board list --state blocked --json    # agent stuck or asking
+comet-board list --json                    # everything, most urgent first
+comet-board --device <box> list ...        # from a machine that isn't the box
+```
+
+**Work you delegate goes THROUGH the board.** `comet-board new "title"
+--dispatch` costs one line and makes the work traceable — branch, PR, review,
+settle, billing. In-chat subagents are for reading and research; anything that
+lands a commit is a ticket. Bypassing the board leaves rows dispatchable under
+you and your agents invisible to every surface.
+
+**Close the issue from the work**: `Closes #N` in a commit on the branch. A
+merged PR settles the row itself.
+
+**Releasing and waiting:**
+
+```bash
+comet-board dispatch --task gh:owner/repo#14 [--account <slot>] [--runtime ..] [--model ..]
+comet-board retry    --task gh:owner/repo#14   # blocked → replace; failed/ready → dispatch
+comet-board wait --timeout 3600 --json [--blocked-is-settled]
+```
+
+`wait` with no --task watches everything in flight when called; it does NOT
+return on blocked unless you pass `--blocked-is-settled` — an orchestrator that
+skips that flag hangs on a child's question forever.
+
+Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
+
+1. Check `dispatchable` first — false means no route; fixing routes is the
+   operator's call (`comet-board routes`, or Settings → Board routing).
+2. Provenance is automatic: your chat id rides COMET_BOARD_CHAT_ID; never
+   fabricate `--via`.
+3. One live attempt per task; a second dispatch fails cleanly. Caps refuse at
+   max_concurrent — report, don't cancel someone else's work.
+4. **Billing**: a dispatch naming no account runs on the box owner's Claude
+   login. Pass `--account <slot>` for whoever should pay; the picker rows and
+   the CLI warn on cross-billing (billing_guard).
+5. Cancel ends the attempt, not the issue; the row returns to ready.
+6. After releasing work, wait for it or say plainly you're leaving it running.
+   With `notify_dispatcher = true` your chat is prompted on settle.
+7. Never dispatch speculatively — a human keypress or explicit instruction
+   releases tasks. Reading is always safe.
+8. New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
+   one verb). `comet-board doctor` explains a board that looks wrong.
+
+The pinned orchestrator's fuller brief: docs/orchestrator.md.
+
+## Every verb
+
+<!-- BEGIN generated verbs — rendered from clap by `cargo test -p comet-board-bin`; rewrite with UPDATE_SKILL=1 -->
+Global flags, on every verb: `--port`, `--data-dir`, `--device`.
+
+| verb | flags | what it is for |
+| --- | --- | --- |
+| `list` | `--state`, `--source`, `--json` | List what is on the board. `--json` for orchestrating agents |
+| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill` | Release a task into a coding-agent chat |
+| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill` | Release a task again — the desktop panel's Retry, from a shell |
+| `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
+| `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
+| `new <title>` | `--body`, `--team`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
+| `stats` | `--since-days`, `--json` | What the board knows about its own throughput |
+| `doctor` | — | Check the environment: keys, engine, routes, repos. Exits non-zero on any failing check |
+| `init` | `--force` | Generate a starter routing.toml from the spaces on this device |
+| `routes` | — | Read and change the board's `routing.toml` — over the RPC, so `--device` reaches the box that hosts the board (gh#75) |
+| `routes list` | `--json` | The routes in force, what is wrong with the config, and what is not routed yet |
+| `routes show` | — | Print `routing.toml` verbatim. Comments and all: this is the file |
+| `routes add <slug>` | `--labels`, `--all-issues` | Route a repo that has a space on the board's device but nothing watching it — the `[[route]]` and `[github] repos` halves, written together |
+| `routes ignore <slug>` | — | Stop offering a repo — you are only reading it |
+| `routes set <route> <key> [value]` | `--unset` | Set one key on one route: `routes set 2 account brede-personal` |
+| `routes defaults <key> [value]` | `--unset` | Set one key under `[defaults]`: `routes defaults max_duration 4h` |
+| `routes edit` | — | Open `routing.toml` in `$EDITOR` and write it back, validated |
+| `onboard [slug]` | `--dir`, `--labels`, `--all-issues`, `--json` | Put a repo the board has never seen on the board: clone it, give it a space, and route it — one verb (gh#97) |
+| `adopt [slug]` | `--labels`, `--all-issues`, `--ignore` | Offer git-detected spaces the board is not watching; adopt one by slug |
+| `skill` | — | Install this skill — the one you are reading — where agents on this machine will find it |
+| `skill install` | `--dir` | Write it into a Claude config dir (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) |
+| `skill status` | `--json` | Where the skill is installed, and whether it matches this binary |
+| `skill show` | — | Print the skill this binary ships, stamped with its version |
+<!-- END generated verbs -->
+
+<!-- comet-board skill {{VERSION}} — shipped with the binary. The source is
+     assets/skills/comet-board/SKILL.md in the comet-board repo; installed
+     copies are overwritten by `comet-board skill install`, so edit the repo. -->

@@ -252,5 +252,8 @@ unreachable repos, routes pointing at spaces that do not exist, an engine that
 is not listening. Prefer it to guessing.
 
 Source lives in this repo (`apps/board-cli`, `crates/board`); `docs/BOARD.md`
-maps the port, and herdr-board's README documents the inherited behavior.
+maps the port, and herdr-board's README documents the inherited behavior. The
+short form of this text is the `comet-board` skill, which ships inside the
+binary and is what a Claude session discovers on its own — `comet-board skill
+install` puts it where sessions on this machine will find it (`docs/skill.md`).
 <!-- END comet-board conventions -->

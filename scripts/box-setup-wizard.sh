@@ -322,9 +322,16 @@ chmod 600 "$BOARD_DIR/github-app.pem" 2>/dev/null || warn "pem not found at $BOA
 board_env GITHUB_APP_PRIVATE_KEY_PATH "$BOARD_DIR/github-app.pem"
 
 # ── 10 ─────────────────────────────────────────────────────────────────
-stage "Routes + doctor"
+stage "Routes, agent skill + doctor"
 say "Seeding routing.toml from this device's spaces, then the truth test:"
 comet-board init 2>/dev/null || note "init needs the daemon up and spaces created — fine to re-run later"
+say ""
+say "The board's own skill, so every Claude session on this box knows the"
+say "conventions (verbs, tickets-first, billing, wait --blocked-is-settled):"
+comet-board skill install || warn "skill install failed — \`comet-board doctor\` will say so"
+note "Ships inside the binary, so \`comet-board skill install\` again after an"
+note "upgrade. Dispatched agents run under an agent-account slot, which gets"
+note "its own copy automatically — nothing to do per slot."
 say ""
 note "Clone the team's repos under ~/dev (or wherever), open them once so"
 note "spaces exist, then: comet-board adopt <slug> — or edit"

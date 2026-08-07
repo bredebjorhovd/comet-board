@@ -33,6 +33,7 @@ pub mod routes;
 pub mod rows;
 pub mod runtime;
 pub mod settled;
+pub mod skill;
 pub mod sources;
 pub mod stats;
 pub mod sync;
