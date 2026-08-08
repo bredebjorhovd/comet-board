@@ -26,7 +26,7 @@ case "$first" in
   emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":false},{"type":"tool_result","tool_use_id":"tool-2","is_error":true}]}}'
   # Informational rate-limit status: stays quiet.
   emit '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}'
-  emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-1","total_cost_usd":0.01}'
+  emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"session_id":"sess-1","total_cost_usd":0.01}'
   ;;
 
 *scenario:askuser*)

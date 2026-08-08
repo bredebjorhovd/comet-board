@@ -176,7 +176,7 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
                 });
             }
         }
-        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
+        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage(_) => {}
     }
     out
 }

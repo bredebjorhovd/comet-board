@@ -540,7 +540,9 @@ fn handle_dispatch(
     if replace && let Some(attempt) = task.live_attempt() {
         // The attempt the retry replaces may still hold a live chat; interrupt
         // it the way a cancel does, then archive the attempt so the fresh
-        // release below can take its place.
+        // release below can take its place. Its tokens are read first, for the
+        // reason `handle_cancel` reads them first (gh#151).
+        engine.record_tokens(Some(runtime), attempt);
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {
@@ -722,6 +724,10 @@ fn handle_cancel(
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
     if let Some(attempt) = task.live_attempt() {
+        // Before the interrupt, while the chat is still there to ask: a cancel
+        // never goes through reconcile, so this is the attempt's last chance
+        // to record what it spent (gh#151).
+        engine.record_tokens(Some(runtime), attempt);
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {

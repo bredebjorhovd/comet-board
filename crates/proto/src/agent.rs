@@ -219,6 +219,75 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// The tokens a turn spent, in the four buckets a provider actually meters.
+///
+/// **Normalized on the Anthropic convention**, which is the one that lets the
+/// four numbers be *added*: [`input_tokens`](Self::input_tokens) is the input
+/// that was NOT served from cache, and the two cache figures are counted apart
+/// from it. Codex reports the opposite shape — its `inputTokens` includes its
+/// `cachedInputTokens` — so its normalizer subtracts before emitting, and a
+/// test pins that, because a total that double-counts the cached half of a
+/// long session is wrong by more than the rest of the page put together.
+///
+/// **Per turn, never cumulative.** Both harnesses emit exactly one
+/// [`AgentEvent::Usage`] per turn: the claude CLI's result frame carries the
+/// turn's own totals, and the codex app-server's repeated
+/// `thread/tokenUsage/updated` snapshots are held and flushed once at
+/// `turn/completed`. So summing the events in a run journal is a sum over
+/// turns, and that is what the board records against an attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TokenUsage {
+    /// Fresh input — prompt tokens the provider had to read, cache aside.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Input served out of the prompt cache.
+    pub cache_read_tokens: u64,
+    /// Input written *into* the prompt cache.
+    pub cache_creation_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Every token the provider handled — the headline number. A plain sum,
+    /// which is only sound because the buckets are disjoint by construction.
+    pub fn total(&self) -> u64 {
+        self.input_total() + self.output_tokens
+    }
+
+    /// All input, cached and not.
+    pub fn input_total(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+    }
+
+    /// Nothing was spent. Distinct from "nothing was *reported*", which is an
+    /// `Option<TokenUsage>` being `None` — see [`crate::view::stats`].
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Saturating, because a corrupt frame must not wrap a running total.
+    pub fn merged(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(other.cache_read_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_add(other.cache_creation_tokens),
+        }
+    }
+
+    pub fn add(&mut self, other: Self) {
+        *self = self.merged(other);
+    }
+}
+
+impl std::iter::Sum for TokenUsage {
+    fn sum<I: Iterator<Item = TokenUsage>>(iter: I) -> Self {
+        iter.fold(Self::default(), Self::merged)
+    }
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -256,12 +325,14 @@ pub enum AgentEvent {
         id: String,
         is_error: bool,
     },
-    /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
-    #[serde(rename_all = "camelCase")]
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-    },
+    /// What one *turn* spent, in [`TokenUsage`]'s four buckets. A harness
+    /// passthrough (never persisted into docs); the run journal keeps it, and
+    /// the board sums it onto its attempt rows (gh#151).
+    ///
+    /// Per turn, not per run and not cumulative — see [`TokenUsage`] for why
+    /// that is the one property both harnesses had to be settled on before
+    /// anything could be added up.
+    Usage(TokenUsage),
     Error {
         message: String,
     },
@@ -321,6 +392,60 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    /// The event is journaled to disk, and journals outlive a release. A
+    /// two-field `usage` line written before gh#151 must still parse — as
+    /// zeroes in the two buckets nobody recorded, which is what "we did not
+    /// know" looks like when it is added to a total.
+    #[test]
+    fn a_usage_line_written_before_the_cache_fields_existed_still_parses() {
+        let old = r#"{"type":"usage","inputTokens":10,"outputTokens":20}"#;
+        let ev: AgentEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            ev,
+            AgentEvent::Usage(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                ..Default::default()
+            })
+        );
+        // And the widened event keeps the same flat wire shape, so a reader
+        // that only knows the old two fields still finds them.
+        let json = serde_json::to_value(AgentEvent::Usage(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 3,
+            cache_creation_tokens: 4,
+        }))
+        .unwrap();
+        assert_eq!(json["type"], "usage");
+        assert_eq!(json["inputTokens"], 1);
+        assert_eq!(json["cacheReadTokens"], 3);
+        assert_eq!(json["cacheCreationTokens"], 4);
+    }
+
+    #[test]
+    fn the_buckets_add_up_without_counting_the_cache_twice() {
+        let a = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_tokens: 900,
+            cache_creation_tokens: 50,
+        };
+        assert_eq!(a.input_total(), 1_050);
+        assert_eq!(a.total(), 1_060);
+        assert!(!a.is_zero());
+        assert!(TokenUsage::default().is_zero());
+        // Summing turns is how a run's total is built.
+        let run: TokenUsage = [a, a].into_iter().sum();
+        assert_eq!(run.total(), 2_120);
+        // Saturating, so one corrupt frame cannot wrap a running total.
+        let huge = TokenUsage {
+            input_tokens: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(huge.merged(a).input_tokens, u64::MAX);
     }
 
     #[test]

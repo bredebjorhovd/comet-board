@@ -359,10 +359,15 @@ impl Normalizer {
                 if let Some(id) = &f.session_id {
                     self.session_id = Some(id.clone());
                 }
-                let usage = AgentEvent::Usage {
+                // Straight across: the CLI already reports the four buckets in
+                // the shape `TokenUsage` normalizes on (uncached input apart
+                // from the two cache figures), so nothing is derived here.
+                let usage = AgentEvent::Usage(comet_proto::TokenUsage {
                     input_tokens: f.usage.input_tokens,
                     output_tokens: f.usage.output_tokens,
-                };
+                    cache_read_tokens: f.usage.cache_read_input_tokens,
+                    cache_creation_tokens: f.usage.cache_creation_input_tokens,
+                });
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
                         status: if interrupted {

@@ -18,14 +18,25 @@
 //! `comet_proto::view::stats`, so the CLI, this page and anything after it
 //! agree on the arithmetic.
 //!
+//! **Tokens (gh#151)** sit between the dispatch chart and where the work
+//! landed: the headline processed, the four buckets it splits into, the
+//! provider share, a day series, and a per-model table. Counts only — what a
+//! token costs depends on a seat and a price table the board does not have,
+//! and a number that looks like money is read as money. Every token card
+//! carries its coverage as the aside, because a total summed from two of five
+//! attempts is not the window's spend, and a window that reported nothing says
+//! so instead of drawing zeroes.
+//!
 //! Descriptive, like the CLI it shares a source with: it reports what
 //! happened. Nothing here grades the operator.
 
 use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 
 use comet_proto::view::board;
+use comet_proto::TokenUsage;
 use comet_proto::view::stats::{
-    BoardStats, Tally, WINDOWS, bar_fraction, human_minutes, peak_dispatches, percent, ranked_top,
+    BoardStats, Tally, TokenTally, WINDOWS, bar_fraction, human_minutes, human_tokens,
+    peak_dispatches, peak_tokens, percent, ranked_top, ranked_tokens,
 };
 use comet_rpc::methods;
 
@@ -324,6 +335,274 @@ impl StatsPage {
             .into_any_element()
     }
 
+    /// Tokens per day, one tone.
+    ///
+    /// The dispatch chart above it splits its bars because "how much of a
+    /// day's work landed" is a proportion; this one does not, because tokens
+    /// have no such second number yet. What it does share is the day range —
+    /// the two series are generated from one calendar, so a spike here sits
+    /// under the day that caused it.
+    fn render_token_chart(stats: &BoardStats, theme: &Theme) -> AnyElement {
+        let peak = peak_tokens(&stats.daily_tokens);
+        if peak == 0 {
+            return div()
+                .px(px(20.0))
+                .py(px(18.0))
+                .text_size(px(12.5))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(
+                    "No day in this window has usage to show.",
+                ))
+                .into_any_element();
+        }
+        let bars: Vec<AnyElement> = stats
+            .daily_tokens
+            .iter()
+            .map(|day| {
+                let total = day.usage.total();
+                // Against the peak day and not the total, for the reason the
+                // dispatch chart is: the question is which day was expensive.
+                let fraction = if peak == 0 {
+                    0.0
+                } else {
+                    (total as f32 / peak as f32).clamp(0.0, 1.0)
+                };
+                div()
+                    .flex_1()
+                    .min_w(px(3.0))
+                    .h(px(CHART_HEIGHT))
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(CHART_HEIGHT * fraction
+                                + if total > 0 { 2.0 } else { 0.0 }))
+                            .rounded(px(3.0))
+                            .bg(theme.accent.opacity(0.7)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let first = stats
+            .daily_tokens
+            .first()
+            .map(|d| d.date.clone())
+            .unwrap_or_default();
+        let last = stats
+            .daily_tokens
+            .last()
+            .map(|d| d.date.clone())
+            .unwrap_or_default();
+        div()
+            .px(px(20.0))
+            .py(px(16.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(3.0))
+                    .h(px(CHART_HEIGHT))
+                    .children(bars),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(first))
+                    .child(SharedString::from(format!(
+                        "peak {}/day",
+                        human_tokens(peak)
+                    )))
+                    .child(SharedString::from(last)),
+            )
+            .into_any_element()
+    }
+
+    /// A token tally as label + share bar + total — the provider split, and
+    /// anything else that divides the same pot.
+    fn render_token_tally(theme: &Theme, rows: Vec<TokenTally>) -> AnyElement {
+        let peak = rows.iter().map(|t| t.usage.total()).max().unwrap_or(0);
+        let children: Vec<AnyElement> = rows
+            .into_iter()
+            .map(|row| {
+                let total = row.usage.total();
+                let fraction = if peak == 0 {
+                    0.0
+                } else {
+                    (total as f32 / peak as f32).clamp(0.0, 1.0)
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .flex_none()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(theme.text)
+                            .child(SharedString::from(row.label)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(6.0))
+                            .rounded(px(3.0))
+                            .bg(theme.white_alpha(0.05))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fraction))
+                                    .rounded(px(3.0))
+                                    .bg(theme.accent.opacity(0.6)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(58.0))
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(human_tokens(total))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .px(px(20.0))
+            .py(px(14.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .children(children)
+            .into_any_element()
+    }
+
+    /// The per-model table: where the tokens went, and into which bucket.
+    ///
+    /// A table rather than bars, because the interesting comparison here is
+    /// across *columns* — a model whose input is almost all cache reads is a
+    /// different fact from one whose input is fresh every turn, and a single
+    /// bar per row cannot say which.
+    fn render_token_table(theme: &Theme, rows: Vec<TokenTally>) -> AnyElement {
+        let cell = |theme: &Theme, text: String, head: bool, lead: bool| {
+            let base = div()
+                .when(lead, |el| el.flex_1().min_w_0().truncate())
+                .when(!lead, |el| el.w(px(72.0)).flex_none().text_right())
+                .text_size(px(12.0));
+            if head {
+                base.text_color(theme.text_faint)
+                    .child(SharedString::from(text))
+            } else {
+                base.text_color(theme.text_muted)
+                    .child(SharedString::from(text))
+            }
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(cell(theme, "Model".into(), true, true))
+            .child(cell(theme, "Uncached".into(), true, false))
+            .child(cell(theme, "Cached".into(), true, false))
+            .child(cell(theme, "Writes".into(), true, false))
+            .child(cell(theme, "Output".into(), true, false))
+            .child(cell(theme, "Total".into(), true, false));
+        let body: Vec<AnyElement> = rows
+            .into_iter()
+            .map(|row| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(theme.text)
+                            .child(SharedString::from(row.label)),
+                    )
+                    .child(cell(
+                        theme,
+                        human_tokens(row.usage.input_tokens),
+                        false,
+                        false,
+                    ))
+                    .child(cell(
+                        theme,
+                        human_tokens(row.usage.cache_read_tokens),
+                        false,
+                        false,
+                    ))
+                    .child(cell(
+                        theme,
+                        human_tokens(row.usage.cache_creation_tokens),
+                        false,
+                        false,
+                    ))
+                    .child(cell(
+                        theme,
+                        human_tokens(row.usage.output_tokens),
+                        false,
+                        false,
+                    ))
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .flex_none()
+                            .text_right()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(human_tokens(row.usage.total()))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .px(px(20.0))
+            .py(px(14.0))
+            .flex()
+            .flex_col()
+            .gap(px(9.0))
+            .child(header)
+            .children(body)
+            .into_any_element()
+    }
+
+    /// The coverage sentence — what share of the window's attempts the totals
+    /// above it actually account for.
+    ///
+    /// It rides on every token card as the aside, not in a panel of its own,
+    /// because a total read without it is a total read wrong: attempts that
+    /// predate the recording, and harnesses that meter nothing, are simply
+    /// absent from the sums. An honest "62% of attempts reported usage" is
+    /// worth more than a figure that quietly under-reports.
+    fn coverage_note(stats: &BoardStats) -> Option<String> {
+        let share = percent(stats.token_coverage)?;
+        Some(format!(
+            "{share} of attempts reported usage ({} of {})",
+            stats.attempts_with_tokens, stats.attempts
+        ))
+    }
+
     /// A ranked tally as label + bar + count.
     fn render_tally(theme: &Theme, rows: Vec<Tally>) -> AnyElement {
         let peak = rows.iter().map(|t| t.count).max().unwrap_or(0);
@@ -604,6 +883,99 @@ impl Render for StatsPage {
             Some("solid = ended in done".into()),
             self.render_chart(&stats, &theme),
         ));
+
+        // ── what it spent (gh#151) ──────────────────────────────────────────
+        // Counts only. What a token costs depends on a seat, a plan and a
+        // price table none of which the board knows, and a number that looks
+        // like money is read as money.
+        let coverage = Self::coverage_note(&stats);
+        if !stats.has_tokens() {
+            // Never a wall of zeroes: nothing reported is a fact about the
+            // board's records, not about what the work cost.
+            column = column.child(Self::card(
+                &theme,
+                "Tokens",
+                coverage.clone(),
+                div()
+                    .px(px(20.0))
+                    .py(px(18.0))
+                    .text_size(px(12.5))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(
+                        "No attempt in this window reported token usage. \
+                         Attempts from before the board recorded it stay blank \
+                         rather than reading as free.",
+                    ))
+                    .into_any_element(),
+            ));
+        } else {
+            let tokens: TokenUsage = stats.tokens;
+            // The headline, then the split of it. `processed` first because it
+            // is the number somebody opened the page for; the rest explains it.
+            column = column.child(
+                div()
+                    .mt(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.0))
+                    .child(Self::tile(
+                        &theme,
+                        human_tokens(tokens.total()),
+                        "tokens processed",
+                    ))
+                    .child(Self::tile(
+                        &theme,
+                        human_tokens(tokens.input_tokens),
+                        "uncached input",
+                    ))
+                    .child(Self::tile(
+                        &theme,
+                        human_tokens(tokens.cache_read_tokens),
+                        "cached input",
+                    ))
+                    .child(Self::tile(
+                        &theme,
+                        human_tokens(tokens.cache_creation_tokens),
+                        "cache writes",
+                    ))
+                    .child(Self::tile(
+                        &theme,
+                        human_tokens(tokens.output_tokens),
+                        "output",
+                    )),
+            );
+
+            if !stats.tokens_by_runtime.is_empty() {
+                column = column.child(Self::card(
+                    &theme,
+                    "By provider",
+                    coverage.clone(),
+                    Self::render_token_tally(
+                        &theme,
+                        ranked_tokens(&stats.tokens_by_runtime, TALLY_ROWS),
+                    ),
+                ));
+            }
+
+            column = column.child(Self::card(
+                &theme,
+                "Tokens per day",
+                Some("tokens processed".into()),
+                Self::render_token_chart(&stats, &theme),
+            ));
+
+            if !stats.tokens_by_model.is_empty() {
+                column = column.child(Self::card(
+                    &theme,
+                    "By model",
+                    coverage,
+                    Self::render_token_table(
+                        &theme,
+                        ranked_tokens(&stats.tokens_by_model, TALLY_ROWS),
+                    ),
+                ));
+            }
+        }
 
         // ── where it landed ─────────────────────────────────────────────────
         // The question a completion rate only half-answers: an attempt can end

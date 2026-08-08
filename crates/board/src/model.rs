@@ -442,6 +442,22 @@ pub struct Attempt {
     /// a wrongly-settled attempt is re-opened, which un-archives the chat in
     /// the same motion.
     pub chat_archived_at: Option<String>,
+    /// What this attempt spent, summed off its chat's run journal (gh#151).
+    ///
+    /// `None` is **"nothing was reported"**, not zero: every attempt made
+    /// before the board recorded tokens has it, as does any run on a harness
+    /// that meters nothing. The stats page keeps that distinction all the way
+    /// to the pixel — a blank, never a 0, because a zero reads as free work —
+    /// and says what share of a window it could account for.
+    ///
+    /// Refreshed on every reconcile while the attempt is live, so one that is
+    /// cancelled or orphaned keeps what it had spent up to the last tick.
+    pub tokens: Option<comet_proto::TokenUsage>,
+    /// The model the harness said it was running, recorded beside the tokens
+    /// (gh#151). Not the route's override — see
+    /// [`crate::runtime::RunTokens`] for why that is nearly always `None` and
+    /// this nearly always is not.
+    pub model: Option<String>,
 }
 
 impl Attempt {

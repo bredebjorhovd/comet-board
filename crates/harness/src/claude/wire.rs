@@ -140,12 +140,23 @@ pub(crate) struct ResultFrame {
     pub session_id: Option<String>,
 }
 
+/// The result frame's `usage` block. `input_tokens` here is the *uncached*
+/// input only — the cached halves are the two fields below it, and on a long
+/// session they are the overwhelming majority of what the turn read. Reading
+/// only the first two (which is what shipped) under-reported a run by an order
+/// of magnitude; gh#151.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct UsageBody {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Input written into the prompt cache by this turn.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Input this turn read back out of it.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
 }
 
 /// A CLI→client control request (`can_use_tool` is the one we act on).

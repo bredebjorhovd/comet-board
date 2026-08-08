@@ -18,7 +18,16 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::AgentEvent;
+use comet_proto::{AgentEvent, TokenUsage};
+
+/// What [`RunJournal::tokens`] found in a chat's journal: everything it spent,
+/// and the model the harness said was spending it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalTokens {
+    pub usage: TokenUsage,
+    /// `None` on a journal whose runs never named a model.
+    pub model: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -153,6 +162,60 @@ impl RunJournal {
         Ok(all.into_iter().filter(|(seq, _)| *seq > from).collect())
     }
 
+    /// Everything a chat has spent, summed off its journal (gh#151).
+    ///
+    /// The journal is the right source and not a live counter: it is already
+    /// the durable record of the run (the settle authority, `last_event`), so
+    /// an engine restart mid-attempt loses nothing, and a total read here is
+    /// the same total the transcript would give.
+    ///
+    /// [`AgentEvent::Usage`] is emitted once per *turn* by both harnesses (see
+    /// [`TokenUsage`]), so this sum is a sum over turns. `None` means the chat
+    /// reported no usage at all — a journal that predates gh#151, a harness
+    /// that meters nothing, a run that never started. Never `Some(zero)` for
+    /// those: the board renders "no usage reported" as a blank, and a zero
+    /// would read as work that was free.
+    ///
+    /// Lines are filtered by tag before they are parsed, because a long run's
+    /// journal is mostly text deltas and this is called on every reconcile.
+    pub fn tokens(&self, chat_id: &str) -> Result<Option<JournalTokens>, JournalError> {
+        const USAGE_TAG: &str = r#""type":"usage""#;
+        const STARTED_TAG: &str = r#""type":"sessionStarted""#;
+        let path = self.path_for(chat_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = JournalTokens::default();
+        let mut reported = false;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.contains(USAGE_TAG) && !line.contains(STARTED_TAG) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<JournalLine>(&line) else {
+                continue;
+            };
+            match parsed.event {
+                AgentEvent::Usage(usage) => {
+                    out.usage.add(usage);
+                    reported = true;
+                }
+                // The model the harness said it was actually running, which is
+                // the only place it is stated: a route names one on maybe one
+                // dispatch in ten, and the harness default is what the rest
+                // ran on. Last wins — a resumed chat can change model, and
+                // what it is on now is the more useful of the two.
+                AgentEvent::SessionStarted { model, .. } if !model.is_empty() => {
+                    out.model = Some(model);
+                }
+                _ => {}
+            }
+        }
+        Ok(reported.then_some(out))
+    }
+
     /// The last event in a chat's journal, if any (ignores a torn tail line).
     pub fn last_event(&self, chat_id: &str) -> Result<Option<(u64, AgentEvent)>, JournalError> {
         let path = self.path_for(chat_id);
@@ -265,6 +328,94 @@ mod tests {
             error: None,
             session_id: None,
         }
+    }
+
+    fn usage(input: u64, output: u64) -> AgentEvent {
+        AgentEvent::Usage(TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: input * 10,
+            cache_creation_tokens: 1,
+        })
+    }
+
+    fn started(model: &str) -> AgentEvent {
+        AgentEvent::SessionStarted {
+            harness: comet_proto::HarnessId::ClaudeCode,
+            model: model.into(),
+            tools: Vec::new(),
+            cwd: "/tmp".into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        }
+    }
+
+    /// One `Usage` event per turn, so a run's total is the sum over its turns
+    /// — the property gh#151 had to settle before anything could be added up.
+    #[test]
+    fn a_runs_tokens_are_the_sum_of_its_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &started("claude-opus-5")).unwrap();
+        journal.append("chat-1", &text("thinking")).unwrap();
+        journal.append("chat-1", &usage(100, 10)).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        // A second turn in the same chat.
+        journal.append("chat-1", &usage(50, 5)).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+
+        let tokens = journal.tokens("chat-1").unwrap().expect("reported");
+        assert_eq!(tokens.usage.input_tokens, 150);
+        assert_eq!(tokens.usage.output_tokens, 15);
+        assert_eq!(tokens.usage.cache_read_tokens, 1_500);
+        assert_eq!(tokens.usage.cache_creation_tokens, 2);
+        assert_eq!(tokens.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// A chat that reported nothing is `None`, never `Some(zero)`: the board
+    /// leaves such an attempt blank, and a zero would read as free work.
+    #[test]
+    fn a_chat_that_reported_nothing_says_nothing_rather_than_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.tokens("never-ran").unwrap(), None);
+        journal.append("chat-1", &started("mock")).unwrap();
+        journal.append("chat-1", &text("hello")).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(
+            journal.tokens("chat-1").unwrap(),
+            None,
+            "a harness that meters nothing is not a harness that spent nothing"
+        );
+    }
+
+    /// The scan filters lines by tag before parsing them. A transcript that
+    /// happens to *contain* the tag (an agent pasting its own journal, say)
+    /// must not be mistaken for a usage event.
+    #[test]
+    fn text_that_merely_looks_like_a_usage_line_is_not_counted_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append("chat-1", &text(r#"{"type":"usage","inputTokens":9999}"#))
+            .unwrap();
+        journal.append("chat-1", &usage(1, 1)).unwrap();
+        let tokens = journal.tokens("chat-1").unwrap().expect("reported");
+        assert_eq!(tokens.usage.input_tokens, 1);
+    }
+
+    /// The model last announced wins — a chat resumed on another model is on
+    /// that one now, and that is the more useful of the two answers.
+    #[test]
+    fn the_model_recorded_is_the_one_the_last_run_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &started("claude-sonnet-5")).unwrap();
+        journal.append("chat-1", &usage(1, 1)).unwrap();
+        journal.append("chat-1", &started("claude-opus-5")).unwrap();
+        journal.append("chat-1", &usage(1, 1)).unwrap();
+        let tokens = journal.tokens("chat-1").unwrap().expect("reported");
+        assert_eq!(tokens.model.as_deref(), Some("claude-opus-5"));
     }
 
     #[test]

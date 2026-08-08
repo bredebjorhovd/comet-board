@@ -19,7 +19,10 @@ use std::sync::Arc;
 /// The shape lives in proto so the viewports can deserialize a `BoardStats`
 /// reply without linking this crate (the [`crate::runtime::RuntimeOption`]
 /// split, for the same reason). What it *contains* is this module's.
-pub use comet_proto::view::stats::{BoardStats as Stats, DayBucket, Friction, Landing};
+pub use comet_proto::TokenUsage;
+pub use comet_proto::view::stats::{
+    BoardStats as Stats, DayBucket, Friction, Landing, TokenDay, human_tokens,
+};
 
 fn minutes(a: &Attempt) -> Option<i64> {
     let start = chrono::DateTime::parse_from_rfc3339(&a.started_at).ok()?;
@@ -56,12 +59,14 @@ fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
     sorted.get(rank.saturating_sub(1)).copied()
 }
 
-/// Every day from the first dispatch to today, zeroes included — a chart with
-/// holes in it reads as missing data rather than as a quiet Sunday.
-fn day_series(
-    counts: &BTreeMap<String, (usize, usize)>,
-    since_days: Option<i64>,
-) -> Vec<DayBucket> {
+/// Every day the charts cover, oldest first — from the first dispatch (or the
+/// start of the window) to today, quiet days included. A chart with holes in it
+/// reads as missing data rather than as a quiet Sunday.
+///
+/// One range for every series, so the dispatch bars and the token bars under
+/// them are the same days in the same order and a reader comparing them index
+/// by index is comparing like with like.
+fn day_range(counts: &BTreeMap<String, (usize, usize)>, since_days: Option<i64>) -> Vec<String> {
     let today = chrono::Local::now().date_naive();
     let first = match (counts.keys().next(), since_days) {
         // A window says where the chart starts even if nothing ran on day one.
@@ -75,16 +80,32 @@ fn day_series(
     let mut out = Vec::new();
     let mut day = first;
     while day <= today {
-        let key = day.format("%Y-%m-%d").to_string();
-        let (dispatches, done) = counts.get(&key).copied().unwrap_or((0, 0));
-        out.push(DayBucket {
-            date: key,
-            dispatches,
-            done,
-        });
+        out.push(day.format("%Y-%m-%d").to_string());
         day += chrono::Duration::days(1);
     }
     out
+}
+
+fn day_series(days: &[String], counts: &BTreeMap<String, (usize, usize)>) -> Vec<DayBucket> {
+    days.iter()
+        .map(|date| {
+            let (dispatches, done) = counts.get(date).copied().unwrap_or((0, 0));
+            DayBucket {
+                date: date.clone(),
+                dispatches,
+                done,
+            }
+        })
+        .collect()
+}
+
+fn token_day_series(days: &[String], counts: &BTreeMap<String, TokenUsage>) -> Vec<TokenDay> {
+    days.iter()
+        .map(|date| TokenDay {
+            date: date.clone(),
+            usage: counts.get(date).copied().unwrap_or_default(),
+        })
+        .collect()
 }
 
 pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
@@ -101,10 +122,18 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
     let mut by_account: BTreeMap<String, usize> = BTreeMap::new();
     let mut durations: Vec<i64> = Vec::new();
     let mut days: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut token_days: BTreeMap<String, TokenUsage> = BTreeMap::new();
     let mut hour_of_day = vec![0usize; 24];
     let mut live = 0;
     let mut agent_dispatched = 0;
     let mut friction = Friction::default();
+    // Tokens are summed only over attempts that reported any. An attempt with
+    // no record contributes nothing and is counted out of the coverage below,
+    // rather than adding a zero that would quietly deflate every total.
+    let mut tokens = TokenUsage::default();
+    let mut attempts_with_tokens = 0usize;
+    let mut tokens_by_model: BTreeMap<String, TokenUsage> = BTreeMap::new();
+    let mut tokens_by_runtime: BTreeMap<String, TokenUsage> = BTreeMap::new();
 
     for (task, a) in &attempts {
         match a.outcome {
@@ -139,15 +168,35 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         if let Some(m) = minutes(a) {
             durations.push(m);
         }
+        // What it spent, where it is known (gh#151). Bucketed by the model the
+        // harness announced and by the runtime that ran it; an attempt whose
+        // journal never named a model is still counted in the totals and in
+        // the runtime split, and says so in its own row rather than being
+        // dropped from a table that would then not add up.
+        if let Some(usage) = a.tokens {
+            tokens.add(usage);
+            attempts_with_tokens += 1;
+            let model = a.model.clone().unwrap_or_else(|| "unnamed model".into());
+            tokens_by_model.entry(model).or_default().add(usage);
+            tokens_by_runtime
+                .entry(a.runtime.clone())
+                .or_default()
+                .add(usage);
+        }
         if let Some(start) = started_local(a) {
             use chrono::Timelike as _;
             hour_of_day[start.hour() as usize] += 1;
-            let entry = days
-                .entry(start.date_naive().format("%Y-%m-%d").to_string())
-                .or_default();
+            let key = start.date_naive().format("%Y-%m-%d").to_string();
+            let entry = days.entry(key.clone()).or_default();
             entry.0 += 1;
             if a.outcome == Some(Outcome::Done) {
                 entry.1 += 1;
+            }
+            // Against the day the attempt *started*, like the dispatch bar
+            // above it — an overnight run's tokens belong to the evening
+            // somebody released it, which is the day they are looking for.
+            if let Some(usage) = a.tokens {
+                token_days.entry(key).or_default().add(usage);
             }
         }
     }
@@ -185,6 +234,8 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         }
     }
 
+    let calendar = day_range(&days, since_days);
+
     Stats {
         since_days,
         attempts: attempts.len(),
@@ -196,15 +247,27 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         p90_minutes: percentile(&durations, 0.9),
         longest_minutes: durations.last().copied(),
         total_minutes: durations.iter().sum(),
+        tokens,
+        attempts_with_tokens,
+        // The coverage line, and the same `None`-not-zero rule the completion
+        // rate follows: with nothing dispatched there is no share to take. A
+        // window where attempts ran and none of them reported is a genuine 0%,
+        // and worth saying — it is the difference between a board that spent
+        // nothing and a board that is not counting.
+        token_coverage: (!attempts.is_empty())
+            .then(|| attempts_with_tokens as f64 / attempts.len() as f64),
         landing,
         friction,
-        daily: day_series(&days, since_days),
+        daily: day_series(&calendar, &days),
+        daily_tokens: token_day_series(&calendar, &token_days),
         hour_of_day,
         by_workspace,
         by_runtime,
         by_source,
         by_account,
         agent_dispatched,
+        tokens_by_model,
+        tokens_by_runtime,
     }
 }
 
@@ -255,6 +318,22 @@ pub fn print(s: &Stats) {
             "  {} released by an agent rather than by you",
             s.agent_dispatched
         );
+    }
+    // Never a total without the coverage beside it: a figure summed from two
+    // of five attempts is not the window's tokens, and saying so in the same
+    // line is the only thing that keeps it from being read as if it were.
+    if s.has_tokens() {
+        println!(
+            "  {} tokens ({} in, {} cached, {} out) across {}/{} attempt(s) that reported",
+            human_tokens(s.tokens.total()),
+            human_tokens(s.tokens.input_tokens),
+            human_tokens(s.tokens.cache_read_tokens),
+            human_tokens(s.tokens.output_tokens),
+            s.attempts_with_tokens,
+            s.attempts,
+        );
+    } else {
+        println!("  no attempt in this window reported token usage");
     }
     let line = |label: &str, m: &BTreeMap<String, usize>| {
         if m.len() > 1 {
@@ -360,6 +439,17 @@ mod tests {
             dispatched_by_device: None,
             dispatched_by_user: None,
             billed_to: None,
+            tokens: None,
+            model: None,
+        }
+    }
+
+    fn usage(input: u64, output: u64, read: u64, write: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_creation_tokens: write,
         }
     }
 
@@ -561,6 +651,110 @@ mod tests {
         let s = gather(&[task("t1", vec![paid, free])], None);
         assert_eq!(s.by_account.get("brede@tally.no"), Some(&1));
         assert_eq!(s.by_account.get("the box's own login"), Some(&1));
+    }
+
+    // -- tokens (gh#151) ----------------------------------------------------
+
+    #[test]
+    fn a_window_reports_what_share_of_its_attempts_it_could_account_for() {
+        // The honesty line. Two of three attempts reported; the third ran
+        // before the board recorded tokens. The total is the two, and the page
+        // says so rather than presenting it as the window's spend.
+        let mut metered = attempt(60, 5, Some(Outcome::Done), None);
+        metered.tokens = Some(usage(1_000, 200, 40_000, 3_000));
+        let mut also = attempt(50, 5, Some(Outcome::Done), None);
+        also.tokens = Some(usage(500, 100, 0, 0));
+        let silent = attempt(40, 5, Some(Outcome::Done), None);
+
+        let s = gather(&[task("t1", vec![metered, also, silent])], None);
+        assert_eq!(s.attempts_with_tokens, 2);
+        assert_eq!(s.attempts, 3);
+        assert_eq!(s.token_coverage, Some(2.0 / 3.0));
+        assert_eq!(s.tokens.input_tokens, 1_500);
+        assert_eq!(s.tokens.cache_read_tokens, 40_000);
+        assert_eq!(s.tokens.total(), 44_800);
+        assert!(s.has_tokens());
+    }
+
+    /// A run that reported nothing must never be summed in as a zero — and a
+    /// window of only such runs has no total to show at all, only a 0%.
+    #[test]
+    fn attempts_that_reported_nothing_are_absent_from_the_total_not_zero_in_it() {
+        let s = gather(
+            &[task(
+                "t1",
+                vec![
+                    attempt(60, 5, Some(Outcome::Done), None),
+                    attempt(50, 5, Some(Outcome::Done), None),
+                ],
+            )],
+            None,
+        );
+        assert!(!s.has_tokens());
+        assert!(s.tokens.is_zero());
+        assert_eq!(s.attempts_with_tokens, 0);
+        assert_eq!(
+            s.token_coverage,
+            Some(0.0),
+            "attempts ran and none reported — a real 0%, worth saying"
+        );
+        // Nothing ran at all is a different fact, and has no share.
+        assert_eq!(gather(&[], None).token_coverage, None);
+    }
+
+    #[test]
+    fn tokens_are_split_by_the_model_the_run_named_and_by_the_runtime() {
+        let mut opus = attempt(60, 5, Some(Outcome::Done), None);
+        opus.tokens = Some(usage(100, 10, 0, 0));
+        opus.model = Some("claude-opus-5".into());
+        let mut opus_again = attempt(55, 5, Some(Outcome::Done), None);
+        opus_again.tokens = Some(usage(50, 5, 0, 0));
+        opus_again.model = Some("claude-opus-5".into());
+        // A run whose journal never said. It still counts — dropping it would
+        // leave a per-model table that does not add up to the headline.
+        let mut anonymous = attempt(50, 5, Some(Outcome::Done), None);
+        anonymous.tokens = Some(usage(7, 1, 0, 0));
+        anonymous.runtime = "codex".into();
+
+        let s = gather(&[task("t1", vec![opus, opus_again, anonymous])], None);
+        assert_eq!(s.tokens_by_model["claude-opus-5"].total(), 165);
+        assert_eq!(s.tokens_by_model["unnamed model"].total(), 8);
+        assert_eq!(
+            s.tokens_by_model.values().map(|u| u.total()).sum::<u64>(),
+            s.tokens.total(),
+            "the breakdown accounts for the headline"
+        );
+        assert_eq!(s.tokens_by_runtime["claude-code"].total(), 165);
+        assert_eq!(s.tokens_by_runtime["codex"].total(), 8);
+    }
+
+    #[test]
+    fn the_token_series_covers_the_same_days_as_the_dispatch_series() {
+        // Index-aligned by construction: the page draws one under the other.
+        let mut spent = attempt(10, 5, Some(Outcome::Done), None);
+        spent.tokens = Some(usage(1_000, 100, 0, 0));
+        let s = gather(&[task("t1", vec![spent])], Some(7));
+        assert_eq!(s.daily.len(), 7);
+        assert_eq!(s.daily_tokens.len(), 7);
+        let dates: Vec<&str> = s.daily.iter().map(|d| d.date.as_str()).collect();
+        let token_dates: Vec<&str> = s.daily_tokens.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(dates, token_dates);
+        assert_eq!(s.daily_tokens.last().unwrap().usage.total(), 1_100);
+        assert!(
+            s.daily_tokens[..6].iter().all(|d| d.usage.is_zero()),
+            "quiet days are present with zeroes, like the bars above them"
+        );
+    }
+
+    #[test]
+    fn a_window_excludes_the_tokens_of_the_attempts_it_excludes() {
+        let mut old = attempt(60 * 24 * 10, 5, Some(Outcome::Done), None);
+        old.tokens = Some(usage(9_000, 900, 0, 0));
+        let mut recent = attempt(30, 5, Some(Outcome::Done), None);
+        recent.tokens = Some(usage(100, 10, 0, 0));
+        let t = task("t1", vec![old, recent]);
+        assert_eq!(gather(std::slice::from_ref(&t), None).tokens.total(), 10_010);
+        assert_eq!(gather(&[t], Some(7)).tokens.total(), 110);
     }
 
     #[test]

@@ -7,7 +7,9 @@ A ground-up native rewrite of [comet](../comet) — a multi-device controller fo
 - Sync is Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects.
 - Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
   Everything device-side is Rust.
-- Feature parity with comet **except token-usage display** (poor fit for CRDTs; excluded).
+- Feature parity with comet **except token-usage display in the transcript/docs** (poor fit for
+  CRDTs; excluded). The board keeps its own token totals in `board.db` for its stats page — a
+  different store with a different lifetime (gh#151, docs/BOARD.md §H35).
 - Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
 - One binary, **headed or headless**. Smooth transitions/animations matching the original
@@ -282,9 +284,10 @@ per `docs/research/durable-objects-language.md`.
 
 ## 7. Parity exclusions & deliberate changes
 
-- **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,
-  `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
-  CLIs, not CRDT-synced).
+- **Excluded**: token-usage display *in the CRDT docs* (profile heatmap, lifetime stats,
+  per-message token columns, `WatchUsage`). Rate-limit meters on agent accounts are *kept*
+  (separate concern; probed from CLIs, not CRDT-synced), and so are the board's own per-attempt
+  totals — summed off the host's run journal into `board.db`, never into a session doc (gh#151).
 - **Changed**: Postgres entity sync/server → workspace doc + edge; Electron/React/mugen → gpui with
   ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (comet
   had already made this move); mobile app → out of scope for this repo.
