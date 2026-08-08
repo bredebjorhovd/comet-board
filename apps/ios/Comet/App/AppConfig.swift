@@ -100,6 +100,25 @@ final class AppConfig: @unchecked Sendable {
         return Date().timeIntervalSince1970 > exp - 60
     }
 
+    /// GET /workspace/{orgId}/presence → the devices the workspace room can see
+    /// RIGHT NOW, derived by the edge from its own socket set (gh#145).
+    ///
+    /// This is the ask. Presence is no longer pushed on a 15s timer — that timer
+    /// is what kept the room's Durable Object from ever hibernating, at 83% of
+    /// the daily free tier for an idle fleet — so a viewer that has been away
+    /// asks once when someone actually looks, and believes the answer until the
+    /// room volunteers a newer one.
+    func workspacePresence() async -> Set<String>? {
+        guard let token = await currentToken() else { return nil }
+        var request = URLRequest(url: edgeURL.appending(path: "workspace/\(orgId)/presence"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let devices = body["devices"] as? [String: Any] else { return nil }
+        return Set(devices.keys)
+    }
+
     /// GET /device/{deviceId}/status → whether the device's relay HOST socket
     /// is currently attached (distinct from workspace presence).
     func deviceStatus(deviceId: String) async -> String {

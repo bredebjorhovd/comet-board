@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use loro::awareness::EphemeralStore;
 use loro::{ExportMode, LoroDoc, VersionVector};
 use loro_protocol::{
     BatchId, CrdtType, Permission, ProtocolMessage, UpdateStatusCode, decode, encode,
@@ -58,22 +59,38 @@ struct LiveSocket {
     reader: tokio::task::JoinHandle<()>,
 }
 
+/// One socket on a room, as the real `SessionRoom` sees it: who is on the other
+/// end (`?deviceId=`), and whether they have joined the `%EPH` sub-room.
+struct Member {
+    tx: mpsc::UnboundedSender<WsMessage>,
+    /// The device this socket belongs to — what presence is DERIVED from
+    /// (gh#145). `None` for a socket that named no device, which contributes no
+    /// presence, exactly as on the real edge.
+    device_id: Option<String>,
+    /// Joined `%EPH`, i.e. wants presence broadcasts.
+    eph: bool,
+}
+
 #[derive(Default)]
 struct EdgeState {
     sockets: Vec<LiveSocket>,
     /// Per-room doc, so a rejoining client gets real backfill rather than an
     /// empty answer that would hide a broken resync.
     docs: HashMap<String, LoroDoc>,
-    /// Live member sockets per room — what lets one engine's frames (doc
-    /// updates AND `%EPH` presence heartbeats) reach another engine on the
-    /// same room, exactly as the real edge broadcasts them (gh#126). Dead
-    /// senders are tolerated (their sends fail silently) and replaced by the
-    /// rejoin's registration.
-    members: HashMap<String, Vec<mpsc::UnboundedSender<WsMessage>>>,
+    /// Live member sockets per room — what lets one engine's doc updates reach
+    /// another engine on the same room, exactly as the real edge broadcasts
+    /// them, and what presence is now derived from (gh#145). Dead senders are
+    /// tolerated (their sends fail silently) and replaced by the rejoin's
+    /// registration.
+    members: HashMap<String, Vec<Member>>,
     /// Is the DeviceRoom's host socket claimed right now? This is the fact the
     /// iOS host sweep reads through `GET /device/{id}/status`, and the one that
     /// was false-and-invisible for 25 minutes.
     host_connected: bool,
+    /// `%EPH` writes received FROM clients — the frames that used to wake this
+    /// object every 15s per device, per room, forever (gh#145). The bill was
+    /// this number.
+    client_eph_writes: usize,
 }
 
 struct FakeEdge {
@@ -100,6 +117,10 @@ impl FakeEdge {
         self.state.lock().expect("lock").host_connected
     }
 
+    fn client_eph_writes(&self) -> usize {
+        self.state.lock().expect("lock").client_eph_writes
+    }
+
     /// Redeploy: drop every live socket, exactly as cycling the Durable Objects
     /// does. The edge keeps listening — this is a handover, not an outage.
     fn redeploy(&self) {
@@ -108,6 +129,10 @@ impl FakeEdge {
             socket.reader.abort();
             socket.writer.abort();
         }
+        // Cycling the Durable Objects takes their socket sets with them, which
+        // since gh#145 is where presence lives — a redeployed room knows nobody
+        // until they dial back in.
+        state.members.clear();
         state.host_connected = false;
     }
 }
@@ -211,7 +236,11 @@ async fn serve_socket(
             .members
             .entry(room.clone())
             .or_default()
-            .push(out_tx.clone());
+            .push(Member {
+                tx: out_tx.clone(),
+                device_id: device_id_of(&uri),
+                eph: false,
+            });
     }
     let reader = tokio::spawn({
         let state = state.clone();
@@ -229,6 +258,18 @@ async fn serve_socket(
                     }
                     _ => {}
                 }
+            }
+            // The socket left: drop it from the room's set and re-answer, which
+            // is the whole offline path now that nothing beats (gh#145).
+            if let Some(room) = &room {
+                state
+                    .lock()
+                    .expect("lock")
+                    .members
+                    .entry(room.clone())
+                    .or_default()
+                    .retain(|member| !member.tx.same_channel(&out_tx));
+                publish_presence(&state, room);
             }
         }
     });
@@ -302,6 +343,19 @@ fn serve_room_frame(
                 version: Vec::new(),
                 extra: None,
             });
+            if crdt == CrdtType::LoroEphemeralStore {
+                // A presence joiner: remember it wants broadcasts, then answer
+                // with who this room can see — derived from the socket set, the
+                // way `SessionRoom::publishPresence` does since gh#145.
+                if let Some(members) = state.lock().expect("lock").members.get_mut(room_id) {
+                    for member in members.iter_mut() {
+                        if member.tx.same_channel(out) {
+                            member.eph = true;
+                        }
+                    }
+                }
+                publish_presence(state, room_id);
+            }
         }
         ProtocolMessage::DocUpdate {
             crdt,
@@ -313,6 +367,9 @@ fn serve_room_frame(
                 for update in &updates {
                     let _ = doc.import(update);
                 }
+            }
+            if crdt == CrdtType::LoroEphemeralStore {
+                state.lock().expect("lock").client_eph_writes += 1;
             }
             reply(&ProtocolMessage::Ack {
                 crdt,
@@ -331,8 +388,8 @@ fn serve_room_frame(
                 .map(|members| {
                     members
                         .iter()
-                        .filter(|member| !member.same_channel(out))
-                        .cloned()
+                        .filter(|member| !member.tx.same_channel(out))
+                        .map(|member| member.tx.clone())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -341,6 +398,65 @@ fn serve_room_frame(
             }
         }
         _ => {}
+    }
+}
+
+/// The `?deviceId=` a room socket named itself with, if any — what the real
+/// edge stamps onto the socket attachment so presence can be derived from it.
+fn device_id_of(uri: &str) -> Option<String> {
+    uri.split('?')
+        .nth(1)?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("deviceId="))
+        .map(str::to_string)
+}
+
+/// Answer the room's presence question the way `SessionRoom` does since gh#145:
+/// look at who is actually attached, write one `presence/{deviceId}` entry per
+/// device, and push the whole thing to every `%EPH` member.
+///
+/// Nothing here is on a timer, which is the point — this fires on a join and on
+/// a socket going away, both of which are events the real Durable Object was
+/// already awake for.
+fn publish_presence(state: &Arc<Mutex<EdgeState>>, room_id: &str) {
+    let (present, targets) = {
+        let guard = state.lock().expect("lock");
+        let Some(members) = guard.members.get(room_id) else {
+            return;
+        };
+        let present: Vec<String> = members
+            .iter()
+            .filter_map(|member| member.device_id.clone())
+            .collect();
+        let targets: Vec<mpsc::UnboundedSender<WsMessage>> = members
+            .iter()
+            .filter(|member| member.eph)
+            .map(|member| member.tx.clone())
+            .collect();
+        (present, targets)
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let store = EphemeralStore::new(30_000);
+    let now = chrono::Utc::now().timestamp_millis();
+    for device_id in &present {
+        store.set(&format!("presence/{device_id}"), now);
+    }
+    let encoded = store.encode_all();
+    if encoded.is_empty() {
+        return;
+    }
+    let Ok(bytes) = encode(&ProtocolMessage::DocUpdate {
+        crdt: CrdtType::LoroEphemeralStore,
+        room_id: room_id.into(),
+        updates: vec![encoded],
+        batch_id: BatchId([0; 8]),
+    }) else {
+        return;
+    };
+    for target in targets {
+        let _ = target.send(WsMessage::Binary(bytes.clone()));
     }
 }
 
@@ -486,17 +602,22 @@ async fn health_reports_the_dark_window_rather_than_hiding_it() {
     .await;
 }
 
-/// The gh#126 exit criterion: a box whose engine is up and roomed never reads
-/// offline on another device for longer than one staleness window.
+/// The gh#126 exit criterion, over the gh#145 mechanism: a box whose engine is
+/// up and roomed never reads offline on another device for longer than one
+/// staleness window.
 ///
 /// Two engines (the "box" and a "viewer" — same user, same org, as Brede's Mac
-/// and box are) share the fake edge. The box's 15s ephemeral heartbeat must
-/// reach the viewer and fold into its device row's `lastSeenAt` — the exact
-/// value every sidebar's presence verdict reads. Then the edge is redeployed
-/// (all sockets die) and the beat must come back on its own, because the
-/// incident review showed the real outage began exactly here: sockets died,
-/// and what failed next determined whether eight amber rows lied for hours.
-/// The census must also carry the presence line up the whole way
+/// and box are) share the fake edge. What must reach the viewer is no longer a
+/// heartbeat the box sends: it is the ROOM's answer about who it can see,
+/// derived from the socket the box joined on and pushed when the viewer's own
+/// `%EPH` join woke the room. That answer must fold into the box's device row
+/// `lastSeenAt` — the exact value every sidebar's presence verdict reads.
+///
+/// Then the edge is redeployed (all sockets die, and with them the room's
+/// knowledge of anyone) and presence must come back on its own, because the
+/// incident review showed the real outage began exactly here: sockets died, and
+/// what failed next determined whether eight amber rows lied for hours. The
+/// census must also carry the presence line up the whole way
 /// (`workspace_presence`/`org_presence`, the gh#126 EdgeHealth addition).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_roomed_box_reads_fresh_on_another_device_and_survives_a_redeploy() {
@@ -516,10 +637,10 @@ async fn a_roomed_box_reads_fresh_on_another_device_and_survives_a_redeploy() {
             .is_some_and(|at| at >= floor)
     };
 
-    // The box's join-time beat (or first 15s tick) must land in the viewer's
-    // device row well inside one staleness window.
+    // The room's answer must land in the viewer's device row well inside one
+    // staleness window.
     let start = chrono::Utc::now();
-    wait_until("the viewer to see the box's heartbeat", || {
+    wait_until("the viewer to see the box on the room's answer", || {
         box_seen_after(start)
     })
     .await;
@@ -533,7 +654,7 @@ async fn a_roomed_box_reads_fresh_on_another_device_and_survives_a_redeploy() {
     // without anyone restarting anything, exactly like the doc rooms do.
     edge.redeploy();
     let after_deploy = chrono::Utc::now();
-    wait_until("the heartbeat to flow again after the redeploy", || {
+    wait_until("presence to flow again after the redeploy", || {
         box_seen_after(after_deploy)
     })
     .await;
@@ -541,6 +662,61 @@ async fn a_roomed_box_reads_fresh_on_another_device_and_survives_a_redeploy() {
         box_core.edge_health().workspace_presence == Some(true)
     })
     .await;
+}
+
+/// The gh#145 exit criterion, and the one nothing else in this file would
+/// notice: an idle fleet must generate NO periodic traffic on the sync rooms.
+///
+/// Cloudflare notified at 90% of the daily Durable Object duration free tier on
+/// a morning with zero agents running. `SessionRoom` had burned 31.2k GB-s over
+/// 36.47k requests; `DeviceRoom`, on comparable traffic, 0.386. The difference
+/// was not load — it was that every engine wrote `presence/{deviceId} → now`
+/// into two `SessionRoom`s every 15s, and a `%EPH` frame is a real message that
+/// WAKES the object. One object awake around the clock bills 10,800 GB-s/day:
+/// 83% of the tier, permanently, before anyone asks the box to do anything.
+///
+/// So: watch a quiet fleet for longer than that beat's whole period and assert
+/// nothing arrives — while the box goes on reading online throughout, which is
+/// the half of the fix that is easy to break. A room that says nothing is not a
+/// fleet that has gone away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_fleet_sends_no_periodic_presence_traffic() {
+    let edge = fake_edge().await;
+    let box_dir = tempfile::tempdir().expect("tempdir");
+    let viewer_dir = tempfile::tempdir().expect("tempdir");
+    let _box_core = assemble_as(box_dir.path(), &edge.url, "device-box");
+    let viewer = assemble_as(viewer_dir.path(), &edge.url, "device-viewer");
+
+    let devices = viewer.workspace.watch_devices();
+    let box_seen_after = |floor: chrono::DateTime<chrono::Utc>| {
+        devices
+            .borrow()
+            .iter()
+            .find(|d| d.id == "device-box")
+            .and_then(|d| d.last_seen_at)
+            .is_some_and(|at| at >= floor)
+    };
+
+    let start = chrono::Utc::now();
+    wait_until("the viewer to see the box", || box_seen_after(start)).await;
+
+    // Everything that follows is a fleet doing nothing at all.
+    let writes_before = edge.client_eph_writes();
+    let quiet_start = chrono::Utc::now();
+    // Longer than the deleted beat's period, so at least one would have landed.
+    tokio::time::sleep(Duration::from_secs(18)).await;
+
+    assert_eq!(
+        edge.client_eph_writes(),
+        writes_before,
+        "an idle fleet wrote presence to the rooms — the 15s beat is back, and \
+         with it a Durable Object that can never hibernate"
+    );
+    assert!(
+        box_seen_after(quiet_start),
+        "the box stopped reading present during a quiet window — silence from a \
+         room is not evidence that anyone left (gh#126)"
+    );
 }
 
 /// A chat opened while the edge is unreachable used to be roomless forever: the

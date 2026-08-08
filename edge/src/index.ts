@@ -21,8 +21,10 @@
  *   GET  /share/:chatId               — the chat's sharing state
  *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
+ *   GET  /workspace/:orgId/presence   — devices the room sees now (gh#145)
  *   GET  /org/:orgId/devices/ws       — org device registry `orgdev1/{orgId}`
  *   GET  /org/:orgId/devices/tail     — org device registry tail JSON
+ *   GET  /org/:orgId/devices/presence — devices the registry sees now
  *   GET  /device/:deviceId/ws?role=   — device-room byte pipe (§8)
  *   GET  /device/:deviceId/sidecar/:name
  *   POST /device/:deviceId/sidecar/:name
@@ -81,6 +83,15 @@ const requestInit = (request: Request): RequestInit => ({
   method: request.method,
   body: request.body
 });
+
+/** `&deviceId=…` for a room socket, when the caller named a device it is
+ * willing to be identified as. This is what lets `SessionRoom` derive presence
+ * from its socket set instead of being beaten awake every 15s (gh#145); an
+ * unnamed or malformed id simply contributes no presence. */
+const deviceParam = (url: URL): string => {
+  const deviceId = url.searchParams.get("deviceId");
+  return deviceId && ID_RE.test(deviceId) ? `&deviceId=${deviceId}` : "";
+};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -149,7 +160,7 @@ export default {
         request,
         auth,
         "/ws",
-        `?chatId=${parts[1]}`
+        `?chatId=${parts[1]}${deviceParam(url)}`
       );
     }
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
@@ -198,12 +209,17 @@ export default {
           request,
           auth,
           "/ws",
-          `?chatId=${encodeURIComponent(room)}`,
+          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
           "workspace"
         );
       }
       if (parts[2] === "tail" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth, "/tail", "", "workspace");
+      }
+      // The presence ask (gh#145): who does this room see right now? Answered
+      // from the socket set, so it is true about a room that has been asleep.
+      if (parts[2] === "presence" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/presence", "", "workspace");
       }
       // Observability: log/snapshot sizes for the per-user workspace room, so a
       // human can see whether the compaction budget is holding (org-membership
@@ -246,12 +262,15 @@ export default {
           request,
           auth,
           "/ws",
-          `?chatId=${encodeURIComponent(room)}`,
+          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
           "workspace"
         );
       }
       if (parts[3] === "tail" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth, "/tail", "", "workspace");
+      }
+      if (parts[3] === "presence" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/presence", "", "workspace");
       }
       if (parts[3] === "stats" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth, "/stats", "", "workspace");

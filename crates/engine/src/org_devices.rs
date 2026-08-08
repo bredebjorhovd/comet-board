@@ -13,7 +13,7 @@
 //! org-membership authz at the edge like a workspace room), holding a doc whose
 //! only populated container is `devices` — hence the [`WorkspaceDoc`] reuse: the
 //! rows, the LWW writer discipline and the `presence/{deviceId}` ephemeral
-//! heartbeat are the same ones, so nothing new had to be invented for them.
+//! channel are the same ones, so nothing new had to be invented for them.
 //!
 //! Writer discipline is unchanged and matters more here, since the peers are
 //! now other PEOPLE's devices: each device writes only its own row; renames are
@@ -21,21 +21,23 @@
 //! user's own fleet).
 //!
 //! Driven entirely by [`crate::workspace_host::WorkspaceHost`] — it shares the
-//! workspace host's change channel, snapshot debounce and presence tick, so a
-//! second registry costs no second background task.
+//! workspace host's change channel and snapshot debounce, so a second registry
+//! costs no second background task. Since gh#145 it also costs no periodic
+//! traffic at all: presence on this room is derived by the edge from the socket
+//! set, and this host only reads the answers.
 
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 
-use comet_doc::{WorkspaceDoc, presence_key};
+use comet_doc::WorkspaceDoc;
 use comet_proto::Device;
 use comet_sync::{DocsStore, RoomClient};
 
+use crate::EngineError;
 use crate::doc_host::EdgeConfig;
 use crate::workspace_host::{lock, spawn_room_join};
-use crate::{EngineError, now_ms};
 
 /// Snapshot row id in the local `DocsStore` — distinct from the workspace doc's
 /// `workspace2` row, so an org registry and a private workspace never overwrite
@@ -57,9 +59,10 @@ struct OrgDevicesInner {
     config: OrgDevicesConfig,
     doc: Arc<WorkspaceDoc>,
     room: Arc<Mutex<Option<RoomClient>>>,
-    /// Called on every ephemeral update on the org room — a teammate's presence
-    /// heartbeat, which the workspace host folds into its device rows. Wired
-    /// after construction (the host does not exist yet in [`OrgDevices::open`]).
+    /// Called on every ephemeral update on the org room — the room's answer
+    /// about who it can see, which the workspace host folds into its belief and
+    /// its device rows. Wired after construction (the host does not exist yet in
+    /// [`OrgDevices::open`]).
     on_presence: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Doc subscription (drop = unsubscribe) — bumps the workspace host's
     /// change watch, so a remote device row lands in `WatchDevices` the same
@@ -111,9 +114,9 @@ impl OrgDevices {
         Ok(host)
     }
 
-    /// Wire the "a device on this room beat" signal — the workspace host points
-    /// it at its own publish, so a teammate's box coming online updates the
-    /// device list at once instead of on the next 15s tick.
+    /// Wire the "this room answered about presence" signal — the workspace host
+    /// points it at its own belief and publish, so a teammate's box coming
+    /// online updates the device list at once instead of on the next tick.
     pub fn set_presence_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *lock(&self.inner.on_presence) = Some(hook);
     }
@@ -123,22 +126,21 @@ impl OrgDevices {
             return;
         };
         let org_id = &self.inner.config.org_id;
-        let url = edge.room_url(format!("/org/{org_id}/devices/ws"));
+        // The device id rides the socket so the edge can DERIVE presence from
+        // it rather than be beaten awake to be told (gh#145).
+        let url = edge.room_url_as(
+            format!("/org/{org_id}/devices/ws"),
+            Some(&self.inner.config.device_id),
+        );
         // Must match the room id the edge derives from the URL — a mismatch is
         // a room of one.
         let room_id = format!("orgdev1/{org_id}");
-        let beat_device = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         spawn_room_join(
             url,
             room_id,
             self.inner.doc.doc().clone(),
             Arc::downgrade(&self.inner.room),
-            Arc::new(move |client: &RoomClient| {
-                client
-                    .ephemeral()
-                    .set(&presence_key(&beat_device), now_ms());
-            }),
             Arc::new(move || {
                 let hook = weak
                     .upgrade()
@@ -204,30 +206,24 @@ impl OrgDevices {
         }
     }
 
-    /// Boot/shutdown `lastSeenAt` stamp — the periodic beat rides ephemeral
-    /// presence, never the oplog.
+    /// Boot/shutdown `lastSeenAt` stamp — liveness in between is an overlay
+    /// over the live presence belief, never a row write.
     pub fn set_device_last_seen(&self, device_id: &str, at: DateTime<Utc>) {
         if let Err(err) = self.inner.doc.set_device_last_seen(device_id, at) {
             tracing::warn!(device = %device_id, error = %err, "org device lastSeenAt stamp failed");
         }
     }
 
-    /// The live ephemeral heartbeat for `device_id` on the org room, if any.
-    pub fn presence_ms(&self, device_id: &str) -> Option<i64> {
-        let room = lock(&self.inner.room);
-        match room.as_ref()?.ephemeral().get(&presence_key(device_id)) {
-            Some(loro::LoroValue::I64(ms)) => Some(ms),
-            _ => None,
-        }
-    }
-
-    /// Ephemeral presence heartbeat on the org room — this is what makes the
-    /// box's online dot true on a teammate's laptop.
-    pub fn presence_tick(&self) {
-        if let Some(room) = lock(&self.inner.room).as_ref() {
-            room.ephemeral()
-                .set(&presence_key(&self.inner.config.device_id), now_ms());
-        }
+    /// The device ids the org room's latest `%EPH` answer lists — the edge's
+    /// own reading of its socket set (gh#145), and what makes the box's online
+    /// dot true on a TEAMMATE's laptop (their device is only ever on this room).
+    ///
+    /// `None` = no live room handle, which is not "nobody is here": it means
+    /// this engine has no answer, and the belief must be left alone.
+    pub fn presence_ids(&self) -> Option<std::collections::HashSet<String>> {
+        lock(&self.inner.room)
+            .as_ref()
+            .map(crate::presence::room_presence_ids)
     }
 
     pub fn save_snapshot(&self) {

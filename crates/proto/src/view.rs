@@ -53,10 +53,13 @@ pub const SESSION_STALE_MS: i64 = 45_000;
 // Host presence (gh#126)
 // ---------------------------------------------------------------------------
 
-/// A device whose merged heartbeat is younger than this reads present.
-/// Engines beat every 15s, so this is ~4 missed beats — and comfortably wider
-/// than both the engine's own 45s freshness window and the UI's 15s
-/// [`EdgeHealth`] poll cadence.
+/// A device whose overlaid `lastSeenAt` is younger than this reads present.
+///
+/// The engine restamps that value `now` every 15s for every device it BELIEVES
+/// connected (`comet_engine::presence`), so this is ~4 missed republishes — and
+/// comfortably wider than the UI's 15s [`EdgeHealth`] poll cadence. It was ~4
+/// missed 15s device heartbeats until gh#145 deleted those; the window is
+/// unchanged, what it measures is now a belief rather than a beat.
 pub const PRESENCE_STALE_MS: i64 = 70_000;
 
 /// What a remote host's presence row may honestly claim.

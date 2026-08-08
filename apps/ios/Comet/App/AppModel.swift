@@ -610,6 +610,17 @@ final class AppModel {
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
+    /// Somebody is looking: ask the workspace room who it can see (gh#145).
+    ///
+    /// Presence stopped being pushed on a timer, because that timer kept the
+    /// room's Durable Object permanently awake. What replaced it is this — the
+    /// poll driven by a human opening the app, at a human's cadence, plus the
+    /// room volunteering an answer whenever a device joins or leaves.
+    func refreshPresence() {
+        guard let workspace else { return }
+        Task { await workspace.refreshPresence() }
+    }
+
     /// Diagnostics access (live e2e probe).
     var diagnosticsConfig: AppConfig? { config }
 
