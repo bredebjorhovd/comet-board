@@ -1245,9 +1245,17 @@ impl App {
             .iter()
             .filter(|d| Some(d.id.as_str()) != self.local_device_id.as_deref())
             .collect();
-        others.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        others.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let mut cycle = vec![BoardHost::Auto, BoardHost::Pinned(None)];
-        cycle.extend(others.into_iter().map(|d| BoardHost::Pinned(Some(d.id.clone()))));
+        cycle.extend(
+            others
+                .into_iter()
+                .map(|d| BoardHost::Pinned(Some(d.id.clone()))),
+        );
         cycle
     }
 
@@ -1342,7 +1350,10 @@ impl App {
                     self.focus = Focus::Composer;
                     self.select_chat(Some(chat_id))
                 } else {
-                    self.notify(format!("{} is running but has no chat to open", row.identifier));
+                    self.notify(format!(
+                        "{} is running but has no chat to open",
+                        row.identifier
+                    ));
                     Vec::new()
                 }
             }
@@ -2224,7 +2235,13 @@ impl App {
         // Since gh#138 this list OWNS the chats in it: a live session's full
         // row is here, and its space's shelf below picks it back up when the
         // run ends. The placements are what the tree subtracts by.
-        let active = board_view::active_rows(&self.board.rows, &self.chats, &self.sessions, self.orchestrator.as_deref(), now);
+        let active = board_view::active_rows(
+            &self.board.rows,
+            &self.chats,
+            &self.sessions,
+            self.orchestrator.as_deref(),
+            now,
+        );
         let placed: Vec<(String, Option<String>)> =
             spaces_view::active_placements(&active, &self.chats)
                 .into_iter()
@@ -2308,11 +2325,14 @@ impl App {
                 let shelf = spaces_view::space_shelf(&space.id, order, &placements);
                 rows.push(Row::Space {
                     id: space.id.clone(),
-                    label: titles[ix].clone(),
+                    label: titles[ix].line(),
                     attention: attention.get(&space.id).copied(),
                     running: shelf.running,
                 });
-                for chat in chats.iter().filter(|chat| shelf.idle.contains(&chat.id.as_str())) {
+                for chat in chats
+                    .iter()
+                    .filter(|chat| shelf.idle.contains(&chat.id.as_str()))
+                {
                     rows.push(Row::Chat {
                         id: chat.id.clone(),
                         space_id: chat.space_id.clone(),
@@ -2879,6 +2899,35 @@ impl App {
                     MenuItem {
                         label: "Delete…".into(),
                         action: MenuAction::DeleteChat(id),
+                        separated: true,
+                    },
+                ],
+            ),
+            // The pinned slot carries the same menu as a chat row, because it
+            // may be the only row the pinned chat has: its session can end and
+            // its space shelf may never have listed it, and then the kill
+            // switch sits behind a row that does not exist.
+            Some(Row::Orchestrator { chat_id, .. }) => (
+                needs_view::ORCHESTRATOR_NAME.to_string(),
+                vec![
+                    MenuItem {
+                        label: "Rename…".into(),
+                        action: MenuAction::RenameChat(chat_id.clone()),
+                        separated: false,
+                    },
+                    MenuItem {
+                        label: "Archive".into(),
+                        action: MenuAction::SetArchived(chat_id.clone(), true),
+                        separated: false,
+                    },
+                    MenuItem {
+                        label: "Unpin as orchestrator".into(),
+                        action: MenuAction::SetOrchestrator(None),
+                        separated: true,
+                    },
+                    MenuItem {
+                        label: "Delete…".into(),
+                        action: MenuAction::DeleteChat(chat_id),
                         separated: true,
                     },
                 ],
@@ -4203,8 +4252,7 @@ mod tests {
             })
             .collect();
         assert_eq!(nested, ["c1"], "the idle chat is the space's again");
-        let Some(Row::Space { running, .. }) =
-            app.rows.iter().find(|row| row.id() == Some("s1"))
+        let Some(Row::Space { running, .. }) = app.rows.iter().find(|row| row.id() == Some("s1"))
         else {
             panic!("expected the space row");
         };
@@ -4307,7 +4355,10 @@ mod tests {
     // Board
     // -----------------------------------------------------------------------
 
-    fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_proto::view::board::TaskRow {
+    fn board_row(
+        id: &str,
+        state: comet_proto::view::board::BoardState,
+    ) -> comet_proto::view::board::TaskRow {
         use comet_proto::view::board::TaskRow;
         TaskRow {
             id: id.into(),
@@ -4516,7 +4567,9 @@ mod tests {
         app.board.selected = Some("2".into());
         assert!(app.act(Action::BoardEnter).is_empty());
         assert!(
-            app.notice.as_ref().is_some_and(|n| n.text.contains("no route")),
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("no route")),
             "the reason must be said"
         );
     }
@@ -4694,9 +4747,7 @@ mod tests {
             SessionStatus::AwaitingInput,
             0,
         )]));
-        assert!(
-            matches!(&app.rows[0], Row::Section { action: Some(count), .. } if count == "1")
-        );
+        assert!(matches!(&app.rows[0], Row::Section { action: Some(count), .. } if count == "1"));
         let Row::Need { who, what, .. } = &app.rows[1] else {
             panic!("expected a need row, got {:?}", app.rows[1]);
         };
@@ -4829,14 +4880,18 @@ mod tests {
             Some(Command::BoardHost(BoardHost::Pinned(None)))
         ));
         assert!(
-            app.notice.as_ref().is_some_and(|n| n.text.contains("this device")),
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("this device")),
             "the step has to say where it landed"
         );
 
         app.act(Action::BoardCycleHost);
         assert_eq!(app.board_pin, BoardHost::Pinned(Some("box".into())));
         assert!(
-            app.notice.as_ref().is_some_and(|n| n.text.contains("the-box")),
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("the-box")),
             "a device is named, not id'd"
         );
 
@@ -4890,9 +4945,7 @@ mod tests {
         assert_eq!(app.selected_chat.as_deref(), Some("chat-1"));
         assert!(!app.board_open, "the board gives way to the chat");
         assert!(
-            effects
-                .iter()
-                .any(|c| is_watch(c, Some("chat-1"))),
+            effects.iter().any(|c| is_watch(c, Some("chat-1"))),
             "the chat's transcript must stream"
         );
     }
@@ -4929,13 +4982,23 @@ mod tests {
         app.apply(Update::Board(vec![a, b, u]));
 
         app.act(Action::BoardCycleFilter);
-        assert_eq!(app.board.filter, comet_proto::view::board::Filter::Route("offhand".into()));
+        assert_eq!(
+            app.board.filter,
+            comet_proto::view::board::Filter::Route("offhand".into())
+        );
         app.act(Action::BoardCycleFilter);
-        assert_eq!(app.board.filter, comet_proto::view::board::Filter::Route("tally".into()));
+        assert_eq!(
+            app.board.filter,
+            comet_proto::view::board::Filter::Route("tally".into())
+        );
         app.act(Action::BoardCycleFilter);
         assert_eq!(app.board.filter, comet_proto::view::board::Filter::NoRoute);
         app.act(Action::BoardCycleFilter);
-        assert_eq!(app.board.filter, comet_proto::view::board::Filter::All, "wraps to everything");
+        assert_eq!(
+            app.board.filter,
+            comet_proto::view::board::Filter::All,
+            "wraps to everything"
+        );
 
         // The cursor never rests on a hidden row.
         app.act(Action::BoardCycleFilter); // offhand
@@ -4966,7 +5029,11 @@ mod tests {
 
         app.act(Action::BoardFindEscape);
         assert!(!app.board.typing);
-        assert_eq!(app.board.filter, comet_proto::view::board::Filter::All, "esc clears the query");
+        assert_eq!(
+            app.board.filter,
+            comet_proto::view::board::Filter::All,
+            "esc clears the query"
+        );
         assert_eq!(app.board.shown_tasks(), 2);
     }
 
@@ -5396,7 +5463,10 @@ mod tests {
             SessionStatus::AwaitingInput,
             0,
         )]));
-        assert!(matches!(app.rows.get(app.cursor), Some(Row::Running { .. })));
+        assert!(matches!(
+            app.rows.get(app.cursor),
+            Some(Row::Running { .. })
+        ));
     }
 
     #[test]
@@ -5459,9 +5529,17 @@ mod tests {
         app.act(Action::ToggleBoard); // board open: transcript and composer are gone
         app.focus = Focus::Composer;
         app.act(Action::FocusNext);
-        assert_eq!(app.focus, Focus::Sidebar, "composer is hidden, so it is skipped");
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "composer is hidden, so it is skipped"
+        );
         app.focus = Focus::Board;
         app.act(Action::FocusNext);
-        assert_eq!(app.focus, Focus::Sidebar, "the chat panes are hidden when the board is open");
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "the chat panes are hidden when the board is open"
+        );
     }
 }

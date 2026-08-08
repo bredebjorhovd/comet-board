@@ -200,14 +200,16 @@ base = "origin/HEAD"
 # until somebody notices the disk; `comet-board doctor` reports the running cost
 # either way.
 retain_worktrees = "7d"
-# And how long its *chat* stays on the space's shelf before the board archives
-# it. Same clock, same rule — never while an attempt is live or blocked, never
-# while a pull request is in review, never the pinned orchestrator, and never a
-# chat you made yourself. Archiving is not deleting: the transcript is intact
-# and Settings → Archived puts it back. `off` keeps every finished chat in the
+# And when its *chat* leaves the space's shelf. `on-settle` is no window at all:
+# the same guards hold it — never while an attempt is live or blocked, never
+# while a pull request is in review, never the pinned orchestrator, never a chat
+# you made yourself — and once none of them do, the task has merged or closed and
+# its row has nothing left to say. Write a duration (`2d`, `1w`) for a grace
+# period instead. Archiving is not deleting: the transcript is intact and
+# Settings → Archived puts it back. `off` keeps every finished chat in the
 # sidebar, which is how a shelf becomes a landfill at agent throughput. Set it
 # per route (`archive_chats` on a `[[route]]`) where one space wants longer.
-archive_chats = "7d"
+archive_chats = "on-settle"
 # When an agent releases work through the board, prompt it in its own chat once
 # that work settles. Off, because an orchestrator woken by every child it
 # released cannot hold a train of thought. Turn it on if you dispatch from

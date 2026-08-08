@@ -126,7 +126,9 @@ impl Runtime for CometRuntime {
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;
         // Identity a human can read in the sidebar; the branch is the sub-line.
-        self.workspace.rename_chat(&chat_id, &spec.identifier)?;
+        // Identifier AND title (`gh#25 · D1 Prototype v1`): a shelf of bare
+        // identifiers is a list you have to look every row up to read.
+        self.workspace.rename_chat(&chat_id, &spec.chat_title())?;
         self.workspace.set_chat_branch(&chat_id, &spec.branch)?;
 
         // The brief, as a durable first send. `queue_command` returns once the

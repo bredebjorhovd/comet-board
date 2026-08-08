@@ -731,6 +731,9 @@ fn chats_check(paths: &Paths, db: Option<&Db>) -> Check {
                 .filter(|r| r.archive_chats.is_some())
                 .count();
             let window = match cfg.archive_chats_secs(None) {
+                // No window is its own sentence: "archived 0 seconds after" is
+                // a number where the operator wants the rule.
+                Some(0) => "archived as their task leaves the board".to_string(),
                 Some(secs) => format!(
                     "archived {} after their task leaves the board",
                     gc::human_window(secs)

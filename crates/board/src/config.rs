@@ -378,6 +378,38 @@ pub fn parse_retention(s: &str) -> std::result::Result<Option<u64>, String> {
     }
 }
 
+/// Parse an `archive_chats` value (gh#139) — [`parse_retention`] plus the
+/// spelling a shelf needs and a disk does not.
+///
+/// `on-settle` (also `immediately`, `now`) is `Some(0)`: archive as soon as the
+/// task has left the board, with no window at all. A checkout is evidence you
+/// might go back for, so a week of them is a week of insurance; a chat is a row
+/// you are *shown*, and a finished row keeps its place in the list it is
+/// cluttering for exactly as long as the window says. Nothing is lost either
+/// way — archiving is not deleting.
+///
+/// A bare `0` is rejected rather than guessed at. It reads as "no window" here
+/// and means "off — keep forever" in [`parse_retention`], and the two are
+/// opposites; the error names both spellings.
+pub fn parse_chat_retention(s: &str) -> std::result::Result<Option<u64>, String> {
+    let t = s.trim().to_ascii_lowercase();
+    if matches!(
+        t.as_str(),
+        "on-settle" | "on settle" | "immediately" | "now"
+    ) {
+        return Ok(Some(0));
+    }
+    if matches!(t.as_str(), "0" | "0s" | "0m" | "0h" | "0d") {
+        return Err(format!(
+            "`{s}` is ambiguous here — write `on-settle` to archive as soon as \
+             the task leaves the board, or `off` to keep chats forever"
+        ));
+    }
+    parse_retention(s).map_err(|_| {
+        format!("`{s}` is not a duration; write it like `on-settle`, `2d`, `1w`, or `off`")
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
@@ -496,9 +528,16 @@ pub struct Defaults {
     /// same reason: a chat whose task is still owed something is a chat
     /// somebody is still using. Overridden per route.
     ///
-    /// A week by default, matching the checkout its work happened in: the two
-    /// are the same attempt's leavings, and a box that keeps one without the
-    /// other is a box where half the evidence has been thrown away. `off` (or
+    /// **`on-settle`** — no window at all. gh#139 gave the chat the checkout's
+    /// week on the theory that they are one attempt's leavings, but they are
+    /// not read the same way: a checkout is evidence you might go back for, a
+    /// chat is a row you are *shown*, and a merged task's row has nothing left
+    /// to say. Every guard is in [`crate::gc::chat_standing`] and none of them
+    /// is the clock: a live attempt, a blocked one, an open pull request or an
+    /// issue still open all hold the chat on the shelf regardless. What is left
+    /// when they let go is a task that merged or closed, and a row for it is
+    /// the landfill gh#139 was about. A duration still works — `2d`, `1w` — for
+    /// a space that wants a grace period. `off` (or
     /// `0`) keeps every chat on the shelf forever, which is what every board
     /// did before this existed — and what the operator question behind gh#139
     /// ("do all complete sessions just accumulate under the folder?") was
@@ -551,7 +590,7 @@ fn default_retain_worktrees() -> String {
 }
 
 fn default_archive_chats() -> String {
-    "7d".into()
+    "on-settle".into()
 }
 
 fn default_new_source() -> String {
@@ -981,7 +1020,7 @@ impl RoutingConfig {
             // A typo here reads as "keep every chat forever" (gh#139), which
             // is the shelf silting up again behind a key somebody did set.
             if let Some(a) = &r.archive_chats
-                && let Err(e) = parse_retention(a)
+                && let Err(e) = parse_chat_retention(a)
             {
                 out.push(format!(
                     "route {} ({}) has archive_chats {e}",
@@ -1014,7 +1053,7 @@ impl RoutingConfig {
         if let Err(e) = parse_retention(&self.defaults.retain_worktrees) {
             out.push(format!("[defaults] retain_worktrees {e}"));
         }
-        if let Err(e) = parse_retention(&self.defaults.archive_chats) {
+        if let Err(e) = parse_chat_retention(&self.defaults.archive_chats) {
             out.push(format!("[defaults] archive_chats {e}"));
         }
         // `[github] repos` stays the one list of what is polled, so a
@@ -1187,8 +1226,11 @@ impl RoutingConfig {
         let raw = route
             .and_then(|r| r.archive_chats.as_deref())
             .unwrap_or(&self.defaults.archive_chats);
-        parse_retention(raw)
-            .unwrap_or_else(|_| parse_retention(&default_archive_chats()).ok().flatten())
+        parse_chat_retention(raw).unwrap_or_else(|_| {
+            parse_chat_retention(&default_archive_chats())
+                .ok()
+                .flatten()
+        })
     }
 }
 
@@ -1840,12 +1882,34 @@ runtime = "claude"
     // ---- the chat shelf (gh#139) -----------------------------------------
 
     #[test]
-    fn finished_chats_are_archived_after_a_week_unless_told_otherwise() {
-        // The same week the checkout gets: the two are one attempt's leavings,
-        // and a default that kept chats forever is the landfill gh#139 is about.
+    fn a_settled_chat_leaves_the_shelf_with_no_window_at_all() {
+        // gh#139 gave the chat the checkout's week. The operator reading the
+        // shelf the morning after (2026-08-08): thirteen finished rows under
+        // one space, all of one night's merged work — "having the issues alive
+        // and not collected is kinda worthless really". The guards in
+        // `gc::chat_standing` are what protect an unfinished chat; a window on
+        // top of them only delays the ones that are finished.
         let c = RoutingConfig::default();
-        assert_eq!(c.archive_chats_secs(None), Some(7 * 86_400));
-        assert_eq!(c.archive_chats_secs(None), c.retain_worktrees_secs());
+        assert_eq!(c.archive_chats_secs(None), Some(0));
+        // The checkout keeps its week — it is evidence, not a row in a list.
+        assert_eq!(c.retain_worktrees_secs(), Some(7 * 86_400));
+    }
+
+    #[test]
+    fn on_settle_is_a_spelling_and_a_bare_zero_is_not() {
+        for spelling in ["on-settle", "on settle", "immediately", "NOW"] {
+            assert_eq!(parse_chat_retention(spelling), Ok(Some(0)), "{spelling}");
+        }
+        // `0` means "off, forever" for a worktree and "no window" for a chat.
+        // Opposite readings of one character: refuse rather than guess.
+        for zero in ["0", "0s", "0d"] {
+            let err = parse_chat_retention(zero).expect_err(zero);
+            assert!(err.contains("on-settle") && err.contains("off"), "{err}");
+        }
+        assert_eq!(parse_retention("0"), Ok(None), "unchanged for worktrees");
+        // A grace period is still a grace period.
+        assert_eq!(parse_chat_retention("2d"), Ok(Some(2 * 86_400)));
+        assert_eq!(parse_chat_retention("off"), Ok(None));
     }
 
     #[test]
@@ -1890,7 +1954,10 @@ runtime = "claude"
 
     #[test]
     fn off_is_how_chat_archiving_is_turned_off() {
-        for spelling in ["off", "OFF", "none", "never", "0"] {
+        // `0` is no longer among these: it is the one spelling that reads as
+        // both ends of this setting, so it is refused — see
+        // `on_settle_is_a_spelling_and_a_bare_zero_is_not`.
+        for spelling in ["off", "OFF", "none", "never"] {
             let c = github(&format!("[defaults]\narchive_chats = \"{spelling}\"\n"));
             assert_eq!(c.archive_chats_secs(None), None, "{spelling}");
         }
