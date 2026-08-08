@@ -170,10 +170,14 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
     // Informational rate-limit frames stay quiet.
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
 
-    assert!(events.contains(&AgentEvent::Usage {
+    // The cache halves of the result frame reach the event too (gh#151) —
+    // on a real session they are most of what the turn read.
+    assert!(events.contains(&AgentEvent::Usage(comet_proto::TokenUsage {
         input_tokens: 10,
-        output_tokens: 20
-    }));
+        output_tokens: 20,
+        cache_creation_tokens: 300,
+        cache_read_tokens: 4000,
+    })));
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {

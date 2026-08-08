@@ -17,7 +17,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use comet_board::runtime::{DispatchHandle, DispatchSpec, RunEnd, Runtime};
+use comet_board::runtime::{DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime};
 use comet_doc::SessionCommandPayload;
 use comet_proto::{
     AgentEvent, ChatConfig, DoneStatus, RunRequest, SandboxLevel, Session, SessionStatus,
@@ -311,6 +311,16 @@ impl Runtime for CometRuntime {
             }),
             _ => None,
         })
+    }
+
+    /// The chat's tokens, off the same journal `last_run_end` reads (gh#151).
+    /// The board calls this on every reconcile of a live attempt, so the scan
+    /// filters lines by tag before parsing them — see [`RunJournal::tokens`].
+    fn run_tokens(&self, chat_id: &str) -> anyhow::Result<Option<RunTokens>> {
+        Ok(self.journal.tokens(chat_id)?.map(|t| RunTokens {
+            usage: t.usage,
+            model: t.model,
+        }))
     }
 }
 

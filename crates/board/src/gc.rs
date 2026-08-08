@@ -322,6 +322,8 @@ mod tests {
             collected_at: None,
             chat_archivable_at: None,
             chat_archived_at: None,
+            tokens: None,
+            model: None,
         }
     }
 

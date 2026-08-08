@@ -20,7 +20,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      blocked_count,
      overrun_warned_at, repo_path, collectable_at, collected_at,
      dispatched_by_device, dispatched_by_user, billed_to, \
-     chat_archivable_at, chat_archived_at";
+     chat_archivable_at, chat_archived_at, \
+     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -62,6 +63,20 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         billed_to: r.get(30)?,
         chat_archivable_at: r.get(31)?,
         chat_archived_at: r.get(32)?,
+        // All four together or none: the columns are written in one statement
+        // and a partially-NULL row cannot arise. `input_tokens` is the witness
+        // — NULL there is "this attempt reported nothing", which the page must
+        // never render as a zero (gh#151).
+        tokens: match r.get::<_, Option<i64>>(33)? {
+            None => None,
+            Some(input) => Some(comet_proto::TokenUsage {
+                input_tokens: input.max(0) as u64,
+                output_tokens: r.get::<_, Option<i64>>(34)?.unwrap_or(0).max(0) as u64,
+                cache_read_tokens: r.get::<_, Option<i64>>(35)?.unwrap_or(0).max(0) as u64,
+                cache_creation_tokens: r.get::<_, Option<i64>>(36)?.unwrap_or(0).max(0) as u64,
+            }),
+        },
+        model: r.get(37)?,
     })
 }
 
@@ -208,7 +223,21 @@ impl Db {
               -- columns `collectable_at`/`collected_at` are for the checkout,
               -- kept apart because the windows are configured apart.
               chat_archivable_at TEXT,
-              chat_archived_at TEXT
+              chat_archived_at TEXT,
+              -- What the attempt spent, summed off its chat's run journal
+              -- (gh#151). Nullable on purpose, and written as a set: NULL
+              -- across all four is "this attempt reported no usage", which is
+              -- what every row from before this existed honestly is. A DEFAULT
+              -- 0 here would have made the whole history look free.
+              input_tokens INTEGER,
+              output_tokens INTEGER,
+              cache_read_tokens INTEGER,
+              cache_creation_tokens INTEGER,
+              -- The model the harness announced for the run, recorded beside
+              -- the tokens. The route's override is not it: most routes name
+              -- none, so the column would be NULL exactly where the breakdown
+              -- needs it most.
+              model TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -345,6 +374,18 @@ impl Db {
                 // finished. That is the backlog this feature is about.
                 ("chat_archivable_at", "TEXT"),
                 ("chat_archived_at", "TEXT"),
+                // Tokens, and the model that spent them (gh#151). Nullable
+                // with no default on all five, which is the whole point:
+                // existing rows keep NULL and read as "reported nothing", and
+                // the stats page counts them out of its coverage rather than
+                // adding a zero to a total. Backfilling them is not possible
+                // and would not be honest if it were — the runs are over and
+                // their journals may be gone.
+                ("input_tokens", "INTEGER"),
+                ("output_tokens", "INTEGER"),
+                ("cache_read_tokens", "INTEGER"),
+                ("cache_creation_tokens", "INTEGER"),
+                ("model", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -812,6 +853,39 @@ impl Db {
         self.conn.execute(
             "UPDATE attempts SET outcome = ?2 WHERE id = ?1 AND outcome IS NOT NULL",
             params![attempt_id, outcome.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Record what an attempt has spent, and what spent it (gh#151).
+    ///
+    /// All five columns in one statement, so `input_tokens IS NULL` is a sound
+    /// witness for "this attempt reported nothing" — the reader keys the whole
+    /// [`Attempt::tokens`] option on it. Written on every reconcile of a live
+    /// attempt, and the totals only ever grow, so a run that ends between two
+    /// ticks keeps the last figure its journal gave.
+    ///
+    /// `model` is left alone when the run did not name one, rather than
+    /// overwriting a model a previous tick did learn.
+    pub fn set_attempt_tokens(
+        &self,
+        attempt_id: i64,
+        usage: comet_proto::TokenUsage,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET input_tokens = ?2, output_tokens = ?3,
+                 cache_read_tokens = ?4, cache_creation_tokens = ?5,
+                 model = COALESCE(?6, model)
+               WHERE id = ?1",
+            params![
+                attempt_id,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                usage.cache_read_tokens as i64,
+                usage.cache_creation_tokens as i64,
+                model,
+            ],
         )?;
         Ok(())
     }

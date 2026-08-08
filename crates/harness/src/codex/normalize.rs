@@ -61,6 +61,19 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
 
 /// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
 /// turn's tokens (held by the session loop, emitted before `Done`).
+///
+/// Two things this notification is *not*, both of which would double-count a
+/// long thread if taken at face value (gh#151):
+///
+/// - It is a **snapshot, not a delta.** Codex re-sends it as the turn runs,
+///   each time with that turn's running total. The session loop keeps only the
+///   latest in `pending_usage` and flushes one event at `turn/completed`, so
+///   what reaches the journal is one figure per turn and summing over turns is
+///   sound. We read `last` (the turn) and never `total` (the thread), which
+///   would be added to itself once per turn.
+/// - Its `inputTokens` **includes** `cachedInputTokens`, the reverse of the
+///   Anthropic shape [`comet_proto::TokenUsage`] normalizes on. Subtracted
+///   here, saturating, so the four buckets stay disjoint and addable.
 pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
     let last = field(params, &["tokenUsage", "token_usage"])?.get("last")?;
     let count = |keys: &[&str]| {
@@ -68,10 +81,16 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
             .and_then(Value::as_u64)
             .unwrap_or_default()
     };
-    Some(AgentEvent::Usage {
-        input_tokens: count(&["inputTokens", "input_tokens"]),
+    let cached = count(&["cachedInputTokens", "cached_input_tokens"]);
+    Some(AgentEvent::Usage(comet_proto::TokenUsage {
+        input_tokens: count(&["inputTokens", "input_tokens"]).saturating_sub(cached),
         output_tokens: count(&["outputTokens", "output_tokens"]),
-    })
+        cache_read_tokens: cached,
+        // Codex meters no cache *writes* — the field does not exist on its
+        // wire. Zero is the honest reading: not "no cache", but "nothing this
+        // provider will tell us about creating one".
+        cache_creation_tokens: 0,
+    }))
 }
 
 /// Tool-shaped Codex items must always close the lifecycle they open: started
@@ -307,19 +326,54 @@ mod tests {
     fn usage_reads_last_snapshot_under_both_spellings() {
         assert_eq!(
             usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
-            Some(AgentEvent::Usage {
+            Some(AgentEvent::Usage(comet_proto::TokenUsage {
                 input_tokens: 42,
-                output_tokens: 7
-            })
+                output_tokens: 7,
+                ..Default::default()
+            }))
         );
         assert_eq!(
             usage_event(&json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}})),
-            Some(AgentEvent::Usage {
+            Some(AgentEvent::Usage(comet_proto::TokenUsage {
                 input_tokens: 1,
-                output_tokens: 2
-            })
+                output_tokens: 2,
+                ..Default::default()
+            }))
         );
         assert_eq!(usage_event(&json!({})), None);
+    }
+
+    /// Codex counts cached input *inside* `inputTokens`; we count it beside.
+    /// Without the subtraction a cached thread's input is reported twice, and
+    /// the four buckets stop being addable (gh#151).
+    #[test]
+    fn cached_input_is_taken_out_of_the_input_it_is_reported_inside() {
+        let ev = usage_event(&json!({"tokenUsage": {"last": {
+            "inputTokens": 50_000, "cachedInputTokens": 48_000, "outputTokens": 900,
+        }}}));
+        let Some(AgentEvent::Usage(usage)) = ev else {
+            panic!("expected a usage event");
+        };
+        assert_eq!(usage.input_tokens, 2_000, "fresh input only");
+        assert_eq!(usage.cache_read_tokens, 48_000);
+        assert_eq!(usage.cache_creation_tokens, 0, "codex meters no writes");
+        // The whole point of the split: the buckets add up to what codex said
+        // the turn read, plus what it wrote — nothing counted twice.
+        assert_eq!(usage.input_total(), 50_000);
+        assert_eq!(usage.total(), 50_900);
+    }
+
+    /// A snapshot arriving with cached ≥ input (a rounding or ordering quirk
+    /// on codex's side) must not wrap a u64 into a nonsense total.
+    #[test]
+    fn a_cached_count_larger_than_the_input_saturates_rather_than_wrapping() {
+        let ev = usage_event(&json!({"tokenUsage": {"last": {
+            "inputTokens": 10, "cachedInputTokens": 99, "outputTokens": 1,
+        }}}));
+        let Some(AgentEvent::Usage(usage)) = ev else {
+            panic!("expected a usage event");
+        };
+        assert_eq!(usage.input_tokens, 0);
     }
 
     #[test]

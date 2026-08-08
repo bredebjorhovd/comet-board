@@ -413,6 +413,32 @@ pub trait Runtime {
     /// mid-stream (or nothing has ever run). The settle authority §H4 names —
     /// see [`RunEnd`] for why the session status cannot carry this.
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>>;
+
+    /// What the chat has spent so far, summed off the same run journal
+    /// (gh#151). `None` is "nothing reported" — the board leaves the attempt's
+    /// token columns NULL for it, and the stats page renders a blank.
+    ///
+    /// Default `Ok(None)` rather than a refusal, unlike
+    /// [`Runtime::reclaim_worktree`]'s: a runtime that cannot count tokens
+    /// costs the page some coverage, and coverage is a number the page already
+    /// reports honestly. Nothing is at stake in being silent here.
+    fn run_tokens(&self, chat_id: &str) -> anyhow::Result<Option<RunTokens>> {
+        let _ = chat_id;
+        Ok(None)
+    }
+}
+
+/// What one chat's run journal says it spent, and what spent it (gh#151).
+///
+/// The model rides along because the journal is the only place it is stated:
+/// [`DispatchSpec::model`] is `None` on most attempts (the route named no
+/// override, so the harness default ran), and a per-model breakdown whose
+/// biggest row is "unknown" is not a breakdown. What the harness announced in
+/// its `SessionStarted` is the model that actually ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTokens {
+    pub usage: comet_proto::TokenUsage,
+    pub model: Option<String>,
 }
 
 #[cfg(test)]

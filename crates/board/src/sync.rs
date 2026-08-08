@@ -862,6 +862,11 @@ impl SyncEngine {
             let Some(task) = self.db.get_task(&attempt.task_id)? else {
                 continue;
             };
+            // Before anything can decide the attempt is over: every branch
+            // below can be the last time this row is seen live — settled,
+            // orphaned, capped — and a total recorded after the close would
+            // never be recorded at all (gh#151).
+            self.record_tokens(runtime, &attempt);
             let status = statuses
                 .get(chat_id)
                 .copied()
@@ -932,6 +937,54 @@ impl SyncEngine {
         // the live pass above a row it has already decided about.
         self.rewatch_settled_attempts(statuses, runtime)?;
         Ok(())
+    }
+
+    /// Copy what an attempt's chat has spent onto its row (gh#151).
+    ///
+    /// The engine's run journal is the source and the attempt row is the
+    /// record, because the two have different lifetimes: §H33 archives a chat
+    /// once nobody is coming back to it, and a journal can be compacted or
+    /// lost, while the attempt survives for as long as the board has a history
+    /// to report on. So this is a copy taken while the evidence is still
+    /// there, not a lookup deferred to whenever somebody opens the page.
+    ///
+    /// Called on every reconcile of a live attempt rather than once at close:
+    /// an attempt can end by being orphaned, capped or cancelled — paths where
+    /// the chat may already be gone — and the last tick's figure is a far
+    /// better answer for those than none at all.
+    ///
+    /// Never fatal. A runtime that cannot count tokens, an unreadable journal
+    /// and a chat that has reported nothing yet all leave the row exactly as
+    /// it was; the page's coverage line is where that shows up, which is where
+    /// it belongs.
+    pub fn record_tokens(&self, runtime: Option<&dyn Runtime>, attempt: &Attempt) {
+        let Some(runtime) = runtime else { return };
+        let Some(chat_id) = attempt.pane_id.as_deref() else {
+            return;
+        };
+        let run = match runtime.run_tokens(chat_id) {
+            Ok(Some(run)) => run,
+            Ok(None) => return,
+            Err(e) => {
+                self.log
+                    .warn(format!("tokens for chat {chat_id} unreadable: {e:#}"));
+                return;
+            }
+        };
+        // A write per tick per live attempt is a write nobody needs: the
+        // journal only grows between turns, so a chat mid-thought reports the
+        // same numbers every time it is asked.
+        let model_settled = run.model.is_none() || attempt.model == run.model;
+        if attempt.tokens == Some(run.usage) && model_settled {
+            return;
+        }
+        if let Err(e) = self
+            .db
+            .set_attempt_tokens(attempt.id, run.usage, run.model.as_deref())
+        {
+            self.log
+                .warn(format!("recording tokens for attempt {}: {e:#}", attempt.id));
+        }
     }
 
     // ---- the wall-clock cap (gh#70) --------------------------------------
@@ -3057,6 +3110,130 @@ mod tests {
         let a = live(&e);
         assert!(a.saw_working, "the latch does not unlatch");
         assert_eq!(a.agent_status, Some(AgentStatus::Blocked));
+    }
+
+    // ---- tokens on the attempt row (gh#151) ------------------------------
+
+    /// A runtime that only meters. Everything else is unreachable: the token
+    /// copy must not depend on any other verb, or a reconcile that cannot
+    /// reach the chat would stop recording what it already knows.
+    struct Meter(std::sync::Mutex<Option<crate::runtime::RunTokens>>);
+
+    impl Meter {
+        fn saying(usage: comet_proto::TokenUsage, model: Option<&str>) -> Meter {
+            Meter(std::sync::Mutex::new(Some(crate::runtime::RunTokens {
+                usage,
+                model: model.map(str::to_string),
+            })))
+        }
+        fn silent() -> Meter {
+            Meter(std::sync::Mutex::new(None))
+        }
+        fn set(&self, usage: comet_proto::TokenUsage, model: Option<&str>) {
+            *self.0.lock().unwrap() = Some(crate::runtime::RunTokens {
+                usage,
+                model: model.map(str::to_string),
+            });
+        }
+    }
+
+    impl Runtime for Meter {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!()
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+        fn run_tokens(&self, _: &str) -> anyhow::Result<Option<crate::runtime::RunTokens>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    fn tokens(input: u64, output: u64) -> comet_proto::TokenUsage {
+        comet_proto::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: input * 4,
+            cache_creation_tokens: 7,
+        }
+    }
+
+    #[test]
+    fn reconcile_copies_the_running_total_onto_the_attempt() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = Meter::saying(tokens(100, 10), Some("claude-opus-5"));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        let a = live(&e);
+        assert_eq!(a.tokens, Some(tokens(100, 10)));
+        assert_eq!(a.model.as_deref(), Some("claude-opus-5"));
+
+        // The next turn's total replaces it — the journal's figure is already
+        // a run total, so this is a copy and never an accumulation on top of
+        // an accumulation.
+        rt.set(tokens(250, 30), Some("claude-opus-5"));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).tokens, Some(tokens(250, 30)));
+    }
+
+    /// The whole point of the `Option`: a chat that has reported nothing
+    /// leaves the row blank. A zero would be indistinguishable from an agent
+    /// that worked for an hour for free.
+    #[test]
+    fn a_chat_that_reports_nothing_leaves_the_row_blank_not_zero() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.reconcile_sessions_with(
+            &statuses(&[("chat-9", AgentStatus::Working)]),
+            Some(&Meter::silent()),
+        )
+        .unwrap();
+        assert_eq!(live(&e).tokens, None);
+        // And a reconcile with no runtime at all cannot invent one either.
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        assert_eq!(live(&e).tokens, None);
+    }
+
+    /// An attempt orphaned or capped is closed inside the same reconcile that
+    /// would record its tokens — so the recording happens first, or the
+    /// longest-running attempts are exactly the ones that never report.
+    #[test]
+    fn an_orphaned_attempt_keeps_what_it_had_spent() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = Meter::saying(tokens(500, 50), Some("claude-opus-5"));
+        // Seen working once, then the chat vanishes for two ticks.
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt)).unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt)).unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        let a = task.attempts.last().unwrap();
+        assert_eq!(a.outcome, Some(Outcome::Orphaned));
+        assert_eq!(a.tokens, Some(tokens(500, 50)));
     }
 
     // ---- the status-only fast path --------------------------------------

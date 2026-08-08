@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::TokenUsage;
+
 /// One day's dispatches, for the throughput chart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,12 +34,37 @@ pub struct DayBucket {
     pub done: usize,
 }
 
+/// One day's tokens, for the series drawn under the dispatch chart. Same days
+/// and the same zero rule as [`DayBucket`] — the two series are generated from
+/// one date range so a reader comparing them index by index is comparing the
+/// same day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenDay {
+    /// `YYYY-MM-DD`, box-local, matching [`DayBucket::date`].
+    pub date: String,
+    /// Tokens on attempts *started* that day. A day whose attempts reported
+    /// nothing is zero here and blank on the coverage line — the page says
+    /// which of the two it is once, at the top, rather than per bar.
+    pub usage: TokenUsage,
+}
+
 /// One row of a tally — a workspace, a runtime, a source, a person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tally {
     pub label: String,
     pub count: usize,
+}
+
+/// One row of a *token* tally — a model, a runtime. [`Tally`]'s shape with a
+/// breakdown instead of a count, so the per-model table can show where the
+/// tokens went and not only how many there were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTally {
+    pub label: String,
+    pub usage: TokenUsage,
 }
 
 /// Where the work ended up, which is the question a completion rate only
@@ -119,12 +146,31 @@ pub struct BoardStats {
     /// Agent-minutes in the window, summed over ended attempts.
     pub total_minutes: i64,
 
+    /// Tokens across every attempt in the window that reported any (gh#151).
+    /// Read it beside [`attempts_with_tokens`](Self::attempts_with_tokens):
+    /// this is a total over the rows that answered, not over the window.
+    pub tokens: TokenUsage,
+    /// How many attempts in the window reported usage at all.
+    ///
+    /// The page's honesty line. Attempts that ran before the board recorded
+    /// tokens — and any harness that never emits a usage event — are counted
+    /// in [`attempts`](Self::attempts) and not here, so the totals above can
+    /// be read as "of the work we can account for" instead of as the truth.
+    pub attempts_with_tokens: usize,
+    /// That share, `0.0..=1.0`. `None` when nothing ran, never `0.0` — the
+    /// same rule [`completion_rate`](Self::completion_rate) follows, and for
+    /// the same reason: a zero here would read as "nothing reported" when what
+    /// happened is that nothing ran.
+    pub token_coverage: Option<f64>,
+
     pub landing: Landing,
     pub friction: Friction,
 
     /// Attempts started per day, oldest first. Days with nothing are present
     /// with zeroes: a chart with holes in it reads as missing data.
     pub daily: Vec<DayBucket>,
+    /// Tokens per day, index-aligned with [`daily`](Self::daily).
+    pub daily_tokens: Vec<TokenDay>,
     /// Dispatches by hour of the box's local day, `[0..24)`.
     pub hour_of_day: Vec<usize>,
 
@@ -135,6 +181,14 @@ pub struct BoardStats {
     pub by_account: BTreeMap<String, usize>,
     /// Released by an agent rather than by a person.
     pub agent_dispatched: usize,
+
+    /// Tokens by the model the harness said it was running (gh#151). Keyed on
+    /// what the *run* reported, not on the route's override — most routes name
+    /// no model, and a breakdown whose biggest row is "unknown" is not one.
+    pub tokens_by_model: BTreeMap<String, TokenUsage>,
+    /// Tokens by runtime — the provider split, against the same `by_runtime`
+    /// dispatch counts already on this struct.
+    pub tokens_by_runtime: BTreeMap<String, TokenUsage>,
 }
 
 impl BoardStats {
@@ -152,16 +206,31 @@ impl BoardStats {
             p90_minutes: None,
             longest_minutes: None,
             total_minutes: 0,
+            tokens: TokenUsage::default(),
+            attempts_with_tokens: 0,
+            token_coverage: None,
             landing: Landing::default(),
             friction: Friction::default(),
             daily: Vec::new(),
+            daily_tokens: Vec::new(),
             hour_of_day: vec![0; 24],
             by_workspace: BTreeMap::new(),
             by_runtime: BTreeMap::new(),
             by_source: BTreeMap::new(),
             by_account: BTreeMap::new(),
             agent_dispatched: 0,
+            tokens_by_model: BTreeMap::new(),
+            tokens_by_runtime: BTreeMap::new(),
         }
+    }
+
+    /// Whether any attempt in the window reported tokens.
+    ///
+    /// The gate the token half of the page renders behind: with nothing
+    /// reported there is no total to show, and a wall of zeroes would say the
+    /// work was free rather than that it was never metered.
+    pub fn has_tokens(&self) -> bool {
+        self.attempts_with_tokens > 0
     }
 
     /// Nothing ran. Distinct from "nothing finished": the page says so instead
@@ -212,6 +281,61 @@ pub fn ranked_top(tally: &BTreeMap<String, usize>, max: usize) -> Vec<Tally> {
     out
 }
 
+/// [`ranked_top`] for a token tally: biggest total first, ties alphabetical,
+/// everything past the cap folded into one `n others` row that carries the
+/// usage it stands for. Rows that spent nothing are dropped — a model that
+/// appears with four zeroes is noise in a table about where tokens went.
+pub fn ranked_tokens(tally: &BTreeMap<String, TokenUsage>, max: usize) -> Vec<TokenTally> {
+    let mut rows: Vec<TokenTally> = tally
+        .iter()
+        .filter(|(_, usage)| !usage.is_zero())
+        .map(|(label, usage)| TokenTally {
+            label: label.clone(),
+            usage: *usage,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.usage
+            .total()
+            .cmp(&a.usage.total())
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    if max == 0 || rows.len() <= max {
+        return rows;
+    }
+    let (head, tail) = rows.split_at(max);
+    let rest: TokenUsage = tail.iter().map(|t| t.usage).sum();
+    let mut out = head.to_vec();
+    out.push(TokenTally {
+        label: format!("{} others", tail.len()),
+        usage: rest,
+    });
+    out
+}
+
+/// A token count as a page shows it: `812`, `48.2k`, `1.31M`.
+///
+/// Three significant figures and no more. The exact number is never the point
+/// — nobody acts on the difference between 1,310,442 and 1,310,443 — and a
+/// seven-digit figure in a tile is a number the eye has to count digits in.
+pub fn human_tokens(tokens: u64) -> String {
+    const M: u64 = 1_000_000;
+    const K: u64 = 1_000;
+    if tokens >= 1_000 * M {
+        return format!("{:.2}B", tokens as f64 / (1_000 * M) as f64);
+    }
+    if tokens >= M {
+        return format!("{:.2}M", tokens as f64 / M as f64);
+    }
+    if tokens >= 10 * K {
+        return format!("{:.0}k", tokens as f64 / K as f64);
+    }
+    if tokens >= K {
+        return format!("{:.1}k", tokens as f64 / K as f64);
+    }
+    tokens.to_string()
+}
+
 /// A bar's share of its chart, `0.0..=1.0`, scaled against the largest bucket.
 ///
 /// Against the largest and not against the total: these charts answer "which
@@ -227,6 +351,11 @@ pub fn bar_fraction(value: usize, peak: usize) -> f32 {
 /// The busiest bucket in a day series — the scale every bar is drawn against.
 pub fn peak_dispatches(daily: &[DayBucket]) -> usize {
     daily.iter().map(|d| d.dispatches).max().unwrap_or(0)
+}
+
+/// The same, for the token series.
+pub fn peak_tokens(daily: &[TokenDay]) -> u64 {
+    daily.iter().map(|d| d.usage.total()).max().unwrap_or(0)
 }
 
 /// A duration in minutes, said the way a person would: `48m`, `3h 20m`, `2d 4h`.
@@ -383,6 +512,96 @@ mod tests {
         assert_eq!(l.total(), 15);
     }
 
+    // -- tokens (gh#151) -----------------------------------------------------
+
+    fn usage(input: u64, output: u64, read: u64, write: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_creation_tokens: write,
+        }
+    }
+
+    #[test]
+    fn a_token_tally_ranks_on_the_total_and_folds_the_tail_without_losing_it() {
+        let tally: BTreeMap<String, TokenUsage> = [
+            ("sonnet", usage(10, 1, 0, 0)),
+            ("opus", usage(1_000, 100, 5_000, 0)),
+            ("haiku", usage(500, 50, 0, 0)),
+            ("cursor-small", usage(4, 1, 0, 0)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let rows = ranked_tokens(&tally, 2);
+        assert_eq!(rows[0].label, "opus");
+        assert_eq!(rows[1].label, "haiku");
+        assert_eq!(rows[2].label, "2 others");
+        // Nothing dropped: the fold carries what it stands for.
+        assert_eq!(rows[2].usage.total(), 16);
+        assert_eq!(
+            rows.iter().map(|t| t.usage.total()).sum::<u64>(),
+            tally.values().map(|u| u.total()).sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn a_model_that_spent_nothing_is_not_a_row_in_a_table_about_spending() {
+        let tally: BTreeMap<String, TokenUsage> = [
+            ("mock".to_string(), TokenUsage::default()),
+            ("opus".to_string(), usage(1, 1, 0, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let rows = ranked_tokens(&tally, 6);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "opus");
+    }
+
+    #[test]
+    fn token_counts_are_readable_at_a_glance_not_exact() {
+        assert_eq!(human_tokens(0), "0");
+        assert_eq!(human_tokens(812), "812");
+        assert_eq!(human_tokens(1_240), "1.2k");
+        assert_eq!(human_tokens(48_200), "48k");
+        assert_eq!(human_tokens(1_310_442), "1.31M");
+        assert_eq!(human_tokens(2_500_000_000), "2.50B");
+    }
+
+    #[test]
+    fn a_window_with_no_metered_attempt_shows_no_total_rather_than_a_free_one() {
+        // The rule the rest of the page follows: a blank, never a zero. A 0
+        // token total would read as work that cost nothing.
+        let s = BoardStats::empty(Some(7));
+        assert!(!s.has_tokens());
+        assert_eq!(s.token_coverage, None);
+        assert!(s.tokens.is_zero());
+        // A window where attempts ran and none reported is a *real* 0% — that
+        // one is worth saying out loud.
+        let mut ran = BoardStats::empty(Some(7));
+        ran.attempts = 4;
+        ran.token_coverage = Some(0.0);
+        assert!(!ran.has_tokens());
+        assert_eq!(percent(ran.token_coverage), Some("0%".into()));
+    }
+
+    #[test]
+    fn the_token_series_scales_against_the_busiest_day() {
+        let daily = vec![
+            TokenDay {
+                date: "2026-08-07".into(),
+                usage: usage(100, 10, 0, 0),
+            },
+            TokenDay {
+                date: "2026-08-08".into(),
+                usage: usage(400, 40, 0, 0),
+            },
+        ];
+        assert_eq!(peak_tokens(&daily), 440);
+        assert_eq!(peak_tokens(&[]), 0);
+    }
+
     #[test]
     fn the_wire_shape_round_trips_camel_case() {
         // The board gathers this on the box and a viewport deserializes it
@@ -413,6 +632,17 @@ mod tests {
             done: 3,
         }];
         s.by_workspace.insert("attn".into(), 4);
+        s.tokens = usage(1_000, 200, 40_000, 3_000);
+        s.attempts_with_tokens = 3;
+        s.token_coverage = Some(0.75);
+        s.daily_tokens = vec![TokenDay {
+            date: "2026-08-08".into(),
+            usage: usage(1_000, 200, 40_000, 3_000),
+        }];
+        s.tokens_by_model
+            .insert("claude-opus-5".into(), usage(1_000, 200, 40_000, 3_000));
+        s.tokens_by_runtime
+            .insert("claude-code".into(), usage(1_000, 200, 40_000, 3_000));
 
         let json = serde_json::to_value(&s).expect("serializes");
         // The names the viewports read.
@@ -428,6 +658,12 @@ mod tests {
         assert!(json["friction"].get("retriedTasks").is_some());
         assert!(json["friction"].get("blockedEntries").is_some());
         assert!(json["daily"][0].get("dispatches").is_some());
+        assert!(json.get("attemptsWithTokens").is_some());
+        assert!(json.get("tokenCoverage").is_some());
+        assert!(json.get("tokensByModel").is_some());
+        assert!(json.get("tokensByRuntime").is_some());
+        assert_eq!(json["tokens"]["cacheReadTokens"], 40_000);
+        assert_eq!(json["dailyTokens"][0]["usage"]["cacheCreationTokens"], 3_000);
 
         let back: BoardStats = serde_json::from_value(json).expect("deserializes");
         assert_eq!(back, s);

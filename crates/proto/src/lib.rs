@@ -1,8 +1,9 @@
 //! comet-proto — wire types shared by engine, UI, and RPC.
 //!
 //! Ported from comet's `packages/control/src/wire.ts` + `packages/harness/src/types.ts`.
-//! Token-usage *display* types are excluded by design; the `Usage` agent event is kept as a
-//! harness-level passthrough (rate-limit meters), never persisted into docs.
+//! Token-usage is never persisted into *docs* (a poor fit for CRDTs, and the original
+//! exclusion): the `Usage` agent event stays a harness-level passthrough, kept in the host's
+//! run journal and summed onto the board's own attempt rows for the stats page (gh#151).
 
 pub mod agent;
 pub mod entities;

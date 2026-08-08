@@ -243,10 +243,11 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         .position(|e| {
             matches!(
                 e,
-                AgentEvent::Usage {
+                AgentEvent::Usage(comet_proto::TokenUsage {
                     input_tokens: 42,
-                    output_tokens: 7
-                }
+                    output_tokens: 7,
+                    ..
+                })
             )
         })
         .expect("usage emitted");

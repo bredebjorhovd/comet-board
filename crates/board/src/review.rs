@@ -742,6 +742,8 @@ mod tests {
             collected_at: None,
             chat_archivable_at: None,
             chat_archived_at: None,
+            tokens: None,
+            model: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
             billed_to: None,
