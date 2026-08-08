@@ -498,6 +498,19 @@ impl StatsPage {
     }
 }
 
+/// The scroll container every settings page wraps its column in — and the one
+/// this page shipped without, which on the longest page in the app meant
+/// everything below the fold was simply unreachable (operator, 2026-08-08).
+/// It has to wrap EVERY return path, including the two empty states, or the
+/// bug comes back the first time somebody adds a third.
+fn scroll_page(column: gpui::Div) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("stats-page")
+        .size_full()
+        .overflow_y_scroll()
+        .child(column)
+}
+
 impl Render for StatsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -532,17 +545,17 @@ impl Render for StatsPage {
             } else {
                 "Reading the board…"
             };
-            return column.child(
+            return scroll_page(column.child(
                 div()
                     .mt(px(24.0))
                     .text_size(px(13.0))
                     .text_color(theme.text_faint)
                     .child(SharedString::from(note)),
-            );
+            ));
         };
 
         if stats.is_empty() {
-            return column.child(
+            return scroll_page(column.child(
                 div()
                     .mt(px(24.0))
                     .text_size(px(13.0))
@@ -551,7 +564,7 @@ impl Render for StatsPage {
                         "No dispatches in the {}. Release a task and this fills in.",
                         stats.window_label()
                     ))),
-            );
+            ));
         }
 
         // ── the headline ────────────────────────────────────────────────────
@@ -731,6 +744,6 @@ impl Render for StatsPage {
             ),
         ));
 
-        column
+        scroll_page(column)
     }
 }
