@@ -39,6 +39,7 @@ use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
 use comet_board::rows::{TaskDetail, TaskRow, board_rows, task_detail};
 use comet_board::runtime::{Runtime, agent_status};
+use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_proto::view::board::OrchestratorPin;
 use comet_proto::{Session, Space};
@@ -75,6 +76,12 @@ enum Msg {
     Detail {
         task_id: String,
         reply: oneshot::Sender<anyhow::Result<TaskDetail>>,
+    },
+    /// Throughput over a window (gh#143). On the loop's thread for the same
+    /// reason `Detail` is: that thread owns `board.db`.
+    Stats {
+        since_days: Option<i64>,
+        reply: oneshot::Sender<anyhow::Result<BoardStats>>,
     },
     Shutdown,
 }
@@ -294,6 +301,17 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
     }
 
+    /// What the board knows about its own throughput over a window (gh#143).
+    /// `None` days is all time.
+    pub async fn stats(&self, since_days: Option<i64>) -> anyhow::Result<BoardStats> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Stats { since_days, reply })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
+    }
+
     /// Stop the loop and wait for the in-flight cycle to finish, so shutdown
     /// never truncates a SQLite write mid-transaction.
     pub fn shutdown(&self) {
@@ -422,6 +440,15 @@ fn run_loop(
             }
             // A read, so it publishes nothing and logs nothing: opening a row
             // is not an event on the board.
+            // A read like `Detail`: publishes nothing, logs nothing. Opening
+            // the stats page is not an event on the board.
+            Ok(Msg::Stats { since_days, reply }) => {
+                let result = engine
+                    .db
+                    .load_tasks()
+                    .map(|tasks| comet_board::stats::gather(&tasks, since_days));
+                let _ = reply.send(result);
+            }
             Ok(Msg::Detail { task_id, reply }) => {
                 let result = engine
                     .db
@@ -503,18 +530,14 @@ fn handle_dispatch(
         .db
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
-    if !replace
-        && let Some(live) = task.live_attempt()
-    {
+    if !replace && let Some(live) = task.live_attempt() {
         anyhow::bail!(
             "{} already has a live attempt (chat {})",
             task.identifier,
             live.pane_id.as_deref().unwrap_or("pending")
         );
     }
-    if replace
-        && let Some(attempt) = task.live_attempt()
-    {
+    if replace && let Some(attempt) = task.live_attempt() {
         // The attempt the retry replaces may still hold a live chat; interrupt
         // it the way a cancel does, then archive the attempt so the fresh
         // release below can take its place.
@@ -717,7 +740,9 @@ fn handle_cancel(
     if let Some(attempt) = task.last_closed_attempt()
         && matches!(attempt.outcome, Some(Outcome::Failed | Outcome::Orphaned))
     {
-        engine.db.set_attempt_outcome(attempt.id, Outcome::Cancelled)?;
+        engine
+            .db
+            .set_attempt_outcome(attempt.id, Outcome::Cancelled)?;
         engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
         engine.rederive_all()?;
         log.info(format!(
@@ -823,7 +848,10 @@ mod tests {
 
     impl Runtime for FakeRuntime {
         fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
-            if self.spawn_in_dispatch.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .spawn_in_dispatch
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 tokio::spawn(async move {});
             }
             self.dispatched.lock().unwrap().push(spec.clone());
@@ -1075,7 +1103,11 @@ runtime = "mock"
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let d = service
-            .dispatch_task("gh:owner/widget#7", DispatchOrigin::via("chat-parent"), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#7",
+                DispatchOrigin::via("chat-parent"),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap();
         assert_eq!(d.chat_id, "chat-for-gh#7");
@@ -1099,7 +1131,11 @@ runtime = "mock"
 
         // A second dispatch is refused while the first attempt is live.
         let err = service
-            .dispatch_task("gh:owner/widget#7", DispatchOrigin::default(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#7",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
@@ -1139,7 +1175,11 @@ runtime = "mock"
         let d = std::thread::spawn(move || {
             handle.block_on(async {
                 dispatch
-                    .dispatch_task("gh:owner/widget#60", DispatchOrigin::default(), DispatchOverrides::default())
+                    .dispatch_task(
+                        "gh:owner/widget#60",
+                        DispatchOrigin::default(),
+                        DispatchOverrides::default(),
+                    )
                     .await
                     .expect("dispatch succeeds")
             })
@@ -1153,7 +1193,11 @@ runtime = "mock"
         // The loop survived: a second dispatch is refused on the live attempt
         // with a real answer, not "board loop is not running".
         let err = service
-            .dispatch_task("gh:owner/widget#60", DispatchOrigin::default(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#60",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
@@ -1237,7 +1281,10 @@ runtime = "mock"
         let task = db.get_task("gh:owner/widget#74").unwrap().unwrap();
         let attempt = task.live_attempt().expect("live attempt");
         assert_eq!(attempt.dispatched_by_device.as_deref(), Some("laptop-ana"));
-        assert_eq!(attempt.dispatched_by_user.as_deref(), Some("ana@example.com"));
+        assert_eq!(
+            attempt.dispatched_by_user.as_deref(),
+            Some("ana@example.com")
+        );
         // No agent in the chain: the operator is a person now, not an anonymous
         // `Dispatcher::Operator`.
         assert!(!attempt.dispatcher().is_agent());
@@ -1428,7 +1475,11 @@ billing_guard = "{mode}"
             ..DispatchOrigin::default()
         };
         let err = service
-            .dispatch_task("gh:owner/widget#103", ana.clone(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#103",
+                ana.clone(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1662,7 +1713,11 @@ max_concurrent_per_workspace = 1
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let err = service
-            .dispatch_task("gh:owner/widget#21", DispatchOrigin::default(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#21",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cancel one first"), "{err}");
@@ -1691,7 +1746,11 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         service
-            .dispatch_task("gh:owner/widget#31", DispatchOrigin::via("chat-parent-30"), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#31",
+                DispatchOrigin::via("chat-parent-30"),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap();
 
@@ -1722,7 +1781,11 @@ max_concurrent_per_workspace = 1
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         service
-            .dispatch_task("gh:owner/widget#40", DispatchOrigin::via("chat-gone"), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#40",
+                DispatchOrigin::via("chat-gone"),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap();
 
@@ -1745,7 +1808,11 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![]);
 
         let err = service
-            .dispatch_task("gh:owner/widget#8", DispatchOrigin::default(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#8",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no comet space"), "{err}");
@@ -1849,7 +1916,11 @@ max_concurrent_per_workspace = 1
         let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
 
         let dispatched = service
-            .dispatch_task("gh:owner/widget#62", DispatchOrigin::default(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#62",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap();
         assert_eq!(dispatched.attempt, 2);
@@ -1883,14 +1954,22 @@ max_concurrent_per_workspace = 1
         // A plain dispatch is still refused while the attempt is live — only
         // the retry is allowed past the guard.
         let err = service
-            .dispatch_task("gh:owner/widget#63", DispatchOrigin::default(), DispatchOverrides::default())
+            .dispatch_task(
+                "gh:owner/widget#63",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live attempt"), "{err}");
 
         // The retry interrupts the stuck chat and archives it…
         let dispatched = service
-            .retry_task("gh:owner/widget#63", DispatchOrigin::default(), DispatchOverrides::default())
+            .retry_task(
+                "gh:owner/widget#63",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
             .await
             .unwrap();
         assert_eq!(dispatched.attempt, 2);

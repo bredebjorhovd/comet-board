@@ -98,7 +98,13 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
    behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
    class, doc id `ws2/{orgId}` — the `2` is the spaces-overhaul destructive break), with presence
-   via Loro `EphemeralStore` (replaces the 15s heartbeat writes). Writer discipline: each device
+   via Loro `EphemeralStore` (replaces the 15s heartbeat writes). Presence is DERIVED by the edge
+   from each room's socket set and pushed on join/close, never beaten in by clients: a `%EPH`
+   frame wakes the Durable Object, so a 15s client heartbeat meant a room that could never
+   hibernate — 10,800 GB-s/day per room, 83% of the free tier for an idle fleet (gh#145). Clients
+   read it as membership and ask (`GET /workspace/{orgId}/presence`) when someone looks; a
+   device's own `DeviceRoom` (`/status`, derived the same hibernation-safe way) is the independent
+   check that can retire a socket whose uplink died silently. Writer discipline: each device
    writes only its own device/session/chat rows and the git stamps of spaces it owns;
    creates/renames/archives/seen-marks are LWW map sets from any device. `deleteSpace` cascades:
    the space row and every chat/session row in it tombstone in one commit.

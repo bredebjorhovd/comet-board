@@ -88,9 +88,24 @@ impl EdgeConfig {
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
     pub fn room_url(&self, path: impl Into<String>) -> Arc<dyn comet_sync::UrlProvider> {
+        self.room_url_as(path, None)
+    }
+
+    /// As [`Self::room_url`], naming the device this socket belongs to.
+    ///
+    /// That name is what lets the edge DERIVE presence from its socket set
+    /// instead of being beaten awake every 15s to be told (gh#145). A socket
+    /// with no device id contributes no presence — which is correct for a
+    /// browser client, and is also what an engine older than gh#145 looks like.
+    pub fn room_url_as(
+        &self,
+        path: impl Into<String>,
+        device_id: Option<&str>,
+    ) -> Arc<dyn comet_sync::UrlProvider> {
         let ws_base = self.url.replacen("http", "ws", 1);
         Arc::new(EdgeRoomUrl {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
+            device_id: device_id.map(str::to_string),
             token: self.token.clone(),
         })
     }
@@ -98,6 +113,7 @@ impl EdgeConfig {
 
 struct EdgeRoomUrl {
     base: String,
+    device_id: Option<String>,
     token: Arc<dyn comet_rpc::TokenSource>,
 }
 
@@ -105,11 +121,17 @@ impl comet_sync::UrlProvider for EdgeRoomUrl {
     fn url(&self) -> futures::future::BoxFuture<'static, Result<String, comet_sync::SyncError>> {
         let token = self.token.clone();
         let base = self.base.clone();
+        let device_id = self.device_id.clone();
         Box::pin(async move {
             let token = token.token().await.ok_or_else(|| {
                 comet_sync::SyncError::Auth("no access token (signed out)".into())
             })?;
-            Ok(format!("{base}?token={token}"))
+            // Device ids are `[A-Za-z0-9_-]` (the edge's own `ID_RE`, which
+            // gates the routes that carry them), so nothing here needs escaping.
+            let device = device_id
+                .map(|id| format!("&deviceId={id}"))
+                .unwrap_or_default();
+            Ok(format!("{base}?token={token}{device}"))
         })
     }
 }
@@ -364,11 +386,13 @@ impl DocHost {
         // and rebuilds a client that stops reconnecting.
         if let Some(edge) = &self.inner.config.edge {
             crate::workspace_host::spawn_room_join(
-                edge.room_url(format!("/session/{chat_id}/ws")),
+                edge.room_url_as(
+                    format!("/session/{chat_id}/ws"),
+                    Some(&self.inner.config.device_id),
+                ),
                 chat_id.to_string(),
                 doc.doc().clone(),
                 Arc::downgrade(&handle.room),
-                Arc::new(|_: &RoomClient| {}),
                 Arc::new(|| {}),
             );
         }

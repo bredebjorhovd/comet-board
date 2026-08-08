@@ -99,6 +99,10 @@ icon_assets![
     (DOCUMENT_ADD, "document-add"),
     (GLOBAL, "global"),
     (CHECKLIST, "checklist"),
+    // Hand-drawn axis-and-bars in the Solar Linear style (like the
+    // terminal/pin/git-branch ports) — the board's throughput page (gh#143);
+    // the embedded set has no chart glyph.
+    (CHART, "chart"),
     (WIDGET, "widget"),
     // Hand-drawn wand in the Solar Linear style (like the terminal/plus/return
     // ports) — the skill-invocation landmark (gh#134); the embedded set has no

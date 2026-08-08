@@ -75,6 +75,36 @@ pub fn space_title<'a>(space: &'a Space, slug: Option<&'a str>) -> &'a str {
     space.display_name()
 }
 
+/// A row's name, split at the seam that matters when the row is too narrow
+/// for all of it: the `base` a reader recognises, and the `qualifier` that
+/// tells this row from its twin.
+///
+/// The two are separate fields and not one string because the surfaces that
+/// elide do it from the right, and the qualifier is the last thing that may be
+/// lost — a truncated `bredebjorhovd/attn · board-gh-10-attn` reads exactly
+/// like the row it was minted to be different from. A renderer with room lays
+/// them out with [`SpaceTitle::line`]; a renderer without gives the qualifier
+/// its own width and shrinks the base instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceTitle {
+    /// The name proper: rename, else repo slug, else folder basename.
+    pub base: String,
+    /// The path tail that separates this row from a same-named sibling in its
+    /// device group. `None` when the base already stands alone.
+    pub qualifier: Option<String>,
+}
+
+impl SpaceTitle {
+    /// Both halves on one line, `base · qualifier` — for surfaces with room
+    /// for the whole name (the TUI, tooltips, a drag ghost).
+    pub fn line(&self) -> String {
+        match &self.qualifier {
+            Some(tail) => format!("{} · {tail}", self.base),
+            None => self.base.clone(),
+        }
+    }
+}
+
 /// Row titles for ONE device group: [`space_title`] for each, made unique
 /// within the group.
 ///
@@ -82,13 +112,18 @@ pub fn space_title<'a>(space: &'a Space, slug: Option<&'a str>) -> &'a str {
 /// slug and any number of checkouts, so the moment a second folder on the same
 /// machine points at it (a worktree the board cut, a second clone), two rows
 /// carry one word and the sidebar looks like it is repeating itself (gh#138).
-/// Colliding rows therefore append the shortest path tail that separates them,
+/// Colliding rows therefore take the shortest path tail that separates them,
 /// at a uniform depth so the group reads at one level:
 ///
 /// ```text
 /// bredebjorhovd/attn · attn
 /// bredebjorhovd/attn · board-gh-10-attn
 /// ```
+///
+/// The tail comes back as a [`SpaceTitle::qualifier`] rather than glued to the
+/// name, because in a sidebar narrow enough to elide `bredebjorhovd/attn` on
+/// its own an appended tail is the FIRST thing cut, and the fix is invisible
+/// exactly where it was needed.
 ///
 /// Uniqueness is per group, not global, because that is the scope a reader
 /// scans: the same repo checked out on the laptop AND on the box is told apart
@@ -98,12 +133,18 @@ pub fn space_title<'a>(space: &'a Space, slug: Option<&'a str>) -> &'a str {
 /// Pure and index-preserving: `out[i]` names `rows[i]`. Two rows for literally
 /// the same path keep the same title — there is no fact left to separate them
 /// with, and that IS a duplicate.
-pub fn space_titles(rows: &[(&Space, Option<&str>)]) -> Vec<String> {
+pub fn space_titles(rows: &[(&Space, Option<&str>)]) -> Vec<SpaceTitle> {
     let bases: Vec<&str> = rows
         .iter()
         .map(|(space, slug)| space_title(space, *slug))
         .collect();
-    let mut out: Vec<String> = bases.iter().map(|base| (*base).to_string()).collect();
+    let mut out: Vec<SpaceTitle> = bases
+        .iter()
+        .map(|base| SpaceTitle {
+            base: (*base).to_string(),
+            qualifier: None,
+        })
+        .collect();
     let mut done: Vec<&str> = Vec::new();
     for base in &bases {
         if done.contains(base) {
@@ -142,7 +183,7 @@ pub fn space_titles(rows: &[(&Space, Option<&str>)]) -> Vec<String> {
         for ix in clash {
             let tail = path_tail(&rows[ix].0.path, depth);
             if !tail.is_empty() {
-                out[ix] = format!("{base} · {tail}");
+                out[ix].qualifier = Some(tail);
             }
         }
     }
@@ -326,7 +367,10 @@ mod tests {
     fn title_prefers_rename_then_slug_then_basename() {
         let mut s = space("s1", "box", "/srv/comet-board");
         assert_eq!(space_title(&s, None), "comet-board");
-        assert_eq!(space_title(&s, Some("brede/comet-board")), "brede/comet-board");
+        assert_eq!(
+            space_title(&s, Some("brede/comet-board")),
+            "brede/comet-board"
+        );
         s.name = Some("My board".into());
         assert_eq!(space_title(&s, Some("brede/comet-board")), "My board");
     }
@@ -353,11 +397,35 @@ mod tests {
         let slug = Some("bredebjorhovd/attn");
         let titles = space_titles(&[(&checkout, slug), (&worktree, slug)]);
         assert_eq!(
-            titles,
+            titles.iter().map(SpaceTitle::line).collect::<Vec<_>>(),
             [
                 "bredebjorhovd/attn · attn",
                 "bredebjorhovd/attn · board-gh-10-attn"
             ]
+        );
+    }
+
+    #[test]
+    fn the_separating_tail_is_a_field_a_narrow_row_can_keep() {
+        // The operator screenshot after gh#138 shipped: both rows still read
+        // `bredebjorhovd/attn…`, because the sidebar elides from the right and
+        // the qualifier was glued to the end of the name. It comes back apart
+        // so a renderer can spend its width on the half that differs.
+        let checkout = space("s1", "mac", "/Users/brede/dev/attn");
+        let worktree = space(
+            "s2",
+            "mac",
+            "/Users/brede/.comet-native/worktrees/attn/board-gh-10-attn",
+        );
+        let slug = Some("bredebjorhovd/attn");
+        let titles = space_titles(&[(&checkout, slug), (&worktree, slug)]);
+        assert!(titles.iter().all(|t| t.base == "bredebjorhovd/attn"));
+        assert_eq!(
+            titles
+                .iter()
+                .map(|t| t.qualifier.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("attn"), Some("board-gh-10-attn")]
         );
     }
 
@@ -369,7 +437,11 @@ mod tests {
             (&one, Some("brede/attn")),
             (&two, Some("brede/comet-native")),
         ]);
-        assert_eq!(titles, ["brede/attn", "brede/comet-native"]);
+        assert_eq!(
+            titles.iter().map(SpaceTitle::line).collect::<Vec<_>>(),
+            ["brede/attn", "brede/comet-native"]
+        );
+        assert!(titles.iter().all(|t| t.qualifier.is_none()));
     }
 
     #[test]
@@ -378,7 +450,10 @@ mod tests {
         let one = space("s1", "mac", "/Users/brede/dev/attn/api");
         let two = space("s2", "mac", "/Users/brede/work/web/api");
         let titles = space_titles(&[(&one, Some("brede/api")), (&two, Some("brede/api"))]);
-        assert_eq!(titles, ["brede/api · attn/api", "brede/api · web/api"]);
+        assert_eq!(
+            titles.iter().map(SpaceTitle::line).collect::<Vec<_>>(),
+            ["brede/api · attn/api", "brede/api · web/api"]
+        );
     }
 
     #[test]
@@ -396,7 +471,10 @@ mod tests {
         one.name = Some("Attn".into());
         two.name = Some("Attn".into());
         let titles = space_titles(&[(&one, None), (&two, None)]);
-        assert_eq!(titles, ["Attn · attn", "Attn · attn-2"]);
+        assert_eq!(
+            titles.iter().map(SpaceTitle::line).collect::<Vec<_>>(),
+            ["Attn · attn", "Attn · attn-2"]
+        );
     }
 
     // -- one full row per chat (gh#138) -------------------------------------

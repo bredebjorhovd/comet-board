@@ -225,6 +225,24 @@ statement that you are finished, so it settles the attempt promptly. Commits
 are not — you were told to make them mid-flight — so they settle it only once
 the run has genuinely ended. Open the PR when you want the row to move promptly.
 
+**Screenshots go in the repo, not in a `raw.githubusercontent.com` link.** A
+ticket that asks for screenshots in the PR description is asking for something
+that keeps working, and the URL an agent reaches for first does not:
+`https://raw.githubusercontent.com/<owner>/<repo>/<branch>/shot.png` is
+unreadable without a token on a **private** repo — so it renders broken for
+everyone, the author included — and it names a **branch**, which is deleted the
+moment the PR merges. Both failures are silent: the markdown is well-formed and
+the PR looks right until somebody opens it.
+
+Commit the images on your branch and reference them with a **relative** path
+from a markdown file that is also in the repo (`prototypes/v1/DESIGN-NOTES.md`
+→ `![Variant A](screenshots/01.png)`). Relative paths resolve against whatever
+ref the reader is on, private or not, and survive the branch. The PR body then
+links to that file, and the images you added also render as image diffs in the
+PR's own Files-changed tab. Inline images that live in the PR body itself
+(`user-attachments`) come from a drag-and-drop upload — a human can make one,
+you cannot, so do not write markup that pretends otherwise.
+
 **A settle is not final.** If the board closes your attempt while you are still
 working, it notices: a closed attempt whose chat is still working is re-opened,
 the row goes back to `working`, and the count of times that happened is kept on
@@ -240,10 +258,11 @@ so in the PR description rather than spending the remaining minutes on another
 lap. Finishing inside the grace settles the attempt `done` on your artifacts as
 normal — the cap only takes what nothing else has closed.
 
-**Your chat is filed away once the work is over, not deleted.** A week after
-the task leaves the board — merged, closed upstream, or marked done — the board
-archives the chat it dispatched you into, along with reclaiming the checkout you
-worked in (`archive_chats` / `retain_worktrees`, both per route). Never while
+**Your chat is filed away once the work is over, not deleted.** As soon as the
+task leaves the board — merged, closed upstream, or marked done — the board
+archives the chat it dispatched you into; the checkout you worked in is
+reclaimed on its own, week-long clock (`archive_chats` / `retain_worktrees`,
+both per route). Never while
 your attempt is live or blocked, and never while a pull request is still in
 review: a chat in review is how the board delivers comments back to you, so it
 outlives everything else. The transcript survives archiving, Settings →

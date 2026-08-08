@@ -76,6 +76,11 @@ struct RepoSpacesReply {
 /// plus the 2px column gap.
 const SPACE_ROW_SLOT: f32 = 31.0;
 
+/// How much of a space row the disambiguating tail may claim (gh#138). It wins
+/// the width fight against the repo name — that is the whole point — but not
+/// the whole row: past this it elides too, and the chevron stays put.
+const SPACE_QUALIFIER_MAX: f32 = 132.0;
+
 /// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
 /// animation restarts (the session-tab idiom, vertical).
 ///
@@ -371,7 +376,10 @@ impl Shell {
                 {
                     object.insert("targetDeviceId".into(), serde_json::json!(target));
                 }
-                let Ok(value) = engine.client().call(methods::LIST_REPO_SPACES, params).await
+                let Ok(value) = engine
+                    .client()
+                    .call(methods::LIST_REPO_SPACES, params)
+                    .await
                 else {
                     continue;
                 };
@@ -381,9 +389,7 @@ impl Shell {
                 links.extend(reply.spaces);
             }
             this.update(cx, |shell, cx| {
-                shell
-                    .state
-                    .update(cx, |s, _| s.apply_space_slugs(links));
+                shell.state.update(cx, |s, _| s.apply_space_slugs(links));
                 cx.notify();
             })
             .ok();
@@ -439,12 +445,7 @@ impl Shell {
             let device_presence: std::collections::HashMap<String, crate::state::HostPresence> =
                 spaces
                     .iter()
-                    .map(|s| {
-                        (
-                            s.device_id.clone(),
-                            state.host_presence(&s.device_id, now),
-                        )
-                    })
+                    .map(|s| (s.device_id.clone(), state.host_presence(&s.device_id, now)))
                     .collect();
             // Spaces with a live/awaiting session get an aggregate dot (the
             // most urgent member status wins) so the attention signal survives
@@ -594,11 +595,7 @@ impl Shell {
                         .get(&device_id)
                         .copied()
                         .unwrap_or(crate::state::HostPresence::Online);
-                    column = column.child(Self::render_device_header(
-                        device_name,
-                        presence,
-                        theme,
-                    ));
+                    column = column.child(Self::render_device_header(device_name, presence, theme));
                 }
                 let count = group.len();
                 let drag = self
@@ -622,7 +619,7 @@ impl Shell {
                     let is_selected = selected.as_deref() == Some(space.id.as_str());
                     let space_attention = attention.get(&space.id).copied();
                     let slug = slugs.get(&space.id).map(String::as_str);
-                    let title: SharedString = titles[ix].clone().into();
+                    let title = titles[ix].clone();
                     let repo = slug.is_some();
                     let expanded = self.space_expanded(&space.id) && !drag_active;
                     // What Active holds for this space — the count the row
@@ -857,7 +854,7 @@ impl Shell {
         ix: usize,
         device: String,
         space: Space,
-        title: SharedString,
+        title: spaces_view::SpaceTitle,
         repo: bool,
         expanded: bool,
         selected: bool,
@@ -867,6 +864,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let id = space.id.clone();
+        let base: SharedString = title.base.clone().into();
+        let qualifier: Option<SharedString> = title.qualifier.clone().map(Into::into);
+        let ghost_name: SharedString = title.line().into();
         let fade_key = format!("space-row-{id}");
         let rest_bg = if selected {
             theme.glass_selected_bg()
@@ -910,7 +910,7 @@ impl Shell {
                 SpaceDragPayload {
                     device,
                     from: ix,
-                    name: title.clone(),
+                    name: ghost_name,
                     repo,
                 },
                 |payload, _point, _, cx| {
@@ -924,23 +924,23 @@ impl Shell {
             // stable — appearing/disappearing at the right edge made the row
             // jitter (user request). Faint at rest, colored under attention.
             .child(
-                div()
-                    .size(px(6.0))
-                    .rounded_full()
-                    .flex_none()
-                    .bg(attention
-                        .map(|status| status_dot_color(status, theme))
-                        .unwrap_or_else(|| theme.white_alpha(0.14))),
+                div().size(px(6.0)).rounded_full().flex_none().bg(attention
+                    .map(|status| status_dot_color(status, theme))
+                    .unwrap_or_else(|| theme.white_alpha(0.14))),
             )
             // The glyph says what a space IS in a repo-first product: a repo
             // (a host supplied the gh#118 link), or a plain folder for the
             // scratch directory that is nobody's repo. Not the OS symbol for
             // "opens" — this row is a container, and the chevron carries that.
             .child(
-                icon(if repo { icons::GITHUB_MARK } else { icons::FOLDER })
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
+                icon(if repo {
+                    icons::GITHUB_MARK
+                } else {
+                    icons::FOLDER
+                })
+                .size(px(16.0))
+                .flex_none()
+                .text_color(theme.text_muted),
             )
             .child(
                 div()
@@ -949,8 +949,26 @@ impl Shell {
                     .text_size(px(13.0))
                     .line_height(px(17.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(title),
+                    .child(base),
             )
+            // The half that tells this row from its twin (gh#138), given its
+            // own width instead of a place at the end of a name the sidebar
+            // elides from the right. `bredebjorhovd/attn` alone overruns this
+            // pane, so an appended tail was always the first thing cut and the
+            // two checkouts read as one row drawn twice. The base shrinks
+            // first now; the qualifier is what survives.
+            .when_some(qualifier, |el, tail| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .max_w(px(SPACE_QUALIFIER_MAX))
+                        .truncate()
+                        .text_size(px(11.0))
+                        .line_height(px(17.0))
+                        .text_color(theme.text_muted.opacity(0.75))
+                        .child(SharedString::from(format!("· {tail}"))),
+                )
+            })
             // "· 3 running" (gh#138): where the space's live rows went. Muted
             // and after the name — the dot already said how urgent, this says
             // how many, and neither needs to shout.
@@ -1048,8 +1066,8 @@ impl Shell {
             // Either the space has no sessions, or Active is holding all of
             // them — and the difference is exactly what a reader who just
             // expanded an obviously-busy space needs told.
-            let note = spaces_view::shelf_note(shelf)
-                .unwrap_or_else(|| "No sessions yet".to_string());
+            let note =
+                spaces_view::shelf_note(shelf).unwrap_or_else(|| "No sessions yet".to_string());
             div()
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
@@ -1094,10 +1112,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = chat.id.clone();
-        let title: SharedString = transcript::single_line(
-            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-        )
-        .into();
+        let title: SharedString =
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
+                .into();
         let time_ago: SharedString =
             format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
         let harness = chat.config.as_ref().map(|c| c.harness);
@@ -1449,6 +1466,7 @@ impl Shell {
             theme.text.opacity(0.8)
         };
         let chat_id = slot.chat_id.clone();
+        let menu_id = slot.chat_id.clone();
         // The ◆ is identity; state is carried honestly beside it — the spinner
         // while a turn runs, so an 8h-old report can never be mistaken for a
         // turn running now.
@@ -1533,6 +1551,19 @@ impl Shell {
                     let id = chat_id.clone();
                     this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
                 }))
+                // The same right-click menu every chat row has — because this
+                // row may be the ONLY place the pinned chat appears. Unpinning
+                // lives on the row that is pinned (shell.rs), and a chat whose
+                // session has ended and whose space shelf never held it left
+                // the operator with a permanent slot and no way to reach the
+                // item: the kill switch was behind a row that does not exist.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.chat_menu = Some((menu_id.clone(), event.position));
+                        cx.notify();
+                    }),
+                )
                 .child(
                     div()
                         .w_full()
@@ -1923,8 +1954,7 @@ impl Shell {
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
         // text caret — Enter and ⌘Enter are both handled there.
-        let search =
-            cx.new(|cx| ComposerInput::with_context("Search repos…", "PaletteSearch", cx));
+        let search = cx.new(|cx| ComposerInput::with_context("Search repos…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 if let Some(flow) = this.add_space.as_mut() {
@@ -2181,11 +2211,10 @@ impl Shell {
                 if let Some(flow) = shell.add_space.as_mut() {
                     flow.onboarding = None;
                 }
-                match result
-                    .map_err(|e| format!("{e}"))
-                    .and_then(|v| serde_json::from_value::<comet_board::onboard::Onboarded>(v)
-                        .map_err(|e| format!("Unreadable reply: {e}")))
-                {
+                match result.map_err(|e| format!("{e}")).and_then(|v| {
+                    serde_json::from_value::<comet_board::onboard::Onboarded>(v)
+                        .map_err(|e| format!("Unreadable reply: {e}"))
+                }) {
                     Ok(done) => {
                         // The space was created on the box and will arrive with
                         // the next workspace frame; echo it so landing in it is
@@ -2493,8 +2522,7 @@ impl Shell {
                 };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 if let Some(flow) = self.add_space.as_mut() {
-                    flow.active =
-                        popover::menu_step(Some(flow.active), count, delta).unwrap_or(0);
+                    flow.active = popover::menu_step(Some(flow.active), count, delta).unwrap_or(0);
                     // Keep the highlighted row in view as the cursor walks
                     // past the viewport (user-reported: the list didn't
                     // follow the keyboard).
@@ -2685,7 +2713,11 @@ impl Shell {
             .border_color(hairline)
             .child(
                 key_chip(&theme)
-                    .child(icon(icons::COMMAND).size(px(11.0)).text_color(theme.text_muted.opacity(0.7)))
+                    .child(
+                        icon(icons::COMMAND)
+                            .size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.7)),
+                    )
                     .child(SharedString::from("K")),
             )
             .child(
@@ -2765,38 +2797,39 @@ impl Shell {
                 )
             });
 
-        let card = div()
-            .id("add-space-palette")
-            .w(px(680.0))
-            .rounded(px(14.0))
-            .border_1()
-            .border_color(theme.white_alpha(0.10))
-            // The popover_card glass recipe: a translucent tint over the
-            // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
-            // an opaque fill here killed the vibrancy every other float has.
-            .bg(theme.float_card())
-            .shadow_lg()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .text_color(theme.text)
-            // On the keyboard dispatch path (see `AddSpaceFlow::focus`) — the
-            // pickers' proven structure for frame-level keys with a focused
-            // child input.
-            .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.add_space_key(event, cx)
-            }))
-            // Clicking the scrim dismisses (user requirement) — same close
-            // path as Escape.
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.add_space = None;
-                cx.notify();
-            }))
-            .child(input_row)
-            .child(body)
-            .child(footer)
-            .into_any_element();
+        let card =
+            div()
+                .id("add-space-palette")
+                .w(px(680.0))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(theme.white_alpha(0.10))
+                // The popover_card glass recipe: a translucent tint over the
+                // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
+                // an opaque fill here killed the vibrancy every other float has.
+                .bg(theme.float_card())
+                .shadow_lg()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .text_color(theme.text)
+                // On the keyboard dispatch path (see `AddSpaceFlow::focus`) — the
+                // pickers' proven structure for frame-level keys with a focused
+                // child input.
+                .track_focus(&focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    this.add_space_key(event, cx)
+                }))
+                // Clicking the scrim dismisses (user requirement) — same close
+                // path as Escape.
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.add_space = None;
+                    cx.notify();
+                }))
+                .child(input_row)
+                .child(body)
+                .child(footer)
+                .into_any_element();
         Some(popover::modal("add-space-dialog", viewport, card))
     }
 
@@ -2885,7 +2918,15 @@ impl Shell {
                         // spin forever.
                         let connecting =
                             onboarding.is_some() && onboarding.as_deref() == row.slug.as_deref();
-                        self.render_repo_row(theme, ix, ix == active, connecting, &device_labels, row, cx)
+                        self.render_repo_row(
+                            theme,
+                            ix,
+                            ix == active,
+                            connecting,
+                            &device_labels,
+                            row,
+                            cx,
+                        )
                     })),
             )
             .into_any_element()
@@ -3197,9 +3238,13 @@ impl Shell {
                             .flex_none()
                             .text_color(theme.text_muted.opacity(0.8)),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
-                        "Browse folders…",
-                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from("Browse folders…")),
+                    )
                     .child(
                         icon(icons::ARROW_RIGHT)
                             .size(px(12.0))
@@ -3271,9 +3316,7 @@ impl Shell {
                 let at_home = home.as_deref() == Some(listing.path.as_str());
                 let folded = 1 + home
                     .as_deref()
-                    .filter(|h| {
-                        listing.path == *h || listing.path.starts_with(&format!("{h}/"))
-                    })
+                    .filter(|h| listing.path == *h || listing.path.starts_with(&format!("{h}/")))
                     .map(|h| h.split('/').filter(|s| !s.is_empty()).count())
                     .unwrap_or(0);
                 div()
@@ -3297,7 +3340,9 @@ impl Shell {
                         if at_home {
                             // Standing at home — the device crumb IS the
                             // current folder.
-                            crumb.text_color(theme.text.opacity(0.85)).into_any_element()
+                            crumb
+                                .text_color(theme.text.opacity(0.85))
+                                .into_any_element()
                         } else {
                             crumb
                                 .text_color(theme.text_muted.opacity(0.55))
@@ -3312,53 +3357,42 @@ impl Shell {
                                 .into_any_element()
                         }
                     })
-                    .children(
-                        segments
-                            .into_iter()
-                            .enumerate()
-                            .skip(folded)
-                            .map(|(ix, (label, full))| {
-                                let is_last = ix == last;
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .child(separator(theme))
-                                    .child({
-                                        let crumb = div()
-                                            .id(("add-space-crumb", ix))
-                                            .px(px(3.0))
-                                            .rounded(px(4.0))
-                                            .text_color(if is_last {
-                                                theme.text.opacity(0.85)
-                                            } else {
-                                                theme.text_muted.opacity(0.55)
-                                            })
-                                            .child(SharedString::from(label));
-                                        if is_last {
-                                            crumb.into_any_element()
+                    .children(segments.into_iter().enumerate().skip(folded).map(
+                        |(ix, (label, full))| {
+                            let is_last = ix == last;
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(separator(theme))
+                                .child({
+                                    let crumb = div()
+                                        .id(("add-space-crumb", ix))
+                                        .px(px(3.0))
+                                        .rounded(px(4.0))
+                                        .text_color(if is_last {
+                                            theme.text.opacity(0.85)
                                         } else {
-                                            crumb
-                                                .cursor_pointer()
-                                                .hover(|s| s.text_color(theme.text))
-                                                .on_click(cx.listener(
-                                                    move |this, _, _, cx| {
-                                                        if let Some(flow) =
-                                                            this.add_space.as_mut()
-                                                        {
-                                                            flow.browser_repo = false;
-                                                        }
-                                                        this.load_space_folders(
-                                                            Some(full.clone()),
-                                                            cx,
-                                                        );
-                                                    },
-                                                ))
-                                                .into_any_element()
-                                        }
-                                    })
-                            }),
-                    )
+                                            theme.text_muted.opacity(0.55)
+                                        })
+                                        .child(SharedString::from(label));
+                                    if is_last {
+                                        crumb.into_any_element()
+                                    } else {
+                                        crumb
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(theme.text))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(flow) = this.add_space.as_mut() {
+                                                    flow.browser_repo = false;
+                                                }
+                                                this.load_space_folders(Some(full.clone()), cx);
+                                            }))
+                                            .into_any_element()
+                                    }
+                                })
+                        },
+                    ))
                     .into_any_element()
             }
             None => div()
@@ -3440,37 +3474,40 @@ impl Shell {
                         .flex_col()
                         // The app-wide list rhythm (sidebar rows, menu rows): 2px.
                         .gap(px(2.0))
-                .children(rows.into_iter().enumerate().map(|(ix, entry)| {
-                    let name: SharedString = entry.name.clone().into();
-                    let full = crate::pickers::child_path(&base_path, &entry.name);
-                    let is_repo = entry.is_repo;
-                    popover::menu_row_nav(theme, false, ix == active, format!("add-space-folder-{ix}"))
-                        // The active-tab/session selection language: the wash
-                        // plus the ring-only inset outline.
-                        .when(ix == active, |el| {
-                            el.shadow(theme.glass_selected_shadows())
-                        })
-                        .id(("add-space-folder", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.add_space_descend(full.clone(), is_repo, cx);
-                        }))
-                        .child(
-                            icon(icons::FOLDER)
-                                .size(px(15.0))
-                                .flex_none()
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        // Repos get a quiet trailing branch glyph — the row
-                        // you're usually hunting for announces itself.
-                        .when(is_repo, |el| {
-                            el.child(
-                                icon(icons::GIT_BRANCH)
-                                    .size(px(13.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted.opacity(0.5)),
+                        .children(rows.into_iter().enumerate().map(|(ix, entry)| {
+                            let name: SharedString = entry.name.clone().into();
+                            let full = crate::pickers::child_path(&base_path, &entry.name);
+                            let is_repo = entry.is_repo;
+                            popover::menu_row_nav(
+                                theme,
+                                false,
+                                ix == active,
+                                format!("add-space-folder-{ix}"),
                             )
-                        })
+                            // The active-tab/session selection language: the wash
+                            // plus the ring-only inset outline.
+                            .when(ix == active, |el| el.shadow(theme.glass_selected_shadows()))
+                            .id(("add-space-folder", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.add_space_descend(full.clone(), is_repo, cx);
+                            }))
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(15.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted.opacity(0.8)),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(name))
+                            // Repos get a quiet trailing branch glyph — the row
+                            // you're usually hunting for announces itself.
+                            .when(is_repo, |el| {
+                                el.child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(13.0))
+                                        .flex_none()
+                                        .text_color(theme.text_muted.opacity(0.5)),
+                                )
+                            })
                         })),
                 )
                 .into_any_element()
@@ -3498,7 +3535,10 @@ impl Shell {
         let device = self.add_space.as_ref().and_then(|f| f.device.clone());
         let device_presence: Vec<bool> = {
             let state = self.state.read(cx);
-            devices.iter().map(|d| state.device_online(&d.id, now)).collect()
+            devices
+                .iter()
+                .map(|d| state.device_online(&d.id, now))
+                .collect()
         };
         let device_name: SharedString = device
             .as_ref()
@@ -3571,19 +3611,23 @@ impl Shell {
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .child(
-                        div().size(px(5.0)).rounded_full().flex_none().when(online, |el| {
-                            // The Devices-page presence emerald, soft glow
-                            // included.
-                            let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
-                            el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
-                                color: emerald.opacity(0.55),
-                                offset: gpui::point(px(0.0), px(0.0)),
-                                blur_radius: px(6.0),
-                                spread_radius: px(0.0),
-                                inset: false,
-                            }])
-                        })
-                        .when(!online, |el| el.bg(theme.white_alpha(0.22))),
+                        div()
+                            .size(px(5.0))
+                            .rounded_full()
+                            .flex_none()
+                            .when(online, |el| {
+                                // The Devices-page presence emerald, soft glow
+                                // included.
+                                let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+                                el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
+                                    color: emerald.opacity(0.55),
+                                    offset: gpui::point(px(0.0), px(0.0)),
+                                    blur_radius: px(6.0),
+                                    spread_radius: px(0.0),
+                                    inset: false,
+                                }])
+                            })
+                            .when(!online, |el| el.bg(theme.white_alpha(0.22))),
                     )
             }))
             .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
@@ -3632,9 +3676,13 @@ impl Shell {
                             .flex_none()
                             .text_color(theme.text_faint.opacity(0.7)),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
-                        "Back to repos",
-                    ))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from("Back to repos")),
+                    ),
             )
     }
 

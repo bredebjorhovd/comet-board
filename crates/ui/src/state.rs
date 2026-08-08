@@ -591,10 +591,12 @@ impl AppState {
             .map(|d| d.name.as_str())
     }
 
-    /// Host-presence check: is this device's 15s presence heartbeat fresh?
-    /// Distinguishes "host offline" (its queued work syncs when it returns)
-    /// from slow sync. The local device is trivially online; unknown devices
-    /// get the benefit of the doubt (no evidence — don't cry wolf).
+    /// Host-presence check: is this device's overlaid `lastSeenAt` fresh — i.e.
+    /// did our engine restamp it because it believes the device connected
+    /// (`comet_engine::presence`, gh#145)? Distinguishes "host offline" (its
+    /// queued work syncs when it returns) from slow sync. The local device is
+    /// trivially online; unknown devices get the benefit of the doubt (no
+    /// evidence — don't cry wolf).
     pub fn device_online(&self, device_id: &str, now: DateTime<Utc>) -> bool {
         if self.local_device_id.as_deref() == Some(device_id) {
             return true;
