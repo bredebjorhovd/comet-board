@@ -77,6 +77,17 @@ struct BoardView: View {
         .navigationTitle("Board")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                // What the board did with the work it was given (gh#143). Off
+                // the board rather than off Home: it is a question about this
+                // board, and it is read on the host the rows came from.
+                Button {
+                    path.append(.stats)
+                } label: {
+                    Image(systemName: "chart.bar")
+                }
+                .accessibilityLabel("Board stats")
+            }
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text("Board")

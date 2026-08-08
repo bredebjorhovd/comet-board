@@ -22,6 +22,31 @@ import Foundation
 
 // MARK: - Unique names within a group
 
+/// A row's name, split at the seam that matters when the row is too narrow for
+/// all of it (gh#144): the `base` a reader recognises, and the `qualifier` that
+/// tells this row from its twin.
+///
+/// Two fields and not one string because a row elides from the RIGHT, and the
+/// qualifier is the last thing that may be lost — a truncated
+/// `bredebjorhovd/attn · board-gh…` reads exactly like the row it was minted to
+/// be different from, which is the fix being invisible precisely where it was
+/// needed. A renderer with room lays them out with `line`; a renderer without
+/// gives the qualifier its own width and shrinks the base instead.
+struct SpaceTitle: Hashable {
+    /// The name proper: the space's rename, else its folder basename.
+    var base: String
+    /// The path tail that separates this row from a same-named sibling in its
+    /// device group. `nil` when the base already stands alone.
+    var qualifier: String?
+
+    /// Both halves on one line, `base · qualifier` — for surfaces with room for
+    /// the whole name.
+    var line: String {
+        guard let qualifier else { return base }
+        return "\(base) · \(qualifier)"
+    }
+}
+
 /// Row titles for one group of spaces: the space's display name, made unique
 /// within the group.
 ///
@@ -30,9 +55,9 @@ import Foundation
 /// laptop AND on the box is told apart by the device each row already names.
 /// Two rows for literally the same path keep the same title: there is no fact
 /// left to separate them with, and that IS a duplicate.
-func spaceTitles(_ spaces: [Space]) -> [String] {
+func spaceTitles(_ spaces: [Space]) -> [SpaceTitle] {
     let bases = spaces.map(\.displayName)
-    var out = bases
+    var out = bases.map { SpaceTitle(base: $0, qualifier: nil) }
     var done = Set<String>()
     for base in bases where !done.contains(base) {
         done.insert(base)
@@ -47,7 +72,7 @@ func spaceTitles(_ spaces: [Space]) -> [String] {
         } ?? deepest
         for ix in clash {
             let tail = pathTail(spaces[ix].path, depth)
-            if !tail.isEmpty { out[ix] = "\(base) · \(tail)" }
+            if !tail.isEmpty { out[ix].qualifier = tail }
         }
     }
     return out

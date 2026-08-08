@@ -116,6 +116,10 @@ struct OrchestratorSlotSection: View {
     @Environment(AppModel.self) private var model
     @Binding var path: [Route]
 
+    /// Why the unpin did not happen, when it did not. Nothing is said on
+    /// success — the slot disappearing IS the board agreeing.
+    @State private var failure: String?
+
     var body: some View {
         if let slot = model.orchestratorSlotRow {
             Section {
@@ -125,9 +129,43 @@ struct OrchestratorSlotSection: View {
                     OrchestratorSlotView(slot: slot)
                 }
                 .buttonStyle(PressWashButtonStyle())
+                // The kill switch, and on the phone the ONLY one (gh#144).
+                // This slot is often the only row a pinned chat has — its
+                // session ends and its space shelf may never have listed it —
+                // so without a menu here an operator who reopens the
+                // orchestrator cannot unpin it from this device at all. The
+                // desktop and the TUI grew this menu for exactly that; the
+                // phone has no `comet-board routes defaults orchestrator_chat
+                // --unset` to fall back to.
+                .contextMenu {
+                    Button("Unpin orchestrator", systemImage: "pin.slash",
+                           role: .destructive) {
+                        unpin()
+                    }
+                }
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 1, trailing: 12))
+                .alert("Couldn't unpin the orchestrator",
+                       isPresented: Binding(get: { failure != nil },
+                                            set: { if !$0 { failure = nil } })) {
+                    Button("OK", role: .cancel) { failure = nil }
+                } message: {
+                    Text(failure ?? "")
+                }
+            }
+        }
+    }
+
+    /// Clear `[defaults] orchestrator_chat` on the board's routing.toml.
+    ///
+    /// Nothing is applied optimistically: the board republishes the pin on the
+    /// watch stream as the write lands, so a refusal must not leave the slot
+    /// gone on a phone the box disagrees with.
+    private func unpin() {
+        Task {
+            if let error = await model.setOrchestrator(chatId: nil) {
+                failure = error
             }
         }
     }

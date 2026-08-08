@@ -44,6 +44,14 @@ final class DemoDataset {
         let comet = Space(id: "space-comet", deviceId: "dev-mac",
                           path: "/Users/dev/comet-native", name: nil, gitDetected: true,
                           gitCheckedAt: now, checkoutId: nil, createdAt: now - 86_400_000 * 9)
+        // A second checkout of the SAME repo on the same machine — the state
+        // gh#138/gh#144 exist for. Both rows are called `comet-native`, so the
+        // list has to tell them apart with a path tail, and the tail has to
+        // survive a row too narrow for the whole name.
+        let cometWorktree = Space(id: "space-comet-wt", deviceId: "dev-mac",
+                                  path: "/Users/dev/worktrees/comet-native", name: nil,
+                                  gitDetected: true, gitCheckedAt: now, checkoutId: nil,
+                                  createdAt: now - 86_400_000 * 2)
         let edge = Space(id: "space-edge", deviceId: "dev-vps",
                          path: "/srv/deploys/edge", name: nil, gitDetected: true,
                          gitCheckedAt: now, checkoutId: nil, createdAt: now - 86_400_000 * 4)
@@ -102,7 +110,7 @@ final class DemoDataset {
                                             status: .working, startedAt: now - 6_600_000,
                                             updatedAt: now - 2_000),
         ]
-        let dataset = DemoDataset(devices: [mac, vps], spaces: [comet, edge],
+        let dataset = DemoDataset(devices: [mac, vps], spaces: [comet, cometWorktree, edge],
                                   chats: chats, sessions: sessions)
         dataset.boardRows = boardDemoRows(now: now)
         return dataset
@@ -238,6 +246,108 @@ final class DemoDataset {
             who is paying for it.
             """,
     ]
+
+    // MARK: Throughput (gh#143, gh#151)
+
+    /// What the demo board "did" over a window — the shape `comet_board::stats`
+    /// gathers, so the stats screen is explorable with no box.
+    ///
+    /// Deterministic on purpose: a screenshot rig that got a different board on
+    /// every launch would make two runs incomparable. The day pattern is a
+    /// fixed weekly rhythm, and the honest empties the screen exists to respect
+    /// are real here too — three attempts in four reported tokens, so the
+    /// coverage line has something to say.
+    static func stats(sinceDays: Int64?) -> BoardStats {
+        let days = max(1, min(Int(sinceDays ?? 30), 30))
+        let pattern = [4, 7, 2, 9, 5, 1, 6]
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let today = Date()
+
+        var daily: [DayBucket] = []
+        var dailyTokens: [TokenDay] = []
+        for offset in stride(from: days - 1, through: 0, by: -1) {
+            let date = formatter.string(from: today.addingTimeInterval(-86_400 * Double(offset)))
+            let dispatches = pattern[offset % pattern.count]
+            let done = max(0, dispatches - (offset % 3 == 0 ? 1 : 0))
+            daily.append(DayBucket(date: date, dispatches: dispatches, done: done))
+            let scale = UInt64(dispatches)
+            dailyTokens.append(TokenDay(date: date, usage: TokenUsage(
+                inputTokens: 9_400 * scale, outputTokens: 6_100 * scale,
+                cacheReadTokens: 148_000 * scale, cacheCreationTokens: 21_500 * scale)))
+        }
+
+        let attempts = daily.reduce(0) { $0 + $1.dispatches }
+        let live = min(2, attempts)  // the two attempts the demo board is running
+        let ended = max(0, attempts - live)
+        // Never more landed than ended: a 24h window is one small day, and a
+        // demo that reported 150% completion would discredit the screen it is
+        // meant to show off.
+        let done = min(daily.reduce(0) { $0 + $1.done }, ended)
+        let tokens = dailyTokens.reduce(TokenUsage()) { $0 + $1.usage }
+        let metered = Int((Double(attempts) * 0.76).rounded())
+
+        var hours = [Int](repeating: 0, count: 24)
+        for (hour, count) in [(8, 2), (9, 5), (10, 7), (11, 4), (13, 6), (14, 8),
+                              (15, 5), (16, 3), (21, 4), (22, 6), (23, 2)] {
+            hours[hour] = count * max(1, days / 7)
+        }
+
+        let majority = TokenUsage(
+            inputTokens: tokens.inputTokens * 72 / 100,
+            outputTokens: tokens.outputTokens * 72 / 100,
+            cacheReadTokens: tokens.cacheReadTokens * 72 / 100,
+            cacheCreationTokens: tokens.cacheCreationTokens * 72 / 100)
+        let remainder = TokenUsage(
+            inputTokens: tokens.inputTokens - majority.inputTokens,
+            outputTokens: tokens.outputTokens - majority.outputTokens,
+            cacheReadTokens: tokens.cacheReadTokens - majority.cacheReadTokens,
+            cacheCreationTokens: tokens.cacheCreationTokens - majority.cacheCreationTokens)
+
+        func split(_ total: Int, _ shares: [(String, Double)]) -> [String: Int] {
+            var out: [String: Int] = [:]
+            for (label, share) in shares {
+                let value = Int((Double(total) * share).rounded())
+                if value > 0 { out[label] = value }
+            }
+            return out
+        }
+
+        return BoardStats(
+            sinceDays: sinceDays,
+            attempts: attempts,
+            tasksTouched: max(1, Int(Double(attempts) * 0.82)),
+            outcomes: ["done": done, "failed": max(0, ended - done - 1), "cancelled": 1],
+            live: live,
+            completionRate: ended > 0 ? Double(done) / Double(ended) : nil,
+            medianMinutes: 18,
+            p90Minutes: 74,
+            longestMinutes: 196,
+            totalMinutes: Int64(attempts) * 27,
+            tokens: tokens,
+            attemptsWithTokens: metered,
+            tokenCoverage: attempts > 0 ? Double(metered) / Double(attempts) : nil,
+            landing: Landing(merged: max(0, done - 2), open: 2,
+                             closedUnmerged: 1, noPr: max(0, ended - done)),
+            friction: Friction(retriedTasks: 3, earlySettles: 1,
+                               blockedEntries: 4, overruns: 1),
+            daily: daily,
+            dailyTokens: dailyTokens,
+            hourOfDay: hours,
+            // The demo's own spaces, and only them: a tally naming a workspace
+            // no row on this device has ever heard of is a tally nobody can
+            // check against the rest of the app.
+            byWorkspace: split(attempts, [("comet-native", 0.7), ("edge", 0.3)]),
+            byRuntime: split(attempts, [("claude-code", 0.74), ("codex", 0.26)]),
+            bySource: split(attempts, [("github", 0.79), ("linear", 0.21)]),
+            byAccount: split(attempts, [("brede@tally.no", 0.7), ("ana@tally.no", 0.3)]),
+            agentDispatched: Int(Double(attempts) * 0.4),
+            // Split exactly, remainder and all: a breakdown whose rows do not
+            // add up to the headline is the one thing a table like this must
+            // never do.
+            tokensByModel: ["claude-fable-5": majority, "gpt-5.6-terra": remainder],
+            tokensByRuntime: ["claude-code": majority, "codex": remainder])
+    }
 
     /// One row per board state that has anything to say, in board order. The
     /// two live attempts point at real demo chats so `agentRows` keeps them

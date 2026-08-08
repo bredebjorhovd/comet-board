@@ -100,6 +100,8 @@ final class AppModel {
                 launchRoute = .space(String(spec.dropFirst("space:".count)))
             } else if spec == "board" {
                 launchRoute = .board
+            } else if spec == "stats" {
+                launchRoute = .stats
             }
         }
         if let ix = args.firstIndex(of: "-sheet"), ix + 1 < args.count {
@@ -263,8 +265,12 @@ final class AppModel {
 
     /// Row titles, made unique within each device's spaces (gh#138): a repo
     /// slug names a repo, and one machine can hold several checkouts of it.
-    var spaceTitlesById: [String: String] {
-        var out: [String: String] = [:]
+    ///
+    /// Split into base and qualifier (gh#144), never glued: the row elides from
+    /// the right, so a single string loses the disambiguating tail first and
+    /// two rows for one repo read identically again.
+    var spaceTitlesById: [String: SpaceTitle] {
+        var out: [String: SpaceTitle] = [:]
         for (_, group) in Dictionary(grouping: spaces, by: \.deviceId) {
             let titles = spaceTitles(group)
             for (ix, space) in group.enumerated() { out[space.id] = titles[ix] }
@@ -315,6 +321,15 @@ final class AppModel {
     var boardStatus: String? { demo != nil ? nil : board?.status }
 
     var boardAttached: Bool { demo != nil || board?.attached == true }
+
+    /// The device the board sweep settled on, once it has. Read by surfaces
+    /// that ASK the board something rather than watch it: a screen opened
+    /// before the sweep answered has to know when to try again, and this
+    /// changing is that moment.
+    var boardHostDeviceId: String? {
+        if demo != nil { return demo?.devices.first { $0.platform != "ios" }?.id }
+        return board?.hostDeviceId
+    }
 
     /// The home screen's Active group (gh#123): everything alive, most urgent
     /// first — live board attempts (gh#103) and the working chats no attempt
@@ -400,6 +415,36 @@ final class AppModel {
         }
         guard let board else { return .failed("Not connected to a board") }
         return await board.taskDetail(taskId: taskId)
+    }
+
+    /// What the board did with the work it was given, over a window (gh#143).
+    ///
+    /// Read when the screen opens and on every window change, never streamed:
+    /// a full aggregate on every board tick would cost a phone a recompute
+    /// nobody is looking at — the same reason `BoardStats` is a call on every
+    /// other surface.
+    func boardStats(sinceDays: Int64?) async -> BoardStore.StatsOutcome {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 250_000_000)  // feel like a sweep
+            let box = demo?.devices.first { $0.platform != "ios" }?.id ?? "dev-vps"
+            return .read(DemoDataset.stats(sinceDays: sinceDays), host: box)
+        }
+        guard let board else { return .failed("Not connected to a board") }
+        return await board.stats(sinceDays: sinceDays)
+    }
+
+    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#144).
+    ///
+    /// The phone's only route to `comet-board routes defaults orchestrator_chat
+    /// --unset`: the slot is often the ONLY row a pinned chat has, since its
+    /// session ends and its space shelf may never have listed it.
+    func setOrchestrator(chatId: String?) async -> String? {
+        if let demo {
+            demo.orchestratorChatId = chatId
+            return nil
+        }
+        guard let board else { return "Not connected to a board" }
+        return await board.setOrchestrator(chatId: chatId)
     }
 
     func cancelBoardTask(taskId: String) async -> String? {

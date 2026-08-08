@@ -378,6 +378,88 @@ final class BoardStore {
         }
     }
 
+    // MARK: Throughput (gh#143)
+
+    enum StatsOutcome {
+        case read(BoardStats, host: String)
+        case failed(String)
+    }
+
+    /// What the board did with the work it was given, over a window.
+    ///
+    /// `board.db` lives on whichever device hosts the board, so this asks the
+    /// host the watch sweep already settled on and falls back to the rest of
+    /// the candidates — the screen can be opened before `WatchBoard` has
+    /// answered anybody, and a candidate that refuses has said "I host no
+    /// board", which is this store's contract everywhere else.
+    ///
+    /// A reply that will not decode ends the sweep rather than continuing it:
+    /// that host HAS a board and is running a different version, and asking
+    /// the next device would report the wrong problem.
+    func stats(sinceDays: Int64?) async -> StatsOutcome {
+        var candidates = boardHostCandidates(devices())
+        if let host = hostDeviceId {
+            candidates.removeAll { $0 == host }
+            candidates.insert(host, at: 0)
+        }
+        guard !candidates.isEmpty else {
+            return .failed("No device in this org is hosting a board")
+        }
+        var params: [String: Any] = [:]
+        // Omitted, never null: all time is the absence of a window.
+        if let sinceDays { params["sinceDays"] = sinceDays }
+        var last: String?
+        for deviceId in candidates {
+            do {
+                let stats: BoardStats = try await relay(for: deviceId)
+                    .call(method: "BoardStats", params: params)
+                return .read(stats, host: deviceId)
+            } catch is DecodingError {
+                return .failed("Unreadable stats — the board is on another version")
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        return .failed(last ?? "No device in this org is hosting a board")
+    }
+
+    // MARK: The orchestrator pin (gh#104, gh#144)
+
+    /// Pin a chat as the board's orchestrator, or unpin whatever is.
+    ///
+    /// One `[defaults]` key on the board's `routing.toml`, written through the
+    /// same validated path a settings page uses. `nil` removes it, which is the
+    /// kill switch: the notices stop and the chat is an ordinary chat again.
+    ///
+    /// Nothing is applied optimistically — the board republishes the pin on the
+    /// watch stream as the write lands, so the slot disappearing IS the box
+    /// agreeing. Returns an error to say, or nil.
+    func setOrchestrator(chatId: String?) async -> String? {
+        var candidates = boardHostCandidates(devices())
+        if let host = hostDeviceId {
+            candidates.removeAll { $0 == host }
+            candidates.insert(host, at: 0)
+        }
+        guard !candidates.isEmpty else { return "No board host" }
+        var params: [String: Any] = ["op": "default", "key": "orchestrator_chat"]
+        if let chatId { params["value"] = chatId }
+        // The host replies with the board's whole config view; nothing here
+        // reads it — the pin comes back on the watch stream — so this decodes
+        // any object and cares only that the write was accepted.
+        struct Ack: Decodable {}
+        var last: String?
+        for deviceId in candidates {
+            do {
+                let _: Ack = try await relay(for: deviceId)
+                    .call(method: "WriteBoardConfig", params: params)
+                return nil
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        return last ?? "No device in this org is hosting a board"
+    }
+
     /// The email the attempt row should carry as its releaser. WorkOS mode
     /// knows one; dev mode's bearer is a user id, which is what a reader gets.
     private var signedInEmail: String? {
