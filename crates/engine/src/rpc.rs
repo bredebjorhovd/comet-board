@@ -1149,6 +1149,10 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_TASK
             | methods::READ_BOARD_TASK
             | methods::LIST_BOARD_RUNTIMES
+            // Throughput is read off `board.db`, which only the box has
+            // (gh#143) — a laptop's stats page is asking about the board, not
+            // about itself.
+            | methods::BOARD_STATS
             // `routing.toml` is a file on the board's device, which is exactly
             // why it is forwarded (gh#75): the alternative for a teammate who
             // needs a repo routed is an ssh account on the box.
@@ -1500,6 +1504,24 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            // Throughput over a window (gh#143) — read when the page opens,
+            // never streamed: a full aggregate on every board tick would cost
+            // every connected viewport a recompute nobody is looking at.
+            methods::BOARD_STATS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    #[serde(default)]
+                    since_days: Option<i64>,
+                }
+                let p: P = parse_params(params)?;
+                let stats = self
+                    .board()?
+                    .stats(p.since_days)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&stats)
             }
             // The issue text behind one row (gh#132) — read when a detail
             // surface opens it, never streamed with the rows.

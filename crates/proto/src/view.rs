@@ -21,6 +21,7 @@ pub mod needs;
 pub mod repos;
 pub mod skills;
 pub mod spaces;
+pub mod stats;
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -631,7 +632,10 @@ mod presence_tests {
         );
         // The local device is trivially online; no row yet says nothing.
         assert_eq!(host_presence(true, None, None, now), HostPresence::Online);
-        assert_eq!(host_presence(false, None, Some(&deaf()), now), HostPresence::Online);
+        assert_eq!(
+            host_presence(false, None, Some(&deaf()), now),
+            HostPresence::Online
+        );
     }
 
     /// The window boundary the devices page has always used (70s).
@@ -673,7 +677,10 @@ mod presence_tests {
         );
         // No census at all (engine predates it / first poll pending): the
         // pre-gh#126 read, so nothing regresses while the answer loads.
-        assert_eq!(host_presence(false, stale, None, now), HostPresence::Offline);
+        assert_eq!(
+            host_presence(false, stale, None, now),
+            HostPresence::Offline
+        );
         // A fresh beat outranks a deaf census — hearing it IS hearing.
         let fresh = Some(now - TimeDelta::seconds(10));
         assert_eq!(

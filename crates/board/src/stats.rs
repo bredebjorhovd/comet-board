@@ -13,37 +13,13 @@ use crate::db::Db;
 use crate::log::Logger;
 use crate::model::{Attempt, Outcome, Task};
 use anyhow::Result;
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Stats {
-    /// The window these numbers cover, in days. `None` means everything.
-    pub since_days: Option<i64>,
-    pub attempts: usize,
-    pub tasks_touched: usize,
-    pub outcomes: BTreeMap<String, usize>,
-    /// Still running right now.
-    pub live: usize,
-    /// Minutes from dispatch to a finished attempt. Median, because one agent
-    /// that ran overnight would drag a mean anywhere.
-    pub median_minutes: Option<i64>,
-    pub longest_minutes: Option<i64>,
-    /// Attempts that ended in `done` as a share of ended attempts.
-    pub completion_rate: Option<f64>,
-    /// Tasks that needed more than one attempt.
-    pub retried_tasks: usize,
-    /// Times the board closed an attempt and then caught its pane still working
-    /// (gh#34). Not retries — nobody dispatched anything — so they are counted
-    /// apart from `retried_tasks`. This is the board reporting on its own
-    /// judgement rather than on the herd's.
-    pub early_settles: usize,
-    /// Released by an agent rather than by the operator.
-    pub agent_dispatched: usize,
-    pub by_workspace: BTreeMap<String, usize>,
-    pub by_runtime: BTreeMap<String, usize>,
-}
+/// The shape lives in proto so the viewports can deserialize a `BoardStats`
+/// reply without linking this crate (the [`crate::runtime::RuntimeOption`]
+/// split, for the same reason). What it *contains* is this module's.
+pub use comet_proto::view::stats::{BoardStats as Stats, DayBucket, Friction, Landing};
 
 fn minutes(a: &Attempt) -> Option<i64> {
     let start = chrono::DateTime::parse_from_rfc3339(&a.started_at).ok()?;
@@ -61,6 +37,56 @@ fn started_within(a: &Attempt, since_days: Option<i64>) -> bool {
     (chrono::Utc::now() - start.with_timezone(&chrono::Utc)).num_days() < days
 }
 
+/// The attempt's start as a local instant — the day and hour buckets are read
+/// by a person in a timezone, and a UTC boundary splits their evening in two.
+fn started_local(a: &Attempt) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::parse_from_rfc3339(&a.started_at)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Local))
+}
+
+/// A percentile off a sorted slice, by nearest rank. Small-n honest: with four
+/// durations the p90 IS the longest, and pretending otherwise would interpolate
+/// a number no attempt ever took.
+fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = ((sorted.len() as f64) * p).ceil() as usize;
+    sorted.get(rank.saturating_sub(1)).copied()
+}
+
+/// Every day from the first dispatch to today, zeroes included — a chart with
+/// holes in it reads as missing data rather than as a quiet Sunday.
+fn day_series(
+    counts: &BTreeMap<String, (usize, usize)>,
+    since_days: Option<i64>,
+) -> Vec<DayBucket> {
+    let today = chrono::Local::now().date_naive();
+    let first = match (counts.keys().next(), since_days) {
+        // A window says where the chart starts even if nothing ran on day one.
+        (_, Some(days)) => today - chrono::Duration::days((days - 1).max(0)),
+        (Some(earliest), None) => match chrono::NaiveDate::parse_from_str(earliest, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        },
+        (None, None) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut day = first;
+    while day <= today {
+        let key = day.format("%Y-%m-%d").to_string();
+        let (dispatches, done) = counts.get(&key).copied().unwrap_or((0, 0));
+        out.push(DayBucket {
+            date: key,
+            dispatches,
+            done,
+        });
+        day += chrono::Duration::days(1);
+    }
+    out
+}
+
 pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
     let attempts: Vec<(&Task, &Attempt)> = tasks
         .iter()
@@ -71,17 +97,33 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
     let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_workspace: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_runtime: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_account: BTreeMap<String, usize> = BTreeMap::new();
     let mut durations: Vec<i64> = Vec::new();
+    let mut days: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut hour_of_day = vec![0usize; 24];
     let mut live = 0;
     let mut agent_dispatched = 0;
+    let mut friction = Friction::default();
 
-    for (_, a) in &attempts {
+    for (task, a) in &attempts {
         match a.outcome {
             Some(o) => *outcomes.entry(o.as_str().to_string()).or_default() += 1,
             None => live += 1,
         }
         *by_workspace.entry(a.workspace.clone()).or_default() += 1;
         *by_runtime.entry(a.runtime.clone()).or_default() += 1;
+        *by_source
+            .entry(task.source.as_str().to_string())
+            .or_default() += 1;
+        // Whose subscription it spent (gh#101). A dispatch that named no slot
+        // ran on the box's own login, and saying so is the point of the row —
+        // "unattributed" would hide exactly the case the guard exists for.
+        let payer = a
+            .billed_to
+            .clone()
+            .unwrap_or_else(|| "the box's own login".to_string());
+        *by_account.entry(payer).or_default() += 1;
         // An agent, by either name it can be known under. Counting only
         // `dispatched_by` counted only agents the board itself dispatched,
         // which is the one kind that almost never does the dispatching — so
@@ -89,8 +131,24 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         if a.dispatcher().is_agent() {
             agent_dispatched += 1;
         }
+        friction.early_settles += a.reopened as usize;
+        friction.blocked_entries += a.blocked_count as usize;
+        if a.overrun_warned_at.is_some() {
+            friction.overruns += 1;
+        }
         if let Some(m) = minutes(a) {
             durations.push(m);
+        }
+        if let Some(start) = started_local(a) {
+            use chrono::Timelike as _;
+            hour_of_day[start.hour() as usize] += 1;
+            let entry = days
+                .entry(start.date_naive().format("%Y-%m-%d").to_string())
+                .or_default();
+            entry.0 += 1;
+            if a.outcome == Some(Outcome::Done) {
+                entry.1 += 1;
+            }
         }
     }
     durations.sort_unstable();
@@ -100,7 +158,7 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
 
     let touched: std::collections::HashSet<&str> =
         attempts.iter().map(|(t, _)| t.id.as_str()).collect();
-    let retried_tasks = tasks
+    friction.retried_tasks = tasks
         .iter()
         .filter(|t| {
             t.attempts
@@ -111,20 +169,42 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         })
         .count();
 
+    // Where the work landed, counted per TASK and not per attempt: three goes
+    // at one issue produce one pull request, and counting the attempts would
+    // report the same merge three times. Only tasks touched in the window.
+    let mut landing = Landing::default();
+    for task in tasks.iter().filter(|t| touched.contains(t.id.as_str())) {
+        if task.pr_merged {
+            landing.merged += 1;
+        } else if task.pr_open {
+            landing.open += 1;
+        } else if task.pr_number.is_some() {
+            landing.closed_unmerged += 1;
+        } else {
+            landing.no_pr += 1;
+        }
+    }
+
     Stats {
         since_days,
         attempts: attempts.len(),
         tasks_touched: touched.len(),
         outcomes,
         live,
-        median_minutes: durations.get(durations.len() / 2).copied(),
-        longest_minutes: durations.last().copied(),
         completion_rate: (ended > 0).then(|| done as f64 / ended as f64),
-        retried_tasks,
-        early_settles: attempts.iter().map(|(_, a)| a.reopened as usize).sum(),
-        agent_dispatched,
+        median_minutes: percentile(&durations, 0.5),
+        p90_minutes: percentile(&durations, 0.9),
+        longest_minutes: durations.last().copied(),
+        total_minutes: durations.iter().sum(),
+        landing,
+        friction,
+        daily: day_series(&days, since_days),
+        hour_of_day,
         by_workspace,
         by_runtime,
+        by_source,
+        by_account,
+        agent_dispatched,
     }
 }
 
@@ -158,13 +238,16 @@ pub fn print(s: &Stats) {
     if let (Some(med), Some(max)) = (s.median_minutes, s.longest_minutes) {
         println!("  {med} min median, {max} min longest");
     }
-    if s.retried_tasks > 0 {
-        println!("  {} task(s) needed more than one go", s.retried_tasks);
+    if s.friction.retried_tasks > 0 {
+        println!(
+            "  {} task(s) needed more than one go",
+            s.friction.retried_tasks
+        );
     }
-    if s.early_settles > 0 {
+    if s.friction.early_settles > 0 {
         println!(
             "  {} attempt(s) called finished while their agent was still working",
-            s.early_settles
+            s.friction.early_settles
         );
     }
     if s.agent_dispatched > 0 {
@@ -336,7 +419,7 @@ mod tests {
             task("b", vec![attempt(40, 5, Some(Outcome::Done), None)]),
         ];
         let s = gather(&tasks, None);
-        assert_eq!(s.retried_tasks, 1);
+        assert_eq!(s.friction.retried_tasks, 1);
         assert_eq!(s.tasks_touched, 2);
         assert_eq!(s.attempts, 3);
     }
@@ -386,5 +469,116 @@ mod tests {
         );
         assert_eq!(gather(std::slice::from_ref(&t), None).attempts, 2);
         assert_eq!(gather(&[t], Some(7)).attempts, 1);
+    }
+
+    // -- the dashboard's series (gh#143) ------------------------------------
+
+    #[test]
+    fn a_window_draws_a_bar_for_every_day_including_the_quiet_ones() {
+        // Two dispatches today and nothing for the six days before it: the
+        // chart still has seven bars, because a gap that is simply absent
+        // reads as data the board failed to record.
+        let tasks = vec![task(
+            "t1",
+            vec![
+                attempt(10, 5, Some(Outcome::Done), None),
+                attempt(20, 5, Some(Outcome::Cancelled), None),
+            ],
+        )];
+        let s = gather(&tasks, Some(7));
+        assert_eq!(s.daily.len(), 7);
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let last = s.daily.last().unwrap();
+        assert_eq!(last.date, today);
+        assert_eq!(last.dispatches, 2);
+        assert_eq!(last.done, 1, "only the one that ended done");
+        assert!(s.daily[..6].iter().all(|d| d.dispatches == 0));
+    }
+
+    #[test]
+    fn the_hour_histogram_has_a_slot_for_every_hour() {
+        let tasks = vec![task("t1", vec![attempt(30, 5, Some(Outcome::Done), None)])];
+        let s = gather(&tasks, None);
+        assert_eq!(s.hour_of_day.len(), 24);
+        assert_eq!(s.hour_of_day.iter().sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn where_the_work_landed_is_counted_per_task_not_per_attempt() {
+        // Three goes at one issue produce one pull request; counting attempts
+        // would report the same merge three times.
+        let mut merged = task(
+            "t1",
+            vec![
+                attempt(60, 5, Some(Outcome::Failed), None),
+                attempt(50, 5, Some(Outcome::Failed), None),
+                attempt(40, 5, Some(Outcome::Done), None),
+            ],
+        );
+        merged.pr_number = Some(7);
+        merged.pr_merged = true;
+        let mut in_review = task("t2", vec![attempt(30, 5, Some(Outcome::Done), None)]);
+        in_review.pr_number = Some(8);
+        in_review.pr_open = true;
+        let mut abandoned = task("t3", vec![attempt(20, 5, Some(Outcome::Cancelled), None)]);
+        abandoned.pr_number = Some(9);
+        let no_pr = task("t4", vec![attempt(10, 5, Some(Outcome::Done), None)]);
+
+        let s = gather(&[merged, in_review, abandoned, no_pr], None);
+        assert_eq!(s.landing.merged, 1);
+        assert_eq!(s.landing.open, 1);
+        assert_eq!(s.landing.closed_unmerged, 1);
+        assert_eq!(s.landing.no_pr, 1);
+        assert_eq!(s.landing.total(), s.tasks_touched);
+    }
+
+    #[test]
+    fn friction_counts_transitions_and_the_boards_own_misjudgements() {
+        let mut a = attempt(60, 30, Some(Outcome::Done), None);
+        a.blocked_count = 3;
+        a.reopened = 1;
+        a.overrun_warned_at = Some(crate::db::now());
+        let mut b = attempt(50, 10, Some(Outcome::Done), None);
+        b.blocked_count = 1;
+        let s = gather(&[task("t1", vec![a, b])], None);
+        assert_eq!(s.friction.blocked_entries, 4);
+        assert_eq!(s.friction.early_settles, 1);
+        assert_eq!(s.friction.overruns, 1);
+        assert_eq!(s.friction.retried_tasks, 1, "two attempts on one task");
+        assert!(!s.friction.is_clean());
+    }
+
+    #[test]
+    fn a_dispatch_that_named_no_slot_is_still_attributed_to_a_payer() {
+        // The billing guard exists for exactly this row: work that quietly
+        // spent the box owner's subscription must not read as unattributed.
+        let mut paid = attempt(30, 5, Some(Outcome::Done), None);
+        paid.billed_to = Some("brede@tally.no".into());
+        let free = attempt(20, 5, Some(Outcome::Done), None);
+        let s = gather(&[task("t1", vec![paid, free])], None);
+        assert_eq!(s.by_account.get("brede@tally.no"), Some(&1));
+        assert_eq!(s.by_account.get("the box's own login"), Some(&1));
+    }
+
+    #[test]
+    fn the_ninth_decile_never_claims_a_duration_nothing_took() {
+        // Four attempts: the p90 is the longest of them, not an interpolation
+        // between two that would name a number no attempt ever ran for.
+        let tasks = vec![task(
+            "t1",
+            vec![
+                attempt(100, 10, Some(Outcome::Done), None),
+                attempt(90, 20, Some(Outcome::Done), None),
+                attempt(80, 30, Some(Outcome::Done), None),
+                attempt(70, 40, Some(Outcome::Done), None),
+            ],
+        )];
+        let s = gather(&tasks, None);
+        assert_eq!(s.p90_minutes, Some(40));
+        assert_eq!(s.longest_minutes, Some(40));
+        assert_eq!(s.total_minutes, 100);
     }
 }

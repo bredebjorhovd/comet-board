@@ -132,6 +132,15 @@ pub mod methods {
     /// name + label per harness, the set the engine validates overrides
     /// against. Params: `{}` → `[{name, label}]`.
     pub const LIST_BOARD_RUNTIMES: &str = "ListBoardRuntimes";
+    /// What the board knows about its own throughput (gh#143). Params:
+    /// `{sinceDays?}` → `comet_proto::view::stats::BoardStats`; omit
+    /// `sinceDays` for all time.
+    ///
+    /// A call and not a stream, like [`READ_BOARD_TASK`]: these numbers are
+    /// read when somebody opens the page and are stale by a poll interval at
+    /// worst, and streaming a full aggregate on every board tick would cost
+    /// every connected viewport a recompute nobody is looking at.
+    pub const BOARD_STATS: &str = "BoardStats";
     /// Stream: which chat is pinned as this board's orchestrator (gh#104),
     /// current value first, then every change. Params: `{}` → `{chatId}`.
     ///
