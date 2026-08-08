@@ -55,8 +55,14 @@ pub mod methods {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
-    /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
-    /// the answer is about whichever engine you are directly connected to).
+    /// This engine's identity → `{deviceId, version}` (IPC-only; never
+    /// relay-forwarded — the answer is about whichever engine you are directly
+    /// connected to).
+    ///
+    /// `version` is the engine binary's own `CARGO_PKG_VERSION`, added in
+    /// gh#156 so a CLI can tell whether it shipped with the engine it is
+    /// driving. Absent from engines older than that, which is why every reader
+    /// treats it as optional.
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// Which edge connections this engine holds right now →
     /// [`comet_proto::EdgeHealth`] (gh#116).

@@ -701,17 +701,19 @@ fn main() -> Result<()> {
         }
         Command::Doctor => {
             let (engine, spaces, accounts, edge) = match runtime.block_on(fetch_spaces(port)) {
-                Ok((device, spaces, accounts, edge)) => (
+                Ok(info) => (
                     EngineStatus {
                         reachable: true,
                         detail: format!(
-                            "listening on 127.0.0.1:{port} (device {device}, {} space(s) here)",
-                            spaces.len()
+                            "listening on 127.0.0.1:{port} (device {}, {} space(s) here)",
+                            info.device,
+                            info.spaces.len()
                         ),
+                        version: info.version,
                     },
-                    Some(spaces),
-                    Some(accounts),
-                    edge,
+                    Some(info.spaces),
+                    Some(info.accounts),
+                    info.edge,
                 ),
                 Err(e) => (
                     EngineStatus {
@@ -720,6 +722,7 @@ fn main() -> Result<()> {
                             "not reachable on 127.0.0.1:{port} ({e:#}) — start `comet` or \
                              `comet headless`"
                         ),
+                        version: None,
                     },
                     None,
                     None,
@@ -739,13 +742,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Init { force } => {
-            let (_, spaces, _, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
+            let info = runtime.block_on(fetch_spaces(port)).with_context(|| {
                 format!(
                     "listing spaces from the engine on 127.0.0.1:{port} — \
                      start `comet` or `comet headless` first"
                 )
             })?;
-            comet_board::init::init(&paths, &spaces, adopt::probe, force)
+            comet_board::init::init(&paths, &info.spaces, adopt::probe, force)
         }
         Command::Routes { command } => runtime.block_on(async {
             let board = ops::attach(port, device).await?;
@@ -789,12 +792,15 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let (_, spaces, _, _) = runtime.block_on(fetch_spaces(port)).with_context(|| {
-                format!(
-                    "listing spaces from the engine on 127.0.0.1:{port} — \
-                     start `comet` or `comet headless` first"
-                )
-            })?;
+            let spaces = runtime
+                .block_on(fetch_spaces(port))
+                .with_context(|| {
+                    format!(
+                        "listing spaces from the engine on 127.0.0.1:{port} — \
+                         start `comet` or `comet headless` first"
+                    )
+                })?
+                .spaces;
             // Unvalidated on purpose, same as doctor: adoption must stay
             // usable while some unrelated route is broken.
             let cfg = comet_board::config::RoutingConfig::load_unvalidated(&routing).with_context(
@@ -1140,29 +1146,44 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
     }
 }
 
-/// This device's spaces, from the engine: `LocalDevice` for the device id, the
-/// first `WatchSpaces` snapshot for the rows, filtered to spaces this device
-/// owns — a route's `repo =` is a local path, and another device's folders are
-/// not on this disk. Plus the engine's live edge-connection census (gh#116),
-/// which is the one fact this loopback conversation cannot otherwise reveal.
-#[allow(clippy::type_complexity)] // one doctor fixture, deliberately not a struct
-async fn fetch_spaces(
-    port: u16,
-) -> Result<(
-    String,
-    Vec<Space>,
-    Vec<comet_proto::AgentAccount>,
-    Option<comet_proto::EdgeHealth>,
-)> {
+/// What one loopback conversation with the local engine yields.
+///
+/// A struct rather than a tuple because doctor wants nearly all of it and the
+/// other two callers want one field: named holes read better than `(_, spaces,
+/// _, _, _)` at three call sites.
+struct EngineInfo {
+    device: String,
+    /// The engine binary's own version (gh#156). `None` from an engine older
+    /// than the field — doctor then falls back to what is on disk.
+    version: Option<String>,
+    spaces: Vec<Space>,
+    accounts: Vec<comet_proto::AgentAccount>,
+    edge: Option<comet_proto::EdgeHealth>,
+}
+
+/// This device's spaces, from the engine: `LocalDevice` for the device id (and
+/// the engine's version), the first `WatchSpaces` snapshot for the rows,
+/// filtered to spaces this device owns — a route's `repo =` is a local path, and
+/// another device's folders are not on this disk. Plus the engine's live
+/// edge-connection census (gh#116), which is the one fact this loopback
+/// conversation cannot otherwise reveal.
+async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
     let fetch = async {
         let client: RpcClient = connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
-        let device = client
+        let local = client
             .call(methods::LOCAL_DEVICE, serde_json::json!({}))
-            .await?
+            .await?;
+        let device = local
             .get("deviceId")
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("LocalDevice reply missing deviceId"))?;
+        // Optional by design: an engine predating gh#156 answers the identity
+        // and says nothing about its version, which must not fail the dial.
+        let version = local
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let mut stream = client
             .subscribe(methods::WATCH_SPACES, serde_json::json!({}))
             .await?;
@@ -1171,7 +1192,7 @@ async fn fetch_spaces(
             .await
             .ok_or_else(|| anyhow::anyhow!("WatchSpaces stream ended before a snapshot"))?;
         let spaces: Vec<Space> = serde_json::from_value(snapshot)?;
-        let local: Vec<Space> = spaces
+        let mine: Vec<Space> = spaces
             .into_iter()
             .filter(|s| s.device_id == device)
             .collect();
@@ -1192,7 +1213,13 @@ async fn fetch_spaces(
             .await
             .ok()
             .and_then(|v| serde_json::from_value(v).ok());
-        Ok::<_, anyhow::Error>((device, local, accounts, edge))
+        Ok::<_, anyhow::Error>(EngineInfo {
+            device,
+            version,
+            spaces: mine,
+            accounts,
+            edge,
+        })
     };
     tokio::time::timeout(FETCH_TIMEOUT, fetch)
         .await

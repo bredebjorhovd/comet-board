@@ -68,6 +68,12 @@ comet login                          # sign in (paste a code, done)
 systemctl --user start comet-native
 ```
 
+That installs two binaries from the same release: `comet`, the engine, and
+`comet-board`, the CLI that drives the board. They are upgraded together and
+`comet-board doctor` fails if they ever fall out of step. If something you put
+in `~/.local/bin` yourself is already in the way, the installer says so and
+leaves it alone rather than overwriting it.
+
 No configuration needed. Day-to-day:
 
 ```bash
