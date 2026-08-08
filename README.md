@@ -69,10 +69,12 @@ systemctl --user start comet-native
 ```
 
 That installs two binaries from the same release: `comet`, the engine, and
-`comet-board`, the CLI that drives the board. They are upgraded together and
-`comet-board doctor` fails if they ever fall out of step. If something you put
-in `~/.local/bin` yourself is already in the way, the installer says so and
-leaves it alone rather than overwriting it.
+`comet-board`, the CLI that drives the board. They are upgraded together, and
+if they ever fall out of step `comet status` says so on its `Board CLI:` line —
+as does the engine's log at boot, and `comet-board doctor` from the other side.
+If something you put in `~/.local/bin` yourself is already in the way, the
+installer names it and its version and leaves it alone rather than overwriting
+it.
 
 No configuration needed. Day-to-day:
 

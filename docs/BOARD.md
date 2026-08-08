@@ -1880,6 +1880,26 @@ whose agents were supposed to use them.
   instead of offering an installer that would relink nothing. Every other check
   in that report asks about the environment the CLI can see. This one asks
   about the CLI, which is how the whole class of bug stayed invisible.
+- **But doctor cannot be the only teller, because it ships inside the stale
+  thing.** A CLI old enough to have drifted is old enough not to carry the
+  check — so on the one box with the problem, `comet-board doctor` goes on
+  reporting a clean board. The check has to also live where the *current* code
+  runs, and on that box the current code is the engine. `board_cli::probe`
+  inverts it: find the binary (`resolve_board_exe`), run `--version`, compare
+  against the engine's own. `comet status` prints a `Board CLI:` line from it,
+  and `comet headless` logs one WARN at boot when they disagree — the only
+  report in this whole section that fires without somebody first going to look,
+  and it fires on the restart the install itself performs. Off the boot path on
+  its own thread: the probe executes a binary nobody vouches for, and one that
+  hangs instead of answering must not be able to hold the engine down.
+- **`comet-board --version`, for everything outside the binary.** doctor never
+  needed it — a process knows its own `CARGO_PKG_VERSION` — which is why it
+  did not exist, and why `install.sh` could see a binary in its way and not say
+  which one. Now the warning names it: `~/.local/bin/comet-board (v0.2.9) ->
+  ~/comet-board/target/release/comet-board`. A copy too old to know the flag
+  dates itself by failing, since the flag lands with the first release that
+  ships this binary at all — reported as "too old to answer `--version`", which
+  is a fact and not a guess.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

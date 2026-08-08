@@ -43,8 +43,16 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Parser)]
 #[command(
     name = "comet-board",
+    version,
     about = "Task board over comet — Linear/GitHub issues in, coding-agent chats out"
 )]
+// `version` exists for everything *outside* this binary (gh#156). `doctor` has
+// never needed it — a process knows its own `CARGO_PKG_VERSION` — but nothing
+// else could ask: `install.sh` could see a binary in the way and not say which
+// one, and `comet status` could not tell whether the CLI beside it was the one
+// the release installed. A stale copy answering "unexpected argument
+// '--version'" is itself the answer, since the flag lands with the first
+// release that ships this binary at all.
 struct Cli {
     /// Localhost IPC port the engine serves (env: COMET_IPC_PORT).
     #[arg(long, global = true)]

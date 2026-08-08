@@ -11,6 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 comet-engine.workspace = true
+# For the board CLI's version, reported by `comet status` (gh#156). Already in
+# the tree under comet-engine; direct here because the check has to run in a
+# binary the release upgrades, and a stale comet-board cannot report on itself.
+comet-board.workspace = true
 comet-proto.workspace = true
 comet-rpc.workspace = true
 comet-ui.workspace = true

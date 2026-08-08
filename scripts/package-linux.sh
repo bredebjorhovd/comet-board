@@ -64,10 +64,31 @@ held=()
 # Writing through it would overwrite the build tree it points at; unlinking it
 # would silently reverse a decision a human made. So name what is there, name
 # what removes it, and leave it standing.
+# What a binary says it is, so the warning below names the version it leaves
+# standing rather than gesturing at it. A copy too old to know `--version`
+# dates itself by failing: the flag ships with the first release that carries
+# comet-board at all.
+#
+# Under `timeout` where there is one: the binary being run is by definition one
+# nobody vouches for, and a copy that hangs instead of answering must not wedge
+# the install.
+version_of() {
+  local v
+  if command -v timeout >/dev/null 2>&1; then
+    v="$(timeout 5 "$1" --version 2>/dev/null | head -1 | awk '{print $NF}')" || v=""
+  else
+    v="$("$1" --version 2>/dev/null | head -1 | awk '{print $NF}')" || v=""
+  fi
+  case "$v" in
+    [0-9]*) echo "v$v" ;;
+    *) echo 'version unknown — too old to answer `--version`' ;;
+  esac
+}
+
 install_bin() {
   local name="$1" dest="$HOME/.local/bin/$1"
   if [[ -L "$dest" ]]; then
-    held+=("$dest -> $(readlink "$dest")")
+    held+=("$dest ($(version_of "$dest")) -> $(readlink "$dest")")
     return 0
   fi
   install -Dm755 "$HERE/$name" "$dest"
@@ -99,9 +120,9 @@ if [[ ${#held[@]} -gt 0 ]]; then
   echo
   echo "NOT installed — a symlink is already there, and it is not this installer's:" >&2
   for h in "${held[@]}"; do echo "  $h" >&2; done
-  echo "Each keeps whatever version it points at. To hand one over, remove it" >&2
-  echo "and re-run this script:" >&2
-  for h in "${held[@]}"; do echo "  rm -f ${h%% -> *}" >&2; done
+  echo "Each stays at the version above. To hand one over, remove it and re-run" >&2
+  echo "this script:" >&2
+  for h in "${held[@]}"; do echo "  rm -f ${h%% (*}" >&2; done
 fi
 INSTALL
 chmod 755 "$STAGE/install.sh"

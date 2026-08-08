@@ -79,11 +79,34 @@ mkdir -p "$HOME/.local/bin"
 # already a symlink into ~/.comet-native/app. Anything else — a regular file, or
 # a symlink into somebody's source checkout — a human put there, and it sits
 # ahead of us on PATH. Replacing it silently is how a hand-built binary vanishes
-# with nobody deciding it should, so this reports it and moves on. `comet-board
-# doctor` says the same thing from the other end, whenever it is next run.
+# with nobody deciding it should, so this reports it and moves on. `comet status`
+# says the same thing afterwards, from a binary this script does upgrade.
 linked=""    # names this run actually put on PATH
-held=""      # "<bin> -> <target>" lines for the ones it would not touch
+held=""      # "<bin> (<version>) -> <target>" lines for the ones it would not touch
 held_bins="" # the same paths alone, for the rm hints
+
+# What a binary says it is, so the warning below can name the version it is
+# leaving in place instead of gesturing at it. A copy too old to know
+# `--version` dates itself by failing: the flag ships with the first release
+# that carries comet-board at all.
+#
+# Under `timeout` where there is one (coreutils; this script is Linux-only), and
+# five seconds is generous for a flag that prints and exits. The binary being
+# run is by definition one nobody vouches for — the whole reason we are asking
+# is that we do not know what it is — and a copy that hangs instead of answering
+# must not be able to wedge an installer somebody is watching over a curl pipe.
+version_of() {
+  if command -v timeout >/dev/null 2>&1; then
+    v="$(timeout 5 "$1" --version 2>/dev/null | head -1 | awk '{print $NF}')" || v=""
+  else
+    v="$("$1" --version 2>/dev/null | head -1 | awk '{print $NF}')" || v=""
+  fi
+  case "$v" in
+    [0-9]*) echo "v$v" ;;
+    *) echo "version unknown — too old to answer \`--version\`" ;;
+  esac
+}
+
 link_bin() {
   name="$1"
   src="$app_root/current/$name"
@@ -96,7 +119,7 @@ link_bin() {
     case "$points_at" in
       "$app_root"/*) ;; # a previous run of this script — relink below
       *)
-        held="$held  $bin -> $points_at
+        held="$held  $bin ($(version_of "$bin")) -> $points_at
 "
         held_bins="$held_bins  rm -f $bin
 "
@@ -176,7 +199,7 @@ if [ -n "$held" ]; then
   {
     echo "warn: left in place — already there, and not this installer's:"
     printf '%s' "$held"
-    echo "      each keeps the version it already had, while this box is now on $ver."
+    echo "      each stays at the version above, while this box is now on $ver."
     echo "      to hand one over, remove it and re-run this installer:"
     printf '%s' "$held_bins"
     echo ""
