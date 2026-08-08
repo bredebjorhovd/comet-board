@@ -27,11 +27,25 @@
  *   GET /tail when dirty (§5 L2).
  * - `diff` blob — latest-only working-tree diff sidecar, overwritten on each
  *   host publish (§6.1).
- * - Ephemeral presence (%EPH room) is memory-only by construction.
+ * - Ephemeral presence (%EPH room) is memory-only by construction, and is
+ *   DERIVED from the socket set rather than written by clients — see
+ *   [`livePresence`] and `publishPresence` (gh#145).
  *
  * Hibernation discipline: no wall-clock JS timers except the flush debounce
  * (which only exists while traffic keeps the DO awake anyway); scheduled work
  * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
+ *
+ * That discipline is why presence is derived here. Until gh#145 every engine
+ * wrote `presence/{deviceId} → now` into this room's ephemeral store every 15s.
+ * A `%EPH` frame is a real message, so it WAKES the object — a room with any
+ * device attached therefore never hibernated, and one such object awake around
+ * the clock bills 86,400 × 0.125 GB = 10,800 GB-s/day, 83% of the daily free
+ * tier before an agent runs. Two of these rooms exist whenever anyone is signed
+ * in (the per-user workspace doc and the org device registry), which is exactly
+ * the shape of the 2026-08-07/08 overruns. `DeviceRoom` was the control group at
+ * 434× less duration for comparable traffic, and the reason is precisely that it
+ * derives liveness from `getWebSocketAutoResponseTimestamp` — a stamp the
+ * runtime maintains WHILE HIBERNATING, for free. This room now does the same.
  */
 import { LoroDoc, EphemeralStore, VersionVector } from "loro-crdt";
 import {
@@ -80,7 +94,52 @@ interface SocketState {
   /** True for sockets on a workspace-doc room — org membership was enforced
    * by the Worker, so the per-chat ownership discipline does not apply. */
   workspace?: boolean;
+  /** Which device this socket belongs to (`?deviceId=`), so presence can be
+   * DERIVED from the socket set instead of beaten into the room (gh#145).
+   * Absent on sockets from engines older than that, and on browser clients —
+   * those simply contribute no presence. */
+  deviceId?: string;
+  /** Accept time — the liveness floor until the socket's first auto-pong,
+   * mirroring `DeviceRoom`'s `SocketState.joinedAt`. */
+  joinedAt?: number;
 }
+
+/** Ephemeral key prefix for device presence (`presence/{deviceId}` → ms).
+ * MUST match `comet_doc::presence_key` — the wire shape is deliberately
+ * unchanged across gh#145 so an engine that predates it still reads correct
+ * presence off a room that now derives it. */
+const PRESENCE_PREFIX = "presence/";
+
+/** How long a socket may go without proving liveness before it stops counting
+ * as present. Identical in value and reasoning to `DeviceRoom`'s
+ * `HOST_LIVENESS_MS`: clients text-ping every 15s
+ * (crates/sync/src/room.rs PING_INTERVAL), the runtime auto-answers and stamps
+ * a timestamp without waking us, and the window is sized for 2.5 intervals of
+ * the slower 30s cadence still possible in the fleet. A socket whose uplink
+ * died silently (laptop lid, NAT reaping an idle flow) is never closed by the
+ * runtime, so this staleness check is the ONLY thing that stops a corpse from
+ * reading online forever. */
+const PRESENCE_LIVENESS_MS = 75_000;
+
+/** Derive `{deviceId: lastSeenAt}` from a room's sockets. Pure, so the rule is
+ * testable without a DO (mirrors `pickLiveHost`).
+ *
+ * A device may hold several sockets at once — a redial that overlaps its
+ * predecessor, or genuinely two processes — so the FRESHEST wins; a corpse
+ * listed alongside a live socket must not drag the device offline. */
+export const livePresence = (
+  sockets: ReadonlyArray<{ deviceId?: string; lastSeenAt: number }>,
+  now: number
+): Record<string, number> => {
+  const live: Record<string, number> = {};
+  for (const socket of sockets) {
+    if (!socket.deviceId) continue;
+    if (now - socket.lastSeenAt > PRESENCE_LIVENESS_MS) continue;
+    const best = live[socket.deviceId];
+    if (best === undefined || socket.lastSeenAt > best) live[socket.deviceId] = socket.lastSeenAt;
+  }
+  return live;
+};
 
 /** What a caller may do with a chat room (gh#66).
  * - `claim`  — unclaimed; the first joiner becomes its owner;
@@ -183,13 +242,16 @@ export class SessionRoom implements DurableObject {
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
+      const deviceId = url.searchParams.get("deviceId") ?? "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
       const state: SocketState = {
         userId,
         rooms: [],
+        joinedAt: Date.now(),
         ...(orgId ? { orgId } : {}),
-        ...(workspace ? { workspace } : {})
+        ...(workspace ? { workspace } : {}),
+        ...(deviceId ? { deviceId } : {})
       };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -241,6 +303,9 @@ export class SessionRoom implements DurableObject {
       return json({
         chatId: this.getMeta("chatId") ?? null,
         connectedSockets: this.ctx.getWebSockets().length,
+        // Derived presence (gh#145) — how many devices this room would report
+        // present if asked right now.
+        presentDevices: Object.keys(this.socketPresence()).length,
         updateRows,
         updateLogBytes: Number(this.getMeta("updateBytes") ?? "0"),
         snapshotBytes: snapshot?.length ?? 0,
@@ -260,6 +325,15 @@ export class SessionRoom implements DurableObject {
         // wedge signature ensureDoc's automated reset watches for.
         replayAttempts: Number(this.getMeta("replayAttempts") ?? "0")
       });
+    }
+    if (url.pathname === "/presence" && request.method === "GET") {
+      // THE ASK (gh#145). Presence is no longer pushed on a timer, so this is
+      // how a caller gets a fresh answer on demand — computed from the socket
+      // set at the moment of asking, which is the only reading that is true
+      // about a room that has been asleep. Cheap by construction: no doc
+      // materialization, no flush, nothing that outlives the request.
+      if (!mayRead) return refuse();
+      return json({ at: Date.now(), devices: this.socketPresence() });
     }
     if (url.pathname === "/tail" && request.method === "GET") {
       if (!mayRead) return refuse();
@@ -380,11 +454,17 @@ export class SessionRoom implements DurableObject {
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     this.fragments.delete(ws);
+    // A socket leaving IS the presence event — and it already woke us, so
+    // announcing it costs nothing beyond the wake we were paying anyway.
+    // `ws` is excluded because the runtime still lists a socket while its
+    // close is being handled (same trap `pickLiveHost` documents).
+    this.publishPresence(ws);
     await this.flush();
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
     this.fragments.delete(ws);
+    this.publishPresence(ws);
     await this.flush();
   }
 
@@ -443,11 +523,14 @@ export class SessionRoom implements DurableObject {
       if (backfill.length > 0) {
         this.sendUpdates(ws, message.crdt, message.roomId, [backfill]);
       }
+      // A doc-only joiner still carries a device id, so its arrival changes the
+      // answer for everyone already watching presence.
+      this.publishPresence();
       return;
     }
 
     if (message.crdt === CrdtType.LoroEphemeralStore) {
-      const eph = this.ensureEph();
+      this.ensureEph();
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
       this.send(ws, {
@@ -457,8 +540,11 @@ export class SessionRoom implements DurableObject {
         permission: "write",
         version: new Uint8Array()
       });
-      const all = eph.encodeAll();
-      if (all.length > 0) this.sendUpdates(ws, message.crdt, message.roomId, [all]);
+      // Recompute BEFORE answering rather than replaying whatever the store
+      // happens to still hold: the ephemeral store's 30s TTL has forgotten
+      // every entry if the room has been quiet, which is now the normal state.
+      // This both backfills the joiner and tells everyone else it arrived.
+      this.publishPresence();
       return;
     }
 
@@ -686,6 +772,66 @@ export class SessionRoom implements DurableObject {
   private ensureEph(): EphemeralStore {
     if (!this.eph) this.eph = new EphemeralStore(30_000);
     return this.eph;
+  }
+
+  // ── derived presence (gh#145) ────────────────────────────────────────────
+
+  /** `{deviceId: lastSeenAt}` for every device with a live socket on this room.
+   *
+   * `exclude` drops the socket a close is being handled for — the runtime still
+   * lists it there, and counting it would report a device as present in the
+   * very answer its departure triggered. */
+  private socketPresence(exclude?: WebSocket): Record<string, number> {
+    return livePresence(
+      this.ctx.getWebSockets().map((ws) => {
+        if (ws === exclude) return { lastSeenAt: 0 };
+        const state = ws.deserializeAttachment() as SocketState | null;
+        return {
+          deviceId: state?.deviceId,
+          // Auto-pongs are stamped even while hibernating — this is the whole
+          // trick; `joinedAt` covers the window before a fresh socket's first
+          // ping. A socket attached by an older deploy has neither and simply
+          // contributes nothing.
+          lastSeenAt: Math.max(
+            this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0,
+            state?.joinedAt ?? 0
+          )
+        };
+      }),
+      Date.now()
+    );
+  }
+
+  /** Recompute derived presence into the `%EPH` store and push it to every
+   * joined presence socket.
+   *
+   * Only called from events that ALREADY woke this object — a join, a close —
+   * so the whole presence channel costs no wake of its own. That is the gh#145
+   * fix in one line: the room answers when something happens, and when it is
+   * asked (`GET /presence`), and otherwise sleeps.
+   *
+   * Devices whose sockets are gone have their key DELETED rather than left to
+   * age out, so a clean departure is instant instead of a TTL later. (A
+   * transitional cost: an engine older than gh#145 still beats its own key in,
+   * and a delete here races that beat — it re-appears within its 15s cadence,
+   * so the flicker is bounded and self-healing.) */
+  private publishPresence(exclude?: WebSocket): void {
+    const live = this.socketPresence(exclude);
+    const eph = this.ensureEph();
+    for (const key of Object.keys(eph.getAllStates())) {
+      if (!key.startsWith(PRESENCE_PREFIX)) continue;
+      if (live[key.slice(PRESENCE_PREFIX.length)] === undefined) eph.delete(key);
+    }
+    for (const [deviceId, at] of Object.entries(live)) eph.set(`${PRESENCE_PREFIX}${deviceId}`, at);
+    const all = eph.encodeAll();
+    if (all.length === 0) return;
+    const roomId = this.getMeta("chatId") ?? "";
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws === exclude) continue;
+      const state = ws.deserializeAttachment() as SocketState | null;
+      if (!state?.rooms.includes(CrdtType.LoroEphemeralStore)) continue;
+      this.sendUpdates(ws, CrdtType.LoroEphemeralStore, roomId, [all]);
+    }
   }
 
   // ── durability: flush, compaction, backups ───────────────────────────────

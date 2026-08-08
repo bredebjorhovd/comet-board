@@ -57,6 +57,10 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
    releases tasks. Reading is always safe.
 8. New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
    one verb). `comet-board doctor` explains a board that looks wrong.
+9. **Screenshots in a PR description**: commit them and link them with a
+   relative path from a markdown file in the repo. A
+   `raw.githubusercontent.com/<owner>/<repo>/<branch>/…` URL is broken on a
+   private repo and dies with the branch on merge — silently, both times.
 
 The pinned orchestrator's fuller brief: docs/orchestrator.md.
 

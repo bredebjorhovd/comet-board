@@ -3,7 +3,9 @@
 // `ws3/{orgId}/{userId}` room, projects the doc into typed rows, and performs
 // the writes the writer discipline allows a viewer device: chat creates,
 // archives and seen marks. iOS is a viewport, not an engine device, so it
-// deliberately owns neither a device row nor a presence heartbeat.
+// deliberately owns neither a device row nor a presence heartbeat — and since
+// gh#145 nobody does: presence is derived by the edge from each room's socket
+// set, and read here as membership rather than freshness.
 
 import Foundation
 import Loro
@@ -16,7 +18,13 @@ final class WorkspaceStore {
     private(set) var spaces: [Space] = []
     private(set) var chats: [Chat] = []
     private(set) var sessions: [String: SessionRow] = [:]
-    private(set) var presence: [String: Int64] = [:]  // deviceId → last heartbeat ms
+    /// Devices the workspace room said it could see, when it last said anything
+    /// (gh#145). Membership, not freshness: the room derives this from its own
+    /// socket set and volunteers it on every join and every close, so a device
+    /// is in here until the room takes it out. It deliberately does NOT decay —
+    /// a room that has been quiet is a room where nothing happened, not a fleet
+    /// that went away (gh#126).
+    private(set) var presence: Set<String> = []
     private(set) var connected = false
 
     let doc = LoroDoc()
@@ -81,6 +89,11 @@ final class WorkspaceStore {
             connected = true
             purgeLegacyMobileDevices()
             project()
+            // A rejoin is the other moment worth asking (gh#145): while this
+            // viewer was gone the room may have gone quiet with devices still
+            // listed in our copy, and a room that has been asleep only tells
+            // the truth to someone who asks.
+            Task { @MainActor [weak self] in await self?.refreshPresence() }
         case .disconnected:
             connected = false
         case .remoteUpdate:
@@ -119,19 +132,28 @@ final class WorkspaceStore {
         guard let room else { return }
         Task { @MainActor in
             let states = await room.eph.getAllStates()
-            var fresh: [String: Int64] = [:]
-            for (key, value) in states where key.hasPrefix("presence/") {
-                if let ms = value.i64Value {
-                    fresh[String(key.dropFirst("presence/".count))] = ms
-                }
-            }
-            presence = fresh
+            presence = Set(
+                states.keys
+                    .filter { $0.hasPrefix("presence/") }
+                    .map { String($0.dropFirst("presence/".count)) }
+            )
         }
     }
 
+    /// Ask the room who it can see right now (gh#145). Called when someone
+    /// actually looks — a foreground, not a timer: a timer against this room is
+    /// precisely what stopped its Durable Object from ever hibernating.
+    ///
+    /// A failed ask changes nothing. This viewer's own broken connection is not
+    /// evidence about anybody else's device (gh#126).
+    func refreshPresence() async {
+        guard let devices = await config.workspacePresence() else { return }
+        presence = devices
+    }
+
+    /// Is this device connected, as far as the room last said?
     func deviceOnline(_ deviceId: String) -> Bool {
-        guard let ms = presence[deviceId] else { return false }
-        return nowMs() - ms < presenceFreshMs
+        presence.contains(deviceId)
     }
 
     // MARK: Projection (doc → rows)

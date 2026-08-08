@@ -23,6 +23,12 @@ struct CometApp: App {
                     if phase == .background {
                         model.flushDocs()
                     }
+                    // Coming back to the app IS the presence poll (gh#145):
+                    // rooms no longer beat, so the answer is refreshed when
+                    // somebody is there to read it.
+                    if phase == .active {
+                        model.refreshPresence()
+                    }
                 }
         }
     }

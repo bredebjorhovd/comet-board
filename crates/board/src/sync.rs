@@ -6200,27 +6200,24 @@ max_duration = "{max_duration}"
     }
 
     #[test]
-    fn a_finished_attempts_chat_is_marked_then_archived_a_week_later() {
+    fn a_settled_attempts_chat_is_marked_and_archived_on_the_next_sweep() {
         let e = engine(None);
         let a = spent_chat(&e);
         let shelf = Shelf::default();
 
-        // The sweep that finds it finished only starts the clock.
+        // The sweep that finds it finished stamps when it became archivable —
+        // the mark is still taken, because it is what `Unmark` reverses when a
+        // task comes back to life. It just is not waited on.
         e.archive_chats(Some(&shelf));
         let row = attempt_row(&e, a);
-        assert!(row.chat_archivable_at.is_some(), "the clock has to start");
+        assert!(row.chat_archivable_at.is_some(), "the mark is still taken");
         assert!(row.chat_archived_at.is_none());
         assert!(
             shelf.archived.borrow().is_empty(),
-            "nothing goes on day one"
+            "the sweep that marks does not also collect"
         );
 
-        // Six days in, still on the shelf.
-        age_shelf_mark(&e, a, 6 * 86_400);
-        e.archive_chats(Some(&shelf));
-        assert!(shelf.archived.borrow().is_empty(), "the window is a week");
-
-        age_shelf_mark(&e, a, 7 * 86_400);
+        // The next one takes it — no window to wait out.
         e.archive_chats(Some(&shelf));
         assert_eq!(
             shelf.archived.borrow().as_slice(),
@@ -6229,6 +6226,24 @@ max_duration = "{max_duration}"
         assert!(attempt_row(&e, a).chat_archived_at.is_some());
 
         // And it is not offered again — the row says where it went.
+        e.archive_chats(Some(&shelf));
+        assert_eq!(shelf.archived.borrow().len(), 1);
+    }
+
+    /// A space that wants a grace period still gets one: the window is a
+    /// setting, and only its default changed.
+    #[test]
+    fn a_route_that_asks_for_a_window_still_waits_it_out() {
+        let mut e = engine(None);
+        e.cfg.defaults.archive_chats = "2d".into();
+        let a = spent_chat(&e);
+        let shelf = Shelf::default();
+
+        e.archive_chats(Some(&shelf));
+        e.archive_chats(Some(&shelf));
+        assert!(shelf.archived.borrow().is_empty(), "two days is two days");
+
+        age_shelf_mark(&e, a, 2 * 86_400);
         e.archive_chats(Some(&shelf));
         assert_eq!(shelf.archived.borrow().len(), 1);
     }

@@ -39,6 +39,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::members::MembersPage;
 use crate::settings::routing::RoutingPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::stats::StatsPage;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
@@ -155,17 +156,22 @@ pub enum SettingsSection {
     /// The board's `routing.toml` (gh#75) — a comet-board addition, and the
     /// only settings section whose subject lives on another device.
     Routing,
+    /// What the board did with the work it was given (gh#143) — a
+    /// comet-board addition, and like [`Self::Routing`] its subject lives on
+    /// whichever device hosts the board.
+    Stats,
     Appearance,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
         SettingsSection::Members,
         SettingsSection::Routing,
+        SettingsSection::Stats,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -181,6 +187,7 @@ impl SettingsSection {
             // gh#76 — the workspace roster and its invitations.
             SettingsSection::Members => "Members",
             SettingsSection::Routing => "Board routing",
+            SettingsSection::Stats => "Board stats",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -421,6 +428,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     members_page: Option<Entity<MembersPage>>,
     routing_page: Option<Entity<RoutingPage>>,
+    stats_page: Option<Entity<StatsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -600,6 +608,7 @@ impl Shell {
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/members") => Route::Settings(SettingsSection::Members),
             Some("settings/routing") => Route::Settings(SettingsSection::Routing),
+            Some("settings/stats") => Route::Settings(SettingsSection::Stats),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -642,6 +651,7 @@ impl Shell {
             devices_page: None,
             members_page: None,
             routing_page: None,
+            stats_page: None,
             archived_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -709,9 +719,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         // Capture knob: the add-space palette needs only the device registry.
-        if self.debug_dialog.as_deref() == Some("add-space")
-            && !state.read(cx).devices.is_empty()
-        {
+        if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
             self.open_add_space(cx);
         }
@@ -823,10 +831,12 @@ impl Shell {
         {
             let (selected_space, selected_chat, chat_space) = {
                 let s = state.read(cx);
-                let chat_space = s
-                    .selected_chat_row()
-                    .and_then(|c| c.space_id.clone());
-                (s.selected_space.clone(), s.selected_chat.clone(), chat_space)
+                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
+                (
+                    s.selected_space.clone(),
+                    s.selected_chat.clone(),
+                    chat_space,
+                )
             };
             if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
                 self.space_last_chat.insert(space, chat);
@@ -1234,6 +1244,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Stats => {
+                if self.stats_page.is_none() {
+                    let state = self.state.clone();
+                    self.stats_page = Some(cx.new(|cx| StatsPage::new(state, cx)));
+                }
+                match &self.stats_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Appearance => {
                 if self.appearance_page.is_none() {
                     let state = self.state.clone();
@@ -1602,7 +1622,10 @@ impl Shell {
         org.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::ACCEPT_INVITE, serde_json::json!({ "token": token }))
+                .call(
+                    methods::ACCEPT_INVITE,
+                    serde_json::json!({ "token": token }),
+                )
                 .await;
             this.update(cx, |shell, cx| {
                 if let Some(org) = shell.org.as_mut() {
@@ -1875,6 +1898,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Routing => icons::CHECKLIST,
+            SettingsSection::Stats => icons::CHART,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to
@@ -1925,9 +1949,7 @@ impl Shell {
                                     theme.text_muted
                                 })
                                 .cursor_pointer()
-                                .hover(|s| {
-                                    s.bg(theme.wash(0.11)).text_color(theme.text)
-                                })
+                                .hover(|s| s.bg(theme.wash(0.11)).text_color(theme.text))
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
@@ -1955,9 +1977,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| {
-                            s.bg(theme.wash(0.11)).text_color(theme.text)
-                        })
+                        .hover(|s| s.bg(theme.wash(0.11)).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (comet settings-sidebar.tsx),
@@ -2064,19 +2084,13 @@ impl Shell {
                             .child(div().pb(px(Theme::SPACE_SM))),
                     )
                     .when(lists_fade_top && !glass, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(sidebar_fade, 0.0),
-                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                                )),
-                        )
+                        el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
+                            gpui::linear_gradient(
+                                180.0,
+                                gpui::linear_color_stop(sidebar_fade, 0.0),
+                                gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
+                            ),
+                        ))
                     })
                     .when(lists_fade_bottom && !glass, |el| {
                         el.child(
@@ -2129,11 +2143,7 @@ impl Shell {
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`comet update`); click dismisses it for that version.
-    fn render_update_strip(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
@@ -2149,9 +2159,7 @@ impl Shell {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
                 UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => {
-                    (format!("Update failed: {message}").into(), true)
-                }
+                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else {
             (
@@ -2311,11 +2319,7 @@ impl Shell {
             .bg(if open {
                 theme.element_hover
             } else {
-                motion::hover_blend(
-                    "user-menu-trigger",
-                    theme.wash(0.0),
-                    theme.wash(0.11),
-                )
+                motion::hover_blend("user-menu-trigger", theme.wash(0.0), theme.wash(0.11))
             })
             .on_hover(motion::hover_listener("user-menu-trigger"))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -2730,9 +2734,7 @@ impl Shell {
                             popover::btn_primary(&theme_owned, "Add a repo")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_add_space(cx)
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
                         ),
                 ))
                 .into_any_element()
@@ -3342,7 +3344,9 @@ impl Shell {
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("Or join a workspace you were invited to")),
+                    .child(SharedString::from(
+                        "Or join a workspace you were invited to",
+                    )),
             )
             .child(
                 div()
@@ -3935,13 +3939,7 @@ impl Render for Shell {
                     .h_full()
                     .flex_none()
                     .relative()
-                    .child(
-                        sidebar_handle
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(-2.0)),
-                    );
+                    .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
                 // Sidebar tone: a slightly lighter column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,

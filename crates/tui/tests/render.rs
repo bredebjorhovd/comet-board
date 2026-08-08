@@ -189,7 +189,10 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     // space's host device named once as a group header, the space row, and
     // its sessions nested under it.
     assert!(screen.contains("Spaces"), "{screen}");
-    assert!(!screen.contains("Sessions"), "the flat list is retired:\n{screen}");
+    assert!(
+        !screen.contains("Sessions"),
+        "the flat list is retired:\n{screen}"
+    );
     assert!(screen.contains("@ dev"), "device header missing:\n{screen}");
 
     // Transcript: the user turn, the assistant text, the tool row, the fenced
@@ -376,7 +379,9 @@ fn the_help_overlay_scrolls_with_jk_and_says_so() {
     // bottom entries are off-screen and the marker says they exist.
     let top = joined(&snapshot(&mut app, 96, 30));
     assert!(top.contains("↓"), "the overflow marker is missing:\n{top}");
-    let board_visible = comet_tui::keys::HELP.iter().any(|(k, _)| top.contains(k.trim()));
+    let board_visible = comet_tui::keys::HELP
+        .iter()
+        .any(|(k, _)| top.contains(k.trim()));
     assert!(!board_visible || top.contains("board"), "no marker:\n{top}");
 
     // Scrolling down reaches the board keys and, further, the detach binding.
@@ -385,7 +390,10 @@ fn the_help_overlay_scrolls_with_jk_and_says_so() {
     }
     let scrolled = joined(&snapshot(&mut app, 96, 30));
     assert!(scrolled.contains("task board"), "{scrolled}");
-    assert!(scrolled.contains("↑"), "the upward marker is missing:\n{scrolled}");
+    assert!(
+        scrolled.contains("↑"),
+        "the upward marker is missing:\n{scrolled}"
+    );
 }
 
 #[test]
@@ -580,16 +588,16 @@ fn the_sidebar_follows_the_desktop_order() {
         "{sidebar:#?}"
     );
     assert_eq!(
-        sidebar
-            .iter()
-            .filter(|row| row.contains("dev"))
-            .count(),
+        sidebar.iter().filter(|row| row.contains("dev")).count(),
         1,
         "the device is named once:\n{sidebar:#?}"
     );
     // The user row is pinned to the bottom of the sidebar, not inline.
     let user = index("w@example.com");
-    assert!(user > second_session, "user row must be last:\n{sidebar:#?}");
+    assert!(
+        user > second_session,
+        "user row must be last:\n{sidebar:#?}"
+    );
     assert!(
         user >= sidebar.len() - 3,
         "user row must be pinned to the bottom:\n{sidebar:#?}"
@@ -886,7 +894,10 @@ fn each_session_nests_under_its_own_space() {
     // is the more recent chat, it does not float above Alpha's space.
     assert_eq!(at("Alpha session"), at("alpha") + 1, "{sidebar:#?}");
     assert_eq!(at("Beta session"), at("beta") + 1, "{sidebar:#?}");
-    assert!(at("alpha") < at("beta"), "spaces keep creation order:\n{sidebar:#?}");
+    assert!(
+        at("alpha") < at("beta"),
+        "spaces keep creation order:\n{sidebar:#?}"
+    );
     // And no second surface: the flat Sessions header is gone.
     assert!(
         !sidebar.iter().any(|row| row.contains("Sessions")),
@@ -930,11 +941,7 @@ fn a_running_session_draws_one_row_and_the_space_says_where() {
         "the space row must count what Active took:\n{sidebar:#?}"
     );
     // The idle sibling is still the space's, right under it.
-    assert_eq!(
-        at("Chase the flaky"),
-        at("comet") + 1,
-        "{sidebar:#?}"
-    );
+    assert_eq!(at("Chase the flaky"), at("comet") + 1, "{sidebar:#?}");
 
     // With every session live, the shelf answers rather than leaving a gap.
     app.apply(Update::Sessions(vec![
@@ -969,7 +976,10 @@ fn one_repo_in_two_folders_reads_as_two_rows() {
     app.apply(Update::Connection(ConnectionStatus::Ready));
     app.apply(Update::Spaces(vec![
         space("s1", "/Users/brede/dev/attn"),
-        space("s2", "/Users/brede/.comet-native/worktrees/attn/board-gh-10-attn"),
+        space(
+            "s2",
+            "/Users/brede/.comet-native/worktrees/attn/board-gh-10-attn",
+        ),
     ]));
     let sidebar = sidebar_of(&snapshot(&mut app, 100, 24), 100);
     assert!(
@@ -2214,7 +2224,10 @@ fn a_space_that_is_not_a_checkout_has_no_footer_at_all() {
 // Board
 // ---------------------------------------------------------------------------
 
-fn board_row(id: &str, state: comet_proto::view::board::BoardState) -> comet_proto::view::board::TaskRow {
+fn board_row(
+    id: &str,
+    state: comet_proto::view::board::BoardState,
+) -> comet_proto::view::board::TaskRow {
     use comet_proto::view::board::TaskRow;
     TaskRow {
         id: id.into(),
@@ -2275,12 +2288,8 @@ fn the_board_shows_sections_in_fixed_order_with_glyph_carried_state() {
             .position(|row| row.contains(needle))
             .unwrap_or_else(|| panic!("{needle:?} missing:\n{screen}"))
     };
-    let (blocked, working, ready, review) = (
-        at("BLOCKED"),
-        at("WORKING"),
-        at("READY"),
-        at("REVIEW"),
-    );
+    let (blocked, working, ready, review) =
+        (at("BLOCKED"), at("WORKING"), at("READY"), at("REVIEW"));
     assert!(
         blocked < working && working < ready && ready < review,
         "sections must keep board order:\n{screen}"
@@ -2338,7 +2347,10 @@ fn rows_lead_with_the_repo_and_group_by_route_with_no_route_folded() {
     // shows, its row does not.
     assert!(screen.contains("tally  1"), "{screen}");
     assert!(screen.contains("no route  1 hidden"), "{screen}");
-    assert!(!screen.contains("LIN-142"), "a folded group hides its rows:\n{screen}");
+    assert!(
+        !screen.contains("LIN-142"),
+        "a folded group hides its rows:\n{screen}"
+    );
 
     // The header carries the whole count beside the pane's name — folded rows
     // included, because they are still on the board.
@@ -2371,7 +2383,7 @@ fn a_selected_ready_row_offers_dispatch_in_the_footer() {
         other => panic!("expected an account fetch, got {other:?}"),
     }
     app.apply(Update::DispatchAccounts {
-            harness: Some(comet_proto::HarnessId::ClaudeCode),
+        harness: Some(comet_proto::HarnessId::ClaudeCode),
         task_id: "1".into(),
         accounts: vec![comet_proto::AgentAccount {
             id: "slot-ana".into(),
@@ -2477,7 +2489,10 @@ fn the_board_stays_glyph_readable_under_no_color() {
     // No hue means no way to tell blocked from failed except the glyph — which
     // is why the shapes are distinct.
     for glyph in ['▲', '●', '▸', '✓'] {
-        assert!(screen.contains(glyph), "{glyph:?} must survive NO_COLOR:\n{screen}");
+        assert!(
+            screen.contains(glyph),
+            "{glyph:?} must survive NO_COLOR:\n{screen}"
+        );
     }
 }
 
@@ -2509,7 +2524,9 @@ fn space_opens_a_row_over_the_board_with_everything_the_list_cannot_say() {
     app.act(Action::BoardPeek);
     app.apply(Update::TaskDetail {
         task_id: "507".into(),
-        body: Ok(Some("The resume path re-reads the session but not the LoA.".into())),
+        body: Ok(Some(
+            "The resume path re-reads the session but not the LoA.".into(),
+        )),
     });
 
     let screen = joined(&snapshot(&mut app, 100, 26));
@@ -2524,7 +2541,10 @@ fn space_opens_a_row_over_the_board_with_everything_the_list_cannot_say() {
     );
     assert!(screen.contains("board, M"), "the labels:\n{screen}");
     assert!(screen.contains("attempt 2"), "the history:\n{screen}");
-    assert!(screen.contains("last failed"), "the last outcome:\n{screen}");
+    assert!(
+        screen.contains("last failed"),
+        "the last outcome:\n{screen}"
+    );
     // The actions the row has anywhere else, in the shared vocabulary.
     assert!(screen.contains("Dispatch"), "the actions:\n{screen}");
     assert!(screen.contains("Open issue"), "the links:\n{screen}");
@@ -2555,10 +2575,16 @@ fn the_board_find_field_counts_matches_as_you_type() {
     let mut app = boarded();
     app.act(Action::BoardFind);
     let screen = joined(&snapshot(&mut app, 100, 26));
-    assert!(screen.contains("4 rows"), "the count before typing:\n{screen}");
+    assert!(
+        screen.contains("4 rows"),
+        "the count before typing:\n{screen}"
+    );
     app.act(Action::BoardFindType('2'));
     let screen = joined(&snapshot(&mut app, 100, 26));
-    assert!(screen.contains("1 row"), "the count after typing:\n{screen}");
+    assert!(
+        screen.contains("1 row"),
+        "the count after typing:\n{screen}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2677,13 +2703,19 @@ fn unmanaged_runs_draw_in_the_sidebar_with_no_board_at_all() {
 
     let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
     assert!(sidebar.contains("Active"), "{sidebar}");
-    assert!(sidebar.contains("1 blocked"), "the header count:\n{sidebar}");
+    assert!(
+        sidebar.contains("1 blocked"),
+        "the header count:\n{sidebar}"
+    );
     // The chat's own title, since there is no issue behind it to name.
     assert!(sidebar.contains("Orchestrator"), "{sidebar}");
     assert!(sidebar.contains("Altinn docs"), "{sidebar}");
     // Elapsed since the RUN started, and no cap — nothing bounds these.
     assert!(sidebar.contains("1h50m"), "{sidebar}");
-    assert!(!sidebar.contains("1h50m /"), "no cap to read against:\n{sidebar}");
+    assert!(
+        !sidebar.contains("1h50m /"),
+        "no cap to read against:\n{sidebar}"
+    );
 
     let at = |needle: &str| {
         sidebar
@@ -2813,4 +2845,42 @@ fn clicking_an_agent_row_opens_its_chat() {
     let (x, y) = cell_of(&mut app, 100, 30, "gh#2");
     app.click(x, y);
     assert_eq!(app.selected_chat.as_deref(), Some("c2"));
+}
+
+/// gh#122's pinned slot may be the ONLY row a pinned chat has — its session
+/// can end, and its space shelf may never have listed it. The menu that holds
+/// the kill switch has to open on that row too, or unpinning is unreachable
+/// from the app that pinned it (operator report, 2026-08-08).
+#[test]
+fn the_pinned_slot_carries_the_unpin_switch() {
+    let mut app = populated();
+    app.apply(Update::Chats(vec![chat("c1", "Orchestrator")]));
+    app.apply(Update::Orchestrator(Some("c1".into())));
+    app.apply(Update::BoardHostChanged {
+        device: Some("dev".into()),
+        live: true,
+    });
+
+    let (x, y) = cell_of(&mut app, 100, 30, "Orchestrator");
+    app.right_click(x, y);
+    let screen = joined(&snapshot(&mut app, 100, 30));
+    assert!(screen.contains("Unpin as orchestrator"), "{screen}");
+
+    // Walk to it and confirm: the pin is cleared through the same
+    // routing.toml write the desktop uses, with no chat id.
+    app.act(Action::OverlayStep(1));
+    app.act(Action::OverlayStep(1));
+    let effects = app.act(Action::OverlayConfirm);
+    assert!(app.overlay.is_none(), "confirming closes the menu");
+    match effects.first() {
+        Some(comet_tui::link::Command::Call { params, .. }) => {
+            assert_eq!(params["op"], "default");
+            assert_eq!(params["key"], "orchestrator_chat");
+            assert!(
+                params.get("value").is_none_or(|v| v.is_null()),
+                "unpin removes the key: {params}"
+            );
+        }
+        other => panic!("expected the config write, got {other:?}"),
+    }
 }

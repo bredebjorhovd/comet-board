@@ -19,6 +19,7 @@ pub mod devices;
 pub mod members;
 pub mod routing;
 pub mod shortcuts;
+pub mod stats;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -419,7 +420,11 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
-        assert_eq!(d.theme, crate::theme::ThemeChoice::Dark, "dark stays default");
+        assert_eq!(
+            d.theme,
+            crate::theme::ThemeChoice::Dark,
+            "dark stays default"
+        );
     }
 
     #[test]

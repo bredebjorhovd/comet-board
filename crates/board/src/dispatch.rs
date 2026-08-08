@@ -297,6 +297,7 @@ pub fn build_spec(
     let git_author = by_user.and_then(|u| cfg.git_author_for(u));
     Ok(DispatchSpec {
         identifier: task.identifier.clone(),
+        title: task.title.clone(),
         space_id: space.id.clone(),
         device_id: space.device_id.clone(),
         push_repo,

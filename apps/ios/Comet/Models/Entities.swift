@@ -92,7 +92,10 @@ enum ChatIndicator: Int {
 /// state.rs:277 — a Working/AwaitingInput row older than this reads as stale
 /// (a crashed backend never shows eternal "Working").
 let sessionStaleMs: Int64 = 45_000
-/// workspace_host.rs:45 — presence freshness window for device online dots.
+/// Freshness window for a device row's `lastSeenAt`. Only the DEMO dataset
+/// reads it now: live presence is membership in `WorkspaceStore.presence` —
+/// the room's own answer about its socket set — not the age of a timestamp
+/// anybody wrote (gh#145).
 let presenceFreshMs: Int64 = 45_000
 
 func effectiveStatus(_ row: SessionRow?, now: Int64) -> SessionStatus? {

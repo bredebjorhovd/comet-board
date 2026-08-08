@@ -1607,8 +1607,10 @@ other half: a board-dispatched chat was archived only by a hand, so at agent
 throughput a space's shelf silted up in days and the six chats somebody was
 actually working in were somewhere in it.
 
-`[defaults] archive_chats = "7d"` (per route, `off` honored), swept by
+`[defaults] archive_chats` (per route, `off` honored), swept by
 `SyncEngine::archive_chats` beside `collect_worktrees` on the same interval.
+Shipped at the checkout's `7d`; §H33 made it `on-settle` after a morning spent
+reading last night's finished rows.
 
 - **The same rule, not a second one.** `gc::chat_standing` is `gc::standing`
   with two additions, and `gc::decide` ages both windows: a chat and a checkout
@@ -1675,6 +1677,102 @@ activity concentrates in one space, which is the common case.
   `Row::Space`; the phone applies it to the home screen's Sessions list, where
   Active sits directly above (`SpaceRows.swift`, the Swift port). `SpaceView`
   is a different screen with no Active on it and stays complete.
+
+### H33 — What the morning after §H31/§H32 showed — **done** (gh#144)
+The operator looked at the same sidebar the next morning (2026-08-08) and the
+two fixes read as no fix at all. Neither was wrong; both stopped one step short
+of the screen.
+
+- **A disambiguator at the end of a name the sidebar elides from the right is
+  the first thing cut.** §H32's `space_titles` correctly named the two attn
+  checkouts `· attn` and `· board-gh-10-attn`, and both rows still drew
+  `bredebjorhovd/attn…`: the pane is narrower than the slug alone. The tail is
+  now a field, not a suffix — `SpaceTitle { base, qualifier }`, with
+  `line()` for the surfaces that have room (the TUI, the drag ghost). The
+  desktop row gives the qualifier its own `flex_none` width (capped at
+  `SPACE_QUALIFIER_MAX`, so the chevron stays put) and lets the *base* shrink
+  first. The half that differs is the half that survives.
+- **A week is the checkout's clock, not the chat's.** §H31 gave both the same
+  window on the theory that they are one attempt's leavings. They are not read
+  the same way: a checkout is evidence you might go back for, a chat is a row
+  you are *shown*, and thirteen finished rows from one night's work buried the
+  live ones — "having the issues alive and not collected is kinda worthless
+  really". `[defaults] archive_chats` is **`on-settle`**: no window. The guards
+  are what protect an unfinished chat, and they are all in `chat_standing`
+  already — live attempt, blocked attempt, open pull request, issue still open,
+  the pinned orchestrator, a chat nobody dispatched. When none of them hold, the
+  task has merged or closed and the row has nothing left to say. A duration
+  still works for a space that wants a grace period; a bare `0` is now an error,
+  because it reads as "no window" here and "keep forever" for a checkout, and
+  guessing between opposites is worse than asking.
+- **A row you have to look up is not a row.** A dispatched chat was named for
+  its identifier alone, so a shelf read `gh#10 gh#25 gh#26 gh#11 gh#13`.
+  `DispatchSpec` now carries the task's `title` and `chat_title()` composes
+  `gh#25 · D1 Prototype v1: the Today window (static)` — identifier first,
+  because it is short, it is what the board rows and the branch sub-line say,
+  and it is therefore the half that has to survive a narrow pane. The title is
+  clipped at 60 chars on a word boundary; an empty one leaves the bare
+  identifier rather than a dangling separator.
+- **The kill switch was behind a row that does not exist.** §H27 put unpinning
+  on the pinned chat's own row — "whoever wants the notices to stop reaches for
+  the session they pinned" — and gh#122's slot is not that row. Exit the
+  orchestrator's session and its chat leaves Active; if its space shelf never
+  listed it, the slot above Spaces is the only row it has, and that row had
+  `on_click` and nothing else. The operator could reopen the thread and not
+  unpin it from either app. The slot now carries the same context menu a chat
+  row does, on both surfaces (`render_orchestrator_slot`, and `Row::Orchestrator`
+  in the TUI's `open_context_menu`, which fell through to `_ => return`). The
+  CLI escape hatch was always there and nobody should need it:
+  `comet-board routes defaults orchestrator_chat --unset`.
+- **Screenshots in a PR body die twice.** Not a board bug, but the board's
+  agents keep writing it: an attempt asked for screenshots in its PR
+  description and reached for
+  `raw.githubusercontent.com/<owner>/<repo>/<branch>/…`, which is unreadable
+  without a token on a private repo *and* names a branch that merge deletes.
+  Both failures are silent. `docs/agent-conventions.md` (and the shipped skill,
+  rule 9) now says: commit the images and reference them with a relative path
+  from a markdown file in the repo.
+
+### H34 — The board reports on itself — **done** (gh#143)
+`comet-board stats` has answered "is delegating actually working" since the
+port, on one text screen nobody opens: a shell verb is where you go when you
+already suspect something. The numbers belong where the board is looked at.
+
+- **Settings → Board stats.** A section beside Board routing, and for the same
+  reason it is beside it: `board.db` lives on whichever device hosts the board,
+  so the page sweeps `host_candidates` for the one that answers and a laptop
+  reads the box's throughput without an ssh account on it. Headline tiles
+  (dispatches, tasks, completion, median, live), then dispatches per day with
+  the share that ended `done` filled in, where the work *landed*, how long runs
+  take, friction, hour-of-day, and the tallies — space, runtime, tracker, whose
+  subscription.
+- **`BoardStats`, a call and not a stream.** Like §H30's `ReadBoardTask`: these
+  are read when a page opens and stale by a poll interval at worst, and
+  streaming a full aggregate on every board tick would cost every connected
+  viewport a recompute nobody is looking at. Served on the board loop's own
+  thread, which owns `board.db`.
+- **One gatherer, one shape.** `comet_board::stats::gather` still produces it
+  and the CLI still prints it; the *type* moved to
+  `comet_proto::view::stats::BoardStats` so a viewport can deserialize the reply
+  without linking a SQLite store — the `RuntimeOption` split. The renderer's
+  arithmetic (ranking a tally, scaling a bar, phrasing a duration, folding a
+  long tail into `n others`) lives there too, so the CLI, this page and whatever
+  comes next cannot disagree about it.
+- **What the record already knew.** Nothing new is stored. Landing comes from
+  the task's `pr_merged`/`pr_open`/`pr_number` and is counted per *task* — three
+  goes at one issue produce one pull request, and counting attempts would report
+  the same merge three times. Friction is `reopened` + `blocked_count` +
+  `overrun_warned_at`, which the board was already writing and nothing was
+  reading. Whose subscription is gh#101's `billed_to`, with the dispatches that
+  named no slot said out loud as the box's own login rather than hidden as
+  unattributed.
+- **Honest empties.** A completion rate is `None` until something has ended and
+  renders as `—`: a `0%` on a board whose first agent is still running is a lie
+  about the board. Day buckets are emitted for quiet days too — a gap that is
+  simply absent reads as data the board failed to record.
+
+Not on the TUI or the phone yet. The derivation is shared, so both are a
+rendering away.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

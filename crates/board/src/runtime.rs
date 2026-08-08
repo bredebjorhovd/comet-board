@@ -179,6 +179,10 @@ pub struct DispatchSpec {
     /// Task identifier, e.g. `LIN-145` or `gh:owner/repo#87` — becomes the
     /// chat title prefix and the provenance the agent sees.
     pub identifier: String,
+    /// The task's own title, for [`DispatchSpec::chat_title`]. Carried on the
+    /// spec rather than looked up at rename time because the engine that names
+    /// the chat has no tracker and no board table to ask.
+    pub title: String,
     /// The space (device + folder pair) the route resolved to. What herdr
     /// called a workspace.
     pub space_id: String,
@@ -237,6 +241,46 @@ impl DispatchSpec {
         vars.insert("worktree", cwd.to_string());
         crate::config::interpolate(&self.prompt, &vars)
     }
+
+    /// What the chat is called in the sidebar: `gh#25 · D1 Prototype v1`.
+    ///
+    /// The identifier alone is what shipped, and a shelf of `gh#10 gh#25 gh#26
+    /// gh#11` is a list you have to look each row up to read (operator,
+    /// 2026-08-08). It stays, and stays in front: it is short, it is what the
+    /// board rows and the branch sub-line say, and it is therefore the part
+    /// that must survive a narrow pane — the surfaces elide from the right, so
+    /// the recognisable half goes on the left and the descriptive half takes
+    /// whatever width is left.
+    ///
+    /// The title is capped at [`CHAT_TITLE_MAX`] graphemes-by-`char` so one
+    /// essay-length issue cannot make a chat name nothing else fits beside; an
+    /// empty title falls back to the bare identifier rather than leaving a
+    /// dangling separator.
+    pub fn chat_title(&self) -> String {
+        let title = self.title.trim();
+        if title.is_empty() {
+            return self.identifier.clone();
+        }
+        format!("{} · {}", self.identifier, truncate_title(title))
+    }
+}
+
+/// How much task title a chat name carries. Long enough for a real sentence,
+/// short enough that the name is still a name.
+const CHAT_TITLE_MAX: usize = 60;
+
+fn truncate_title(title: &str) -> String {
+    if title.chars().count() <= CHAT_TITLE_MAX {
+        return title.to_string();
+    }
+    // Cut on a word boundary when there is one near the end, so the name reads
+    // as a clipped sentence rather than a clipped word.
+    let cut: String = title.chars().take(CHAT_TITLE_MAX).collect();
+    let stem = match cut.rfind(char::is_whitespace) {
+        Some(ix) if ix >= CHAT_TITLE_MAX / 2 => &cut[..ix],
+        _ => cut.as_str(),
+    };
+    format!("{}…", stem.trim_end_matches([' ', ',', ':', ';', '-', '—']))
 }
 
 /// A dispatched attempt, from the board's side of the fence.
@@ -462,5 +506,61 @@ mod tests {
         }
         // The canonical names are exactly the kebab-case harness ids.
         assert_eq!(runtime_name(HarnessId::Opencode), "opencode");
+    }
+
+    fn spec(identifier: &str, title: &str) -> DispatchSpec {
+        DispatchSpec {
+            identifier: identifier.into(),
+            title: title.into(),
+            space_id: "s".into(),
+            device_id: "d".into(),
+            repo_path: "/tmp".into(),
+            branch: "b".into(),
+            base: "origin/HEAD".into(),
+            worktree: true,
+            harness: HarnessId::Mock,
+            model: None,
+            account: None,
+            push_repo: None,
+            git_author: None,
+            prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_chat_is_named_for_its_issue_and_not_only_its_number() {
+        // The shelf the operator read on 2026-08-08: gh#10, gh#25, gh#26,
+        // gh#11, gh#13 — five rows and not one of them says what it is.
+        assert_eq!(
+            spec("gh#25", "D1 Prototype v1: the Today window (static)").chat_title(),
+            "gh#25 · D1 Prototype v1: the Today window (static)"
+        );
+        // The identifier leads, because the pane elides from the right and it
+        // is the half that has to survive.
+        assert!(
+            spec("LIN-145", "Anything at all")
+                .chat_title()
+                .starts_with("LIN-145")
+        );
+    }
+
+    #[test]
+    fn a_long_title_is_clipped_at_a_word_and_an_empty_one_is_not_appended() {
+        let long = spec(
+            "gh#1",
+            "A title that simply keeps going and going well past \
+                                 any width a sidebar row could ever hope to give it",
+        )
+        .chat_title();
+        assert!(
+            long.chars().count() <= "gh#1 · ".len() + CHAT_TITLE_MAX + 1,
+            "{long}"
+        );
+        assert!(long.ends_with('…'), "{long}");
+        assert!(!long.contains("  "), "clipped at a word: {long}");
+
+        // No dangling separator when the tracker has no title for us.
+        assert_eq!(spec("gh#7", "   ").chat_title(), "gh#7");
+        assert_eq!(spec("gh#7", "").chat_title(), "gh#7");
     }
 }

@@ -21,6 +21,7 @@ pub mod needs;
 pub mod repos;
 pub mod skills;
 pub mod spaces;
+pub mod stats;
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -52,10 +53,13 @@ pub const SESSION_STALE_MS: i64 = 45_000;
 // Host presence (gh#126)
 // ---------------------------------------------------------------------------
 
-/// A device whose merged heartbeat is younger than this reads present.
-/// Engines beat every 15s, so this is ~4 missed beats — and comfortably wider
-/// than both the engine's own 45s freshness window and the UI's 15s
-/// [`EdgeHealth`] poll cadence.
+/// A device whose overlaid `lastSeenAt` is younger than this reads present.
+///
+/// The engine restamps that value `now` every 15s for every device it BELIEVES
+/// connected (`comet_engine::presence`), so this is ~4 missed republishes — and
+/// comfortably wider than the UI's 15s [`EdgeHealth`] poll cadence. It was ~4
+/// missed 15s device heartbeats until gh#145 deleted those; the window is
+/// unchanged, what it measures is now a belief rather than a beat.
 pub const PRESENCE_STALE_MS: i64 = 70_000;
 
 /// What a remote host's presence row may honestly claim.
@@ -631,7 +635,10 @@ mod presence_tests {
         );
         // The local device is trivially online; no row yet says nothing.
         assert_eq!(host_presence(true, None, None, now), HostPresence::Online);
-        assert_eq!(host_presence(false, None, Some(&deaf()), now), HostPresence::Online);
+        assert_eq!(
+            host_presence(false, None, Some(&deaf()), now),
+            HostPresence::Online
+        );
     }
 
     /// The window boundary the devices page has always used (70s).
@@ -673,7 +680,10 @@ mod presence_tests {
         );
         // No census at all (engine predates it / first poll pending): the
         // pre-gh#126 read, so nothing regresses while the answer loads.
-        assert_eq!(host_presence(false, stale, None, now), HostPresence::Offline);
+        assert_eq!(
+            host_presence(false, stale, None, now),
+            HostPresence::Offline
+        );
         // A fresh beat outranks a deaf census — hearing it IS hearing.
         let fresh = Some(now - TimeDelta::seconds(10));
         assert_eq!(

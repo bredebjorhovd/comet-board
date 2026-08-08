@@ -19,7 +19,9 @@
 //! own session rows, and rows for chats it hosts; title/archived renames are LWW map
 //! sets from any device — matching comet's Mutate surface. Presence rides the room's
 //! `EphemeralStore` under keys `presence/{deviceId}` (an online timestamp), replacing
-//! comet's 15s heartbeat writes so liveness never grows the oplog.
+//! comet's 15s heartbeat writes so liveness never grows the oplog. Since gh#145 those
+//! entries are written by the EDGE, derived from the room's socket set: a client
+//! writing them every 15s is what stopped the Durable Object ever hibernating.
 //!
 //! Timestamps are stored as epoch millis (the session-doc convention) and surface as
 //! `chrono::DateTime<Utc>` through the `comet_proto` entity types.

@@ -124,6 +124,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     // ── dispatch ────────────────────────────────────────────────────────────
     let spec = DispatchSpec {
         identifier: "gh#1".into(),
+        title: "Teach the widget to fold".into(),
         space_id: "space-widget".into(),
         device_id: core.device_id.clone(),
         repo_path: repo.to_string_lossy().into_owned(),
@@ -166,7 +167,12 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         .expect("chat exists");
     assert_eq!(chat.cwd.as_deref(), Some(handle.cwd.as_str()));
     assert_eq!(chat.branch.as_deref(), Some("board/gh-1-widget"));
-    assert_eq!(chat.title.as_deref(), Some("gh#1"));
+    // Identifier AND title: the sidebar row has to be readable without
+    // looking the issue up.
+    assert_eq!(
+        chat.title.as_deref(),
+        Some("gh#1 · Teach the widget to fold")
+    );
     assert_eq!(chat.space_id.as_deref(), Some("space-widget"));
     // The repo its pushes authenticate for, on the chat rather than on the run
     // (gh#68): the fix for a review comment next week is a new run in this same
@@ -244,6 +250,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     let rt = runtime.clone();
     let bogus = DispatchSpec {
         identifier: "gh#2".into(),
+        title: "A dispatch whose login does not resolve".into(),
         space_id: "space-widget".into(),
         device_id: core.device_id.clone(),
         repo_path: repo.to_string_lossy().into_owned(),

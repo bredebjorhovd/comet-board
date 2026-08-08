@@ -21,6 +21,7 @@ pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod org_devices;
+pub mod presence;
 pub mod push_credentials;
 pub mod registry;
 pub mod repos;
