@@ -30,8 +30,26 @@ use tokio::sync::watch;
 use crate::EngineError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
-/// Refresh when the cached token has less than this much life left.
+/// How much life a cached token must have left to satisfy a *dial*
+/// ([`Auth::access_token`]) — under this it is refreshed on the spot.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
+/// How much life a cached token must have left to satisfy the *background loop*
+/// ([`Auth::spawn_refresh_loop`]) — wider than [`TOKEN_SLACK`] so a long-lived
+/// dial (a room, the device relay) never opens with a token about to expire.
+///
+/// The two thresholds MUST both be passed to [`Auth::refresh`] as its
+/// `min_remaining`, and that is the whole of gh#153. When the loop woke at
+/// `remaining - 60s` but `refresh` short-circuited on its own hard-coded 30s,
+/// every token spent the 30 seconds between the two thresholds in a loop that
+/// asked for a refresh, was handed the same cached token back, and immediately
+/// asked again: one pinned core for 30s out of every 300s token — 10% of a core
+/// forever, on an engine doing nothing, with no log line and no allocation
+/// growth to show for it.
+const REFRESH_LEAD: Duration = Duration::from_secs(60);
+/// Floor between two background refresh attempts that did not leave a token with
+/// [`REFRESH_LEAD`] of life. The loop's invariant is that EVERY iteration waits:
+/// either on the cached token's own life at the top, or here.
+const REFRESH_RETRY: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -376,12 +394,12 @@ impl Auth {
         if self.inner.workos.is_none() {
             return Some(self.inner.config.dev_user_id.clone());
         }
-        if let Some(entry) = &*lock(&self.inner.access)
-            && entry.remaining() > TOKEN_SLACK
+        if self.access_remaining() > TOKEN_SLACK
+            && let Some(entry) = &*lock(&self.inner.access)
         {
             return Some(entry.token.clone());
         }
-        match self.refresh(None).await {
+        match self.refresh(None, TOKEN_SLACK).await {
             Ok(token) => token,
             Err(err) => {
                 tracing::warn!(error = %err, "auth: refresh failed");
@@ -390,8 +408,27 @@ impl Auth {
         }
     }
 
+    /// Life left on the cached access token; zero when there is none. The
+    /// background loop's only reading of "did that attempt get us anywhere".
+    fn access_remaining(&self) -> Duration {
+        lock(&self.inner.access)
+            .as_ref()
+            .map(AccessEntry::remaining)
+            .unwrap_or(Duration::ZERO)
+    }
+
     /// Sleep-until-near-expiry refresh loop so long-lived dials (relay, rooms) always
     /// have a live token to present on reconnect. No-op task in dev mode.
+    ///
+    /// EVERY iteration waits (gh#153). It waits at the top on the cached token's
+    /// own life when there is life to wait on, and on [`REFRESH_RETRY`] at the
+    /// bottom when the attempt left no usable token — an unreachable edge, a
+    /// session revoked mid-flight, a token whose whole lifetime is shorter than
+    /// [`REFRESH_LEAD`]. There is no path back to the top that has not waited on
+    /// something, because the two ways to skip the top's wait — a cached token
+    /// the refresh declined to replace, and a refresh that failed at the
+    /// transport layer and reported `Ok(None)` for it — are exactly how this
+    /// loop came to burn a core on an idle box.
     pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
         let auth = self.clone();
         tokio::spawn(async move {
@@ -407,11 +444,7 @@ impl Auth {
                     }
                     continue;
                 }
-                let remaining = lock(&auth.inner.access)
-                    .as_ref()
-                    .map(AccessEntry::remaining)
-                    .unwrap_or(Duration::ZERO);
-                let wait = remaining.saturating_sub(Duration::from_secs(60));
+                let wait = auth.access_remaining().saturating_sub(REFRESH_LEAD);
                 if wait > Duration::ZERO {
                     // Re-evaluate at least once a minute rather than parking
                     // on one long timer: tokio timers ride the monotonic
@@ -432,9 +465,25 @@ impl Auth {
                         _ = wake.recv() => {}
                     }
                 }
-                if let Err(err) = auth.refresh(None).await {
+                // Asks for a token good for the whole lead, so a cached one the
+                // dial path would still accept does NOT satisfy this and a real
+                // refresh happens.
+                if let Err(err) = auth.refresh(None, REFRESH_LEAD).await {
                     tracing::warn!(error = %err, "auth: background refresh failed");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                // The attempt is only progress if it left a token the wait at the
+                // top can actually park on. Anything else — a transport failure
+                // (reported as `Ok(None)`, so an error check alone misses it), a
+                // sign-out, a token shorter-lived than the lead — has to back off
+                // here or the next iteration runs at CPU speed.
+                if auth.access_remaining() <= REFRESH_LEAD {
+                    tokio::select! {
+                        _ = tokio::time::sleep(REFRESH_RETRY) => {}
+                        changed = state_rx.changed() => {
+                            if changed.is_err() { return; }
+                        }
+                        _ = wake.recv() => {}
+                    }
                 }
             }
         })
@@ -531,7 +580,9 @@ impl Auth {
         if self.inner.workos.is_none() {
             return Ok(());
         }
-        let token = self.refresh(Some(organization_id)).await?;
+        // An org switch always re-mints (the `Some(organization_id)` arm skips the
+        // freshness short-circuit outright), so `min_remaining` is moot here.
+        let token = self.refresh(Some(organization_id), TOKEN_SLACK).await?;
         let scoped = token
             .as_deref()
             .and_then(jwt_claims)
@@ -777,12 +828,22 @@ impl Auth {
     /// Refresh the session (single-flight). `organization_id` migrates the WorkOS
     /// session to that org; routine refreshes keep the current scope. Returns the new
     /// access token, `None` when signed out / the refresh could not run.
-    async fn refresh(&self, organization_id: Option<&str>) -> Result<Option<String>, EngineError> {
+    ///
+    /// `min_remaining` is how much life the CALLER needs: a cached token with at
+    /// least that much left is handed back unrefreshed. Callers must pass the
+    /// same threshold they will re-test the result against, or they get back a
+    /// token that does not satisfy them and no reason to wait before asking
+    /// again (gh#153).
+    async fn refresh(
+        &self,
+        organization_id: Option<&str>,
+        min_remaining: Duration,
+    ) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
         // Re-check under the gate: the refresh we queued behind may have done the work.
         if organization_id.is_none()
+            && self.access_remaining() > min_remaining
             && let Some(entry) = &*lock(&self.inner.access)
-            && entry.remaining() > TOKEN_SLACK
         {
             return Ok(Some(entry.token.clone()));
         }
@@ -1276,6 +1337,194 @@ mod tests {
                 "state": "needsOrganization",
                 "user": {"id": "u1", "email": "u@x", "name": null},
             })
+        );
+    }
+
+    // ── gh#153: the refresh loop must never iterate without waiting ─────────
+    //
+    // The idle box burned 4h46m of CPU in 21h with zero agents. This loop was
+    // ~10% of it at a steady state and ~80% whenever the edge was unreachable:
+    // both are the same shape — an iteration that asks for a refresh, gets
+    // nothing done, and has nothing to sleep on before asking again.
+
+    fn base64url(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 {
+                out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+            }
+            if chunk.len() > 2 {
+                out.push(ALPHABET[n as usize & 63] as char);
+            }
+        }
+        out
+    }
+
+    /// A JWT whose `exp - iat` — the only thing [`AccessEntry::fresh`] reads — is
+    /// `ttl`, tagged with `tag` so a test can tell two of them apart.
+    fn jwt_with_ttl(tag: &str, ttl: Duration) -> String {
+        let payload = format!(
+            r#"{{"exp":{},"iat":1000,"org_id":"org_1","tag":"{tag}"}}"#,
+            1000 + ttl.as_secs()
+        );
+        format!("h.{}.sig", base64url(payload.as_bytes()))
+    }
+
+    /// A one-shot-per-connection edge that answers `POST /auth/refresh` with a
+    /// token of `ttl`, counting how many times it was asked.
+    async fn fake_edge(ttl: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let _ = &counter;
+                    let mut scratch = [0u8; 4096];
+                    // One read is enough: reqwest writes the whole small POST at
+                    // once, and nothing here depends on the request's contents.
+                    let _ = stream.read(&mut scratch).await;
+                    let body = serde_json::json!({
+                        "accessToken": jwt_with_ttl(&format!("mint{n}"), ttl),
+                        "refreshToken": format!("refresh{n}"),
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (url, hits)
+    }
+
+    /// A WorkOS-mode `Auth` with a persisted, org-scoped session (so its state is
+    /// `SignedIn` and the refresh loop actually runs).
+    fn signed_in_auth(edge_url: &str, dir: &std::path::Path) -> Auth {
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::json!({
+                "refreshToken": "r0",
+                "user": {"id": "u1", "email": "u@x", "name": null},
+                "orgId": "org_1",
+            })
+            .to_string(),
+        )
+        .expect("write session");
+        let mut config = AuthConfig::new(edge_url, dir);
+        config.workos_client_id = Some("client_1".into());
+        let auth = Auth::new(config);
+        assert!(
+            auth.watch_state().borrow().is_signed_in(),
+            "test fixture must start signed in"
+        );
+        auth
+    }
+
+    /// The bug itself. A token in the band between the two thresholds — too
+    /// stale for the background loop's [`REFRESH_LEAD`], fresh enough for a
+    /// dial's [`TOKEN_SLACK`] — used to be handed straight back by `refresh`,
+    /// so the loop asked for it again, and again, for the whole 30s the band
+    /// lasted. Asking for `REFRESH_LEAD` must re-mint.
+    #[tokio::test]
+    async fn a_token_too_stale_for_the_loop_is_actually_re_minted() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (edge, hits) = fake_edge(Duration::from_secs(300)).await;
+        let auth = signed_in_auth(&edge, dir.path());
+
+        // Mid-band: 45s left — under the loop's 60s lead, over a dial's 30s.
+        let banded = jwt_with_ttl("banded", Duration::from_secs(45));
+        *lock(&auth.inner.access) = Some(AccessEntry::fresh(banded.clone()));
+
+        // A DIAL is still satisfied by it — that property is unchanged, and is
+        // why the two thresholds are allowed to differ at all.
+        assert_eq!(auth.access_token().await.as_deref(), Some(banded.as_str()));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a dial must not re-mint");
+
+        // The LOOP is not, and must get a real refresh rather than the same
+        // token back with nothing to wait on.
+        let minted = auth
+            .refresh(None, REFRESH_LEAD)
+            .await
+            .expect("refresh")
+            .expect("token");
+        assert_ne!(minted, banded, "the loop was handed back the stale token");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            auth.access_remaining() > REFRESH_LEAD,
+            "a refresh the loop asked for must leave it something to sleep on"
+        );
+    }
+
+    /// The other half, and the more expensive one: a transport failure reports
+    /// `Ok(None)`, not `Err`, so a loop that backs off only on `Err` backs off
+    /// never. `access_remaining` is what the loop tests instead — it reads the
+    /// same "no usable token" for a dead edge as for no edge at all.
+    #[tokio::test]
+    async fn an_unreachable_edge_leaves_the_loop_nothing_to_sleep_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Port 1 is reserved and unbound: connections are refused immediately,
+        // which is exactly the fast-failing shape that made this a hot loop.
+        let auth = signed_in_auth("http://127.0.0.1:1", dir.path());
+
+        let outcome = auth.refresh(None, REFRESH_LEAD).await;
+        assert!(
+            matches!(outcome, Ok(None)),
+            "a transport failure is reported as Ok(None), not Err: {outcome:?}"
+        );
+        assert!(
+            auth.access_remaining() <= REFRESH_LEAD,
+            "no token was minted, so the loop must read this as no progress"
+        );
+    }
+
+    /// End to end: the whole loop, against an edge that only ever issues tokens
+    /// SHORTER than the lead — the degenerate case where every refresh succeeds
+    /// and still leaves the loop unsatisfied. It must settle onto
+    /// [`REFRESH_RETRY`] rather than spin. Before gh#153 this made zero requests
+    /// and pinned a core; a naive fix makes one request per iteration and pins
+    /// the edge instead.
+    #[tokio::test]
+    async fn the_loop_settles_even_when_no_token_can_satisfy_it() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (edge, hits) = fake_edge(Duration::from_secs(45)).await;
+        let auth = signed_in_auth(&edge, dir.path());
+
+        let loop_task = auth.spawn_refresh_loop();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        loop_task.abort();
+
+        let asked = hits.load(Ordering::SeqCst);
+        assert!(asked >= 1, "the loop never refreshed at all");
+        assert!(
+            asked <= 2,
+            "the loop is spinning: {asked} refreshes in 1.5s, with a {}s floor between attempts",
+            REFRESH_RETRY.as_secs()
         );
     }
 }
