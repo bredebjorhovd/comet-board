@@ -255,7 +255,21 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   box and no swap happens under a live run.
 - **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs, member
   invitations); loopback callback server headed, paste-code headless; dev mode (no key ⇒
-  bearer = configured user id).
+  bearer = configured user id). The background refresh loop is held to one invariant
+  (gh#153): **every iteration waits** — on the cached token's own life, or on a retry floor
+  when the attempt left no usable token. Two thresholds are in play (a dial needs 30s of
+  token, the loop wants 60s) and both are passed to the refresh as `min_remaining`, because
+  a loop that asks for 60s and is handed back a 45s token has nothing left to sleep on.
+
+*What an idle engine costs.* The other half of the DO-duration story above is the client
+side: an engine hosting no chats should be indistinguishable from a parked process. Measured
+(2026-08-08, signed in, zero chats, over ten minutes and two token cycles): **0.73 CPU-seconds
+in 586 — about 0.12% of a core**, of which the periodic work is one local watch republish per
+15s, one relay-status probe per 30s, and one token refresh per 240s. That is the number to
+re-measure against; anything materially above it is a spin, and the first place to look is a
+`select!` branch that is always ready or a loop whose "retry" path can complete without
+waiting. Both shapes have now cost real money here — gh#145 on the bill, gh#153 on the box,
+where an idle engine burned 4h46m of CPU in 21h with zero agents ever dispatched.
 
 ## 6. Edge plan (TypeScript, `edge/`)
 
