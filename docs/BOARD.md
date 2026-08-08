@@ -1830,6 +1830,51 @@ pinned by tests:
   Claude Max seat did not cost a per-token figure, so whatever is shown must be
   labelled a list-price estimate of the same usage on the API, not a bill.
 
+### H36 — "Hosts no board" and "could not be asked" are different answers — **done** (gh#155)
+
+"if i click add space and try to search for repos I cant find it." Nothing was
+misconfigured. §H25's sweep asks every device `ListRepoSpaces` and skips the
+ones that fail, on a contract that is sound as far as it goes: a device hosting
+no board refuses before it does any git or GitHub work, so being refused rules
+it out for free. What the contract could not survive was a host that *would*
+have answered and could not — during §H26's free-tier Durable Object outage
+every relayed call to the box returned 500, so the box was skipped exactly like
+a laptop that hosts nothing, and the picker showed the Mac's repos with no
+error, no spinner and no hint that a second device had been asked. The shorter
+list read as the whole truth. §H26's lesson, on a surface that never learned it.
+
+- **The two answers were the same `Err`, and that is the real fix.** Every
+  board-addressed method funnels through `EngineRpc::board()`, which returned
+  `RpcError::Failed` — indistinguishable at the call site from a dead relay.
+  There is now `RpcError::Refused`, and it survives the hop: `ServerFrame`
+  carries an optional `code` beside `err`, `RpcError::code`/`from_wire` are the
+  two ends of it, and an untagged frame (an older peer) still reads as
+  `Failed`. Nothing else changes on the wire, and the `Display` text is
+  unchanged, so no existing message moves.
+- **Silence is now a fact the picker holds.** `hosts_no_board` is the whole
+  rule, one predicate with a test: `Refused` and `UnknownMethod` are *answers*
+  and rule a device out silently; transport, `Closed` and everything else mean
+  nobody was asked. The unasked devices land in `AddSpaceFlow::unreachable`,
+  named — with the transport's own words underneath — and the list keeps every
+  repo that did answer, because the ones that answered still work.
+- **The warning sits above the list, with Retry.** `view::repos::unreachable_note`
+  is the pure sentence ("Could not reach box — any repos hosted there are
+  missing from this list."), named devices rather than a count, because the
+  operator's next move is device-shaped. A footnote under a plausible list is
+  how this was missed the first time. The rail stops claiming "no device here
+  hosts a board" when the sweep never got to make that claim, and an onboard
+  with nowhere to go says which of the two is true.
+- **The sidebar's copy of the sweep had the same disease.** `refresh_space_slugs`
+  replaced the `space → owner/repo` map wholesale from every sweep, so one
+  unreachable box quietly renamed every one of its spaces back to a folder
+  basename. A sweep every device answered still replaces; one that lost a device
+  merges (`AppState::merge_space_slugs`) — it can add and update, never delete.
+- **Not done: the phone.** `BoardStore.repoHosts()` swallows the same way
+  (`guard let … try? await` — one `continue` for both answers), and the phone is
+  the surface where the repo list is the *only* door. The wire now carries what
+  it needs (`code` on the frame); porting it is `RelayError.refused` plus the
+  banner, and it is a separate change with a separate build to verify.
+
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from
   upstream + live attempt; nothing here changes that.

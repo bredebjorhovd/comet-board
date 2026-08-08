@@ -196,6 +196,48 @@ pub fn repo_rows(
     rows
 }
 
+/// A device the host sweep asked and never heard back from (gh#155).
+///
+/// Not the same thing as a device that hosts no board. That one *refuses*
+/// `ListRepoSpaces` before doing any work, and being refused is an answer: it
+/// is not a host, and it belongs nowhere in this picker. A device whose call
+/// errored — relay down, 500, timeout — was never successfully asked, so
+/// whatever it hosts is missing from the list and the list is not the whole
+/// truth. The picker has to say which one this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableHost {
+    /// What to call it: the device's name where the frontend knows one, its id
+    /// otherwise. Named, never counted — "1 device unreachable" is a fact
+    /// nobody can act on.
+    pub device: String,
+    /// The transport's own words, for the line under the headline.
+    pub detail: Option<String>,
+}
+
+/// The picker's headline for a sweep that came back incomplete — `None` when
+/// every device answered (refusals included: those ARE answers).
+///
+/// Names the devices, because the operator's next move is device-shaped:
+/// wake the box, check the relay, retry. And says what the silence cost — the
+/// repos that are missing — since the visible list looks complete either way,
+/// which is the whole failure this exists to prevent.
+pub fn unreachable_note(hosts: &[UnreachableHost]) -> Option<String> {
+    let names: Vec<&str> = hosts.iter().map(|h| h.device.as_str()).collect();
+    let names = join_names(&names)?;
+    Some(format!(
+        "Could not reach {names} — any repos hosted there are missing from this list."
+    ))
+}
+
+/// "a", "a and b", "a, b and c" — an empty list has nothing to say.
+fn join_names(names: &[&str]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
+    }
+}
+
 /// Match rank of one row against a query: `0` prefix, `1` substring, `None` no
 /// match. Case-insensitive; an empty query matches everything at rank 1.
 ///
@@ -347,6 +389,36 @@ mod tests {
         assert_eq!(hits, vec!["bredebjorhovd/comet-board", "comet-labs/other"]);
         assert!(filter_rows("zzz", &rows).is_empty());
         assert_eq!(filter_rows("", &rows).len(), 3);
+    }
+
+    fn unreachable(device: &str) -> UnreachableHost {
+        UnreachableHost {
+            device: device.into(),
+            detail: None,
+        }
+    }
+
+    /// The gh#155 failure: the box was asked, the relay 500'd, and the picker
+    /// showed the laptop's repos as if that were everything. A sweep that lost
+    /// a device says so, by name, and says what it cost.
+    #[test]
+    fn a_sweep_that_lost_a_device_names_it() {
+        assert_eq!(unreachable_note(&[]), None, "a complete sweep says nothing");
+        assert_eq!(
+            unreachable_note(&[unreachable("box")]).as_deref(),
+            Some("Could not reach box — any repos hosted there are missing from this list.")
+        );
+        assert_eq!(
+            unreachable_note(&[unreachable("box"), unreachable("MacBook Pro")]).as_deref(),
+            Some(
+                "Could not reach box and MacBook Pro — any repos hosted there are missing \
+                 from this list."
+            )
+        );
+        assert_eq!(
+            unreachable_note(&[unreachable("a"), unreachable("b"), unreachable("c")]).as_deref(),
+            Some("Could not reach a, b and c — any repos hosted there are missing from this list.")
+        );
     }
 
     /// With no board host found, nothing is "on the box" — the list still works,
