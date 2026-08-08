@@ -212,20 +212,56 @@ pub struct UnreachableHost {
     pub device: String,
     /// The transport's own words, for the line under the headline.
     pub detail: Option<String>,
+    /// The fleet already believed this device was not there when it was asked
+    /// (`HostPresence::Offline` — a lapsed heartbeat observed by a viewer whose
+    /// own sync is up, gh#126/gh#145).
+    ///
+    /// Silence from a device nobody expected to answer is not news. A laptop
+    /// shut for the night fails the same call as a box behind a broken relay,
+    /// and treating them alike puts a warning on the palette every single time
+    /// it opens — which is how a warning stops being read before the day it
+    /// matters. `SyncDown` is deliberately NOT this: a viewer that cannot hear
+    /// does not get to call anything absent, and that is exactly the state the
+    /// outage behind this issue produced.
+    pub believed_offline: bool,
 }
 
-/// The picker's headline for a sweep that came back incomplete — `None` when
-/// every device answered (refusals included: those ARE answers).
+/// The picker's headline for a sweep that lost a device it had every reason to
+/// expect an answer from — `None` when there is no such device.
 ///
-/// Names the devices, because the operator's next move is device-shaped:
-/// wake the box, check the relay, retry. And says what the silence cost — the
-/// repos that are missing — since the visible list looks complete either way,
-/// which is the whole failure this exists to prevent.
+/// Names them, because the operator's next move is device-shaped: check the
+/// relay, retry. And says what the silence cost — the repos that are missing —
+/// since the visible list looks complete either way, which is the whole failure
+/// this exists to prevent.
 pub fn unreachable_note(hosts: &[UnreachableHost]) -> Option<String> {
-    let names: Vec<&str> = hosts.iter().map(|h| h.device.as_str()).collect();
+    let names: Vec<&str> = hosts
+        .iter()
+        .filter(|h| !h.believed_offline)
+        .map(|h| h.device.as_str())
+        .collect();
     let names = join_names(&names)?;
     Some(format!(
         "Could not reach {names} — any repos hosted there are missing from this list."
+    ))
+}
+
+/// The quiet counterpart: devices that were already known to be away.
+///
+/// A statement of the fleet's state, not a warning, and it carries no Retry —
+/// retrying a device that is switched off cannot succeed. Frontends only pass
+/// devices whose silence *costs* something (a device that holds spaces here);
+/// an offline phone that hosts nothing has nothing to be missing.
+pub fn absent_note(hosts: &[UnreachableHost]) -> Option<String> {
+    let names: Vec<&str> = hosts
+        .iter()
+        .filter(|h| h.believed_offline)
+        .map(|h| h.device.as_str())
+        .collect();
+    let plural = names.len() > 1;
+    let names = join_names(&names)?;
+    Some(format!(
+        "{names} {} offline — repos hosted there are not listed.",
+        if plural { "are" } else { "is" }
     ))
 }
 
@@ -395,6 +431,14 @@ mod tests {
         UnreachableHost {
             device: device.into(),
             detail: None,
+            believed_offline: false,
+        }
+    }
+
+    fn absent(device: &str) -> UnreachableHost {
+        UnreachableHost {
+            believed_offline: true,
+            ..unreachable(device)
         }
     }
 
@@ -419,6 +463,37 @@ mod tests {
             unreachable_note(&[unreachable("a"), unreachable("b"), unreachable("c")]).as_deref(),
             Some("Could not reach a, b and c — any repos hosted there are missing from this list.")
         );
+    }
+
+    /// A device the fleet already believes is away is absent, not unreachable.
+    /// It never reaches the warning line — an asleep phone fails this call on
+    /// every single open, and a warning that is always on is a warning nobody
+    /// reads on the day the box is the one that went quiet.
+    #[test]
+    fn a_device_known_to_be_offline_is_not_a_warning() {
+        assert_eq!(unreachable_note(&[absent("iPhone")]), None);
+        assert_eq!(
+            absent_note(&[absent("iPhone")]).as_deref(),
+            Some("iPhone is offline — repos hosted there are not listed.")
+        );
+        assert_eq!(
+            absent_note(&[absent("box"), absent("iPhone")]).as_deref(),
+            Some("box and iPhone are offline — repos hosted there are not listed.")
+        );
+
+        // Both at once: the box was expected to answer and did not, while the
+        // phone was never expected to. Two different sentences, and only the
+        // first one is a warning.
+        let mixed = [unreachable("box"), absent("iPhone")];
+        assert_eq!(
+            unreachable_note(&mixed).as_deref(),
+            Some("Could not reach box — any repos hosted there are missing from this list.")
+        );
+        assert_eq!(
+            absent_note(&mixed).as_deref(),
+            Some("iPhone is offline — repos hosted there are not listed.")
+        );
+        assert_eq!(absent_note(&[unreachable("box")]), None);
     }
 
     /// With no board host found, nothing is "on the box" — the list still works,

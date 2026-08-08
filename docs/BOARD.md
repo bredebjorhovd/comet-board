@@ -1864,6 +1864,21 @@ list read as the whole truth. §H26's lesson, on a surface that never learned it
   how this was missed the first time. The rail stops claiming "no device here
   hosts a board" when the sweep never got to make that claim, and an onboard
   with nowhere to go says which of the two is true.
+- **Absent is not unreachable, or the strip is on every time.** The sweep asks
+  every registered device, and this fleet is Mac + box + iPhone: a phone is
+  asleep essentially always, hosts no board and never will, so its relayed call
+  fails as transport like any other. Warning about it on every open is how a
+  strip stops being read before the day it has something real to say — silent-
+  when-it-should-speak was the bug, and loud-every-time is how the fix gets
+  reverted. So the report is gated on §H26's presence verdict, gathered per
+  device *before* the call (silence carries no facts): `Offline` — a lapsed
+  heartbeat seen by a viewer whose own sync is up — is absence, and gets one
+  muted line and no Retry, or nothing at all when the device holds no spaces
+  here and its silence therefore costs the list nothing. `SyncDown` is
+  deliberately not absence: a viewer that cannot hear does not get to call
+  anything away, and that is precisely the state the outage put the box in, so
+  the case this issue is about still gets the full treatment. `Candidate::silence`
+  is the rule, with the fleet's own shape as its test.
 - **The sidebar's copy of the sweep had the same disease.** `refresh_space_slugs`
   replaced the `space → owner/repo` map wholesale from every sweep, so one
   unreachable box quietly renamed every one of its spaces back to a folder

@@ -186,6 +186,44 @@ fn hosts_no_board(err: &comet_rpc::RpcError) -> bool {
     )
 }
 
+/// One device about to be asked [`methods::LIST_REPO_SPACES`], with everything
+/// the sweep will need if it never answers (gh#155).
+///
+/// Gathered up front because silence carries no facts: a device that does not
+/// reply cannot tell you its name, and by the time the call has failed the
+/// question "did we expect this one to answer?" is exactly the question that
+/// decides whether the operator sees a warning.
+struct Candidate {
+    /// Relay target: `None` is this device (no `targetDeviceId` passthrough).
+    target: Option<String>,
+    name: String,
+    /// The fleet believed this device was away before it was asked
+    /// (`HostPresence::Offline`).
+    offline: bool,
+    /// It owns at least one space in the workspace doc — so its silence costs
+    /// this list something real.
+    hosts_spaces: bool,
+}
+
+impl Candidate {
+    /// What to report when this device fails to answer — `None` when the
+    /// honest answer is to say nothing.
+    ///
+    /// A device that is switched off, and holds nothing here, is not news: the
+    /// operator's phone is asleep for all but minutes of the day, hosts no
+    /// board and never will, and a palette that warned about it on every open
+    /// would teach him to skip the strip long before the morning it is the box
+    /// that has gone quiet. Silent-when-it-should-speak was the bug; loud-every-
+    /// time is how the fix gets reverted.
+    fn silence(&self, detail: String) -> Option<UnreachableHost> {
+        (!self.offline || self.hosts_spaces).then(|| UnreachableHost {
+            device: self.name.clone(),
+            detail: Some(detail),
+            believed_offline: self.offline,
+        })
+    }
+}
+
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
 /// across the top, the repo list (or the folder browser) on the left, a rail on
 /// the right, kbd-hint footer. One surface — switching doors or picking a device
@@ -2092,23 +2130,40 @@ impl Shell {
             let state = self.state.read(cx);
             (state.devices.clone(), state.local_device_id.clone())
         };
-        // A device is named before it is asked: an unreachable one has no reply
-        // to name itself with, and "could not reach a device" is not something
-        // anybody can act on.
-        let candidates: Vec<(Option<String>, String)> = {
+        // Everything the sweep needs to know about a device is settled before it
+        // is asked, because a device that does not answer tells you nothing
+        // about itself: its name (an unnamed device is not something anybody can
+        // act on), whether the fleet already believed it was away, and whether
+        // its silence costs this list anything.
+        let candidates: Vec<Candidate> = {
+            let now = Utc::now();
             let state = self.state.read(cx);
             board::host_candidates(&devices, local.as_deref())
                 .into_iter()
-                .map(|candidate| {
-                    let name = match &candidate {
+                .map(|target| {
+                    let device_id = target.clone().or_else(|| local.clone());
+                    let name = match device_id.as_deref() {
                         Some(id) => state.device_name(id).unwrap_or(id).to_string(),
-                        None => local
-                            .as_deref()
-                            .and_then(|id| state.device_name(id))
-                            .unwrap_or("this device")
-                            .to_string(),
+                        None => "this device".to_string(),
                     };
-                    (candidate, name)
+                    let (offline, hosts_spaces) = match device_id.as_deref() {
+                        Some(id) => (
+                            // gh#126's three-state, and only its middle verdict
+                            // counts as absence: `SyncDown` means this viewer
+                            // cannot hear, which is no evidence about the device
+                            // — and is precisely the state the outage behind
+                            // gh#155 put the box in.
+                            state.host_presence(id, now) == crate::state::HostPresence::Offline,
+                            state.spaces.iter().any(|s| s.device_id == id),
+                        ),
+                        None => (false, true),
+                    };
+                    Candidate {
+                        target,
+                        name,
+                        offline,
+                        hosts_spaces,
+                    }
                 })
                 .collect()
         };
@@ -2121,9 +2176,10 @@ impl Shell {
         self.repo_task_set(cx.spawn(async move |this, cx| {
             let mut hosts: Vec<RepoHost> = Vec::new();
             let mut unreachable: Vec<UnreachableHost> = Vec::new();
-            for (candidate, name) in candidates {
+            for candidate in candidates {
                 let mut params = serde_json::json!({});
-                if let (Some(target), Some(object)) = (candidate.as_deref(), params.as_object_mut())
+                if let (Some(target), Some(object)) =
+                    (candidate.target.as_deref(), params.as_object_mut())
                 {
                     object.insert("targetDeviceId".into(), serde_json::json!(target));
                 }
@@ -2136,10 +2192,9 @@ impl Shell {
                     // "I host no board." Not a host, nothing to report.
                     Err(err) if hosts_no_board(&err) => continue,
                     Err(err) => {
-                        unreachable.push(UnreachableHost {
-                            device: name,
-                            detail: Some(format!("{err}")),
-                        });
+                        if let Some(host) = candidate.silence(format!("{err}")) {
+                            unreachable.push(host);
+                        }
                         continue;
                     }
                 };
@@ -2148,15 +2203,14 @@ impl Shell {
                     // It answered, and we cannot read the answer — its repos are
                     // just as missing, so it counts the same way.
                     Err(err) => {
-                        unreachable.push(UnreachableHost {
-                            device: name,
-                            detail: Some(format!("unreadable reply: {err}")),
-                        });
+                        if let Some(host) = candidate.silence(format!("unreadable reply: {err}")) {
+                            unreachable.push(host);
+                        }
                         continue;
                     }
                 };
                 hosts.push(RepoHost {
-                    target: candidate,
+                    target: candidate.target,
                     device_id: reply.device_id,
                     links: reply.spaces,
                     offers: reply
@@ -2278,13 +2332,14 @@ impl Shell {
         if flow.onboarding.is_some() {
             return;
         }
-        let unreachable = repos::unreachable_note(&flow.unreachable);
+        let silence = repos::unreachable_note(&flow.unreachable)
+            .or_else(|| repos::absent_note(&flow.unreachable));
         let Some(host) = flow.host() else {
             if let Some(flow) = self.add_space.as_mut() {
-                // Which of the two is true decides what to do next, so the
-                // refusal has to say (gh#155): install a board, or get the box
-                // back.
-                flow.error = Some(match unreachable {
+                // Which of these is true decides what to do next, so the refusal
+                // has to say (gh#155): install a board, fix the relay, or go and
+                // wake the box.
+                flow.error = Some(match silence {
                     Some(note) => format!("Nowhere to clone this repo yet — {note}").into(),
                     None => "No device here hosts a board, so there is nowhere to clone this repo"
                         .into(),
@@ -3056,24 +3111,50 @@ impl Shell {
         }
     }
 
-    /// The strip that says the list is short, and offers the one move that can
-    /// fix it (gh#155).
+    /// What the sweep could not ask, in whichever of two voices is honest
+    /// (gh#155).
     ///
-    /// Named devices, the transport's own words underneath, and Retry. Warning
-    /// coloured rather than danger: nothing is broken here — a device could not
-    /// be reached, the repos that DID answer are right below, and picking one of
-    /// those still works.
+    /// A device that was expected to answer and did not gets the warning strip:
+    /// named, the transport's own words underneath, and Retry — warning
+    /// coloured rather than danger, because nothing is broken and the repos that
+    /// DID answer are right below. A device the fleet already knew was away gets
+    /// one muted line and no Retry, since retrying a switched-off machine cannot
+    /// succeed. When both are true, both are said.
     fn render_unreachable_banner(
         &self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let flow = self.add_space.as_ref()?;
-        let headline = repos::unreachable_note(&flow.unreachable)?;
+        let headline = repos::unreachable_note(&flow.unreachable);
+        let absent = repos::absent_note(&flow.unreachable);
+        if headline.is_none() {
+            // Nothing to warn about; at most a quiet statement of the fleet's
+            // own state, which gets no border, no icon and no button.
+            return absent.map(|note| {
+                div()
+                    .flex_none()
+                    .mx(px(14.0))
+                    .mt(px(10.0))
+                    .text_size(px(11.5))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.55))
+                    .child(SharedString::from(note))
+                    .into_any_element()
+            });
+        }
+        let headline = headline?;
         // One line for the details, deduplicated: three devices behind the same
-        // dead relay have the same thing wrong with them.
+        // dead relay have the same thing wrong with them. Only the warned-about
+        // devices contribute — an offline phone's transport error is not
+        // evidence about anything.
         let mut details: Vec<&str> = Vec::new();
-        for detail in flow.unreachable.iter().filter_map(|h| h.detail.as_deref()) {
+        for detail in flow
+            .unreachable
+            .iter()
+            .filter(|h| !h.believed_offline)
+            .filter_map(|h| h.detail.as_deref())
+        {
             if !details.contains(&detail) {
                 details.push(detail);
             }
@@ -3123,6 +3204,17 @@ impl Shell {
                                     .line_height(px(15.0))
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(detail)),
+                            )
+                        })
+                        // A device that is merely away rides along quietly under
+                        // the one that is actually wrong.
+                        .when_some(absent, |el, note| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .line_height(px(15.0))
+                                    .text_color(theme.text_muted.opacity(0.55))
+                                    .child(SharedString::from(note)),
                             )
                         }),
                 )
@@ -3251,7 +3343,11 @@ impl Shell {
             .unwrap_or_default();
         let target = flow.map(|f| f.target).unwrap_or(0);
         let sweeping = flow.is_some_and(|f| matches!(f.repos, Loadable::Loading | Loadable::Idle));
-        let lost_a_host = flow.is_some_and(|f| !f.unreachable.is_empty());
+        // Two different reasons the sweep might have come up empty, and they
+        // are not the same advice: one is worth retrying, the other is worth
+        // waking a machine for.
+        let lost_a_host = flow.is_some_and(|f| repos::unreachable_note(&f.unreachable).is_some());
+        let host_away = flow.and_then(|f| repos::absent_note(&f.unreachable));
         let note = flow.and_then(|f| f.host()).and_then(|h| h.note.clone());
         let (names, presence): (
             std::collections::HashMap<String, String>,
@@ -3373,6 +3469,12 @@ impl Shell {
             // sweep did not get to make it (gh#155).
             "No board answered, and a device could not be reached — retry before \
              concluding there is none."
+                .into()
+        } else if hosts.is_empty() && host_away.is_some() {
+            // Same incomplete sweep, different cure: nothing here can reach a
+            // machine that is switched off, and Retry would only say so again.
+            "No board answered, and a device is offline — a repo has nowhere to \
+             be cloned until it is back."
                 .into()
         } else if hosts.is_empty() {
             "No device here hosts a board, so a repo has nowhere to be cloned.".into()
@@ -4137,5 +4239,61 @@ mod tests {
         assert!(!hosts_no_board(&RpcError::Failed(
             "cannot reach device box: remote routing unavailable (offline)".into()
         )));
+    }
+
+    fn candidate(name: &str, offline: bool, hosts_spaces: bool) -> Candidate {
+        Candidate {
+            target: Some(name.to_string()),
+            name: name.to_string(),
+            offline,
+            hosts_spaces,
+        }
+    }
+
+    /// Whose silence is worth saying out loud. The operator's fleet is Mac +
+    /// box + iPhone, and the phone is asleep essentially always — so a rule
+    /// that warned about every device that failed the call would put a warning
+    /// on the palette on every open, which is how the strip stops being read
+    /// before the morning the box is the one that went quiet.
+    #[test]
+    fn a_device_nobody_expected_to_answer_is_not_news() {
+        // The phone: switched off, hosts nothing here. Nothing is missing, so
+        // nothing is said.
+        assert_eq!(
+            candidate("iPhone", true, false).silence("timeout".into()),
+            None
+        );
+
+        // The box, believed present, failing the call — the gh#155 case, and
+        // the loud one. `SyncDown` reaches here as `offline: false`, which is
+        // what the Durable Object outage produced.
+        let reached = candidate("box", false, true)
+            .silence("device room unreachable: 500".into())
+            .expect("a device believed present must be reported");
+        assert!(!reached.believed_offline);
+        assert_eq!(
+            repos::unreachable_note(std::slice::from_ref(&reached)).as_deref(),
+            Some("Could not reach box — any repos hosted there are missing from this list.")
+        );
+
+        // The box, switched off, holding spaces: its repos really are missing,
+        // so it is stated — but quietly, and with no Retry to offer.
+        let away = candidate("box", true, true)
+            .silence("timeout".into())
+            .expect("an offline device that holds spaces still costs the list something");
+        assert!(away.believed_offline);
+        assert_eq!(repos::unreachable_note(std::slice::from_ref(&away)), None);
+        assert_eq!(
+            repos::absent_note(std::slice::from_ref(&away)).as_deref(),
+            Some("box is offline — repos hosted there are not listed.")
+        );
+
+        // A device believed present is reported whether or not it holds spaces:
+        // what it could have offered is exactly what we failed to find out.
+        assert!(
+            candidate("laptop", false, false)
+                .silence("timeout".into())
+                .is_some()
+        );
     }
 }
