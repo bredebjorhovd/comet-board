@@ -747,6 +747,13 @@ impl StatsPage {
     /// A card: heading, an optional aside, and a body.
     fn card(theme: &Theme, title: &str, aside: Option<String>, body: AnyElement) -> AnyElement {
         widgets::section_card(theme)
+            // `section_card` carries the settings stack's own `mt(24)`. In a
+            // grid that margin is wrong twice: it double-spaces the rows on top
+            // of the column gap, and it drops a card 24px below the panel
+            // beside it, so two halves of one row no longer start on the same
+            // line. Spacing is the grid's job here.
+            .mt(px(0.0))
+            .h_full()
             .child(
                 div()
                     .px(px(20.0))
@@ -775,6 +782,240 @@ impl StatsPage {
             .child(body)
             .into_any_element()
     }
+    /// The answer, in the top-left corner where a reader starts.
+    ///
+    /// The page exists to answer "is delegating working", and before this it
+    /// made you assemble that from five tiles and a scroll. So: the count, then
+    /// the three facts that qualify it in one sentence each, then where the
+    /// work went. Everything below this panel is evidence for it.
+    fn render_answer(stats: &BoardStats, theme: &Theme) -> AnyElement {
+        let completion = percent(stats.completion_rate);
+        let median = stats.median_minutes.map(human_minutes);
+        // The qualifying line, assembled only from facts that exist. A board
+        // with nothing ended has no rate and no median, and inventing an
+        // em-dash for each would read as two failures rather than as a board
+        // that has only just started.
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(rate) = completion {
+            facts.push(format!("{rate} ended in done"));
+        }
+        if stats.landing.merged > 0 {
+            facts.push(format!("{} merged", stats.landing.merged));
+        }
+        if let Some(median) = median {
+            facts.push(format!("{median} median"));
+        }
+        if stats.live > 0 {
+            facts.push(format!("{} running now", stats.live));
+        }
+
+        let spaces = ranked_top(&stats.by_workspace, 4);
+        let peak = spaces.first().map(|t| t.count).unwrap_or(0);
+        let split: Vec<AnyElement> = spaces
+            .into_iter()
+            .map(|row| {
+                let fraction = bar_fraction(row.count, peak);
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .w(px(120.0))
+                            .flex_none()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(row.label)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(5.0))
+                            .rounded(px(3.0))
+                            .bg(theme.white_alpha(0.05))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fraction))
+                                    .rounded(px(3.0))
+                                    .bg(theme.accent.opacity(0.55)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .flex_none()
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!("{}", row.count))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        widgets::section_card(theme)
+            .mt(px(0.0))
+            .h_full()
+            .px(px(20.0))
+            .py(px(18.0))
+            .gap(px(14.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(30.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(SharedString::from(format!(
+                                "{} dispatch{}",
+                                stats.attempts,
+                                if stats.attempts == 1 { "" } else { "es" }
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(if facts.is_empty() {
+                                format!("across {} task(s)", stats.tasks_touched)
+                            } else {
+                                facts.join(" · ")
+                            })),
+                    ),
+            )
+            .when(!split.is_empty(), |el| {
+                el.child(div().flex().flex_col().gap(px(7.0)).children(split))
+            })
+            .into_any_element()
+    }
+
+    /// The right-hand column of row three: the four facts that used to be four
+    /// separate cards, each holding two numbers. A card per fact is what made
+    /// the page a scroll; as label-and-value rows they read in one pass.
+    fn render_glance(stats: &BoardStats, theme: &Theme) -> AnyElement {
+        let landing = stats.landing;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if landing.total() > 0 {
+            rows.push(Self::line(
+                theme,
+                "Merged",
+                format!("{} of {}", landing.merged, landing.total()),
+            ));
+            if landing.open > 0 {
+                rows.push(Self::line(theme, "In review", format!("{}", landing.open)));
+            }
+            if landing.closed_unmerged > 0 {
+                rows.push(Self::line(
+                    theme,
+                    "Closed unmerged",
+                    format!("{}", landing.closed_unmerged),
+                ));
+            }
+            if landing.no_pr > 0 {
+                rows.push(Self::line(theme, "No pull request", format!("{}", landing.no_pr)));
+            }
+        }
+        if let Some(coverage) = percent(stats.token_coverage) {
+            rows.push(Self::line(
+                theme,
+                "Reported tokens",
+                format!("{coverage} of attempts"),
+            ));
+        }
+        rows.push(Self::line(
+            theme,
+            "Agent time",
+            human_minutes(stats.total_minutes),
+        ));
+        if let Some(p90) = stats.p90_minutes {
+            rows.push(Self::line(theme, "Nine in ten within", human_minutes(p90)));
+        }
+        // Friction earns a line when there is any, and one honest line when
+        // there is none — four zeroes would be four things to read that all
+        // say nothing happened.
+        let friction = stats.friction;
+        if friction.is_clean() {
+            rows.push(Self::line(theme, "Friction", "none"));
+        } else {
+            if friction.retried_tasks > 0 {
+                rows.push(Self::line(theme, "Retried", format!("{}", friction.retried_tasks)));
+            }
+            if friction.blocked_entries > 0 {
+                rows.push(Self::line(theme, "Stopped to ask", format!("{}", friction.blocked_entries)));
+            }
+            if friction.early_settles > 0 {
+                rows.push(Self::line(theme, "Closed while working", format!("{}", friction.early_settles)));
+            }
+            if friction.overruns > 0 {
+                rows.push(Self::line(theme, "Past their cap", format!("{}", friction.overruns)));
+            }
+        }
+        rows.push(Self::line(
+            theme,
+            "Released",
+            if stats.agent_dispatched == stats.attempts {
+                "all by agents".to_string()
+            } else if stats.agent_dispatched == 0 {
+                "all by you".to_string()
+            } else {
+                format!("{} by agents", stats.agent_dispatched)
+            },
+        ));
+        Self::card(theme, "At a glance", None, Self::lines(theme, rows))
+    }
+}
+
+
+/// The page's own column, wider than [`widgets::page_column`]'s 768px.
+///
+/// That width is the settings *form* rhythm — right for Devices and Accounts,
+/// wrong here: a dashboard read as a 768px ribbon in a 1400px window is the
+/// whole of "hard to get an overview without scrolling" (operator, 2026-08-08).
+/// Still capped, because a chart stretched across an ultrawide is not a better
+/// chart.
+fn dashboard_column() -> gpui::Div {
+    div()
+        .w_full()
+        .max_w(px(1160.0))
+        .mx_auto()
+        .px(px(24.0))
+        .pt(px(32.0))
+        .pb(px(64.0))
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+}
+
+/// Two panels side by side, weighted, that stack when the window is too narrow
+/// to hold them — gpui has no media queries, so `flex_wrap` plus a min width
+/// per panel is the responsive rule.
+fn split_row(left: AnyElement, left_grow: f32, right: AnyElement, right_grow: f32) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex_grow(left_grow)
+                .min_w(px(320.0))
+                .flex_basis(px(0.0))
+                .child(left),
+        )
+        .child(
+            div()
+                .flex_grow(right_grow)
+                .min_w(px(320.0))
+                .flex_basis(px(0.0))
+                .child(right),
+        )
+        .into_any_element()
 }
 
 /// The scroll container every settings page wraps its column in — and the one
@@ -794,7 +1035,7 @@ impl Render for StatsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let host = self.host_label(cx);
-        let mut column = widgets::page_column().child(
+        let mut column = dashboard_column().child(
             div()
                 .flex()
                 .flex_row()
@@ -846,45 +1087,20 @@ impl Render for StatsPage {
             ));
         }
 
-        // ── the headline ────────────────────────────────────────────────────
-        // Completion has no number until something has ended, and "—" is the
-        // honest glyph for that: a 0% on a board whose first agent is still
-        // running would be a lie about the board rather than about the work.
-        let completion = percent(stats.completion_rate).unwrap_or_else(|| "—".into());
-        let median = stats
-            .median_minutes
-            .map(human_minutes)
-            .unwrap_or_else(|| "—".into());
-        column = column.child(
-            div()
-                .mt(px(20.0))
-                .flex()
-                .flex_row()
-                .gap(px(10.0))
-                .child(Self::tile(
-                    &theme,
-                    format!("{}", stats.attempts),
-                    "dispatches",
-                ))
-                .child(Self::tile(
-                    &theme,
-                    format!("{}", stats.tasks_touched),
-                    "tasks touched",
-                ))
-                .child(Self::tile(&theme, completion, "ended in done"))
-                .child(Self::tile(&theme, median, "median run"))
-                .child(Self::tile(&theme, format!("{}", stats.live), "running now")),
-        );
-
-        // ── when ────────────────────────────────────────────────────────────
-        column = column.child(Self::card(
-            &theme,
-            "Dispatches",
-            Some("solid = ended in done".into()),
-            self.render_chart(&stats, &theme),
+        // ── row 1: the answer, and the shape of it ──────────────────────────
+        column = column.child(split_row(
+            Self::render_answer(&stats, &theme),
+            2.0,
+            Self::card(
+                &theme,
+                "Dispatches per day",
+                Some("solid = ended in done".into()),
+                self.render_chart(&stats, &theme),
+            ),
+            3.0,
         ));
 
-        // ── what it spent (gh#151) ──────────────────────────────────────────
+        // ── row 2: what it spent (gh#151) ───────────────────────────────────
         // Counts only. What a token costs depends on a seat, a plan and a
         // price table none of which the board knows, and a number that looks
         // like money is read as money.
@@ -910,13 +1126,11 @@ impl Render for StatsPage {
             ));
         } else {
             let tokens: TokenUsage = stats.tokens;
-            // The headline, then the split of it. `processed` first because it
-            // is the number somebody opened the page for; the rest explains it.
             column = column.child(
                 div()
-                    .mt(px(4.0))
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .gap(px(10.0))
                     .child(Self::tile(
                         &theme,
@@ -945,176 +1159,91 @@ impl Render for StatsPage {
                     )),
             );
 
-            if !stats.tokens_by_runtime.is_empty() {
-                column = column.child(Self::card(
-                    &theme,
-                    "By provider",
-                    coverage.clone(),
-                    Self::render_token_tally(
-                        &theme,
-                        ranked_tokens(&stats.tokens_by_runtime, TALLY_ROWS),
-                    ),
-                ));
-            }
-
-            column = column.child(Self::card(
-                &theme,
-                "Tokens per day",
-                Some("tokens processed".into()),
-                Self::render_token_chart(&stats, &theme),
-            ));
-
-            if !stats.tokens_by_model.is_empty() {
-                column = column.child(Self::card(
+            // ── row 3: the breakdown, beside the facts that qualify it ──────
+            column = column.child(split_row(
+                Self::card(
                     &theme,
                     "By model",
-                    coverage,
+                    coverage.clone(),
                     Self::render_token_table(
                         &theme,
                         ranked_tokens(&stats.tokens_by_model, TALLY_ROWS),
                     ),
-                ));
-            }
+                ),
+                3.0,
+                Self::render_glance(&stats, &theme),
+                2.0,
+            ));
+
+            column = column.child(split_row(
+                Self::card(
+                    &theme,
+                    "Tokens per day",
+                    Some("tokens processed".into()),
+                    Self::render_token_chart(&stats, &theme),
+                ),
+                3.0,
+                Self::card(
+                    &theme,
+                    "By provider",
+                    coverage,
+                    Self::render_token_tally(
+                        &theme,
+                        ranked_tokens(&stats.tokens_by_runtime, TALLY_ROWS),
+                    ),
+                ),
+                2.0,
+            ));
         }
 
-        // ── where it landed ─────────────────────────────────────────────────
-        // The question a completion rate only half-answers: an attempt can end
-        // `done` and leave a pull request nobody merged.
-        let landing = stats.landing;
-        if landing.total() > 0 {
+        // With no tokens to break down, the glance panel still has to land —
+        // it carries where the work went, which is not a token fact.
+        if !stats.has_tokens() {
+            column = column.child(split_row(
+                Self::render_glance(&stats, &theme),
+                2.0,
+                Self::card(
+                    &theme,
+                    "When you release work",
+                    Some("local time".into()),
+                    Self::render_hours(&stats, &theme),
+                ),
+                3.0,
+            ));
+        } else {
             column = column.child(Self::card(
                 &theme,
-                "Where the work landed",
-                Some(format!("{} task(s)", landing.total())),
-                Self::lines(
-                    &theme,
-                    vec![
-                        Self::line(&theme, "Merged", format!("{}", landing.merged)),
-                        Self::line(
-                            &theme,
-                            "Pull request still open",
-                            format!("{}", landing.open),
-                        ),
-                        Self::line(
-                            &theme,
-                            "Closed without merging",
-                            format!("{}", landing.closed_unmerged),
-                        ),
-                        Self::line(&theme, "No pull request", format!("{}", landing.no_pr)),
-                    ],
-                ),
+                "When you release work",
+                Some("local time".into()),
+                Self::render_hours(&stats, &theme),
             ));
         }
 
-        // ── how long ────────────────────────────────────────────────────────
-        let mut duration_rows = vec![Self::line(
-            &theme,
-            "Agent time in this window",
-            human_minutes(stats.total_minutes),
-        )];
-        if let Some(p90) = stats.p90_minutes {
-            duration_rows.push(Self::line(
-                &theme,
-                "Nine in ten finished within",
-                human_minutes(p90),
-            ));
-        }
-        if let Some(longest) = stats.longest_minutes {
-            duration_rows.push(Self::line(&theme, "Longest", human_minutes(longest)));
-        }
-        column = column.child(Self::card(
-            &theme,
-            "How long they take",
-            stats
-                .median_minutes
-                .map(|m| format!("{} median", human_minutes(m))),
-            Self::lines(&theme, duration_rows),
-        ));
-
-        // ── friction ────────────────────────────────────────────────────────
-        let friction = stats.friction;
-        let friction_body = if friction.is_clean() {
-            div()
-                .px(px(20.0))
-                .py(px(14.0))
-                .text_size(px(12.5))
-                .text_color(theme.text_faint)
-                .child(SharedString::from(
-                    "Nothing was retried, reopened, blocked or capped.",
-                ))
-                .into_any_element()
-        } else {
-            Self::lines(
-                &theme,
-                vec![
-                    Self::line(
-                        &theme,
-                        "Tasks that needed more than one go",
-                        format!("{}", friction.retried_tasks),
-                    ),
-                    Self::line(
-                        &theme,
-                        "Times an agent stopped to ask, or died",
-                        format!("{}", friction.blocked_entries),
-                    ),
-                    Self::line(
-                        &theme,
-                        "Closed while still working (the board's own misjudgement)",
-                        format!("{}", friction.early_settles),
-                    ),
-                    Self::line(
-                        &theme,
-                        "Ran past their route's cap",
-                        format!("{}", friction.overruns),
-                    ),
-                ],
-            )
-        };
-        column = column.child(Self::card(&theme, "Friction", None, friction_body));
-
-        // ── when in the day ─────────────────────────────────────────────────
-        column = column.child(Self::card(
-            &theme,
-            "When you release work",
-            Some("local time".into()),
-            Self::render_hours(&stats, &theme),
-        ));
-
-        // ── who and what ────────────────────────────────────────────────────
-        for (title, tally) in [
+        // ── the tallies, two up ─────────────────────────────────────────────
+        let tallies: Vec<AnyElement> = [
             ("By space", &stats.by_workspace),
             ("By runtime", &stats.by_runtime),
             ("By tracker", &stats.by_source),
             ("Whose subscription", &stats.by_account),
-        ] {
-            if tally.is_empty() {
-                continue;
-            }
-            column = column.child(Self::card(
+        ]
+        .into_iter()
+        .filter(|(_, tally)| !tally.is_empty())
+        .map(|(title, tally)| {
+            Self::card(
                 &theme,
                 title,
                 None,
                 Self::render_tally(&theme, ranked_top(tally, TALLY_ROWS)),
-            ));
+            )
+        })
+        .collect();
+        let mut pairs = tallies.into_iter();
+        while let Some(left) = pairs.next() {
+            match pairs.next() {
+                Some(right) => column = column.child(split_row(left, 1.0, right, 1.0)),
+                None => column = column.child(left),
+            }
         }
-
-        // The number that says whether the herd is releasing its own work.
-        column = column.child(Self::card(
-            &theme,
-            "Released by",
-            None,
-            Self::lines(
-                &theme,
-                vec![
-                    Self::line(&theme, "An agent", format!("{}", stats.agent_dispatched)),
-                    Self::line(
-                        &theme,
-                        "You",
-                        format!("{}", stats.attempts.saturating_sub(stats.agent_dispatched)),
-                    ),
-                ],
-            ),
-        ));
 
         scroll_page(column)
     }
