@@ -97,14 +97,18 @@ pub fn push_env(exe: &Path, repo: &str) -> Vec<(String, String)> {
 /// started with a data dir of its own. Both are paths, not secrets, and the
 /// resolved pair is passed rather than the data dir so the helper cannot
 /// re-derive them differently than the engine did.
+///
+/// This pair is also why no other resolution may read them (gh#190): every
+/// process a dispatched agent starts inherits it, including `cargo test`.
+/// [`Paths::discover`] is the one reader, and a helper is what it is for.
 pub fn agent_env(exe: &Path, repo: &str, paths: &Paths) -> Vec<(String, String)> {
     let mut env = push_env(exe, repo);
     env.push((
-        "COMET_BOARD_CONFIG_DIR".into(),
+        crate::config::CONFIG_DIR_ENV.into(),
         paths.config_dir.display().to_string(),
     ));
     env.push((
-        "COMET_BOARD_STATE_DIR".into(),
+        crate::config::STATE_DIR_ENV.into(),
         paths.state_dir.display().to_string(),
     ));
     env

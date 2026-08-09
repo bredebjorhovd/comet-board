@@ -8,34 +8,61 @@ use std::path::{Path, PathBuf};
 use crate::runtime::{RUNTIME_NAMES, harness_for_runtime};
 
 /// Where the board keeps things: under comet's own data dir, beside the
-/// engine's stores. Env overrides exist so tests and a by-hand `doctor` run
-/// work against a scratch directory.
+/// engine's stores.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
 }
 
+/// The two variables that name a board from outside — see [`Paths::discover`].
+///
+/// Named once so the guard test (`crates/board/tests/env_isolation.rs`) and the
+/// dispatched-agent environment ([`crate::git_credentials::agent_env`]) cannot
+/// spell them differently than the resolution does.
+pub const CONFIG_DIR_ENV: &str = "COMET_BOARD_CONFIG_DIR";
+pub const STATE_DIR_ENV: &str = "COMET_BOARD_STATE_DIR";
+
 impl Paths {
+    /// The board this *process* was pointed at, for a `comet-board` that was
+    /// handed no data dir — the CLI, and above all the `git-askpass` /
+    /// `credential` helpers git spawns with none of their parent's arguments.
+    ///
+    /// The only resolution that reads [`CONFIG_DIR_ENV`] / [`STATE_DIR_ENV`],
+    /// and the only one that may (gh#190). Those variables exist for exactly
+    /// this: the engine exports its *already-resolved* pair into every
+    /// dispatched agent's environment ([`crate::git_credentials::agent_env`]) so
+    /// a `comet-board` started down there attaches to the board that dispatched
+    /// it instead of re-deriving a different one. They are an answer to "which
+    /// board is this shell's", never an instruction to relocate a board — so
+    /// nothing that already knows its data dir consults them, and no library
+    /// call can inherit them from whatever shell it happens to be running in.
     pub fn discover() -> Result<Paths> {
-        Self::under(&data_dir())
+        let base = data_dir().join("board");
+        let config_dir = env_dir(CONFIG_DIR_ENV).unwrap_or_else(|| base.clone());
+        let state_dir = env_dir(STATE_DIR_ENV).unwrap_or_else(|| base.join("state"));
+        Self::at(config_dir, state_dir)
     }
 
     /// The board directories under an already-resolved engine data dir — the
     /// engine's board service passes its own `EngineConfig::data_dir` here so
-    /// config precedence cannot diverge between the two. The
-    /// `COMET_BOARD_CONFIG_DIR` / `COMET_BOARD_STATE_DIR` overrides still win,
-    /// so tests and a by-hand `doctor` run keep working against scratch dirs.
+    /// config precedence cannot diverge between the two.
+    ///
+    /// Deliberately pure: the caller's directory is the answer, and no
+    /// environment variable may overrule it (gh#190). It used to honour
+    /// [`CONFIG_DIR_ENV`] / [`STATE_DIR_ENV`], which is how a *test* handed a
+    /// tempdir — and a dev engine started under `COMET_DATA_DIR=/some/scratch`
+    /// — opened the box's live `board.db` and logged into its `syncd.log`
+    /// instead: both run inside a dispatched agent, whose environment carries
+    /// that pair by design. An operator relocating a whole install moves
+    /// `COMET_DATA_DIR`, which this follows.
     pub fn under(data_dir: &Path) -> Result<Paths> {
         let base = data_dir.join("board");
-        let config_dir = match std::env::var("COMET_BOARD_CONFIG_DIR") {
-            Ok(v) if !v.is_empty() => PathBuf::from(v),
-            _ => base.clone(),
-        };
-        let state_dir = match std::env::var("COMET_BOARD_STATE_DIR") {
-            Ok(v) if !v.is_empty() => PathBuf::from(v),
-            _ => base.join("state"),
-        };
+        let state = base.join("state");
+        Self::at(base, state)
+    }
+
+    fn at(config_dir: PathBuf, state_dir: PathBuf) -> Result<Paths> {
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("creating config dir {}", config_dir.display()))?;
         std::fs::create_dir_all(&state_dir)
@@ -61,6 +88,13 @@ impl Paths {
     pub fn logfile(&self) -> PathBuf {
         self.state_dir.join("syncd.log")
     }
+}
+
+/// One directory-naming variable, or `None` when it is unset or empty.
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The engine's data dir — `$COMET_DATA_DIR`, else `~/.comet-native`.

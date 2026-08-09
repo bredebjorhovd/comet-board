@@ -242,22 +242,17 @@ impl Harness for InstantHarness {
     }
 }
 
-/// A board's paths under a scratch dir, built by hand.
+/// A board's paths under a scratch dir.
 ///
-/// NOT `Paths::under`: that honours `COMET_BOARD_CONFIG_DIR` /
-/// `COMET_BOARD_STATE_DIR`, so under an environment that sets them — which is
-/// exactly the environment an agent dispatched *by a board* runs in — these
-/// tests seeded their fixture tasks into the live board's database and wrote
-/// their two-line fixture over its `routing.toml`. The same reasoning as
-/// `push_credentials.rs`'s `paths_in`: a test's board is a directory it made,
-/// never the device's.
+/// `Paths::under` used to honour the board's two directory variables, so under
+/// an environment that sets them — which is exactly the environment an agent
+/// dispatched *by a board* runs in — these tests seeded their fixture tasks into
+/// the live board's database and wrote their two-line fixture over its
+/// `routing.toml`. It is pure since gh#190: a test's board is a directory it
+/// made, never the device's, and that is now the constructor's guarantee rather
+/// than each caller's discipline.
 fn board_paths(dir: &std::path::Path) -> comet_board::config::Paths {
-    let paths = comet_board::config::Paths {
-        config_dir: dir.to_path_buf(),
-        state_dir: dir.join("state"),
-    };
-    std::fs::create_dir_all(&paths.state_dir).expect("board state dir");
-    paths
+    comet_board::config::Paths::under(dir).expect("board dirs")
 }
 
 fn registry() -> Arc<HarnessRegistry> {
@@ -584,11 +579,8 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     // Engine B is the box: it hosts the board service. Seed a task into its
     // store first, so a forwarded frame is provably B's board and not an empty
     // one A could have produced by itself.
-    // Built by hand rather than with `Paths::under`, which honours
-    // `COMET_BOARD_CONFIG_DIR` / `COMET_BOARD_STATE_DIR`. Those are set in the
-    // environment of every board-dispatched agent, so under one this test took
-    // its tempdir, ignored it, and ran against the *box's live* board — reading
-    // its rows and writing its hand-edited `routing.toml`.
+    // Through `board_paths`, whose comment says why the derivation had to stop
+    // reading the environment (gh#162, gh#190).
     let board_dir = dirs.path().join("board-b");
     let paths = board_paths(&board_dir);
     {
