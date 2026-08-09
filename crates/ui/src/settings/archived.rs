@@ -141,7 +141,7 @@ impl Render for ArchivedPage {
                             .child(
                                 crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
                                     .size(px(16.0))
-                                    .text_color(theme.text_muted.opacity(0.6)),
+                                    .text_color(theme.text_subtle),
                             ),
                     )
                     .child(
@@ -169,14 +169,14 @@ impl Render for ArchivedPage {
                                         div()
                                             .flex_none()
                                             .text_size(px(11.0))
-                                            .text_color(theme.text_muted.opacity(0.5))
+                                            .text_color(theme.text_subtle)
                                             .child(time_ago),
                                     ),
                             )
                             .child({
                                 // device · location, separator at the line's
-                                // own tone (comet: a plain span inheriting
-                                // `text-muted-foreground/55`).
+                                // own tone (comet: a plain span inheriting the
+                                // metadata tone).
                                 let mut meta = div()
                                     .mt(px(2.0))
                                     .flex()
@@ -184,7 +184,7 @@ impl Render for ArchivedPage {
                                     .items_center()
                                     .gap(px(6.0))
                                     .text_size(px(11.0))
-                                    .text_color(theme.text_muted.opacity(0.55));
+                                    .text_color(theme.text_subtle);
                                 let both = device.is_some() && location.is_some();
                                 if let Some(device) = device {
                                     meta = meta.child(device);
@@ -250,25 +250,26 @@ impl Render for ArchivedPage {
                 .flex_col()
                 .items_center()
                 .text_center()
-                .text_color(theme.text_muted.opacity(0.5))
+                // The sub-line inherits; the headline steps up one tone.
+                .text_color(theme.text_subtle)
                 .child(
-                    // `opacity-40` on top of the inherited muted/50 — an
-                    // effectively ~20% glyph (comet settings.archived.tsx).
+                    // Ornament, not text: a dim wash of the archive glyph
+                    // behind the copy (comet settings.archived.tsx).
                     crate::icons::icon(crate::icons::ARCHIVE_MINIMALISTIC)
                         .size(px(28.0))
-                        .text_color(theme.text_muted.opacity(0.2)),
+                        .text_color(theme.white_alpha(0.14)),
                 )
                 .child(
                     div()
                         .mt(px(12.0))
                         .text_size(px(14.0))
+                        .text_color(theme.text_muted)
                         .child(SharedString::from("Nothing archived")),
                 )
                 .child(
                     div()
                         .mt(px(4.0))
                         .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.4))
                         .child(SharedString::from(
                             "Right-click a session in the sidebar to archive it.",
                         )),

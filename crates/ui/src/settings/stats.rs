@@ -235,7 +235,7 @@ impl StatsPage {
             .child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(theme.text_muted.opacity(0.75))
+                    .text_color(theme.text_subtle)
                     .truncate()
                     .child(SharedString::from(label.to_string())),
             )
@@ -254,7 +254,7 @@ impl StatsPage {
                 .px(px(20.0))
                 .py(px(18.0))
                 .text_size(px(12.5))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("Nothing was dispatched in this window."))
                 .into_any_element();
         }
@@ -327,7 +327,7 @@ impl StatsPage {
                     .items_center()
                     .justify_between()
                     .text_size(px(10.5))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(first))
                     .child(SharedString::from(format!("peak {peak}/day")))
                     .child(SharedString::from(last)),
@@ -349,7 +349,7 @@ impl StatsPage {
                 .px(px(20.0))
                 .py(px(18.0))
                 .text_size(px(12.5))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(
                     "No day in this window has usage to show.",
                 ))
@@ -417,7 +417,7 @@ impl StatsPage {
                     .items_center()
                     .justify_between()
                     .text_size(px(10.5))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(first))
                     .child(SharedString::from(format!(
                         "peak {}/day",
@@ -504,7 +504,7 @@ impl StatsPage {
                 .when(!lead, |el| el.w(px(72.0)).flex_none().text_right())
                 .text_size(px(12.0));
             if head {
-                base.text_color(theme.text_faint)
+                base.text_color(theme.text_subtle)
                     .child(SharedString::from(text))
             } else {
                 base.text_color(theme.text_muted)
@@ -689,7 +689,7 @@ impl StatsPage {
                     )
                     // Every third hour is labelled: 24 numbers at this width
                     // is a smear, and the reader is looking for a shape.
-                    .child(div().text_size(px(9.0)).text_color(theme.text_faint).child(
+                    .child(div().text_size(px(9.0)).text_color(theme.text_subtle).child(
                         SharedString::from(if hour % 3 == 0 {
                             format!("{hour:02}")
                         } else {
@@ -774,7 +774,7 @@ impl StatsPage {
                         el.child(
                             div()
                                 .text_size(px(11.5))
-                                .text_color(theme.text_faint)
+                                .text_color(theme.text_subtle)
                                 .child(SharedString::from(aside)),
                         )
                     }),
@@ -1069,7 +1069,7 @@ impl Render for StatsPage {
                 div()
                     .mt(px(24.0))
                     .text_size(px(13.0))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(note)),
             ));
         };
@@ -1079,7 +1079,7 @@ impl Render for StatsPage {
                 div()
                     .mt(px(24.0))
                     .text_size(px(13.0))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(format!(
                         "No dispatches in the {}. Release a task and this fills in.",
                         stats.window_label()
@@ -1116,7 +1116,7 @@ impl Render for StatsPage {
                     .px(px(20.0))
                     .py(px(18.0))
                     .text_size(px(12.5))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(
                         "No attempt in this window reported token usage. \
                          Attempts from before the board recorded it stay blank \

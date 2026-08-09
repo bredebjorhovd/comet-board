@@ -585,7 +585,7 @@ impl Shell {
                 div()
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from("Spaces")),
             )
             .child(
@@ -607,7 +607,7 @@ impl Shell {
                     .child(
                         icon(icons::PLUS)
                             .size(px(14.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
+                            .text_color(theme.text_subtle),
                     ),
             );
 
@@ -824,7 +824,7 @@ impl Shell {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_color(theme.text_muted.opacity(0.5))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(format!("@ {name}"))),
             )
             // Three-state (gh#126), said ONCE per group: amber "offline" only
@@ -834,7 +834,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_color(theme.warning.opacity(0.8))
+                        .text_color(theme.warning_text())
                         .child(SharedString::from("· offline")),
                 )
             })
@@ -842,7 +842,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_color(theme.text_muted.opacity(0.5))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from("· sync down")),
                 )
             })
@@ -955,7 +955,7 @@ impl Shell {
         let rest_text = if selected {
             theme.text
         } else {
-            theme.text.opacity(0.8)
+            theme.text_muted
         };
         let select_id = id.clone();
         let menu_id = id.clone();
@@ -1044,7 +1044,7 @@ impl Shell {
                         .truncate()
                         .text_size(px(11.0))
                         .line_height(px(17.0))
-                        .text_color(theme.text_muted.opacity(0.75))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(format!("· {tail}"))),
                 )
             })
@@ -1058,7 +1058,7 @@ impl Shell {
                         .text_size(px(11.0))
                         .line_height(px(17.0))
                         .font_weight(gpui::FontWeight::NORMAL)
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(label)),
                 )
             })
@@ -1093,7 +1093,7 @@ impl Shell {
                             icons::ALT_ARROW_RIGHT
                         })
                         .size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.7)),
+                        .text_color(theme.text_subtle),
                     ),
             )
     }
@@ -1151,7 +1151,7 @@ impl Shell {
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
                 .text_size(px(12.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(note))
                 .into_any_element()
         } else {
@@ -1203,7 +1203,7 @@ impl Shell {
             .map(str::trim)
             .filter(|b| !b.is_empty())
             .map(|b| SharedString::from(b.to_string()));
-        let subline = theme.text_muted.opacity(0.5);
+        let subline = theme.text_subtle;
         let status_rail: AnyElement = if status == ChatIndicator::Working {
             div()
                 .w(px(6.0))
@@ -1233,7 +1233,7 @@ impl Shell {
         let rest_text = if selected {
             theme.text
         } else {
-            theme.text.opacity(0.8)
+            theme.text_muted
         };
         let select_id = id.clone();
         let menu_id = id.clone();
@@ -1315,7 +1315,7 @@ impl Shell {
                                 icon(path)
                                     .size(px(11.0))
                                     .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                                    .text_color(tint.unwrap_or(subline)),
                             )
                         },
                     )
@@ -1366,7 +1366,7 @@ impl Shell {
                 div()
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(needs_view::NEEDS_YOU_TITLE)),
             )
             // The count is the header's whole answer: how many things want me.
@@ -1402,7 +1402,7 @@ impl Shell {
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(needs_view::ALL_CLEAR)),
                 )
                 .into_any_element()
@@ -1445,7 +1445,7 @@ impl Shell {
             NeedKind::DeadRun => theme.danger,
             NeedKind::Report => status_dot_color(ChatIndicator::Completed, theme),
         };
-        let subline = theme.text_muted.opacity(0.6);
+        let subline = theme.text_subtle;
         let fade_key = format!("need-row-{}", need.chat_id);
         let rest_bg = if selected {
             theme.glass_selected_bg()
@@ -1455,7 +1455,7 @@ impl Shell {
         let rest_text = if selected {
             theme.text
         } else {
-            theme.text.opacity(0.8)
+            theme.text_muted
         };
         let chat_id = need.chat_id.clone();
 
@@ -1532,7 +1532,7 @@ impl Shell {
         let slot = self.state.read(cx).orchestrator_slot(now)?;
         let selected = self.state.read(cx).selected_chat.as_deref() == Some(slot.chat_id.as_str());
 
-        let subline = theme.text_muted.opacity(0.6);
+        let subline = theme.text_subtle;
         let fade_key = format!("orch-slot-{}", slot.chat_id);
         let rest_bg = if selected {
             theme.glass_selected_bg()
@@ -1542,7 +1542,7 @@ impl Shell {
         let rest_text = if selected {
             theme.text
         } else {
-            theme.text.opacity(0.8)
+            theme.text_muted
         };
         let chat_id = slot.chat_id.clone();
         let menu_id = slot.chat_id.clone();
@@ -1604,7 +1604,7 @@ impl Shell {
             .unwrap_or_else(|| needs_view::NO_REPORTS.to_string());
         // The latest report is the payload: brighter while unread.
         let preview_color = if slot.unseen {
-            theme.text.opacity(0.7)
+            theme.text_muted
         } else {
             subline
         };
@@ -1752,7 +1752,7 @@ impl Shell {
                 div()
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from("Active")),
             )
             // The count is what you look for first: three running, one of them
@@ -1823,7 +1823,7 @@ impl Shell {
             row.state,
             accent,
         );
-        let subline = theme.text_muted.opacity(0.6);
+        let subline = theme.text_subtle;
         let fade_key = format!("running-row-{}", row.chat_id);
         let rest_bg = if selected {
             theme.glass_selected_bg()
@@ -1833,7 +1833,7 @@ impl Shell {
         let rest_text = if selected {
             theme.text
         } else {
-            theme.text.opacity(0.8)
+            theme.text_muted
         };
         let chat_id = row.chat_id.clone();
 
@@ -1875,7 +1875,7 @@ impl Shell {
                     div()
                         .flex_none()
                         .text_size(px(11.0))
-                        .text_color(accent.opacity(0.9))
+                        .text_color(accent)
                         .child(SharedString::from(row.state.label())),
                 )
             })
@@ -1909,14 +1909,14 @@ impl Shell {
         );
 
         let (hover, text) = (theme.element_hover, theme.text);
-        let subline = theme.text_muted.opacity(0.6);
+        let subline = theme.text_subtle;
         let fade_key = format!("agent-row-{}", agent.chat_id);
         let rest_bg = if selected {
             theme.glass_selected_bg()
         } else {
             theme.wash(0.0)
         };
-        let rest_text = if selected { text } else { text.opacity(0.8) };
+        let rest_text = if selected { text } else { theme.text_muted };
         let chat_id = agent.chat_id.clone();
         // Past the cap the counter IS the warning: gh#70's clock will interrupt
         // this agent, and the number is the reason.
@@ -2011,7 +2011,7 @@ impl Shell {
                             div()
                                 .text_size(px(11.0))
                                 .line_height(px(14.0))
-                                .text_color(accent.opacity(0.9))
+                                .text_color(accent)
                                 .child(SharedString::from(agent.state.label())),
                         )
                     }),
@@ -2778,7 +2778,7 @@ impl Shell {
                 .bg(theme.white_alpha(0.05))
                 .text_size(px(11.0))
                 .font_family(theme.font_mono.clone())
-                .text_color(theme.text_muted.opacity(0.7))
+                .text_color(theme.text_subtle)
         };
 
         // ── search bar (the ⌘K bar): summon chip · input · primary chip · esc.
@@ -2843,7 +2843,7 @@ impl Shell {
                         icons::COMMAND
                     })
                     .size(px(11.0))
-                    .text_color(theme.bg.opacity(0.8)),
+                    .text_color(theme.bg),
                 )
             })
             .child(primary_label.clone());
@@ -2868,7 +2868,7 @@ impl Shell {
                     .child(
                         icon(icons::COMMAND)
                             .size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
+                            .text_color(theme.text_subtle),
                     )
                     .child(SharedString::from("K")),
             )
@@ -3044,7 +3044,7 @@ impl Shell {
                     .px(px(14.0))
                     .py(px(16.0))
                     .text_size(px(12.5))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(if !query_empty {
                         "No repos match"
                     } else if lost_a_host {
@@ -3138,7 +3138,7 @@ impl Shell {
                     .mt(px(10.0))
                     .text_size(px(11.5))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.55))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(note))
                     .into_any_element()
             });
@@ -3180,7 +3180,7 @@ impl Shell {
                         .size(px(13.0))
                         .flex_none()
                         .mt(px(1.0))
-                        .text_color(theme.warning.opacity(0.9)),
+                        .text_color(theme.warning),
                 )
                 .child(
                     div()
@@ -3193,7 +3193,7 @@ impl Shell {
                             div()
                                 .text_size(px(12.0))
                                 .line_height(px(16.0))
-                                .text_color(theme.text.opacity(0.9))
+                                .text_color(theme.text)
                                 .child(SharedString::from(headline)),
                         )
                         .when(!detail.is_empty(), |el| {
@@ -3202,7 +3202,7 @@ impl Shell {
                                     .truncate()
                                     .text_size(px(11.0))
                                     .line_height(px(15.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(detail)),
                             )
                         })
@@ -3213,7 +3213,7 @@ impl Shell {
                                 div()
                                     .text_size(px(11.0))
                                     .line_height(px(15.0))
-                                    .text_color(theme.text_muted.opacity(0.55))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(note)),
                             )
                         }),
@@ -3289,19 +3289,19 @@ impl Shell {
                     } else if row.slug.is_some() {
                         icon(icons::GITHUB_MARK)
                             .size(px(14.0))
-                            .text_color(theme.text_muted.opacity(if connected {
-                                0.85
+                            // An unconnected repo is a row that will make you
+                            // wait; it sits a tone quieter than the ones that
+                            // open instantly.
+                            .text_color(if connected {
+                                theme.text_muted
                             } else {
-                                // An unconnected repo is a row that will make you
-                                // wait; it sits a shade quieter than the ones
-                                // that open instantly.
-                                0.5
-                            }))
+                                theme.text_subtle
+                            })
                             .into_any_element()
                     } else {
                         icon(icons::FOLDER)
                             .size(px(15.0))
-                            .text_color(theme.text_muted.opacity(0.8))
+                            .text_color(theme.text_muted)
                             .into_any_element()
                     }),
             )
@@ -3311,7 +3311,7 @@ impl Shell {
                     div()
                         .flex_none()
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(note)),
                 )
             })
@@ -3321,9 +3321,9 @@ impl Shell {
                         .flex_none()
                         .text_size(px(11.5))
                         .text_color(if device_offline {
-                            theme.warning.opacity(0.8)
+                            theme.warning_text()
                         } else {
-                            theme.text_muted.opacity(0.6)
+                            theme.text_subtle
                         })
                         .child(SharedString::from(tag)),
                 )
@@ -3399,7 +3399,7 @@ impl Shell {
                     .gap(px(6.0))
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(if asking {
                         "Clone onto"
                     } else {
@@ -3430,7 +3430,7 @@ impl Shell {
                             .shadow(theme.glass_selected_shadows())
                             .text_color(theme.text)
                     })
-                    .when(!selected, |el| el.text_color(theme.text_muted.opacity(0.8)))
+                    .when(!selected, |el| el.text_color(theme.text_muted))
                     .when(asking, |el| {
                         el.cursor_pointer()
                             .hover(|s| s.bg(theme.element_hover))
@@ -3445,7 +3445,7 @@ impl Shell {
                         icon(icons::MONITOR)
                             .size(px(14.0))
                             .flex_none()
-                            .text_color(theme.text_muted.opacity(0.8)),
+                            .text_color(theme.text_muted),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .child(
@@ -3498,13 +3498,13 @@ impl Shell {
                     .gap(px(6.0))
                     .text_size(px(11.0))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.5))
+                    .text_color(theme.text_subtle)
                     .child(
                         icon(icons::INFO_CIRCLE)
                             .size(px(12.0))
                             .flex_none()
                             .mt(px(1.0))
-                            .text_color(theme.text_muted.opacity(0.5)),
+                            .text_color(theme.text_subtle),
                     )
                     .child(div().min_w_0().child(info)),
             );
@@ -3518,7 +3518,7 @@ impl Shell {
                     .pt(px(6.0))
                     .text_size(px(11.0))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.45))
+                    .text_color(theme.text_subtle)
                     .child(note),
             );
         }
@@ -3531,7 +3531,7 @@ impl Shell {
                     .pb(px(4.0))
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from("This device")),
             )
             // The second door. A scratch folder that is nobody's repo is a real
@@ -3547,7 +3547,7 @@ impl Shell {
                     .items_center()
                     .gap(px(8.0))
                     .text_size(px(12.5))
-                    .text_color(theme.text_muted.opacity(0.8))
+                    .text_color(theme.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.element_hover))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3557,7 +3557,7 @@ impl Shell {
                         icon(icons::FOLDER)
                             .size(px(14.0))
                             .flex_none()
-                            .text_color(theme.text_muted.opacity(0.8)),
+                            .text_color(theme.text_muted),
                     )
                     .child(
                         div()
@@ -3570,7 +3570,7 @@ impl Shell {
                         icon(icons::ARROW_RIGHT)
                             .size(px(12.0))
                             .flex_none()
-                            .text_color(theme.text_faint.opacity(0.7)),
+                            .text_color(theme.text_subtle),
                     ),
             )
     }
@@ -3616,7 +3616,7 @@ impl Shell {
             .id("add-space-crumb-repos")
             .px(px(3.0))
             .rounded(px(4.0))
-            .text_color(theme.text_muted.opacity(0.55))
+            .text_color(theme.text_subtle)
             .cursor_pointer()
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -3625,7 +3625,7 @@ impl Shell {
             .child(SharedString::from("Repos"));
         let separator = |theme: &Theme| {
             div()
-                .text_color(theme.text_faint.opacity(0.7))
+                .text_color(theme.text_faint)
                 .child(SharedString::from("/"))
         };
         let crumbs: AnyElement = match &listing {
@@ -3661,12 +3661,10 @@ impl Shell {
                         if at_home {
                             // Standing at home — the device crumb IS the
                             // current folder.
-                            crumb
-                                .text_color(theme.text.opacity(0.85))
-                                .into_any_element()
+                            crumb.text_color(theme.text).into_any_element()
                         } else {
                             crumb
-                                .text_color(theme.text_muted.opacity(0.55))
+                                .text_color(theme.text_subtle)
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme.text))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -3692,9 +3690,9 @@ impl Shell {
                                         .px(px(3.0))
                                         .rounded(px(4.0))
                                         .text_color(if is_last {
-                                            theme.text.opacity(0.85)
+                                            theme.text
                                         } else {
-                                            theme.text_muted.opacity(0.55)
+                                            theme.text_subtle
                                         })
                                         .child(SharedString::from(label));
                                     if is_last {
@@ -3768,7 +3766,7 @@ impl Shell {
                 .px(px(14.0))
                 .py(px(16.0))
                 .text_size(px(12.5))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(if query_empty {
                     "No folders here"
                 } else {
@@ -3816,7 +3814,7 @@ impl Shell {
                                 icon(icons::FOLDER)
                                     .size(px(15.0))
                                     .flex_none()
-                                    .text_color(theme.text_muted.opacity(0.8)),
+                                    .text_color(theme.text_muted),
                             )
                             .child(div().flex_1().min_w_0().truncate().child(name))
                             // Repos get a quiet trailing branch glyph — the row
@@ -3826,7 +3824,7 @@ impl Shell {
                                     icon(icons::GIT_BRANCH)
                                         .size(px(13.0))
                                         .flex_none()
-                                        .text_color(theme.text_muted.opacity(0.5)),
+                                        .text_color(theme.text_subtle),
                                 )
                             })
                         })),
@@ -3884,7 +3882,7 @@ impl Shell {
                     .pb(px(4.0))
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from("Devices")),
             )
             .children(devices.into_iter().enumerate().map(|(ix, dev)| {
@@ -3918,7 +3916,7 @@ impl Shell {
                             .text_color(theme.text)
                     })
                     .when(!is_active, |el| {
-                        el.text_color(theme.text_muted.opacity(0.7))
+                        el.text_color(theme.text_muted)
                             .hover(|s| s.bg(theme.element_hover))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3928,7 +3926,7 @@ impl Shell {
                         icon(platform_icon)
                             .size(px(14.0))
                             .flex_none()
-                            .text_color(theme.text_muted.opacity(0.8)),
+                            .text_color(theme.text_muted),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .child(
@@ -3961,13 +3959,13 @@ impl Shell {
                     .gap(px(6.0))
                     .text_size(px(11.0))
                     .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.5))
+                    .text_color(theme.text_subtle)
                     .child(
                         icon(icons::INFO_CIRCLE)
                             .size(px(12.0))
                             .flex_none()
                             .mt(px(1.0))
-                            .text_color(theme.text_muted.opacity(0.5)),
+                            .text_color(theme.text_subtle),
                     )
                     .child(div().min_w_0().child(SharedString::from(format!(
                         "Showing folders from {device_name} only"
@@ -3985,7 +3983,7 @@ impl Shell {
                     .items_center()
                     .gap(px(8.0))
                     .text_size(px(12.5))
-                    .text_color(theme.text_muted.opacity(0.8))
+                    .text_color(theme.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.element_hover))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3995,7 +3993,7 @@ impl Shell {
                         icon(icons::ARROW_LEFT)
                             .size(px(12.0))
                             .flex_none()
-                            .text_color(theme.text_faint.opacity(0.7)),
+                            .text_color(theme.text_subtle),
                     )
                     .child(
                         div()

@@ -473,7 +473,7 @@ impl Transcript {
                 // (message-rail.tsx: w-3 rest, w-5 hovered).
                 let bar_width = if is_hovered { 20.0 } else { 12.0 };
                 let bar_color = if is_active || is_hovered {
-                    theme.text.opacity(0.8)
+                    theme.white_alpha(0.8)
                 } else {
                     theme.white_alpha(0.16)
                 };
@@ -509,7 +509,7 @@ impl Transcript {
                             el.child(
                                 div()
                                     .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(format!("{bucket_len} prompts"))),
                             )
                         });

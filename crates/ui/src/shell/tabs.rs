@@ -251,14 +251,15 @@ impl Shell {
                 // Hover state lives in Shell (the trailing slot swaps dot ↔
                 // close), so the wash snaps off it too — gpui allows only one
                 // `on_hover` per element, and the state listener wins.
+                // Three tones, three states: the selected tab reads as a
+                // title, hover lifts to body, the rest sit at label weight.
                 let (text_color, bg) = if is_selected {
                     (theme.text, theme.glass_selected_bg())
                 } else if is_hovered {
-                    (theme.text_muted.opacity(0.8), theme.element_hover)
+                    (theme.text_muted, theme.element_hover)
                 } else {
-                    (theme.text_muted.opacity(0.6), theme.wash(0.0))
+                    (theme.text_subtle, theme.wash(0.0))
                 };
-                let glyph_alpha = if is_selected { 0.9 } else { 0.6 };
                 let brand = harness.map(crate::pickers::harness_brand_icon);
                 let select_id = id.clone();
                 let close_id = id.clone();
@@ -327,9 +328,7 @@ impl Shell {
                     .text_size(px(12.0))
                     .text_color(text_color)
                     .bg(bg)
-                    .when(is_selected, |el| {
-                        el.shadow(theme.glass_selected_shadows())
-                    })
+                    .when(is_selected, |el| el.shadow(theme.glass_selected_shadows()))
                     .cursor_pointer()
                     // Tabs sit inside the titlebar drag strip — carve them out.
                     // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
@@ -382,7 +381,7 @@ impl Shell {
                             icon(path)
                                 .size(px(14.0))
                                 .flex_none()
-                                .text_color(tint.unwrap_or(theme.text_muted).opacity(glyph_alpha)),
+                                .text_color(tint.unwrap_or(text_color)),
                         )
                     })
                     .child(div().flex_1().min_w_0().truncate().child(title))

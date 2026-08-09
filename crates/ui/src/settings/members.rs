@@ -342,7 +342,7 @@ impl MembersPage {
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(if muted {
-                theme.text_muted.opacity(0.7)
+                theme.text_subtle
             } else {
                 theme.text_muted
             })
@@ -406,7 +406,7 @@ impl MembersPage {
                     .child(
                         div()
                             .text_size(px(11.5))
-                            .text_color(theme.text_muted.opacity(0.65))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(
                                 "They get an email with a join link. Anyone in the workspace can \
                                  open its shared sessions and devices.",
@@ -437,7 +437,7 @@ impl MembersPage {
                 .py(px(24.0))
                 .text_center()
                 .text_size(px(13.0))
-                .text_color(theme.text_muted.opacity(0.6))
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("No pending invitations"))
                 .into_any_element(),
             Loadable::Ready(rows) => div()
@@ -554,7 +554,7 @@ impl Render for MembersPage {
                         .py(px(40.0))
                         .text_center()
                         .text_size(px(14.0))
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from("No members yet")),
                 )
                 .into_any_element(),
@@ -639,7 +639,7 @@ impl Render for MembersPage {
                                 .mt(px(24.0))
                                 .text_size(px(12.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text_muted.opacity(0.7))
+                                .text_color(theme.text)
                                 .child(SharedString::from("Pending invitations")),
                         )
                         .child(self.render_invites(cx))

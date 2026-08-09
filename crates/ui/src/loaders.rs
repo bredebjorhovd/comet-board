@@ -203,13 +203,13 @@ pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
     }
 }
 
-/// "L O A D I N G" — `text-[11px] uppercase tracking-[0.32em]
-/// text-muted-foreground/70`; tracking approximated with thin spaces (gpui has
-/// no letter-spacing at the pinned rev).
+/// "L O A D I N G" — `text-[11px] uppercase tracking-[0.32em]`; tracking
+/// approximated with thin spaces (gpui has no letter-spacing at the pinned
+/// rev).
 pub fn loading_word(theme: &Theme) -> impl IntoElement {
     div()
         .text_size(px(11.0))
-        .text_color(theme.text_muted.opacity(0.7))
+        .text_color(theme.text_subtle)
         .child(SharedString::from(
             "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",
         ))

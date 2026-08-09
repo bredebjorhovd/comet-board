@@ -364,7 +364,11 @@ impl AccountsPage {
                 icon(icons::SORT_VERTICAL)
                     .size(px(14.0))
                     .flex_none()
-                    .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
+                    .text_color(if open {
+                        theme.text_muted
+                    } else {
+                        theme.text_subtle
+                    }),
             );
 
         if open {
@@ -405,7 +409,7 @@ impl AccountsPage {
                                 div()
                                     .flex_none()
                                     .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from("You")),
                             )
                         })
@@ -708,7 +712,7 @@ impl AccountsPage {
             .items_center()
             .gap(px(8.0))
             .text_size(px(11.5))
-            .text_color(theme.text_muted.opacity(0.7))
+            .text_color(theme.text_subtle)
             .child(
                 div()
                     .w(px(48.0))
@@ -752,7 +756,6 @@ impl AccountsPage {
                     div()
                         .flex_none()
                         .truncate()
-                        .text_color(theme.text_muted.opacity(0.45))
                         .child(SharedString::from(reset)),
                 )
             })
@@ -899,7 +902,7 @@ impl AccountsPage {
                                     .mt(px(6.0))
                                     .truncate()
                                     .text_size(px(11.5))
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(if account.switchable {
                                         "Usage unavailable"
                                     } else {
@@ -938,18 +941,17 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let red_text = crate::theme::oklch(0.81, 0.108, 19.6).opacity(0.9); // red-300
+        let red_text = crate::theme::oklch(0.81, 0.108, 19.6); // red-300
         let login = self.login.as_ref()?;
         let title = login.title();
         let url_link = |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
             let open_url = url.to_string();
-            // "Reopen the …" text link (comet: `text-[12px]
-            // text-muted-foreground/60 hover:underline`).
+            // "Reopen the …" text link (comet: `text-[12px] hover:underline`).
             div()
                 .id(id)
                 .mt(px(6.0))
                 .text_size(px(12.0))
-                .text_color(theme.text_muted.opacity(0.6))
+                .text_color(theme.text_subtle)
                 .truncate()
                 .cursor_pointer()
                 .hover(|s| s.text_color(theme.text))
@@ -1061,7 +1063,7 @@ impl AccountsPage {
                                 .child(
                                     div()
                                         .text_size(px(12.5))
-                                        .text_color(theme.text_muted.opacity(0.7))
+                                        .text_color(theme.text_muted)
                                         .child(message.clone().unwrap_or_else(|| {
                                             SharedString::from("Waiting for the browser…")
                                         })),
@@ -1327,7 +1329,7 @@ impl Render for AccountsPage {
                                     .py(px(32.0))
                                     .text_center()
                                     .text_size(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(if supports_login(harness) {
                                         format!(
                                             "No {name} login detected on this device — sign in \
@@ -1360,7 +1362,7 @@ impl Render for AccountsPage {
                         } else if has_rows {
                             div()
                                 .text_size(px(11.5))
-                                .text_color(theme.text_muted.opacity(0.6))
+                                .text_color(theme.text_subtle)
                                 .child(SharedString::from("Signed in via opencode"))
                                 .into_any_element()
                         } else {
@@ -1455,14 +1457,13 @@ impl Render for AccountsPage {
                         )
                     })
                     .children(sections)
-                    // Footer note (comet: `mt-6 text-[12px] leading-relaxed
-                    // text-muted-foreground/60`).
+                    // Footer note (comet: `mt-6 text-[12px] leading-relaxed`).
                     .child(
                         div()
                             .mt(px(24.0))
                             .text_size(px(12.0))
                             .line_height(px(19.0))
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(
                                 "Switching rewrites the CLI\u{2019}s stored login, so new \
                                  agent sessions use the selected account immediately. On \

@@ -298,9 +298,9 @@ impl Render for DevicesPage {
                         .font_family(theme.font_mono.clone())
                         .text_size(px(10.5))
                         .text_color(if id_copied {
-                            crate::theme::oklch(0.845, 0.143, 164.978).opacity(0.9)
+                            crate::theme::oklch(0.845, 0.143, 164.978)
                         } else {
-                            theme.text_muted.opacity(0.5)
+                            theme.text_subtle
                         })
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text_muted))
@@ -363,7 +363,7 @@ impl Render for DevicesPage {
                     .py(px(40.0))
                     .text_center()
                     .text_size(px(14.0))
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from("No devices registered")),
             )
         } else {

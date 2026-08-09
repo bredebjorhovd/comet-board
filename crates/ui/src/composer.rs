@@ -2841,11 +2841,7 @@ impl Composer {
                         .min_w_0()
                         .text_size(px(13.5))
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if picked {
-                            theme.text
-                        } else {
-                            theme.text.opacity(0.9)
-                        })
+                        .text_color(if picked { theme.text } else { theme.text_muted })
                         .child(SharedString::from(label.clone())),
                 )
                 .when(ix < 9, |el| {
@@ -2867,7 +2863,7 @@ impl Composer {
                             .text_color(if picked {
                                 theme.text
                             } else {
-                                theme.text_muted.opacity(0.6)
+                                theme.text_subtle
                             })
                             .child(SharedString::from(format!("{}", ix + 1))),
                     )
@@ -2909,7 +2905,7 @@ impl Composer {
                                 div()
                                     .text_size(px(10.5))
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(crate::popover::tracked_upper(
                                         &question.header,
                                     ))),
@@ -2925,7 +2921,7 @@ impl Composer {
                                         .bg(theme.white_alpha(0.06))
                                         .text_size(px(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .text_color(theme.text_subtle)
                                         .child(SharedString::from(counter)),
                                 )
                             }),
@@ -2944,7 +2940,7 @@ impl Composer {
                             div()
                                 .mt(px(4.0))
                                 .text_size(px(12.0))
-                                .text_color(theme.text_muted.opacity(0.65))
+                                .text_color(theme.text_subtle)
                                 .child(SharedString::from("Select one or more options.")),
                         )
                     })
@@ -3049,11 +3045,7 @@ impl Composer {
                                     .flex_none()
                                     .text_size(px(13.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(if active {
-                                        theme.text
-                                    } else {
-                                        theme.text.opacity(0.85)
-                                    })
+                                    .text_color(if active { theme.text } else { theme.text_muted })
                                     .child(name),
                             )
                             .when_some(skill.description.clone(), |el, description| {
@@ -3072,7 +3064,7 @@ impl Composer {
                                     .flex_none()
                                     .ml_auto()
                                     .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from(skill.source.label())),
                             )
                     }),
@@ -3085,7 +3077,7 @@ impl Composer {
                         .px(px(8.0))
                         .py(px(4.0))
                         .text_size(px(10.0))
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(format!("{hidden} more — keep typing"))),
                 )
             });
@@ -3285,14 +3277,14 @@ impl Render for Composer {
                     (
                         amber.opacity(0.16),
                         amber.opacity(0.05),
-                        theme.warning_text().opacity(0.9),
+                        theme.warning_text(),
                     )
                 } else {
                     let danger = theme.danger; // red-400
                     (
                         danger.opacity(0.16),
                         danger.opacity(0.05),
-                        theme.danger_text().opacity(0.9),
+                        theme.danger_text(),
                     )
                 };
                 el.child(

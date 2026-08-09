@@ -1923,7 +1923,7 @@ impl Shell {
                             .pb(px(4.0))
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from("Settings")),
                     )
                     .child(div().flex().flex_col().gap(px(2.0)).children(
@@ -2395,7 +2395,7 @@ impl Shell {
                         .pt(px(6.0))
                         .pb(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(theme.text_subtle)
                         .truncate()
                         .child(user_email.unwrap_or(user_line)),
                 )
@@ -2707,7 +2707,7 @@ impl Shell {
                             icon(icons::COMET_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
+                                .text_color(theme.white_alpha(0.09)),
                         )
                         .child(
                             div()
@@ -2721,7 +2721,7 @@ impl Shell {
                             div()
                                 .mt(px(6.0))
                                 .text_size(px(13.0))
-                                .text_color(theme.text_muted.opacity(0.7))
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(
                                     // gh#118: the picker's front door is repos,
                                     // so the empty state names the same thing it
@@ -2740,7 +2740,7 @@ impl Shell {
                 .into_any_element()
         } else {
             // New-chat canvas (comet index.tsx): the dim comet mark watermark
-            // (`h-12 text-foreground/[0.09]`) over the centered helper line —
+            // (a 9% wash, ornament rather than text) over the helper line —
             // now naming the space the session will start in.
             let helper: SharedString = if space_name.is_empty() {
                 "Send a message to start a new session.".into()
@@ -2763,13 +2763,13 @@ impl Shell {
                             icon(icons::COMET_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
+                                .text_color(theme.white_alpha(0.09)),
                         )
                         .child(
                             div()
                                 .mt(px(24.0))
                                 .text_size(px(14.0))
-                                .text_color(theme.text_muted.opacity(0.6))
+                                .text_color(theme.text_muted)
                                 .child(helper),
                         ),
                 ))
@@ -3039,7 +3039,7 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .text_color(theme.text_faint)
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(transcript::format_elapsed(elapsed_secs))),
                     )
                     .into_any_element()
@@ -3301,7 +3301,7 @@ impl Shell {
                             .pb(px(8.0))
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(
                                 "Or continue in a workspace you belong to",
                             )),
@@ -3343,7 +3343,7 @@ impl Shell {
                     .pb(px(8.0))
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(
                         "Or join a workspace you were invited to",
                     )),
@@ -3487,7 +3487,7 @@ impl Shell {
                         .mt(px(16.0))
                         .text_size(px(12.0))
                         .line_height(px(17.0))
-                        .text_color(crate::theme::oklch(0.81, 0.108, 19.6).opacity(0.9)) // red-300
+                        .text_color(theme.danger_text())
                         .child(message),
                 )
             })
@@ -3496,7 +3496,7 @@ impl Shell {
                     div()
                         .id("org-signout")
                         .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(theme.text_subtle)
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
@@ -3678,11 +3678,7 @@ fn nav_history_button(
             // Even disabled it reads as a control — occlude so double-clicks
             // on it don't fall through to the titlebar strip's zoom handler.
             .occlude()
-            .child(
-                icon(icon_path)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted.opacity(0.35)),
-            )
+            .child(icon(icon_path).size(px(16.0)).text_color(theme.text_faint))
             .into_any_element();
     }
     window_control_button(id, icon_path, theme, on_click).into_any_element()
