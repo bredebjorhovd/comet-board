@@ -70,6 +70,7 @@ enum SpecRunner {
         var humanMinutes: [MinuteCase]
         var percent: [PercentCase]
         var barFraction: [BarCase]
+        var humanUsd: [UsdCase]
         var boardStats: [StatsCase]
     }
 
@@ -108,6 +109,11 @@ enum SpecRunner {
         var expect: Double
     }
 
+    private struct UsdCase: Decodable {
+        var dollars: Double
+        var expect: String
+    }
+
     private struct StatsCase: Decodable {
         var name: String
         /// A real serialized `BoardStats` — decoding it here is half the point,
@@ -124,6 +130,11 @@ enum SpecRunner {
             var tokenTotal: UInt64
             var peakDispatches: Int
             var peakTokens: UInt64
+            /// gh#182. The three spend states — no rates, rates that priced
+            /// nothing, a real figure — are the ones a surface must not
+            /// collapse into a zero.
+            var hasSpend: Bool
+            var spendLabel: String
         }
     }
 
@@ -170,6 +181,9 @@ enum SpecRunner {
         for c in spec.barFraction {
             expect(barFraction(c.value, c.peak), c.expect, "barFraction(\(c.value), \(c.peak))")
         }
+        for c in spec.humanUsd {
+            expect(humanUsd(c.dollars), c.expect, "humanUsd(\(c.dollars))")
+        }
         for c in spec.boardStats {
             let s = c.stats
             let what = "boardStats — \(c.name)"
@@ -183,6 +197,8 @@ enum SpecRunner {
             expect(s.tokens.total, c.expect.tokenTotal, "\(what): token total")
             expect(peakDispatches(s.daily), c.expect.peakDispatches, "\(what): peak dispatches")
             expect(peakTokens(s.dailyTokens), c.expect.peakTokens, "\(what): peak tokens")
+            expect(s.hasSpend, c.expect.hasSpend, "\(what): hasSpend")
+            expect(s.spendLabel, c.expect.spendLabel, "\(what): spend label")
             // 24 slots exist even before anything has run in them.
             expect(s.hourOfDay.count, 24, "\(what): hour slots")
         }

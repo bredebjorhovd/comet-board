@@ -252,6 +252,13 @@ pub fn doctor(
             checks.push(billing_guard_check(&cfg));
             checks.push(default_account_check(&cfg, accounts, members));
 
+            // What the board prices that spend at, and how old those rates are
+            // (gh#182). Reported beside the billing checks because it is the
+            // same subject seen from the other end — who pays, then how much —
+            // and it names the table's date rather than implying freshness.
+            checks.push(rates_check(&cfg, &today_local()));
+            checks.push(subscriptions_check(&cfg, accounts));
+
             // The pin (gh#104). Reported next to the other notice lines because
             // it is another answer to the same question — who hears about a
             // settle — and because an unpinned board is the one state where
@@ -1789,6 +1796,143 @@ fn operator_notice_check(defaults: &crate::config::Defaults) -> Check {
 /// issued on the box carries no stamp and is compared against the frontend's
 /// claim, which is correct there and worth saying out loud rather than
 /// implying. Neither line hedges about the other's case.
+/// Today, in the box's own reckoning — the clock the rate table's age is
+/// measured against, and the same local day the stats buckets use.
+fn today_local() -> String {
+    chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// What the board prices tokens at, and how old that is (gh#182).
+///
+/// **Reports the date rather than implying freshness.** The rates ship inside
+/// the binary — no provider publishes a pricing API, and scraping one for money
+/// on a box with no network guarantees fails silently into a number nobody
+/// re-checks — so the only honest thing a check can do is say when the snapshot
+/// was taken and go `ok: false` once it is old enough to have missed a change.
+/// Not a failure of the board: a failure of *this line* to still be trustworthy,
+/// which is what a person reading `doctor` needs to know.
+fn rates_check(cfg: &crate::config::RoutingConfig, today: &str) -> Check {
+    let prices = crate::prices::Prices::from_config(cfg);
+    let table = &prices.table;
+    let age = table.age_days(today);
+    let overrides = match table.overridden.as_slice() {
+        [] => String::new(),
+        some => format!(" · overridden here: {}", some.join(", ")),
+    };
+    let stale = table.is_stale(today);
+    let vintage = match age {
+        Some(days) if stale => format!(
+            "list prices last checked {} ({days} days ago) — old enough to have missed a \
+             change; re-check the published prices and override what moved in \
+             `[defaults.rates]`",
+            table.as_of
+        ),
+        Some(days) => format!(
+            "list prices as of {} ({days} days ago), shipped with this binary",
+            table.as_of
+        ),
+        None => format!(
+            "list prices as of {}, shipped with this binary",
+            table.as_of
+        ),
+    };
+    Check {
+        name: "token rates".into(),
+        ok: !stale,
+        detail: format!(
+            "{} model(s) priced · {vintage}{overrides}. A model with no rate is reported \
+             unpriced rather than free",
+            table.entries.len()
+        ),
+    }
+}
+
+/// What the plans behind that spend cost — the half only a person can tell the
+/// board (gh#182).
+///
+/// Always printed, like the duration cap, and for the same reason: with nothing
+/// configured every account reports as *unknown*, which looks exactly like a
+/// board that was told and got zero. Unknown is the honest default — comet
+/// never sees anybody's invoice — but it is worth saying which state you are in.
+fn subscriptions_check(
+    cfg: &crate::config::RoutingConfig,
+    accounts: Option<&[AgentAccount]>,
+) -> Check {
+    if cfg.accounts.is_empty() {
+        return Check {
+            name: "subscription cost".into(),
+            ok: true,
+            detail: "not configured — the stats page prices what the board ran at list \
+                     price, and says nothing about what the plans behind it cost. Add \
+                     `[account.\"<slot>\"] monthly_usd = …` to compare the two"
+                .into(),
+        };
+    }
+    let configured: Vec<String> = cfg
+        .accounts
+        .iter()
+        .map(|(slot, account)| {
+            let who = account.email.as_deref().unwrap_or(slot);
+            match &account.plan {
+                Some(plan) => format!(
+                    "{who}: {plan} at {}/month",
+                    comet_proto::view::rates::human_usd(account.monthly_usd)
+                ),
+                None => format!(
+                    "{who}: {}/month",
+                    comet_proto::view::rates::human_usd(account.monthly_usd)
+                ),
+            }
+        })
+        .collect();
+    // A plan written against a slot this device has never saved is settings
+    // that apply to nothing — silently, which is the failure mode every other
+    // config check here exists to remove.
+    let unknown: Vec<&str> = match accounts {
+        None => Vec::new(),
+        Some(saved) => cfg
+            .accounts
+            .keys()
+            .filter(|slot| {
+                !saved.iter().any(|a| {
+                    a.id.eq_ignore_ascii_case(slot)
+                        || a.email
+                            .as_deref()
+                            .is_some_and(|e| e.eq_ignore_ascii_case(slot))
+                })
+            })
+            .filter(|slot| {
+                // An entry keyed by email, whose email matches a saved login,
+                // is fine however it was written.
+                !cfg.accounts[*slot].email.as_deref().is_some_and(|email| {
+                    saved.iter().any(|a| {
+                        a.email
+                            .as_deref()
+                            .is_some_and(|e| e.eq_ignore_ascii_case(email))
+                    })
+                })
+            })
+            .map(String::as_str)
+            .collect(),
+    };
+    Check {
+        name: "subscription cost".into(),
+        ok: unknown.is_empty(),
+        detail: match unknown.as_slice() {
+            [] => configured.join(" · "),
+            some => format!(
+                "{} · no saved login matches {}, so those plans price nothing (\
+                 `comet-board doctor` lists the slot ids under agent accounts)",
+                configured.join(" · "),
+                some.join(", ")
+            ),
+        },
+    }
+}
+
 fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
     use crate::billing::GuardMode;
     let mode = cfg.billing_guard(None);
@@ -3059,6 +3203,89 @@ mod tests {
             .find(|c| c.name == "billing guard")
             .expect("doctor is silent about whose subscription dispatches spend");
         assert!(c.detail.starts_with("warn —"), "{:?}", c.detail);
+    }
+
+    /// The rates ship inside the binary, so the only honest thing this line
+    /// can do is say when they were taken — and stop calling itself ok once
+    /// that is old enough to have missed a change (gh#182).
+    #[test]
+    fn the_rates_line_dates_itself_and_goes_amber_when_the_table_is_old() {
+        let cfg = RoutingConfig::default();
+        let fresh = rates_check(&cfg, "2026-08-09");
+        assert!(fresh.ok);
+        assert!(
+            fresh
+                .detail
+                .contains(comet_proto::view::rates::BUILTIN_AS_OF),
+            "the date is the point: {}",
+            fresh.detail
+        );
+        assert!(
+            fresh.detail.contains("unpriced rather than free"),
+            "and the rule for what it cannot price: {}",
+            fresh.detail
+        );
+
+        let old = rates_check(&cfg, "2027-08-09");
+        assert!(!old.ok, "a year-old price list is not a clean check");
+        assert!(old.detail.contains("[defaults.rates]"), "{}", old.detail);
+
+        // An override is named, so a reader can tell which rows are not the
+        // shipped ones.
+        let overridden: RoutingConfig =
+            toml::from_str("[defaults.rates.\"claude-opus-5\"]\ninput = 4.0\noutput = 20.0\n")
+                .unwrap();
+        let detail = rates_check(&overridden, "2026-08-09").detail;
+        assert!(
+            detail.contains("overridden here: claude-opus-5"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn the_subscription_line_says_which_of_the_two_unknowns_it_is() {
+        // Nothing configured: the stats page prices the work and says nothing
+        // about the bill — which is a state worth naming, because it looks
+        // exactly like a plan configured at zero.
+        let bare = subscriptions_check(&RoutingConfig::default(), Some(&[]));
+        assert!(bare.ok);
+        assert!(bare.detail.starts_with("not configured"), "{}", bare.detail);
+
+        let cfg: RoutingConfig = toml::from_str(
+            "[account.\"slot-box\"]\nemail = \"brede@tally.no\"\n\
+             plan = \"Claude Max 20x\"\nmonthly_usd = 200\n",
+        )
+        .unwrap();
+        let mine = [account(
+            "slot-box",
+            "brede@tally.no",
+            comet_proto::HarnessId::ClaudeCode,
+        )];
+        let known = subscriptions_check(&cfg, Some(&mine));
+        assert!(known.ok);
+        assert!(known.detail.contains("Claude Max 20x"), "{}", known.detail);
+        assert!(known.detail.contains("$200"), "{}", known.detail);
+
+        // A plan written against a slot this device has never saved prices
+        // nothing — silently, until this says so.
+        let orphan = subscriptions_check(&cfg, Some(&[]));
+        assert!(!orphan.ok);
+        assert!(orphan.detail.contains("slot-box"), "{}", orphan.detail);
+    }
+
+    #[test]
+    fn doctor_emits_the_rate_checks() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
+        assert!(
+            checks.iter().any(|c| c.name == "token rates"),
+            "doctor is silent about what the board prices tokens at"
+        );
+        assert!(
+            checks.iter().any(|c| c.name == "subscription cost"),
+            "doctor is silent about what the plans behind it cost"
+        );
     }
 
     #[test]

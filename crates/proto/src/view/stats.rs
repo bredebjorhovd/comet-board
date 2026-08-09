@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::TokenUsage;
+use crate::view::rates::{ModelRate, RateSource, RateTable, Usd, human_usd};
 
 /// One day's dispatches, for the throughput chart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +118,153 @@ impl Friction {
     }
 }
 
+// -- spend (gh#182) ----------------------------------------------------------
+
+/// One model's tokens, priced.
+///
+/// Carries the rate it was priced at, not only the answer: a figure with no
+/// provenance is one nobody can check, and the difference between an exact
+/// rate and a family one ([`crate::view::rates::RateMatch::key`]) is the first
+/// thing a reader who distrusts the number will want.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSpend {
+    /// The model as the *run* reported it — the same label
+    /// [`BoardStats::tokens_by_model`] is keyed on.
+    pub label: String,
+    /// The table key that priced it. Equal to `label` on an exact hit; the
+    /// family it fell back to otherwise.
+    pub rate_key: String,
+    pub source: RateSource,
+    pub rate: ModelRate,
+    pub usage: TokenUsage,
+    pub cost: Usd,
+}
+
+/// What one agent-account's work would have cost at the meter, beside what its
+/// subscription actually costs.
+///
+/// The two halves are deliberately not added together, ever. The list price is
+/// the board's; the plan is one person's. On a box carrying several teammates'
+/// slots (gh#59) a single "cost" field would quietly sum other people's plans
+/// into one number and call it the board's spend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSpend {
+    /// Whose subscription — the same key [`BoardStats::by_account`] uses: the
+    /// login's email, or the box's own login said out loud.
+    pub label: String,
+    pub attempts: usize,
+    pub usage: TokenUsage,
+    /// List price of this account's metered work. Unpriced models are excluded
+    /// and counted in [`unpriced_tokens`](Self::unpriced_tokens).
+    pub list_price: Usd,
+    pub unpriced_tokens: u64,
+    /// What the operator says this account's plan costs per month, from
+    /// `[account."<id>"]` in `routing.toml`. `None` is unconfigured, which is
+    /// not zero: comet cannot see anybody's bill and must not pretend to.
+    pub plan: Option<AccountPlan>,
+    /// The plan's cost over *this window*, pro-rated from the monthly figure —
+    /// the only form in which the subsidy question has an answer. `None` for an
+    /// all-time window (nothing to pro-rate against) or an unconfigured plan.
+    pub plan_in_window: Option<Usd>,
+}
+
+impl AccountSpend {
+    /// How far the subscription carried it: list price as a multiple of what
+    /// the plan cost over the same window. `None` when either half is missing
+    /// or the plan is free — a ratio against zero is not a number.
+    pub fn subsidy(&self) -> Option<f64> {
+        let plan = self.plan_in_window?;
+        (!plan.is_zero()).then(|| self.list_price.dollars() / plan.dollars())
+    }
+}
+
+/// A plan a human wrote down: what an agent account costs its owner per month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPlan {
+    /// What the plan is called, as the operator wrote it (`Max 20x`,
+    /// `Team seat`). Free-text: comet has no list of plans and inventing one
+    /// would put words in an operator's mouth.
+    pub label: Option<String>,
+    pub monthly: Usd,
+}
+
+/// What the window cost — the half of the stats page that is about money
+/// (gh#182).
+///
+/// Two different facts live here and are kept apart on purpose:
+///
+/// 1. **List price** ([`list_price`](Self::list_price)) — what the tokens the
+///    board ran would have cost at the meter. That is the board's own number,
+///    summed over every model it could price.
+/// 2. **Subscriptions** ([`accounts`](Self::accounts)) — what the operator
+///    actually pays for the plans those runs spent. Per account, entered by a
+///    person, and never added into (1).
+///
+/// The comparison between them is the headline this exists for — *how
+/// subsidised is this* rather than *what did I burn* — and it only works while
+/// the two stay separate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardSpend {
+    /// The rate set these figures were computed from, date and all.
+    pub rates: RateTable,
+    /// List price of everything the board could price in this window.
+    pub list_price: Usd,
+    /// Per model, biggest first. Ties alphabetical, like every other tally
+    /// here, so an unchanged board redraws identically.
+    pub by_model: Vec<ModelSpend>,
+    /// Models with tokens and no rate. Present, and never folded into the
+    /// total: a breakdown that dropped what it could not price would not add up
+    /// to the token counts on the same page.
+    pub unpriced: Vec<TokenTally>,
+    /// Their tokens, summed — the one number that says how much of the window
+    /// the price above does *not* account for.
+    pub unpriced_tokens: u64,
+    /// Per agent-account, biggest list price first.
+    pub accounts: Vec<AccountSpend>,
+}
+
+impl BoardSpend {
+    /// Did every metered model have a rate? The honesty gate for the headline,
+    /// the way `token_coverage` is for the token totals.
+    pub fn is_complete(&self) -> bool {
+        self.unpriced.is_empty()
+    }
+
+    /// Any money to show at all. False on a window that ran nothing, and on one
+    /// whose every model was unpriced.
+    pub fn has_price(&self) -> bool {
+        !self.by_model.is_empty()
+    }
+
+    /// The headline, said once: `$12.40 at list price`, with what it could not
+    /// account for attached rather than left implied.
+    pub fn headline(&self) -> String {
+        let price = human_usd(self.list_price);
+        if self.is_complete() {
+            format!("{price} at list price")
+        } else {
+            format!(
+                "{price} at list price, plus {} unpriced token(s) across {} model(s)",
+                human_tokens(self.unpriced_tokens),
+                self.unpriced.len()
+            )
+        }
+    }
+
+    /// What the operator pays per month across every account with a plan
+    /// configured. Their plans, not the board's spend — see the type's own doc.
+    pub fn monthly_subscriptions(&self) -> Usd {
+        self.accounts
+            .iter()
+            .filter_map(|a| a.plan.as_ref().map(|p| p.monthly))
+            .sum()
+    }
+}
+
 /// Everything the board can say about its own throughput over a window.
 ///
 /// Field order is the order a page reads them in: what happened, how well, how
@@ -189,6 +337,20 @@ pub struct BoardStats {
     /// Tokens by runtime — the provider split, against the same `by_runtime`
     /// dispatch counts already on this struct.
     pub tokens_by_runtime: BTreeMap<String, TokenUsage>,
+    /// Tokens by whose subscription paid for them (gh#182), keyed like
+    /// [`by_account`](Self::by_account). The counts there say who ran how many
+    /// attempts; this says what those attempts actually spent, which is what
+    /// the per-account price is computed from.
+    pub tokens_by_account: BTreeMap<String, TokenUsage>,
+
+    /// What it cost, at list price, and what the plans behind it cost (gh#182).
+    ///
+    /// `None` is **rates not configured** — said out loud rather than rendered
+    /// as a confident `$0.00`, which is gh#96's lesson applied to money. A
+    /// board that was given rates and simply spent nothing carries a `Some`
+    /// whose total is zero, and those two are different facts.
+    #[serde(default)]
+    pub spend: Option<BoardSpend>,
 }
 
 impl BoardStats {
@@ -221,6 +383,8 @@ impl BoardStats {
             agent_dispatched: 0,
             tokens_by_model: BTreeMap::new(),
             tokens_by_runtime: BTreeMap::new(),
+            tokens_by_account: BTreeMap::new(),
+            spend: None,
         }
     }
 
@@ -237,6 +401,31 @@ impl BoardStats {
     /// of drawing a wall of zeroes and a 0% that means nothing.
     pub fn is_empty(&self) -> bool {
         self.attempts == 0
+    }
+
+    /// Is there a priced figure to show (gh#182)?
+    ///
+    /// False covers both halves of "no": a board with no rates configured, and
+    /// a board with rates whose every metered model was one the table has never
+    /// heard of. The page distinguishes them with [`spend`](Self::spend) being
+    /// `None` versus a `Some` that
+    /// [`has_price`](BoardSpend::has_price)s nothing.
+    pub fn has_spend(&self) -> bool {
+        self.spend.as_ref().is_some_and(BoardSpend::has_price)
+    }
+
+    /// The sentence a page leads the money half with — including the two ways
+    /// there is no number, which are the ones worth saying out loud.
+    pub fn spend_label(&self) -> String {
+        match &self.spend {
+            None => "rates not configured".to_string(),
+            Some(spend) if !spend.has_price() && spend.unpriced_tokens > 0 => format!(
+                "no rate for any model in this window ({} unpriced token(s))",
+                human_tokens(spend.unpriced_tokens)
+            ),
+            Some(spend) if !spend.has_price() => "nothing metered to price".to_string(),
+            Some(spend) => spend.headline(),
+        }
     }
 
     /// How the window is named on the page.
@@ -758,8 +947,52 @@ mod spec {
                 "tokenTotal": stats.tokens.total(),
                 "peakDispatches": peak_dispatches(&stats.daily),
                 "peakTokens": peak_tokens(&stats.daily_tokens),
+                // gh#182. The three states are the whole point: no rates, rates
+                // that priced nothing, and a real figure — and a surface that
+                // collapsed any two of them would be inventing a zero.
+                "hasSpend": stats.has_spend(),
+                "spendLabel": stats.spend_label(),
             }
         })
+    }
+
+    /// A priced window, built by hand (gh#182).
+    ///
+    /// The arithmetic that produces one of these lives in `comet_board::prices`
+    /// — the box's side, where the config is — and is tested there. What the
+    /// fixture pins is what both viewports do *with* it: the sentences, and the
+    /// decode.
+    fn spend(
+        rates: RateTable,
+        models: &[(&str, TokenUsage)],
+        accounts: &[AccountSpend],
+    ) -> BoardSpend {
+        let mut by_model = Vec::new();
+        let mut unpriced = Vec::new();
+        for (label, usage) in models {
+            match rates.rate_for(label) {
+                Some(found) => by_model.push(ModelSpend {
+                    label: (*label).to_string(),
+                    rate_key: found.key,
+                    source: found.source,
+                    rate: found.rate,
+                    usage: *usage,
+                    cost: found.rate.cost(*usage),
+                }),
+                None => unpriced.push(TokenTally {
+                    label: (*label).to_string(),
+                    usage: *usage,
+                }),
+            }
+        }
+        BoardSpend {
+            rates,
+            list_price: by_model.iter().map(|m| m.cost).sum(),
+            unpriced_tokens: unpriced.iter().map(|t| t.usage.total()).sum(),
+            by_model,
+            unpriced,
+            accounts: accounts.to_vec(),
+        }
     }
 
     /// Every rule this module owns, as data.
@@ -827,6 +1060,64 @@ mod spec {
         unmetered.attempts = 4;
         unmetered.token_coverage = Some(0.0);
 
+        // The same busy week, priced (gh#182): one model the table knows, one
+        // it does not, and one account whose plan the operator wrote down. The
+        // three facts a spend page must not collapse — a total, what that total
+        // leaves out, and what the subscription behind it costs.
+        let mut priced = busy.clone();
+        priced.by_account = tally(&[("brede@tally.no", 11), ("ana@example.com", 2)]);
+        priced.tokens_by_account = token_tally(&[
+            ("brede@tally.no", usage(9_000, 6_000, 148_000, 21_000)),
+            ("ana@example.com", usage(400, 100, 0, 500)),
+        ]);
+        priced.spend = Some(spend(
+            crate::view::rates::builtin(),
+            &[
+                ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
+                ("gpt-5.6-terra", usage(400, 100, 0, 500)),
+            ],
+            &[
+                AccountSpend {
+                    label: "brede@tally.no".into(),
+                    attempts: 11,
+                    usage: usage(9_000, 6_000, 148_000, 21_000),
+                    // $0.045 fresh input + $0.15 output + $0.074 cache reads +
+                    // $0.13125 cache writes — the four rates, applied apart.
+                    list_price: Usd::from_dollars(0.400_25),
+                    unpriced_tokens: 0,
+                    plan: Some(AccountPlan {
+                        label: Some("Claude Max 20x".into()),
+                        monthly: Usd::from_dollars(200.0),
+                    }),
+                    plan_in_window: Some(Usd::from_dollars(46.666_667)),
+                },
+                AccountSpend {
+                    label: "ana@example.com".into(),
+                    attempts: 2,
+                    usage: usage(400, 100, 0, 500),
+                    list_price: Usd::ZERO,
+                    unpriced_tokens: 1_000,
+                    plan: None,
+                    plan_in_window: None,
+                },
+            ],
+        ));
+
+        // Rates configured, and not one of them matched: a real answer, and not
+        // the same one as "no rates configured" above.
+        let mut nothing_priceable = BoardStats::empty(Some(7));
+        nothing_priceable.attempts = 2;
+        nothing_priceable.attempts_with_tokens = 2;
+        nothing_priceable.token_coverage = Some(1.0);
+        nothing_priceable.tokens = usage(400, 100, 0, 500);
+        nothing_priceable.tokens_by_model =
+            token_tally(&[("gpt-5.6-terra", usage(400, 100, 0, 500))]);
+        nothing_priceable.spend = Some(spend(
+            crate::view::rates::builtin(),
+            &[("gpt-5.6-terra", usage(400, 100, 0, 500))],
+            &[],
+        ));
+
         // Scalar rules, one case per input. Built before the object below
         // because `json!` reads a `[` as an array literal, not as a Rust one.
         let human_token_cases: Vec<Value> = [
@@ -863,6 +1154,17 @@ mod spec {
         let bar_cases: Vec<Value> = [(8_usize, 8_usize), (2, 8), (0, 8), (0, 0), (9, 8)]
             .iter()
             .map(|(v, p)| json!({ "value": v, "peak": p, "expect": bar_fraction(*v, *p) }))
+            .collect();
+        // Money, at the three scales the same field is read at (gh#182): a
+        // per-model row where the cents are the whole story, a headline, and a
+        // figure nobody acts on to the cent. Halves are deliberately absent —
+        // two languages' rounding of `1.315` is not a rule worth pinning.
+        let usd_cases: Vec<Value> = [0.0_f64, 0.0042, 0.14, 1.316, 12.4, 248.4, 1_234.4]
+            .iter()
+            .map(|d| {
+                let amount = crate::view::rates::Usd::from_dollars(*d);
+                json!({ "dollars": amount, "expect": crate::view::rates::human_usd(amount) })
+            })
             .collect();
 
         json!({
@@ -901,12 +1203,15 @@ mod spec {
             "humanMinutes": human_minute_cases,
             "percent": percent_cases,
             "barFraction": bar_cases,
+            "humanUsd": usd_cases,
             "boardStats": [
                 stats_case("a board that has just started", &BoardStats::empty(Some(7))),
                 stats_case("all time, nothing in it", &BoardStats::empty(None)),
                 stats_case("24 hours", &BoardStats::empty(Some(1))),
                 stats_case("ran, and nothing reported usage", &unmetered),
                 stats_case("a busy week", &busy),
+                stats_case("a busy week, priced", &priced),
+                stats_case("rates configured, nothing priceable", &nothing_priceable),
             ],
         })
     }
