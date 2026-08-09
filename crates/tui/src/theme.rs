@@ -81,18 +81,20 @@ impl Theme {
             text: Color::Rgb(0xe5, 0xe5, 0xe5),
             muted: Color::Rgb(0xa1, 0xa1, 0xa1),
             faint: Color::Rgb(0x73, 0x73, 0x73),
-            accent: Color::Rgb(0x7c, 0x86, 0xff),
+            // The status ramp at its dark anchor (`comet_proto::view::status`):
+            // one lightness, one chroma, four hues.
+            accent: Color::Rgb(0x7f, 0xa8, 0xff),
             base: Color::Rgb(0x0b, 0x0b, 0x0d),
             panel: Color::Rgb(0x12, 0x12, 0x15),
             element: Color::Rgb(0x1c, 0x1c, 0x21),
             selection: Color::Rgb(0x2c, 0x2c, 0x33),
             code_wash: Color::Rgb(0x16, 0x16, 0x1a),
-            danger: Color::Rgb(0xff, 0x64, 0x67),
-            warning: Color::Rgb(0xff, 0xb9, 0x00),
-            dot_working: Color::Rgb(0xfb, 0x64, 0xb6),
-            dot_awaiting: Color::Rgb(0x7c, 0x86, 0xff),
-            dot_errored: Color::Rgb(0xff, 0x64, 0x67),
-            dot_completed: Color::Rgb(0x00, 0xd4, 0x92),
+            danger: Color::Rgb(0xf7, 0x85, 0x7d),
+            warning: Color::Rgb(0xde, 0x9c, 0x31),
+            dot_working: Color::Rgb(0xde, 0x9c, 0x31),
+            dot_awaiting: Color::Rgb(0x7f, 0xa8, 0xff),
+            dot_errored: Color::Rgb(0xf7, 0x85, 0x7d),
+            dot_completed: Color::Rgb(0x47, 0xc5, 0x8c),
             dot_idle: Color::Rgb(0x2f, 0x2f, 0x2f),
             plain: false,
         }
@@ -100,26 +102,27 @@ impl Theme {
 
     /// The same ramp inverted — the sRGB conversions of the desktop app's
     /// light theme (comet-ui `Theme::light`): surfaces walk DOWN from a
-    /// near-white base, text walks UP to near-black, and the accents move to
-    /// the 600-shades so they keep contrast on white. Status dot hues are
-    /// unchanged — they carry meaning, not decoration.
+    /// near-white base, text walks UP to near-black. The status HUES are
+    /// unchanged — they carry meaning, not decoration — but they ride the
+    /// ramp's light anchor, because a hue tuned to shine on near-black
+    /// disappears on near-white.
     pub fn light() -> Self {
         Self {
             text: Color::Rgb(0x1b, 0x1b, 0x1b),
             muted: Color::Rgb(0x5d, 0x5d, 0x5d),
             faint: Color::Rgb(0x92, 0x92, 0x92),
-            accent: Color::Rgb(0x4f, 0x39, 0xf6),
+            accent: Color::Rgb(0x49, 0x6d, 0xc3),
             base: Color::Rgb(0xf6, 0xf6, 0xf6),
             panel: Color::Rgb(0xf0, 0xf0, 0xf0),
             element: Color::Rgb(0xe1, 0xe1, 0xe1),
             selection: Color::Rgb(0xd4, 0xd4, 0xd4),
             code_wash: Color::Rgb(0xe9, 0xe9, 0xe9),
-            danger: Color::Rgb(0xe6, 0x2b, 0x30),
-            warning: Color::Rgb(0xd6, 0x8d, 0x00),
-            dot_working: Color::Rgb(0xfb, 0x64, 0xb6),
-            dot_awaiting: Color::Rgb(0x4f, 0x39, 0xf6),
-            dot_errored: Color::Rgb(0xff, 0x64, 0x67),
-            dot_completed: Color::Rgb(0x00, 0xd4, 0x92),
+            danger: Color::Rgb(0xb5, 0x4a, 0x46),
+            warning: Color::Rgb(0xa0, 0x62, 0x00),
+            dot_working: Color::Rgb(0xa0, 0x62, 0x00),
+            dot_awaiting: Color::Rgb(0x49, 0x6d, 0xc3),
+            dot_errored: Color::Rgb(0xb5, 0x4a, 0x46),
+            dot_completed: Color::Rgb(0x00, 0x89, 0x54),
             dot_idle: Color::Rgb(0xb0, 0xb0, 0xb0),
             plain: false,
         }
@@ -427,9 +430,15 @@ mod tests {
         assert_eq!(t.text, oklch(0.922, 0.0, 0.0), "neutral-200 body text");
         assert_eq!(t.muted, oklch(0.708, 0.0, 0.0), "neutral-400 sub-lines");
         assert_eq!(t.faint, oklch(0.556, 0.0, 0.0), "neutral-500 timestamps");
-        assert_eq!(t.accent, oklch(0.673, 0.182, 276.935), "indigo-400");
-        assert_eq!(t.danger, oklch(0.704, 0.191, 22.216), "red-400");
-        assert_eq!(t.warning, oklch(0.828, 0.189, 84.429), "amber-400");
+        // The status ramp, at the shared dark anchor.
+        use comet_proto::view::status;
+        let ramp = |hue: f32| {
+            let (l, c, h) = status::dark(hue);
+            oklch(l, c, h)
+        };
+        assert_eq!(t.accent, ramp(status::REVIEW), "the review hue");
+        assert_eq!(t.danger, ramp(status::BLOCKED), "the blocked hue");
+        assert_eq!(t.warning, ramp(status::WORKING), "the working hue");
     }
 
     #[test]
@@ -440,9 +449,19 @@ mod tests {
         assert_eq!(t.text, oklch(0.22, 0.0, 0.0), "near-black body text");
         assert_eq!(t.muted, oklch(0.48, 0.0, 0.0), "mid-grey sub-lines");
         assert_eq!(t.faint, oklch(0.66, 0.0, 0.0), "light-grey timestamps");
-        assert_eq!(t.accent, oklch(0.511, 0.262, 276.966), "indigo, darkened");
-        assert_eq!(t.danger, oklch(0.60, 0.22, 26.0), "red, darkened");
-        assert_eq!(t.warning, oklch(0.70, 0.16, 76.0), "amber, darkened");
+        // The same four hues, at the ramp's light anchor.
+        use comet_proto::view::status;
+        let ramp = |hue: f32| {
+            let (l, c, h) = status::light(hue);
+            oklch(l, c, h)
+        };
+        assert_eq!(t.accent, ramp(status::REVIEW), "the review hue, darkened");
+        assert_eq!(t.danger, ramp(status::BLOCKED), "the blocked hue, darkened");
+        assert_eq!(
+            t.warning,
+            ramp(status::WORKING),
+            "the working hue, darkened"
+        );
         // Text darkens down the ramp, surfaces lighten up from the base —
         // the mirror of dark.
         let luma = |c: Color| match c {
@@ -459,15 +478,17 @@ mod tests {
 
     #[test]
     fn light_status_dots_stay_on_the_shared_hues() {
-        // Status meaning does not change with the theme: working stays pink,
-        // errored red, completed emerald. Awaiting rides the light accent.
+        // Status meaning does not change with the theme — the hues are the
+        // shared ones; only the anchor moves, so they hold on a light terminal.
+        use comet_proto::view::status;
         let t = Theme::light();
-        let d = comet_proto::view::dot::WORKING;
-        assert_eq!(t.dot_working, oklch(d.0, d.1, d.2));
-        let d = comet_proto::view::dot::ERRORED;
-        assert_eq!(t.dot_errored, oklch(d.0, d.1, d.2));
-        let d = comet_proto::view::dot::COMPLETED;
-        assert_eq!(t.dot_completed, oklch(d.0, d.1, d.2));
+        let ramp = |hue: f32| {
+            let (l, c, h) = status::light(hue);
+            oklch(l, c, h)
+        };
+        assert_eq!(t.dot_working, ramp(status::WORKING));
+        assert_eq!(t.dot_errored, ramp(status::BLOCKED));
+        assert_eq!(t.dot_completed, ramp(status::SETTLED));
         assert_eq!(t.dot_awaiting, t.accent);
     }
 
@@ -521,7 +542,7 @@ mod tests {
         // The meanings live in proto so they cannot diverge per surface.
         let t = Theme::dark();
         let d = comet_proto::view::dot::WORKING;
-        assert_eq!(t.dot_working, oklch(d.0, d.1, d.2), "pink, not amber");
+        assert_eq!(t.dot_working, oklch(d.0, d.1, d.2), "amber, at the anchor");
         let d = comet_proto::view::dot::AWAITING;
         assert_eq!(t.dot_awaiting, oklch(d.0, d.1, d.2));
         let d = comet_proto::view::dot::ERRORED;

@@ -211,7 +211,7 @@ impl Render for DevicesPage {
         };
         let copied = self.copied.clone();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
-        let emerald = crate::theme::oklch(0.765, 0.177, 163.223); // emerald-400
+        let emerald = theme.settled;
         let count = devices.len();
 
         let rows: Vec<AnyElement> = devices
@@ -298,7 +298,7 @@ impl Render for DevicesPage {
                         .font_family(theme.font_mono.clone())
                         .text_size(px(10.5))
                         .text_color(if id_copied {
-                            crate::theme::oklch(0.845, 0.143, 164.978)
+                            theme.settled_text()
                         } else {
                             theme.text_subtle
                         })

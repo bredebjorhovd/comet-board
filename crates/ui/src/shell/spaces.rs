@@ -316,23 +316,16 @@ pub(super) struct RenameSpaceDialog {
     pub _events: Subscription,
 }
 
-/// Dot color for a chat's display status (tab dots + Sessions rows).
-pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
-    match status {
-        // Pink, not amber — the harsh yellow read as a warning; running is
-        // routine (user request).
-        ChatIndicator::Working => {
-            crate::theme::oklch(0.718, 0.202, 349.761).opacity(0.85) // pink-400
-        }
-        // Blue: "asking you a question" must read differently from "busy
-        // working" at a glance.
-        ChatIndicator::AwaitingInput => theme.accent.opacity(0.9),
-        ChatIndicator::Errored => theme.danger,
-        // Green: finished-but-unseen reads as "ready for you".
-        ChatIndicator::Completed => {
-            crate::theme::oklch(0.765, 0.177, 163.223).opacity(0.9) // emerald-400
-        }
-        ChatIndicator::Idle => theme.white_alpha(0.14),
+/// Dot color for a chat's display status (tab dots + Sessions rows) — the same
+/// status ramp the board pane paints from (gh#173), so a working agent is one
+/// colour in both. It used to be pink here and amber there, and the two dimming
+/// opacities that came with the pink are gone too: the ramp's one lightness is
+/// what keeps a running dot from shouting, not a per-hue fudge factor.
+pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
+    match crate::theme::Status::of_chat(status) {
+        Some(status) => theme.status(status),
+        // Idle spends no colour: a hairline dot, not a hue.
+        None => theme.white_alpha(0.14),
     }
 }
 
@@ -3453,10 +3446,7 @@ impl Shell {
                             .size(px(5.0))
                             .rounded_full()
                             .flex_none()
-                            .when(online, |el| {
-                                let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
-                                el.bg(emerald.opacity(0.9))
-                            })
+                            .when(online, |el| el.bg(theme.settled.opacity(0.9)))
                             .when(!online, |el| el.bg(theme.white_alpha(0.22))),
                     ),
             );
@@ -3935,9 +3925,9 @@ impl Shell {
                             .rounded_full()
                             .flex_none()
                             .when(online, |el| {
-                                // The Devices-page presence emerald, soft glow
+                                // The Devices-page presence green, soft glow
                                 // included.
-                                let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+                                let emerald = theme.settled;
                                 el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
                                     color: emerald.opacity(0.55),
                                     offset: gpui::point(px(0.0), px(0.0)),

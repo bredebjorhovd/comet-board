@@ -315,7 +315,7 @@ impl AccountsPage {
             .as_ref()
             .map(|d| d.name.clone().into())
             .unwrap_or_else(|| SharedString::from("This device"));
-        let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+        let emerald = theme.settled;
         let open = self.device_menu_open;
 
         let mut trigger = div()
@@ -822,7 +822,7 @@ impl AccountsPage {
             .items_center()
             .gap(px(6.0))
             .when(account.active, |el| {
-                el.child(widgets::badge_active("Active"))
+                el.child(widgets::badge_active(theme, "Active"))
             })
             .when_some(account.plan_label.clone(), |el, plan| {
                 el.child(widgets::badge(theme, plan))

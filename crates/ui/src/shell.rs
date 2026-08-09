@@ -52,7 +52,9 @@ use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_heigh
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
-mod spaces;
+// `pub(crate)` for one thing only: `spaces::status_dot_color`, the sidebar's
+// half of the status-colour contract the board pane's test asserts (gh#173).
+pub(crate) mod spaces;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};

@@ -155,11 +155,11 @@ pub fn badge(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
         .child(label.into())
 }
 
-/// Emerald status pill (the Accounts "Active" badge:
-/// `bg-emerald-400/[0.12] text-emerald-300/90`).
-pub fn badge_active(label: impl Into<SharedString>) -> gpui::Div {
-    let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
-    let emerald_text = crate::theme::oklch(0.845, 0.143, 164.978); // emerald-300
+/// The settled status pill (the Accounts "Active" badge) — the ramp's green at
+/// a 12% fill, with its own text tone on top.
+pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
+    let emerald = theme.settled;
+    let emerald_text = theme.settled_text();
     div()
         .flex_none()
         .px(px(8.0))
