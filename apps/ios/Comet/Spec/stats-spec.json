@@ -1,0 +1,771 @@
+{
+  "barFraction": [
+    {
+      "expect": 1.0,
+      "peak": 8,
+      "value": 8
+    },
+    {
+      "expect": 0.25,
+      "peak": 8,
+      "value": 2
+    },
+    {
+      "expect": 0.0,
+      "peak": 8,
+      "value": 0
+    },
+    {
+      "expect": 0.0,
+      "peak": 0,
+      "value": 0
+    },
+    {
+      "expect": 1.0,
+      "peak": 8,
+      "value": 9
+    }
+  ],
+  "boardStats": [
+    {
+      "expect": {
+        "completionPercent": null,
+        "coveragePercent": null,
+        "hasTokens": false,
+        "isEmpty": true,
+        "peakDispatches": 0,
+        "peakTokens": 0,
+        "tokenTotal": 0,
+        "windowLabel": "last 7 days"
+      },
+      "name": "a board that has just started",
+      "stats": {
+        "agentDispatched": 0,
+        "attempts": 0,
+        "attemptsWithTokens": 0,
+        "byAccount": {},
+        "byRuntime": {},
+        "bySource": {},
+        "byWorkspace": {},
+        "completionRate": null,
+        "daily": [],
+        "dailyTokens": [],
+        "friction": {
+          "blockedEntries": 0,
+          "earlySettles": 0,
+          "overruns": 0,
+          "retriedTasks": 0
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 0,
+          "merged": 0,
+          "noPr": 0,
+          "open": 0
+        },
+        "live": 0,
+        "longestMinutes": null,
+        "medianMinutes": null,
+        "outcomes": {},
+        "p90Minutes": null,
+        "sinceDays": 7,
+        "tasksTouched": 0,
+        "tokenCoverage": null,
+        "tokens": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 0,
+          "outputTokens": 0
+        },
+        "tokensByModel": {},
+        "tokensByRuntime": {},
+        "totalMinutes": 0
+      }
+    },
+    {
+      "expect": {
+        "completionPercent": null,
+        "coveragePercent": null,
+        "hasTokens": false,
+        "isEmpty": true,
+        "peakDispatches": 0,
+        "peakTokens": 0,
+        "tokenTotal": 0,
+        "windowLabel": "all time"
+      },
+      "name": "all time, nothing in it",
+      "stats": {
+        "agentDispatched": 0,
+        "attempts": 0,
+        "attemptsWithTokens": 0,
+        "byAccount": {},
+        "byRuntime": {},
+        "bySource": {},
+        "byWorkspace": {},
+        "completionRate": null,
+        "daily": [],
+        "dailyTokens": [],
+        "friction": {
+          "blockedEntries": 0,
+          "earlySettles": 0,
+          "overruns": 0,
+          "retriedTasks": 0
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 0,
+          "merged": 0,
+          "noPr": 0,
+          "open": 0
+        },
+        "live": 0,
+        "longestMinutes": null,
+        "medianMinutes": null,
+        "outcomes": {},
+        "p90Minutes": null,
+        "sinceDays": null,
+        "tasksTouched": 0,
+        "tokenCoverage": null,
+        "tokens": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 0,
+          "outputTokens": 0
+        },
+        "tokensByModel": {},
+        "tokensByRuntime": {},
+        "totalMinutes": 0
+      }
+    },
+    {
+      "expect": {
+        "completionPercent": null,
+        "coveragePercent": null,
+        "hasTokens": false,
+        "isEmpty": true,
+        "peakDispatches": 0,
+        "peakTokens": 0,
+        "tokenTotal": 0,
+        "windowLabel": "last 24 hours"
+      },
+      "name": "24 hours",
+      "stats": {
+        "agentDispatched": 0,
+        "attempts": 0,
+        "attemptsWithTokens": 0,
+        "byAccount": {},
+        "byRuntime": {},
+        "bySource": {},
+        "byWorkspace": {},
+        "completionRate": null,
+        "daily": [],
+        "dailyTokens": [],
+        "friction": {
+          "blockedEntries": 0,
+          "earlySettles": 0,
+          "overruns": 0,
+          "retriedTasks": 0
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 0,
+          "merged": 0,
+          "noPr": 0,
+          "open": 0
+        },
+        "live": 0,
+        "longestMinutes": null,
+        "medianMinutes": null,
+        "outcomes": {},
+        "p90Minutes": null,
+        "sinceDays": 1,
+        "tasksTouched": 0,
+        "tokenCoverage": null,
+        "tokens": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 0,
+          "outputTokens": 0
+        },
+        "tokensByModel": {},
+        "tokensByRuntime": {},
+        "totalMinutes": 0
+      }
+    },
+    {
+      "expect": {
+        "completionPercent": null,
+        "coveragePercent": "0%",
+        "hasTokens": false,
+        "isEmpty": false,
+        "peakDispatches": 0,
+        "peakTokens": 0,
+        "tokenTotal": 0,
+        "windowLabel": "last 30 days"
+      },
+      "name": "ran, and nothing reported usage",
+      "stats": {
+        "agentDispatched": 0,
+        "attempts": 4,
+        "attemptsWithTokens": 0,
+        "byAccount": {},
+        "byRuntime": {},
+        "bySource": {},
+        "byWorkspace": {},
+        "completionRate": null,
+        "daily": [],
+        "dailyTokens": [],
+        "friction": {
+          "blockedEntries": 0,
+          "earlySettles": 0,
+          "overruns": 0,
+          "retriedTasks": 0
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 0,
+          "merged": 0,
+          "noPr": 0,
+          "open": 0
+        },
+        "live": 0,
+        "longestMinutes": null,
+        "medianMinutes": null,
+        "outcomes": {},
+        "p90Minutes": null,
+        "sinceDays": 30,
+        "tasksTouched": 0,
+        "tokenCoverage": 0.0,
+        "tokens": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 0,
+          "outputTokens": 0
+        },
+        "tokensByModel": {},
+        "tokensByRuntime": {},
+        "totalMinutes": 0
+      }
+    },
+    {
+      "expect": {
+        "completionPercent": "82%",
+        "coveragePercent": "62%",
+        "hasTokens": true,
+        "isEmpty": false,
+        "peakDispatches": 8,
+        "peakTokens": 440,
+        "tokenTotal": 185000,
+        "windowLabel": "last 7 days"
+      },
+      "name": "a busy week",
+      "stats": {
+        "agentDispatched": 5,
+        "attempts": 13,
+        "attemptsWithTokens": 8,
+        "byAccount": {},
+        "byRuntime": {
+          "claude-code": 10,
+          "codex": 3
+        },
+        "bySource": {},
+        "byWorkspace": {
+          "comet-native": 9,
+          "edge": 4
+        },
+        "completionRate": 0.8181818181818182,
+        "daily": [
+          {
+            "date": "2026-08-03",
+            "dispatches": 2,
+            "done": 2
+          },
+          {
+            "date": "2026-08-04",
+            "dispatches": 0,
+            "done": 0
+          },
+          {
+            "date": "2026-08-05",
+            "dispatches": 8,
+            "done": 5
+          },
+          {
+            "date": "2026-08-06",
+            "dispatches": 3,
+            "done": 3
+          }
+        ],
+        "dailyTokens": [
+          {
+            "date": "2026-08-03",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 100,
+              "outputTokens": 10
+            }
+          },
+          {
+            "date": "2026-08-04",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 0,
+              "outputTokens": 0
+            }
+          },
+          {
+            "date": "2026-08-05",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 400,
+              "outputTokens": 40
+            }
+          },
+          {
+            "date": "2026-08-06",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 50,
+              "outputTokens": 5
+            }
+          }
+        ],
+        "friction": {
+          "blockedEntries": 4,
+          "earlySettles": 1,
+          "overruns": 1,
+          "retriedTasks": 3
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 1,
+          "merged": 7,
+          "noPr": 1,
+          "open": 2
+        },
+        "live": 2,
+        "longestMinutes": null,
+        "medianMinutes": 18,
+        "outcomes": {},
+        "p90Minutes": 74,
+        "sinceDays": 7,
+        "tasksTouched": 11,
+        "tokenCoverage": 0.6153846153846154,
+        "tokens": {
+          "cacheCreationTokens": 21500,
+          "cacheReadTokens": 148000,
+          "inputTokens": 9400,
+          "outputTokens": 6100
+        },
+        "tokensByModel": {
+          "claude-opus-5": {
+            "cacheCreationTokens": 21000,
+            "cacheReadTokens": 148000,
+            "inputTokens": 9000,
+            "outputTokens": 6000
+          },
+          "gpt-5.6-terra": {
+            "cacheCreationTokens": 500,
+            "cacheReadTokens": 0,
+            "inputTokens": 400,
+            "outputTokens": 100
+          }
+        },
+        "tokensByRuntime": {},
+        "totalMinutes": 351
+      }
+    }
+  ],
+  "humanMinutes": [
+    {
+      "expect": "0m",
+      "minutes": -5
+    },
+    {
+      "expect": "0m",
+      "minutes": 0
+    },
+    {
+      "expect": "48m",
+      "minutes": 48
+    },
+    {
+      "expect": "59m",
+      "minutes": 59
+    },
+    {
+      "expect": "1h",
+      "minutes": 60
+    },
+    {
+      "expect": "3h 20m",
+      "minutes": 200
+    },
+    {
+      "expect": "1d",
+      "minutes": 1440
+    },
+    {
+      "expect": "1d 1h",
+      "minutes": 1500
+    },
+    {
+      "expect": "2d 4h",
+      "minutes": 3120
+    }
+  ],
+  "humanTokens": [
+    {
+      "expect": "0",
+      "tokens": 0
+    },
+    {
+      "expect": "812",
+      "tokens": 812
+    },
+    {
+      "expect": "1.2k",
+      "tokens": 1240
+    },
+    {
+      "expect": "10.0k",
+      "tokens": 9999
+    },
+    {
+      "expect": "10k",
+      "tokens": 10000
+    },
+    {
+      "expect": "48k",
+      "tokens": 48200
+    },
+    {
+      "expect": "1.31M",
+      "tokens": 1310442
+    },
+    {
+      "expect": "2.50B",
+      "tokens": 2500000000
+    }
+  ],
+  "note": "Generated by crates/proto/src/view/stats.rs (mod spec). Do not hand-edit — run `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`.",
+  "percent": [
+    {
+      "expect": null,
+      "rate": null
+    },
+    {
+      "expect": "0%",
+      "rate": 0.0
+    },
+    {
+      "expect": "91%",
+      "rate": 0.914
+    },
+    {
+      "expect": "100%",
+      "rate": 1.0
+    },
+    {
+      "expect": "100%",
+      "rate": 1.4
+    },
+    {
+      "expect": "0%",
+      "rate": -0.2
+    }
+  ],
+  "rankedTokens": [
+    {
+      "expect": [
+        {
+          "label": "opus",
+          "usage": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 5000,
+            "inputTokens": 1000,
+            "outputTokens": 100
+          }
+        },
+        {
+          "label": "haiku",
+          "usage": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "inputTokens": 500,
+            "outputTokens": 50
+          }
+        },
+        {
+          "label": "2 others",
+          "usage": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "inputTokens": 14,
+            "outputTokens": 2
+          }
+        }
+      ],
+      "max": 2,
+      "name": "ranks on the total and folds the tail with its usage",
+      "tally": {
+        "cursor-small": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 4,
+          "outputTokens": 1
+        },
+        "haiku": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 500,
+          "outputTokens": 50
+        },
+        "opus": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 5000,
+          "inputTokens": 1000,
+          "outputTokens": 100
+        },
+        "sonnet": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 10,
+          "outputTokens": 1
+        }
+      }
+    },
+    {
+      "expect": [
+        {
+          "label": "opus",
+          "usage": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "inputTokens": 1,
+            "outputTokens": 1
+          }
+        }
+      ],
+      "max": 6,
+      "name": "a model that spent nothing is not a row",
+      "tally": {
+        "mock": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 0,
+          "outputTokens": 0
+        },
+        "opus": {
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "inputTokens": 1,
+          "outputTokens": 1
+        }
+      }
+    }
+  ],
+  "rankedTop": [
+    {
+      "expect": [
+        {
+          "count": 9,
+          "label": "comet"
+        },
+        {
+          "count": 3,
+          "label": "attn"
+        },
+        {
+          "count": 3,
+          "label": "zed"
+        }
+      ],
+      "max": 0,
+      "name": "ties do not shuffle",
+      "tally": {
+        "attn": 3,
+        "comet": 9,
+        "zed": 3
+      }
+    },
+    {
+      "expect": [
+        {
+          "count": 5,
+          "label": "a"
+        },
+        {
+          "count": 4,
+          "label": "b"
+        },
+        {
+          "count": 6,
+          "label": "3 others"
+        }
+      ],
+      "max": 2,
+      "name": "the tail is folded, never dropped",
+      "tally": {
+        "a": 5,
+        "b": 4,
+        "c": 3,
+        "d": 2,
+        "e": 1
+      }
+    },
+    {
+      "expect": [
+        {
+          "count": 2,
+          "label": "a"
+        },
+        {
+          "count": 1,
+          "label": "b"
+        }
+      ],
+      "max": 5,
+      "name": "shorter than the cap is left alone",
+      "tally": {
+        "a": 2,
+        "b": 1
+      }
+    },
+    {
+      "expect": [],
+      "max": 4,
+      "name": "nothing at all",
+      "tally": {}
+    }
+  ]
+}

@@ -36,6 +36,34 @@ desktop's pulldown-cmark config).
   `-route`/`-sheet` work against a live edge too, which is where the rows that
   matter are.
 
+### Keeping the ported rules honest (gh#157)
+
+Several files here are second implementations of rules that live in Rust —
+`StatsModels.swift`, `SpaceRows.swift`, `BoardModels.swift` — because no Rust
+runs on this device. Two implementations of one rule is how a phone comes to
+disagree with a laptop about a number somebody is deciding on, so for the stats
+rules the *cases* live outside both languages:
+
+```sh
+cargo test -p comet-proto stats     # the Rust half + the fixture guard
+scripts/ios-stats-spec.sh           # the Swift half, in the simulator
+```
+
+`crates/proto/src/view/stats.rs` (mod `spec`) generates
+`Comet/Spec/stats-spec.json` — every rule's inputs and expected outputs, plus
+real serialized `BoardStats` values so the decode is checked too — and fails
+when the checked-in file stops matching the Rust. `SpecRunner` (launch arg
+`-spec`) asserts the Swift functions against the same file. Whichever side
+moves is the side that fails. After changing a rule in Rust:
+
+```sh
+UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats && scripts/ios-stats-spec.sh
+```
+
+A launch-arg runner rather than XCTest: this project has one target and one
+shared scheme, and a test target means editing `project.pbxproj` and
+`Comet.xcscheme`. `-bench` and `-e2e` already work this way.
+
 ### Verifying the board against a real box
 
 `-e2e-board <repoPath>` drives gh#114's exit criteria headlessly, against a dev
@@ -74,7 +102,8 @@ Board/
                         wire shape (decoded strictly — a skewed field is an
                         error, never a zero) plus the renderer's arithmetic —
                         ranking a tally, scaling a bar, phrasing a duration,
-                        folding a tail into `n others`, and the honest empties
+                        folding a tail into `n others`, and the honest empties.
+                        Held to the Rust by a shared fixture — see below
   ActiveSection.swift   the one live group (gh#103 + gh#117, merged by gh#123),
                         phone-shaped: attempts with identifier chips, unmanaged
                         runs by bare title, needs-you first

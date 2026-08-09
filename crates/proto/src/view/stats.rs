@@ -669,3 +669,302 @@ mod tests {
         assert_eq!(back, s);
     }
 }
+
+/// The cross-language fixture (gh#157).
+///
+/// The rules above have a second implementation: `apps/ios/Comet/Board/
+/// StatsModels.swift`, because no Rust runs on that device. Two
+/// implementations of one rule is exactly what this module's own doc calls a
+/// real bug waiting to happen — the phone quietly disagreeing with the desktop
+/// about a number somebody is deciding on — and the tests above only ever
+/// guarded the half written in Rust.
+///
+/// So the *cases* leave Rust as data. This module writes every rule's inputs
+/// and expected outputs to `apps/ios/Comet/Spec/stats-spec.json`, asserts the
+/// checked-in file still matches what the code here produces, and the phone's
+/// `SpecRunner` asserts its own functions against the same file. One spec, two
+/// consumers: whichever side moves is the side that fails.
+///
+/// Regenerate after changing a rule (and re-run `scripts/ios-stats-spec.sh`,
+/// which is where the Swift half will disagree):
+///
+/// ```sh
+/// UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats
+/// ```
+#[cfg(test)]
+mod spec {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn tally(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    fn usage(input: u64, output: u64, read: u64, write: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_creation_tokens: write,
+        }
+    }
+
+    fn token_tally(pairs: &[(&str, TokenUsage)]) -> BTreeMap<String, TokenUsage> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    fn day(date: &str, dispatches: usize, done: usize) -> DayBucket {
+        DayBucket {
+            date: date.to_string(),
+            dispatches,
+            done,
+        }
+    }
+
+    fn spec_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/ios/Comet/Spec/stats-spec.json")
+    }
+
+    /// One `ranked_top` case: a tally, a cap, and the rows it must produce.
+    fn ranked_case(name: &str, pairs: &[(&str, usize)], max: usize) -> Value {
+        let input = tally(pairs);
+        json!({ "name": name, "tally": input, "max": max, "expect": ranked_top(&input, max) })
+    }
+
+    fn token_case(name: &str, pairs: &[(&str, TokenUsage)], max: usize) -> Value {
+        let input = token_tally(pairs);
+        json!({ "name": name, "tally": input, "max": max, "expect": ranked_tokens(&input, max) })
+    }
+
+    /// One whole-struct case: a serialized `BoardStats` and every answer the
+    /// struct's own accessors give about it. Doubles as a decode test — the
+    /// phone has to read this shape off the wire before it can render it.
+    fn stats_case(name: &str, stats: &BoardStats) -> Value {
+        json!({
+            "name": name,
+            "stats": stats,
+            "expect": {
+                "windowLabel": stats.window_label(),
+                "isEmpty": stats.is_empty(),
+                "hasTokens": stats.has_tokens(),
+                "completionPercent": percent(stats.completion_rate),
+                "coveragePercent": percent(stats.token_coverage),
+                "tokenTotal": stats.tokens.total(),
+                "peakDispatches": peak_dispatches(&stats.daily),
+                "peakTokens": peak_tokens(&stats.daily_tokens),
+            }
+        })
+    }
+
+    /// Every rule this module owns, as data.
+    fn build() -> Value {
+        // A board mid-window: things ended, things merged, tokens partly
+        // metered — the case where every accessor has something to say.
+        let mut busy = BoardStats::empty(Some(7));
+        busy.attempts = 13;
+        busy.tasks_touched = 11;
+        busy.live = 2;
+        busy.completion_rate = Some(0.8181818181818182);
+        busy.median_minutes = Some(18);
+        busy.p90_minutes = Some(74);
+        busy.total_minutes = 351;
+        busy.tokens = usage(9_400, 6_100, 148_000, 21_500);
+        busy.attempts_with_tokens = 8;
+        busy.token_coverage = Some(8.0 / 13.0);
+        busy.landing = Landing {
+            merged: 7,
+            open: 2,
+            closed_unmerged: 1,
+            no_pr: 1,
+        };
+        busy.friction = Friction {
+            retried_tasks: 3,
+            early_settles: 1,
+            blocked_entries: 4,
+            overruns: 1,
+        };
+        busy.daily = vec![
+            day("2026-08-03", 2, 2),
+            day("2026-08-04", 0, 0),
+            day("2026-08-05", 8, 5),
+            day("2026-08-06", 3, 3),
+        ];
+        busy.daily_tokens = vec![
+            TokenDay {
+                date: "2026-08-03".into(),
+                usage: usage(100, 10, 0, 0),
+            },
+            TokenDay {
+                date: "2026-08-04".into(),
+                usage: TokenUsage::default(),
+            },
+            TokenDay {
+                date: "2026-08-05".into(),
+                usage: usage(400, 40, 0, 0),
+            },
+            TokenDay {
+                date: "2026-08-06".into(),
+                usage: usage(50, 5, 0, 0),
+            },
+        ];
+        busy.by_workspace = tally(&[("comet-native", 9), ("edge", 4)]);
+        busy.by_runtime = tally(&[("claude-code", 10), ("codex", 3)]);
+        busy.agent_dispatched = 5;
+        busy.tokens_by_model = token_tally(&[
+            ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
+            ("gpt-5.6-terra", usage(400, 100, 0, 500)),
+        ]);
+
+        // Attempts ran and none reported usage: a REAL 0% coverage, which is a
+        // different fact from "nothing ran" and the one most easily lost.
+        let mut unmetered = BoardStats::empty(Some(30));
+        unmetered.attempts = 4;
+        unmetered.token_coverage = Some(0.0);
+
+        // Scalar rules, one case per input. Built before the object below
+        // because `json!` reads a `[` as an array literal, not as a Rust one.
+        let human_token_cases: Vec<Value> = [
+            0_u64,
+            812,
+            1_240,
+            9_999,
+            10_000,
+            48_200,
+            1_310_442,
+            2_500_000_000,
+        ]
+        .iter()
+        .map(|t| json!({ "tokens": t, "expect": human_tokens(*t) }))
+        .collect();
+        let human_minute_cases: Vec<Value> = [-5_i64, 0, 48, 59, 60, 200, 1_440, 1_500, 3_120]
+            .iter()
+            .map(|m| json!({ "minutes": m, "expect": human_minutes(*m) }))
+            .collect();
+        // None stays None all the way to the renderer: a rate that has not
+        // happened yet is not 0%.
+        let percent_cases: Vec<Value> = [
+            None,
+            Some(0.0),
+            Some(0.914),
+            Some(1.0),
+            Some(1.4),
+            Some(-0.2),
+        ]
+        .iter()
+        .map(|r| json!({ "rate": r, "expect": percent(*r) }))
+        .collect();
+        // Against the largest bucket, never the total.
+        let bar_cases: Vec<Value> = [(8_usize, 8_usize), (2, 8), (0, 8), (0, 0), (9, 8)]
+            .iter()
+            .map(|(v, p)| json!({ "value": v, "peak": p, "expect": bar_fraction(*v, *p) }))
+            .collect();
+
+        json!({
+            "note": "Generated by crates/proto/src/view/stats.rs (mod spec). \
+                     Do not hand-edit — run `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`.",
+            "rankedTop": [
+                // Ties alphabetical, so an unchanged board redraws identically.
+                ranked_case("ties do not shuffle", &[("attn", 3), ("comet", 9), ("zed", 3)], 0),
+                // The fold carries the count it stands for.
+                ranked_case(
+                    "the tail is folded, never dropped",
+                    &[("a", 5), ("b", 4), ("c", 3), ("d", 2), ("e", 1)],
+                    2,
+                ),
+                ranked_case("shorter than the cap is left alone", &[("a", 2), ("b", 1)], 5),
+                ranked_case("nothing at all", &[], 4),
+            ],
+            "rankedTokens": [
+                token_case(
+                    "ranks on the total and folds the tail with its usage",
+                    &[
+                        ("sonnet", usage(10, 1, 0, 0)),
+                        ("opus", usage(1_000, 100, 5_000, 0)),
+                        ("haiku", usage(500, 50, 0, 0)),
+                        ("cursor-small", usage(4, 1, 0, 0)),
+                    ],
+                    2,
+                ),
+                token_case(
+                    "a model that spent nothing is not a row",
+                    &[("mock", TokenUsage::default()), ("opus", usage(1, 1, 0, 0))],
+                    6,
+                ),
+            ],
+            "humanTokens": human_token_cases,
+            "humanMinutes": human_minute_cases,
+            "percent": percent_cases,
+            "barFraction": bar_cases,
+            "boardStats": [
+                stats_case("a board that has just started", &BoardStats::empty(Some(7))),
+                stats_case("all time, nothing in it", &BoardStats::empty(None)),
+                stats_case("24 hours", &BoardStats::empty(Some(1))),
+                stats_case("ran, and nothing reported usage", &unmetered),
+                stats_case("a busy week", &busy),
+            ],
+        })
+    }
+
+    #[test]
+    fn the_cross_language_fixture_matches_this_module() {
+        let built = build();
+        let rendered = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&built).expect("serializes")
+        );
+        let path = spec_path();
+        if std::env::var("UPDATE_STATS_SPEC").is_ok() {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).expect("fixture directory");
+            }
+            std::fs::write(&path, &rendered).expect("writes the fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "cannot read {}: {err}. Run `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`",
+                path.display()
+            )
+        });
+        // Compare as JSON, not as text: reformatting the file is not a
+        // behaviour change, and a rule moving is.
+        let disk_value: Value = serde_json::from_str(&on_disk).expect("the fixture is JSON");
+        if disk_value == built {
+            return;
+        }
+        // Report the sections that moved, not the whole document. A diff of
+        // eight hundred lines is a diff nobody reads, and the useful fact here
+        // is *which rule* changed.
+        let (disk_map, built_map) = (
+            disk_value.as_object().expect("an object"),
+            built.as_object().expect("an object"),
+        );
+        let moved: Vec<String> = built_map
+            .keys()
+            .chain(disk_map.keys())
+            .filter(|key| disk_map.get(*key) != built_map.get(*key))
+            .map(|key| {
+                format!(
+                    "  {key}:\n    fixture: {}\n    now:     {}",
+                    disk_map
+                        .get(key)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "(absent)".into()),
+                    built_map
+                        .get(key)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "(absent)".into()),
+                )
+            })
+            .collect();
+        panic!(
+            "the checked-in stats fixture no longer matches this module — a rule changed here, \
+             so the phone's copy in apps/ios/Comet/Board/StatsModels.swift is now wrong too.\n\n\
+             {}\n\n\
+             Regenerate with `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`, then run \
+             `scripts/ios-stats-spec.sh` and fix whatever the Swift side reports.",
+            moved.join("\n")
+        );
+    }
+}

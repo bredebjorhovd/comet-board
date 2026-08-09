@@ -1844,11 +1844,25 @@ Three things the other surfaces had and the phone did not: the stats screen
   coverage, at-a-glance, by runtime). The tile rows, the side-by-side panels
   and hour-of-day did not come.
 - **`comet_proto::view::stats`, ported not shared.** No Rust runs on the
-  device, so `StatsModels.swift` is the Swift half of it, rule for rule, with
-  the Rust tests as the specification — the same discipline `SpaceRows.swift`
-  and `BoardModels.swift` keep. The wire struct decodes *strictly*: a field
-  whose name skewed arrives as an error the screen says out loud, not as a zero
-  that reads like a real one.
+  device, so `StatsModels.swift` is the Swift half of it, rule for rule — the
+  same discipline `SpaceRows.swift` and `BoardModels.swift` keep. The wire
+  struct decodes *strictly*: a field whose name skewed arrives as an error the
+  screen says out loud, not as a zero that reads like a real one.
+- **One spec, two consumers.** "Ported rule for rule" is a property that decays
+  silently, and the first symptom is the phone disagreeing with the desktop
+  about a number somebody is deciding on. The ported surface had tests on the
+  Rust half only, so the *cases* left Rust as data: `mod spec` in
+  `crates/proto/src/view/stats.rs` writes every rule's inputs and expected
+  outputs to `apps/ios/Comet/Spec/stats-spec.json` and fails when the
+  checked-in file stops matching the Rust (regenerate with
+  `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`); the phone's
+  `SpecRunner` asserts its own functions against the same file, 79 checks, run
+  by `scripts/ios-stats-spec.sh`. Whichever side moves is the side that fails —
+  verified by breaking a rule in each language in turn. The struct cases carry
+  a real serialized `BoardStats`, so the decode is checked with them. A launch
+  arg rather than XCTest because this project has one target and one shared
+  scheme, and a test target means editing `project.pbxproj` and
+  `Comet.xcscheme`; `-bench` and `-e2e` already set that precedent.
 - **The sweep, and one thing the desktop page did not need.** `BoardStats` is
   a plain relay call to whichever device hosts the board — the settled host
   first, then the rest of `host_candidates`. On a phone the screen can be

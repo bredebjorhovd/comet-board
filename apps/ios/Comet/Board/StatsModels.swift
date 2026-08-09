@@ -10,6 +10,16 @@
 // on this device. The Rust tests in `crates/proto/src/view/stats.rs` are the
 // specification; these functions must keep answering the way they do.
 //
+// **That is checked, not hoped for (gh#157).** A second implementation of a
+// rule is how a phone comes to disagree with a laptop about a number somebody
+// is deciding on, so the cases live outside both languages: `mod spec` in that
+// Rust file writes every rule's inputs and expected outputs to
+// `Spec/stats-spec.json` and fails if the checked-in file stops matching the
+// Rust; `SpecRunner` (launch arg `-spec`, or `scripts/ios-stats-spec.sh`) runs
+// the functions below against the same file. Whichever side moves is the side
+// that fails. Each function names the Rust one it mirrors — if you change one,
+// the fixture will tell you about the other.
+//
 // **Honest empties are the rule of the whole file.** `completionRate` is
 // `nil` rather than 0% before anything has ended, a window that metered
 // nothing shows a blank instead of a free-looking zero, and every token total
@@ -86,7 +96,7 @@ struct TokenDay: Decodable, Hashable {
 }
 
 /// One row of a tally — a workspace, a runtime, a source, a person.
-struct Tally: Hashable, Identifiable {
+struct Tally: Decodable, Hashable, Identifiable {
     var id: String { label }
     var label: String
     var count: Int
@@ -94,7 +104,7 @@ struct Tally: Hashable, Identifiable {
 
 /// One row of a *token* tally: `Tally`'s shape with a breakdown instead of a
 /// count, so a table can show where the tokens went and not only how many.
-struct TokenTally: Hashable, Identifiable {
+struct TokenTally: Decodable, Hashable, Identifiable {
     var id: String { label }
     var label: String
     var usage: TokenUsage
@@ -200,6 +210,7 @@ struct BoardStats: Decodable, Hashable {
 
 /// One tally, ordered for reading: biggest first, ties alphabetical so the rows
 /// do not shuffle between refreshes of an unchanged board.
+/// Mirrors `stats::ranked` — pinned by the fixture's `rankedTop` cases.
 func ranked(_ tally: [String: Int]) -> [Tally] {
     tally.map { Tally(label: $0.key, count: $0.value) }
         .sorted { $0.count == $1.count ? $0.label < $1.label : $0.count > $1.count }
@@ -208,6 +219,7 @@ func ranked(_ tally: [String: Int]) -> [Tally] {
 /// The same, capped — with everything past the cap folded into one honest
 /// `n others` row rather than dropped. A truncated list that does not say it
 /// was truncated reads as the whole truth.
+/// Mirrors `stats::ranked_top`.
 func rankedTop(_ tally: [String: Int], _ max: Int) -> [Tally] {
     let rows = ranked(tally)
     guard max > 0, rows.count > max else { return rows }
@@ -220,6 +232,7 @@ func rankedTop(_ tally: [String: Int], _ max: Int) -> [Tally] {
 /// tail folded into one row that carries the usage it stands for. Rows that
 /// spent nothing are dropped — a model that appears with four zeroes is noise
 /// in a table about where tokens went.
+/// Mirrors `stats::ranked_tokens`.
 func rankedTokens(_ tally: [String: TokenUsage], _ max: Int) -> [TokenTally] {
     var rows: [TokenTally] = []
     for (label, usage) in tally where !usage.isZero {
@@ -241,6 +254,7 @@ func rankedTokens(_ tally: [String: TokenUsage], _ max: Int) -> [TokenTally] {
 /// Three significant figures and no more. Nobody acts on the difference
 /// between 1,310,442 and 1,310,443, and a seven-digit figure is a number the
 /// eye has to count digits in.
+/// Mirrors `stats::human_tokens`.
 func humanTokens(_ tokens: UInt64) -> String {
     let billion: UInt64 = 1_000_000_000
     let million: UInt64 = 1_000_000
@@ -257,6 +271,8 @@ func humanTokens(_ tokens: UInt64) -> String {
 /// not against the total: these charts answer "which day was busy", and a
 /// proportion-of-total bar on a thirty-day window is thirty bars too short to
 /// compare.
+/// Mirrors `stats::bar_fraction` (which takes usizes; the `UInt64` overload
+/// below is the same rule for the token series).
 func barFraction(_ value: Int, _ peak: Int) -> Double {
     guard peak > 0 else { return 0 }
     return min(max(Double(value) / Double(peak), 0), 1)
@@ -268,15 +284,18 @@ func barFraction(_ value: UInt64, _ peak: UInt64) -> Double {
 }
 
 /// The busiest bucket in a day series — the scale every bar is drawn against.
+/// Mirrors `stats::peak_dispatches`.
 func peakDispatches(_ daily: [DayBucket]) -> Int {
     daily.map(\.dispatches).max() ?? 0
 }
 
+/// Mirrors `stats::peak_tokens`.
 func peakTokens(_ daily: [TokenDay]) -> UInt64 {
     daily.map(\.usage.total).max() ?? 0
 }
 
 /// A duration in minutes, said the way a person would: `48m`, `3h 20m`, `2d 4h`.
+/// Mirrors `stats::human_minutes`.
 func humanMinutes(_ minutes: Int64) -> String {
     let m = Swift.max(0, minutes)
     if m < 60 { return "\(m)m" }
@@ -290,13 +309,33 @@ func humanMinutes(_ minutes: Int64) -> String {
 
 /// A rate as a whole-number percentage. `nil` stays `nil` all the way to the
 /// renderer — see `BoardStats.completionRate`.
+/// Mirrors `stats::percent` (renamed only because `percent` reads as a noun
+/// at a Swift call site).
 func percentLabel(_ rate: Double?) -> String? {
     guard let rate else { return nil }
     return String(format: "%.0f%%", min(max(rate, 0), 1) * 100)
 }
 
+/// The windows the stats screen offers, and what each is called — the same set
+/// the desktop page and the CLI's `--since-days` use, so the surfaces are
+/// asking one question.
+/// Mirrors `stats::WINDOWS`, shortened for a phone's width.
+let statsWindows: [(days: Int64?, label: String)] = [
+    (1, "24h"), (7, "7d"), (30, "30d"), (nil, "All"),
+]
+
+// MARK: - The renderer's own
+//
+// Everything below this line has no counterpart in `comet_proto` and so is not
+// in the fixture: it is how THIS screen phrases things, not a rule two
+// surfaces have to agree on. `coverageNote` is the one borderline case — the
+// desktop spells the same sentence in `StatsPage::coverage_note`, private to
+// its page. If a third surface ever needs it, it belongs in proto with the
+// rest, and in the fixture with them.
+
 /// The coverage sentence — what share of the window's attempts the token
-/// totals actually account for.
+/// totals actually account for. The desktop page's `coverage_note`, word for
+/// word.
 ///
 /// It rides with every token figure rather than sitting in a panel of its own,
 /// because a total read without it is a total read wrong: attempts that
@@ -306,13 +345,6 @@ func coverageNote(_ stats: BoardStats) -> String? {
     guard let share = percentLabel(stats.tokenCoverage) else { return nil }
     return "\(share) of attempts reported usage (\(stats.attemptsWithTokens) of \(stats.attempts))"
 }
-
-/// The windows the stats screen offers, and what each is called — the same set
-/// the desktop page and the CLI's `--since-days` use, so the surfaces are
-/// asking one question.
-let statsWindows: [(days: Int64?, label: String)] = [
-    (1, "24h"), (7, "7d"), (30, "30d"), (nil, "All"),
-]
 
 /// The headline's qualifying line: the facts that exist, in one sentence.
 ///

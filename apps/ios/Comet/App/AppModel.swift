@@ -71,6 +71,12 @@ final class AppModel {
             Task { await BenchRunner.run() }
             return
         }
+        // The ported stats rules against the fixture Rust generated (gh#157).
+        // No network, no session: it is arithmetic against a bundled file.
+        if args.contains("-spec") {
+            SpecRunner.run()
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return
