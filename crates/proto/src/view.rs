@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{AuthState, Chat, ChatIndicator, EdgeHealth, Session, SessionStatus, Space};
 
+pub mod account;
 pub mod board;
 pub mod needs;
 pub mod rates;

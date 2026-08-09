@@ -21,6 +21,7 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use comet_proto::view::account as view_account;
 use comet_rpc::methods;
 use gpui_tokio::Tokio;
 
@@ -54,6 +55,7 @@ use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_heigh
 use crate::theme::{Bed, ListRow as _, Theme};
 use crate::transcript::{self, Transcript};
 
+mod account;
 // `pub(crate)` for one thing only: `spaces::status_dot_color`, the sidebar's
 // half of the status-colour contract the board pane's test asserts (gh#173).
 pub(crate) mod spaces;
@@ -2023,13 +2025,14 @@ impl Shell {
 
     /// Settings-mode sidebar (comet settings-sidebar.tsx): window-control
     /// strip, "Settings" heading, icon section rows styled like session rows,
-    /// and a Back row pinned to the bottom.
+    /// then a Back row and the account footer pinned to the bottom.
     fn render_settings_nav(
         &mut self,
         section: SettingsSection,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let account_footer = self.render_account_footer(theme, cx);
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
@@ -2100,22 +2103,15 @@ impl Shell {
                         }),
                     )),
             )
-            // Back pinned to the bottom (comet settings-sidebar.tsx).
+            // Back pinned to the bottom (comet settings-sidebar.tsx), in the
+            // shared footer-row chrome — it and the account block below it are
+            // the same construction in the design, so they are one widget.
             .child(
-                div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
-                    div()
-                        .id("settings-back")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .rounded(px(Theme::RADIUS_ROW))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(6.0))
+                div().px(px(Theme::SPACE_SM)).child(
+                    account::footer_row(theme, "settings-back")
                         .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.wash(0.11)).text_color(theme.text))
+                        .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (comet settings-sidebar.tsx),
@@ -2127,6 +2123,9 @@ impl Shell {
                         .child(SharedString::from("Back")),
                 ),
             )
+            // …and the same account footer the chat sidebar closes with: the
+            // anchor is only an anchor if Settings has it too (gh#230).
+            .child(account_footer)
             .into_any_element()
     }
 
@@ -2141,10 +2140,8 @@ impl Shell {
     /// Chat-mode sidebar (gh#124): the Needs-you inbox, the orchestrator slot,
     /// the Spaces section — each space disclosing its own sessions inline, the
     /// ONE authoritative session surface — then the live-work groups (Agents /
-    /// Running), the notice strip, and the UserMenu (§1.6).
+    /// Running), the notice strip, and the account footer (gh#230).
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let user = self.state.read(cx).auth_user().cloned();
-
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
         let (lists_fade_top, lists_fade_bottom) = self.sidebar_fade_zones();
@@ -2157,12 +2154,7 @@ impl Shell {
         let glass = Theme::GLASS_ALPHA < 1.0;
         let sidebar_fade = theme.surface;
 
-        let user_line: SharedString = user
-            .as_ref()
-            .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-            .unwrap_or_else(|| SharedString::from("Not signed in"));
-        let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
-        let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
+        let account_footer = self.render_account_footer(theme, cx);
 
         // First, the inbox (gh#122): does anything want me — in words, and it
         // cannot miss. Then the orchestrator's pinned slot, then the live-work
@@ -2246,7 +2238,7 @@ impl Shell {
                         )
                     }),
             ))
-            // Update strip (above the user menu; below the lists).
+            // Update strip (above the account footer; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
@@ -2272,7 +2264,7 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(account_footer)
             .into_any_element()
     }
 
@@ -2422,44 +2414,30 @@ impl Shell {
         }
     }
 
-    /// UserMenu (§1.6): name/email trigger row; menu with plan badge, Open
-    /// settings, Sign out.
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        user_email: Option<SharedString>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The account footer (gh#230): a hairline, then the block that closes
+    /// every sidebar — avatar, display name, plan tier — and the account menu
+    /// it triggers.
+    ///
+    /// Every word comes from [`comet_proto::view::account::account_footer`],
+    /// derived from the engine's last `AuthStatus`. That is the whole point of
+    /// the block: the board sweeps hosts and the priced pages read rates off
+    /// whichever account is signed in, so a footer that guessed would be worse
+    /// than none. Signed out it degrades to a row that says so and offers the
+    /// way in, rather than to an empty strip.
+    ///
+    /// That signed-out row is narrow but real: [`comet_proto::view::gate_phase`]
+    /// puts a reported `SignedOut` behind the sign-in gate and a workspace-less
+    /// session behind the org gate, so the one state that reaches here without
+    /// a session is the window between the engine connecting and its first
+    /// `AuthStatus` frame. The row still has to be right for it — that gap is
+    /// exactly when "am I signed in?" is the question being asked.
+    fn render_account_footer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let identity = view_account::account_footer(self.state.read(cx).auth.as_ref());
         let open = self.user_menu_open;
-        // Bottom-of-sidebar identity (comet user-menu.tsx): avatar circle +
-        // name with the plan label underneath, Alpha badge chip on the right.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
-        let mut trigger = div()
-            .id("user-menu")
-            .flex_none()
-            .rounded(px(Theme::RADIUS_ROW))
-            .px(px(Theme::SPACE_SM))
-            .py(px(Theme::SPACE_SM))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(10.0))
-            .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
-            .bg(if open {
-                theme.element_hover
-            } else {
-                motion::hover_blend("user-menu-trigger", theme.wash(0.0), theme.wash(0.11))
-            })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
+        let in_settings = matches!(self.route, Route::Settings(_));
+
+        let mut block = account::account_block(theme, &identity, open)
+            .my(px(Theme::SPACE_SM))
             .on_click(cx.listener(|this, _, _, cx| {
                 // A click that just dismissed the menu (outside-click on the
                 // trigger) must not instantly reopen it.
@@ -2469,54 +2447,17 @@ impl Shell {
                 this.user_menu_open = !this.user_menu_open && !just_dismissed;
                 this.user_menu_dismissed_at = None;
                 cx.notify();
-            }))
-            .child(
-                // Avatar: white circle, initial in near-black (comet user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded(px(Theme::RADIUS_ROW))
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(Theme::TEXT_DENSE))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
-            )
-            .child(
-                // Name with the plan label underneath — no chip on the right.
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .line_height(px(15.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Alpha")),
-                    ),
-            );
+            }));
+
         if open {
             // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
             // (exactly as wide as the trigger row — sidebar minus its p-2
             // gutters), `flex-col gap-0.5`, then: one small muted email line
             // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // "Settings", separator, "Sign out". Both rows are plain
+            // "Settings", separator, and the session verb. Both rows are plain
             // `menuItem`s with muted 16px icons — sign-out carries NO
             // destructive tone in the original.
+            let signed_out = !identity.state.has_session();
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2527,31 +2468,56 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .pt(px(6.0))
-                        .pb(px(4.0))
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(theme.text_subtle)
-                        .truncate()
-                        .child(user_email.unwrap_or(user_line)),
-                )
-                .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
-                        .id("user-menu-settings")
+                // The address, when there is one — signed out there is nothing
+                // to caption the name with, and a blank line is not a caption.
+                .when_some(identity.email.clone(), |el, email| {
+                    el.child(
+                        div()
+                            .px(px(8.0))
+                            .pt(px(6.0))
+                            .pb(px(4.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_subtle)
+                            .truncate()
+                            .child(SharedString::from(email)),
+                    )
+                })
+                // Settings is a door, and on the settings route it leads where
+                // you already are.
+                .when(!in_settings, |el| {
+                    el.child(
+                        popover::menu_row(theme, false, "user-menu-settings")
+                            .id("user-menu-settings")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_settings(SettingsSection::Devices, cx)
+                            }))
+                            .child(
+                                icon(icons::SETTINGS_MINIMALISTIC)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Settings")),
+                    )
+                })
+                .when(!in_settings, |el| el.child(popover::menu_separator(theme)))
+                // One verb, and it is the one the session state allows: a
+                // signed-out window offering "Sign out" was the same lie the
+                // hardcoded plan told.
+                .child(if signed_out {
+                    popover::menu_row(theme, false, "user-menu-signin")
+                        .id("user-menu-signin")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
+                            this.user_menu_open = false;
+                            this.start_sign_in(cx);
+                            cx.notify();
                         }))
                         .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
+                            icon(icons::LOGIN_2)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Settings")),
-                )
-                .child(popover::menu_separator(theme))
-                .child(
+                        .child(SharedString::from("Sign in"))
+                } else {
                     popover::menu_row(theme, false, "user-menu-signout")
                         .id("user-menu-signout")
                         .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
@@ -2560,12 +2526,18 @@ impl Shell {
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Sign out")),
-                )
+                        .child(SharedString::from("Sign out"))
+                })
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above("user-menu-popover", menu));
+            block = block.child(popover::anchored_menu_above("user-menu-popover", menu));
         }
-        trigger.into_any_element()
+
+        div()
+            .flex_none()
+            .px(px(Theme::SPACE_SM))
+            .child(account::footer_divider(theme))
+            .child(block)
+            .into_any_element()
     }
 
     /// Floating layers owned by the shell: the session context menu and the
