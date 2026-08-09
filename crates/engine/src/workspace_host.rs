@@ -639,6 +639,7 @@ impl WorkspaceHost {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: Utc::now(),
         };
         self.inner.doc.upsert_space(&space)?;
@@ -789,6 +790,7 @@ impl WorkspaceHost {
             git_detected,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: Utc::now(),
         })?;
         Ok(())
@@ -819,12 +821,13 @@ impl WorkspaceHost {
         space_id: &str,
         detected: bool,
         checkout_id: Option<&str>,
+        branch: Option<&str>,
     ) -> Result<bool, EngineError> {
         match self.inner.doc.space(space_id)? {
             Some(space) if space.device_id == self.inner.config.device_id => Ok(self
                 .inner
                 .doc
-                .set_space_git(space_id, detected, checkout_id, Utc::now())?),
+                .set_space_git(space_id, detected, checkout_id, branch, Utc::now())?),
             Some(space) => {
                 tracing::warn!(
                     space = %space_id, owner = %space.device_id,

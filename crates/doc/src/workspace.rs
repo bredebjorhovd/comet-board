@@ -7,7 +7,7 @@
 //! to the *same* row settle field-by-field LWW (exactly right for renames/archives):
 //! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, lastSeenAt}
 //! - `spaces`: LoroMap keyed by spaceId → row map {id, deviceId, path, name?,
-//!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
+//!   gitDetected, gitCheckedAt?, checkoutId?, branch?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
@@ -160,6 +160,7 @@ impl WorkspaceDoc {
         row.insert("gitDetected", space.git_detected)?;
         set_opt_ms(&row, "gitCheckedAt", space.git_checked_at)?;
         set_opt_str(&row, "checkoutId", space.checkout_id.as_deref())?;
+        set_opt_str(&row, "branch", space.branch.as_deref())?;
         row.insert("createdAt", space.created_at.timestamp_millis())?;
         self.doc.commit();
         Ok(())
@@ -190,14 +191,16 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
-    /// Owner-stamped git presence for the space folder (SpacesSync; ownership is
-    /// asserted by the engine layer, this is mechanism only). `false` when no
-    /// such row.
+    /// Owner-stamped git presence for the space folder — whether it is a work
+    /// tree, which checkout it is, and the branch it sits on (SpacesSync;
+    /// ownership is asserted by the engine layer, this is mechanism only).
+    /// `false` when no such row.
     pub fn set_space_git(
         &self,
         space_id: &str,
         detected: bool,
         checkout_id: Option<&str>,
+        branch: Option<&str>,
         checked_at: DateTime<Utc>,
     ) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("spaces", space_id) else {
@@ -205,6 +208,7 @@ impl WorkspaceDoc {
         };
         row.insert("gitDetected", detected)?;
         set_opt_str(&row, "checkoutId", checkout_id)?;
+        set_opt_str(&row, "branch", branch)?;
         row.insert("gitCheckedAt", checked_at.timestamp_millis())?;
         self.doc.commit();
         Ok(true)
@@ -588,6 +592,8 @@ struct RawSpace {
     #[serde(default)]
     checkout_id: Option<String>,
     #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
     created_at: i64,
 }
 
@@ -601,6 +607,7 @@ impl From<RawSpace> for Space {
             git_detected: raw.git_detected,
             git_checked_at: raw.git_checked_at.map(dt),
             checkout_id: raw.checkout_id,
+            branch: raw.branch,
             created_at: dt(raw.created_at),
         }
     }
@@ -743,6 +750,7 @@ mod tests {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: ts(1_500),
         }
     }
@@ -925,17 +933,28 @@ mod tests {
         assert_eq!(ws.space("sp-1").unwrap().unwrap().display_name(), "project");
 
         assert!(
-            ws.set_space_git("sp-1", true, Some("checkout-abc"), ts(4_000))
+            ws.set_space_git("sp-1", true, Some("checkout-abc"), Some("main"), ts(4_000))
                 .unwrap()
         );
         let row = ws.space("sp-1").unwrap().unwrap();
         assert!(row.git_detected);
         assert_eq!(row.checkout_id.as_deref(), Some("checkout-abc"));
+        assert_eq!(row.branch.as_deref(), Some("main"));
         assert_eq!(row.git_checked_at, Some(ts(4_000)));
+
+        // A branch is a fact about a work tree, so de-gitting the folder must
+        // clear it rather than leave the sidebar naming a branch that is gone.
+        assert!(
+            ws.set_space_git("sp-1", false, None, None, ts(5_000))
+                .unwrap()
+        );
+        let row = ws.space("sp-1").unwrap().unwrap();
+        assert!(!row.git_detected);
+        assert_eq!(row.branch, None);
 
         // Unknown rows report false, never invent rows.
         assert!(!ws.rename_space("nope", Some("x")).unwrap());
-        assert!(!ws.set_space_git("nope", true, None, ts(1)).unwrap());
+        assert!(!ws.set_space_git("nope", true, None, None, ts(1)).unwrap());
     }
 
     #[test]

@@ -934,6 +934,7 @@ impl EngineRpc {
                     git_detected: true,
                     git_checked_at: None,
                     checkout_id: None,
+                    branch: None,
                     created_at: chrono::Utc::now(),
                 }
                 .display_name()

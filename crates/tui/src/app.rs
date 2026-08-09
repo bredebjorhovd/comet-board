@@ -141,6 +141,11 @@ pub enum Row {
         /// (gh#138). Reads as "· 3 running": the dot says how urgent, this
         /// says how many, and the shelf below no longer repeats their rows.
         running: usize,
+        /// What the folder is checked out on (gh#229), or `None` for a folder
+        /// that is not a work tree. A collapsed space hides its chats and
+        /// their branches with them; this is the row's own answer to "where
+        /// is it".
+        branch: Option<String>,
     },
     /// One thing waiting on a human (gh#122): kind glyph + WHO on the first
     /// line, the one-line WHAT indented under it. First section in the
@@ -2328,6 +2333,7 @@ impl App {
                     label: titles[ix].line(),
                     attention: attention.get(&space.id).copied(),
                     running: shelf.running,
+                    branch: spaces_view::space_branch(space).map(str::to_string),
                 });
                 for chat in chats
                     .iter()
@@ -3454,6 +3460,7 @@ mod tests {
             git_detected: true,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: Utc::now() + chrono::Duration::minutes(created_min),
         }
     }
