@@ -438,6 +438,7 @@ mod tests {
             chat_archived_at: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
             tokens: None,
             model: None,

@@ -238,17 +238,30 @@ pub struct TaskRow {
     /// is also every row on a single-account box (gh#59).
     #[serde(default)]
     pub account: Option<String>,
-    /// The human whose frontend released this row's attempt, as that frontend
-    /// named them — an email when it knows one, else the user id (gh#74). Null
-    /// where nobody said: a `comet-board` dispatch, an agent's, and every
-    /// attempt from before the frontends sent it.
+    /// The human who released this row's attempt — an email where the box knows
+    /// one, else the user id (gh#74). Null where nobody said: a `comet-board`
+    /// dispatch, an agent's, and every attempt from before the frontends sent
+    /// it.
     ///
-    /// A claim, not a credential. Board calls relay as the device room's owner,
-    /// so the box cannot check who really pressed enter; #66's identity work is
-    /// what will make this checkable. Read it as "who says they did", and never
-    /// as permission to do anything.
+    /// How much the name is worth is
+    /// [`dispatched_by_verified`](Self::dispatched_by_verified), and a surface
+    /// that renders one without the other is asserting something the board did
+    /// not. Never a credential either way: what a run may spend stays the
+    /// explicit `account` (gh#59).
     #[serde(default)]
     pub dispatched_by_user: Option<String>,
+    /// Did the edge verify [`dispatched_by_user`](Self::dispatched_by_user)?
+    /// (gh#161.)
+    ///
+    /// True: the relay stamped the caller's verified identity onto the frame
+    /// and the box resolved it — a teammate's dispatch from their own laptop,
+    /// and what `require-own` refuses on. False: a claim — a dispatch issued on
+    /// the box itself (where nothing but the box can reach the IPC port), a
+    /// verified caller nobody could name, and every attempt from before this
+    /// existed. Defaults to false, so a row from an older box reads as the
+    /// claim it is.
+    #[serde(default)]
+    pub dispatched_by_verified: bool,
     /// Whose subscription this row's attempt actually spends, as an email
     /// (gh#101): the [`account`](Self::account) slot's login, or the box's own
     /// CLI login when the dispatch named no slot.
@@ -797,11 +810,13 @@ pub fn billed_email<'a>(
 
 /// Is this run spending somebody else's subscription?
 ///
-/// The match is claim-vs-slot-email and nothing more: `dispatcher` is the
-/// `viaUser` the dispatching frontend sent, which the box cannot verify (see
-/// [`TaskRow::dispatched_by_user`]). Two unknowns therefore read as "not
-/// cross-billed" rather than as an accusation — an unattributed dispatch (the
-/// bare CLI, an orchestrating agent) names nobody to have wronged.
+/// The match is dispatcher-vs-slot-email and nothing more. How much the
+/// dispatcher's name is worth is a separate question with its own answer
+/// ([`TaskRow::dispatched_by_verified`]): on the box it is the frontend's
+/// claim, over the relay it is the identity the edge verified, and this
+/// comparison is the same either way. Two unknowns read as "not cross-billed"
+/// rather than as an accusation — an unattributed dispatch (the bare CLI, an
+/// orchestrating agent) names nobody to have wronged.
 pub fn cross_billed(billed_to: Option<&str>, dispatcher: Option<&str>) -> bool {
     let (Some(billed), Some(by)) = (email(billed_to), email(dispatcher)) else {
         return false;
@@ -818,6 +833,24 @@ pub fn cross_billed(billed_to: Option<&str>, dispatcher: Option<&str>) -> bool {
 /// message that quietly stopped matching would turn the confirm into an error
 /// nobody could act on.
 pub const REQUIRE_OWN_REFUSAL: &str = "billing_guard = \"require-own\"";
+
+/// How a surface names the human who released an attempt, with the strength of
+/// the name on it (gh#161).
+///
+/// One derivation rather than each surface's own parenthetical, for the reason
+/// the billing words are shared: "ana@example.com" and "ana@example.com, as
+/// claimed" are different assertions, and a board that made them
+/// interchangeable would be publishing the weaker one as the stronger. The mark
+/// goes on the *claim*, not on the verified name, because the verified name is
+/// what the sentence would ordinarily mean.
+pub fn dispatcher_label(user: &str, verified: bool) -> String {
+    let user = user.trim();
+    if verified {
+        user.to_string()
+    } else {
+        format!("{user} (as claimed)")
+    }
+}
 
 /// A non-empty, trimmed email, or nothing.
 fn email(value: Option<&str>) -> Option<&str> {
@@ -1731,6 +1764,7 @@ mod tests {
             started_at: None,
             account: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
             max_duration_secs: None,
         }
@@ -2501,10 +2535,12 @@ mod tests {
         assert_eq!(billed_email(&[], ClaudeCode, None), None);
     }
 
-    /// The seatbelt's whole comparison. Two unknowns must never read as an
-    /// accusation: an unattributed dispatch names nobody to have wronged.
+    /// The guard's whole comparison — the same one whether the dispatcher's
+    /// name was verified or claimed (gh#161 decides *that* elsewhere). Two
+    /// unknowns must never read as an accusation: an unattributed dispatch
+    /// names nobody to have wronged.
     #[test]
-    fn cross_billed_is_a_claim_against_a_slot_email_and_nothing_else() {
+    fn cross_billed_is_a_dispatcher_against_a_slot_email_and_nothing_else() {
         assert!(cross_billed(
             Some("brede@tally.no"),
             Some("ana@example.com")

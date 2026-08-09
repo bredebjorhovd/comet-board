@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::billing::Billing;
+use crate::billing::{Attribution, Billing};
 use crate::config::{Route, RoutingConfig, interpolate, slugify};
 use crate::db::Db;
 use crate::model::{Dispatcher, Task, UpstreamState, gh_repo_name};
@@ -132,8 +132,13 @@ pub fn check_billing(
     let slot = effective_account(route, overrides);
     let billing = Billing {
         billed_to: account_email(harness, slot),
-        dispatcher: origin.user.clone(),
+        dispatcher: origin.attribution(),
         harness,
+        // The route's `account` counts as named: it is a decision somebody
+        // wrote down, and the silent fall to the box's own login is the case
+        // where nothing anywhere said which subscription pays.
+        named_slot: slot.is_some(),
+        is_owner: origin.is_box_owner(),
     };
     let acknowledged = crate::billing::acknowledges(
         overrides.bill.as_deref(),
@@ -144,22 +149,24 @@ pub fn check_billing(
     Ok(Some(billing))
 }
 
-/// Where a dispatch came from, as the caller reports it (gh#74).
+/// Where a dispatch came from (gh#74, gh#161).
 ///
-/// One struct rather than three parameters because the three answer one
-/// question — who released this — at three different strengths:
+/// One struct rather than four parameters because they all answer one question
+/// — who released this — at four different strengths:
 ///
-/// - `chat` is the only one the board can *check*: it looks the chat up in its
-///   own records, which is what [`dispatcher_for`] does below;
-/// - `device` and `user` are claims. A relayed board call arrives as the room
-///   owner (docs/BOARD.md §H9), so the box has no per-call identity to compare
-///   them against; establishing one is #66's territory. They are recorded
-///   anyway, because the alternative for a teammate's dispatch is the
-///   anonymous [`Dispatcher::Operator`] — an unverified name is a worse
-///   credential than none and a far better record.
+/// - `chat` the board can *check*: it looks the chat up in its own records,
+///   which is what [`dispatcher_for`] does below;
+/// - `verified` is the only *credential* here: the identity the edge Worker
+///   checked and the relay stamped onto the frame, which no frontend can write
+///   (gh#161). Absent means the call carried no relay stamp, which is a fact
+///   too — it came in over this box's own IPC port;
+/// - `device` and `user` stay claims, exactly as §H15 described them. `user` is
+///   the fallback for the local case and the record for everything else.
 ///
-/// Never authorize on `device`/`user`. Whose subscription a run spends is the
-/// explicit `account` (gh#59), never inferred from these.
+/// Whose subscription a run spends is still the explicit `account` (gh#59),
+/// never inferred from any of these. What `verified` buys is the *comparison*:
+/// `require-own` can now refuse on an identity the box did not have to take
+/// anybody's word for — see [`crate::billing`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DispatchOrigin {
     /// The dispatching chat's id — provenance, never authority.
@@ -167,8 +174,27 @@ pub struct DispatchOrigin {
     /// The device the dispatch was issued from.
     pub device: Option<String>,
     /// Who the dispatching frontend says is signed in there: an email when it
-    /// knows one, else the user id.
+    /// knows one, else the user id. A claim.
     pub user: Option<String>,
+    /// Who the *edge* says made this call, when it came over the relay.
+    pub verified: Option<VerifiedCaller>,
+}
+
+/// The dispatcher as the edge verified them, resolved by the receiving device
+/// (gh#161).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCaller {
+    /// The WorkOS user id the relay stamped on the frame. Never an email: the
+    /// edge verifies a JWT `sub`, and putting a name to it is the box's job.
+    pub user_id: String,
+    /// That id resolved to an address — from the box's own session when the
+    /// caller *is* the box's user, from the workspace roster otherwise.
+    /// `None` when neither could answer, which is a refusal under `require-own`
+    /// rather than a licence to fall back to the claim.
+    pub email: Option<String>,
+    /// Is this the identity the box itself runs as? What decides whether a
+    /// dispatch that names no account is spending its own plan or somebody's.
+    pub is_owner: bool,
 }
 
 impl DispatchOrigin {
@@ -179,6 +205,38 @@ impl DispatchOrigin {
             chat: Some(chat.into()),
             ..DispatchOrigin::default()
         }
+    }
+
+    /// Who released this, at the strongest form available — the projection the
+    /// billing guard and the attempt row both read.
+    ///
+    /// A verified stamp wins outright, and **discards the claim** rather than
+    /// merging with it: the two are answers to the same question from sources
+    /// of different worth, and a frontend that sends a `viaUser` naming
+    /// somebody else must not be able to change what happens by sending it.
+    /// The claim survives only inside [`Attribution::Unnamed`], where it is
+    /// kept as a record and compared against nothing.
+    pub fn attribution(&self) -> Attribution {
+        let claimed = self.user.clone().filter(|u| !u.trim().is_empty());
+        match &self.verified {
+            Some(caller) => match caller.email.clone().filter(|e| !e.trim().is_empty()) {
+                Some(email) => Attribution::Verified(email),
+                None => Attribution::Unnamed {
+                    user_id: caller.user_id.clone(),
+                    claimed,
+                },
+            },
+            None => claimed.map(Attribution::Claimed).unwrap_or_default(),
+        }
+    }
+
+    /// Was this dispatch issued by the identity the box runs as?
+    ///
+    /// True for every call with no relay stamp: nothing but the box's own
+    /// processes can reach its IPC port, so the operator at the box *is* the
+    /// box. Otherwise it is the edge's answer, not the caller's.
+    pub fn is_box_owner(&self) -> bool {
+        self.verified.as_ref().is_none_or(|c| c.is_owner)
     }
 }
 
@@ -823,6 +881,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();
@@ -853,6 +912,56 @@ mod tests {
         let live = db.live_attempt_for_pane("chat-1").unwrap().unwrap();
         db.close_attempt(live.id, Outcome::Done).unwrap();
         assert!(check_capacity(&db, &cfg, &r).is_ok());
+    }
+
+    /// gh#161: where the claim stops mattering. A relayed frame carries an
+    /// identity the frontend could not write, and `attribution()` is the one
+    /// place that decides which of the two the rest of the board sees.
+    #[test]
+    fn a_verified_stamp_replaces_the_claim_rather_than_joining_it() {
+        let lying = DispatchOrigin {
+            // What a frontend willing to misreport its user would send.
+            user: Some("brede@tally.no".into()),
+            verified: Some(VerifiedCaller {
+                user_id: "user_ana".into(),
+                email: Some("ana@example.com".into()),
+                is_owner: false,
+            }),
+            ..DispatchOrigin::default()
+        };
+        assert_eq!(
+            lying.attribution(),
+            Attribution::Verified("ana@example.com".into())
+        );
+        assert_eq!(lying.attribution().email(), Some("ana@example.com"));
+        assert!(!lying.is_box_owner());
+
+        // Verified, but the box could not put an email to the id: the claim is
+        // kept as the record and compared against nothing.
+        let unresolved = DispatchOrigin {
+            verified: Some(VerifiedCaller {
+                email: None,
+                ..lying.verified.clone().unwrap()
+            }),
+            ..lying.clone()
+        };
+        assert_eq!(unresolved.attribution().email(), None);
+        assert_eq!(unresolved.attribution().name(), Some("brede@tally.no"));
+        assert!(!unresolved.attribution().is_verified());
+
+        // No stamp at all: the local box, where the claim is all there is and
+        // whoever sent it is already the identity the box runs as.
+        let local = DispatchOrigin {
+            verified: None,
+            ..lying
+        };
+        assert_eq!(
+            local.attribution(),
+            Attribution::Claimed("brede@tally.no".into())
+        );
+        assert!(local.is_box_owner());
+        assert_eq!(DispatchOrigin::default().attribution(), Attribution::Nobody);
+        assert!(DispatchOrigin::default().is_box_owner());
     }
 
     #[test]

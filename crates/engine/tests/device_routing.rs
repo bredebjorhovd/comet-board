@@ -9,6 +9,12 @@
 //! refused at the handshake. That gate is the whole reason a teammate can drive the
 //! box's board, so the routing tests run with it in place rather than against an open
 //! relay. Dev-mode bearers carry identity as `user@org`, exactly like the edge's.
+//!
+//! …and it *stamps* that identity onto every client→host frame (`u`/`o`, gh#161), the
+//! way `relayedHeader` does in the DO. The box compares against that stamp rather than
+//! against anything the caller wrote, so a relay that did not carry it would make the
+//! billing guard untestable here — and a room without it is exactly the state gh#161
+//! found the real one in.
 
 // tungstenite's `accept_hdr_async` callback signature fixes the Err type as a full
 // `Response` — its size is not ours to shrink.
@@ -122,6 +128,15 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
                     .find_map(|kv| kv.strip_prefix("connId="))
                     .unwrap_or("anon")
                     .to_string();
+                // The identity the (fake) Worker verified for this socket —
+                // the one thing the frames it sends will carry that the sender
+                // did not write.
+                let (caller_user, caller_org) = identity(
+                    query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("token="))
+                        .unwrap_or(""),
+                );
                 let (mut sink, mut ws_stream) = ws.split();
                 let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
                 {
@@ -155,8 +170,13 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
                                 .send(encode_device_frame(&stripped, &payload).expect("encode"));
                         }
                     } else if let Some(host) = &st.host {
+                        // `relayedHeader`: the client's stream and kind, and
+                        // everything else the relay's own. Anything the client
+                        // put in `u`/`o` is dropped here, unread.
                         let mut routed = DeviceFrameHeader::new(header.s, header.k);
                         routed.from = Some(conn_id.clone());
+                        routed.u = Some(caller_user.clone());
+                        routed.o = (!caller_org.is_empty()).then(|| caller_org.clone());
                         let _ = host.send(encode_device_frame(&routed, &payload).expect("encode"));
                     }
                 }
@@ -220,6 +240,24 @@ impl Harness for InstantHarness {
         ])
         .boxed())
     }
+}
+
+/// A board's paths under a scratch dir, built by hand.
+///
+/// NOT `Paths::under`: that honours `COMET_BOARD_CONFIG_DIR` /
+/// `COMET_BOARD_STATE_DIR`, so under an environment that sets them — which is
+/// exactly the environment an agent dispatched *by a board* runs in — these
+/// tests seeded their fixture tasks into the live board's database and wrote
+/// their two-line fixture over its `routing.toml`. The same reasoning as
+/// `push_credentials.rs`'s `paths_in`: a test's board is a directory it made,
+/// never the device's.
+fn board_paths(dir: &std::path::Path) -> comet_board::config::Paths {
+    let paths = comet_board::config::Paths {
+        config_dir: dir.to_path_buf(),
+        state_dir: dir.join("state"),
+    };
+    std::fs::create_dir_all(&paths.state_dir).expect("board state dir");
+    paths
 }
 
 fn registry() -> Arc<HarnessRegistry> {
@@ -537,7 +575,6 @@ async fn terminal_stream_proxies_over_the_relay() {
 /// `CancelTask`) forward as unary calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn board_rpcs_forward_to_the_device_hosting_the_board() {
-    use comet_board::config::Paths;
     use comet_board::db::{Db, UpsertTask};
     use comet_board::model::{Source, UpstreamState};
 
@@ -548,7 +585,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     // store first, so a forwarded frame is provably B's board and not an empty
     // one A could have produced by itself.
     let board_dir = dirs.path().join("board-b");
-    let paths = Paths::under(&board_dir).expect("board paths");
+    let paths = board_paths(&board_dir);
     {
         let db = Db::open(&paths.db()).expect("board store");
         db.upsert_task(&UpsertTask {
@@ -737,7 +774,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     // gh#75: so does the config. `routing.toml` is a file on B's disk, and A
     // is the teammate with no ssh account on B — reading and writing it over
     // the relay is the whole point.
-    let routing_path = Paths::under(&board_dir).expect("board paths").routing();
+    let routing_path = board_paths(&board_dir).routing();
     let read = client
         .call(
             methods::READ_BOARD_CONFIG,
@@ -930,6 +967,148 @@ async fn the_relay_admits_the_org_and_refuses_everyone_else() {
     core_box.shutdown().await;
     core_mate.shutdown().await;
     core_outsider.shutdown().await;
+}
+
+/// gh#161: the box compares against an identity the edge verified, not one the
+/// frontend typed.
+///
+/// Two laptops dispatch the same task into the same box under
+/// `billing_guard = "require-own"`, and each sends a `viaUser` naming the box's
+/// owner — the exact lie §H15 said walked straight through. The teammate is
+/// refused, and refused *naming them*; the owner's own laptop gets past the
+/// guard and fails on the next thing, which is what "past the guard" looks like
+/// from outside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_own_refuses_the_teammate_the_relay_names_not_the_user_they_claim() {
+    use comet_board::db::{Db, UpsertTask};
+    use comet_board::model::{Source, UpstreamState};
+
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    // The box: one task, one route it matches, and a guard set to refuse.
+    let board_dir = dirs.path().join("board-box");
+    let paths = board_paths(&board_dir);
+    {
+        let db = Db::open(&paths.db()).expect("board store");
+        db.upsert_task(&UpsertTask {
+            id: "gh:o/r#161".into(),
+            source: Source::Github,
+            source_id: "161".into(),
+            identifier: "gh#161".into(),
+            title: "the box must verify who dispatched".into(),
+            body: None,
+            url: "https://github.com/o/r/issues/161".into(),
+            labels: vec![],
+            source_state: Some("open".into()),
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Unstarted,
+            updated_at: "2026-08-09T09:00:00Z".into(),
+        })
+        .expect("seed task");
+    }
+    std::fs::write(
+        paths.routing(),
+        "[defaults]\nbilling_guard = \"require-own\"\n\n\
+         [[route]]\nmatch = { gh_repo = \"o/r\" }\nworkspace = \"box\"\n\
+         repo = \"/tmp\"\nruntime = \"mock\"\n",
+    )
+    .expect("write routing.toml");
+
+    let core_box = assemble_as(&dirs.path().join("box"), "device-box", OWNER, ORG);
+    let runtime_box = Arc::new(comet_engine::CometRuntime::new(
+        core_box.repos.clone(),
+        core_box.workspace.clone(),
+        core_box.doc_host.clone(),
+        core_box
+            .workspace
+            .merged_sessions_watch(core_box.sessions.watch_sessions()),
+        core_box.sessions.journal(),
+        core_box.agent_accounts.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let board = comet_engine::BoardService::spawn_at(
+        paths,
+        core_box
+            .workspace
+            .merged_sessions_watch(core_box.sessions.watch_sessions()),
+        runtime_box,
+        core_box.workspace.watch_spaces(),
+        tokio::runtime::Handle::current(),
+    )
+    .expect("board service on the box");
+    core_box.set_board(Arc::new(board));
+    let _host = core_box.start_host_relay(&relay_url);
+
+    // The dispatch every laptop below sends: no `account` (the silent default),
+    // and a `viaUser` claiming to be the box's owner.
+    let dispatch = || {
+        serde_json::json!({
+            "taskId": "gh:o/r#161",
+            "viaUser": bearer(OWNER, ORG),
+            "viaDevice": "some-laptop",
+            "targetDeviceId": "device-box",
+        })
+    };
+
+    // A teammate's laptop, in the org — admitted by the relay (gh#66), and
+    // that is the point: reaching the box is not the same as spending it.
+    let core_mate = assemble_as(&dirs.path().join("mate"), "device-mate", TEAMMATE, ORG);
+    core_mate.set_links(links(&relay_url, TEAMMATE, ORG));
+    let mate = comet_rpc::memory_client(core_mate.rpc_service());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let refused = loop {
+        let err = mate
+            .call(methods::DISPATCH_TASK, dispatch())
+            .await
+            .expect_err("a teammate's dispatch of somebody else's plan is refused");
+        let text = err.to_string();
+        // Ride over the host relay still joining, the way the other tests do.
+        if !text.contains("unreachable") && !text.contains("readiness check") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay never came up: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        refused.contains(comet_proto::view::board::REQUIRE_OWN_REFUSAL),
+        "the refusal has to be the billing guard's, so a frontend can offer the \
+         confirm instead of a dead end: {refused}"
+    );
+    assert!(
+        refused.contains(TEAMMATE),
+        "the box refuses naming who the edge said this was — not who the frame \
+         claimed to be: {refused}"
+    );
+    assert!(
+        !refused.contains(&format!("dispatch came from {OWNER}")),
+        "the claimed user must not be what the refusal is about: {refused}"
+    );
+
+    // The owner's own laptop, sending the identical params over the identical
+    // relay. The stamp differs, so the verdict does: it clears the guard and
+    // dies on the next refusal in `handle_dispatch` — the space `box` that this
+    // test never created.
+    let core_own = assemble_as(&dirs.path().join("own"), "device-own", OWNER, ORG);
+    core_own.set_links(links(&relay_url, OWNER, ORG));
+    let own = comet_rpc::memory_client(core_own.rpc_service());
+    let past_the_guard = own
+        .call(methods::DISPATCH_TASK, dispatch())
+        .await
+        .expect_err("no space named `box` exists in this test");
+    assert!(
+        past_the_guard.to_string().contains("no comet space named"),
+        "the owner's own dispatch must reach the refusal *after* billing: {past_the_guard}"
+    );
+
+    core_box.shutdown().await;
+    core_mate.shutdown().await;
+    core_own.shutdown().await;
 }
 
 #[tokio::test]

@@ -403,6 +403,7 @@ mod tests {
             started_at: Some("2026-08-07T09:00:00Z".into()),
             account: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
             max_duration_secs: None,
         }

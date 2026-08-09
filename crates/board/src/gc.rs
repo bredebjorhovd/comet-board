@@ -317,6 +317,7 @@ mod tests {
             overrun_warned_at: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
             collectable_at: None,
             collected_at: None,

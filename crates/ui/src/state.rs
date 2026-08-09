@@ -129,6 +129,24 @@ struct DeferredEngineRpc {
 #[async_trait]
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        self.handle_as(method, params, &comet_rpc::Caller::LOCAL)
+            .await
+    }
+
+    /// Carries the transport's caller through the wait (gh#161).
+    ///
+    /// This service is only ever served locally today — the window's memory
+    /// transport and the IPC port — and the host relay serves the assembled
+    /// `EngineRpc` directly. Forwarding rather than defaulting anyway, because
+    /// the default would silently turn a *relayed* call into a local one the
+    /// day somebody wires this in front of the relay, and "silently trusted"
+    /// is the failure mode gh#161 exists to remove.
+    async fn handle_as(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        caller: &comet_rpc::Caller,
+    ) -> Result<RpcReply, RpcError> {
         if AuthRpc::handles(method) {
             return self.auth.handle(method, params).await;
         }
@@ -139,7 +157,7 @@ impl RpcService for DeferredEngineRpc {
             match current {
                 DeferredEngineState::Waiting => {}
                 DeferredEngineState::Ready(service) => {
-                    return service.handle(method, params).await;
+                    return service.handle_as(method, params, caller).await;
                 }
                 DeferredEngineState::Failed(message) => return Err(RpcError::Failed(message)),
             }
