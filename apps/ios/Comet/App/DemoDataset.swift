@@ -118,10 +118,13 @@ final class DemoDataset {
 
     // MARK: Board (offline)
 
-    /// What `ListBoardRuntimes` answers on a box with the usual harnesses.
+    /// What `ListBoardRuntimes` answers on a box with the usual harnesses —
+    /// including one it has never installed (gh#187), because a picker that
+    /// only ever demoed the happy case is the picker that used to lie.
     static let runtimes: [BoardRuntime] = [
         BoardRuntime(name: "claude-code", label: "Claude Code", harness: "claude-code"),
-        BoardRuntime(name: "opencode", label: "OpenCode", harness: "opencode"),
+        BoardRuntime(name: "opencode", label: "OpenCode", harness: "opencode",
+                     unavailable: .notInstalled),
         BoardRuntime(name: "codex", label: "Codex", harness: "codex"),
     ]
 

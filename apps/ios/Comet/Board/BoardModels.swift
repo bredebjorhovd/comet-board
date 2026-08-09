@@ -217,6 +217,47 @@ struct TaskRow: Decodable, Hashable, Identifiable {
     var startedAtDate: Date? { rfc3339(startedAt) }
 }
 
+/// Why a runtime cannot start on the board's host (gh#187).
+///
+/// Two axes named apart, because they are two different jobs for whoever reads
+/// them: a missing CLI is an install, a signed-out one is a login. The raw
+/// values are `comet_proto::view::board::RuntimeUnavailable`'s camelCase
+/// spellings; an unknown one decodes as `.unknown` rather than failing the
+/// whole catalog, so a newer box cannot blank the phone's picker.
+enum RuntimeUnavailable: String, Decodable, Hashable {
+    case notInstalled
+    case signedOut
+    case unsupported
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = RuntimeUnavailable(rawValue: raw) ?? .unknown
+    }
+
+    /// The short phrase a chip carries — the same words the desktop picker and
+    /// `comet-board doctor` use, so an operator who learned them in one place
+    /// recognises them in the next.
+    var reason: String {
+        switch self {
+        case .notInstalled: return "not installed"
+        case .signedOut: return "signed out"
+        case .unsupported: return "no adapter in this build"
+        case .unknown: return "unavailable"
+        }
+    }
+
+    /// What to do about it, where there is anything to do. The same two verbs
+    /// `RuntimeUnavailable::hint` gives every other surface.
+    var hint: String? {
+        switch self {
+        case .notInstalled: return "install its CLI on the host"
+        case .signedOut: return "sign it in on the host"
+        case .unsupported, .unknown: return nil
+        }
+    }
+}
+
 /// One runtime a dispatch can be pointed at, as `ListBoardRuntimes` reports it.
 /// `name` is exactly what the `DispatchTask` override accepts; `harness` is how
 /// the account picker knows which saved logins a runtime could spend (gh#74).
@@ -224,8 +265,30 @@ struct BoardRuntime: Decodable, Hashable, Identifiable {
     var name: String
     var label: String
     var harness: String
+    /// Why the host could not start this one (gh#187), or nil when it could.
+    /// Absent from a box too old to say, which reads as available — exactly
+    /// what such a box used to promise.
+    var unavailable: RuntimeUnavailable?
 
     var id: String { name }
+
+    var available: Bool { unavailable == nil }
+
+    /// What the row says under its label: why it cannot run, and what to do —
+    /// nil on a runtime that can.
+    var note: String? {
+        guard let unavailable else { return nil }
+        guard let hint = unavailable.hint else { return unavailable.reason }
+        return "\(unavailable.reason) — \(hint)"
+    }
+
+    init(name: String, label: String, harness: String,
+         unavailable: RuntimeUnavailable? = nil) {
+        self.name = name
+        self.label = label
+        self.harness = harness
+        self.unavailable = unavailable
+    }
 }
 
 /// A saved agent login on the board's host, as `ListAgentAccounts` reports it.

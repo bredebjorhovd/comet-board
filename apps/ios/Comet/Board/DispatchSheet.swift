@@ -163,9 +163,14 @@ struct DispatchSheet: View {
                 }
                 ForEach(Array(runtimes.enumerated()), id: \.element.id) { index, runtime in
                     if index > 0 { SheetSeparator() }
+                    // A runtime the host cannot start is still listed, saying
+                    // why (gh#187): an operator who expects OpenCode on the box
+                    // needs to read "not installed", not find the row absent.
+                    // The reason takes the subtitle over "the route's runtime",
+                    // because a route pointing at a harness the box cannot run
+                    // is the more urgent half of that sentence.
                     SheetSelectRow(title: runtime.label,
-                                   subtitle: runtime.name == target.row.runtime
-                                       ? "the route's runtime" : nil,
+                                   subtitle: runtimeSubtitle(runtime),
                                    selected: runtime.name == runtimeName) {
                         runtimeName = runtime.name
                         // A Claude slot is not lendable to a codex run (gh#59):
@@ -177,6 +182,17 @@ struct DispatchSheet: View {
                 }
             }
         }
+    }
+
+    /// What a runtime row says under its label: why the host cannot start it
+    /// (gh#187), else whether it is the one the route already picked.
+    ///
+    /// The reason wins: a route pointing at a harness the box cannot run is the
+    /// more urgent half of that sentence, and it is the half the dispatch will
+    /// be refused over.
+    private func runtimeSubtitle(_ runtime: BoardRuntime) -> String? {
+        if let note = runtime.note { return note }
+        return runtime.name == target.row.runtime ? "the route's runtime" : nil
     }
 
     private var accountCard: some View {
@@ -264,14 +280,20 @@ struct DispatchSheet: View {
     // MARK: Behaviour
 
     /// The picker's starting row: the route's runtime when the list offers it
-    /// by its canonical name, else the first option. A route configured with an
-    /// alias lands on its harness's canonical entry.
+    /// by its canonical name, else the first option the host can actually start.
+    /// A route configured with an alias lands on its harness's canonical entry.
+    ///
+    /// The route's own runtime wins even when the host cannot start it
+    /// (gh#187) — "the route sends this to OpenCode, which is not installed on
+    /// the box" is precisely the sentence the sheet exists to show. Only the
+    /// fallback prefers an available option, so the sheet never *invents* a
+    /// dead end nobody chose.
     private func primeSelection() {
         guard runtimeName == nil else { return }
         if let route = target.row.runtime, runtimes.contains(where: { $0.name == route }) {
             runtimeName = route
         } else {
-            runtimeName = runtimes.first?.name
+            runtimeName = (runtimes.first { $0.available } ?? runtimes.first)?.name
         }
     }
 

@@ -17,6 +17,7 @@ use crate::runtime::harness_for_runtime;
 use crate::skill;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
+use comet_proto::view::board::RuntimeOption;
 use comet_proto::{AgentAccount, EdgeHealth, Space};
 use std::path::{Path, PathBuf};
 
@@ -49,7 +50,8 @@ pub struct EngineStatus {
 /// the same engine's live edge-connection census (gh#116), and `members` how
 /// many people are in the workspace (gh#161) — the fact that turns "a dispatch
 /// that names no account spends the box's login" from a tautology into a
-/// warning.
+/// warning. `runtimes` is the same engine's `ListBoardRuntimes` answer, which
+/// since gh#187 says which harnesses could actually start here.
 pub fn doctor(
     paths: &Paths,
     engine: &EngineStatus,
@@ -57,6 +59,7 @@ pub fn doctor(
     accounts: Option<&[AgentAccount]>,
     edge: Option<&EdgeHealth>,
     members: Option<usize>,
+    runtimes: Option<&[RuntimeOption]>,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
@@ -143,6 +146,14 @@ pub fn doctor(
     // the exact state the box was in for 25 minutes after an edge redeploy,
     // dispatching happily and invisible to every remote viewer.
     checks.push(edge_connections_check(edge));
+
+    // Which harnesses could actually start on this box (gh#187). Beside the
+    // engine that answered it, because it is a fact about the box in the same
+    // way the routes and the credentials below are — and because it used to be
+    // invisible: `runtime_options()` was a constant, so every picker offered
+    // every harness on every device and a dispatch to a missing CLI failed
+    // after the worktree was cut.
+    checks.push(harnesses_check(runtimes));
 
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
@@ -631,6 +642,69 @@ fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
     Check {
         name: "edge connections".into(),
         ok: !edge.dark(),
+        detail,
+    }
+}
+
+/// Which harnesses can actually start on this box, and why the rest cannot
+/// (gh#187).
+///
+/// `doctor` already reports the routes, the credentials and the skill; "which
+/// agents could I even spin up here" is the same kind of fact and was the one
+/// nothing said out loud. It is the shell's copy of what the pickers now show,
+/// read from the same `ListBoardRuntimes` answer so the two cannot disagree.
+///
+/// Failing rather than warning when *nothing* can run: a box with no harness is
+/// a board that can poll, derive, and never dispatch — and that is the state
+/// this check exists to catch before an operator releases a task into it. One
+/// missing runtime out of four is a choice, not a fault, so it prints and
+/// passes.
+///
+/// `mock` is left out of the census entirely. It is dispatchable on purpose and
+/// always available, so counting it would let a box with no real harness report
+/// "1 ready" and pass.
+fn harnesses_check(runtimes: Option<&[RuntimeOption]>) -> Check {
+    let name = "harnesses".to_string();
+    let Some(runtimes) = runtimes else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine did not answer".into(),
+        };
+    };
+    let real: Vec<&RuntimeOption> = runtimes
+        .iter()
+        .filter(|r| r.harness != comet_proto::HarnessId::Mock)
+        .collect();
+    if real.is_empty() {
+        // An engine old enough to answer without the availability field, or one
+        // whose catalog is empty. Either way there is nothing to report on.
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine listed no runtimes".into(),
+        };
+    }
+    let ready: Vec<&str> = real
+        .iter()
+        .filter(|r| r.available())
+        .map(|r| r.name.as_str())
+        .collect();
+    let blocked: Vec<String> = real
+        .iter()
+        .filter_map(|r| Some(format!("{} ({})", r.name, r.unavailable?.reason())))
+        .collect();
+    let detail = match (ready.is_empty(), blocked.is_empty()) {
+        (true, _) => format!(
+            "none can start here — {}. Nothing this board dispatches will run",
+            blocked.join(", ")
+        ),
+        (false, true) => format!("{} ready", ready.join(", ")),
+        (false, false) => format!("{} ready · {}", ready.join(", "), blocked.join(", ")),
+    };
+    Check {
+        name,
+        ok: !ready.is_empty(),
         detail,
     }
 }
@@ -1881,7 +1955,7 @@ mod tests {
     #[test]
     fn doctor_reports_a_missing_routing_file_without_panicking() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
@@ -2066,7 +2140,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("0 of 4 live"), "{}", check.detail);
@@ -2091,7 +2165,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok, "{}", check.detail);
         assert!(
@@ -2106,7 +2180,7 @@ mod tests {
     #[test]
     fn an_unaskable_engine_leaves_the_edge_check_unchecked() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok);
         assert!(check.detail.contains("not checked"), "{}", check.detail);
@@ -2126,7 +2200,7 @@ mod tests {
             detail: "connection refused".into(),
             version: None,
         };
-        let checks = doctor(&p, &down, None, Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
         // The route's space is "not checked", not failed: one dead engine must
         // not fail every route and bury its own report.
@@ -2174,14 +2248,14 @@ mod tests {
 
         routing("origin/HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
         assert!(!ok, "{detail}");
         assert!(detail.contains("origin"), "{detail}");
         assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
 
         routing("HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
         assert!(ok, "{detail}");
     }
 
@@ -2231,14 +2305,14 @@ mod tests {
             comet_proto::HarnessId::ClaudeCode,
         )];
 
-        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&ok);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("sam@example.com"), "{}", c.detail);
 
         // An id this device has never saved: named, along with what it does have.
         routing_with_account(&p, "claude-code", "ffffffffffffffff");
-        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&bad);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("ffffffffffffffff"), "{}", c.detail);
@@ -2256,7 +2330,7 @@ mod tests {
             "sam@example.com",
             comet_proto::HarnessId::ClaudeCode,
         )];
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("claude-code"), "{}", c.detail);
@@ -2274,11 +2348,11 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(!checks.iter().any(|c| c.name == "route w: account"));
 
         routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
-        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("not checked"), "{}", c.detail);
@@ -2294,7 +2368,7 @@ mod tests {
         )
         .unwrap();
         let spaces = [space("Tally")];
-        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None, None).unwrap();
         // Case-insensitive, like every other name match on the board.
         let c = checks
             .iter()
@@ -2302,13 +2376,88 @@ mod tests {
             .unwrap();
         assert!(c.ok, "{}", c.detail);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "route tally: space")
             .unwrap();
         assert!(!c.ok);
         assert!(c.detail.contains("no comet space named"), "{}", c.detail);
+    }
+
+    /// `doctor` says which harnesses this box can start, and why the rest
+    /// cannot (gh#187) — the shell's copy of what the pickers show.
+    #[test]
+    fn the_harness_census_names_the_ready_and_the_reason_for_the_rest() {
+        use comet_proto::HarnessId;
+        use comet_proto::view::board::RuntimeUnavailable;
+        let (_d, p) = tmp();
+
+        let option = |name: &str, harness, unavailable| RuntimeOption {
+            name: name.into(),
+            label: name.into(),
+            harness,
+            unavailable,
+        };
+        let runtimes = vec![
+            option("claude-code", HarnessId::ClaudeCode, None),
+            option(
+                "opencode",
+                HarnessId::Opencode,
+                Some(RuntimeUnavailable::NotInstalled),
+            ),
+            option("codex", HarnessId::Codex, Some(RuntimeUnavailable::SignedOut)),
+            // Always available, and deliberately not part of the census.
+            option("mock", HarnessId::Mock, None),
+        ];
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            Some(&runtimes),
+        )
+        .unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(c.ok, "one harness ready is not a fault: {}", c.detail);
+        assert!(c.detail.contains("claude-code ready"), "{}", c.detail);
+        // Both axes named apart — one is an install, the other a login.
+        assert!(c.detail.contains("opencode (not installed)"), "{}", c.detail);
+        assert!(c.detail.contains("codex (signed out)"), "{}", c.detail);
+        assert!(!c.detail.contains("mock"), "{}", c.detail);
+
+        // A box that can start nothing is a board that can only ever poll.
+        let none: Vec<RuntimeOption> = runtimes
+            .iter()
+            .cloned()
+            .map(|mut o| {
+                if o.harness != HarnessId::Mock {
+                    o.unavailable = Some(RuntimeUnavailable::NotInstalled);
+                }
+                o
+            })
+            .collect();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            Some(&none),
+        )
+        .unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("none can start here"), "{}", c.detail);
+
+        // An engine that could not be asked says so rather than condemning the
+        // box on the strength of a failed lookup.
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(c.ok && c.detail.contains("not checked"), "{}", c.detail);
     }
 
     #[test]
@@ -2324,7 +2473,7 @@ mod tests {
              runtime = \"gpt-piloted-typewriter\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let alias = checks
             .iter()
             .find(|c| c.name == "route w: runtime" && c.ok)
@@ -2354,7 +2503,7 @@ mod tests {
              runtime = \"claude\"\nmax_duration = \"off\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let detail = |name: &str| {
             checks
                 .iter()
@@ -2582,7 +2731,7 @@ mod tests {
     fn doctor_emits_the_default_account_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2), None).unwrap();
         assert!(
             checks.iter().any(|c| c.name == "default account"),
             "doctor is silent about what an unnamed account spends"
@@ -2614,7 +2763,7 @@ mod tests {
     fn doctor_emits_the_billing_guard_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "billing guard")
@@ -2630,7 +2779,7 @@ mod tests {
             "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "settle notice")
@@ -2645,7 +2794,7 @@ mod tests {
     fn doctor_says_when_no_agent_is_running_the_board() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "orchestrator")
@@ -2663,7 +2812,7 @@ mod tests {
             "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
@@ -2685,7 +2834,7 @@ mod tests {
              [github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("gets the whole board"), "{}", c.detail);
@@ -2741,7 +2890,7 @@ mod tests {
         db.set_attempt_pane(a, "chat-9").unwrap();
         drop(db);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
@@ -2895,7 +3044,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(
             !checks.iter().any(|c| c.name == "linear review state"),
             "a board with no Linear anywhere must not be handed a Linear setting"
@@ -2914,7 +3063,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "linear review state"));
     }
 

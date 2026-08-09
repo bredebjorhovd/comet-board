@@ -57,7 +57,7 @@ use rpc::{Incoming, RpcClient};
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then PATH, then
 /// common install locations GUI launches miss. Resolved per call — cheap, and
 /// PATH may be adopted from the login shell after startup.
-fn resolve_codex_executable() -> Option<PathBuf> {
+pub(crate) fn resolve_codex_executable() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
         && !p.is_empty()
     {
