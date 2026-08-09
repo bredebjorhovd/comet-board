@@ -482,6 +482,22 @@ pub struct Attempt {
     /// [`crate::runtime::RunTokens`] for why that is nearly always `None` and
     /// this nearly always is not.
     pub model: Option<String>,
+    /// What the agent says it did, file-anchored (§gh#183).
+    ///
+    /// On the attempt and not on the task because a retry is a different agent
+    /// on a different branch making different claims, and because the review
+    /// happens after the chat is archived — the conversation that produced them
+    /// is not somewhere the board can go back and read.
+    ///
+    /// Empty is the common case and the honest one: an attempt that never
+    /// answered the contract claimed nothing, and
+    /// [`claims_at`](Self::claims_at) is what tells that apart from an agent
+    /// that submitted an empty set.
+    pub claims: Vec<crate::claims::Claim>,
+    /// When the claims above were submitted. `None` with an empty list means
+    /// the contract went unanswered — a fact a review must be able to shout
+    /// about, and one a bare empty list cannot carry.
+    pub claims_at: Option<String>,
 }
 
 impl Attempt {
@@ -553,8 +569,57 @@ impl Dispatcher {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// An attempt row with nothing on it, for the tests that care about two
+    /// fields out of forty. Shared across the crate because the alternative is
+    /// a forty-line literal in every module that needs one, and forty-line
+    /// literals are what makes adding a column a day's work.
+    pub(crate) fn blank_attempt() -> Attempt {
+        Attempt {
+            id: 1,
+            task_id: "gh:o/r#1".into(),
+            pane_id: Some("chat-1".into()),
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            repo_path: None,
+            branch: Some("board/gh-1".into()),
+            started_at: "2026-08-09T09:00:00Z".into(),
+            ended_at: None,
+            outcome: None,
+            account: None,
+            missing_ticks: 0,
+            agent_status: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            saw_working: true,
+            settled_at: None,
+            reopened: 0,
+            screen_print: None,
+            screen_at: None,
+            nudges: 0,
+            nudged_at: None,
+            blocked_count: 0,
+            overrun_warned_at: None,
+            collectable_at: None,
+            collected_at: None,
+            cache_sweepable_at: None,
+            cache_swept_at: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
+            dispatched_by_verified: false,
+            billed_to: None,
+            chat_archivable_at: None,
+            chat_archived_at: None,
+            tokens: None,
+            model: None,
+            claims: Vec::new(),
+            claims_at: None,
+        }
+    }
 
     fn d() -> Derivation {
         Derivation::default()

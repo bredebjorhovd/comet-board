@@ -959,6 +959,10 @@ impl SyncEngine {
             // orphaned, capped — and a total recorded after the close would
             // never be recorded at all (gh#151).
             self.record_tokens(runtime, &attempt);
+            // …and the same argument for the review's evidence (§gh#183): the
+            // checkout and the journal both outlive the attempt by less than
+            // the review does.
+            self.record_review_facts(runtime, &attempt);
             let status = statuses
                 .get(chat_id)
                 .copied()
@@ -1075,9 +1079,229 @@ impl SyncEngine {
             .db
             .set_attempt_tokens(attempt.id, run.usage, run.model.as_deref())
         {
-            self.log
-                .warn(format!("recording tokens for attempt {}: {e:#}", attempt.id));
+            self.log.warn(format!(
+                "recording tokens for attempt {}: {e:#}",
+                attempt.id
+            ));
         }
+    }
+
+    // ---- the review contract (§gh#183) -----------------------------------
+
+    /// Copy the two facts a review needs onto the attempt while they still
+    /// exist: what the branch touched, and what the run's commands did.
+    ///
+    /// A copy for [`SyncEngine::record_tokens`]'s reason, restated: gc reclaims
+    /// the checkout (gh#72) and a run journal can be compacted, while the
+    /// attempt row survives for as long as the board has a history to report
+    /// on. A review taken at read time would be a review that goes blank
+    /// exactly when it is most useful — a fortnight after the merge, when
+    /// somebody asks what that branch actually changed.
+    ///
+    /// Called on every reconcile of a live attempt rather than once at close,
+    /// again for `record_tokens`'s reason: an attempt can end by being
+    /// orphaned, capped or cancelled, and the last tick's snapshot is a far
+    /// better answer for those than none at all.
+    ///
+    /// Never fatal, and never noisy: an unreadable checkout, a runtime that
+    /// cannot read journals, and an attempt with no worktree all leave the row
+    /// as it was. What that costs is visible in the review itself, as
+    /// [`crate::claims::DiffSource::Unavailable`].
+    pub fn record_review_facts(&self, runtime: Option<&dyn Runtime>, attempt: &Attempt) {
+        if let Some(changed) = self.branch_changes(attempt) {
+            // The board reads this every cycle and the diff only moves when the
+            // agent commits, so a write per tick is a write nobody needs.
+            let stored = self.db.attempt_changes(attempt.id).unwrap_or_default();
+            if stored != changed
+                && let Err(e) = self.db.set_attempt_changes(attempt.id, &changed)
+            {
+                self.log.warn(format!(
+                    "recording changes for attempt {}: {e:#}",
+                    attempt.id
+                ));
+            }
+        }
+        let Some(runtime) = runtime else { return };
+        let Some(chat_id) = attempt.pane_id.as_deref() else {
+            return;
+        };
+        let commands = match runtime.run_commands(chat_id) {
+            Ok(Some(commands)) => commands,
+            Ok(None) => return,
+            Err(e) => {
+                self.log
+                    .warn(format!("commands for chat {chat_id} unreadable: {e:#}"));
+                return;
+            }
+        };
+        let evidence = crate::evidence::gather(&commands);
+        if self.db.attempt_evidence(attempt.id).ok().flatten().as_ref() == Some(&evidence) {
+            return;
+        }
+        if let Err(e) = self.db.set_attempt_evidence(attempt.id, &evidence) {
+            self.log.warn(format!(
+                "recording evidence for attempt {}: {e:#}",
+                attempt.id
+            ));
+        }
+    }
+
+    /// What this attempt's branch has touched, read from its checkout.
+    ///
+    /// `None` — not an empty diff — when the question cannot be asked: no
+    /// worktree recorded, the checkout is gone, or no base to measure from. The
+    /// distinction is the whole of it: an empty list is "this branch changed
+    /// nothing", and a review that rendered the two the same would say exactly
+    /// the wrong thing about a reclaimed checkout.
+    ///
+    /// Measured from the attempt's own `base_sha`, like
+    /// [`SyncEngine::attempt_has_commits`] and for the same reason (AGE-19):
+    /// anything else counts the operator's unpushed work as the agent's. An
+    /// attempt with no recorded base is not guessed at — the fallback that
+    /// function keeps for pre-`base_sha` rows is a weaker measurement, and a
+    /// *remainder* computed against the wrong base would invent unclaimed files
+    /// out of somebody else's commits.
+    pub fn branch_changes(&self, attempt: &Attempt) -> Option<Vec<crate::claims::ChangedFile>> {
+        let worktree = attempt.worktree.as_deref()?;
+        if !std::path::Path::new(worktree).exists() {
+            return None;
+        }
+        let base = attempt.base_sha.as_deref()?;
+        let range = format!("{base}..HEAD");
+        // `--no-renames`, deliberately: to a reviewer a rename is two paths
+        // that both changed, and a claim naming only the old one has not
+        // accounted for the new one arriving.
+        let numstat = git_out(worktree, &["diff", "--numstat", "--no-renames", &range])?;
+        let name_status = git_out(worktree, &["diff", "--name-status", "--no-renames", &range])
+            .unwrap_or_default();
+        Some(crate::claims::parse_diff(&numstat, &name_status))
+    }
+
+    /// Record an agent's claims against an attempt, and hand back the review
+    /// they land in — including what they did not account for.
+    ///
+    /// Answering with the remainder is the point of doing it here rather than
+    /// in a fire-and-forget write: the agent learns, at the moment it submits,
+    /// which of its own changes nothing it wrote covers. That is the earliest
+    /// the question can be asked, and it is asked of the one party still able
+    /// to answer it.
+    ///
+    /// The attempt is the task's live one, else its most recent: an agent
+    /// submits while its own run is still going, and a retry's claims belong to
+    /// the retry.
+    pub fn submit_claims(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task_id: &str,
+        text: &str,
+    ) -> Result<crate::claims::AttemptReview> {
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        let attempt = task
+            .live_attempt()
+            .or_else(|| task.attempts.last())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no attempts — claims belong to a run, and nothing has run",
+                    task.identifier
+                )
+            })?
+            .clone();
+        let claims = crate::claims::parse(text, attempt.worktree.as_deref())?;
+        self.db.set_attempt_claims(attempt.id, &claims)?;
+        self.log.info(format!(
+            "{}: attempt {} claimed {} change(s) across {} file(s)",
+            task.identifier,
+            attempt.id,
+            claims.len(),
+            claims.iter().flat_map(|c| &c.files).count()
+        ));
+        // A fresh snapshot before answering: the agent has just finished
+        // committing, and a remainder computed against the last reconcile's
+        // diff would report files it has since accounted for.
+        self.record_review_facts(runtime, &attempt);
+        self.review(task_id, Some(attempt.id))
+    }
+
+    /// Everything a review of one attempt is made of (§gh#183): the brief, the
+    /// claims, the evidence, and the changes no claim accounts for.
+    ///
+    /// `attempt` names one; `None` is the task's latest, which is what a
+    /// reviewer opening a row means. The diff is read live from the checkout
+    /// when there is one and falls back to the snapshot the board took while
+    /// the attempt was live — and says which, because "nothing changed" and
+    /// "the checkout is gone" must never render the same.
+    pub fn review(
+        &self,
+        task_id: &str,
+        attempt: Option<i64>,
+    ) -> Result<crate::claims::AttemptReview> {
+        use crate::claims::DiffSource;
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        let attempt =
+            match attempt {
+                Some(id) => task
+                    .attempts
+                    .iter()
+                    .find(|a| a.id == id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("attempt {id} does not belong to {}", task.identifier)
+                    })?,
+                None => task.attempts.last().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("{} has no attempts to review", task.identifier)
+                })?,
+            };
+        let (changed, diff) = match self.branch_changes(&attempt) {
+            Some(changed) => (changed, DiffSource::Checkout),
+            None => {
+                let recorded = self.db.attempt_changes(attempt.id)?;
+                if recorded.is_empty() {
+                    (
+                        Vec::new(),
+                        DiffSource::Unavailable {
+                            reason: unreadable_diff(&attempt),
+                        },
+                    )
+                } else {
+                    (recorded, DiffSource::Recorded)
+                }
+            }
+        };
+        Ok(crate::claims::review(
+            &task,
+            &attempt,
+            changed,
+            diff,
+            self.uncommitted(&attempt),
+            self.db.attempt_evidence(attempt.id)?.unwrap_or_default(),
+        ))
+    }
+
+    /// How many files are changed in this attempt's checkout but not committed.
+    ///
+    /// Reported rather than folded into the diff, because the remainder is
+    /// about the *branch* — what a reviewer can fetch — and uncommitted work is
+    /// not on it. It exists for the submission-time case: an agent that claims
+    /// before it commits would otherwise be told all of its changes were
+    /// accounted for, having shown the board none of them.
+    ///
+    /// `None` when there is no checkout to ask, which is not zero.
+    fn uncommitted(&self, attempt: &Attempt) -> Option<u32> {
+        let worktree = attempt.worktree.as_deref()?;
+        if !std::path::Path::new(worktree).exists() {
+            return None;
+        }
+        // `--porcelain` is one line per path, untracked files included: an
+        // agent that has written a new file and not added it has not shown it
+        // to the board either.
+        let out = git_out(worktree, &["status", "--porcelain"])?;
+        Some(out.lines().filter(|l| !l.trim().is_empty()).count() as u32)
     }
 
     // ---- the wall-clock cap (gh#70) --------------------------------------
@@ -1914,6 +2138,11 @@ impl SyncEngine {
         evidence: Evidence,
         pr_url: Option<&str>,
     ) -> Result<()> {
+        // The last honest moment to look at the checkout and the journal
+        // (§gh#183). The event path settles the instant a run ends, so it can
+        // close an attempt no interval reconcile has seen since its final
+        // commit — and that commit is the one the review is about.
+        self.record_review_facts(runtime, attempt);
         self.db.close_attempt(attempt.id, Outcome::Done)?;
         self.enqueue_outcome(task, Outcome::Done, pr_url)?;
         self.log.info(format!(
@@ -3210,6 +3439,27 @@ fn git_out(worktree: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Why an attempt's diff could not be read, in the words a review prints
+/// (§gh#183). Specific on purpose: "unavailable" tells a reviewer to go and
+/// find out, and each of these tells them what they would find.
+fn unreadable_diff(attempt: &Attempt) -> String {
+    match (
+        attempt.worktree.as_deref(),
+        attempt.collected_at.is_some(),
+        attempt.base_sha.as_deref(),
+    ) {
+        (None, _, _) => "this attempt never recorded a checkout".into(),
+        (Some(w), true, _) => format!("the checkout was reclaimed ({w})"),
+        (Some(w), false, _) if !std::path::Path::new(w).exists() => {
+            format!("the checkout is no longer on disk ({w})")
+        }
+        (_, _, None) => "this attempt recorded no base commit, so there is nothing honest to \
+             measure its diff against"
+            .into(),
+        _ => "the checkout could not be read".into(),
+    }
+}
+
 /// A git command run for its exit status alone (`merge-base --is-ancestor`).
 fn git_ok(worktree: &str, args: &[&str]) -> bool {
     Command::new("git")
@@ -3731,8 +3981,10 @@ mod tests {
         // Seen working once, then the chat vanishes for two ticks.
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
-        e.reconcile_sessions_with(&statuses(&[]), Some(&rt)).unwrap();
-        e.reconcile_sessions_with(&statuses(&[]), Some(&rt)).unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
 
         let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
         let a = task.attempts.last().unwrap();
@@ -7832,5 +8084,299 @@ max_duration = "{max_duration}"
             e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
             BoardState::Blocked
         );
+    }
+
+    // ---- the review contract, against a real checkout (§gh#183) ----------
+
+    /// A checkout with one commit on it, and an attempt whose base is that
+    /// commit — the shape every dispatched agent starts from.
+    fn checkout_with_a_base() -> (std::path::PathBuf, String) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cb-claims-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/db.rs"), "// base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        (dir, base)
+    }
+
+    /// An attempt in `dir` measured from `base`, with a chat to read a journal
+    /// for.
+    fn attempt_in(e: &SyncEngine, dir: &std::path::Path, base: &str) -> i64 {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, &dir.to_string_lossy())
+            .unwrap();
+        e.db.set_attempt_base_sha(a, base).unwrap();
+        a
+    }
+
+    fn commit_all(dir: &std::path::Path, message: &str) {
+        for args in [
+            ["add", "-A"].as_slice(),
+            ["commit", "-m", message].as_slice(),
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        }
+    }
+
+    /// The whole ticket, end to end: an agent claims two files, the branch
+    /// touched four, and the board — not the agent — names the other two.
+    #[test]
+    fn the_board_computes_what_the_agent_did_not_account_for() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        attempt_in(&e, &dir, &base);
+
+        std::fs::write(dir.join("src/db.rs"), "// base\n// claims column\n").unwrap();
+        std::fs::write(dir.join("src/claims.rs"), "// the contract\n").unwrap();
+        // Nobody is going to mention these two.
+        std::fs::write(dir.join("Cargo.lock"), "# a dependency moved\n").unwrap();
+        std::fs::write(dir.join("src/gc.rs"), "// edited in passing\n").unwrap();
+        commit_all(&dir, "the work");
+
+        let review = e
+            .submit_claims(
+                None,
+                "linear:LIN-142",
+                "Claims are stored against the attempt :: src/db.rs\n\
+                 The format and the remainder :: src/claims.rs\n",
+            )
+            .unwrap();
+
+        assert!(review.claimed(), "the contract was answered");
+        assert_eq!(review.remainder.claims.len(), 2);
+        assert_eq!(review.remainder.claimed, 2);
+        assert_eq!(
+            review
+                .remainder
+                .unclaimed
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["Cargo.lock", "src/gc.rs"],
+            "the remainder is the product"
+        );
+        assert!(matches!(review.diff, crate::claims::DiffSource::Checkout));
+        // And the line counts a reader needs to judge one at a glance.
+        let lock = &review.remainder.unclaimed[0];
+        assert_eq!(lock.status, "A");
+        assert_eq!(lock.added, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The one way an empty remainder could mislead: an agent that claims
+    /// before it commits has shown the board nothing, and "all accounted for"
+    /// would be the friendliest possible lie.
+    #[test]
+    fn work_that_is_not_committed_yet_is_reported_beside_the_remainder() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// written, not committed\n").unwrap();
+        std::fs::write(dir.join("src/new.rs"), "// not even added\n").unwrap();
+
+        let review = e
+            .submit_claims(None, "linear:LIN-142", "Storage :: src/db.rs")
+            .unwrap();
+        assert!(review.changed.is_empty(), "nothing is on the branch yet");
+        assert!(review.remainder.complete(), "vacuously — hence the flag");
+        assert_eq!(
+            review.uncommitted,
+            Some(2),
+            "the untracked file counts too: it has been shown to nobody either"
+        );
+
+        // Committing turns it into a diff, and the flag goes.
+        commit_all(&dir, "the work");
+        let review = e.review("linear:LIN-142", None).unwrap();
+        assert_eq!(review.changed.len(), 2);
+        assert_eq!(review.uncommitted, Some(0));
+        assert_eq!(review.remainder.unclaimed[0].path, "src/new.rs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Submitting again is the agent correcting itself, not adding to a pile —
+    /// a review that showed a superseded claim beside its replacement would be
+    /// worse than one that showed neither.
+    #[test]
+    fn a_second_submission_replaces_the_first() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
+        commit_all(&dir, "work");
+
+        e.submit_claims(None, "linear:LIN-142", "Wrong :: src/nothing.rs")
+            .unwrap();
+        let review = e
+            .submit_claims(None, "linear:LIN-142", "Right :: src/db.rs")
+            .unwrap();
+        assert_eq!(review.remainder.claims.len(), 1);
+        assert_eq!(review.remainder.claims[0].text, "Right");
+        assert!(review.remainder.complete());
+        assert_eq!(e.db.get_attempt(a).unwrap().unwrap().claims.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Prose is refused where it is submitted, and nothing is recorded — the
+    /// contract is enforced by the board, not by the agent remembering it.
+    #[test]
+    fn prose_is_refused_and_leaves_the_attempt_unclaimed() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+        let err = e
+            .submit_claims(None, "linear:LIN-142", "I improved the storage layer.")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no `::`"), "{err}");
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        assert!(attempt.claims.is_empty());
+        assert_eq!(attempt.claims_at, None, "and it still owes an answer");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reason the snapshot exists: gc reclaims the checkout (gh#72) and the
+    /// review still has to be able to name the unclaimed set.
+    #[test]
+    fn the_remainder_survives_the_checkout_being_reclaimed() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
+        std::fs::write(dir.join("Cargo.lock"), "# nobody says\n").unwrap();
+        commit_all(&dir, "work");
+
+        // A reconcile snapshots the diff while the attempt is still live.
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        e.record_review_facts(None, &attempt);
+        e.submit_claims(None, "linear:LIN-142", "Storage :: src/db.rs")
+            .unwrap();
+
+        // …and then gc takes the checkout away.
+        std::fs::remove_dir_all(&dir).unwrap();
+        e.db.set_attempt_collected(a).unwrap();
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        assert!(matches!(review.diff, crate::claims::DiffSource::Recorded));
+        assert_eq!(review.remainder.unclaimed.len(), 1);
+        assert_eq!(review.remainder.unclaimed[0].path, "Cargo.lock");
+    }
+
+    /// …and when there is neither a checkout nor a snapshot, the review says
+    /// so. An empty diff would read as "this branch changed nothing", which is
+    /// the opposite of what happened.
+    #[test]
+    fn a_review_with_no_diff_to_read_says_why_rather_than_showing_none() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/gone-long-ago").unwrap();
+        e.db.set_attempt_collected(a).unwrap();
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        let crate::claims::DiffSource::Unavailable { reason } = &review.diff else {
+            panic!("expected the reason, got {:?}", review.diff);
+        };
+        assert!(reason.contains("reclaimed"), "{reason}");
+        assert!(!review.claimed());
+    }
+
+    /// The evidence half: what the run's own commands did, off the journal,
+    /// recorded onto the row while the journal is still there.
+    #[test]
+    fn the_runs_commands_are_recorded_as_evidence_against_the_attempt() {
+        use crate::evidence::RanCommand;
+
+        struct Journal;
+        impl Runtime for Journal {
+            fn dispatch(
+                &self,
+                _spec: &crate::runtime::DispatchSpec,
+            ) -> Result<crate::runtime::DispatchHandle> {
+                unreachable!()
+            }
+            fn prompt(&self, _chat: &str, _text: &str) -> Result<()> {
+                Ok(())
+            }
+            fn cancel(&self, _chat: &str) -> Result<()> {
+                Ok(())
+            }
+            fn session(&self, _chat: &str) -> Result<Option<comet_proto::Session>> {
+                Ok(None)
+            }
+            fn chat_alive(&self, _chat: &str) -> Result<bool> {
+                Ok(true)
+            }
+            fn chat_cwd(&self, _chat: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn last_run_end(&self, _chat: &str) -> Result<Option<RunEnd>> {
+                Ok(None)
+            }
+            fn run_commands(&self, _chat: &str) -> Result<Option<Vec<RanCommand>>> {
+                Ok(Some(vec![
+                    RanCommand {
+                        command: "git status".into(),
+                        failed: false,
+                    },
+                    RanCommand {
+                        command: "cargo test -p comet-board".into(),
+                        failed: true,
+                    },
+                    RanCommand {
+                        command: "cargo test -p comet-board".into(),
+                        failed: false,
+                    },
+                ]))
+            }
+        }
+
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        e.record_review_facts(Some(&Journal), &attempt);
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        assert_eq!(review.evidence.commands, 3);
+        assert_eq!(review.evidence.failed, 1);
+        assert!(review.evidence.checked());
+        assert_eq!(
+            review.evidence.checks[0].command,
+            "cargo test -p comet-board"
+        );
+        assert_eq!(review.evidence.checks[0].runs, 2);
+        assert!(review.evidence.checks[0].ever_passed());
     }
 }

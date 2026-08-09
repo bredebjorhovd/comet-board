@@ -19,7 +19,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use comet_board::adopt::{Unadopted, git_remote, github_slug};
+use comet_board::claims::AttemptReview;
 use comet_board::config::{self, Paths, RoutingConfig};
+use comet_board::evidence::RunEvidence;
 use comet_board::members::{Roster, Slot};
 use comet_board::model::{BoardState, Source};
 use comet_board::onboard::{Candidate, Onboarded};
@@ -277,6 +279,228 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{cut}…")
+}
+
+// ---- the review contract (§gh#183) --------------------------------------
+
+/// Record what this attempt did, and read back what the claims did not account
+/// for.
+///
+/// The raw block goes over the wire unparsed on purpose: the format is enforced
+/// on the board's host, so a refusal is the same refusal whichever client sent
+/// it, and the CLI cannot become a second, laxer definition of the contract.
+pub async fn submit_claims(board: &Board, task_id: &str, text: &str) -> Result<AttemptReview> {
+    let params = board.params(serde_json::json!({ "taskId": task_id, "text": text }));
+    let reply = board.client.call(methods::SUBMIT_CLAIMS, params).await?;
+    serde_json::from_value(reply).context("parsing SubmitClaims reply")
+}
+
+/// One attempt's review. `None` is the task's latest attempt.
+pub async fn attempt_review(
+    board: &Board,
+    task_id: &str,
+    attempt: Option<i64>,
+) -> Result<AttemptReview> {
+    let mut params = serde_json::json!({ "taskId": task_id });
+    if let (Some(attempt), Some(object)) = (attempt, params.as_object_mut()) {
+        object.insert("attempt".into(), serde_json::json!(attempt));
+    }
+    let reply = board
+        .client
+        .call(methods::READ_ATTEMPT_REVIEW, board.params(params))
+        .await?;
+    serde_json::from_value(reply).context("parsing ReadAttemptReview reply")
+}
+
+/// The whole review, printed in the order the question is asked in: what was
+/// asked, what the agent says it did, what the board saw for itself, and what
+/// nobody accounted for.
+///
+/// The remainder goes last because it is what a reader should be left holding,
+/// and it is the only section that is loud when it is non-empty.
+pub fn print_review(review: &AttemptReview, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(review)?);
+    } else {
+        print!("{}", render_review(review));
+    }
+    Ok(())
+}
+
+/// What `claim` prints back: the receipt, and then the only part that matters —
+/// the changes the agent has just failed to account for.
+pub fn print_claim_result(review: &AttemptReview, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(review)?);
+    } else {
+        print!("{}", render_claim_result(review));
+    }
+    Ok(())
+}
+
+/// Rendered rather than printed, so what a reviewer reads is testable. The
+/// sections are the question in order, and the remainder is last because it is
+/// what a reader should be left holding.
+pub fn render_review(review: &AttemptReview) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} · {}", review.brief.identifier, review.brief.title);
+    let _ = writeln!(out, "  {}", review.brief.url);
+    let _ = write!(out, "  attempt {}", review.attempt);
+    if let Some(branch) = &review.branch {
+        let _ = write!(out, " · {branch}");
+    }
+    match &review.outcome {
+        Some(outcome) => {
+            let _ = writeln!(out, " · {outcome}");
+        }
+        None => {
+            let _ = writeln!(out, " · still running");
+        }
+    }
+    if let Some(pr) = &review.pr_url {
+        let _ = writeln!(out, "  {pr}");
+    }
+    out.push('\n');
+    claims_section(review, &mut out);
+    out.push('\n');
+    evidence_section(&review.evidence, &mut out);
+    out.push('\n');
+    remainder_section(review, &mut out);
+    out
+}
+
+pub fn render_claim_result(review: &AttemptReview) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "recorded {} claim(s) on {} attempt {}",
+        review.remainder.claims.len(),
+        review.brief.identifier,
+        review.attempt
+    );
+    // A claim the diff does not support is the other half of the answer: work
+    // described that did not happen, said as loudly as work nobody described.
+    for claim in review.remainder.claims.iter().filter(|c| !c.anchored()) {
+        let _ = writeln!(out, "  ! nothing in the diff matches: {}", claim.text);
+    }
+    out.push('\n');
+    remainder_section(review, &mut out);
+    out
+}
+
+fn claims_section(review: &AttemptReview, out: &mut String) {
+    use std::fmt::Write;
+    if !review.claimed() {
+        let _ = writeln!(
+            out,
+            "CLAIMS — none submitted; this attempt never answered the contract"
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "CLAIMS ({}, submitted {})",
+        review.remainder.claims.len(),
+        review.claimed_at.as_deref().unwrap_or("—")
+    );
+    for claim in &review.remainder.claims {
+        // `!` is a claim nothing in the diff supports — a claim about work that
+        // did not happen, which is at least as interesting as an unclaimed file.
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            if claim.anchored() { "·" } else { "!" },
+            claim.text
+        );
+        if !claim.matched.is_empty() {
+            let _ = writeln!(out, "      {}", claim.matched.join(", "));
+        }
+        for path in &claim.unmatched {
+            let _ = writeln!(out, "      (unchanged: {path})");
+        }
+    }
+}
+
+fn evidence_section(evidence: &RunEvidence, out: &mut String) {
+    use std::fmt::Write;
+    if evidence.commands == 0 {
+        let _ = writeln!(
+            out,
+            "EVIDENCE — the board recorded no commands for this run"
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "EVIDENCE ({} command(s) ran, {} exited non-zero)",
+        evidence.commands, evidence.failed
+    );
+    if !evidence.checked() {
+        let _ = writeln!(out, "  ! nothing that checks anything ran");
+        return;
+    }
+    for check in &evidence.checks {
+        let tail = match (check.runs, check.failed) {
+            (1, 0) => String::new(),
+            (runs, 0) => format!("  ×{runs}"),
+            (runs, failed) => format!("  ×{runs}, {failed} failed"),
+        };
+        let _ = writeln!(
+            out,
+            "  {} {}{tail}",
+            if check.ever_passed() { "·" } else { "!" },
+            check.command
+        );
+    }
+    if evidence.truncated {
+        let _ = writeln!(out, "  (…and more; the list is capped)");
+    }
+}
+
+fn remainder_section(review: &AttemptReview, out: &mut String) {
+    use std::fmt::Write;
+    if let comet_board::claims::DiffSource::Unavailable { reason } = &review.diff {
+        let _ = writeln!(out, "UNCLAIMED — unknown: {reason}");
+        return;
+    }
+    let total = review.changed.len();
+    if review.remainder.complete() {
+        let _ = writeln!(
+            out,
+            "UNCLAIMED — none; all {total} changed file(s) are accounted for"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "UNCLAIMED ({} of {total} changed file(s))",
+            review.remainder.unclaimed.len()
+        );
+        for file in &review.remainder.unclaimed {
+            let counts = if file.binary {
+                "binary".to_string()
+            } else {
+                format!("+{} −{}", file.added, file.removed)
+            };
+            let _ = writeln!(out, "  {:<2} {:<52} {counts}", file.status, file.path);
+        }
+    }
+    if matches!(review.diff, comet_board::claims::DiffSource::Recorded) {
+        let _ = writeln!(
+            out,
+            "  (from the diff the board recorded; the checkout is gone)"
+        );
+    }
+    // The one thing that would make an empty remainder a lie: work that is in
+    // the checkout and not on the branch has been shown to nobody.
+    if let Some(n) = review.uncommitted.filter(|n| *n > 0) {
+        let _ = writeln!(
+            out,
+            "  ! {n} file(s) changed in the checkout and not committed — \
+             not on the branch, so not in the diff above"
+        );
+    }
 }
 
 // ---- dispatch / retry / cancel ------------------------------------------
@@ -1506,7 +1730,9 @@ mod tests {
             };
         }
 
-        let err = resolve_runtime(&options, "opencode").unwrap_err().to_string();
+        let err = resolve_runtime(&options, "opencode")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not installed"), "{err}");
         assert!(err.contains("claude-code"), "names what does work: {err}");
 
@@ -1714,5 +1940,174 @@ mod tests {
     fn truncate_is_char_safe() {
         assert_eq!(truncate("short", 48), "short");
         assert_eq!(truncate("ålesund", 4), "åle…");
+    }
+
+    // ---- the review, as a reader sees it (§gh#183) ----------------------
+
+    use comet_board::claims::{Brief, ChangedFile, ClaimView, DiffSource, Remainder};
+    use comet_board::evidence::Check;
+
+    fn changed(path: &str, status: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            status: status.into(),
+            added: 12,
+            removed: 3,
+            binary: false,
+        }
+    }
+
+    fn review_of(remainder: Remainder, changed_files: Vec<ChangedFile>) -> AttemptReview {
+        AttemptReview {
+            task_id: "gh:o/r#183".into(),
+            attempt: 7,
+            attempt_number: 2,
+            state: "review".into(),
+            outcome: Some("done".into()),
+            branch: Some("board/gh-183".into()),
+            worktree: Some("/wt/gh-183".into()),
+            pr_url: Some("https://github.com/o/r/pull/210".into()),
+            brief: Brief {
+                identifier: "gh#183".into(),
+                title: "review backend".into(),
+                url: "https://github.com/o/r/issues/183".into(),
+                body: None,
+            },
+            claimed_at: Some("2026-08-09T10:00:00Z".into()),
+            remainder,
+            changed: changed_files,
+            diff: DiffSource::Checkout,
+            uncommitted: Some(0),
+            evidence: RunEvidence::default(),
+        }
+    }
+
+    /// The remainder is the thing a reader is left holding, so it is last and
+    /// it names every file.
+    #[test]
+    fn the_unclaimed_set_is_the_last_thing_the_review_says() {
+        let text = render_review(&review_of(
+            Remainder {
+                claims: vec![ClaimView {
+                    text: "Storage".into(),
+                    files: vec!["src/db.rs".into()],
+                    matched: vec!["src/db.rs".into()],
+                    unmatched: vec![],
+                }],
+                unclaimed: vec![changed("Cargo.lock", "A")],
+                unmatched_anchors: vec![],
+                claimed: 1,
+            },
+            vec![changed("src/db.rs", "M"), changed("Cargo.lock", "A")],
+        ));
+        assert!(text.contains("gh#183 · review backend"), "{text}");
+        assert!(text.contains("attempt 7 · board/gh-183 · done"), "{text}");
+        assert!(
+            text.contains("CLAIMS (1, submitted 2026-08-09T10:00:00Z)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("UNCLAIMED (1 of 2 changed file(s))"),
+            "{text}"
+        );
+        assert!(text.contains("Cargo.lock"), "{text}");
+        let (before, after) = text.split_once("UNCLAIMED").expect("a remainder section");
+        assert!(before.contains("CLAIMS"), "the claims come first");
+        assert!(!after.contains("CLAIMS"), "and the remainder is last");
+    }
+
+    /// Two silences a review must never render as calm: an attempt that never
+    /// claimed anything, and a run that never checked anything.
+    #[test]
+    fn an_unanswered_contract_and_an_unchecked_run_both_say_so() {
+        let mut review = review_of(
+            Remainder {
+                unclaimed: vec![changed("src/db.rs", "M")],
+                ..Default::default()
+            },
+            vec![changed("src/db.rs", "M")],
+        );
+        review.claimed_at = None;
+        review.evidence = RunEvidence {
+            commands: 214,
+            failed: 11,
+            checks: vec![],
+            truncated: false,
+        };
+        let text = render_review(&review);
+        assert!(text.contains("never answered the contract"), "{text}");
+        assert!(
+            text.contains("214 command(s) ran, 11 exited non-zero"),
+            "{text}"
+        );
+        assert!(text.contains("nothing that checks anything ran"), "{text}");
+    }
+
+    /// A check that never passed is marked, and a claim that anchors to nothing
+    /// is marked the same way — both are things the reader has to look at.
+    #[test]
+    fn failures_and_unanchored_claims_are_both_flagged() {
+        let mut review = review_of(
+            Remainder {
+                claims: vec![ClaimView {
+                    text: "Fixed the retry path".into(),
+                    files: vec!["src/retry.rs".into()],
+                    matched: vec![],
+                    unmatched: vec!["src/retry.rs".into()],
+                }],
+                unmatched_anchors: vec!["src/retry.rs".into()],
+                ..Default::default()
+            },
+            vec![],
+        );
+        review.evidence = RunEvidence {
+            commands: 9,
+            failed: 2,
+            checks: vec![Check {
+                command: "cargo test".into(),
+                runs: 2,
+                failed: 2,
+            }],
+            truncated: false,
+        };
+        let text = render_review(&review);
+        assert!(text.contains("! Fixed the retry path"), "{text}");
+        assert!(text.contains("(unchanged: src/retry.rs)"), "{text}");
+        assert!(text.contains("! cargo test  ×2, 2 failed"), "{text}");
+
+        // …and the claim receipt says the same thing, first.
+        let receipt = render_claim_result(&review);
+        assert!(
+            receipt.starts_with("recorded 1 claim(s) on gh#183 attempt 7"),
+            "{receipt}"
+        );
+        assert!(
+            receipt.contains("! nothing in the diff matches: Fixed the retry path"),
+            "{receipt}"
+        );
+    }
+
+    /// The two states that would otherwise read as "nothing changed".
+    #[test]
+    fn an_unreadable_diff_and_uncommitted_work_are_never_silent() {
+        let mut review = review_of(Remainder::default(), vec![]);
+        review.diff = DiffSource::Unavailable {
+            reason: "the checkout was reclaimed (/wt/gh-183)".into(),
+        };
+        let text = render_review(&review);
+        assert!(text.contains("UNCLAIMED — unknown"), "{text}");
+        assert!(text.contains("reclaimed"), "{text}");
+
+        let mut review = review_of(Remainder::default(), vec![]);
+        review.uncommitted = Some(3);
+        let text = render_review(&review);
+        assert!(
+            text.contains("all 0 changed file(s) are accounted for"),
+            "{text}"
+        );
+        assert!(
+            text.contains("3 file(s) changed in the checkout and not committed"),
+            "an empty remainder over uncommitted work is the friendly lie: {text}"
+        );
     }
 }

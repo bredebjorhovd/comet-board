@@ -17,6 +17,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use comet_board::evidence::RanCommand;
 use comet_board::runtime::{
     DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
 };
@@ -353,6 +354,12 @@ impl Runtime for CometRuntime {
             usage: t.usage,
             model: t.model,
         }))
+    }
+
+    /// The chat's commands, off the same journal again (§gh#183) — the half of
+    /// a review the agent did not write. See [`RunJournal::commands`].
+    fn run_commands(&self, chat_id: &str) -> anyhow::Result<Option<Vec<RanCommand>>> {
+        Ok(self.journal.commands(chat_id)?)
     }
 }
 

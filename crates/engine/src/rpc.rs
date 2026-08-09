@@ -1259,6 +1259,12 @@ fn forwardable(method: &str) -> bool {
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
             | methods::READ_BOARD_TASK
+            // The review contract (§gh#183). Forwarded for the same reason
+            // every other board verb is: the attempt row, the checkout the
+            // diff comes out of, and the run journal all live on the box, and
+            // an agent submitting claims is usually not sitting on it.
+            | methods::SUBMIT_CLAIMS
+            | methods::READ_ATTEMPT_REVIEW
             | methods::LIST_BOARD_RUNTIMES
             // Throughput is read off `board.db`, which only the box has
             // (gh#143) — a laptop's stats page is asking about the board, not
@@ -1673,6 +1679,40 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&detail)
+            }
+            // The claim contract (§gh#183). The refusal a malformed claim gets
+            // comes back as the call's error, because the format is enforced
+            // here and not in whatever wrote the params.
+            methods::SUBMIT_CLAIMS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    text: String,
+                }
+                let p: P = parse_params(params)?;
+                let review = self
+                    .board()?
+                    .submit_claims(&p.task_id, &p.text)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&review)
+            }
+            methods::READ_ATTEMPT_REVIEW => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    #[serde(default)]
+                    attempt: Option<i64>,
+                }
+                let p: P = parse_params(params)?;
+                let review = self
+                    .board()?
+                    .attempt_review(&p.task_id, p.attempt)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&review)
             }
             // The routing surface (gh#75). Served off the board's own paths, so
             // this answers about the config the running loop reads — and keeps

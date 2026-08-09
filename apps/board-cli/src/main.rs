@@ -71,8 +71,10 @@ struct Cli {
     /// and the board RPCs are relay-forwarded: this still dials the local
     /// engine, which passes the call on. Applies to the verbs that ask the
     /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`,
-    /// `routes`, which reads and writes the host's routing.toml (gh#75), and
-    /// `onboard`, whose clone, space and route all land on the host (gh#97).
+    /// `claim` and `review`, whose attempt rows and checkouts live on the host
+    /// (§gh#183), `routes`, which reads and writes the host's routing.toml
+    /// (gh#75), and `onboard`, whose clone, space and route all land on the
+    /// host (gh#97).
     /// The rest (doctor, init, adopt, stats) read this device's own files
     /// either way, and are unaffected.
     #[arg(long, global = true)]
@@ -189,6 +191,48 @@ enum Command {
         /// Give up after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Say what your attempt did, in claims a reviewer can check.
+    ///
+    /// One claim per line: `what you did :: path/one.rs path/two.rs`. The paths
+    /// are the point — a sentence with no files after `::` is prose, and prose
+    /// is refused, because the board checks every claim against the diff and
+    /// then tells you which of your changes no claim accounts for. That answer
+    /// is what comes back, and it is worth reading: it is the part of your own
+    /// work you did not notice you had done.
+    ///
+    /// Pipe a block on stdin, or pass `--claim` once per claim. Submitting
+    /// again replaces the set.
+    Claim {
+        /// The task whose attempt these claims are about.
+        #[arg(long)]
+        task: String,
+        /// One claim, in the format above. Repeat for several; omit and the
+        /// block is read from stdin.
+        #[arg(long = "claim")]
+        claims: Vec<String>,
+        /// Print the whole review as JSON instead of the summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// What an attempt was asked to do, what it says it did, and what it did
+    /// not account for.
+    ///
+    /// The last of those is the one to read: a dependency nobody mentioned and
+    /// a function edited in passing are what you would have missed, and they
+    /// are computed by the board from the branch diff rather than asserted by
+    /// the agent.
+    Review {
+        /// The task to review.
+        #[arg(long)]
+        task: String,
+        /// Which attempt, by id. Defaults to the task's latest — a retry makes
+        /// claims of its own.
+        #[arg(long)]
+        attempt: Option<i64>,
+        /// Print brief, claims, evidence and remainder as one JSON object.
         #[arg(long)]
         json: bool,
     },
@@ -683,6 +727,25 @@ fn main() -> Result<()> {
             })?;
             ops::print_tasks(&rows, json)
         }
+        Command::Claim { task, claims, json } => {
+            let text = claim_text(&claims)?;
+            let review = runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                ops::submit_claims(&board, &task, &text).await
+            })?;
+            ops::print_claim_result(&review, json)
+        }
+        Command::Review {
+            task,
+            attempt,
+            json,
+        } => {
+            let review = runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                ops::attempt_review(&board, &task, attempt).await
+            })?;
+            ops::print_review(&review, json)
+        }
         Command::New {
             title,
             body,
@@ -983,6 +1046,33 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The claim block to submit: the `--claim` flags if there are any, else
+/// whatever is on stdin (§gh#183).
+///
+/// A terminal with no flags is somebody who typed the verb to see what it does,
+/// and the honest answer is the format rather than a hang on a pipe nobody is
+/// writing to. Everything else — a heredoc, a file, a `--claim` — goes through
+/// unparsed; the board's host owns the format.
+fn claim_text(claims: &[String]) -> Result<String> {
+    use std::io::IsTerminal;
+    if !claims.is_empty() {
+        return Ok(claims.join("\n"));
+    }
+    if std::io::stdin().is_terminal() {
+        bail!(
+            "nothing to record. Pass --claim once per claim, or pipe a block:\n\
+             \n  comet-board claim --task <id> <<'EOF'\n  \
+             what you did :: path/one.rs path/two.rs\n  EOF\n\n\
+             The paths are the contract: a claim with none cannot be checked \
+             against the diff, and the diff is what says which of your changes \
+             no claim accounts for."
+        );
+    }
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+    Ok(buf)
 }
 
 /// `comet-board skill …` — put the shipped skill where agents read it (gh#133).

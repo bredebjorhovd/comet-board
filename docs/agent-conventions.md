@@ -244,6 +244,36 @@ statement that you are finished, so it settles the attempt promptly. Commits
 are not — you were told to make them mid-flight — so they settle it only once
 the run has genuinely ended. Open the PR when you want the row to move promptly.
 
+**Say what you changed, in claims a reviewer can check.** Before you call
+yourself done — after the commits, alongside the pull request — submit them:
+
+```bash
+comet-board claim --task gh:owner/repo#183 <<'EOF'
+Claims are stored against the attempt :: crates/board/src/db.rs crates/board/src/model.rs
+The remainder is computed from the branch diff :: crates/board/src/claims.rs
+EOF
+```
+
+One claim per line: `<what you did> :: <path> [<path>…]`. Paths are
+repo-relative, and a directory (`crates/board/src/`) accounts for everything
+under it. A line with no `::`, or nothing after it, is **refused** — a summary
+written by the model that wrote the code inherits its blind spots, so a claim
+that cannot be checked against the diff is not worth storing.
+
+What comes back is the part to read. The board diffs your branch against the
+commit your attempt started from and prints **every changed file no claim
+accounts for** — computed from git, not from what you wrote, which is why it
+catches the dependency you bumped and the function you edited in passing.
+Either claim those changes too or go and look at them; they are the ones a
+reviewer would have found. Claims that anchor to files nothing happened to come
+back as well, and mean the opposite: work you described that the diff does not
+show.
+
+Claims live on the attempt, so they survive the chat being archived, and a retry
+makes its own. Submitting again replaces the set — correcting yourself is
+expected. `comet-board review --task <id> [--json]` prints the whole thing back:
+the brief, your claims, the commands your run actually ran, and the remainder.
+
 **Screenshots go in the repo, not in a `raw.githubusercontent.com` link.** A
 ticket that asks for screenshots in the PR description is asking for something
 that keeps working, and the URL an agent reaches for first does not:
