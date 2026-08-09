@@ -3,7 +3,7 @@
 §gh#151 made the board count tokens and closed with the sentence this ticket
 starts from: *"pricing is a separate ticket… whatever is shown must be labelled
 a list-price estimate of the same usage on the API, not a bill."* This is the
-backend half of §gh#179 — that ticket redesigns the Stats page around spend,
+backend half of gh#179 — that ticket redesigns the Stats page around spend,
 this one makes spend a number the page can render, in `crates/board` and
 `crates/proto` so the two can run in parallel.
 
