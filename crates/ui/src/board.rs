@@ -12,8 +12,15 @@
 //! - Sections in fixed order (blocked → working → ready → review → failed →
 //!   done), empty ones omitted; `done` is bounded to today by the shared
 //!   derivation;
-//! - `enter` on a ready row dispatches it (`DispatchTask`); on a running row it
-//!   opens that attempt's chat; on a section header it folds/unfolds;
+//! - a row is one 32px line (gh#176): glyph, identifier, title, then the row's
+//!   own verb and its metadata right-aligned against the far edge. Every row is
+//!   that height in every state, so nothing the pointer does reflows the list
+//!   (gh#132);
+//! - `enter` runs the selected row's primary verb — the one the row draws
+//!   without being hovered, taken from `board::primary_action` so the chip and
+//!   the key are one rule (gh#176): dispatch a ready row (`DispatchTask`),
+//!   retry a failed one, open a running or blocked one's chat, open a review's
+//!   PR. On a section header it folds/unfolds;
 //! - the dispatch picker asks which runtime, whose agent account, and which
 //!   model on that harness (`ListModels`, defaulted to the harness's first
 //!   catalog row) to release under, and sends all three as overrides. The
@@ -454,23 +461,31 @@ fn group_row_id(state: BoardState, route: Option<&str>) -> String {
     )
 }
 
-/// A task row's height — **the same for every row, in every state** (gh#132).
+/// A task row's height — **the same for every row, in every state** (gh#132),
+/// and one line tall (gh#176).
 ///
 /// gh#125 made it a minimum so the hovered row could wrap its title, which is
-/// how a hover came to reflow everything under it. It is a constant again, and
-/// the two lines inside it are constants too: nothing a pointer does may change
-/// the geometry of a list it is only passing over.
-const ROW_H: f32 = ROW_PAD_Y * 2.0 + ROW_LINE_H + ROW_LINE_GAP + META_LINE_H;
-/// The first line's height — the action chip's, so a row showing chips is
+/// how a hover came to reflow everything under it. gh#132 made it a constant
+/// again — 47px: a title line, a metadata line, and the gap between them, held
+/// whether or not the row had any metadata to put on the second one. Ready rows
+/// mostly have none, so a third of the list's vertical budget was reserved
+/// blank by contract.
+///
+/// gh#176 spends it: the metadata moved onto the title's line as a right-hand
+/// column, and the row is 32px. The guarantee is untouched and the arithmetic
+/// is simpler for it — one line, its padding, and nothing a pointer does may
+/// change either.
+const ROW_H: f32 = ROW_PAD_Y * 2.0 + ROW_LINE_H;
+/// The row's one line — the action chip's height, so a row showing chips is
 /// exactly as tall as one that is not.
 const ROW_LINE_H: f32 = 20.0;
-/// The metadata line's height, held even when there is no metadata.
-const META_LINE_H: f32 = 15.0;
-/// The gap between a row's two lines, and its vertical padding — named because
-/// [`ROW_H`] is their sum and a row whose declared height disagreed with its
-/// content would clip one of them.
-const ROW_LINE_GAP: f32 = 2.0;
-const ROW_PAD_Y: f32 = 5.0;
+/// The row's vertical padding, named because [`ROW_H`] is built from it and a
+/// row whose declared height disagreed with its content would clip the line.
+const ROW_PAD_Y: f32 = 6.0;
+/// How much of a row the metadata column may take before it truncates. The
+/// title is what the list is for; the facts beside it are a column to scan
+/// down, not a second title.
+const META_MAX_W: f32 = 150.0;
 /// How tall the peek's issue body may get before it scrolls (gh#132). Capped
 /// rather than proportional: the list above is the thing being navigated, and a
 /// panel that grew with a long issue would push the cursor's own row off screen.
@@ -485,6 +500,24 @@ fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
         Some(status) => theme.status(status),
         None if state == BoardState::Done => theme.text_faint,
         None => theme.text,
+    }
+}
+
+/// A section header's words on this surface (gh#176).
+///
+/// [`BoardState::label`] is the published spelling — `BLOCKED`, `DONE TODAY` —
+/// and it stays that way: the TUI, the CLI and the phone all say it, and a
+/// contract is not something one viewport edits. Caps are a *typographic*
+/// choice, though, and this surface has stopped making it: a header shouting in
+/// a grey slab was loud without being clear. Same words, sentence case.
+fn section_title(state: BoardState) -> &'static str {
+    match state {
+        BoardState::Blocked => "Blocked",
+        BoardState::Working => "Working",
+        BoardState::Ready => "Ready",
+        BoardState::Review => "Review",
+        BoardState::Failed => "Failed",
+        BoardState::Done => "Done today",
     }
 }
 
@@ -520,11 +553,15 @@ pub fn agent_state_color(state: board::AgentState, theme: &Theme) -> gpui::Hsla 
     theme.status(crate::theme::Status::of_agent(state))
 }
 
-/// The `[process exited]`-free reason a working/blocked row's metadata names
-/// the runtime of — see [`board::row_metadata`] for the shared derivation this
-/// trims the terminal padding off.
+/// The facts a row carries in its right-hand column — the shared derivation's,
+/// in the spelling a proportional font can set (gh#176): joined with `·`, not
+/// padded into the terminal's monospace grid.
+///
+/// `selected: false` always. The grid's one selection-dependent field is the
+/// `[enter to dispatch]` hint, which this surface now draws as a chip that is
+/// always there rather than a note that appears under the cursor.
 fn metadata(row: &TaskRow, now: chrono::DateTime<Utc>) -> String {
-    board::row_metadata(row, false, 120, now).trim_end().to_string()
+    board::row_metadata_line(row, false, now)
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,8 +1894,17 @@ impl BoardPanel {
         cx.notify();
     }
 
-    /// `enter` on the board: dispatch a ready (or failed) task, fold a section
-    /// header, or open a running task's chat.
+    /// `enter` on the board: fold a header, or run the selected row's primary
+    /// verb — dispatch a ready task, retry a failed one (gh#42), open a running
+    /// or blocked one's chat, open a review's PR.
+    ///
+    /// Which verb that is comes from [`board::primary_action`] rather than a
+    /// second match here (gh#176), so the chip the row wears and the key the
+    /// operator presses cannot come to mean different things. A blocked row is
+    /// the case that earns the shared rule: its actions lead with Retry, but
+    /// enter opens the chat (gh#49) — its agent is alive and awaiting input, so
+    /// the chat is where the answer is, and ending the attempt to replace it is
+    /// explicit enough for a chip.
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.model.on_section() {
             self.model.toggle_collapsed(state);
@@ -1873,17 +1919,9 @@ impl BoardPanel {
         let Some(row) = self.model.selected_task() else {
             return;
         };
-        let (id, state) = (row.id.clone(), row.state());
-        match state {
-            // Enter dispatches a ready task, and retries a failed one (gh#42).
-            BoardState::Ready | BoardState::Failed => self.dispatch(&id, cx),
-            // Enter opens a running task's chat — including a blocked one
-            // (gh#49): its agent is alive and awaiting input, so the chat is
-            // where the answer is, and ending the attempt to replace it is
-            // explicit enough for a chip, not something enter should do by
-            // accident. The Retry chip is the blocked row's redispatch path.
-            BoardState::Working | BoardState::Blocked => self.open_chat(&id, window, cx),
-            _ => {}
+        let id = row.id.clone();
+        if let Some(action) = board::primary_action(row) {
+            self.run_action(&id, action, window, cx);
         }
     }
 
@@ -2602,11 +2640,19 @@ impl BoardPanel {
             .into_any_element()
     }
 
-    /// A section header: glyph + uppercase label + the folded count where the
-    /// rows would be (comet's board language — see the TUI renderer).
+    /// A section header: glyph + label + the count where the rows would be
+    /// (comet's board language — see the TUI renderer).
+    ///
+    /// gh#176 took the slab off it. It was set in caps on a grey fill with its
+    /// count in a second grey pill — three devices to say one word, and the
+    /// weight landed on the fill rather than on the word. Sentence case at
+    /// 12/600 in full-strength text, on a hairline: louder by being quieter,
+    /// and the only fills left in the list are the ones that mean something
+    /// (hover, selection).
     fn render_section(
         &mut self,
         state: BoardState,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -2628,6 +2674,11 @@ impl BoardPanel {
             .items_center()
             .gap(px(8.0))
             .px(px(Theme::SPACE_LG))
+            // The hairline the header sits on — the only line the list draws,
+            // and it separates sections rather than boxing them (gh#176). The
+            // topmost header skips it: the panel's own header already drew one
+            // there, and two hairlines a pixel apart is a border.
+            .when(!first, |el| el.border_t_1().border_color(theme.border))
             .cursor_pointer()
             // Hover brightens from wherever the row rests — a selected section
             // never darkens toward a weaker wash.
@@ -2652,39 +2703,29 @@ impl BoardPanel {
                     .child(SharedString::from(state.glyph())),
             )
             // A header managing a hundred rows carries the weight of one
-            // (gh#125): bold, a step up in size, its count always beside it —
-            // and a chevron for the fold, not a text button.
+            // (gh#125) — and it carries it in the text, at full strength,
+            // rather than in a fill behind it (gh#176).
             .child(
                 div()
                     .flex_none()
                     .text_size(px(Theme::TEXT_DENSE))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(if selected {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .child(SharedString::from(if state == BoardState::Done {
-                        "DONE TODAY".to_string()
-                    } else {
-                        state.label().to_string()
-                    })),
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(section_title(state))),
             )
+            // The count in the group headers' words — "· 12" — so one language
+            // reads down the whole list instead of a pill here and a suffix
+            // twelve pixels below it.
             .child(
                 div()
-                    .px(px(7.0))
-                    .h(px(18.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(Theme::RADIUS_CHIP))
-                    .bg(theme.wash(0.08))
+                    .flex_none()
                     .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(if folded {
                         theme.text_muted
                     } else {
                         theme.text_subtle
                     })
-                    .child(SharedString::from(len.to_string())),
+                    .child(SharedString::from(format!("· {len}"))),
             )
             .child(div().flex_1())
             .child(
@@ -2790,15 +2831,18 @@ impl BoardPanel {
             .into_any_element()
     }
 
-    /// One task row: glyph + identifier + title on the first line, the shared
-    /// metadata underneath, and a state action on hover/selection.
+    /// One task row, on one line (gh#176): glyph + identifier + title, then the
+    /// row's own verb and its metadata right-aligned against the far edge.
     ///
     /// **Every row is exactly [`ROW_H`] tall, always** (gh#132). gh#125 gave the
     /// row under the pointer a second title line, which meant the list reflowed
     /// on every hover — the "laggy or jagged" the operator reported. Hover here
-    /// changes colour and nothing else; both lines are fixed-height, so even the
-    /// action chips appearing cannot grow the row. The full title lives in the
-    /// peek panel, which is what a click on the row opens.
+    /// changes colour and nothing else that was on screen a moment ago: the
+    /// primary verb and the metadata column are both anchored to the right
+    /// edge, so the hover verbs open leftward into the title's slack rather
+    /// than pushing anything the eye had already found.
+    ///
+    /// The full title lives in the peek panel, which is what a click opens.
     #[allow(clippy::too_many_arguments)]
     fn render_task(
         &mut self,
@@ -2832,7 +2876,6 @@ impl BoardPanel {
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(ROW_LINE_GAP))
             .px(px(Theme::SPACE_LG))
             .cursor_pointer()
             .bg(motion::hover_blend(
@@ -2871,9 +2914,10 @@ impl BoardPanel {
                     }
                 }),
             )
-            // Line 1: glyph + the repo-qualified identifier + title, then the
-            // actions. Its height is the chip's, so a row whose chips appear on
-            // hover is exactly as tall as one whose chips do not (gh#132).
+            // The one line: glyph + the repo-qualified identifier + title, then
+            // the verbs and the metadata column. Its height is the chip's, so a
+            // row whose chips appear on hover is exactly as tall as one whose
+            // chips do not (gh#132).
             .child(
                 div()
                     .w_full()
@@ -2919,40 +2963,58 @@ impl BoardPanel {
                             })
                             .child(SharedString::from(title.clone())),
                     )
-                    .child(actions),
-            )
-            // Line 2: the shared metadata. Fixed-height and always present —
-            // an empty one holds its space rather than letting the row shrink,
-            // so a board of mixed rows scrolls at one rhythm.
-            .child(
-                div()
-                    .w_full()
-                    .h(px(META_LINE_H))
-                    .pl(px(19.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_subtle)
-                    .truncate()
-                    .child(SharedString::from(meta)),
+                    .child(actions)
+                    // The metadata, right-aligned against the row's far edge
+                    // (gh#176) — a column to read down rather than a
+                    // space-padded pseudo-table set in a proportional font. A
+                    // row with nothing to say takes no width, and the rows
+                    // that do say something all end in the same place.
+                    .when(!meta.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(META_MAX_W))
+                                .truncate()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(if state == BoardState::Done {
+                                    theme.text_faint
+                                } else {
+                                    theme.text_subtle
+                                })
+                                .child(SharedString::from(meta)),
+                        )
+                    }),
             )
             .into_any_element()
     }
 
-    /// The row's state actions, revealed on hover or selection.
+    /// The row's verbs: the primary one always, the rest on hover or selection.
     ///
-    /// *Which* actions a row has is [`board::row_actions`] — the shared rule the
-    /// TUI's keys and the phone's chip read too (gh#132). This decides only how
+    /// *Which* actions a row has is [`board::row_actions`] and *which of them is
+    /// its own* is [`board::primary_action`] — the shared rules the TUI's keys
+    /// and the phone's chip read too (gh#132, gh#176). This decides only how
     /// they look and what a click runs.
+    ///
+    /// The primary chip is drawn last, hard against the metadata column, and
+    /// the hover verbs open to its left. A panel whose every verb appeared only
+    /// under the pointer read as inert to anyone who had not already learned
+    /// the footer's legend; one verb that is simply there answers "what does
+    /// this row do" without being asked, and it is the verb `enter` runs, so
+    /// the mouse and the keyboard are teaching the same lesson.
     fn render_row_actions(
         &mut self,
         row: &TaskRow,
         visible: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let actions = board::row_actions(row);
-        if !visible || actions.is_empty() {
+        let primary = board::primary_action(row);
+        let mut actions: Vec<RowAction> = if visible {
+            board::secondary_actions(row)
+        } else {
+            Vec::new()
+        };
+        actions.extend(primary);
+        if actions.is_empty() {
             return gpui::Empty.into_any_element();
         }
         let theme = Theme::of(cx).clone();
@@ -3747,6 +3809,13 @@ impl BoardPanel {
         let filter_active = self.model.filter.active();
         let on_section = self.model.on_section().is_some();
         let selected_task = self.model.selected_task().map(|r| r.state());
+        // The same designation the row's visible chip draws (gh#176): one rule
+        // for what enter does, said twice in the same words.
+        let enter_hint = self
+            .model
+            .selected_task()
+            .and_then(board::primary_action)
+            .map(|action| format!("enter to {}", action.verb()));
         let picking = self.dispatch.is_some();
         let peek_open = self.peek;
 
@@ -3761,11 +3830,8 @@ impl BoardPanel {
             if on_section {
                 hints.push("click to fold/unfold");
             }
-            match selected_task {
-                Some(BoardState::Ready) => hints.push("enter to dispatch"),
-                Some(BoardState::Failed) => hints.push("enter to retry"),
-                Some(BoardState::Working | BoardState::Blocked) => hints.push("enter to open chat"),
-                _ => {}
+            if let Some(hint) = enter_hint.as_deref() {
+                hints.push(hint);
             }
             // The door, named (gh#132) — an affordance nobody can find is one
             // that does not exist.
@@ -3843,7 +3909,7 @@ impl Render for BoardPanel {
                 .enumerate()
                 .map(|(ix, line)| {
                     let content = match line {
-                        BoardLine::Section(state) => self.render_section(*state, cx),
+                        BoardLine::Section(state) => self.render_section(*state, ix == 0, cx),
                         BoardLine::Group(state, route) => {
                             self.render_group(*state, route.clone(), cx)
                         }
@@ -4278,8 +4344,11 @@ mod tests {
         assert_eq!(metadata(&ready, now), "");
         let mut w = row("w", BoardState::Working);
         w.started_at = Some(now.to_rfc3339());
-        assert!(metadata(&w, now).contains("claude-code"));
-        assert!(metadata(&w, now).contains("ws:offhand"));
+        // No padding on this surface: the facts, joined (gh#176). A run of
+        // spaces is a column in a terminal and a ragged gap in a proportional
+        // font.
+        assert_eq!(metadata(&w, now), "claude-code · ws:offhand · 0s");
+        assert!(!metadata(&w, now).contains("  "));
         let mut rev = row("v", BoardState::Review);
         rev.pr_number = Some(7);
         assert_eq!(metadata(&rev, now), "PR #7 · waiting on you");
@@ -4289,18 +4358,34 @@ mod tests {
     }
 
     /// gh#132: every row is the same height, whatever the pointer is doing.
-    /// The two lines are constants and they add up to the row — which is the
-    /// invariant, since a row that can grow is a row the list reflows around.
+    /// The row is one line now (gh#176) and that line is a constant — which is
+    /// the invariant, since a row that can grow is a row the list reflows
+    /// around.
     #[test]
     fn a_row_cannot_change_height_under_the_pointer() {
-        // The declared height IS the content's: padding, two fixed lines and
-        // the gap between them. A row that declared less would clip a line;
-        // one that declared more would drift from what it draws.
-        assert_eq!(ROW_H, 47.0);
-        assert_eq!(ROW_H, ROW_PAD_Y * 2.0 + ROW_LINE_H + ROW_LINE_GAP + META_LINE_H);
-        // The first line is exactly the action chip's height, so a row showing
-        // chips on hover is exactly as tall as one that is not.
+        // The declared height IS the content's: one fixed line and its
+        // padding. A row that declared less would clip the line; one that
+        // declared more would drift from what it draws.
+        assert_eq!(ROW_H, 32.0);
+        assert_eq!(ROW_H, ROW_PAD_Y * 2.0 + ROW_LINE_H);
+        // The line is exactly the action chip's height, so a row showing chips
+        // on hover is exactly as tall as one that is not.
         assert_eq!(ROW_LINE_H, 20.0);
+    }
+
+    /// gh#176's exit criterion, in the geometry it is a claim about: the list
+    /// area the design review measured at the default 520px pane width showed
+    /// ten rows, and shows fifteen now.
+    #[test]
+    fn fifteen_rows_fit_where_ten_did() {
+        /// Two lines, the gap and the padding — the row gh#132 froze.
+        const OLD_ROW_H: f32 = 47.0;
+        const LIST_H: f32 = 480.0;
+        assert_eq!((LIST_H / OLD_ROW_H).floor(), 10.0);
+        assert_eq!((LIST_H / ROW_H).floor(), 15.0);
+        // And the fifteen pixels the five extra rows came out of are exactly
+        // the metadata line that a ready row held empty by contract.
+        assert_eq!(OLD_ROW_H - ROW_H, 15.0);
     }
 
     /// The chips a row draws are the shared rule's, not a second copy of it —
@@ -4330,6 +4415,48 @@ mod tests {
         ] {
             assert!(!action_key(action).is_empty());
             let _ = action_color(action, &theme);
+        }
+    }
+
+    /// gh#176: one verb per row is drawn whether or not anything is hovering
+    /// it, and it is the verb `enter` runs — the designation is the shared
+    /// one, so the chip and the key cannot come to mean different things.
+    #[test]
+    fn the_visible_verb_is_the_one_enter_runs() {
+        assert_eq!(
+            board::primary_action(&row("r", BoardState::Ready)),
+            Some(RowAction::Dispatch)
+        );
+        // The rest stay on hover, and together they are the whole set.
+        let blocked = row("b", BoardState::Blocked);
+        assert_eq!(board::primary_action(&blocked), Some(RowAction::OpenChat));
+        assert_eq!(
+            board::secondary_actions(&blocked),
+            vec![RowAction::Retry, RowAction::Cancel]
+        );
+        // The footer says the same thing in words, from the same rule.
+        assert_eq!(
+            board::primary_action(&blocked).map(|a| format!("enter to {}", a.verb())),
+            Some("enter to open chat".to_string())
+        );
+    }
+
+    /// The header's words are the published ones, in this surface's case
+    /// (gh#176) — the contract is the vocabulary, not the capitals.
+    #[test]
+    fn section_titles_are_the_shared_words_in_sentence_case() {
+        for state in BoardState::SECTION_ORDER {
+            let title = section_title(state);
+            assert_eq!(
+                title.to_uppercase(),
+                if state == BoardState::Done {
+                    "DONE TODAY".to_string()
+                } else {
+                    state.label().to_string()
+                },
+                "{state:?}"
+            );
+            assert!(title.starts_with(|c: char| c.is_uppercase()), "{title}");
         }
     }
 

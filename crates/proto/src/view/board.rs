@@ -765,6 +765,40 @@ pub fn format_age(secs: i64) -> String {
 /// Below this width, drop all metadata rather than wrap.
 pub const NARROW_LIMIT: u16 = 60;
 
+/// The width of the runtime and workspace cells in the terminal's grid.
+///
+/// A grid is a monospace idea: these two are the fields a column of rows reads
+/// down, so the TUI pads them to a fixed cell. Nothing else does — see
+/// [`MetaField`].
+const RUNTIME_CELL: usize = 12;
+const WS_CELL: usize = 11;
+
+/// One fact in a row's metadata, and the terminal cell it occupies.
+///
+/// Two surfaces read the same facts and space them differently. The TUI pads
+/// them into a monospace grid ([`row_metadata`]); the desktop joins them with
+/// `·` into a right-aligned column set in a proportional font
+/// ([`row_metadata_line`], gh#176), where a padding space is neither a column
+/// nor invisible — it is just a gap of the wrong size. The *facts* are derived
+/// once, here, so the two spacings can never come to disagree about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetaField {
+    text: String,
+    /// The cell this pads to in a monospace grid, or `None` for a field that
+    /// simply follows the one before it.
+    cell: Option<usize>,
+}
+
+impl MetaField {
+    fn cell(text: impl Into<String>, width: usize) -> Self {
+        Self { text: text.into(), cell: Some(width) }
+    }
+
+    fn flow(text: impl Into<String>) -> Self {
+        Self { text: text.into(), cell: None }
+    }
+}
+
 /// The right-hand metadata block for a row, already collapsed for `width`.
 ///
 /// Below 60 columns everything goes rather than wrapping. Above it the block
@@ -775,6 +809,9 @@ pub const NARROW_LIMIT: u16 = 60;
 /// field. comet's wire carries no agent-status "settled but quiet" state, so
 /// elapsed stays short and the full block always fits at the widths that show
 /// metadata at all — the collapse has nothing to collapse and is gone.
+///
+/// This is the *terminal's* spelling of the block. A proportional surface wants
+/// [`row_metadata_line`] instead: same facts, no padding.
 pub fn row_metadata(row: &TaskRow, selected: bool, width: u16, now: DateTime<Utc>) -> String {
     if width < NARROW_LIMIT {
         return String::new();
@@ -792,7 +829,9 @@ pub fn row_metadata(row: &TaskRow, selected: bool, width: u16, now: DateTime<Utc
     }
 }
 
-fn state_metadata(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
+/// The facts each state is worth saying, in order, before any surface decides
+/// how to space them.
+fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> Vec<MetaField> {
     match row.state() {
         BoardState::Working | BoardState::Blocked => {
             let elapsed = row
@@ -805,24 +844,26 @@ fn state_metadata(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
                     format_elapsed((now - start.with_timezone(&Utc)).num_seconds().max(0))
                 })
                 .unwrap_or_default();
-            format!(
-                "{}{}{}",
-                fixed(row.runtime.as_deref().unwrap_or(""), 12),
-                fixed(&ws(row), 11),
-                elapsed
-            )
+            vec![
+                MetaField::cell(row.runtime.as_deref().unwrap_or(""), RUNTIME_CELL),
+                MetaField::cell(ws(row), WS_CELL),
+                MetaField::flow(elapsed),
+            ]
         }
-        BoardState::Failed => "pane exited without completing".into(),
+        BoardState::Failed => vec![MetaField::flow("pane exited without completing")],
         BoardState::Review => match (row.pr_number, row.branch.as_deref()) {
-            (Some(n), _) => format!("PR #{n} · waiting on you"),
+            (Some(n), _) => vec![
+                MetaField::flow(format!("PR #{n}")),
+                MetaField::flow("waiting on you"),
+            ],
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.
-            (None, Some(b)) => format!("{b} · no PR"),
-            (None, None) => "waiting on you".into(),
+            (None, Some(b)) => vec![MetaField::flow(b), MetaField::flow("no PR")],
+            (None, None) => vec![MetaField::flow("waiting on you")],
         },
         BoardState::Ready => {
             // The route rides the group header and the repo the leading token
-            // (gh#125), so the sub-line keeps only what neither says: a routed
+            // (gh#125), so the metadata keeps only what neither says: a routed
             // workspace whose name differs from the route's, and the cursor's
             // one affordance.
             let ws = row
@@ -830,42 +871,75 @@ fn state_metadata(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
                 .as_deref()
                 .filter(|w| row.route.as_deref() != Some(w))
                 .unwrap_or_default();
-            if !row.dispatchable {
+            let note = if !row.dispatchable {
                 // A property of the issue, not an affordance for the cursor —
                 // so it shows on every such row, selected or not.
-                if ws.is_empty() {
-                    NO_ROUTE.into()
-                } else {
-                    format!("{ws} · {NO_ROUTE}")
-                }
+                NO_ROUTE
             } else if selected {
-                if ws.is_empty() {
-                    "[enter to dispatch]".into()
-                } else {
-                    format!("{ws} · [enter to dispatch]")
-                }
+                "[enter to dispatch]"
             } else {
-                ws.to_string()
-            }
+                ""
+            };
+            vec![MetaField::flow(ws), MetaField::flow(note)]
         }
         BoardState::Done => {
             // A row whose issue was deleted sits in `done` next to rows that
             // were properly closed, and the two are worth telling apart.
+            let runtime = MetaField::cell(row.runtime.as_deref().unwrap_or(""), RUNTIME_CELL);
             if row.gone {
-                format!(
-                    "{}{}",
-                    fixed(row.runtime.as_deref().unwrap_or(""), 12),
-                    "gone upstream"
-                )
+                vec![runtime, MetaField::flow("gone upstream")]
             } else {
-                format!(
-                    "{}{}",
-                    fixed(row.runtime.as_deref().unwrap_or(""), 12),
-                    fixed(&ws(row), 11)
-                )
+                vec![runtime, MetaField::cell(ws(row), WS_CELL)]
             }
         }
     }
+}
+
+/// The fields padded into the terminal's grid: a celled field takes its whole
+/// cell (empty or not, so the column below it stays a column), and a flowing
+/// one either continues the cell before it or is separated by the board's `·`.
+fn state_metadata(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    let mut after_cell = false;
+    for field in state_metadata_fields(row, selected, now) {
+        match field.cell {
+            Some(width) => {
+                out.push_str(&fixed(&field.text, width));
+                after_cell = true;
+            }
+            None if field.text.is_empty() => {}
+            None => {
+                if !out.is_empty() && !after_cell {
+                    out.push_str(" · ");
+                }
+                out.push_str(&field.text);
+                after_cell = false;
+            }
+        }
+    }
+    out
+}
+
+/// The same facts as [`row_metadata`], as the discrete facts they are: no
+/// padding, nothing empty, billing note last.
+///
+/// A surface that sets metadata in a proportional font wants these — the grid
+/// [`row_metadata`] pads to only exists in a terminal, and pasted into a
+/// desktop row it is a ragged gap rather than a column (gh#176).
+pub fn row_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> Vec<String> {
+    let mut out: Vec<String> = state_metadata_fields(row, selected, now)
+        .into_iter()
+        .map(|field| field.text)
+        .filter(|text| !text.is_empty())
+        .collect();
+    out.extend(billing_note(row));
+    out
+}
+
+/// [`row_metadata_fields`] as one line, joined the way the board joins facts
+/// everywhere else.
+pub fn row_metadata_line(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
+    row_metadata_fields(row, selected, now).join(" · ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1190,20 @@ impl RowAction {
         }
     }
 
+    /// The verb as a sentence wants it: "enter to open PR", "double-click to
+    /// dispatch". Lower case except where the word is not a word — a footer
+    /// that lower-cased "PR" would be spelling it a fourth way.
+    pub fn verb(self) -> &'static str {
+        match self {
+            RowAction::Dispatch => "dispatch",
+            RowAction::Retry => "retry",
+            RowAction::Cancel => "cancel",
+            RowAction::OpenChat => "open chat",
+            RowAction::OpenIssue => "open issue",
+            RowAction::OpenPr => "open PR",
+        }
+    }
+
     /// Does this end somebody's work? Surfaces that colour a destructive action
     /// differently (all three do) ask here rather than each keeping a list.
     pub fn destructive(self) -> bool {
@@ -1173,6 +1261,48 @@ pub fn row_actions(row: &TaskRow) -> Vec<RowAction> {
         BoardState::Done => {}
     }
     out
+}
+
+/// The one verb a row wears without being asked for it — and the one `enter`
+/// runs on it (gh#176).
+///
+/// [`row_actions`] says which verbs a row *has*; nothing said which of them was
+/// the row's own. Every surface then picked for itself: the desktop's `enter`
+/// arm, the TUI's key table, the phone's single chip. Three answers to one
+/// question, and for a blocked row three *different* answers — its action list
+/// leads with `Retry`, but `enter` opens the chat, because a blocked agent is
+/// alive and waiting for you rather than needing replacing (gh#49).
+///
+/// So the designation lives here, beside the set it selects from, and the
+/// answer is always a member of that set: a surface that draws this chip and
+/// binds `enter` to it cannot end up offering a verb the board would refuse.
+///
+/// `None` where a row has nothing to be done to it — a closed row, a ready one
+/// with no route, a review with no PR raised. A permanently visible verb is
+/// worth having because it is always true; inventing one for those rows would
+/// spend the same space on a lie.
+pub fn primary_action(row: &TaskRow) -> Option<RowAction> {
+    let wanted = match row.state() {
+        BoardState::Ready => RowAction::Dispatch,
+        // A failed attempt's verb is the one that replaces it (gh#42).
+        BoardState::Failed => RowAction::Retry,
+        BoardState::Working | BoardState::Blocked => RowAction::OpenChat,
+        BoardState::Review => RowAction::OpenPr,
+        BoardState::Done => return None,
+    };
+    row_actions(row).into_iter().find(|action| *action == wanted)
+}
+
+/// The rest — the verbs a surface may keep behind a hover or a long press.
+///
+/// Order is [`row_actions`]', minus the primary. Same set, so nothing a row can
+/// do goes missing by being neither primary nor secondary.
+pub fn secondary_actions(row: &TaskRow) -> Vec<RowAction> {
+    let primary = primary_action(row);
+    row_actions(row)
+        .into_iter()
+        .filter(|action| Some(*action) != primary)
+        .collect()
 }
 
 /// Everything a *detail* surface offers: the row's own actions, plus the links
@@ -2164,6 +2294,46 @@ mod tests {
         assert_eq!(row_metadata(&r, false, 59, now()), "");
     }
 
+    /// gh#176: the desktop sets this block in a proportional font, where the
+    /// terminal's padding is a ragged gap rather than a column. Same facts,
+    /// joined the way the board joins facts — and the grid keeps its padding
+    /// for the surface that has a grid.
+    #[test]
+    fn the_proportional_line_is_the_grid_without_the_padding() {
+        let mut r = row("w", BoardState::Working);
+        r.started_at = Some("2026-08-01T11:59:30Z".into());
+        assert_eq!(
+            row_metadata_line(&r, false, now()),
+            "claude-code · ws:offhand · 30s"
+        );
+        let mut short = r.clone();
+        short.runtime = Some("codex".into());
+        assert_eq!(
+            row_metadata(&short, false, 120, now()),
+            "codex       ws:offhand 30s",
+            "the terminal keeps its cells"
+        );
+        assert_eq!(
+            row_metadata_line(&short, false, now()),
+            "codex · ws:offhand · 30s"
+        );
+        // Every fact the grid carries survives the join, and nothing empty
+        // arrives as a stray separator.
+        let mut done = row("d", BoardState::Done);
+        done.runtime = None;
+        assert_eq!(row_metadata_line(&done, false, now()), "ws:offhand");
+        // A ready row with nothing to say says nothing — the whole reason the
+        // second line could go.
+        assert_eq!(row_metadata_line(&row("r", BoardState::Ready), false, now()), "");
+        // The billing note is still last, and still separated.
+        let mut billed = row("b", BoardState::Working);
+        billed.started_at = Some("2026-08-01T11:59:30Z".into());
+        billed.billed_to = Some("someone@else.example".into());
+        billed.dispatched_by_user = Some("brede@tally.no".into());
+        let line = row_metadata_line(&billed, false, now());
+        assert!(line.ends_with(&bills_label("someone@else.example")), "{line}");
+    }
+
     #[test]
     fn elapsed_never_goes_negative() {
         let mut r = row("w", BoardState::Working);
@@ -2788,6 +2958,78 @@ mod tests {
         assert!(row_actions(&review).is_empty());
         review.pr_url = Some("https://github.com/o/r/pull/9".into());
         assert_eq!(row_actions(&review), vec![RowAction::OpenPr]);
+    }
+
+    // ---- the one visible verb (gh#176) ------------------------------------
+
+    #[test]
+    fn the_primary_verb_is_the_one_enter_runs() {
+        assert_eq!(
+            primary_action(&row("1", BoardState::Ready)),
+            Some(RowAction::Dispatch)
+        );
+        let mut failed = row("2", BoardState::Failed);
+        failed.state = BoardState::Failed.as_str().into();
+        assert_eq!(primary_action(&failed), Some(RowAction::Retry));
+        assert_eq!(
+            primary_action(&row("3", BoardState::Working)),
+            Some(RowAction::OpenChat)
+        );
+        // Not the first of its actions: a blocked row leads with Retry and
+        // still opens on enter, which is exactly why the designation is not
+        // "whatever came first" (gh#49).
+        let blocked = row("4", BoardState::Blocked);
+        assert_eq!(row_actions(&blocked)[0], RowAction::Retry);
+        assert_eq!(primary_action(&blocked), Some(RowAction::OpenChat));
+    }
+
+    #[test]
+    fn a_row_with_nothing_to_do_wears_no_verb() {
+        assert_eq!(primary_action(&row("1", BoardState::Done)), None);
+        let mut stranded = row("2", BoardState::Ready);
+        stranded.dispatchable = false;
+        assert_eq!(primary_action(&stranded), None);
+        // A review with no PR raised has nothing to open yet; one with a PR
+        // wears it.
+        let mut review = row("3", BoardState::Review);
+        assert_eq!(primary_action(&review), None);
+        review.pr_url = Some("https://github.com/o/r/pull/9".into());
+        assert_eq!(primary_action(&review), Some(RowAction::OpenPr));
+    }
+
+    #[test]
+    fn primary_and_secondary_are_the_whole_action_set_and_no_more() {
+        for state in BoardState::SECTION_ORDER {
+            let mut r = row("1", state);
+            r.state = state.as_str().into();
+            r.pr_url = Some("https://github.com/o/r/pull/9".into());
+            let mut split = Vec::new();
+            split.extend(primary_action(&r));
+            split.extend(secondary_actions(&r));
+            split.sort_by_key(|a| format!("{a:?}"));
+            let mut all = row_actions(&r);
+            all.sort_by_key(|a| format!("{a:?}"));
+            assert_eq!(split, all, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_sentence_spelling() {
+        for action in [
+            RowAction::Dispatch,
+            RowAction::Retry,
+            RowAction::Cancel,
+            RowAction::OpenChat,
+            RowAction::OpenIssue,
+            RowAction::OpenPr,
+        ] {
+            let verb = action.verb();
+            assert!(!verb.is_empty());
+            // A verb reads inside a sentence, so it starts lower case — and
+            // "PR" stays "PR".
+            assert!(verb.starts_with(|c: char| c.is_lowercase()), "{verb}");
+        }
+        assert_eq!(RowAction::OpenPr.verb(), "open PR");
     }
 
     #[test]
