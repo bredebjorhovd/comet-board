@@ -24,7 +24,7 @@ use gpui::{
 use comet_rpc::methods;
 use gpui_tokio::Tokio;
 
-use crate::board::{BoardPanel, ToggleBoard};
+use crate::board::{BoardEvent, BoardPanel, ToggleBoard};
 use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
@@ -32,6 +32,7 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, RESIZE, SPLASH_OUT};
 use crate::popover::{self, Loadable};
 use crate::rail;
+use crate::review::ReviewPanel;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearanceEvent, AppearancePage};
 use crate::settings::archived::ArchivedPage;
@@ -41,8 +42,9 @@ use crate::settings::routing::RoutingPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::stats::StatsPage;
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    KeymapConfig, REVIEW_SESSION_DEFAULT, REVIEW_SESSION_MAX, REVIEW_SESSION_MIN,
+    RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
+    SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
@@ -198,10 +200,26 @@ impl SettingsSection {
 }
 
 /// What the main outlet shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// [`Route::Review`] carries its subject rather than pointing at ambient
+/// selection, which is why this enum is `Clone` and not `Copy`: a review is of
+/// one attempt of one task, and a route that had to ask somewhere else which
+/// one would be a route that can be wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+    /// One attempt's review (gh#180) — the inverted route, where the review is
+    /// the content and the chat that authored it is the reference beside it.
+    ///
+    /// `chat_id` is the session to show in that column, taken from the board
+    /// row that opened the review. `None` where the attempt's chat is gone: a
+    /// review outlives the conversation that produced it, which is half the
+    /// reason the claims are recorded on the attempt at all.
+    Review {
+        task_id: String,
+        chat_id: Option<String>,
+    },
 }
 
 /// Per-chat panel open flags (comet parity: `sessionPanels` — the terminal and
@@ -247,6 +265,13 @@ pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
     Settings(SettingsSection),
+    /// A review route (gh#180). Carries the chat alongside the task so Back
+    /// lands on the same pairing it left, rather than on whatever session
+    /// happens to be selected by then.
+    Review {
+        task_id: String,
+        chat_id: Option<String>,
+    },
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
@@ -331,6 +356,8 @@ struct SidebarResize;
 struct RightPaneResize;
 /// Drag marker for the terminal-panel height handle.
 struct TerminalResize;
+/// Drag marker for the authoring session's edge on the review route (gh#180).
+struct ReviewSessionResize;
 
 /// Invisible drag ghost — resize drags render nothing at the cursor.
 struct DragGhost;
@@ -423,7 +450,12 @@ pub struct Shell {
     /// section (gh#103), which is on screen with the dock shut.
     board: Entity<BoardPanel>,
     board_open: bool,
-    /// Chat outlet vs settings pages.
+    /// The review card on [`Route::Review`] (gh#180). Lazy like the other
+    /// panes, and REPLACED rather than re-pointed when the route moves to a
+    /// different task: a reply for the review you just left must have nowhere
+    /// to land.
+    review: Option<Entity<ReviewPanel>>,
+    /// Chat outlet vs settings pages vs one attempt's review.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
@@ -549,6 +581,8 @@ pub struct Shell {
     _state_observation: Subscription,
     /// Board frames repaint the sidebar's Agents section.
     _board_observation: Subscription,
+    /// The board panel's one outward verb: "review this attempt" (gh#180).
+    _board_events: Subscription,
     _composer_events: Subscription,
 }
 
@@ -596,6 +630,15 @@ impl Shell {
         // Observing it repaints the sidebar on every board frame.
         let board = cx.new(|cx| BoardPanel::new(state.clone(), cx));
         let board_observation = cx.observe(&board, |_this: &mut Shell, _, cx| cx.notify());
+        let board_events =
+            cx.subscribe(
+                &board,
+                |this: &mut Shell, _, event: &BoardEvent, cx| match event {
+                    BoardEvent::OpenReview { task_id, chat_id } => {
+                        this.open_review(task_id.clone(), chat_id.clone(), cx)
+                    }
+                },
+            );
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
@@ -635,9 +678,13 @@ impl Shell {
             )),
             _ => None,
         };
-        let nav = NavHistory::new(match route {
+        let nav = NavHistory::new(match &route {
             Route::Chat => NavEntry::Chat(String::new()),
-            Route::Settings(section) => NavEntry::Settings(section),
+            Route::Settings(section) => NavEntry::Settings(*section),
+            Route::Review { task_id, chat_id } => NavEntry::Review {
+                task_id: task_id.clone(),
+                chat_id: chat_id.clone(),
+            },
         });
         Self {
             state,
@@ -648,6 +695,7 @@ impl Shell {
             changes: None,
             board,
             board_open: false,
+            review: None,
             route,
             nav,
             devices_page: None,
@@ -713,6 +761,7 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _board_observation: board_observation,
+            _board_events: board_events,
             _composer_events: composer_events,
         }
     }
@@ -1126,6 +1175,23 @@ impl Shell {
         cx.notify();
     }
 
+    /// The review route's seam (gh#180). Measured from the LEFT edge like the
+    /// sidebar's, because the column being dragged is on the left here — the
+    /// whole point of the inversion.
+    fn on_review_session_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<ReviewSessionResize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Window x, less everything left of the column: the sidebar's tweened
+        // width and the inset card's own left gutter.
+        let x = f32::from(event.event.position.x) - self.sidebar_target() - Theme::SPACE_SM;
+        self.settings.review_session_width = x.clamp(REVIEW_SESSION_MIN, REVIEW_SESSION_MAX);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// Debounced settings write: waits [`SAVE_DEBOUNCE_MS`], then persists the
     /// latest snapshot on the background executor. Re-scheduling drops (cancels)
     /// the previous timer.
@@ -1168,6 +1234,55 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open one attempt's review (gh#180) — the inverted route.
+    ///
+    /// The chat comes from the board row rather than from whatever is selected,
+    /// and is *selected* here so the column beside the review is the session
+    /// that authored it. An attempt whose chat is gone opens the review alone,
+    /// which is the case the claims were recorded on the attempt for.
+    ///
+    /// The board dock shuts on the way through: the review is the destination,
+    /// and leaving the queue open over it would put two full-height surfaces on
+    /// one screen with the reading squeezed between them.
+    fn open_review(&mut self, task_id: String, chat_id: Option<String>, cx: &mut Context<Self>) {
+        if let Some(chat) = chat_id.clone()
+            && self.state.read(cx).selected_chat.as_deref() != Some(chat.as_str())
+        {
+            self.state.update(cx, |s, cx| s.select_chat(Some(chat), cx));
+        }
+        // A different task is a different panel: replacing it (rather than
+        // re-pointing one) is what makes an in-flight reply for the review you
+        // just left have nowhere to land.
+        if self
+            .review
+            .as_ref()
+            .is_none_or(|panel| panel.read(cx).task_id() != task_id)
+        {
+            let state = self.state.clone();
+            let id = task_id.clone();
+            self.review = Some(cx.new(|cx| ReviewPanel::new(state, id, None, cx)));
+        }
+        self.board_open = false;
+        self.route = Route::Review {
+            task_id: task_id.clone(),
+            chat_id: chat_id.clone(),
+        };
+        self.nav.push(NavEntry::Review { task_id, chat_id });
+        self.user_menu_open = false;
+        self.chat_menu = None;
+        cx.notify();
+    }
+
+    /// Leave a review for the session it was about. The panel is dropped: a
+    /// review is a snapshot of a diff and a run journal, and the next visit
+    /// should re-read both rather than show what the box said last time.
+    fn close_review(&mut self, cx: &mut Context<Self>) {
+        self.review = None;
+        self.route = Route::Chat;
+        self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        cx.notify();
+    }
+
     // ---- back/forward (route history) ----
 
     fn navigate_back(&mut self, cx: &mut Context<Self>) {
@@ -1196,6 +1311,23 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
+            }
+            NavEntry::Review { task_id, chat_id } => {
+                if let Some(chat) = chat_id.clone()
+                    && self.state.read(cx).selected_chat.as_deref() != Some(chat.as_str())
+                {
+                    self.state.update(cx, |s, cx| s.select_chat(Some(chat), cx));
+                }
+                if self
+                    .review
+                    .as_ref()
+                    .is_none_or(|panel| panel.read(cx).task_id() != task_id)
+                {
+                    let state = self.state.clone();
+                    let id = task_id.clone();
+                    self.review = Some(cx.new(|cx| ReviewPanel::new(state, id, None, cx)));
+                }
+                self.route = Route::Review { task_id, chat_id };
             }
         }
         self.user_menu_open = false;
@@ -1752,7 +1884,11 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_tab_strip(cx),
-            Route::Settings(_) => {
+            // The review route deliberately draws no tab strip: switching
+            // sessions out from under a review would leave the card describing
+            // one attempt and the column beside it holding another. Back is the
+            // way out, and it is already in the control cluster.
+            Route::Settings(_) | Route::Review { .. } => {
                 let inner = div()
                     .size_full()
                     .flex()
@@ -1870,7 +2006,10 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            // The review route keeps the chat sidebar: the session beside the
+            // review is a real selection, and the list is where its space, its
+            // siblings and the Active group still live.
+            Route::Chat | Route::Review { .. } => self.render_chat_sidebar(&theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -2650,11 +2789,6 @@ impl Shell {
     }
 
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme_owned = Theme::of(cx).clone();
-        let theme = &theme_owned;
-        let theme_bg = theme.bg;
-        let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
-
         // Settings route: just the section outlet — the section label lives in
         // the unified window titlebar now (render_title_bar).
         if let Route::Settings(section) = self.route {
@@ -2668,7 +2802,117 @@ impl Shell {
                 .child(div().flex_1().min_h_0().child(outlet))
                 .into_any_element();
         }
+        if matches!(self.route, Route::Review { .. }) {
+            return self.render_review_route(cx);
+        }
+        self.render_conversation(true, cx)
+    }
 
+    /// The review route (gh#180): the same two things as every other route,
+    /// swapped.
+    ///
+    /// Everywhere else the conversation is the content and a diff sits in a
+    /// dock beside it. Reviewing inverts that, because reviewing inverts what
+    /// you are doing: the changes are what you came to read and the chat is the
+    /// reference you consult about them. So the session becomes the narrow
+    /// column — on the LEFT, where it says the true thing about the mechanism,
+    /// that you write here and it lands over there — and the review takes the
+    /// card.
+    ///
+    /// The session column keeps its composer, because the most useful thing a
+    /// reviewer can do with an unclaimed change is ask the agent that made it,
+    /// and it drops the terminal dock, which has no room to be anything but a
+    /// letterbox at this width.
+    fn render_review_route(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let Some(panel) = self.review.clone() else {
+            // Only reachable if the route outlived its panel; the chat route is
+            // the honest fallback rather than an empty card.
+            return self.render_conversation(true, cx);
+        };
+        let width = self
+            .settings
+            .review_session_width
+            .clamp(REVIEW_SESSION_MIN, REVIEW_SESSION_MAX);
+        let has_chat = matches!(&self.route, Route::Review { chat_id, .. } if chat_id.is_some());
+        // A review outlives the chat that produced it — that is why the claims
+        // live on the attempt (gh#183) — so the column says where the session
+        // went instead of drawing an empty transcript.
+        let session: AnyElement = if has_chat {
+            self.render_conversation(false, cx)
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .px(px(Theme::SPACE_LG))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(
+                            "The session that wrote this is gone. The review is not.",
+                        )),
+                )
+                .into_any_element()
+        };
+        let handle = self
+            .resize_handle(
+                "review-session-resize",
+                || ReviewSessionResize,
+                |shell, _| shell.settings.review_session_width = REVIEW_SESSION_DEFAULT,
+                cx,
+            )
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-2.0));
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(width))
+                    .h_full()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .child(session)
+                    .child(handle),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(panel),
+            )
+            .into_any_element()
+    }
+
+    /// The conversation column: transcript (or one of the two canvases), the
+    /// reserved status strip, the composer, and — unless `with_terminal` is
+    /// false — the terminal dock under all three.
+    ///
+    /// `with_terminal` exists for the review route, whose session column is
+    /// ~420px wide: a terminal there is a letterbox, and the dock's own toggle
+    /// is chat-route chrome anyway.
+    fn render_conversation(&mut self, with_terminal: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme_owned = Theme::of(cx).clone();
+        let theme = &theme_owned;
+        let theme_bg = theme.bg;
+        let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
@@ -2836,7 +3080,9 @@ impl Shell {
             // the terminal panel sits below the whole conversation column).
             .child(status)
             .when(has_spaces, |el| el.child(self.composer.clone()))
-            .child(self.render_terminal_container(cx))
+            .when(with_terminal, |el| {
+                el.child(self.render_terminal_container(cx))
+            })
             .when(file_drag_active, |el| {
                 el.child(
                     div()
@@ -3759,7 +4005,12 @@ impl Render for Shell {
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
+                    // The review route mounts the same composer, in the column
+                    // beside the card — so focus lands there for the same
+                    // reason it does on a chat.
+                    Route::Chat | Route::Review { .. } => {
+                        window.focus(&this.composer.focus_handle(cx), cx)
+                    }
                     // No composer here — clear the stale handle so `focused()`
                     // reads None (the render hook below re-lands focus when the
                     // route returns to Chat; a lingering unmounted handle would
@@ -3769,7 +4020,7 @@ impl Render for Shell {
             }));
         }
         if matches!(gate, GatePhase::Ready)
-            && matches!(self.route, Route::Chat)
+            && matches!(self.route, Route::Chat | Route::Review { .. })
             && window.focused(cx).is_none()
         {
             window.focus(&self.composer.focus_handle(cx), cx);
@@ -3788,6 +4039,7 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
+            .on_drag_move(cx.listener(Self::on_review_session_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
             // no-ops (comet __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
@@ -3804,8 +4056,16 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleBoard, window, cx| {
-                if matches!(this.route, Route::Chat) {
-                    this.toggle_board(window, cx)
+                match this.route {
+                    Route::Chat => this.toggle_board(window, cx),
+                    // The board is where a review is opened from, so the same
+                    // key is the way back to it: leave the route, then open the
+                    // dock on the session the review was of.
+                    Route::Review { .. } => {
+                        this.close_review(cx);
+                        this.toggle_board(window, cx);
+                    }
+                    Route::Settings(_) => {}
                 }
             }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
@@ -3844,8 +4104,17 @@ impl Render for Shell {
                         .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
+                // On the review route the transcript is the narrow column, not
+                // the card — so the width that gates the rail is the column's,
+                // and the whole window would be the wrong measure of it.
                 let viewport = f32::from(window.viewport_size().width);
-                let main_width = viewport - self.sidebar_target() - self.right_target(cx) - 10.0;
+                let main_width = if matches!(self.route, Route::Review { .. }) {
+                    self.settings
+                        .review_session_width
+                        .clamp(REVIEW_SESSION_MIN, REVIEW_SESSION_MAX)
+                } else {
+                    viewport - self.sidebar_target() - self.right_target(cx) - 10.0
+                };
                 self.transcript.update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx)
                 });
@@ -4189,5 +4458,68 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    // ---- the review route (gh#180) ----------------------------------------
+
+    fn review(task: &str, chat: Option<&str>) -> NavEntry {
+        NavEntry::Review {
+            task_id: task.to_string(),
+            chat_id: chat.map(str::to_string),
+        }
+    }
+
+    /// A review is a route with a subject, so Back has to land on the pairing
+    /// it left — the same attempt AND the same session beside it — rather than
+    /// on whatever is selected by the time you press it.
+    #[test]
+    fn a_review_navigates_as_one_pairing_of_attempt_and_session() {
+        let mut nav = NavHistory::new(chat("a"));
+        nav.push(review("gh:o/r#180", Some("chat-1")));
+        nav.push(review("gh:o/r#183", Some("chat-2")));
+        assert_eq!(nav.len(), 3, "two reviews are two navigations");
+        assert_eq!(nav.back(), Some(review("gh:o/r#180", Some("chat-1"))));
+        assert_eq!(nav.back(), Some(chat("a")));
+        assert_eq!(nav.forward(), Some(review("gh:o/r#180", Some("chat-1"))));
+    }
+
+    /// Re-opening the review you are already on is not a navigation — the same
+    /// dedup every other route gets, and the one that stops `r` on the board
+    /// from stacking history while somebody re-reads a row.
+    #[test]
+    fn reopening_the_same_review_does_not_stack_history() {
+        let mut nav = NavHistory::new(chat("a"));
+        nav.push(review("gh:o/r#180", Some("chat-1")));
+        nav.push(review("gh:o/r#180", Some("chat-1")));
+        assert_eq!(nav.len(), 2);
+        // The same attempt reviewed with its chat gone IS a different entry:
+        // the column beside the card is not the same column.
+        nav.push(review("gh:o/r#180", None));
+        assert_eq!(nav.len(), 3);
+    }
+
+    /// The inversion, as a number: the session column on the review route is
+    /// narrower than the Changes dock it swaps roles with, because it is the
+    /// reference now and the review is the content.
+    #[test]
+    fn the_review_session_column_is_a_reference_width_not_a_content_width() {
+        assert!(REVIEW_SESSION_DEFAULT < RIGHT_PANE_DEFAULT);
+        assert!(REVIEW_SESSION_MIN < REVIEW_SESSION_DEFAULT);
+        assert!(REVIEW_SESSION_DEFAULT < REVIEW_SESSION_MAX);
+        // Persisted like every other pane width, and healed into range on load
+        // — a hand-edited file must not be able to hide the review behind its
+        // own reference column.
+        let wide = UiSettings {
+            review_session_width: 4000.0,
+            ..UiSettings::default()
+        }
+        .clamped();
+        assert_eq!(wide.review_session_width, REVIEW_SESSION_MAX);
+        let broken = UiSettings {
+            review_session_width: f32::NAN,
+            ..UiSettings::default()
+        }
+        .clamped();
+        assert_eq!(broken.review_session_width, REVIEW_SESSION_DEFAULT);
     }
 }

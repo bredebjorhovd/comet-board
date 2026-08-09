@@ -92,6 +92,19 @@ pub struct ChangedFile {
     pub binary: bool,
 }
 
+impl ChangedFile {
+    /// How much moved, as a reader wants it: `+18 −2`, or `binary` for a file
+    /// that has no lines to count. One spelling, because the CLI's column and
+    /// the desktop's row are the same fact and reading two of them would be
+    /// reading two files.
+    pub fn counts(&self) -> String {
+        if self.binary {
+            return "binary".to_string();
+        }
+        format!("+{} −{}", self.added, self.removed)
+    }
+}
+
 /// One claim, checked against the diff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimView {
@@ -447,6 +460,228 @@ pub fn review(
     }
 }
 
+// ---- the reading ---------------------------------------------------------
+//
+// Everything from here down turns a finished [`AttemptReview`] into the
+// sentences a surface says about it. It lives here, beside the thing it reads,
+// for the reason every other derivation in this workspace does: the CLI, the
+// desktop review screen and whatever comes after it must not each invent their
+// own arithmetic for "is this review alarming", or the same attempt would read
+// as fine in one window and wrong in another.
+//
+// The rule these functions encode is one sentence: **a review is alarming when
+// the board can see something the agent did not account for.** Everything the
+// agent asserted is checked against something it did not author — the diff, the
+// run journal — and only the mismatches are loud.
+
+/// How loudly a surface should say what a review amounts to.
+///
+/// Three states and not two, because "nothing is wrong" and "nothing was
+/// established" are the opposite of the same thing. An attempt that never
+/// answered the claim contract has no findings against it and has also proved
+/// nothing, and a surface that painted that green would be reporting an absence
+/// of evidence as evidence of absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// The board can see something nobody accounted for. The one tone this
+    /// screen is allowed to shout in.
+    Alarm,
+    /// Nothing was established: no claims were submitted, or the diff could not
+    /// be read at all.
+    Unknown,
+    /// The claims account for the whole diff and nothing contradicts them.
+    Settled,
+}
+
+impl Tone {
+    /// Should a surface make this loud? Only [`Tone::Alarm`] — an unknown
+    /// review is quiet on purpose, because there is nothing in it to point at.
+    pub fn loud(self) -> bool {
+        matches!(self, Tone::Alarm)
+    }
+}
+
+/// Which fact a [`Finding`] is. Surfaces switch on this rather than on the
+/// sentence, so the wording can change without a renderer changing meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingKind {
+    /// Changed files no claim names. **The product** — first in the list and
+    /// first on the screen, because it is the only finding here that is derived
+    /// rather than asserted.
+    Unclaimed,
+    /// Work in the checkout that is on no branch, and so has been shown to
+    /// nobody. Not part of the remainder — the remainder is about the branch —
+    /// but it is what would make an empty remainder a lie.
+    Uncommitted,
+    /// A claim anchored to paths the diff never touched: work described that
+    /// did not happen.
+    UnsupportedClaims,
+    /// A verification command that ran and never once passed.
+    NeverPassed,
+    /// Commands ran; none of them checked anything.
+    Unchecked,
+    /// The attempt never answered the claim contract. Distinct from claiming
+    /// nothing, and it must never render as one.
+    NeverClaimed,
+    /// There is no diff to read: no checkout on disk and nothing recorded.
+    NoDiff,
+}
+
+impl FindingKind {
+    /// Does this one mean somebody has to look, or only that nothing is known?
+    pub fn tone(self) -> Tone {
+        match self {
+            FindingKind::Unclaimed
+            | FindingKind::Uncommitted
+            | FindingKind::UnsupportedClaims
+            | FindingKind::NeverPassed
+            | FindingKind::Unchecked => Tone::Alarm,
+            FindingKind::NeverClaimed | FindingKind::NoDiff => Tone::Unknown,
+        }
+    }
+}
+
+/// One thing a review has to say out loud, already counted and phrased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub kind: FindingKind,
+    pub text: String,
+}
+
+/// What the whole review amounts to, in one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub tone: Tone,
+    pub text: String,
+}
+
+/// `1 file` / `2 files` — said the same way everywhere rather than `file(s)`.
+fn count(n: usize, singular: &str, plural: &str) -> String {
+    if n == 1 {
+        format!("{n} {singular}")
+    } else {
+        format!("{n} {plural}")
+    }
+}
+
+impl AttemptReview {
+    /// Everything the board can see that the agent did not account for,
+    /// loudest first.
+    ///
+    /// Ordered, not sorted: the sequence is the argument. The remainder leads
+    /// because it is the only entry derived from something the agent never
+    /// touched; uncommitted work follows because it is the one fact that can
+    /// make an *empty* remainder wrong; then the claims that the diff refuses
+    /// to support, then what did and did not get checked.
+    ///
+    /// Empty is a real answer, and [`Self::verdict`] is what says so.
+    pub fn findings(&self) -> Vec<Finding> {
+        let mut out = Vec::new();
+        // No diff means no denominator: every other finding below would be
+        // computed against an empty changed set and would read as good news.
+        if let DiffSource::Unavailable { reason } = &self.diff {
+            out.push(Finding {
+                kind: FindingKind::NoDiff,
+                text: format!("there is no diff to check these claims against: {reason}"),
+            });
+            return out;
+        }
+        let changed = self.changed.len();
+        if !self.claimed() {
+            out.push(Finding {
+                kind: FindingKind::NeverClaimed,
+                text: format!(
+                    "this attempt never answered the claim contract, so nothing accounts for its {}",
+                    count(changed, "changed file", "changed files")
+                ),
+            });
+        } else if !self.remainder.unclaimed.is_empty() {
+            // Said as a proportion on purpose: "4 unclaimed" is a number, "4 of
+            // 17" is the question of whether the summary covered the work.
+            out.push(Finding {
+                kind: FindingKind::Unclaimed,
+                text: format!(
+                    "{} of {changed} changed files are claimed by nobody",
+                    self.remainder.unclaimed.len()
+                ),
+            });
+        }
+        if let Some(n) = self.uncommitted.filter(|n| *n > 0) {
+            out.push(Finding {
+                kind: FindingKind::Uncommitted,
+                text: format!(
+                    "{} changed in the checkout and on no branch, so the diff above has never seen them",
+                    count(n as usize, "file is", "files are")
+                ),
+            });
+        }
+        let unsupported = self
+            .remainder
+            .claims
+            .iter()
+            .filter(|c| !c.anchored())
+            .count();
+        if unsupported > 0 {
+            out.push(Finding {
+                kind: FindingKind::UnsupportedClaims,
+                text: format!(
+                    "{} anchored to files nothing happened to",
+                    count(unsupported, "claim is", "claims are")
+                ),
+            });
+        }
+        let never = self.evidence.failing().count();
+        if never > 0 {
+            out.push(Finding {
+                kind: FindingKind::NeverPassed,
+                text: format!(
+                    "{} ran and never once passed",
+                    count(never, "check", "checks")
+                ),
+            });
+        } else if !self.evidence.checked() && self.evidence.commands > 0 {
+            out.push(Finding {
+                kind: FindingKind::Unchecked,
+                text: format!(
+                    "nothing that verifies anything ran, across {}",
+                    count(self.evidence.commands as usize, "command", "commands")
+                ),
+            });
+        }
+        out
+    }
+
+    /// The one line a surface leads with.
+    ///
+    /// The loudest finding, or — when there is none — the sentence that says
+    /// the claims covered the diff. Never silent: a review with nothing to
+    /// report still has to say what it checked, or an empty screen reads as a
+    /// screen that failed to load.
+    pub fn verdict(&self) -> Verdict {
+        match self.findings().into_iter().next() {
+            Some(finding) => Verdict {
+                tone: finding.kind.tone(),
+                text: finding.text,
+            },
+            None if self.changed.is_empty() => Verdict {
+                tone: Tone::Unknown,
+                text: "this attempt's branch changed nothing".to_string(),
+            },
+            None if self.changed.len() == 1 => Verdict {
+                tone: Tone::Settled,
+                text: "the one changed file is accounted for".to_string(),
+            },
+            None => Verdict {
+                tone: Tone::Settled,
+                text: format!(
+                    "all {} changed files are accounted for",
+                    self.changed.len()
+                ),
+            },
+        }
+    }
+}
+
 // ---- reading the diff ----------------------------------------------------
 
 /// The changed set from `git diff --numstat` + `--name-status` output.
@@ -499,6 +734,7 @@ pub fn parse_diff(numstat: &str, name_status: &str) -> Vec<ChangedFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{Check, RanCommand};
     use crate::model::{BoardState, Outcome, Source, UpstreamState};
 
     fn changed(path: &str) -> ChangedFile {
@@ -885,5 +1121,235 @@ mod tests {
             r.remainder.complete(),
             "vacuously, and the reader is told why"
         );
+    }
+
+    // ---- the reading -----------------------------------------------------
+
+    fn reviewed(
+        claims: &str,
+        claimed_at: Option<&str>,
+        files: Vec<ChangedFile>,
+        uncommitted: Option<u32>,
+        evidence: RunEvidence,
+    ) -> AttemptReview {
+        let parsed = if claims.is_empty() {
+            vec![]
+        } else {
+            parse(claims, None).unwrap()
+        };
+        let attempt = attempt_with(parsed, claimed_at);
+        let task = task_with(attempt.clone());
+        review(
+            &task,
+            &attempt,
+            files,
+            DiffSource::Checkout,
+            uncommitted,
+            evidence,
+        )
+    }
+
+    fn ran(command: &str, failed: bool) -> RanCommand {
+        RanCommand {
+            command: command.into(),
+            failed,
+        }
+    }
+
+    /// The whole point of the screen, said in one line: the remainder leads,
+    /// and it leads as a proportion rather than a bare count.
+    #[test]
+    fn the_verdict_leads_with_the_changes_nobody_claimed() {
+        let r = reviewed(
+            "Did the storage :: src/db.rs",
+            Some("2026-08-09T10:00:00Z"),
+            vec![changed("src/db.rs"), changed("Cargo.lock")],
+            Some(0),
+            RunEvidence::default(),
+        );
+        let verdict = r.verdict();
+        assert_eq!(verdict.tone, Tone::Alarm);
+        assert_eq!(verdict.text, "1 of 2 changed files are claimed by nobody");
+        assert_eq!(r.findings()[0].kind, FindingKind::Unclaimed);
+    }
+
+    /// A claim that covers the diff is not the same as an unexamined one, so
+    /// the settled verdict names the denominator it checked.
+    #[test]
+    fn a_diff_the_claims_cover_reads_settled_and_says_what_it_covered() {
+        let r = reviewed(
+            "Did the storage :: src/db.rs",
+            Some("2026-08-09T10:00:00Z"),
+            vec![changed("src/db.rs")],
+            Some(0),
+            RunEvidence {
+                commands: 3,
+                failed: 0,
+                checks: vec![Check {
+                    command: "cargo test".into(),
+                    runs: 2,
+                    failed: 1,
+                }],
+                truncated: false,
+            },
+        );
+        assert_eq!(r.findings(), vec![]);
+        let verdict = r.verdict();
+        assert_eq!(verdict.tone, Tone::Settled);
+        assert_eq!(verdict.text, "the one changed file is accounted for");
+    }
+
+    /// Never asked is not claimed nothing (§gh#183), and the reading is where
+    /// that distinction either survives to a screen or dies. A silent attempt
+    /// reads as *unknown*, never as an alarm about work it was never asked to
+    /// describe — and never, ever, as green.
+    #[test]
+    fn an_attempt_that_never_claimed_reads_as_unknown_rather_than_as_a_remainder() {
+        let r = reviewed(
+            "",
+            None,
+            vec![changed("src/db.rs"), changed("Cargo.lock")],
+            Some(0),
+            RunEvidence::default(),
+        );
+        let verdict = r.verdict();
+        assert_eq!(verdict.tone, Tone::Unknown);
+        assert!(verdict.text.contains("never answered the claim contract"));
+        assert!(verdict.text.ends_with("its 2 changed files"));
+        // Not ALSO reported as an unclaimed remainder: "2 of 2" adds a number
+        // to a sentence that already carries it, and dresses a question the
+        // agent was never asked as a failure to answer it.
+        assert!(
+            !r.findings()
+                .iter()
+                .any(|f| f.kind == FindingKind::Unclaimed)
+        );
+    }
+
+    /// Claiming nothing, having been asked, IS the remainder — the other side
+    /// of the distinction above.
+    #[test]
+    fn claiming_nothing_after_being_asked_is_the_whole_diff_unclaimed() {
+        let mut r = reviewed(
+            "",
+            None,
+            vec![changed("src/db.rs")],
+            Some(0),
+            RunEvidence::default(),
+        );
+        r.claimed_at = Some("2026-08-09T10:00:00Z".into());
+        assert_eq!(r.verdict().tone, Tone::Alarm);
+        assert_eq!(r.findings()[0].kind, FindingKind::Unclaimed);
+    }
+
+    /// The one fact that can make an EMPTY remainder wrong: an agent that
+    /// claims before it commits has shown the board none of its work, and
+    /// would otherwise be told all of it was accounted for.
+    #[test]
+    fn uncommitted_work_is_reported_even_when_the_branch_is_fully_claimed() {
+        let r = reviewed(
+            "Did the storage :: src/db.rs",
+            Some("2026-08-09T10:00:00Z"),
+            vec![changed("src/db.rs")],
+            Some(3),
+            RunEvidence::default(),
+        );
+        assert_eq!(r.verdict().tone, Tone::Alarm);
+        assert_eq!(r.findings()[0].kind, FindingKind::Uncommitted);
+        assert!(r.findings()[0].text.starts_with("3 files are changed"));
+    }
+
+    /// Work described that did not happen is as interesting as work nobody
+    /// described, and the reading says so in the same voice.
+    #[test]
+    fn a_claim_the_diff_refuses_to_support_is_its_own_finding() {
+        let r = reviewed(
+            "Rewrote the sync loop :: src/sync.rs",
+            Some("2026-08-09T10:00:00Z"),
+            vec![],
+            Some(0),
+            RunEvidence::default(),
+        );
+        let kinds: Vec<_> = r.findings().iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, vec![FindingKind::UnsupportedClaims]);
+        assert!(r.findings()[0].text.starts_with("1 claim is anchored"));
+    }
+
+    /// Evidence the agent did not author, read the way the module intends it:
+    /// a check that never passed is louder than no checks at all, and a busy
+    /// run that verified nothing still says so.
+    #[test]
+    fn the_evidence_findings_rank_a_failing_check_over_a_missing_one() {
+        let never = reviewed(
+            "Did it :: src/db.rs",
+            Some("2026-08-09T10:00:00Z"),
+            vec![changed("src/db.rs")],
+            Some(0),
+            crate::evidence::gather(&[ran("cargo test -p comet-board", true)]),
+        );
+        assert_eq!(never.findings()[0].kind, FindingKind::NeverPassed);
+        assert_eq!(
+            never.findings()[0].text,
+            "1 check ran and never once passed"
+        );
+
+        let quiet = reviewed(
+            "Did it :: src/db.rs",
+            Some("2026-08-09T10:00:00Z"),
+            vec![changed("src/db.rs")],
+            Some(0),
+            crate::evidence::gather(&[ran("ls", false), ran("grep -rn foo .", false)]),
+        );
+        assert_eq!(quiet.findings()[0].kind, FindingKind::Unchecked);
+        assert!(quiet.findings()[0].text.ends_with("across 2 commands"));
+    }
+
+    /// No diff means no denominator. Every other finding would be computed
+    /// against an empty changed set and would read as good news, so the
+    /// reading stops at the reason and says only that.
+    #[test]
+    fn an_unreadable_diff_suppresses_every_finding_computed_against_it() {
+        let attempt = attempt_with(vec![], None);
+        let task = task_with(attempt.clone());
+        let r = review(
+            &task,
+            &attempt,
+            vec![],
+            DiffSource::Unavailable {
+                reason: "the checkout was reclaimed".into(),
+            },
+            Some(4),
+            crate::evidence::gather(&[ran("cargo test", true)]),
+        );
+        let findings = r.findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, FindingKind::NoDiff);
+        assert_eq!(r.verdict().tone, Tone::Unknown);
+        assert!(r.verdict().text.contains("the checkout was reclaimed"));
+    }
+
+    /// A branch that changed nothing is not a branch whose changes were all
+    /// accounted for. Green there would be a lie about an empty set.
+    #[test]
+    fn a_branch_that_changed_nothing_is_unknown_not_settled() {
+        let r = reviewed(
+            "",
+            Some("2026-08-09T10:00:00Z"),
+            vec![],
+            Some(0),
+            RunEvidence::default(),
+        );
+        assert_eq!(r.verdict().tone, Tone::Unknown);
+        assert_eq!(r.verdict().text, "this attempt's branch changed nothing");
+    }
+
+    #[test]
+    fn a_binary_file_has_no_lines_to_count() {
+        let mut file = changed("logo.png");
+        file.binary = true;
+        file.added = 0;
+        file.removed = 0;
+        assert_eq!(file.counts(), "binary");
+        assert_eq!(changed("src/db.rs").counts(), "+10 −2");
     }
 }

@@ -32,6 +32,18 @@ pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_MAX: f32 = 760.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 
+/// The authoring session's column on the review route (gh#180), in px.
+///
+/// Its own range and not [`RIGHT_PANE_MIN`]'s, because it is a different kind
+/// of column: the Changes dock is a reference the eye visits, while this one
+/// holds a transcript somebody reads and a composer they type into. The floor
+/// is where a message bubble stops being a word per line; the ceiling is where
+/// the review it sits beside — the content on this route — starts losing to its
+/// own reference.
+pub const REVIEW_SESSION_MIN: f32 = 320.0;
+pub const REVIEW_SESSION_MAX: f32 = 620.0;
+pub const REVIEW_SESSION_DEFAULT: f32 = 420.0;
+
 /// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
 /// viewport-relative cap applies at runtime; the absolute cap here only heals
 /// hand-edited files.
@@ -78,6 +90,9 @@ pub struct UiSettings {
     /// (`shell::SessionPanels`, comet `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
     pub right_pane_open: bool,
+    /// Width of the authoring session beside a review (gh#180). Persisted like
+    /// every other pane width; the route it belongs to is not.
+    pub review_session_width: f32,
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
     pub terminal_open: bool,
@@ -100,6 +115,7 @@ impl Default for UiSettings {
             sound_enabled: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
+            review_session_width: REVIEW_SESSION_DEFAULT,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
@@ -302,6 +318,12 @@ impl UiSettings {
             RIGHT_PANE_MAX,
             RIGHT_PANE_DEFAULT,
         );
+        self.review_session_width = clamp_or(
+            self.review_session_width,
+            REVIEW_SESSION_MIN,
+            REVIEW_SESSION_MAX,
+            REVIEW_SESSION_DEFAULT,
+        );
         self.terminal_height = clamp_or(
             self.terminal_height,
             TERMINAL_MIN_HEIGHT,
@@ -370,6 +392,7 @@ mod tests {
             sound_enabled: false,
             right_pane_width: 700.0,
             right_pane_open: true,
+            review_session_width: 500.0,
             terminal_height: 320.0,
             terminal_open: true,
             keymap: KeymapConfig {
