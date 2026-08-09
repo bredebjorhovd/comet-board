@@ -8,12 +8,22 @@
 //! at list price, and how far does the subscription carry it* — so that is the
 //! headline, and everything under it is evidence:
 //!
-//! 1. **Spend** — list price against what the plans behind it cost. Never
-//!    summed: one figure is the board's, the other is a person's (gh#182).
+//! 1. **Spend** — list price against what the plans behind it cost, and where
+//!    inside that price the money went. Never summed: one figure is the
+//!    board's, the other is a person's (gh#182).
 //! 2. **Work released** — dispatches, the day shape, and where they landed.
 //! 3. **Tokens** — what the price above was computed from, per model.
 //! 4. **When and where** — one grid crossing the hour against the space.
 //! 5. **Who ran it** — the runtime, the tracker, the subscription.
+//!
+//! **The four rates are priced apart and then read together (gh#225).** A
+//! cache read is a tenth of fresh input and output is five times it, so the
+//! window's price is nothing like its token counts — and the block that used
+//! to give a whole card to one sentence now spends the room on the split: a
+//! proportional bar over output, cache writes, cached input and uncached
+//! input, with what each one cost and what it bought. Thirty-five million
+//! cached tokens for a fifth of what a million output tokens cost is the whole
+//! story of where the money goes, and no other view of these numbers tells it.
 //!
 //! **The crossing is the point of block four.** "When do I release work" and
 //! "which spaces" were two cards, and the interesting fact — that the evening
@@ -48,7 +58,7 @@ use comet_proto::TokenUsage;
 use comet_proto::view::board;
 use comet_proto::view::rates::{Usd, human_usd};
 use comet_proto::view::stats::{
-    BoardSpend, BoardStats, HOURS, Tally, TokenTally, WINDOWS, bar_fraction, hour_grid,
+    BoardSpend, BoardStats, CostSplit, HOURS, Tally, TokenTally, WINDOWS, bar_fraction, hour_grid,
     human_minutes, human_multiple, human_tokens, peak_dispatches, peak_tokens, percent,
     ranked_tokens, ranked_top,
 };
@@ -73,6 +83,11 @@ const CHART_HEIGHT: f32 = 92.0;
 /// The token series, drawn as a strip inside the tokens block rather than as a
 /// card of its own — it qualifies the total above it.
 const SPARK_HEIGHT: f32 = 40.0;
+
+/// The cost-split bar (gh#225). A proportion, not a magnitude: the height
+/// carries no information, so it is the thickness of a rule and the width does
+/// all the talking.
+const SPLIT_BAR_HEIGHT: f32 = 10.0;
 
 /// The corner on a drawn mark — a chart column, a meter fill, a heat cell.
 ///
@@ -398,9 +413,15 @@ impl StatsPage {
     // -- block 1: spend ------------------------------------------------------
 
     /// What the window would have cost at the meter, against what the plans
-    /// behind it cost — the question the page is opened for.
+    /// behind it cost, and where inside that price the money actually went —
+    /// the question the page is opened for.
     ///
-    /// The two figures are never added. One is the board's own arithmetic over
+    /// **One band, not three cards** (gh#225). The three figures are one
+    /// sentence read left to right — this cost that, the plan carried it this
+    /// far, and it went mostly there — so they are hairline-separated cells of
+    /// one row rather than three boxes with three borders to cross.
+    ///
+    /// The first two are never added. One is the board's own arithmetic over
     /// tokens it counted; the other is a number a person typed beside a login
     /// (gh#178), possibly several people's on a box carrying several slots. The
     /// only honest thing to do with the pair is divide it, which is the
@@ -410,7 +431,9 @@ impl StatsPage {
         let aside = stats.spend.as_ref().map(|s| s.rates.provenance());
         let Some(spend) = priced else {
             // The two ways there is no number, said apart — `spend_label` owns
-            // which one this is, and neither of them is $0.00.
+            // which one this is, and neither of them is $0.00. No band and no
+            // bar here: an empty state is prose, never a row of dashes over a
+            // chart of zeroes.
             let mut body = Self::body(8.0).child(Self::note(
                 theme,
                 format!(
@@ -435,58 +458,17 @@ impl StatsPage {
             );
         };
 
-        let window = stats.window_label();
-        let mut figures = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_start()
-            .gap(px(32.0))
-            .child(Self::figure(
-                theme,
-                human_usd(spend.list_price),
-                &format!("at list price, {window}"),
-            ));
-        match spend.subscriptions_in_window() {
-            Some(plans) => {
-                figures = figures.child(Self::figure(
-                    theme,
-                    human_usd(plans),
-                    &format!(
-                        "of subscription over the same {window} ({}/mo)",
-                        human_usd(spend.monthly_subscriptions())
-                    ),
-                ));
-                if let Some(ratio) = spend.subsidy() {
-                    figures = figures.child(Self::figure(
-                        theme,
-                        human_multiple(ratio),
-                        "list price per plan dollar",
-                    ));
-                }
-            }
-            // Two different "no", and collapsing them would be the mistake
-            // this whole half of the page is built to avoid. An all-time
-            // window has plans and no days to pro-rate them onto; a board with
-            // nothing entered has no second figure at all — and unentered is
-            // not free.
-            None => {
-                let monthly = spend.monthly_subscriptions();
-                figures = figures.child(if monthly.is_zero() {
-                    Self::figure(theme, "—", "no plan cost entered in Accounts")
-                } else {
-                    Self::figure(
-                        theme,
-                        format!("{}/mo", human_usd(monthly)),
-                        "of subscription — all time has no window to pro-rate onto",
-                    )
-                });
-            }
+        let split = spend.cost_split();
+        let mut body = Self::body(14.0).child(Self::spend_band(stats, spend, &split, theme));
+        // The bar earns its room only when there is a shape to draw. A window
+        // whose whole price rounds to nothing keeps the band and says so in the
+        // cell above rather than drawing four empty segments.
+        if !split.is_empty() {
+            body = body
+                .child(Self::seam(theme))
+                .child(Self::render_cost_split(&split, theme));
         }
-
-        let mut body = Self::body(14.0)
-            .child(figures)
-            .child(Self::note(theme, Self::BILL_NOTE));
+        body = body.child(Self::note(theme, Self::BILL_NOTE));
         if !spend.is_complete() {
             body = body.child(Self::note(
                 theme,
@@ -511,9 +493,224 @@ impl StatsPage {
         Self::block(theme, "Spend", aside, body.into_any_element())
     }
 
-    /// The sentence that keeps the block from being read as a bill.
-    const BILL_NOTE: &'static str = "Comet never sees your bill. The list price is what these tokens cost at the meter; \
-         the subscription is what you entered beside each login in Accounts.";
+    /// The three figures, across: what it cost, how far the plan carried it,
+    /// and which of the four rates the price is mostly made of.
+    fn spend_band(
+        stats: &BoardStats,
+        spend: &BoardSpend,
+        split: &CostSplit,
+        theme: &Theme,
+    ) -> AnyElement {
+        let window = stats.window_label();
+        let price = Self::figure(
+            theme,
+            human_usd(spend.list_price),
+            &format!(
+                "at list price · {} tokens over the {window}",
+                human_tokens(split.tokens)
+            ),
+        );
+
+        let plans = match spend.subscriptions_in_window() {
+            // The multiple is the figure and the two amounts are its caption:
+            // *how far does the subscription carry this* is the question, and
+            // the dollars are how it was arrived at.
+            Some(in_window) => match spend.subsidy() {
+                Some(ratio) => Self::figure(
+                    theme,
+                    human_multiple(ratio),
+                    &format!(
+                        "{} of {} in plans over the same {window}",
+                        human_usd(in_window),
+                        Self::monthly_phrase(spend)
+                    ),
+                ),
+                // Plans entered, and free: a ratio against zero is not a
+                // number, and the amount is still worth showing.
+                None => Self::figure(
+                    theme,
+                    human_usd(in_window),
+                    &format!(
+                        "of {} in plans — nothing to divide by",
+                        Self::monthly_phrase(spend)
+                    ),
+                ),
+            },
+            // Two different "no", and collapsing them would be the mistake this
+            // whole half of the page is built to avoid. An all-time window has
+            // plans and no days to pro-rate them onto; a board with nothing
+            // entered has no second figure at all — and unentered is not free.
+            None => {
+                let monthly = spend.monthly_subscriptions();
+                if monthly.is_zero() {
+                    Self::figure(theme, "—", "no plan cost entered in Accounts")
+                } else {
+                    Self::figure(
+                        theme,
+                        format!("{}/mo", human_usd(monthly)),
+                        "in plans — all time has no window to pro-rate onto",
+                    )
+                }
+            }
+        };
+
+        let cost_split = match split.largest().filter(|_| !split.is_empty()) {
+            Some(biggest) => Self::figure(
+                theme,
+                percent(Some(biggest.share)).unwrap_or_else(|| "—".into()),
+                &format!(
+                    "of the price is {}, on {} tokens",
+                    biggest.label(),
+                    human_tokens(biggest.tokens)
+                ),
+            ),
+            None => Self::figure(theme, "—", "nothing in this window carries a price"),
+        };
+
+        Self::band(theme, vec![price, plans, cost_split])
+    }
+
+    /// What the plans cost per month, said so it survives a box carrying
+    /// several teammates' slots (gh#59): one plan is *a* plan, several are
+    /// counted rather than silently summed into somebody's imagined bill.
+    fn monthly_phrase(spend: &BoardSpend) -> String {
+        let monthly = human_usd(spend.monthly_subscriptions());
+        match spend.accounts.iter().filter(|a| a.plan.is_some()).count() {
+            0 | 1 => format!("a {monthly}/mo plan"),
+            n => format!("{monthly}/mo across {n} plans"),
+        }
+    }
+
+    /// One band: figures across, separated by the hairline that used to be a
+    /// card edge. The rule stretches to the tallest cell, so a caption that
+    /// wraps does not leave a stub of a line beside it.
+    fn band(theme: &Theme, cells: Vec<AnyElement>) -> AnyElement {
+        let mut row = div().flex().flex_row().gap(px(20.0));
+        for (index, cell) in cells.into_iter().enumerate() {
+            if index > 0 {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .w(px(1.0))
+                        .min_h(px(34.0))
+                        .bg(theme.border),
+                );
+            }
+            row = row.child(
+                div()
+                    .flex_grow(1.0)
+                    .flex_basis(px(0.0))
+                    .min_w_0()
+                    .child(cell),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// Where the list price goes (gh#225): the four rates as a proportional
+    /// bar, with what each one bought beneath it.
+    ///
+    /// The per-model table in the tokens block answers *which model was
+    /// expensive*. This answers *which kind of token was*, which no other view
+    /// of these numbers can: a week that spends most of its price on a million
+    /// output tokens while thirty-five million cached ones cost a fraction of
+    /// that is a week where the cache is doing its job — and the same week read
+    /// as one total is just a number.
+    ///
+    /// Both figures per class, always. Dollars alone hide that the cheap class
+    /// is the enormous one; tokens alone hide that the small one is the bill.
+    fn render_cost_split(split: &CostSplit, theme: &Theme) -> AnyElement {
+        let tone = |index: usize| theme.accent.opacity(Self::CLASS_TONES[index.min(3)]);
+        let segments: Vec<AnyElement> = split
+            .slices
+            .iter()
+            .enumerate()
+            .map(|(index, slice)| {
+                div()
+                    // Proportional, and never invisible: a class that cost a
+                    // fraction of a percent is still a class that was spent in.
+                    .flex_grow(slice.share as f32)
+                    .flex_basis(px(0.0))
+                    .min_w(px(3.0))
+                    .h_full()
+                    .rounded(px(MARK_RADIUS))
+                    .bg(tone(index))
+                    .into_any_element()
+            })
+            .collect();
+        let legend: Vec<AnyElement> = split
+            .slices
+            .iter()
+            .enumerate()
+            .map(|(index, slice)| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(7.0))
+                            // round-ok: legend dot — the same mark as a status
+                            // dot, standing for a colour rather than a state.
+                            .rounded_full()
+                            .bg(tone(index)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(slice.legend())),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from("Where the list price goes")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(2.0))
+                    .w_full()
+                    .h(px(SPLIT_BAR_HEIGHT))
+                    .children(segments),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(18.0))
+                    .children(legend),
+            )
+            .into_any_element()
+    }
+
+    /// The four tones of the cost bar, biggest class first.
+    ///
+    /// One hue at four weights rather than four hues: the status ramp (gh#173)
+    /// means something on this page, and borrowing it to say `cache writes`
+    /// would be a colour lying about what it names. Ranked slices in a ranked
+    /// ramp also mean the bar reads dark-to-light left to right, which is the
+    /// ordering said twice.
+    const CLASS_TONES: [f32; 4] = [0.85, 0.62, 0.42, 0.24];
+
+    /// The sentence that keeps the block from being read as a bill — one line,
+    /// because a footnote that runs to a paragraph is a paragraph nobody reads.
+    const BILL_NOTE: &'static str = "Comet never sees your bill: list prices come from a dated table, \
+         plan costs from Accounts.";
 
     /// Per subscription: what it ran, what that was worth at the meter, and
     /// what the plan behind it costs.
