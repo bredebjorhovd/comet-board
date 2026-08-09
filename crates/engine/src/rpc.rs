@@ -70,7 +70,7 @@ use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
 use comet_proto::{ChatConfig, HarnessId};
-use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
+use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -83,7 +83,7 @@ use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
 
-use comet_board::dispatch::{DispatchOrigin, DispatchOverrides};
+use comet_board::dispatch::{DispatchOrigin, DispatchOverrides, VerifiedCaller};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,11 +271,15 @@ struct DispatchTaskParams {
     #[serde(default)]
     via: Option<String>,
     /// The device the dispatch was issued from, and who its frontend says is
-    /// signed in there (gh#74). Both are the caller's word — a relayed call
-    /// arrives as the device room's owner, so there is no per-call identity to
-    /// check them against yet (#66). Recorded on the attempt, and never
-    /// consulted for authorization or for billing: which account a run spends
-    /// is `account` below, always explicit.
+    /// signed in there (gh#74). Both are the caller's word.
+    ///
+    /// `via_user` is the **fallback**, and only for a call that arrived with no
+    /// relay stamp — from this box's own IPC port (gh#161). A forwarded call
+    /// resolves its dispatcher from the identity the edge verified and the
+    /// relay stamped on the frame, and this key is then recorded and never
+    /// compared, so a frontend that writes somebody else's address here changes
+    /// nothing about what gets spent. Neither is ever authorization: which
+    /// account a run spends is `account` below, always explicit.
     #[serde(default)]
     via_device: Option<String>,
     #[serde(default)]
@@ -588,6 +592,47 @@ impl EngineRpc {
         self.auth
             .as_ref()
             .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
+    }
+
+    /// Who released a dispatch, from the transport's own answer rather than the
+    /// caller's (gh#161).
+    ///
+    /// The relay stamped [`Caller::user`] on the frame from an identity the
+    /// edge Worker verified, so a forwarded call resolves its dispatcher here;
+    /// `via_user` is the fallback for the local case *only*, where there is no
+    /// relay to have stamped anything and the process on the other end is the
+    /// box's own. Both land on the attempt; only one of them is ever compared
+    /// against an account (see [`comet_board::billing`]).
+    async fn dispatch_origin(
+        &self,
+        caller: &Caller,
+        p_via: Option<String>,
+        p_device: Option<String>,
+        p_user: Option<String>,
+    ) -> DispatchOrigin {
+        let verified = match caller.user() {
+            None => None,
+            Some(user_id) => {
+                let auth = self.auth.as_ref();
+                Some(VerifiedCaller {
+                    user_id: user_id.to_string(),
+                    // A box with no auth service at all (bare-core test
+                    // assemblies) can name nobody, including itself — which is
+                    // the honest answer and the conservative one.
+                    email: match auth {
+                        Some(auth) => auth.email_for_user(user_id).await,
+                        None => None,
+                    },
+                    is_owner: auth.and_then(|a| a.user_id()).as_deref() == Some(user_id),
+                })
+            }
+        };
+        DispatchOrigin {
+            chat: p_via,
+            device: p_device,
+            user: p_user,
+            verified,
+        }
     }
 
     fn updater(&self) -> Result<&comet_update::Updater, RpcError> {
@@ -1423,9 +1468,25 @@ impl RpcService for AuthRpc {
 
 #[async_trait]
 impl RpcService for EngineRpc {
+    /// A call with no transport identity on it: this engine's own IPC port or
+    /// its in-process transport, which is what [`Caller::LOCAL`] means.
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        self.handle_as(method, params, &Caller::LOCAL).await
+    }
+
+    async fn handle_as(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        caller: &Caller,
+    ) -> Result<RpcReply, RpcError> {
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
+        //
+        // The caller is deliberately NOT passed on: the next hop's relay stamps
+        // the identity *this* device dials with, which is the truth about who
+        // is asking it. An identity forwarded as a parameter would be a claim
+        // again, one hop later.
         if forwardable(method)
             && let Some(target) = params.get("targetDeviceId").and_then(|v| v.as_str())
             && target != self.doc_host.device_id()
@@ -1542,11 +1603,9 @@ impl RpcService for EngineRpc {
                     account: p.account,
                     bill: p.bill,
                 };
-                let origin = DispatchOrigin {
-                    chat: p.via,
-                    device: p.via_device,
-                    user: p.via_user,
-                };
+                let origin = self
+                    .dispatch_origin(caller, p.via, p.via_device, p.via_user)
+                    .await;
                 let dispatched = if p.replace {
                     board.retry_task(&p.task_id, origin, overrides).await
                 } else {

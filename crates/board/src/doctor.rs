@@ -46,13 +46,17 @@ pub struct EngineStatus {
 /// logins, or `None` when the engine could not be asked. Route checks against
 /// a `None` say "not checked" rather than failing every route over one dead
 /// engine — the engine check itself is the one that fails loudly. `edge` is
-/// the same engine's live edge-connection census (gh#116).
+/// the same engine's live edge-connection census (gh#116), and `members` how
+/// many people are in the workspace (gh#161) — the fact that turns "a dispatch
+/// that names no account spends the box's login" from a tautology into a
+/// warning.
 pub fn doctor(
     paths: &Paths,
     engine: &EngineStatus,
     spaces: Option<&[Space]>,
     accounts: Option<&[AgentAccount]>,
     edge: Option<&EdgeHealth>,
+    members: Option<usize>,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
@@ -211,8 +215,10 @@ pub fn doctor(
             checks.push(operator_notice_check(&cfg.defaults));
 
             // Whose subscription the dispatches on this box spend, and what the
-            // board says about it (gh#101).
+            // board says about it (gh#101) — then the same question asked of
+            // the dispatches that name nobody at all (gh#161).
             checks.push(billing_guard_check(&cfg));
+            checks.push(default_account_check(&cfg, accounts, members));
 
             // The pin (gh#104). Reported next to the other notice lines because
             // it is another answer to the same question — who hears about a
@@ -1405,10 +1411,12 @@ fn operator_notice_check(defaults: &crate::config::Defaults) -> Check {
 /// it would be a `doctor` people stop reading — so this never fails, exactly
 /// like [`operator_notice_check`].
 ///
-/// The honesty is not optional either. The guard compares the dispatching
-/// frontend's `viaUser` claim against the agent-account's email, and the box
-/// cannot check that claim until #66 lands, so every mode says so in the words
-/// that will still be true afterwards: a seatbelt, not a lock.
+/// The honesty is not optional either — and gh#161 changed what honest says.
+/// A relayed dispatch is compared against the identity the edge verified and
+/// the relay stamped on the frame, which no frontend can write; a dispatch
+/// issued on the box carries no stamp and is compared against the frontend's
+/// claim, which is correct there and worth saying out loud rather than
+/// implying. Neither line hedges about the other's case.
 fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
     use crate::billing::GuardMode;
     let mode = cfg.billing_guard(None);
@@ -1430,15 +1438,16 @@ fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
     let detail = match mode {
         GuardMode::Warn => "warn — a dispatch that spends someone else's subscription says so \
              in the picker, on the CLI, in the dispatch comment and on the row, \
-             and releases anyway. A seatbelt, not a lock: the match is the \
-             frontend's claimed user against the account's email, and the box \
-             cannot verify that claim yet (#66)"
+             and releases anyway. Nothing is refused: the visibility is the \
+             point, and a box where two people share one plan is a normal box"
             .to_string(),
         GuardMode::RequireOwn => "require-own — a dispatch that would spend someone else's \
-             subscription is refused unless it names them (`--bill`). Still a \
-             seatbelt: the match is the frontend's claimed user against the \
-             account's email, so a frontend that misreports one walks through \
-             it (#66)"
+             subscription is refused unless it names them (`--bill`). A \
+             teammate's dispatch is matched against the identity the edge \
+             verified, so misreporting a signed-in user changes nothing; a \
+             dispatch issued on this box carries no such identity and is \
+             matched against what its frontend said, which is all a local \
+             shell can be asked for"
             .to_string(),
         GuardMode::Off => "off — nothing is said when a dispatch spends someone else's \
              subscription. The right answer on a box where one person's plan \
@@ -1453,6 +1462,85 @@ fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
             [] => detail,
             some => format!("{detail}. Per route: {}", some.join(", ")),
         },
+    }
+}
+
+/// What a dispatch that names no account spends, and who else is in a position
+/// to spend it (gh#161).
+///
+/// The other half of the billing guard, from the side nobody looks at: `account`
+/// is optional on a route, and a dispatch that names none falls to this box's
+/// own CLI login. On a one-person box that is not a default at all — it is the
+/// only login there is, and saying anything about it would be noise. On a
+/// workspace with somebody else in it, it is the box owner's plan paying for
+/// whoever pressed enter, and the fact that it is *quiet* is exactly why the
+/// question never gets asked.
+///
+/// Never fails, for [`billing_guard_check`]'s reason: sharing one plan
+/// deliberately is a normal way to run a box, and the line exists so that
+/// choice is made rather than defaulted into.
+fn default_account_check(
+    cfg: &crate::config::RoutingConfig,
+    accounts: Option<&[AgentAccount]>,
+    members: Option<usize>,
+) -> Check {
+    let name = "default account".to_string();
+    let unnamed: Vec<String> = cfg
+        .routes
+        .iter()
+        .filter(|r| r.account.as_deref().unwrap_or("").trim().is_empty())
+        .map(|r| r.display_name().to_string())
+        .collect();
+    if cfg.routes.is_empty() || unnamed.is_empty() {
+        return Check {
+            name,
+            ok: true,
+            detail: "every route names an `account` — no dispatch falls through to this \
+                     box's own CLI login"
+                .into(),
+        };
+    }
+    // Whose login that fallback actually is, where the engine could say. The
+    // active login per harness is what a dispatch with no slot runs under.
+    let mine: Vec<String> = accounts
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| a.active)
+        .filter_map(|a| a.email.clone())
+        .filter(|e| !e.trim().is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let login = match mine.as_slice() {
+        [] => "this box's own CLI login".to_string(),
+        some => format!("this box's own CLI login ({})", some.join(", ")),
+    };
+    let routes = match unnamed.as_slice() {
+        [one] => format!("route `{one}` names no `account`"),
+        many => format!("{} routes name no `account`", many.len()),
+    };
+    let detail = match members {
+        // The case this check exists for.
+        Some(n) if n > 1 => format!(
+            "{routes}, so a dispatch that names none runs on {login} — and there are {n} \
+             people in this workspace. A teammate's release spends the box owner's plan \
+             unless they pass `--account <their slot>`; `[defaults] billing_guard = \
+             \"require-own\"` refuses those outright"
+        ),
+        Some(_) => format!(
+            "{routes}, so a dispatch that names none runs on {login} — which is yours: \
+             one person in this workspace, and the fallback is the only login there is"
+        ),
+        None => format!(
+            "{routes}, so a dispatch that names none runs on {login}. Who else could \
+             spend it was not checked — the engine could not be asked for the workspace \
+             roster"
+        ),
+    };
+    Check {
+        name,
+        ok: true,
+        detail,
     }
 }
 
@@ -1696,7 +1784,7 @@ mod tests {
     #[test]
     fn doctor_reports_a_missing_routing_file_without_panicking() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
@@ -1832,7 +1920,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None).unwrap();
         let check = edge_check_in(&checks);
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("0 of 4 live"), "{}", check.detail);
@@ -1857,7 +1945,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok, "{}", check.detail);
         assert!(
@@ -1872,7 +1960,7 @@ mod tests {
     #[test]
     fn an_unaskable_engine_leaves_the_edge_check_unchecked() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok);
         assert!(check.detail.contains("not checked"), "{}", check.detail);
@@ -1892,7 +1980,7 @@ mod tests {
             detail: "connection refused".into(),
             version: None,
         };
-        let checks = doctor(&p, &down, None, Some(&[]), None).unwrap();
+        let checks = doctor(&p, &down, None, Some(&[]), None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
         // The route's space is "not checked", not failed: one dead engine must
         // not fail every route and bury its own report.
@@ -1940,14 +2028,14 @@ mod tests {
 
         routing("origin/HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
         assert!(!ok, "{detail}");
         assert!(detail.contains("origin"), "{detail}");
         assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
 
         routing("HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
         assert!(ok, "{detail}");
     }
 
@@ -1997,14 +2085,14 @@ mod tests {
             comet_proto::HarnessId::ClaudeCode,
         )];
 
-        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None).unwrap();
+        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
         let c = account_check_in(&ok);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("sam@example.com"), "{}", c.detail);
 
         // An id this device has never saved: named, along with what it does have.
         routing_with_account(&p, "claude-code", "ffffffffffffffff");
-        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None).unwrap();
+        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
         let c = account_check_in(&bad);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("ffffffffffffffff"), "{}", c.detail);
@@ -2022,7 +2110,7 @@ mod tests {
             "sam@example.com",
             comet_proto::HarnessId::ClaudeCode,
         )];
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("claude-code"), "{}", c.detail);
@@ -2040,11 +2128,11 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         assert!(!checks.iter().any(|c| c.name == "route w: account"));
 
         routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
-        let checks = doctor(&p, &engine_up(), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("not checked"), "{}", c.detail);
@@ -2060,7 +2148,7 @@ mod tests {
         )
         .unwrap();
         let spaces = [space("Tally")];
-        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None).unwrap();
         // Case-insensitive, like every other name match on the board.
         let c = checks
             .iter()
@@ -2068,7 +2156,7 @@ mod tests {
             .unwrap();
         assert!(c.ok, "{}", c.detail);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "route tally: space")
@@ -2090,7 +2178,7 @@ mod tests {
              runtime = \"gpt-piloted-typewriter\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let alias = checks
             .iter()
             .find(|c| c.name == "route w: runtime" && c.ok)
@@ -2120,7 +2208,7 @@ mod tests {
              runtime = \"claude\"\nmax_duration = \"off\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let detail = |name: &str| {
             checks
                 .iter()
@@ -2216,23 +2304,29 @@ mod tests {
     /// gh#101. Three modes, one line, and it never fails — `off` is the right
     /// answer on a one-person box, and a `doctor` that nagged about a
     /// preference is a `doctor` people stop reading. What it must never do is
-    /// imply the match is stronger than it is.
+    /// describe the match as stronger — or weaker — than it is (gh#161).
     #[test]
-    fn the_billing_guard_line_reports_the_mode_and_admits_it_is_a_seatbelt() {
+    fn the_billing_guard_line_reports_the_mode_and_what_the_match_is_made_of() {
         let mut cfg = RoutingConfig::default();
 
         let warn = billing_guard_check(&cfg);
         assert!(warn.ok);
         assert!(warn.detail.starts_with("warn —"), "{}", warn.detail);
-        assert!(warn.detail.contains("#66"), "{}", warn.detail);
 
         cfg.defaults.billing_guard = "require-own".into();
         let strict = billing_guard_check(&cfg);
         assert!(strict.ok, "a stricter mode is not a fault");
         assert!(strict.detail.contains("--bill"), "{}", strict.detail);
+        // Both halves of the truth, and neither hedging about the other's
+        // case: verified over the relay, the frontend's word on the box.
         assert!(
-            strict.detail.contains("seatbelt"),
-            "the honesty is not optional: {}",
+            strict.detail.contains("the identity the edge verified"),
+            "the relayed half is the lock: {}",
+            strict.detail
+        );
+        assert!(
+            strict.detail.contains("issued on this box"),
+            "the local half is still a claim, and says so: {}",
             strict.detail
         );
 
@@ -2243,6 +2337,79 @@ mod tests {
             off.detail.contains("The right answer on a box where"),
             "worded as a choice: {}",
             off.detail
+        );
+    }
+
+    /// gh#161's other half: the default nobody set. The same unnamed `account`
+    /// is unremarkable on a one-person box and the whole problem on a shared
+    /// one, so the line turns on who else is in the workspace — and never
+    /// fails, because sharing a plan on purpose is a normal way to run a box.
+    #[test]
+    fn the_default_account_line_turns_on_who_else_could_spend_it() {
+        let shared: RoutingConfig = toml::from_str(
+            "[[route]]\nname = \"platform\"\nmatch = { label = \"team\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let mine = [AgentAccount {
+            active: true,
+            ..account(
+                "slot-box",
+                "brede@tally.no",
+                comet_proto::HarnessId::ClaudeCode,
+            )
+        }];
+
+        let team = default_account_check(&shared, Some(&mine), Some(3));
+        assert!(team.ok, "a shared plan is a choice, not a fault");
+        assert!(team.detail.contains("brede@tally.no"), "{}", team.detail);
+        assert!(
+            team.detail.contains("3 people in this workspace"),
+            "the fact that makes the default wrong: {}",
+            team.detail
+        );
+        assert!(team.detail.contains("--account"), "{}", team.detail);
+
+        // Alone, the same config says nothing worth acting on.
+        let solo = default_account_check(&shared, Some(&mine), Some(1));
+        assert!(solo.detail.contains("which is yours"), "{}", solo.detail);
+        assert!(
+            !solo.detail.contains("--account"),
+            "nothing to fix on a one-person box: {}",
+            solo.detail
+        );
+
+        // Unasked is its own answer, and not a guess in either direction.
+        let unknown = default_account_check(&shared, Some(&mine), None);
+        assert!(
+            unknown.detail.contains("was not checked"),
+            "{}",
+            unknown.detail
+        );
+
+        // A route that names its account has already answered the question.
+        let named: RoutingConfig = toml::from_str(
+            "[[route]]\nname = \"platform\"\nmatch = { label = \"team\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude-code\"\n\
+             account = \"slot-ana\"\n",
+        )
+        .unwrap();
+        let settled = default_account_check(&named, Some(&mine), Some(3));
+        assert!(
+            settled.detail.starts_with("every route names an `account`"),
+            "{}",
+            settled.detail
+        );
+    }
+
+    #[test]
+    fn doctor_emits_the_default_account_check() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2)).unwrap();
+        assert!(
+            checks.iter().any(|c| c.name == "default account"),
+            "doctor is silent about what an unnamed account spends"
         );
     }
 
@@ -2271,7 +2438,7 @@ mod tests {
     fn doctor_emits_the_billing_guard_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "billing guard")
@@ -2287,7 +2454,7 @@ mod tests {
             "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "settle notice")
@@ -2302,7 +2469,7 @@ mod tests {
     fn doctor_says_when_no_agent_is_running_the_board() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "orchestrator")
@@ -2320,7 +2487,7 @@ mod tests {
             "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
@@ -2369,13 +2536,14 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();
         db.set_attempt_pane(a, "chat-9").unwrap();
         drop(db);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
@@ -2529,7 +2697,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         assert!(
             !checks.iter().any(|c| c.name == "linear review state"),
             "a board with no Linear anywhere must not be handed a Linear setting"
@@ -2548,7 +2716,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "linear review state"));
     }
 

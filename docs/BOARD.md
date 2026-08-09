@@ -240,7 +240,7 @@ teammate's engine syncs and writes the doc (a steer is a command entry in it)
 without ever executing the work itself.
 
 Those three gates are what a teammate *may* do; `docs/teammate.md` is what
-somebody has to actually set up for them, in order — the page §H39 added
+somebody has to actually set up for them, in order — the page §H40 added
 because the answer had until then existed only as `doctor` output nobody reads
 before the fact.
 
@@ -797,6 +797,11 @@ these two columns are where a verified identity will land. Until then nothing is
 authorized on them, and in particular no account is inferred from them — which
 subscription a run spends stays the explicit `account` (gh#59).
 
+*(§H39 landed that verified identity: `dispatched_by_user` is now the edge's
+answer for a relayed dispatch and the frontend's only for a local one, with
+`dispatched_by_verified` saying which. Nothing below changed — it is still not
+authority, and no account is inferred from it.)*
+
 Deliberately not here: a per-user default account (that is a preference, and
 preferences want a home and a settings surface), and any UI for reading the
 attribution back beyond the row field — the panel's dispatch notice names the
@@ -1017,12 +1022,14 @@ only honest way to ask "do you mean it" is to ask after the box has said it
 minds. The refusal carries `view::board::REQUIRE_OWN_REFUSAL` so the panel can
 tell it from every other dispatch failure without parsing prose.
 
-**This is a seatbelt, not a lock**, and every surface says so in the words that
-stay true afterwards. The match is claim-vs-slot-email: a frontend willing to
-misreport its signed-in user walks straight through `require-own`, because
-relayed board calls arrive as the device room's owner (§H9) and #66's verified
-identity is what will change that. It is worth having anyway — the failure it
-exists for is nobody noticing, not somebody attacking. `doctor` reports the mode
+**This shipped as a seatbelt, not a lock**, and every surface said so in the
+words that stay true afterwards. The match was claim-vs-slot-email: a frontend
+willing to misreport its signed-in user walked straight through `require-own`,
+because relayed board calls arrived as the device room's owner (§H9) and #66's
+verified identity was what would change that. It was worth having anyway — the
+failure it exists for is nobody noticing, not somebody attacking. **§H39 made it
+a lock over the relay** and left it a seatbelt on the box itself, which is the
+one surface where a claim is all a local shell can be asked for. `doctor` reports the mode
 the way it reports the notices, never failing, and worded so `off` reads as the
 choice it is on a box where one person's plan pays for everything.
 
@@ -1178,7 +1185,7 @@ Three parts, in the order somebody meets them:
   the box's pinned identity, which is what actually happened and what GitHub
   renders as *authored by them*. A file rather than a directory service because
   a two-person box does not need one, and because nothing on the box can answer
-  "which GitHub account is this person?" on its own. Hand-written until §H39,
+  "which GitHub account is this person?" on its own. Hand-written until §H40,
   which added `comet-board member add` and the page that says when to run it.
 - **The two halves are independent.** An author with no App credential still
   authors (it just pushes as the box user); a credential with no `[users]` entry
@@ -2029,7 +2036,92 @@ Three things the other surfaces had and the phone did not: the stats screen
   key through `WriteBoardConfig`, nothing optimistic: the slot disappearing is
   the box agreeing, and a refusal says why instead of leaving the row gone.
 
-### H39 — Onboarding a teammate is a verb and a page — **done** (gh#162)
+### H39 — The box verifies who dispatched — **done** (gh#161)
+§H20's guard compared the dispatching frontend's *claimed* `viaUser` against the
+email on the agent account a run would spend, and `billing.rs` said out loud
+what that was worth: "a frontend willing to lie about who is signed in walks
+straight through `require-own`. This is a seatbelt, not a lock." The identity
+that would fix it already existed and was thrown away at the door — the Worker
+stamps `x-comet-auth-user` on every DO forward from a verified session
+(`edge/src/env.ts`), the device room reads it per connection, and then relayed
+the frame with `from = connId` and nothing else. So the box received a name and
+no way to corroborate it.
+
+**The relay carries the caller.** The client→host frame header grew `u`/`o` —
+the verified user and org — stamped by the DO from the socket's own accept-time
+identity, next to `from` and by the same rule. `relayedHeader` is a pure
+function that takes the client's frame apart key by key rather than spreading
+it, because that *is* the security property in one line: a client chooses the
+stream and the kind, and nothing else. A frame that arrives with no stamp did
+not come through the relay at all — it came from the box's own IPC port, and
+that absence is a fact worth as much as the presence.
+
+**The engine prefers it, and says which it got.** `comet-rpc` grew `Caller`
+(the transport's answer to "who is this") and `RpcService::handle_as`, a second
+method with a default that drops it — nothing wants this but `DispatchTask`, and
+a changed signature would have made every handler pretend to care.
+`serve_connection_as` fixes one caller per connection; the host relay keys its
+virtual connections on `(connId, verified user)` rather than `connId` alone,
+because `connId` is chosen by the dialing client and two people can pick the
+same string. `DispatchOrigin::attribution()` is then the one place that decides
+what the rest of the board sees, and a verified stamp **replaces** the claim
+rather than merging with it: `Verified(email)`, `Claimed(email)`,
+`Unnamed{user_id}` for a verified caller the box could not resolve, `Nobody`.
+The attempt records which (`dispatched_by_verified`), because "we know who this
+was" and "they told us" must not render identically — the orchestrator's
+released-by line marks the claim `(as claimed)`; the public issue comment does
+not, since its audience is the repo and not the operator.
+
+Putting a name to a `sub` is `Auth::email_for_user`: our own session first
+(free, offline, and the box has to recognise itself even with WorkOS
+unreachable), then the workspace roster. It answers `None` for "cannot say",
+never for "nobody".
+
+**`require-own` refuses on three grounds now**, all of them in `Billing::refusal`
+and all answerable by naming the payer:
+
+1. the run bills somebody else — the old refusal, on a comparison the box no
+   longer has to take anybody's word for;
+2. **the dispatcher cannot be named.** A verified caller the roster did not
+   resolve is refused, because the alternative is falling back to the claim,
+   and the claim is what this mode stopped believing. It says the user id, so
+   the refusal is actionable rather than mysterious;
+3. **nothing named an account, and the dispatcher is not the box.** A dispatch
+   that names no slot spends the box's own CLI login; where the box can name
+   that login this is already (1), and where it cannot, (1) goes quiet and a
+   teammate's run charges the owner in silence.
+
+The local box is deliberately not collateral damage: (2) and (3) cannot fire on
+a dispatch with no relay stamp, because nothing but the box's own processes can
+reach its IPC port. An unattributed dispatch is still released by every mode —
+it names no wronged party.
+
+**The same failure from the other side** is that `account` is optional and its
+absence is quiet. `doctor`'s new `default account` line names the routes that
+name none, whose login the fallback actually is, and how many people are in the
+workspace — which is the fact that turns a tautology into a warning, and the
+only reason it needed the roster (`ListMembers`, best-effort, `None` when
+unasked). It never fails, for `billing guard`'s reason: sharing one plan on
+purpose is a normal way to run a box.
+
+**Order of landing.** The edge half needs a Worker deploy; the engine and board
+halves are inert without it — an unstamped relay reads exactly as today's local
+claim — so nothing gets less safe while it rolls out.
+
+Tests: the in-memory room in `crates/engine/tests/device_routing.rs` now stamps
+the identity it verified, and two laptops dispatch the same task into one box
+under `require-own`, both claiming to be the owner. The teammate is refused and
+refused *naming them*; the owner's own laptop clears the guard and dies on the
+next refusal. That file also stopped building its fixture board with
+`Paths::under`, which honours `COMET_BOARD_*` — under a box that sets them (i.e.
+under an agent the board itself dispatched) the tests seeded fixtures into the
+live board's database and wrote their fixture over its `routing.toml`.
+
+Deliberately not here: inferring an *account* from the verified user (§H20's
+note stands — the guard compares, it does not choose), a per-user default
+account, and the phone's rendering of the new flag.
+
+### H40 — Onboarding a teammate is a verb and a page — **done** (gh#162)
 Every mechanism for a second person on the box had shipped: org visibility
 (gh#66), invitations (gh#76), per-run agent accounts (gh#59), per-dispatch
 authorship (§H22). What an operator must actually *do* existed only as three

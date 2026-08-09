@@ -412,12 +412,21 @@ pub struct Attempt {
     /// (gh#74). `None` where nobody said — a `comet-board` run on the box, and
     /// every attempt from before the frontends sent it.
     pub dispatched_by_device: Option<String>,
-    /// Who the dispatching frontend said was signed in there — an email when it
-    /// knows one, else the user id (gh#74). The board cannot check it: relayed
-    /// frames arrive as the room owner, so per-call user identity is #66's to
-    /// establish. Until then this is the only record of which *human* released
-    /// the work, and it is a claim, not a credential — never authorize on it.
+    /// Which *human* released the work — an email where there is one, else the
+    /// user id (gh#74).
     pub dispatched_by_user: Option<String>,
+    /// Did the edge verify that human, or did a frontend simply say so?
+    /// (gh#161.)
+    ///
+    /// True means the relay stamped an identity onto the frame and this box
+    /// resolved it to the address above — the record a `require-own` refusal is
+    /// made of. False means a claim: a dispatch issued on the box itself, a
+    /// verified caller nobody could put a name to, and every attempt from
+    /// before this column existed. Kept beside the name rather than folded into
+    /// it because "we know who this was" and "they told us" must not read the
+    /// same, and because neither is authority: what a run may spend is still
+    /// the explicit `account` (gh#59).
+    pub dispatched_by_verified: bool,
     /// Whose subscription this attempt actually spends, as an email (gh#101) —
     /// the `account` slot's login, or the box's own CLI login when the dispatch
     /// named no slot.

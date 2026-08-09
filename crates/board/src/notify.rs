@@ -372,10 +372,12 @@ pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> St
 /// Who released this attempt, as a line the orchestrator can read.
 ///
 /// The task the releasing agent was itself running is the richest answer, its
-/// chat the one that is always recorded, and the human's name a claim a
-/// frontend made rather than something the board verified — so it is rendered
-/// as attribution beside the chat, never instead of it. `None` is the operator
-/// at a keyboard, which needs no line: it is the default assumption.
+/// chat the one that is always recorded, and the human's name attribution
+/// beside the chat rather than instead of it. The name carries how well the box
+/// knows it (gh#161): an agent deciding what to do about a run should be able
+/// to see that "for ana@example.com" is something the edge verified and "for
+/// ana@example.com (as claimed)" is something a frontend typed. `None` is the
+/// operator at a keyboard, which needs no line: it is the default assumption.
 fn released_by(attempt: &Attempt) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(task) = attempt.dispatched_by.as_deref() {
@@ -385,7 +387,10 @@ fn released_by(attempt: &Attempt) -> Option<String> {
         parts.push(format!("chat {chat}"));
     }
     if let Some(user) = attempt.dispatched_by_user.as_deref() {
-        parts.push(format!("for {user}"));
+        parts.push(format!(
+            "for {}",
+            comet_proto::view::board::dispatcher_label(user, attempt.dispatched_by_verified)
+        ));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
@@ -574,6 +579,7 @@ mod tests {
             model: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
         }
     }

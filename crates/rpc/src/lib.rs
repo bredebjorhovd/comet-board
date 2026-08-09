@@ -28,7 +28,7 @@ pub use device_room::{
     NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
     encode_device_frame,
 };
-pub use server::{serve_connection, serve_ws_listener};
+pub use server::{serve_connection, serve_connection_as, serve_ws_listener};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
@@ -336,10 +336,76 @@ impl RpcReply {
     }
 }
 
+/// Who is on the other end of a connection, as far as the *transport* can
+/// prove it (gh#161).
+///
+/// Not a claim and not a parameter: the relay stamps this onto every
+/// client→host frame from the identity the edge Worker verified before the
+/// frame reached the Durable Object (`edge/src/device-room.ts`,
+/// `AUTH_USER_HEADER`), and nothing a client puts in a frame header or in
+/// `params` can reach it. A handler may therefore compare it against its own
+/// records; a handler may not accept a substitute for it.
+///
+/// [`Caller::LOCAL`] — both fields unset — is the *absence* of a relay stamp,
+/// which is a fact of its own: the call came in over this device's own IPC
+/// port or its in-process transport, so whoever made it is already the person
+/// the device runs as. That is why "unverified" is never the same as
+/// "untrusted" here, and why a local dispatch must not be treated as a
+/// stranger's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Caller {
+    /// The verified WorkOS user id the relay stamped, if this call came over
+    /// one. Never an email — the edge verifies a JWT `sub`, and putting a name
+    /// to it is the receiving device's job.
+    pub user: Option<String>,
+    /// The verified org claim that rode with it, when the caller's session
+    /// carried one.
+    pub org: Option<String>,
+}
+
+impl Caller {
+    /// No relay stamp: this device's own IPC or in-process transport.
+    pub const LOCAL: Caller = Caller {
+        user: None,
+        org: None,
+    };
+
+    /// The identity the edge verified, or `None` for a local call.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref().filter(|u| !u.is_empty())
+    }
+
+    /// Did this call arrive over the relay with a verified identity on it?
+    pub fn is_verified(&self) -> bool {
+        self.user().is_some()
+    }
+}
+
 /// Server-side dispatch: one implementation serves every transport.
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
+
+    /// Same, told who the transport verified the caller to be.
+    ///
+    /// A second method rather than a changed signature because almost nothing
+    /// wants this: the default drops the identity and calls [`handle`], which
+    /// is exactly right for every handler whose answer does not depend on who
+    /// asked. A service that *does* care (the engine, for `DispatchTask`)
+    /// overrides this and implements `handle` as `handle_as(…, &Caller::LOCAL)`
+    /// — so the local path keeps its meaning instead of being an unstamped
+    /// remote one.
+    ///
+    /// [`handle`]: RpcService::handle
+    async fn handle_as(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        caller: &Caller,
+    ) -> Result<RpcReply, RpcError> {
+        let _ = caller;
+        self.handle(method, params).await
+    }
 }
 
 /// Deserialize typed params out of the envelope's `params` value.

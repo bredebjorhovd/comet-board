@@ -8,15 +8,36 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
+use crate::{Caller, ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
 
 /// Serve one connection: read client frames from `inbound`, write server frames to `out`.
 /// Returns when `inbound` closes; all in-flight request tasks are aborted on exit.
+///
+/// The caller is [`Caller::LOCAL`]: no relay stamped this connection, so it is
+/// this device's own IPC or in-process transport. The relay host uses
+/// [`serve_connection_as`] instead.
 pub async fn serve_connection(
     service: Arc<dyn RpcService>,
     out: mpsc::Sender<String>,
-    mut inbound: mpsc::Receiver<String>,
+    inbound: mpsc::Receiver<String>,
 ) {
+    serve_connection_as(service, out, inbound, Caller::LOCAL).await
+}
+
+/// [`serve_connection`] for a connection the transport can name: every request
+/// on it is dispatched through [`RpcService::handle_as`] with `caller`.
+///
+/// One caller per connection, fixed when the connection is made, because that
+/// is how the relay works — a client socket is admitted under one verified
+/// identity and every frame on it carries the same stamp. Handlers therefore
+/// never have to reconcile two identities on one stream.
+pub async fn serve_connection_as(
+    service: Arc<dyn RpcService>,
+    out: mpsc::Sender<String>,
+    mut inbound: mpsc::Receiver<String>,
+    caller: Caller,
+) {
+    let caller = Arc::new(caller);
     let mut running: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     while let Some(payload) = inbound.recv().await {
         // ndjson: a transport may batch several frames per message.
@@ -49,6 +70,7 @@ pub async fn serve_connection(
                 frame.id,
                 method,
                 frame.params,
+                caller.clone(),
             ));
             running.insert(frame.id, task.abort_handle());
         }
@@ -64,6 +86,7 @@ async fn handle_request(
     id: u64,
     method: String,
     params: serde_json::Value,
+    caller: Arc<Caller>,
 ) {
     let send = |frame: ServerFrame| {
         let out = out.clone();
@@ -77,7 +100,7 @@ async fn handle_request(
             }
         }
     };
-    match service.handle(&method, params).await {
+    match service.handle_as(&method, params, &caller).await {
         Ok(RpcReply::Value(value)) => {
             let _ = send(ServerFrame {
                 id,

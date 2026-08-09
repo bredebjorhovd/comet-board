@@ -387,6 +387,51 @@ impl Auth {
         self.state().user().map(|u| u.id.clone())
     }
 
+    /// Put a name to a WorkOS user id the edge verified (gh#161).
+    ///
+    /// The relay stamps a `sub`, and everything a person is judged by here is
+    /// an address — the email on an agent-account login, the git author map,
+    /// the `viaUser` the frontends send. Two sources answer, in this order:
+    ///
+    /// 1. **Our own session**, when the id is ours. Free, offline, and the
+    ///    common case on a box: the owner driving their own device from their
+    ///    own laptop. It also has to come first, because a box that cannot
+    ///    reach WorkOS must still recognise itself.
+    /// 2. **The workspace roster** (`ListMembers`), for everybody else. One
+    ///    network call per dispatch, which is human-paced; a failure answers
+    ///    `None` rather than an error, because "I could not check" is a state
+    ///    the caller has to handle anyway.
+    ///
+    /// `None` therefore means "this box cannot say who that is" — never "that
+    /// is nobody". What the billing guard does with it is gh#161's third
+    /// refusal, and it is deliberately not permissive.
+    pub async fn email_for_user(&self, user_id: &str) -> Option<String> {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return None;
+        }
+        if self.user_id().as_deref() == Some(user_id) {
+            return self
+                .state()
+                .user()
+                .map(|u| u.email.clone())
+                .filter(|e| !e.trim().is_empty());
+        }
+        let roster = self
+            .list_members()
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(user = %user_id, error = %e, "auth: could not read the workspace roster");
+            })
+            .ok()?;
+        roster
+            .members
+            .into_iter()
+            .find(|m| m.user_id == user_id)
+            .and_then(|m| m.email)
+            .filter(|e| !e.trim().is_empty())
+    }
+
     /// Current bearer for edge rooms / the device relay — `None` when signed out.
     /// Dev mode: the configured user id. WorkOS: cached access token, refreshed when
     /// it has under 30s left.

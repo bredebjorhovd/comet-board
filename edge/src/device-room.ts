@@ -6,8 +6,9 @@
  * a WebRTC fast path could slot in under the same frames).
  *
  * Frame encoding (binary): uleb128 header-length ‖ UTF-8 JSON header ‖ payload.
- * Header: { s: streamId, k: kind, to?: connId, from?: connId }.
- * - client → DO: DO stamps `from = connId` and forwards to the host socket.
+ * Header: { s: streamId, k: kind, to?: connId, from?: connId, u?: userId, o?: orgId }.
+ * - client → DO: DO stamps `from = connId` plus the verified `u`/`o` and forwards
+ *   to the host socket (see `relayedHeader` — gh#161).
  * - host → DO: must carry `to = connId`; DO strips routing keys and delivers.
  *
  * Also holds small "sidecar" JSON slots the host publishes (repos/branches
@@ -27,6 +28,15 @@ export interface DeviceFrameHeader {
   to?: string;
   /** Routing: client→host origin (stamped by the relay). */
   from?: string;
+  /** The WorkOS user id the Worker verified for the sending socket, stamped by
+   * the relay the way `from` is (gh#161). Written HERE, from the socket's own
+   * accept-time identity — never copied off the frame a client sent, which is
+   * the whole of its value: the host can compare it against its own records,
+   * and a frontend willing to lie about who is signed in cannot reach it. */
+  u?: string;
+  /** The verified org claim that rode with `u`, when the caller's session
+   * carried one. Same provenance, same rule. */
+  o?: string;
 }
 
 export const encodeDeviceFrame = (header: DeviceFrameHeader, payload: Uint8Array): Uint8Array => {
@@ -47,11 +57,32 @@ export const decodeDeviceFrame = (
 
 interface SocketState {
   userId: string;
+  /** The org claim the Worker verified at accept time, when there was one. */
+  orgId?: string;
   role: "host" | "client";
   connId: string;
   /** Accept time — the liveness floor until the socket's first auto-pong. */
   joinedAt?: number;
 }
+
+/** The header the relay puts on a client→host frame: the client's own `s`/`k`,
+ * and everything else built here (gh#161).
+ *
+ * Pure, and taking the frame apart key by key rather than spreading it, because
+ * that is the security property in one line: a client controls which stream and
+ * which kind, and nothing else. `from` was already stamped this way; `u`/`o`
+ * join it from the socket's accept-time identity, which the Worker verified
+ * before the DO ever saw the request (`AUTH_USER_HEADER`). A client that puts
+ * its own `u` in a frame is writing a key that is dropped on the floor. */
+export const relayedHeader = (
+  frame: DeviceFrameHeader,
+  conn: { connId: string; userId: string; orgId?: string }
+): DeviceFrameHeader => {
+  const header: DeviceFrameHeader = { s: frame.s, k: frame.k, from: conn.connId };
+  if (conn.userId) header.u = conn.userId;
+  if (conn.orgId) header.o = conn.orgId;
+  return header;
+};
 
 /** What a caller may do with a device room (gh#66).
  * - `claim`  — nobody owns it yet and the device's own backend is joining;
@@ -219,7 +250,7 @@ export class DeviceRoom implements DurableObject {
       } else {
         this.ctx.acceptWebSocket(pair[1], [clientTag(connId)]);
       }
-      const state: SocketState = { userId, role, connId, joinedAt: Date.now() };
+      const state: SocketState = { userId, orgId, role, connId, joinedAt: Date.now() };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -325,7 +356,7 @@ export class DeviceRoom implements DurableObject {
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
         return;
       }
-      this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, frame.payload);
+      this.deliver(host, relayedHeader(frame.header, state), frame.payload);
       return;
     }
     // Host frame: route by `to`.

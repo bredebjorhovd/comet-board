@@ -602,16 +602,15 @@ fn handle_dispatch(
                 route.workspace
             )
         })?;
-    // `origin.user` decides one thing here: whose name the commits carry
+    // Who released this, at the strongest form the transport allowed (gh#161):
+    // the identity the edge verified for a relayed dispatch, the frontend's
+    // claim for one issued on the box. Resolved once and used three times
+    // below — the commit author, the attempt row and the upstream comment —
+    // so those three cannot disagree about who this was.
+    let by = origin.attribution();
+    // `by` decides one thing in the spec: whose name the commits carry
     // (gh#107). Provenance, never authority — see `DispatchOrigin`.
-    let spec = build_spec(
-        &engine.cfg,
-        route,
-        &task,
-        &space,
-        overrides,
-        origin.user.as_deref(),
-    )?;
+    let spec = build_spec(&engine.cfg, route, &task, &space, overrides, by.name())?;
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
 
@@ -645,10 +644,13 @@ fn handle_dispatch(
         // route's default can change under a run that is still going, and the
         // attempt is the record of what actually ran (gh#59).
         account: spec.account.clone(),
-        // Which device released it, and who its frontend said was signed in
-        // there (gh#74) — recorded exactly as claimed, see [`DispatchOrigin`].
+        // Which device released it, and which human (gh#74) — with the
+        // strength of that name beside it, because a verified dispatcher and a
+        // frontend's claim are different records and only one of them is what
+        // `require-own` refused on (gh#161).
         dispatched_by_device: origin.device.clone(),
-        dispatched_by_user: origin.user.clone(),
+        dispatched_by_user: by.name().map(str::to_string),
+        dispatched_by_verified: by.is_verified(),
         // …and whose subscription it spends, resolved to an email now (gh#101).
         // Recorded whether or not it is cross-billed: the row says who is
         // paying for the attempt's whole life, and a field that only appeared
@@ -675,10 +677,14 @@ fn handle_dispatch(
             // The upstream comment names the parent legibly: the issue
             // identifier when the board dispatched it too, the chat id
             // otherwise — not the raw task id. With no agent in the chain it
-            // falls back to the human the dispatching frontend named (gh#74),
-            // which is the difference between "dispatched by ana@example.com"
-            // and a comment that says nothing about who released the work.
-            let by = dispatcher_name(&engine.db, &dispatcher).or_else(|| origin.user.clone());
+            // falls back to the human who released it (gh#74), which is the
+            // difference between "dispatched by ana@example.com" and a comment
+            // that says nothing about who released the work. Plain, without
+            // gh#161's strength marker: this one is a public issue comment, and
+            // the audience for "the box checked this" is the operator and the
+            // orchestrator, not the repo.
+            let by =
+                dispatcher_name(&engine.db, &dispatcher).or_else(|| by.name().map(str::to_string));
             engine.enqueue_dispatch(
                 &task,
                 &route.runtime,
@@ -975,6 +981,7 @@ mod tests {
                 account: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();
@@ -1277,6 +1284,7 @@ runtime = "mock"
                     chat: None,
                     device: Some("laptop-ana".into()),
                     user: Some("ana@example.com".into()),
+                    verified: None,
                 },
                 DispatchOverrides::default(),
             )
@@ -1371,6 +1379,7 @@ billing_guard = "{mode}"
                     chat: None,
                     device: Some("laptop-ana".into()),
                     user: Some("ana@example.com".into()),
+                    verified: None,
                 },
                 DispatchOverrides::default(),
             )

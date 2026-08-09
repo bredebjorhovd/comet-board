@@ -19,7 +19,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      settled_at, reopened, screen_print, screen_at, nudges, nudged_at, account, \
      blocked_count,
      overrun_warned_at, repo_path, collectable_at, collected_at,
-     dispatched_by_device, dispatched_by_user, billed_to, \
+     dispatched_by_device, dispatched_by_user, dispatched_by_verified, billed_to, \
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model";
 
@@ -60,23 +60,24 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         collected_at: r.get(27)?,
         dispatched_by_device: r.get(28)?,
         dispatched_by_user: r.get(29)?,
-        billed_to: r.get(30)?,
-        chat_archivable_at: r.get(31)?,
-        chat_archived_at: r.get(32)?,
+        dispatched_by_verified: r.get::<_, i64>(30)? != 0,
+        billed_to: r.get(31)?,
+        chat_archivable_at: r.get(32)?,
+        chat_archived_at: r.get(33)?,
         // All four together or none: the columns are written in one statement
         // and a partially-NULL row cannot arise. `input_tokens` is the witness
         // — NULL there is "this attempt reported nothing", which the page must
         // never render as a zero (gh#151).
-        tokens: match r.get::<_, Option<i64>>(33)? {
+        tokens: match r.get::<_, Option<i64>>(34)? {
             None => None,
             Some(input) => Some(comet_proto::TokenUsage {
                 input_tokens: input.max(0) as u64,
-                output_tokens: r.get::<_, Option<i64>>(34)?.unwrap_or(0).max(0) as u64,
-                cache_read_tokens: r.get::<_, Option<i64>>(35)?.unwrap_or(0).max(0) as u64,
-                cache_creation_tokens: r.get::<_, Option<i64>>(36)?.unwrap_or(0).max(0) as u64,
+                output_tokens: r.get::<_, Option<i64>>(35)?.unwrap_or(0).max(0) as u64,
+                cache_read_tokens: r.get::<_, Option<i64>>(36)?.unwrap_or(0).max(0) as u64,
+                cache_creation_tokens: r.get::<_, Option<i64>>(37)?.unwrap_or(0).max(0) as u64,
             }),
         },
-        model: r.get(37)?,
+        model: r.get(38)?,
     })
 }
 
@@ -204,14 +205,20 @@ impl Db {
               -- When the checkout and its branch were actually reclaimed.
               -- Non-NULL means `worktree` names a path that is no longer there.
               collected_at TEXT,
-              -- Which device the dispatch was issued from, and which human the
-              -- frontend there said was signed in (gh#74). Both are the
-              -- caller's word: a relayed call arrives as the room owner, so
-              -- the box cannot check either. Recorded anyway — an unverified
-              -- name beats an anonymous `Operator` for "who released this",
-              -- and the columns are where #66's verified identity will land.
+              -- Which device the dispatch was issued from, and which human
+              -- released it (gh#74). The device is the caller's word always;
+              -- the human is the edge's answer where the call came over the
+              -- relay and the caller's word where it did not, which is what
+              -- the column below records.
               dispatched_by_device TEXT,
               dispatched_by_user TEXT,
+              -- …and whether the edge verified that human or a frontend merely
+              -- said so (gh#161). The relay stamps the caller's verified
+              -- identity onto every forwarded frame, so a teammate's dispatch
+              -- is checkable; a dispatch issued on the box carries no stamp
+              -- (it came from the box) and stays a claim. 0 for every row
+              -- written before this column existed, which is what they are.
+              dispatched_by_verified INTEGER NOT NULL DEFAULT 0,
               -- Whose subscription this attempt spends, as an email (gh#101):
               -- the `account` slot's login, or the box's own CLI login when the
               -- dispatch named no slot. Resolved once at dispatch — the slot id
@@ -362,6 +369,10 @@ impl Db {
                 // would be a guess dressed as a record.
                 ("dispatched_by_device", "TEXT"),
                 ("dispatched_by_user", "TEXT"),
+                // Whether that human was verified or claimed (gh#161).
+                // Existing rows keep 0 — every one of them recorded a claim,
+                // because a claim was all there was to record.
+                ("dispatched_by_verified", "INTEGER NOT NULL DEFAULT 0"),
                 // Whose subscription the attempt spends (gh#101). Existing rows
                 // keep NULL, which reads as "nobody resolved it" — resolving it
                 // now would answer with today's logins about a run that spent
@@ -670,8 +681,9 @@ impl Db {
                (task_id, pane_id, workspace, runtime, worktree, branch,
                 dispatched_by, dispatched_by_pane, started_at, base_sha, account,
                 repo_path,
-                dispatched_by_device, dispatched_by_user, billed_to)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                dispatched_by_device, dispatched_by_user, dispatched_by_verified,
+                billed_to)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -687,6 +699,7 @@ impl Db {
                 a.repo_path,
                 a.dispatched_by_device,
                 a.dispatched_by_user,
+                a.dispatched_by_verified as i64,
                 a.billed_to
             ],
         );
@@ -1265,9 +1278,10 @@ pub struct NewAttempt {
     /// (gh#74). `None` for a dispatch that named none — the CLI on the box,
     /// and every attempt recorded before frontends sent it.
     pub dispatched_by_device: Option<String>,
-    /// Who the dispatching frontend said was signed in there (gh#74).
-    /// Unverified — see the column comment in `migrate`.
+    /// Which human released it (gh#74) — see the column comment in `migrate`.
     pub dispatched_by_user: Option<String>,
+    /// Whether the edge verified that human (gh#161), or a frontend said so.
+    pub dispatched_by_verified: bool,
     /// Whose subscription this attempt spends, as an email (gh#101). Resolved
     /// by the engine at dispatch, because which logins a device has saved is
     /// engine knowledge; `None` when it could not name one.
@@ -1342,6 +1356,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
         }
     }
@@ -1355,6 +1370,7 @@ mod tests {
         db.insert_attempt(&NewAttempt {
             dispatched_by_device: Some("laptop-ana".into()),
             dispatched_by_user: Some("ana@example.com".into()),
+            dispatched_by_verified: false,
             billed_to: None,
             ..attempt("linear:LIN-142")
         })

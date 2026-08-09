@@ -2256,6 +2256,7 @@ fn board_row(
         started_at: None,
         account: None,
         dispatched_by_user: None,
+        dispatched_by_verified: false,
         billed_to: None,
         max_duration_secs: None,
     }
