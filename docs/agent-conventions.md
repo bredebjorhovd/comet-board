@@ -11,8 +11,13 @@ Nothing below is runtime-specific.
 ## The comet-board task board
 
 One global queue across every space: Linear issues and GitHub issues in, comet
-chats running coding agents out. `comet-board` is on PATH, and `gh` is
-authenticated once per user — neither is specific to the agent you are.
+chats running coding agents out. The engine puts `comet-board` on the PATH of
+every agent it runs — the copy it shipped with — and `gh` is authenticated once
+per user; neither is specific to the agent you are. If `comet-board` is
+nevertheless not found, say so and stop rather than working on without it: an
+agent that quietly skips the board leaves its work with no row, no provenance
+and no one able to see it (`comet-board doctor` names the fault as **agent
+PATH**).
 
 **Read it before acting. Never read `board.db` directly** — the schema changes,
 the CLI shape does not.
@@ -124,7 +129,10 @@ is this board's `review`.
    the route's runtime and that harness's default model for the one dispatch;
    both are checked against the engine's catalogs first, and an unknown value
    is refused naming the valid set, so a typo costs an error rather than an
-   attempt. The row's default runtime is on the row (`runtime`).
+   attempt. The row's default runtime is on the row (`runtime`). A runtime the
+   box lists but cannot start — its CLI is not installed, or it is signed out —
+   is refused the same way, saying which of the two is wrong;
+   `comet-board doctor` names the harnesses that box can actually run.
 3. **Accounts are the operator's choice, not yours.** `routing.toml` decides
    which teammate's Claude/Codex subscription a route's work is billed to.
    `dispatch --account <id>` overrides it; do not pass it unless you were told
@@ -161,12 +169,14 @@ is this board's `review`.
    as soon as the answer is true.
 9. **After releasing work, do not fall silent about it.** That leaves the human
    to notice the agent finished and to prompt you. Either `wait` for it, or say
-   plainly that you are leaving it running. A board configured with
-   `notify_dispatcher` will prompt you in this chat when work you released
-   settles, and a board that has pinned this chat as its **orchestrator** will
-   prompt you about every settle, block, orphan and cap warning on the board —
-   including work you did not release. Both are off by default and you cannot
-   tell which is on from here, so never promise that you will be woken. Note also that `wait` does **not** return on
+   plainly that you are leaving it running. A board with `notify_dispatcher`
+   on — the default — prompts you in this chat when work you released settles
+   or blocks, and it is the first addressee: what reaches you does not also
+   reach the board's orchestrator. What you will *not* be told about is work
+   you did not release; that is the orchestrator's, and only when this chat
+   could not be told. You cannot see either setting from here, and a chat that
+   is archived before its child finishes is told nothing at all, so never
+   promise that you will be woken. Note also that `wait` does **not** return on
    `blocked` by default: an agent that stops to ask a question holds its
    attempt open, and a plain `wait` on it hangs until somebody answers. Pass
    `--blocked-is-settled` to be called back on the question too; either way the
@@ -178,9 +188,14 @@ is this board's `review`.
     is not.
 
 **One chat may be pinned as the board's orchestrator.** If this one is, you
-receive a `comet-board:` prompt for every settle, block, orphan and cap warning
-on the board — not only for work you released — and it is one message per
-event, never a stream. Everything else about you is unchanged: you hold no
+receive a `comet-board:` prompt for everything on the board that no other agent
+could be told about — work a human released from the panel or the phone, work
+whose dispatching chat is gone, and every cap warning — one message per event,
+never a stream. Work a live dispatcher was told about does not reach you, and
+that is deliberate: your context is for the events that would otherwise vanish,
+not for a copy of every child's settle. A notice that names who released it is
+one whose dispatcher never heard, which is the thing to pick up. Everything else
+about you is unchanged: you hold no
 workspace slot, everything you release counts against the caps like anyone's,
 and you bill whatever account your chat names. You are exempt from
 `max_duration` and from `archive_chats` alike, because you are meant to outlive

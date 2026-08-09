@@ -10,19 +10,27 @@
 //!    delivered by the writeback queue, keyed so a block that lasts three
 //!    hours is still one comment (`Attempt::blocked_count`).
 //! 2. **The agent that released the work.** An orchestrator cannot be woken —
-//!    it only gets a turn when something prompts it — so a settle it is waiting
-//!    on has to arrive as a prompt into its own chat ([`dispatcher_message`]).
-//!    This is herdr-board's AGE-25 dispatcher wake, which the port left out;
-//!    `[defaults] notify_dispatcher` is still the switch, and still off by
-//!    default, because an orchestrator woken by every child it released cannot
-//!    hold a train of thought.
+//!    it only gets a turn when something prompts it — so a settle or a block it
+//!    is waiting on has to arrive as a prompt into its own chat
+//!    ([`dispatcher_message`]). This is herdr-board's AGE-25 dispatcher wake;
+//!    `[defaults] notify_dispatcher` is still the switch, and since gh#165 it
+//!    is on by default and tried **first**, because it is the precise channel:
+//!    it prompts the one agent whose plan that task was a step in, and nobody
+//!    else.
 //! 3. **The pinned orchestrator.** The agent whose job is the *board*, not one
-//!    task on it ([`orchestrator_message`]). Audience 2 hears about the work it
-//!    released; this one hears about everything — including work an operator
-//!    released from the board panel, and work a sibling released — because a
-//!    board it only half sees is a board it cannot run. One chat, named by
-//!    `[defaults] orchestrator_chat`, delivered on the same [`Signal`]s plus
-//!    the duration cap's warning ([`Event`]).
+//!    task on it ([`orchestrator_message`]). It is the **addressee of last
+//!    resort**, and that is the whole of its job: work no agent released (the
+//!    board panel, the phone, a bare `comet-board dispatch`), work whose
+//!    dispatcher did not survive it — attempts cap at 2h and chats archive as
+//!    their task settles, so a long child routinely outlives its parent — and
+//!    the events that belong to no attempt at all, which is the duration cap's
+//!    warning ([`Event`]). One chat, named by `[defaults] orchestrator_chat`.
+//!
+//!    What audience 2 was told is *not* repeated here. That is what makes a
+//!    pinned orchestrator survivable on a busy board: its context fills with
+//!    the things that would otherwise vanish, not with a copy of every child's
+//!    settle. Before gh#165 both channels fired and the notice audience 2 could
+//!    not be given was dropped — the two halves of one wrong shape.
 //! 4. **The operator, out of band.** None of the above reaches a human who is
 //!    not looking at the board or at GitHub. `[defaults] notify_webhook` is
 //!    one URL, POSTed [`webhook_payload`] on both events.
@@ -191,21 +199,42 @@ pub fn upstream_comment(attempt_no: u64, why: Stopped, log: &str) -> String {
 ///
 /// Addressed to an agent, so it says what changed and what is actionable, and
 /// nothing else — an orchestrator that gets this is spending a turn on it.
-pub fn dispatcher_message(
-    task: &Task,
-    attempt: &Attempt,
-    outcome: Outcome,
-    evidence: Option<Evidence>,
-    pr_url: Option<&str>,
-) -> String {
-    let mut s = "comet-board: work you released has finished.\n\n".to_string();
-    s.push_str(&settled_block(task, attempt, outcome, evidence, pr_url));
-    s.push_str(
-        "\nNo agent is working on it any more. `comet-board list --json` for the board's \
-         current view; if this was a step in something you are running, this is your cue \
-         to carry on.\n",
-    );
-    s
+///
+/// Both [`Signal`]s, not only the settle: a block is the state where *nothing*
+/// happens until somebody acts, and the party who was waiting on that step is
+/// the one who can act on it soonest. The body is the same one the orchestrator
+/// would have got for the same event, because it is the same event; only the
+/// lead line differs, and it differs because this reader did release the work.
+pub fn dispatcher_message(task: &Task, attempt: &Attempt, signal: &Signal) -> String {
+    match signal {
+        Signal::Settled {
+            outcome,
+            evidence,
+            pr_url,
+        } => {
+            let mut s = "comet-board: work you released has finished.\n\n".to_string();
+            s.push_str(&settled_block(
+                task,
+                attempt,
+                *outcome,
+                *evidence,
+                pr_url.as_deref(),
+            ));
+            s.push_str(
+                "\nNo agent is working on it any more. `comet-board list --json` for the \
+                 board's current view; if this was a step in something you are running, this \
+                 is your cue to carry on.\n",
+            );
+            s
+        }
+        Signal::Blocked(why) => {
+            let mut s = "comet-board: work you released is blocked.\n\n".to_string();
+            s.push_str(&blocked_block(task, attempt, *why));
+            s.push('\n');
+            s.push_str(unsticks(*why));
+            s
+        }
+    }
 }
 
 /// The identity block every settle notice shares: which task, which attempt,
@@ -241,6 +270,46 @@ fn settled_block(
     s
 }
 
+/// The identity block a block notice shares, for [`settled_block`]'s reason:
+/// which task, which attempt, which of the two ways it stopped, and the chat —
+/// which for a block is not context but the address an answer has to be typed
+/// into.
+fn blocked_block(task: &Task, attempt: &Attempt, why: Stopped) -> String {
+    let mut s = format!(
+        "{}  attempt {} · blocked ({})\n",
+        task_lines(task),
+        attempt_no(task),
+        why.as_str(),
+    );
+    if let Some(chat) = attempt.pane_id.as_deref() {
+        s.push_str(&format!("  chat: {chat}\n"));
+    }
+    s
+}
+
+/// What actually unsticks a block, for whichever agent was told about it.
+///
+/// Shared rather than written per audience: a dispatcher and an orchestrator
+/// have the same two moves available to them here, and a board that described
+/// them differently would be teaching two contracts for one state.
+fn unsticks(why: Stopped) -> &'static str {
+    match why {
+        Stopped::Asking => {
+            "It is waiting on an answer and will sit there until it gets one. Read the chat \
+             and answer it, or `comet-board retry --task <id>` under a different model — \
+             which discards the question.\n"
+        }
+        Stopped::Errored => {
+            "The run died; the chat still holds the whole task, so this is a retry or a \
+             cancel, not a lost attempt.\n"
+        }
+        Stopped::Unknown => {
+            "Either it is waiting on an answer or its run died — the chat will say which. \
+             Nothing further happens until somebody picks it up.\n"
+        }
+    }
+}
+
 /// Which task, in the two lines every notice opens with. Shared for the same
 /// reason [`settled_block`] is: three events describing the same row three
 /// slightly different ways is how a format nobody can parse gets written.
@@ -248,8 +317,8 @@ fn task_lines(task: &Task) -> String {
     format!("  {} · {}\n  {}\n", task.identifier, task.title, task.url)
 }
 
-/// Everything the pinned orchestrator is told about, which is a superset of
-/// what [`Signal`] carries.
+/// Everything the pinned orchestrator can be told about, which is [`Signal`]
+/// plus the one event no attempt's dispatcher could act on.
 ///
 /// The duration cap's warning is here and not on `Signal` because the two are
 /// answering different questions. `Signal` is "something happened to an attempt
@@ -259,7 +328,8 @@ fn task_lines(task: &Task) -> String {
 /// that can go and look at it. Putting it on `Signal` would POST every operator
 /// a notice about a run that is still fine.
 pub enum Event<'a> {
-    /// A settle, a block or an orphan — the same events audience 2 gets.
+    /// A settle, a block or an orphan — the same events audience 2 gets, and
+    /// carried here only for the ones audience 2 could not be given.
     Signal(&'a Signal),
     /// An attempt has passed its route's `max_duration` and will be cancelled
     /// when the grace runs out (gh#70).
@@ -272,16 +342,17 @@ pub enum Event<'a> {
 
 /// The prompt queued into the pinned orchestrator's chat (gh#104).
 ///
-/// Same body as the settle notice audience 2 gets — deliberately, so the one
+/// Same body as the notice audience 2 gets — deliberately, so the one
 /// description in `docs/agent-conventions.md` covers both — with two
 /// differences that come from the orchestrator not being the party that
 /// released the work:
 ///
-/// - The lead line does not claim it released anything. Most of what reaches
-///   the orchestrator was released by an operator, or by a sibling chat.
+/// - The lead line does not claim it released anything. Everything that
+///   reaches the orchestrator since gh#165 was released by an operator, or by a
+///   chat that is no longer there to be told.
 /// - It names who *did* release it, when the board recorded anyone. That is the
-///   fact an orchestrator acts on: work it released is a step in its own plan,
-///   and work somebody else released is something it has just been handed.
+///   fact an orchestrator acts on: a settle here with a `released by` line is
+///   one whose dispatcher never heard about it, and picking that up is the job.
 pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> String {
     let mut s = match event {
         Event::Signal(Signal::Settled { .. }) => {
@@ -304,17 +375,7 @@ pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> St
             *evidence,
             pr_url.as_deref(),
         )),
-        Event::Signal(Signal::Blocked(why)) => {
-            s.push_str(&format!(
-                "{}  attempt {} · blocked ({})\n",
-                task_lines(task),
-                attempt_no(task),
-                why.as_str(),
-            ));
-            if let Some(chat) = attempt.pane_id.as_deref() {
-                s.push_str(&format!("  chat: {chat}\n"));
-            }
-        }
+        Event::Signal(Signal::Blocked(why)) => s.push_str(&blocked_block(task, attempt, *why)),
         Event::CapWarning {
             age_secs,
             cap_secs,
@@ -345,21 +406,7 @@ pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> St
             "No agent is working on it any more. `comet-board list --json` for the board's \
              current view; review it, or carry on with whatever you were running.\n"
         }
-        Event::Signal(Signal::Blocked(why)) => match why {
-            Stopped::Asking => {
-                "It is waiting on an answer and will sit there until it gets one. Read the \
-                 chat and answer it, or `comet-board retry --task <id>` under a different \
-                 model — which discards the question.\n"
-            }
-            Stopped::Errored => {
-                "The run died; the chat still holds the whole task, so this is a retry or a \
-                 cancel, not a lost attempt.\n"
-            }
-            Stopped::Unknown => {
-                "Either it is waiting on an answer or its run died — the chat will say \
-                 which. Nothing further happens until somebody picks it up.\n"
-            }
-        },
+        Event::Signal(Signal::Blocked(why)) => unsticks(*why),
         Event::CapWarning { .. } => {
             "The agent has been told to commit and open a pull request. Nothing is required \
              of you before the grace expires; after it, the attempt closes `failed` and is \
@@ -653,9 +700,11 @@ mod tests {
         let m = dispatcher_message(
             &task(),
             &attempt(),
-            Outcome::Done,
-            Some(Evidence::Commits),
-            None,
+            &Signal::Settled {
+                outcome: Outcome::Done,
+                evidence: Some(Evidence::Commits),
+                pr_url: None,
+            },
         );
         assert!(m.contains("LIN-142"));
         assert!(m.contains("settled on commits"));
@@ -663,6 +712,40 @@ mod tests {
             m.contains("no pull request"),
             "an absent PR is a fact the dispatcher has to act on, not an omission"
         );
+    }
+
+    /// gh#165: a block is the event where nothing at all happens until somebody
+    /// acts, and the agent whose plan that task was a step in is the one who
+    /// can act on it soonest. It used to reach the dispatcher never.
+    #[test]
+    fn a_block_reaches_the_dispatcher_with_the_chat_to_answer_in() {
+        let m = dispatcher_message(&task(), &attempt(), &Signal::Blocked(Stopped::Asking));
+        assert!(m.contains("work you released is blocked"), "{m}");
+        assert!(m.contains("LIN-142"), "{m}");
+        assert!(m.contains("chat: chat-9"), "where to answer it: {m}");
+        assert!(m.contains("waiting on an answer"), "{m}");
+
+        let died = dispatcher_message(&task(), &attempt(), &Signal::Blocked(Stopped::Errored));
+        assert!(died.contains("The run died"), "{died}");
+    }
+
+    /// The block's body and its advice are shared with the orchestrator's copy
+    /// for [`settled_block`]'s reason: two audiences describing one state two
+    /// ways is two contracts for it.
+    #[test]
+    fn the_two_audiences_describe_a_block_the_same_way() {
+        let (t, a) = (task(), attempt());
+        let signal = Signal::Blocked(Stopped::Unknown);
+        let to_dispatcher = dispatcher_message(&t, &a, &signal);
+        let to_orchestrator = orchestrator_message(&t, &a, &Event::Signal(&signal));
+        let block = blocked_block(&t, &a, Stopped::Unknown);
+        assert!(to_dispatcher.contains(&block));
+        assert!(to_orchestrator.contains(&block));
+        assert!(to_dispatcher.contains(unsticks(Stopped::Unknown)));
+        assert!(to_orchestrator.contains(unsticks(Stopped::Unknown)));
+        // ...and only the dispatcher's claims it released anything.
+        assert!(to_dispatcher.contains("work you released"));
+        assert!(!to_orchestrator.contains("work you released"));
     }
 
     /// The point of sharing [`settled_block`]: whatever else the two notices
@@ -676,13 +759,7 @@ mod tests {
             evidence: Some(Evidence::PullRequest),
             pr_url: Some("https://github.com/o/r/pull/7".into()),
         };
-        let to_dispatcher = dispatcher_message(
-            &t,
-            &a,
-            Outcome::Done,
-            Some(Evidence::PullRequest),
-            Some("https://github.com/o/r/pull/7"),
-        );
+        let to_dispatcher = dispatcher_message(&t, &a, &signal);
         let to_orchestrator = orchestrator_message(&t, &a, &Event::Signal(&signal));
         let block = settled_block(
             &t,

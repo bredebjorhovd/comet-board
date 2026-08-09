@@ -127,6 +127,103 @@ pub struct RuntimeOption {
     pub name: String,
     pub label: String,
     pub harness: crate::HarnessId,
+    /// Why this runtime could **not** start on the device the list answers for
+    /// (gh#187), or `None` when it could.
+    ///
+    /// The whole reason `ListBoardRuntimes` is relay-forwardable: the catalog
+    /// used to be a constant, so a picker offered OpenCode to a box that had
+    /// never installed it, the dispatch was accepted, a worktree was cut and a
+    /// chat created — and only the harness spawn discovered the missing CLI.
+    /// The board had spent the expensive part before checking the cheap fact.
+    ///
+    /// Defaults to `None` so a box too old to answer reads as available, which
+    /// is exactly what it used to promise. An option is still *listed* when it
+    /// is unavailable: an operator who expects OpenCode on a box should learn
+    /// that it is not installed, not find the row quietly absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<RuntimeUnavailable>,
+}
+
+impl RuntimeOption {
+    /// Could a dispatch pointed at this runtime actually start?
+    pub fn available(&self) -> bool {
+        self.unavailable.is_none()
+    }
+
+    /// What a picker row says beside the label when it cannot start — `None`
+    /// on a runtime that can.
+    pub fn note(&self) -> Option<&'static str> {
+        Some(self.unavailable?.reason())
+    }
+}
+
+/// Why a runtime cannot start on the device a picker (or a dispatch) is asking
+/// about (gh#187).
+///
+/// Two axes, deliberately named apart, because they are two different jobs for
+/// whoever reads them: a missing CLI is an install, a signed-out one is a
+/// login. Codex sat installed-but-signed-out on the box for twenty minutes,
+/// and a dispatch in that window looked identical from the picker to one that
+/// would have worked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeUnavailable {
+    /// The CLI is nowhere this device looks for it.
+    NotInstalled,
+    /// The CLI is there and has no usable credential.
+    SignedOut,
+    /// This build has no adapter for the runtime at all — nothing an operator
+    /// can install will change it, which is why it is not [`NotInstalled`].
+    ///
+    /// [`NotInstalled`]: RuntimeUnavailable::NotInstalled
+    Unsupported,
+}
+
+impl RuntimeUnavailable {
+    /// The short phrase a picker chip, a board row or `doctor` carries. One
+    /// spelling per reason, for the same rule the billing words follow: a
+    /// warning worded three ways is three warnings nobody recognises as one.
+    pub fn reason(self) -> &'static str {
+        match self {
+            RuntimeUnavailable::NotInstalled => "not installed",
+            RuntimeUnavailable::SignedOut => "signed out",
+            RuntimeUnavailable::Unsupported => "no adapter in this build",
+        }
+    }
+
+    /// What to do about it, when there is something to do.
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            RuntimeUnavailable::NotInstalled => Some("install its CLI"),
+            RuntimeUnavailable::SignedOut => Some("sign it in"),
+            // Nothing an operator does to the box will help.
+            RuntimeUnavailable::Unsupported => None,
+        }
+    }
+
+    /// The full sentence, naming the runtime and which of the two is wrong.
+    ///
+    /// Shared rather than composed per surface because four of them say it —
+    /// the engine's refusal, the `comet-board` CLI's pre-flight, the desktop
+    /// picker and the phone's — and an operator who learned the words in one
+    /// place has to recognise them in the next. `runtime` is the canonical
+    /// *name* rather than the picker label, because that is the spelling a
+    /// route or a `--runtime` flag has to be fixed in.
+    ///
+    /// "On the host" and not "here": every surface that says this may be
+    /// asking about another device, and three of them usually are.
+    pub fn refusal(self, runtime: &str) -> String {
+        match self {
+            RuntimeUnavailable::Unsupported => {
+                format!("runtime `{runtime}` has no adapter in this build")
+            }
+            other => format!(
+                "runtime `{runtime}` is {} on the host — {}",
+                other.reason(),
+                other.hint().unwrap_or_default()
+            ),
+        }
+    }
 }
 
 /// The mark a pinned orchestrator's session row carries, on both viewports.

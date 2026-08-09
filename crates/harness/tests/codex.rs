@@ -16,6 +16,13 @@ use comet_proto::{
     ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
+mod common;
+
+/// Ceiling on any single fake-CLI run, before [`common::scaled`]. It covers a
+/// child spawn and teardown as well as the scenario, so it scales with the
+/// runner (gh#167).
+const RUN_DEADLINE: Duration = Duration::from_secs(10);
+
 fn fixture_path() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -71,6 +78,7 @@ fn controls(
         chat_id: None,
         account: None,
         push: None,
+        bin_dirs: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -80,13 +88,24 @@ async fn run_to_end(
     req: RunRequest,
     controls: RunControls,
 ) -> Vec<AgentEvent> {
-    let stream = harness.run(req, controls).await.expect("run starts");
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        stream.map(|r| r.expect("stream event")).collect::<Vec<_>>(),
-    )
-    .await
-    .expect("run finished in time")
+    let mut stream = harness.run(req, controls).await.expect("run starts");
+    // Accumulated outside the timeout so a deadline failure can say what the
+    // stream had emitted by then, not just that it did not end.
+    let mut events = Vec::new();
+    let drain = async {
+        while let Some(ev) = stream.next().await {
+            events.push(ev.expect("stream event"));
+        }
+    };
+    let finished = tokio::time::timeout(common::scaled(RUN_DEADLINE), drain).await;
+    assert!(
+        finished.is_ok(),
+        "run did not finish within {}\n  events before the deadline ({}):\n{}",
+        common::deadline_note(RUN_DEADLINE),
+        events.len(),
+        common::events_so_far(&events),
+    );
+    events
 }
 
 #[tokio::test]
@@ -384,6 +403,7 @@ async fn approvals_round_trip_as_input_requests() {
         chat_id: None,
         account: None,
         push: None,
+        bin_dirs: Vec::new(),
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;
@@ -444,8 +464,8 @@ async fn interrupt_sends_turn_interrupt_and_maps_aborted() {
         .await
         .expect("run starts");
 
-    let events = tokio::time::timeout(Duration::from_secs(10), async move {
-        let mut events = Vec::new();
+    let mut events = Vec::new();
+    let drain = async {
         while let Some(ev) = stream.next().await {
             let ev = ev.expect("stream event");
             if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
@@ -453,10 +473,15 @@ async fn interrupt_sends_turn_interrupt_and_maps_aborted() {
             }
             events.push(ev);
         }
-        events
-    })
-    .await
-    .expect("interrupt completed in time");
+    };
+    let finished = tokio::time::timeout(common::scaled(RUN_DEADLINE), drain).await;
+    assert!(
+        finished.is_ok(),
+        "the interrupted run did not end within {}\n  events before the deadline ({}):\n{}",
+        common::deadline_note(RUN_DEADLINE),
+        events.len(),
+        common::events_so_far(&events),
+    );
 
     assert_eq!(
         events.last(),
@@ -480,8 +505,8 @@ async fn unresponsive_child_is_reaped_with_interrupted_done() {
         .await
         .expect("run starts");
 
-    let events = tokio::time::timeout(Duration::from_secs(10), async move {
-        let mut events = Vec::new();
+    let mut events = Vec::new();
+    let drain = async {
         while let Some(ev) = stream.next().await {
             let ev = ev.expect("stream event");
             if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
@@ -489,10 +514,16 @@ async fn unresponsive_child_is_reaped_with_interrupted_done() {
             }
             events.push(ev);
         }
-        events
-    })
-    .await
-    .expect("escalation completed in time");
+    };
+    let finished = tokio::time::timeout(common::scaled(RUN_DEADLINE), drain).await;
+    assert!(
+        finished.is_ok(),
+        "the wedged child was not escalated and reaped within {} — \
+         the SIGKILL escalation never landed\n  events before the deadline ({}):\n{}",
+        common::deadline_note(RUN_DEADLINE),
+        events.len(),
+        common::events_so_far(&events),
+    );
 
     assert_eq!(
         events.last(),

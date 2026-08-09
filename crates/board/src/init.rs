@@ -222,10 +222,11 @@ retain_build_output = "on-settle"
 # sidebar, which is how a shelf becomes a landfill at agent throughput. Set it
 # per route (`archive_chats` on a `[[route]]`) where one space wants longer.
 archive_chats = "on-settle"
-# When an agent releases work through the board, prompt it in its own chat once
-# that work settles. Off, because an orchestrator woken by every child it
-# released cannot hold a train of thought. Turn it on if you dispatch from
-# orchestrators rather than by hand.
+# When an agent releases work through the board, prompt it in its own chat as
+# that work settles or blocks. On, and tried first: it is the precise channel —
+# the reader is the one agent whose plan that task was a step in. Turn it off if
+# you dispatch by hand rather than from orchestrators, and every settle falls to
+# the pin below instead.
 # notify_dispatcher = true
 # Where the board tells *you* — one URL, POSTed a small JSON body when a
 # dispatched attempt blocks or settles (`{{"event": "on_blocked", …}}`). This is
@@ -234,12 +235,13 @@ archive_chats = "on-settle"
 # on its issue and a coloured row, and nothing else. `notify` switches it off
 # without deleting the URL. `doctor` reports which of the two is missing.
 # notify_webhook = "https://hooks.example.com/comet-board"
-# One chat pinned as this board's orchestrator: it hears about every settle,
-# block, orphan and cap warning, not only the work it released itself, and can
-# drive the board with the ordinary `comet-board` verbs. Set it from the desktop
-# app or the TUI ("Pin as orchestrator" on a session) rather than by hand — they
-# know the chat id. Unset, nothing is delivered anywhere but the trail on the
-# issue. `docs/orchestrator.md` is the brief to open that chat with.
+# One chat pinned as this board's orchestrator: it hears what nobody else can be
+# told — work you released from the panel or the phone, work whose dispatching
+# chat has been archived since, and every cap warning — and can drive the board
+# with the ordinary `comet-board` verbs. Set it from the desktop app or the TUI
+# ("Pin as orchestrator" on a session) rather than by hand — they know the chat
+# id. Unset, those three reach no agent at all and the log says so once per
+# event. `docs/orchestrator.md` is the brief to open that chat with.
 # orchestrator_chat = "chat_01J8Z…"
 
 [linear]

@@ -35,6 +35,13 @@ env:
   CARGO_TERM_COLOR: always
   # Backtraces on a failing test are the whole point of reading CI output.
   RUST_BACKTRACE: 1
+  # The harness integration tests spawn real children and wait on their
+  # streams, so their deadlines cover process spawn, connect and teardown — not
+  # the thing under test. A shared 2-core runner also building this workspace
+  # ate a 7.5x margin twice on one commit (gh#167). Stretch every one of those
+  # deadlines rather than editing literals one flake at a time; see
+  # crates/harness/tests/common/mod.rs.
+  COMET_TEST_TIMEOUT_SCALE: 4
 
 jobs:
   # test and clippy are separate jobs so they run in parallel: clippy compiles

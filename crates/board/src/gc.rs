@@ -155,10 +155,10 @@ pub fn standing(task: &Task, attempt: &Attempt) -> Standing {
 /// that has left the board is spent. What is added here:
 ///
 /// - **The pinned orchestrator is never archived.** It is the board's own
-///   standing agent ([`crate::config::Defaults::orchestrator_chat`]) — it
-///   hears about every settle on the board, so it is *always* somebody's,
-///   whatever the attempt it was once dispatched as. `Held`, not a skip, so a
-///   mark left from before it was pinned is cleared.
+///   standing agent ([`crate::config::Defaults::orchestrator_chat`]) — the
+///   address every event that can reach no other agent goes to, so it is
+///   *always* somebody's, whatever the attempt it was once dispatched as.
+///   `Held`, not a skip, so a mark left from before it was pinned is cleared.
 /// - **A chatless attempt has nothing to archive.** A dispatch whose chat
 ///   never got recorded is `Held` for want of anything to do.
 ///

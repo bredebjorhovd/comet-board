@@ -491,37 +491,50 @@ pub struct Defaults {
     /// three credentials it never reads.
     #[serde(default)]
     pub notify_webhook: Option<String>,
-    /// Also tell the *agent* that released a task when its work settles, by
-    /// queueing a message into the chat it dispatched from (AGE-25).
+    /// Tell the *agent* that released a task when its work settles or blocks,
+    /// by queueing a message into the chat it dispatched from (AGE-25).
     ///
-    /// Off by default, and that is the whole design constraint rather than
-    /// caution: an orchestrator woken by every child it released is one that
-    /// cannot hold a train of thought. Turn it on when the chats you dispatch
-    /// from are orchestrators that want to act on outcomes, not when they are
-    /// you at a prompt — [`notify`](Self::notify) already covers that.
+    /// **On by default since gh#165**, and first in the chain: this is the
+    /// precise channel, prompting the one agent whose plan that task was a step
+    /// in. It was off for a release on the grounds that "an orchestrator woken
+    /// by every child it released cannot hold a train of thought" — true, and a
+    /// description of the *other* channel, which delivers the whole board into
+    /// one chat. A chat told about the two or three things it released is not
+    /// the same volume as a chat told about everything.
+    ///
+    /// Turn it off for a board dispatched from chats that are you at a prompt
+    /// rather than agents — [`notify`](Self::notify) is the channel for that
+    /// reader — and every settle then falls to
+    /// [`orchestrator_chat`](Self::orchestrator_chat), or to nobody.
     ///
     /// Independent of `notify`, because they are different audiences: this one
     /// never fires for operator-released work, which has no dispatcher.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub notify_dispatcher: bool,
     /// The chat pinned as this board's orchestrator (gh#104): the one agent
-    /// that hears about **everything**, not only the work it released itself.
+    /// that hears what **nobody else can be told**.
     ///
     /// [`notify_dispatcher`](Self::notify_dispatcher) wakes the chat that
-    /// released each task, which is the right audience for a chat that released
-    /// one thing and is waiting on it. It is the wrong audience for the
-    /// topology this fork was actually built by: one long-lived agent that
-    /// drives the whole board, dispatches, reviews, merges and backfills. That
-    /// agent has to hear about work an operator released from the board panel
-    /// and work a *sibling* released, because a board it only half sees is a
-    /// board it cannot run.
+    /// released each task, which is the right audience whenever there is one.
+    /// This is the address for the events where there is not, and gh#165 made
+    /// that the whole of its job rather than a superset of the other channel:
     ///
-    /// So this is a superset target rather than a second switch on the same
-    /// channel: every settle, block, orphan and cap warning on the board is
-    /// prompted into this chat, through the same [`crate::runtime::Runtime`]
-    /// path review delivery uses. One per board — re-pinning moves it — and
-    /// unset (the default) is a board with no orchestrator and no notices,
-    /// which is what every board was before this existed.
+    /// - **Work no agent released.** The board panel, the phone and a bare
+    ///   `comet-board dispatch` record no dispatching chat, and that is most of
+    ///   a solo operator's dispatches.
+    /// - **A dispatcher that did not survive its child.** Attempts cap at two
+    ///   hours and chats archive as their task settles, so the notice arriving
+    ///   after the parent is gone is ordinary. It hops here instead of being
+    ///   dropped.
+    /// - **Events that belong to no attempt**, which is the duration cap's
+    ///   warning: the attempt is still running, so no dispatcher is waiting on
+    ///   a step that finished.
+    ///
+    /// What the dispatcher was told is not repeated here, and that is what
+    /// makes a pin survivable on a busy board. Delivery is the same
+    /// [`crate::runtime::Runtime`] path review delivery uses. One per board —
+    /// re-pinning moves it — and unset (the default) is a board where those
+    /// three cases reach nobody, which `doctor` says out loud.
     ///
     /// The value is a comet chat id. Nothing here can check that it names a
     /// live chat: the board core has no runtime at parse time, so a stale id is
@@ -685,7 +698,7 @@ impl Default for Defaults {
             base: default_base(),
             notify: true,
             notify_webhook: None,
-            notify_dispatcher: false,
+            notify_dispatcher: true,
             orchestrator_chat: None,
             new_source: default_new_source(),
             max_duration: default_max_duration(),

@@ -179,7 +179,7 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; unary `call` **and** streaming `subscribe` (`{item}`/`{done}`, `{id,cancel}` on drop); used for ListFolders, direct-to-host `Mutate {createSpace}`, and the board four |
 | Board panel (`ui/src/board.rs`) | Board screen: same sections/glyphs/metadata, dispatch + retry as a sheet (`Board/`) |
 | Settings → Board stats: a 1160px two-column dashboard (gh#143/gh#151) | Stats screen off the board: the headline panel (count, qualifying facts, per-space split) and one column of evidence under it — no tile rows, no side-by-side panels, no hour-of-day |
-| Sidebar chat menu: unpin the orchestrator (gh#144) | Long-press the pinned slot on Home — the phone's only route to `routes defaults orchestrator_chat --unset` |
+| Sidebar chat menu: pin / unpin the orchestrator (gh#104, gh#144) | Same item, same words, on three surfaces (gh#166): the chat screen's ⋯ menu, a long-press on its Active or Needs-you row, and a long-press on the pinned slot itself. Pinning asks first and names what it replaces — one `orchestrator_chat` key, so a second pin moves it; unpinning is immediate, and is the phone's only route to `routes defaults orchestrator_chat --unset`. Never offered on a chat the board dispatched |
 | Sidebar Agents section (gh#103) | Same section on Home, between Spaces and Sessions |
 | Board host sweep with `targetDeviceId` | Same candidate order, dialling each device's room directly — the phone has no local engine to forward through |
 | Hover timestamps / copy | Context menus |

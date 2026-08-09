@@ -157,11 +157,13 @@ deliberately: `WatchBoard` republishes all hundred-odd rows on every sync cycle,
 and a hundred issue bodies riding along would make each frame two orders of
 magnitude larger — relayed to a phone — to draw one truncated line. It is read
 when somebody opens a row, and only that row's.
-`ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
-can be pointed at (the canonical set `build_spec` validates an override against)
-for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
-name resolves to, so a picker can tell which agent accounts a runtime could
-spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
+`ListBoardRuntimes` → `[{name, label, harness, unavailable?}]` lists the runtimes
+a dispatch can be pointed at (the canonical set `build_spec` validates an
+override against) for pickers in the desktop panel, the TUI and the CLI;
+`harness` is what the name resolves to, so a picker can tell which agent
+accounts a runtime could spend without re-implementing `harness_for_runtime`.
+`unavailable` is why that runtime could not start **on the device the call was
+answered by** — see §H41. `runtime`/`model`/`account`
 override the route's configured runtime, the harness's default model, and the
 route's `account` for that one dispatch; the attempt row records whatever the
 agent actually ran under. `bill` is the acknowledgement that a run spends
@@ -692,11 +694,11 @@ not the same person:
   ported: `notify_dispatcher = true` prompts the dispatching chat when its
   released work settles (or orphans), over the same `Runtime::prompt` review
   delivery uses. The provenance was already on the attempt row
-  (`dispatched_by_pane`). Still off by default, and that is the design rather
-  than caution — an orchestrator woken by every child it released cannot hold
-  a train of thought. Operator-released work has no dispatcher chat, so the
-  switch is silent for it by construction, which is why it stays separate from
-  the operator's own.
+  (`dispatched_by_pane`). Off by default here, on the grounds that an
+  orchestrator woken by every child it released cannot hold a train of thought
+  — §H41 inverts that and says why the sentence was about the other channel.
+  Operator-released work has no dispatcher chat, so the switch is silent for it
+  by construction, which is why it stays separate from the operator's own.
 - **The operator, out of band.** `notify` is now real: it switches one webhook
   URL (`notify_webhook`), POSTed `{"event": "on_blocked" | "on_settled", …}`
   with a `text` line for endpoints that render nothing else. One URL, no
@@ -1062,6 +1064,8 @@ not a second switch on the same channel — every settle, block, orphan and cap
 warning is prompted into it, over the same `Runtime::prompt` review delivery
 and the dispatcher wake already use. When the orchestrator *is* the dispatcher
 it is told once, in the dispatcher's words: the more specific truth wins.
+(Superset until §H41, which cut it back to the events no dispatcher could be
+told about — the tie-break above generalised into the whole rule.)
 
 Wording is shared with the settle notice (`notify::settled_block`) rather than
 written twice, so the one description in `docs/agent-conventions.md` stays the
@@ -2184,7 +2188,205 @@ one usually when a commit landed under the wrong name.
   revocations, and one verb doing all three would make the reversible one look
   as final as the other two.
 
-### H41 — Build output is a cache, not evidence — **done** (gh#186)
+### H41 — Dispatcher-first, and the orchestrator hears only what nobody else can — **done** (gh#165)
+`notify.rs` had four audiences and wired the two that are agents as independent
+switches: the chat that released the work (`notify_dispatcher`, off) and the
+pinned orchestrator (`orchestrator_chat`, unset). Both fired when both were set,
+and the orchestrator heard about *everything* — including every settle a live
+dispatcher had already handled. That is backwards, and it is why the dispatcher
+wake shipped off: §H13's config comment said "an orchestrator woken by every
+child it released cannot hold a train of thought", which is true and is a
+description of the **other** channel. The orchestrator channel delivers the
+whole board into one chat. The dispatcher channel prompts the one agent whose
+plan that task was a step in. The caution belonged to the second one and was
+attached to the first.
+
+So the two are now **one channel with a fallback hop** (`SyncEngine::announce`),
+and the switches were the wrong shape rather than wrongly set:
+
+- **Dispatcher-first, on by default.** A settle *or a block* goes to
+  `attempt.dispatched_by_pane` when there is one and it can still be told.
+  Blocks are new here: a block settles nothing and closes nothing, so nothing at
+  all happens until somebody acts, and the party who was waiting on that step is
+  the one who can act soonest. `dispatcher_message` takes a `Signal` now and
+  shares `blocked_block` + `unsticks` with the orchestrator's copy, for
+  `settled_block`'s reason — two audiences describing one state two ways is two
+  contracts for it.
+- **The orchestrator is the addressee of last resort**, and those three cases
+  are the whole of its job. Work no agent released — the panel, the phone, a
+  bare `comet-board dispatch` — which is most of a solo operator's dispatches
+  and reached nobody at all before. Work whose dispatcher did not survive it:
+  attempts cap at 2h and chats archive as their task settles (§H31), so
+  `chat_can_be_told` saying no is ordinary rather than exceptional, and the
+  notice was *dropped* there, silently, documented as best-effort. It is a hop
+  now, not a drop — the event still matters, it just needs a different reader.
+  And the events that belong to no attempt, which is the duration cap's warning:
+  the attempt is still running, so no dispatcher is waiting on a step that
+  finished, and it goes straight to the pin as it always did.
+- **No double delivery.** When a dispatcher was told, the orchestrator is not.
+  That is what makes a pinned orchestrator survivable on a board with
+  dispatching siblings on it: its context fills with the things that would
+  otherwise vanish, not with a copy of every child's settle. §H21's tie-break —
+  "when the orchestrator *is* the dispatcher it is told once" — was this rule
+  seen through a keyhole.
+- **Nothing is dropped in silence.** An event that reaches neither agent now
+  logs which half of the address was empty ("no chat released it, and no
+  orchestrator is pinned" / "the chat that released it is gone, and …"), because
+  "the orchestrator never told me" and "the orchestrator had nothing to say"
+  were indistinguishable. That is what `Told` exists for: three answers rather
+  than a bool, since both the hop and the log line need to know *why* a channel
+  came up empty.
+- **`doctor` says which channel takes an event**, rather than reporting two
+  switches. `settle notice` reads the pin as well as the switch — off with a pin
+  is a routing choice and off without one is silence, and one boolean cannot
+  tell those apart — and the `orchestrator` line says "addressee of last resort"
+  or, with the wake off, that it is taking the whole board again.
+
+Unchanged, and said out loud: the operator webhook (audience 4) and the upstream
+comment (audience 1). Neither is addressed to an agent, and the comment is the
+durable trail either way. Whether a *human* dispatcher gets anything is still
+out of scope — they get the webhook and the row.
+
+### H42 — The phone could unpin an orchestrator and never pin one — **done** (gh#166)
+`BoardStore.setOrchestrator(chatId:)` has taken a chat id since §H33 wrote it,
+written the same `[defaults] orchestrator_chat` key through the same validated
+`WriteBoardConfig`, and applied nothing optimistically. Its only caller passed
+`nil`. The kill switch shipped; the affirmative half was never given a surface,
+so a board pinned from the desktop could be unpinned from the phone and then
+only re-pinned by ssh-ing to the box.
+
+- **Saying it does not do it, and the chat cannot do it itself.** Telling a
+  session "you are now the orchestrator" hands it the brief and moves no
+  address: the pin is one chat id in `routing.toml` that `announce` queues
+  prompts into, and the two are separable — only the address was missing on
+  iOS. Nor could the chat close the gap from inside: an agent learns its own id
+  from `COMET_BOARD_CHAT_ID`, which only a *dispatched* run carries, and an
+  orchestrator is by definition a chat somebody opened.
+- **Three surfaces, one item, one voice.** `OrchestratorPin.swift` holds the
+  words (`Pin as orchestrator` / `Unpin as orchestrator`, the desktop's and the
+  TUI's), the confirmation, and both refusals; the surfaces hold only where the
+  menu hangs. The chat screen's ⋯ menu — because an idle orchestrator has no
+  Active row and, before it is pinned, no slot either — plus a long-press on
+  the Active or Needs-you row of a chat that is running, and on the pinned slot,
+  where §H33's unpin already lived. Same modifier there now: that row is the
+  pinned case of the same item, not a second one.
+- **Pinning asks; unpinning does not.** The cost of the pin is that chat's
+  attention — every settle, block, orphan and cap warning arrives in it as a
+  prompt — so the dialog says so, and says the way back is a long-press on the
+  ◆ slot it is about to gain. It also names the chat it displaces, because
+  `orchestrator_chat` is one key: a second pin *moves* it, and a menu that let
+  you read it as "add" would be lying about the config it writes. Unpinning
+  stays immediate: a kill switch that asks a question is not one.
+- **Not offered on a chat the board dispatched.** That is the one thing
+  `comet-board doctor` says can be wrong with a pin — an attempt holds a
+  workspace slot and pinning it exempts it from its own time cap. The phone
+  declines to offer the mistake rather than reporting it afterwards; the *unpin*
+  is never withheld, since whatever is pinned has to be removable here however
+  it got pinned.
+- **Still nothing optimistic, and the same refusals.** Both halves call the one
+  `setOrchestrator`, so "No board host" and a write the box refused come back in
+  the words they always did — only the verb in the alert's title follows what
+  the operator asked for. The board republishes the pin on the watch stream as
+  the write lands, so the slot *appearing* is the box agreeing, exactly as the
+  slot disappearing already was.
+
+### H43 — The agents could not run the board — **done** (gh#184)
+Read off a live agent on the box, not inferred: `PATH=/usr/local/bin:…:/snap/bin`,
+and `comet-board` nowhere in it. `install.sh` links the CLI into `~/.local/bin`,
+which a systemd **user** service does not inherit and a non-interactive ssh
+shell never sources — so on the one machine that runs dispatched agents, every
+verb §H29's skill hands them was `command not found`.
+
+- **The failure had no symptom.** An agent that cannot reach the board does not
+  crash. It stops checking `dispatchable`, stops releasing sub-work through the
+  board, stops `wait`ing, and gets on with the ticket — and the provenance the
+  board exists to guarantee quietly does not happen. Nothing logs a shell's
+  failed lookup.
+- **The engine already had the seam.** `PushCredentials::apply` prepends the
+  `gh` shim's directory to the harness child's PATH (§H11), carefully reading
+  the adapter's PATH back rather than the process's. That is now one of two
+  layers over a shared `prepend_dirs_to_path`: `RunControls::bin_dirs` goes on
+  first, the shim on top, so a `gh` beside either still loses to the one
+  carrying the credential.
+- **The directory is the one §H37 made real.** `agent_bin_dir()` is
+  `resolve_board_exe()`'s parent, which buys two things a configured path would
+  not: it cannot name a directory with no `comet-board` in it, and it is the
+  same copy `GIT_ASKPASS` runs as. On a managed box that is `app/<version>/`,
+  the payload the engine itself shipped in — so an agent gets the CLI that
+  shipped with the engine running it, by construction. §H37's drift check asks
+  whether the two are in step; this makes them in step for the caller that
+  matters.
+- **Every run, not only dispatched ones.** The skill is installed for the whole
+  box, so an orchestrator the board never dispatched reads the same page of
+  verbs; gating the PATH entry on a push credential would have left it
+  `command not found` there. Resolved once at engine assembly — it is a property
+  of the install, not of the run — and empty resolves to no change at all,
+  never an empty PATH entry.
+- **`doctor` asks it now.** The **agent PATH** check fails when the payload
+  holds no `comet-board` for the engine to point at, which is the one way the
+  guarantee comes apart and is exactly the state §H37 was about. It answers for
+  the payload on this disk, not for the running process, and says so.
+- **The skill no longer promises what the box may not keep.** It says the engine
+  puts `comet-board` on the agent's PATH, and tells an agent that cannot find it
+  to say so and stop rather than work on without the board — the silent
+  degradation above is worse than a refusal anybody can read.
+
+### H44 — The picker tells the truth about what a box can run — **done** (gh#187)
+Half of "every harness reachable in every project" already worked: a dispatch
+can name any runtime (`--runtime codex`, the desktop and phone pickers), it is
+validated against the engine's catalog, and an unknown name is refused rather
+than guessed at. The other half was a lie the pickers told.
+
+`runtime::runtime_options()` was a **static list** — Claude Code, OpenCode,
+Codex, Cursor, Mock — with no reference to the device the work would land on.
+Measured on the box: `claude` and `codex` installed, `opencode` and
+`cursor-agent` not. So the picker offered OpenCode, the dispatch was accepted,
+a worktree was cut, a chat was created — and only then did the harness spawn
+fail. **The board spent the expensive part before checking the cheap fact.**
+
+- **Availability is a fact about a device, not a constant.**
+  `ListBoardRuntimes` was already relay-forwardable; it now answers for the
+  *target* device. Two probes, both cheap, both offline:
+  `comet_harness::locate_cli` (the same resolution the adapter does at spawn,
+  minus the spawn) and `AgentAccounts::signed_in` (the same files the accounts
+  page reads, minus the network). `comet_engine::runtimes` is the one place
+  they are combined, so the picker, the dispatch guard and `doctor` cannot
+  disagree.
+- **Installed and signed-in are named apart**, because they are two different
+  jobs for whoever reads them. Codex sat installed-but-signed-out on the box
+  for twenty minutes, and a dispatch in that window looked identical from the
+  picker to one that would have worked. `RuntimeUnavailable` carries
+  `notInstalled` / `signedOut` / `unsupported` — the last for `cursor`, which
+  is in the runtime table and has never had an adapter, so "not installed"
+  would send an operator off to install something that would not help.
+- **Refused at dispatch, beside the cap and the billing guard** (§H18's
+  position, for §H18's reason): before the attempt row, so a refusal costs no
+  cleanup. `board_runtime.rs` had already established the discipline for the
+  account — resolved before the chat exists, because "an attempt whose chat
+  exists but whose login does not is a row somebody has to clean up" — and an
+  unavailable runtime gets the same treatment. The `comet-board` CLI refuses it
+  one round trip earlier, in the same words.
+- **A named account answers for itself.** A run pointed at a slot reads that
+  slot's materialized config dir and never the CLI's own, so the box's login
+  being absent says nothing about it — the signed-out half is skipped, and the
+  slot is checked for real when the executor materializes it.
+- **Shown, never filtered.** An unavailable runtime stays in the picker,
+  dimmed, saying why: an operator who expects OpenCode on a box needs to read
+  "not installed", not find the row absent and wonder which box it was. The
+  route's own runtime is still where the cursor starts even when the host
+  cannot run it — that sentence is the point — while the *fallback* prefers an
+  available option, so the picker never invents a dead end nobody chose.
+- **`doctor` says it from the shell.** A `harnesses` line naming what is ready
+  and why the rest is not. It fails only when *nothing* can start, which is a
+  board that can poll and derive and never dispatch; one missing runtime out of
+  four is a choice. `mock` is left out of the census — always available, so
+  counting it would let an empty box report "1 ready" and pass.
+- **Routes keep naming a default runtime.** Most work has an obvious harness,
+  and the per-dispatch override stays the way to reach for a different one.
+  What changed is that both now fail loudly and early when the box cannot
+  honour them.
+
+### H45 — Build output is a cache, not evidence — **done** (gh#186)
 The box hit 76% of a 150 GB disk on 2026-08-09 with eight checkouts, and
 `doctor` failed on it: `8 checkout(s), 109.5 GiB in ~/.comet-native/worktrees`.
 Measured per worktree, `board-gh-161-comet-board` was 36 GB — and 298 MB of that

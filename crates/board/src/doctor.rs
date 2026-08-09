@@ -17,6 +17,7 @@ use crate::runtime::harness_for_runtime;
 use crate::skill;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
+use comet_proto::view::board::RuntimeOption;
 use comet_proto::{AgentAccount, EdgeHealth, Space};
 use std::path::{Path, PathBuf};
 
@@ -49,7 +50,8 @@ pub struct EngineStatus {
 /// the same engine's live edge-connection census (gh#116), and `members` how
 /// many people are in the workspace (gh#161) — the fact that turns "a dispatch
 /// that names no account spends the box's login" from a tautology into a
-/// warning.
+/// warning. `runtimes` is the same engine's `ListBoardRuntimes` answer, which
+/// since gh#187 says which harnesses could actually start here.
 pub fn doctor(
     paths: &Paths,
     engine: &EngineStatus,
@@ -57,6 +59,7 @@ pub fn doctor(
     accounts: Option<&[AgentAccount]>,
     edge: Option<&EdgeHealth>,
     members: Option<usize>,
+    runtimes: Option<&[RuntimeOption]>,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
@@ -146,6 +149,14 @@ pub fn doctor(
     // dispatching happily and invisible to every remote viewer.
     checks.push(edge_connections_check(edge));
 
+    // Which harnesses could actually start on this box (gh#187). Beside the
+    // engine that answered it, because it is a fact about the box in the same
+    // way the routes and the credentials below are — and because it used to be
+    // invisible: `runtime_options()` was a constant, so every picker offered
+    // every harness on every device and a dispatch to a missing CLI failed
+    // after the worktree was cut.
+    checks.push(harnesses_check(runtimes));
+
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
     // must not hide the problems in every other route.
@@ -201,7 +212,7 @@ pub fn doctor(
             checks.push(Check {
                 name: "settle notice".into(),
                 ok: true,
-                detail: settle_notice_detail(cfg.defaults.notify_dispatcher),
+                detail: settle_notice_detail(&cfg.defaults),
             });
 
             // The counterpart to the settle notice, and the one gh#71 existed
@@ -420,6 +431,10 @@ pub fn doctor(
     }
 
     checks.push(dispatched_push_check(paths));
+    checks.push(agent_path_check(
+        &crate::config::data_dir().join("app"),
+        git_credentials::agent_bin_dir().as_deref(),
+    ));
     checks.push(git_identity_check(&git_identity::box_identity(
         &paths.config_dir,
     )));
@@ -629,6 +644,69 @@ fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
     Check {
         name: "edge connections".into(),
         ok: !edge.dark(),
+        detail,
+    }
+}
+
+/// Which harnesses can actually start on this box, and why the rest cannot
+/// (gh#187).
+///
+/// `doctor` already reports the routes, the credentials and the skill; "which
+/// agents could I even spin up here" is the same kind of fact and was the one
+/// nothing said out loud. It is the shell's copy of what the pickers now show,
+/// read from the same `ListBoardRuntimes` answer so the two cannot disagree.
+///
+/// Failing rather than warning when *nothing* can run: a box with no harness is
+/// a board that can poll, derive, and never dispatch — and that is the state
+/// this check exists to catch before an operator releases a task into it. One
+/// missing runtime out of four is a choice, not a fault, so it prints and
+/// passes.
+///
+/// `mock` is left out of the census entirely. It is dispatchable on purpose and
+/// always available, so counting it would let a box with no real harness report
+/// "1 ready" and pass.
+fn harnesses_check(runtimes: Option<&[RuntimeOption]>) -> Check {
+    let name = "harnesses".to_string();
+    let Some(runtimes) = runtimes else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine did not answer".into(),
+        };
+    };
+    let real: Vec<&RuntimeOption> = runtimes
+        .iter()
+        .filter(|r| r.harness != comet_proto::HarnessId::Mock)
+        .collect();
+    if real.is_empty() {
+        // An engine old enough to answer without the availability field, or one
+        // whose catalog is empty. Either way there is nothing to report on.
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine listed no runtimes".into(),
+        };
+    }
+    let ready: Vec<&str> = real
+        .iter()
+        .filter(|r| r.available())
+        .map(|r| r.name.as_str())
+        .collect();
+    let blocked: Vec<String> = real
+        .iter()
+        .filter_map(|r| Some(format!("{} ({})", r.name, r.unavailable?.reason())))
+        .collect();
+    let detail = match (ready.is_empty(), blocked.is_empty()) {
+        (true, _) => format!(
+            "none can start here — {}. Nothing this board dispatches will run",
+            blocked.join(", ")
+        ),
+        (false, true) => format!("{} ready", ready.join(", ")),
+        (false, false) => format!("{} ready · {}", ready.join(", "), blocked.join(", ")),
+    };
+    Check {
+        name,
+        ok: !ready.is_empty(),
         detail,
     }
 }
@@ -1032,6 +1110,73 @@ fn dispatched_push_check(paths: &Paths) -> Check {
     }
 }
 
+/// Can a dispatched agent on this box run `comet-board` at all (gh#184)?
+///
+/// The question nobody had asked, because the answer looked obvious from a
+/// login shell. A dispatched agent's PATH is not a login shell's: the engine
+/// runs as a systemd **user** service, which inherits `/usr/local/bin:…:/bin`
+/// and nothing else, and `install.sh` links the CLI into `~/.local/bin` —
+/// which appears nowhere in it. Every board verb the skill hands an agent was
+/// `command not found` on the one machine that runs dispatched agents, and
+/// nothing said so: an agent that cannot reach the board does not crash, it
+/// simply stops checking `dispatchable`, stops releasing sub-work through the
+/// board, stops waiting, and gets on with the ticket alone.
+///
+/// The fix is that the engine prepends its own app directory (`app/<version>/`,
+/// which since gh#156 holds both binaries) to every harness child's PATH. So
+/// what this checks is that the directory has a `comet-board` in it — the one
+/// way the guarantee can come back apart is a payload that ships the engine
+/// alone, which is exactly the state gh#156 was about.
+///
+/// `resolved` is where *this* CLI resolves from, used when there is no managed
+/// install to read. Both answers are about the payload on this disk rather than
+/// about the process: an engine somebody started from a build tree prepends
+/// that tree instead, and no check here can see it.
+fn agent_path_check(app_root: &Path, resolved: Option<&Path>) -> Check {
+    let name = "agent PATH".to_string();
+    let current = app_root.join("current");
+    let (ok, detail) = if current.exists() {
+        if current.join("comet-board").exists() {
+            (
+                true,
+                format!(
+                    "agents get {} on PATH — the comet-board the engine shipped with",
+                    crate::config::shorten_home(&current)
+                ),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "the release at {} ships the engine alone, so the directory an agent \
+                     gets on PATH holds no comet-board and every board verb it types is \
+                     `command not found` — upgrade to a release that carries both",
+                    crate::config::shorten_home(&current)
+                ),
+            )
+        }
+    } else {
+        match resolved {
+            Some(dir) => (
+                true,
+                format!(
+                    "no managed install — agents get {}, where this CLI resolves from",
+                    crate::config::shorten_home(dir)
+                ),
+            ),
+            None => (
+                false,
+                format!(
+                    "no comet-board found beside the engine or on PATH — an agent on this \
+                     box can run no board verb at all (set {})",
+                    git_credentials::BOARD_EXE_ENV
+                ),
+            ),
+        }
+    };
+    Check { name, ok, detail }
+}
+
 /// Which GitHub credential is live, and what it can reach (gh#58).
 ///
 /// Two facts an operator cannot get anywhere else. "GITHUB_TOKEN present" was
@@ -1323,27 +1468,43 @@ fn account_check(
     }
 }
 
-/// Whether a dispatching agent is told its released work settled.
+/// Which agent hears that a settle or a block happened.
 ///
 /// The one setting whose failure is invisible: writeback failing leaves a ticket
 /// open, an unresolvable review state is reported by name, but a notice that
 /// never fires produces nothing at all — no error, no log line, no changed row.
 /// It reads as "nobody told me" rather than "the board is misconfigured", which
 /// is why it belongs in `doctor` next to the other two.
-fn settle_notice_detail(notify_dispatcher: bool) -> String {
-    if notify_dispatcher {
-        "on — an agent that released work is prompted in its own chat \
-         when that work settles"
-            .into()
-    } else {
+///
+/// Since gh#165 the two agent channels are one chain, so this line answers
+/// "who takes this event" rather than reporting a switch. It reads the pin as
+/// well as the switch for exactly that reason: `notify_dispatcher = false` on a
+/// board with an orchestrator is a routing choice, and on a board without one
+/// it is silence — two facts one boolean cannot tell apart.
+fn settle_notice_detail(defaults: &crate::config::Defaults) -> String {
+    match (defaults.notify_dispatcher, defaults.orchestrator()) {
+        (true, Some(chat)) => format!(
+            "on — a settle or a block goes to the chat that released the work; when nothing \
+             did, or that chat is gone, the orchestrator ({chat}) takes it instead"
+        ),
+        (true, None) => "on — a settle or a block goes to the chat that released the work. \
+                         Work released from the panel or the phone released it from no chat, \
+                         and with nothing pinned that reaches no agent at all (see \
+                         `orchestrator`)"
+            .into(),
+        (false, Some(chat)) => format!(
+            "off — the chat that released work is never told; every settle and block goes to \
+             the orchestrator ({chat}), including a copy of every child it released itself \
+             (`[defaults] notify_dispatcher = true` routes them to the dispatcher first)"
+        ),
         // Deliberately not "only you are notified": until gh#71 that was what
         // this line said, and there was no channel that notified you either.
         // A `doctor` line describing a notice nobody sends is worse than no
         // line, because it is the answer somebody stops investigating at.
-        "off — the agent that released work is not told when it settles; the \
-         board row and the comment on the issue are the whole trail \
-         (`[defaults] notify_dispatcher = true` to enable)"
-            .into()
+        (false, None) => "off — no agent is told when work settles or blocks; the board row \
+                          and the comment on the issue are the whole trail (`[defaults] \
+                          notify_dispatcher = true` to enable)"
+            .into(),
     }
 }
 
@@ -1353,8 +1514,8 @@ fn settle_notice_detail(notify_dispatcher: bool) -> String {
 /// Unpinned is a preference, not a fault: a board driven by a human at the panel
 /// wants no orchestrator, and a `doctor` that exited non-zero over that would
 /// stop meaning anything. What the line has to do is say what an unpinned board
-/// costs — work released from the panel reaches no agent at all — so that
-/// "nobody picked this up" is legible as a setting rather than as a bug.
+/// costs — the three cases that reach nobody — so that "nobody picked this up"
+/// is legible as a setting rather than as a bug.
 ///
 /// The fault it does catch is the one misconfiguration the pin allows: pinning
 /// a chat the board itself dispatched. That chat is an attempt — it holds a
@@ -1368,10 +1529,12 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
         return Check {
             name,
             ok: true,
-            detail: "not pinned — no chat is told about the board as a whole. Work you \
-                     release from the panel reaches no agent, and a settle is a row \
-                     colour and a comment on the issue (pin a session in the app, or \
-                     `[defaults] orchestrator_chat = \"<chat-id>\"`)"
+            detail: "not pinned — nothing takes what no dispatcher can be told. Work you \
+                     release from the panel or the phone, a settle whose dispatching chat \
+                     has been archived, and every cap warning reach no agent: they are a row \
+                     colour and a comment on the issue, and the log says so once per event \
+                     (pin a session in the app, or `[defaults] orchestrator_chat = \
+                     \"<chat-id>\"`)"
                 .into(),
         };
     };
@@ -1401,8 +1564,16 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
             name,
             ok: true,
             detail: format!(
-                "chat {chat} — every settle, block, orphan and cap warning on this board \
-                 is prompted into it, one message per event. Unpin to stop them"
+                "chat {chat} — {}, one message per event. Unpin to stop them",
+                if defaults.notify_dispatcher {
+                    "the addressee of last resort: work no chat released, work whose \
+                     dispatching chat is gone, and every cap warning. A settle its \
+                     dispatcher was told about is not repeated here"
+                } else {
+                    "every settle, block, orphan and cap warning on this board is prompted \
+                     into it — `notify_dispatcher` is off, so nothing goes to a dispatcher \
+                     first and this chat gets the whole board"
+                }
             ),
         },
     }
@@ -1866,7 +2037,7 @@ mod tests {
     #[test]
     fn doctor_reports_a_missing_routing_file_without_panicking() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
@@ -1980,6 +2151,55 @@ mod tests {
         assert_eq!(installed_payload_version(&app_root), None);
     }
 
+    // --- agent PATH (gh#184) -------------------------------------------------
+
+    /// The box after the fix: the payload holds both binaries, so the directory
+    /// the engine prepends to every agent's PATH has a `comet-board` in it.
+    #[test]
+    fn a_payload_with_both_binaries_lets_an_agent_run_the_board() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.5", &["comet", "comet-board"]);
+        let c = agent_path_check(&app_root, None);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("on PATH"), "{}", c.detail);
+    }
+
+    /// The one way the guarantee comes apart: a release that ships the engine
+    /// alone. The PATH entry is still there and still useless, which is
+    /// precisely the silence this check exists to end.
+    #[test]
+    fn a_payload_without_the_cli_is_a_path_with_no_board_in_it() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.5", &["comet"]);
+        let c = agent_path_check(&app_root, None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("command not found"), "{}", c.detail);
+    }
+
+    /// A laptop with no managed install: the answer is where this CLI resolves
+    /// from, and it is not a failure.
+    #[test]
+    fn no_managed_install_answers_from_where_the_cli_resolves() {
+        let d = tempfile::tempdir().unwrap();
+        let c = agent_path_check(&d.path().join("app"), Some(&d.path().join("target/debug")));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no managed install"), "{}", c.detail);
+    }
+
+    /// Nothing anywhere: no board verb an agent types can work, and saying so
+    /// is the whole job.
+    #[test]
+    fn no_comet_board_anywhere_fails_loudly() {
+        let d = tempfile::tempdir().unwrap();
+        let c = agent_path_check(&d.path().join("app"), None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains(git_credentials::BOARD_EXE_ENV),
+            "{}",
+            c.detail
+        );
+    }
+
     fn edge_check_in(checks: &[Check]) -> &Check {
         checks
             .iter()
@@ -2002,7 +2222,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("0 of 4 live"), "{}", check.detail);
@@ -2027,7 +2247,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok, "{}", check.detail);
         assert!(
@@ -2042,7 +2262,7 @@ mod tests {
     #[test]
     fn an_unaskable_engine_leaves_the_edge_check_unchecked() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok);
         assert!(check.detail.contains("not checked"), "{}", check.detail);
@@ -2062,7 +2282,7 @@ mod tests {
             detail: "connection refused".into(),
             version: None,
         };
-        let checks = doctor(&p, &down, None, Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
         // The route's space is "not checked", not failed: one dead engine must
         // not fail every route and bury its own report.
@@ -2110,14 +2330,14 @@ mod tests {
 
         routing("origin/HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
         assert!(!ok, "{detail}");
         assert!(detail.contains("origin"), "{detail}");
         assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
 
         routing("HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
         assert!(ok, "{detail}");
     }
 
@@ -2167,14 +2387,14 @@ mod tests {
             comet_proto::HarnessId::ClaudeCode,
         )];
 
-        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&ok);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("sam@example.com"), "{}", c.detail);
 
         // An id this device has never saved: named, along with what it does have.
         routing_with_account(&p, "claude-code", "ffffffffffffffff");
-        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&bad);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("ffffffffffffffff"), "{}", c.detail);
@@ -2192,7 +2412,7 @@ mod tests {
             "sam@example.com",
             comet_proto::HarnessId::ClaudeCode,
         )];
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("claude-code"), "{}", c.detail);
@@ -2210,11 +2430,11 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(!checks.iter().any(|c| c.name == "route w: account"));
 
         routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
-        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("not checked"), "{}", c.detail);
@@ -2230,7 +2450,7 @@ mod tests {
         )
         .unwrap();
         let spaces = [space("Tally")];
-        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None, None).unwrap();
         // Case-insensitive, like every other name match on the board.
         let c = checks
             .iter()
@@ -2238,13 +2458,88 @@ mod tests {
             .unwrap();
         assert!(c.ok, "{}", c.detail);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "route tally: space")
             .unwrap();
         assert!(!c.ok);
         assert!(c.detail.contains("no comet space named"), "{}", c.detail);
+    }
+
+    /// `doctor` says which harnesses this box can start, and why the rest
+    /// cannot (gh#187) — the shell's copy of what the pickers show.
+    #[test]
+    fn the_harness_census_names_the_ready_and_the_reason_for_the_rest() {
+        use comet_proto::HarnessId;
+        use comet_proto::view::board::RuntimeUnavailable;
+        let (_d, p) = tmp();
+
+        let option = |name: &str, harness, unavailable| RuntimeOption {
+            name: name.into(),
+            label: name.into(),
+            harness,
+            unavailable,
+        };
+        let runtimes = vec![
+            option("claude-code", HarnessId::ClaudeCode, None),
+            option(
+                "opencode",
+                HarnessId::Opencode,
+                Some(RuntimeUnavailable::NotInstalled),
+            ),
+            option("codex", HarnessId::Codex, Some(RuntimeUnavailable::SignedOut)),
+            // Always available, and deliberately not part of the census.
+            option("mock", HarnessId::Mock, None),
+        ];
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            Some(&runtimes),
+        )
+        .unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(c.ok, "one harness ready is not a fault: {}", c.detail);
+        assert!(c.detail.contains("claude-code ready"), "{}", c.detail);
+        // Both axes named apart — one is an install, the other a login.
+        assert!(c.detail.contains("opencode (not installed)"), "{}", c.detail);
+        assert!(c.detail.contains("codex (signed out)"), "{}", c.detail);
+        assert!(!c.detail.contains("mock"), "{}", c.detail);
+
+        // A box that can start nothing is a board that can only ever poll.
+        let none: Vec<RuntimeOption> = runtimes
+            .iter()
+            .cloned()
+            .map(|mut o| {
+                if o.harness != HarnessId::Mock {
+                    o.unavailable = Some(RuntimeUnavailable::NotInstalled);
+                }
+                o
+            })
+            .collect();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            Some(&none),
+        )
+        .unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("none can start here"), "{}", c.detail);
+
+        // An engine that could not be asked says so rather than condemning the
+        // box on the strength of a failed lookup.
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(c.ok && c.detail.contains("not checked"), "{}", c.detail);
     }
 
     #[test]
@@ -2260,7 +2555,7 @@ mod tests {
              runtime = \"gpt-piloted-typewriter\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let alias = checks
             .iter()
             .find(|c| c.name == "route w: runtime" && c.ok)
@@ -2290,7 +2585,7 @@ mod tests {
              runtime = \"claude\"\nmax_duration = \"off\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let detail = |name: &str| {
             checks
                 .iter()
@@ -2317,17 +2612,47 @@ mod tests {
     /// gh#27's shape, inherited: a notice that never fires is the one failure
     /// that produces nothing to look at, so the line saying whether it is on
     /// has to be there in both states — and has to name the key.
+    ///
+    /// gh#165: it also has to say which of the two agent channels *takes* the
+    /// event, because they became one chain with a fallback hop. Reporting two
+    /// independent switches was the thing that made "which chat gets this?"
+    /// unanswerable from the report.
     #[test]
-    fn doctor_says_whether_the_dispatcher_is_told() {
-        let on = settle_notice_detail(true);
-        assert!(on.starts_with("on —"), "{on}");
-        assert!(on.contains("released work is prompted"), "{on}");
+    fn doctor_says_which_channel_takes_a_settle() {
+        let mut d = crate::config::Defaults::default();
+        assert!(d.notify_dispatcher, "the default state since gh#165");
 
-        let off = settle_notice_detail(false);
-        assert!(off.starts_with("off —"), "{off}");
+        // Dispatcher-first, and nothing behind it.
+        let bare = settle_notice_detail(&d);
+        assert!(bare.starts_with("on —"), "{bare}");
+        assert!(bare.contains("the chat that released the work"), "{bare}");
         assert!(
-            off.contains("notify_dispatcher"),
-            "off has to name the key to turn it on: {off}"
+            bare.contains("reaches no agent at all"),
+            "an unpinned board has to be told what it drops: {bare}"
+        );
+
+        // Dispatcher-first with the fallback behind it: the whole chain, in
+        // order, in one line.
+        d.orchestrator_chat = Some("chat-boss".into());
+        let chained = settle_notice_detail(&d);
+        assert!(chained.contains("that chat is gone"), "{chained}");
+        assert!(chained.contains("chat-boss"), "{chained}");
+
+        // Off with a pin is a routing choice, and the line says what it costs
+        // the pinned chat rather than reporting a switch.
+        d.notify_dispatcher = false;
+        let routed = settle_notice_detail(&d);
+        assert!(routed.starts_with("off —"), "{routed}");
+        assert!(routed.contains("chat-boss"), "{routed}");
+        assert!(routed.contains("notify_dispatcher"), "{routed}");
+
+        // Off with nothing pinned is the one silent state.
+        d.orchestrator_chat = None;
+        let silent = settle_notice_detail(&d);
+        assert!(silent.contains("no agent is told"), "{silent}");
+        assert!(
+            silent.contains("notify_dispatcher"),
+            "off has to name the key to turn it on: {silent}"
         );
     }
 
@@ -2488,7 +2813,7 @@ mod tests {
     fn doctor_emits_the_default_account_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2), None).unwrap();
         assert!(
             checks.iter().any(|c| c.name == "default account"),
             "doctor is silent about what an unnamed account spends"
@@ -2520,7 +2845,7 @@ mod tests {
     fn doctor_emits_the_billing_guard_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "billing guard")
@@ -2536,7 +2861,7 @@ mod tests {
             "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "settle notice")
@@ -2551,7 +2876,7 @@ mod tests {
     fn doctor_says_when_no_agent_is_running_the_board() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "orchestrator")
@@ -2569,10 +2894,32 @@ mod tests {
             "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
+        // gh#165: what it receives is the question, and on a default board the
+        // answer is "what nobody else could be told" — not the whole board.
+        assert!(c.detail.contains("last resort"), "{}", c.detail);
+        assert!(c.detail.contains("is not repeated here"), "{}", c.detail);
+    }
+
+    /// With the dispatcher wake off, the pin really is the whole board again —
+    /// and an operator who turned it off should read that here rather than
+    /// discover it as volume in the pinned chat.
+    #[test]
+    fn the_pin_says_when_it_is_taking_the_whole_board() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\norchestrator_chat = \"chat-boss\"\nnotify_dispatcher = false\n\n\
+             [github]\nrepos = []\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
+        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        assert!(c.ok);
+        assert!(c.detail.contains("gets the whole board"), "{}", c.detail);
     }
 
     /// The one misconfiguration the pin allows, and it is a quiet one: a
@@ -2625,7 +2972,7 @@ mod tests {
         db.set_attempt_pane(a, "chat-9").unwrap();
         drop(db);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
@@ -2779,7 +3126,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(
             !checks.iter().any(|c| c.name == "linear review state"),
             "a board with no Linear anywhere must not be handed a Linear setting"
@@ -2798,7 +3145,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "linear review state"));
     }
 

@@ -8,6 +8,11 @@ chats running coding agents out. The board lives on ONE host device (the box);
 `comet-board` speaks to it over the local IPC, or from any other machine with
 `--device <box-name>`.
 
+The engine puts `comet-board` on your PATH — the copy it shipped with. If it is
+not there, say so and stop; do not carry on without the board. Work done off the
+board has no row, no provenance and no one who can see it (`comet-board doctor`
+reports this as **agent PATH**).
+
 **Read before acting. Never read board.db directly.**
 
 ```bash
@@ -52,7 +57,10 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
    the CLI warn on cross-billing (billing_guard).
 5. Cancel ends the attempt, not the issue; the row returns to ready.
 6. After releasing work, wait for it or say plainly you're leaving it running.
-   With `notify_dispatcher = true` your chat is prompted on settle.
+   Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
+   default) — and is the first addressee, so what reaches you does not also
+   reach the board's orchestrator. Never promise you'll be woken: the setting
+   is invisible from here and an archived chat is told nothing.
 7. Never dispatch speculatively — a human keypress or explicit instruction
    releases tasks. Reading is always safe.
 8. New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,

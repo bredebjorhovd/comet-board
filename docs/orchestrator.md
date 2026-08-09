@@ -8,8 +8,10 @@ tells a human what happened — so the human's job reduces to reading summaries.
 ## Pinning one
 
 Open a session on the box, then **Pin as orchestrator** on its row (right-click
-in the desktop app, `m` in the TUI). One per board; pinning another moves it.
-Under the hood that is `[defaults] orchestrator_chat` in the board's
+in the desktop app, `m` in the TUI, long-press on the phone — or the chat
+screen's ⋯ menu there, which is the surface an idle chat has). One per board;
+pinning another moves it, and the phone says whose pin it is moving before it
+does. Under the hood that is `[defaults] orchestrator_chat` in the board's
 `routing.toml`, so `comet-board routes defaults orchestrator_chat <chat-id>`
 does the same thing from a shell.
 
@@ -30,9 +32,27 @@ ordinary chat again, with everything in it intact.
 
 ## What it receives
 
-Every settle, block, orphan and cap warning on the board — including work you
-released from the board panel yourself, and work another chat released. Each
-arrives as one prompt in the chat, on the same durable path review comments
+**Everything nobody else can be told**, which is three things:
+
+- **Work no agent released.** A dispatch from the board panel, from the phone,
+  or from a bare `comet-board dispatch` records no dispatching chat. On a board
+  one person drives, that is most of what gets released.
+- **Work whose dispatcher did not survive it.** Attempts cap at two hours and
+  chats archive as their task settles, so a child routinely outlives the chat
+  that released it. That notice used to be dropped; it comes here instead.
+- **Cap warnings.** The one notice about a run that is *still going*, and the
+  only window in which reading its chat can change how it ends. It belongs to no
+  dispatcher, because nothing has finished for one to be waiting on.
+
+**Not** a settle a live dispatcher already handled. When the chat that released
+the work is there to be prompted, it is told and you are not — `notify_dispatcher`
+is on by default and is the first addressee. That is what makes a pin usable on
+a busy board: your context fills with the events that would otherwise vanish,
+rather than with a copy of every child's settle. A notice here that names who
+released it is one whose dispatcher never heard about it, which is exactly the
+thing to go and pick up.
+
+Each arrives as one prompt in the chat, on the same durable path review comments
 take: safe to deliver into a busy chat, and a pile-up supersedes rather than
 queues.
 
@@ -40,6 +60,11 @@ One message per event. The board never polls the orchestrator and never repeats
 itself, which matters more here than anywhere else: the orchestrator is exempt
 from `max_duration` because it is meant to live forever, so the volume of what
 arrives is the only thing bounding what it costs.
+
+Unpinned, those three reach no agent at all. The board says so once per event in
+its log ("… reached no agent — …") rather than dropping them in silence, and
+`comet-board doctor`'s `settle notice` and `orchestrator` lines say between them
+which channel would take a given event.
 
 ## The brief
 
@@ -83,9 +108,9 @@ ticket, it is small enough to do yourself.
 **Release, then stay with it.** `comet-board dispatch --task <id>` cuts the
 worktree, makes the chat and starts the agent. After that either
 `comet-board wait --blocked-is-settled --timeout 3600` or say plainly that you
-are leaving it running — going quiet leaves a human to notice. You are pinned,
-so settles and blocks reach you as prompts whether or not you are waiting; that
-is a reason to wait less, not a reason to say nothing.
+are leaving it running — going quiet leaves a human to notice. Work you release
+records this chat, so its settles and blocks reach you as prompts whether or not
+you are waiting; that is a reason to wait less, not a reason to say nothing.
 
 **Review what comes back.** A task in `review` keeps its chat, and comments on
 its pull request are delivered back into it — so say what is wrong *on the pull
@@ -116,7 +141,8 @@ a human, what you are still waiting on. That summary is the product.
 
 ## What it does not need
 
-Nothing new. `comet-board` is on PATH and `COMET_BOARD_CHAT_ID` is already in
+Nothing new. The engine prepends its own app directory to every harness child's
+PATH, so `comet-board` is there (gh#184), and `COMET_BOARD_CHAT_ID` is already in
 the environment of any chat on the box, so provenance is recorded without
 anybody passing ids by hand — the board knows which chat released what. Pinning
 grants no authority the chat did not already have; it only decides who is told.
