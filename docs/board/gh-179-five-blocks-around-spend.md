@@ -11,7 +11,7 @@ assemble the question out of them. It is five blocks now, and the order is the
 argument: **what it cost**, what it ran, what it spent that on, when and where,
 and who.
 
-## The headline is spend, and the two halves are never added
+### The headline is spend, and the two halves are never added
 
 The block leads with three figures: what the window's tokens would have cost at
 the meter, what the plans behind them cost over the same days, and the multiple
@@ -38,7 +38,7 @@ there is no price (no rates, rates that matched nothing, no plan to compare
 against) each keep their own sentence; `BoardStats::spend_label` owns which one
 it is.
 
-## The crossing was the fact both cards were hiding
+### The crossing was the fact both cards were hiding
 
 "When do I release work" was an hour histogram. "Which spaces" was a workspace
 tally. Between them a reader can tell that the board runs late and that one
@@ -60,7 +60,7 @@ tally here uses — biggest first, ties alphabetical, the tail folded into one
 `n others` row that carries the hours it stands for, and the column margin
 summed *after* the fold so the bottom of the grid still totals every dispatch.
 
-## What else moved
+### What else moved
 
 - **The token tiles are a line.** Five bordered tiles for one total and its four
   buckets is a card per number; they read as one figure and four label-value
