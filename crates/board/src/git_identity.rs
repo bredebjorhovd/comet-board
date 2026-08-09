@@ -94,7 +94,11 @@ pub fn parse_author(value: &str) -> Option<GitAuthor> {
 /// One `@`, something on each side, no whitespace. Not validation — the address
 /// is the operator's to get right — only enough to tell an address from a name
 /// somebody typed into the wrong half of the map.
-fn plausible_email(s: &str) -> bool {
+///
+/// Public because the *key* half of `[users]` needs the same reading: a
+/// `member add` whose first argument is a GitHub login rather than a sign-in
+/// email would write a map entry no dispatch can ever match (gh#162).
+pub fn plausible_email(s: &str) -> bool {
     let mut parts = s.split('@');
     let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;

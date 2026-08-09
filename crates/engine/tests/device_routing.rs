@@ -547,8 +547,17 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     // Engine B is the box: it hosts the board service. Seed a task into its
     // store first, so a forwarded frame is provably B's board and not an empty
     // one A could have produced by itself.
+    // Built by hand rather than with `Paths::under`, which honours
+    // `COMET_BOARD_CONFIG_DIR` / `COMET_BOARD_STATE_DIR`. Those are set in the
+    // environment of every board-dispatched agent, so under one this test took
+    // its tempdir, ignored it, and ran against the *box's live* board — reading
+    // its rows and writing its hand-edited `routing.toml`.
     let board_dir = dirs.path().join("board-b");
-    let paths = Paths::under(&board_dir).expect("board paths");
+    let paths = Paths {
+        config_dir: board_dir.clone(),
+        state_dir: board_dir.join("state"),
+    };
+    std::fs::create_dir_all(&paths.state_dir).expect("board dirs");
     {
         let db = Db::open(&paths.db()).expect("board store");
         db.upsert_task(&UpsertTask {
@@ -737,7 +746,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     // gh#75: so does the config. `routing.toml` is a file on B's disk, and A
     // is the teammate with no ssh account on B — reading and writing it over
     // the relay is the whole point.
-    let routing_path = Paths::under(&board_dir).expect("board paths").routing();
+    let routing_path = board_dir.join("routing.toml");
     let read = client
         .call(
             methods::READ_BOARD_CONFIG,
@@ -866,6 +875,74 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         .expect("unpinning is published too")
         .expect("a frame");
     assert!(cleared["chatId"].is_null(), "got: {cleared}");
+
+    // gh#162: and so is the `[users]` map, which is the one config edit whose
+    // *reason* is that A is a different person from whoever set B up. Until
+    // this op existed, mapping a teammate meant hand-writing TOML on the box —
+    // and until somebody did, every task that teammate released committed
+    // under B's own git identity.
+    //
+    // An address needs no round trip to GitHub, which is what makes this
+    // testable without a credential; a bare login takes B's App, deliberately,
+    // because A's laptop has none.
+    let mapped = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "member", "user": "ana@example.com",
+                "github": "22494697+ana@users.noreply.github.com",
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect("remote member add");
+    assert_eq!(
+        mapped["routing"]["config"]["users"]["ana@example.com"].as_str(),
+        Some("22494697+ana@users.noreply.github.com"),
+        "got: {mapped}"
+    );
+    assert!(
+        std::fs::read_to_string(&routing_path)
+            .expect("B's routing.toml")
+            .contains("[users]"),
+        "the map is on B's disk, where B's dispatch reads it"
+    );
+
+    // A value that is not an address is refused by B rather than stamped onto
+    // GIT_AUTHOR_EMAIL, where it would produce exactly the unattributable
+    // commits the map exists to prevent.
+    let refused = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "member", "user": "sam@example.com", "github": "Sam Ito",
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect_err("a name is not a GitHub identity");
+    assert!(
+        refused.to_string().contains("GitHub login"),
+        "the refusal says what to type instead: {refused}"
+    );
+
+    // Offboarding is the same surface from the other side.
+    let removed = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "user", "user": "ana@example.com", "value": null,
+                "targetDeviceId": "device-b"
+            }),
+        )
+        .await
+        .expect("remote member remove");
+    assert!(
+        removed["routing"]["config"]["users"]
+            .as_object()
+            .is_some_and(|m| m.is_empty()),
+        "got: {removed}"
+    );
 
     core_a.shutdown().await;
     core_b.shutdown().await;

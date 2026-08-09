@@ -181,6 +181,23 @@ pub enum Edit {
         #[serde(default)]
         value: Option<String>,
     },
+    /// Set (or, with `value: null`, remove) one `[users]` entry — whose name a
+    /// teammate's dispatched commits carry (gh#162).
+    ///
+    /// Its own op rather than a `Default`-shaped one because the key is data,
+    /// not a name from a fixed list: `[users]` is keyed by the email a
+    /// teammate signs in with, so what a typo produces here is not an ignored
+    /// key but an entry that no dispatch will ever match. The check is
+    /// therefore on the *shape* of the key, and the value goes through the
+    /// same author parse [`crate::git_identity`] reads it back with.
+    ///
+    /// `comet-board member add` is the verb; a caller that already holds the
+    /// address (a settings page, an agent) can send this directly.
+    User {
+        user: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
 }
 
 /// The keys [`Edit::Route`] may set, and the TOML each writes.
@@ -317,6 +334,37 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
                 rendered(kind, value.as_deref())?,
             )
         }
+        Edit::User { user, value } => {
+            let user = user.trim();
+            if !crate::git_identity::plausible_email(user) {
+                bail!(
+                    "`{user}` is not a sign-in email. `[users]` is keyed by the address \
+                     the teammate signs in to comet with — that is what a dispatch \
+                     arrives as — and valued with their git author; their GitHub login \
+                     goes on the other side."
+                );
+            }
+            // Refused here rather than left to `apply`'s revalidation so the
+            // error names the value somebody typed instead of reporting that
+            // the whole config would not have validated.
+            if let Some(value) = value
+                && crate::git_identity::parse_author(value).is_none()
+            {
+                bail!(
+                    "`{value}` is not a git author — write an email address or \
+                     `Name <email>`. GitHub attributes commits to the account owning \
+                     the address; `<id>+<login>@users.noreply.github.com` from \
+                     https://github.com/settings/emails always works."
+                );
+            }
+            let key = user_key(&before, user);
+            set_in_table(
+                &before,
+                "[users]",
+                &key,
+                value.as_deref().map(adopt::toml_string),
+            )
+        }
     };
     adopt::apply(&path, &before, &after)?;
     read(paths)
@@ -351,6 +399,42 @@ fn set_in_route(text: &str, n: usize, key: &str, value: Option<String>) -> Resul
         .find(|i| *i > at)
         .unwrap_or_else(|| text.lines().count());
     Ok(set_between(text, at, end, key, value))
+}
+
+/// The spelling `[users]` already uses for an address, or a freshly quoted one.
+///
+/// Emails are compared case-insensitively wherever the map is *read*
+/// ([`RoutingConfig::git_author_for`]), so writing `Ana@Example.com` beside an
+/// existing `ana@example.com` would be two entries for one person and a map
+/// whose behaviour depends on which one TOML happened to keep. The key already
+/// in the file wins, verbatim — including its quoting, since a re-quoted
+/// version of the same address would not match the line and would append a
+/// duplicate.
+///
+/// Read off the text rather than off the parse for that last reason: the parse
+/// gives the logical key, and it is the literal that has to be edited.
+fn user_key(text: &str, user: &str) -> String {
+    let headers = adopt::header_lines(text);
+    if let Some(&(at, _)) = headers.iter().find(|(_, name)| name == "[users]") {
+        let end = headers
+            .iter()
+            .map(|(i, _)| *i)
+            .find(|i| *i > at)
+            .unwrap_or_else(|| text.lines().count());
+        for line in text.lines().take(end).skip(at + 1) {
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.starts_with('#') {
+                continue;
+            }
+            if key.trim_matches(['"', '\'']).eq_ignore_ascii_case(user) {
+                return key.to_string();
+            }
+        }
+    }
+    adopt::toml_string(user)
 }
 
 /// Set (or remove) `key` in a named top-level table, creating the table when it
@@ -827,5 +911,167 @@ max_duration = "banana"
         let cleared: Edit =
             serde_json::from_value(serde_json::json!({"op": "default", "key": "notify"})).unwrap();
         assert!(matches!(cleared, Edit::Default { value: None, .. }));
+        // The map's own op (gh#162), keyed by data rather than by a name from
+        // a list.
+        let user: Edit = serde_json::from_value(serde_json::json!({
+            "op": "user", "user": "ana@example.com",
+            "value": "22494697+ana@users.noreply.github.com"
+        }))
+        .unwrap();
+        assert!(matches!(user, Edit::User { .. }));
+    }
+
+    // ── the `[users]` map (gh#162) ──────────────────────────────────────────
+
+    fn user_edit(paths: &Paths, user: &str, value: Option<&str>) -> Result<RoutingView> {
+        edit(
+            paths,
+            &Edit::User {
+                user: user.into(),
+                value: value.map(str::to_string),
+            },
+        )
+    }
+
+    /// The first entry writes the table; the second joins it; a third with the
+    /// same person corrects the line rather than adding one.
+    #[test]
+    fn a_member_add_writes_the_map_and_re_running_it_changes_nothing() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = user_edit(
+            &paths,
+            "ana@example.com",
+            Some("22494697+ana@users.noreply.github.com"),
+        )
+        .unwrap();
+        assert_eq!(
+            view.config.as_ref().unwrap().users["ana@example.com"],
+            "22494697+ana@users.noreply.github.com"
+        );
+        assert!(view.problems.is_empty(), "{:?}", view.problems);
+        // The routes above it are untouched — this is a text edit, and the
+        // comments in the file are the reason.
+        assert!(view.text.contains("# Offhand's own work."));
+
+        let again = user_edit(
+            &paths,
+            "ana@example.com",
+            Some("22494697+ana@users.noreply.github.com"),
+        )
+        .unwrap();
+        assert_eq!(again.text, view.text, "a repeat write moved the file");
+
+        let two = user_edit(
+            &paths,
+            "sam@example.com",
+            Some("Sam Ito <8134+sam@users.noreply.github.com>"),
+        )
+        .unwrap();
+        let users = &two.config.as_ref().unwrap().users;
+        assert_eq!(users.len(), 2, "{users:?}");
+
+        // The dispatch-time reader agrees with what was written.
+        let author = two
+            .config
+            .as_ref()
+            .unwrap()
+            .git_author_for("SAM@example.com")
+            .unwrap();
+        assert_eq!(author.name, "Sam Ito");
+    }
+
+    /// The map is read case-insensitively, so it must be *written* that way
+    /// too: a second entry differing only in case is one person with two
+    /// answers, and which one wins is whichever TOML happened to keep.
+    #[test]
+    fn a_second_spelling_of_one_address_corrects_the_entry_it_already_has() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        user_edit(
+            &paths,
+            "ana@example.com",
+            Some("1+ana@users.noreply.github.com"),
+        )
+        .unwrap();
+        let view = user_edit(
+            &paths,
+            "Ana@Example.COM",
+            Some("22494697+ana@users.noreply.github.com"),
+        )
+        .unwrap();
+        let users = &view.config.as_ref().unwrap().users;
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert_eq!(
+            users["ana@example.com"],
+            "22494697+ana@users.noreply.github.com"
+        );
+    }
+
+    /// Offboarding, and the entry for the wrong account.
+    #[test]
+    fn removing_somebody_leaves_the_rest_of_the_map_alone() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        user_edit(
+            &paths,
+            "ana@example.com",
+            Some("1+ana@users.noreply.github.com"),
+        )
+        .unwrap();
+        user_edit(
+            &paths,
+            "sam@example.com",
+            Some("2+sam@users.noreply.github.com"),
+        )
+        .unwrap();
+        let view = user_edit(&paths, "ANA@example.com", None).unwrap();
+        let users = &view.config.as_ref().unwrap().users;
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(users.contains_key("sam@example.com"));
+        // Removing what is not there is already true, and must not error.
+        assert!(user_edit(&paths, "nobody@example.com", None).is_ok());
+    }
+
+    /// Both halves are refused by name, and the file is untouched — the value
+    /// because `[users]` holding a non-address is the unattributable commit
+    /// gh#107 exists to prevent, the key because a `member add` given a login
+    /// where the sign-in email goes writes an entry no dispatch can match.
+    #[test]
+    fn a_key_or_a_value_that_is_not_an_address_is_refused_rather_than_written() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let before = read(&paths).unwrap().text;
+
+        let bad_value = user_edit(&paths, "ana@example.com", Some("ana")).unwrap_err();
+        assert!(
+            format!("{bad_value:#}").contains("not a git author"),
+            "{bad_value:#}"
+        );
+        let bad_key = user_edit(&paths, "ana", Some("1+ana@users.noreply.github.com")).unwrap_err();
+        assert!(
+            format!("{bad_key:#}").contains("not a sign-in email"),
+            "{bad_key:#}"
+        );
+        assert_eq!(read(&paths).unwrap().text, before, "the file moved");
+    }
+
+    /// A file whose `[users]` table was hand-written keeps its own spelling of
+    /// a key — re-quoting it would not match the line and would append a
+    /// duplicate the whole config then fails to parse on.
+    #[test]
+    fn a_hand_written_key_is_edited_in_place_whatever_its_quoting() {
+        let (_dir, paths) = paths_with(
+            "[users]\n'ana@example.com' = \"1+ana@users.noreply.github.com\"\n\n[defaults]\n",
+        );
+        let view = user_edit(
+            &paths,
+            "ana@example.com",
+            Some("22494697+ana@users.noreply.github.com"),
+        )
+        .unwrap();
+        assert!(
+            view.text
+                .contains("'ana@example.com' = \"22494697+ana@users.noreply.github.com\""),
+            "{}",
+            view.text
+        );
+        assert_eq!(view.config.as_ref().unwrap().users.len(), 1);
     }
 }

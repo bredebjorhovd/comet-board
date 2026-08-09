@@ -111,6 +111,26 @@ enum BoardConfigWrite {
     },
     /// Stop offering a repo — you are only reading it.
     Ignore { slug: String },
+    /// Map a teammate's sign-in email to their GitHub identity — the `[users]`
+    /// entry `comet-board member add` writes (gh#162).
+    ///
+    /// Here rather than in `routes::Edit` for the same reason `Adopt` is: a
+    /// bare `--github ana` has to be resolved into the address GitHub minted
+    /// for that login, and the credential that can ask is the *board's*. The
+    /// laptop running the command usually has none — which is the whole reason
+    /// the map was a hand-edit over ssh.
+    ///
+    /// A `--github` that is already an address needs no round trip and takes
+    /// none. Removal is [`comet_board::routes::Edit::User`] with a null value:
+    /// there is nothing to resolve when taking somebody out.
+    Member {
+        user: String,
+        github: String,
+        /// The name their commits show. Absent leaves the GitHub login, which
+        /// is what the address would have derived anyway.
+        #[serde(default)]
+        name: Option<String>,
+    },
     #[serde(untagged)]
     Edit(comet_board::routes::Edit),
 }
@@ -676,7 +696,7 @@ impl EngineRpc {
     /// Perform one config write. Everything lands through
     /// [`comet_board::routes::edit`] or [`comet_board::adopt`], which is where
     /// the parse + validate + `.bak` discipline lives.
-    fn write_board_config(
+    async fn write_board_config(
         &self,
         paths: &comet_board::config::Paths,
         write: BoardConfigWrite,
@@ -684,6 +704,36 @@ impl EngineRpc {
         use comet_board::adopt;
         match write {
             BoardConfigWrite::Edit(edit) => comet_board::routes::edit(paths, &edit),
+            // Resolve first, write second: a login GitHub has never heard of
+            // must cost an error naming it, not a half-written map.
+            BoardConfigWrite::Member { user, github, name } => {
+                let author = match comet_board::members::parse_github(&github)? {
+                    comet_board::members::GithubRef::Author(a) => a,
+                    comet_board::members::GithubRef::Login(login) => {
+                        let paths = paths.clone();
+                        // Blocking: the GitHub clients are `reqwest::blocking`
+                        // and hold `Rc`s, exactly as `onboard_repo`'s phase one
+                        // does.
+                        tokio::task::spawn_blocking(move || {
+                            let rest = comet_board::sources::github::HttpRest::from_paths(&paths)?;
+                            comet_board::members::resolve_login(
+                                &comet_board::sources::github::Github::new(rest),
+                                &login,
+                            )
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("resolving `{github}`: {e}"))??
+                    }
+                };
+                let author = comet_board::members::named(author, name.as_deref());
+                comet_board::routes::edit(
+                    paths,
+                    &comet_board::routes::Edit::User {
+                        user,
+                        value: Some(comet_board::members::users_value(&author)),
+                    },
+                )
+            }
             BoardConfigWrite::Ignore { slug } => {
                 adopt::ignore(&paths.routing(), &slug)?;
                 comet_board::routes::read(paths)
@@ -1565,6 +1615,7 @@ impl RpcService for EngineRpc {
                 let paths = self.board()?.paths().clone();
                 let view = self
                     .write_board_config(&paths, p)
+                    .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 // Republish what a frontend is watching off this file before
                 // replying (gh#104): pinning a chat is a direct action, and the

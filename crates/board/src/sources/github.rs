@@ -400,6 +400,15 @@ pub struct RepoFacts {
     pub has_issues: bool,
 }
 
+/// One GitHub account, as much of it as `[users]` needs (gh#162).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GithubUser {
+    /// The numeric id — the left half of the noreply address.
+    pub id: i64,
+    /// The login, spelled the way the account spells it.
+    pub login: String,
+}
+
 pub struct Github<T: Rest> {
     pub rest: T,
 }
@@ -407,6 +416,33 @@ pub struct Github<T: Rest> {
 impl<T: Rest> Github<T> {
     pub fn new(rest: T) -> Github<T> {
         Github { rest }
+    }
+
+    /// The account behind a login, for the one fact `[users]` needs (gh#162):
+    /// the numeric id, which is the half of
+    /// `<id>+<login>@users.noreply.github.com` nobody can type from memory.
+    ///
+    /// Public data, so any credential the board holds reaches it — but the
+    /// board's App is the one that will be holding it on the box, which is why
+    /// this is asked *there* rather than from the laptop running `member add`.
+    /// A login GitHub has never heard of answers 404, and the caller says what
+    /// to do about that: the noreply address can always be pasted instead.
+    pub fn user(&self, login: &str) -> Result<GithubUser> {
+        let v = self.rest.get(&format!("/users/{login}"))?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("github's reply for `{login}` carried no account id"))?;
+        Ok(GithubUser {
+            // GitHub's own casing, for the same reason `repo` takes it: the
+            // address is minted from the login as the account spells it.
+            login: v
+                .get("login")
+                .and_then(Value::as_str)
+                .unwrap_or(login)
+                .to_string(),
+            id,
+        })
     }
 
     /// What GitHub says about one repo, under whatever credential is in force

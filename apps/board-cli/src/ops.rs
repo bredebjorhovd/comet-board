@@ -20,6 +20,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use comet_board::adopt::{Unadopted, git_remote, github_slug};
 use comet_board::config::{self, Paths, RoutingConfig};
+use comet_board::members::{Roster, Slot};
 use comet_board::model::{BoardState, Source};
 use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
@@ -1057,6 +1058,115 @@ pub fn print_write_result(cfg: &BoardConfig) {
             println!("  ✕ {p}");
         }
     }
+}
+
+// ---- members (the `[users]` map beside the slots, gh#162) ---------------
+
+/// The board host's saved agent-account logins, or `None` when the engine
+/// could not be asked.
+///
+/// Forwardable like the board calls, so `--device` asks the *box* which logins
+/// it has — which is the only device whose answer means anything here, since
+/// those are the subscriptions the dispatches spend.
+///
+/// `None` rather than an empty list on failure, deliberately: "this box has no
+/// slots" and "nobody could be asked" are different answers, and rendering the
+/// second as the first would tell every mapped teammate they need an account
+/// they may already have (gh#155).
+pub async fn agent_accounts(board: &Board) -> Option<Vec<comet_proto::AgentAccount>> {
+    // Offline list, as doctor's is: the ids and who they belong to, not a
+    // round of rate-limit probes against everybody's plan.
+    let reply = board
+        .client
+        .call(
+            methods::LIST_AGENT_ACCOUNTS,
+            board.params(serde_json::json!({})),
+        )
+        .await
+        .ok()?;
+    serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(reply)
+        .ok()
+        .map(|s| s.accounts)
+}
+
+/// One slot, as every line that names one spells it.
+fn slot_line(s: &Slot) -> String {
+    let who = s.email.as_deref().unwrap_or("login unreadable");
+    format!(
+        "{} · {} · {who}{}",
+        s.id,
+        runtime_name(s.harness),
+        if s.active { " · active" } else { "" }
+    )
+}
+
+/// The map, the slots, and the pairing between them.
+pub fn print_roster(roster: &Roster, host: Option<&str>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(roster)?);
+        return Ok(());
+    }
+    if let Some(h) = host {
+        println!("the board on {h}");
+    }
+    if roster.members.is_empty() {
+        println!(
+            "no `[users]` map — every dispatch commits under this box's own git identity, \
+             whoever released it"
+        );
+    }
+    for m in &roster.members {
+        match &m.author {
+            Some(a) => println!("{}  →  {} <{}>", m.user, a.name, a.email),
+            // The config error `problems()` already reports, said again where
+            // somebody is looking at the map: this entry authors nothing.
+            None => println!(
+                "{}  →  \"{}\" is not an address — those dispatches commit as the box",
+                m.user, m.value
+            ),
+        }
+        if m.author.is_some() && !m.noreply {
+            println!(
+                "    not a GitHub noreply address — attribution depends on it being on \
+                 that account, which nothing here can check"
+            );
+        }
+        // The pairing gh#162 is about. Only when the slots are known: a box
+        // that could not be asked must not accuse everybody of missing one.
+        match (roster.accounts_known, m.accounts.as_slice()) {
+            (_, [first, rest @ ..]) => {
+                println!("    account {}", slot_line(first));
+                for s in rest {
+                    println!("            {}", slot_line(s));
+                }
+            }
+            (true, []) => println!(
+                "    no agent account — their dispatches spend whichever subscription the \
+                 route names, or the box's own"
+            ),
+            (false, []) => println!("    agent account not checked — the engine did not answer"),
+        }
+    }
+    if !roster.unmapped.is_empty() {
+        // Not a fault: the box owner's own login lives here. It is the other
+        // half of the same pairing, and the answer to "why did their commit
+        // land as the box".
+        println!("\nslots belonging to nobody in the map:");
+        for s in &roster.unmapped {
+            println!("  {}", slot_line(s));
+        }
+    }
+    if !roster.accounts_known {
+        println!(
+            "\nthe engine could not be asked for this box's agent accounts, so no pairing \
+             above is known — start `comet` or `comet headless`"
+        );
+    }
+    println!(
+        "\nadd one:  comet-board member add <email> --github <login>\
+         \nthe rest: docs/teammate.md"
+    );
+    Ok(())
 }
 
 // ---- new ----------------------------------------------------------------
