@@ -695,7 +695,7 @@ mod tests {
                 attempt(20, 5, Some(Outcome::Cancelled), None),
             ],
         )];
-        let s = gather(&tasks, Some(7));
+        let mut s = gather(&tasks, Some(7));
         assert_eq!(s.daily.len(), 7);
         // Which local day each attempt lands in is not the point and must not
         // be assumed: at 00:05 the two are on opposite sides of midnight. The
@@ -721,6 +721,42 @@ mod tests {
                 .filter(|d| d.date != done_day && d.date != cancelled_day)
                 .all(|d| d.dispatches == 0),
             "every other day is present and empty"
+        );
+
+        // And what the chart makes of that (gh#226). A bucket per day was only
+        // half the promise: the other half is that a day with nothing in it is
+        // *drawn*, at zero height with a dash where its figure would be.
+        // Neither attempt reported tokens, so here every column is a quiet one.
+        let columns = comet_proto::view::stats::day_columns(&s.daily, &s.daily_tokens);
+        assert_eq!(columns.len(), 7);
+        assert!(columns.iter().all(|c| c.is_quiet() && c.value == "—"));
+        // A quiet bar still says what ran under it — the count the bars gave up
+        // is in the caption, and no dispatch is lost on the way there.
+        assert!(
+            columns
+                .iter()
+                .all(|c| c.caption.ends_with(&format!(" · {}", c.dispatches))),
+            "{:?}",
+            columns.iter().map(|c| &c.caption).collect::<Vec<_>>()
+        );
+        assert_eq!(columns.iter().map(|c| c.dispatches).sum::<usize>(), 2);
+        // Give one day some tokens and it is the only bar with height — the six
+        // around it stay present at zero rather than going missing, which is
+        // what made a week's work read as one lonely bar.
+        s.daily_tokens
+            .iter_mut()
+            .filter(|d| d.date == done_day)
+            .for_each(|d| d.usage = usage(90_000, 10_000, 0, 0));
+        let drawn = comet_proto::view::stats::day_columns(&s.daily, &s.daily_tokens);
+        let busy: Vec<&comet_proto::view::stats::DayColumn> =
+            drawn.iter().filter(|c| !c.is_quiet()).collect();
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].value, "100k");
+        assert_eq!(busy[0].fraction, 1.0);
+        assert_eq!(
+            drawn.iter().filter(|c| c.fraction == 0.0).count(),
+            6,
+            "the quiet days are present at zero height, not absent"
         );
     }
 

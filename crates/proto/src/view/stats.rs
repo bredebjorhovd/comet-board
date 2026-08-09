@@ -35,10 +35,10 @@ pub struct DayBucket {
     pub done: usize,
 }
 
-/// One day's tokens, for the series drawn under the dispatch chart. Same days
-/// and the same zero rule as [`DayBucket`] — the two series are generated from
-/// one date range so a reader comparing them index by index is comparing the
-/// same day.
+/// One day's tokens, which is what the day chart is drawn from (gh#226). Same
+/// days and the same zero rule as [`DayBucket`] — the two series are generated
+/// from one date range so a reader comparing them index by index is comparing
+/// the same day.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenDay {
@@ -48,6 +48,49 @@ pub struct TokenDay {
     /// nothing is zero here and blank on the coverage line — the page says
     /// which of the two it is once, at the top, rather than per bar.
     pub usage: TokenUsage,
+}
+
+/// One column of the day chart: how tall it is, and the two lines around it
+/// (gh#226).
+///
+/// **Height is tokens, and the dispatch count rides in the caption.** The chart
+/// used to plot dispatches, which is nearly flat and nearly meaningless — two
+/// dispatches can differ by twenty times in what they cost. Token volume is
+/// what actually varies between days, and it is what the spend block above is
+/// computed from, so the two blocks now tell one story instead of two.
+///
+/// Nothing here is a new number: [`DayBucket`] and [`TokenDay`] are the same
+/// two series the board already gathered, zipped by date so a spike cannot land
+/// under the wrong day even if a board answered with series of different
+/// lengths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayColumn {
+    /// `YYYY-MM-DD`, box-local, from [`DayBucket::date`].
+    pub date: String,
+    /// What the day spent — the bar's height.
+    pub tokens: u64,
+    /// What ran that day — the number in the caption.
+    pub dispatches: usize,
+    /// The bar's share of the chart, `0.0..=1.0`, against the busiest day.
+    pub fraction: f32,
+    /// What rides above the bar: `1.31M`, or `—` on a day with nothing to show.
+    pub value: String,
+    /// And under it: `Mon 3 · 2`.
+    pub caption: String,
+}
+
+impl DayColumn {
+    /// A day with no tokens on it — drawn as a hairline where the bar would be,
+    /// never as an absent column. A seven-day window on a board that worked one
+    /// day is a shape; one lonely bar reads as six days the board forgot.
+    ///
+    /// It does not distinguish "nothing ran" from "what ran reported nothing":
+    /// the caption's dispatch count is the first of those, and the coverage line
+    /// at the top of the block is the second, said once rather than per bar.
+    pub fn is_quiet(&self) -> bool {
+        self.tokens == 0
+    }
 }
 
 /// One row of a tally — a workspace, a runtime, a source, a person.
@@ -708,14 +751,88 @@ pub fn bar_fraction(value: usize, peak: usize) -> f32 {
     (value as f32 / peak as f32).clamp(0.0, 1.0)
 }
 
-/// The busiest bucket in a day series — the scale every bar is drawn against.
+/// [`bar_fraction`] for a token count, which needs the whole `u64` range: a
+/// week can put nine figures through one bar.
+pub fn token_fraction(value: u64, peak: u64) -> f32 {
+    if peak == 0 {
+        return 0.0;
+    }
+    (value as f64 / peak as f64).clamp(0.0, 1.0) as f32
+}
+
+/// The busiest bucket in a day series — still what the dispatch counts are
+/// scaled against wherever one is drawn (the phone's chart, until gh#181).
 pub fn peak_dispatches(daily: &[DayBucket]) -> usize {
     daily.iter().map(|d| d.dispatches).max().unwrap_or(0)
 }
 
-/// The same, for the token series.
+/// The same, for the token series — the scale the desktop day chart is drawn
+/// against, and the figure its peak annotation reads out (gh#226).
 pub fn peak_tokens(daily: &[TokenDay]) -> u64 {
     daily.iter().map(|d| d.usage.total()).max().unwrap_or(0)
+}
+
+/// A bucket date as a chart caption says it: `Mon 3`.
+///
+/// Weekday and day-of-month, not the ISO date: under a bar, `2026-08-03` is ten
+/// characters of which two are news, and the weekday is the half of the date a
+/// reader is actually pattern-matching on. A date that will not parse is
+/// returned as it came rather than guessed at.
+pub fn short_day(date: &str) -> String {
+    use chrono::Datelike as _;
+    match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(day) => format!("{} {}", day.format("%a"), day.day()),
+        Err(_) => date.to_string(),
+    }
+}
+
+/// How many columns a day chart can caption before the labels collide.
+///
+/// A week fits comfortably and a month does not — at eleven pixels a caption is
+/// about fifty wide, and thirty of those want a chart no window is. Past this
+/// the columns are drawn bare and the axis under them carries the range, which
+/// is the shape a month is read for anyway.
+pub const CAPTIONED_COLUMNS: usize = 10;
+
+/// Whether a chart of `columns` days can carry a caption under every bar.
+pub fn day_captions_fit(columns: usize) -> bool {
+    columns <= CAPTIONED_COLUMNS
+}
+
+/// The day chart, ready to draw (gh#226): one column per day in the window,
+/// oldest first, quiet days included.
+///
+/// Driven by the dispatch series because that is the one built from the
+/// window's whole calendar; the tokens are looked up by date rather than by
+/// index, so two series that disagreed in length would draw short rather than
+/// draw a spike under the wrong day.
+pub fn day_columns(daily: &[DayBucket], daily_tokens: &[TokenDay]) -> Vec<DayColumn> {
+    let peak = peak_tokens(daily_tokens);
+    let spent: BTreeMap<&str, u64> = daily_tokens
+        .iter()
+        .map(|d| (d.date.as_str(), d.usage.total()))
+        .collect();
+    daily
+        .iter()
+        .map(|day| {
+            let tokens = spent.get(day.date.as_str()).copied().unwrap_or(0);
+            DayColumn {
+                date: day.date.clone(),
+                tokens,
+                dispatches: day.dispatches,
+                fraction: token_fraction(tokens, peak),
+                // An em dash, never `0` — the same rule the totals follow. A
+                // day that spent nothing has no figure to show, and a zero
+                // printed above a hairline is a number nobody needs to read.
+                value: if tokens == 0 {
+                    "—".to_string()
+                } else {
+                    human_tokens(tokens)
+                },
+                caption: format!("{} · {}", short_day(&day.date), day.dispatches),
+            }
+        })
+        .collect()
 }
 
 /// A duration in minutes, said the way a person would: `48m`, `3h 20m`, `2d 4h`.
@@ -1052,6 +1169,121 @@ mod tests {
         ];
         assert_eq!(peak_tokens(&daily), 440);
         assert_eq!(peak_tokens(&[]), 0);
+    }
+
+    // -- the day chart (gh#226) ----------------------------------------------
+
+    fn bucket(date: &str, dispatches: usize, done: usize) -> DayBucket {
+        DayBucket {
+            date: date.to_string(),
+            dispatches,
+            done,
+        }
+    }
+
+    fn spent_on(date: &str, tokens: u64) -> TokenDay {
+        TokenDay {
+            date: date.to_string(),
+            usage: usage(tokens, 0, 0, 0),
+        }
+    }
+
+    #[test]
+    fn a_day_column_is_as_tall_as_what_it_spent_and_says_what_it_ran() {
+        // Two dispatches and 3.1M tokens on the Monday, three dispatches and a
+        // twentieth of that on the Tuesday: the count is nearly flat and the
+        // volume is not, which is the whole reason the bar plots the second.
+        let daily = vec![bucket("2026-08-03", 2, 2), bucket("2026-08-04", 3, 1)];
+        let tokens = vec![
+            spent_on("2026-08-03", 3_100_000),
+            spent_on("2026-08-04", 155_000),
+        ];
+        let columns = day_columns(&daily, &tokens);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].value, "3.10M");
+        assert_eq!(columns[0].caption, "Mon 3 · 2");
+        assert_eq!(columns[0].fraction, 1.0, "the busiest day is the scale");
+        assert_eq!(columns[1].value, "155k");
+        assert_eq!(columns[1].caption, "Tue 4 · 3");
+        assert_eq!(columns[1].fraction, 0.05);
+        assert!(columns.iter().all(|c| !c.is_quiet()));
+    }
+
+    /// The failure this chart is drawn against: a week where one day worked
+    /// must read as one busy day in seven, not as a single lonely bar.
+    #[test]
+    fn a_quiet_day_is_a_column_with_a_dash_over_it_and_not_an_absent_one() {
+        let daily = vec![
+            bucket("2026-08-03", 2, 2),
+            bucket("2026-08-04", 0, 0),
+            // Dispatched and never metered: still a quiet column, because the
+            // bar plots tokens — and the caption still says two ran.
+            bucket("2026-08-05", 2, 1),
+        ];
+        let columns = day_columns(&daily, &[spent_on("2026-08-03", 40_000)]);
+        assert_eq!(columns.len(), 3, "every day in the window draws");
+        assert!(!columns[0].is_quiet());
+        assert!(columns[1].is_quiet());
+        assert_eq!(columns[1].value, "—", "a dash, never a zero");
+        assert_eq!(columns[1].caption, "Tue 4 · 0");
+        assert_eq!(columns[1].fraction, 0.0);
+        assert!(columns[2].is_quiet());
+        assert_eq!(
+            columns[2].caption, "Wed 5 · 2",
+            "unmetered work still says what ran"
+        );
+    }
+
+    #[test]
+    fn a_window_that_metered_nothing_still_draws_its_days() {
+        // No peak to scale against is not a reason to draw nothing: the days
+        // are the shape, and the coverage line above says why they are flat.
+        let daily = vec![bucket("2026-08-03", 1, 1), bucket("2026-08-04", 2, 0)];
+        let columns = day_columns(&daily, &[]);
+        assert_eq!(columns.len(), 2);
+        assert!(columns.iter().all(|c| c.is_quiet() && c.fraction == 0.0));
+        assert_eq!(columns[1].caption, "Tue 4 · 2");
+        assert!(day_columns(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_column_takes_its_tokens_by_date_and_not_by_position() {
+        // A board that answered with a shorter token series must not put the
+        // spike under the wrong day.
+        let daily = vec![
+            bucket("2026-08-03", 1, 1),
+            bucket("2026-08-04", 1, 1),
+            bucket("2026-08-05", 1, 1),
+        ];
+        let columns = day_columns(&daily, &[spent_on("2026-08-05", 900)]);
+        assert_eq!(columns[0].tokens, 0);
+        assert_eq!(columns[2].tokens, 900);
+        assert_eq!(columns[2].value, "900");
+    }
+
+    #[test]
+    fn a_bar_scales_over_the_whole_token_range() {
+        // Nine figures through one bar is an ordinary week, and the `usize`
+        // rule beside this one would have to round them.
+        assert_eq!(token_fraction(0, 0), 0.0);
+        assert_eq!(token_fraction(5, 0), 0.0, "no peak is no bar, not a crash");
+        assert_eq!(token_fraction(1_000_000_000, 4_000_000_000), 0.25);
+        assert_eq!(token_fraction(9, 4), 1.0, "clamped, never overdrawn");
+    }
+
+    #[test]
+    fn a_caption_is_a_weekday_and_a_date_that_will_not_parse_is_left_alone() {
+        assert_eq!(short_day("2026-08-03"), "Mon 3");
+        assert_eq!(short_day("2026-12-25"), "Fri 25");
+        assert_eq!(short_day("whenever"), "whenever");
+    }
+
+    #[test]
+    fn a_month_of_columns_goes_bare_rather_than_illegible() {
+        assert!(day_captions_fit(1));
+        assert!(day_captions_fit(7), "the default window is captioned");
+        assert!(day_captions_fit(CAPTIONED_COLUMNS));
+        assert!(!day_captions_fit(30), "a month reads as a shape");
     }
 
     // -- the spend headline (gh#182 rendered by gh#179) -----------------------
