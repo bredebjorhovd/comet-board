@@ -21,6 +21,38 @@ enum DocDisk {
         return directory.appendingPathComponent("\(safe).loro")
     }
 
+    /// On-disk id for the per-user workspace doc — deliberately NOT the room
+    /// name (gh#148).
+    ///
+    /// A room generation bump (`ws3/…` → `ws4/…`) abandons the edge's storage
+    /// on purpose, and that is only safe because every device still holds the
+    /// doc locally to re-seed the virgin room from. Keying this file by the
+    /// room name made the local copy die WITH the room it was supposed to
+    /// outlive: a bump would have orphaned the snapshot, cost the sidebar its
+    /// instant local-first render, and lost any edit made while offline. The
+    /// desktop engine has always kept these separate (`WORKSPACE_DOC_ID =
+    /// "workspace2"` is stable across every room generation); this matches it,
+    /// name and all.
+    static func workspaceId(orgId: String, userId: String) -> String {
+        "workspace2/\(orgId)/\(userId)"
+    }
+
+    /// Hydrate the workspace doc, adopting the pre-gh#148 file if that is all
+    /// this device has — the one-time cost of having keyed it by room name.
+    @discardableResult
+    static func loadWorkspace(into doc: LoroDoc, orgId: String, userId: String) -> Bool {
+        let id = workspaceId(orgId: orgId, userId: userId)
+        if load(into: doc, id: id) { return true }
+        let legacy = "ws3/\(orgId)/\(userId)"
+        guard load(into: doc, id: legacy) else { return false }
+        // Adopt it under the stable name, then drop the old file: left behind,
+        // it no longer matches the keep-rule in `prune` and would be LRU-evicted
+        // as if it were a session snapshot.
+        save(doc: doc, id: id)
+        try? FileManager.default.removeItem(at: url(for: legacy))
+        return true
+    }
+
     /// Import the saved snapshot, if any. Returns whether anything loaded.
     @discardableResult
     static func load(into doc: LoroDoc, id: String) -> Bool {
@@ -35,12 +67,18 @@ enum DocDisk {
     }
 
     /// LRU-prune session snapshots (the workspace doc is always kept).
+    ///
+    /// The keep-rule matches the STABLE workspace file name, not a room
+    /// generation. It used to spell `ws3_`, which made it one more guard that a
+    /// generation bump would have silently switched off (gh#148) — and this one
+    /// fails destructively: an unprotected workspace snapshot is not merely
+    /// force-trimmed, it is deleted as the 81st-oldest session.
     static func prune(keep: Int) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: directory,
                                                       includingPropertiesForKeys: [.contentModificationDateKey])
         else { return }
-        let sessions = files.filter { !$0.lastPathComponent.hasPrefix("ws3_") }
+        let sessions = files.filter { !$0.lastPathComponent.hasPrefix("workspace2_") }
         guard sessions.count > keep else { return }
         let sorted = sessions.sorted {
             let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast

@@ -376,7 +376,7 @@ impl Auth {
     }
 
     /// The signed-in user id — the identity that scopes workspace rooms
-    /// (`ws3/{orgId}/{userId}`) and local storage (`orgs/{org}/{user}/`).
+    /// (`ws4/{orgId}/{userId}`) and local storage (`orgs/{org}/{user}/`).
     /// Dev mode mirrors the edge's dev-bearer parsing (`user@org` → `user`,
     /// a bare token IS the user id). `None` = signed out (WorkOS only).
     pub fn user_id(&self) -> Option<String> {

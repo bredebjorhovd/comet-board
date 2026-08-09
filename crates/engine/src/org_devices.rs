@@ -1,6 +1,6 @@
 //! OrgDevices — the org-wide device registry (gh#66).
 //!
-//! The workspace doc is deliberately per-user (`ws3/{orgId}/{userId}`): spaces,
+//! The workspace doc is deliberately per-user (`ws4/{orgId}/{userId}`): spaces,
 //! chats and sessions are private to the person who made them. Devices are the
 //! one thing that cannot be, because a device is how a *team* reaches shared
 //! work. A teammate signing in on their own laptop starts with an empty

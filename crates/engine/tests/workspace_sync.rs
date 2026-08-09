@@ -472,7 +472,7 @@ async fn two_engines_converge_through_a_real_workspace_room() {
             .expect("engine core assembles")
     };
 
-    // Workspace docs are per-user (`ws3/{org}/{user}`): convergence is across
+    // Workspace docs are per-user (`ws4/{org}/{user}`): convergence is across
     // ONE user's devices — two engines, same user, different device ids.
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();

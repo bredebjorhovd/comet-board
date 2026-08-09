@@ -193,9 +193,14 @@ Sync/
   RoomClient.swift      room.rs port: join with oplog VV, snapshot backfill,
                         resubmit-from-server-VV, DocUpdate+Ack, fragments,
                         %EPH presence sub-room, ping/pong lease, backoff
-  WorkspaceStore.swift  ws3/{org}/{user} mirror: devices/spaces/chats/sessions
+  WorkspaceStore.swift  ws4/{org}/{user} mirror: devices/spaces/chats/sessions
                         rows, presence heartbeats, viewer-side writes
-                        (createChat, archive, lastSeenAt, own device row)
+                        (createChat, archive, lastSeenAt, own device row).
+                        The room generation is a label only — the on-disk
+                        snapshot is keyed `workspace2/{org}/{user}` and must
+                        NOT follow it (gh#148): abandoning a room's edge
+                        storage is survivable precisely because the local
+                        copy outlives it and re-seeds the new one
   SessionStore.swift    session doc mirror: entries/parts (continuations
                         joined), command ledger appends (rule 1), host nudge
 Markdown/

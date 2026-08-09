@@ -19,7 +19,8 @@
  *   POST /append/:chatId              — repair: merge-import a Loro update
  *   POST /share/:chatId               — owner shares the chat with their org
  *   GET  /share/:chatId               — the chat's sharing state
- *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss)
+ *   GET  /workspace/:orgId/ws         — workspace-doc room (wss); the room name
+ *                                       is worker-internal, see `rooms.ts`
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
  *   GET  /workspace/:orgId/presence   — devices the room sees now (gh#145)
  *   GET  /workspace/:orgId/snapshot   — repair: read the workspace doc snapshot
@@ -40,6 +41,7 @@ import { handleAuthRoute } from "./auth-routes";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
+import { orgDeviceRoom, workspaceRoom } from "./rooms";
 import installSh from "./install.sh";
 
 export { SessionRoom, DeviceRoom };
@@ -196,11 +198,15 @@ export default {
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
       if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      // `ws3` = the per-user privacy destructive break (`ws2` was the spaces
-      // overhaul): a fresh DO instance with an empty doc; legacy org-wide
-      // rooms are orphaned (hibernated, ~zero cost). URL path stays
-      // `/workspace/:orgId/*`.
-      const room = `ws3/${orgId}/${auth.userId}`;
+      // `ws4` = the 2026-08-04 incident break (gh#148): ws3's storage was left
+      // with causally-broken update rows by the abort-thrash loop and could
+      // not be trusted again even after /reset-log, so the name bump allocates
+      // a virgin DO. Orphaned ws3 rooms are simply never dialed again
+      // (hibernated, ~zero cost). Nothing is copied server-side: every device
+      // holds a full local replica and re-seeds the empty room on first join.
+      // The name is worker-internal — the URL path stays `/workspace/:orgId/*`
+      // and clients never spell a generation. See `rooms.ts`.
+      const room = workspaceRoom(orgId, auth.userId);
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);
@@ -263,11 +269,15 @@ export default {
     //    of them, and presence rides the room's EphemeralStore as usual.
     //
     //    Deliberately devices ONLY. Spaces, chats and sessions stay per-user in
-    //    `ws3/{orgId}/{userId}`; org visibility is opt-in per chat (`/share`).
+    //    the workspace room; org visibility is opt-in per chat (`/share`).
+    //
+    //    NOT bumped alongside the workspace doc (gh#148): this room has its own
+    //    lifetime, it never carried ws3's damaged storage, and abandoning it
+    //    would blank the only index by which a teammate can find the box.
     if (parts[0] === "org" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "devices") {
       const orgId = parts[1];
       if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      const room = `orgdev1/${orgId}`;
+      const room = orgDeviceRoom(orgId);
       if (parts[3] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);

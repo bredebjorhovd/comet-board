@@ -350,7 +350,7 @@ half.
 | `b019439` | 08-04 | Workspace rooms force-trim only at aged checkpoints, never the live frontier | `f764a4b` | taken — extended to our registry in `d864d36`, below |
 | `c1243c5` | 08-04 | Penalty-box devices whose imports keep failing — stop the doomed-push DOS | `a52091f` | taken |
 | `79c8e22` | 08-04 | Expose GET /workspace/:orgId/snapshot for doc repair reads | `d53feaa` | taken (adapted: our `forward` takes the whole `Verified`) |
-| `fb6492c` | 08-04 | Retire ws3 workspace rooms — ws4 allocates virgin DO storage | — | **declined** — live-data migration, not a code fix; separate ticket |
+| `fb6492c` | 08-04 | Retire ws3 workspace rooms — ws4 allocates virgin DO storage | this branch | taken (gh#148, after gh#146 — see *The ws4 break* below) |
 | `3a89e68` | 08-04 | Recycle DOs: clear stale in-memory import penalties after fleet doc flatten | — | **empty upstream** — zero file changes; its subject describes `fb6492c`'s fallout. Nothing to carry |
 | `02002cf` | 08-05 | Salvage importable updates before striking; small-payload penalty probe; attributed /stats | `7533818` | taken (conflict: gh#66 read gate inside their new try/catch) |
 | `469d18a` | 08-05 | Fold the update log when it dwarfs the folded state, not only at fixed budgets | `ee75b07` | taken — then largely reverted by `6f19b76`; kept in order so we land where upstream did |
@@ -405,6 +405,95 @@ checking a real room.
 **Where the next sync starts:** everything through `6cee4af` (2026-08-05) in
 `edge/` is now ours. `upstream/main` at `433ff68` (v0.1.26) is still ahead by the
 registry-sidebar, iOS, ACP-harness and terminal work — none of it edge.
+
+### The ws4 break (gh#148)
+
+`fb6492c` was held back from the gh#146 cluster on the grounds that it is a
+live-data migration rather than a code fix. Both halves of that turned out to
+be true, and they point opposite ways: it **is** the only commit in the cluster
+that changes which storage the fleet uses, and there is **nothing to migrate**.
+Taken here, sequenced after gh#146 so the bump lands on an edge that has stopped
+damaging its own storage — a virgin room handed to the old trim/poison bugs
+would simply become the next room worth abandoning.
+
+**What actually moves: nothing.** A room name is the Durable Object's identity
+(`idFromName`), so `ws3/…` → `ws4/…` allocates an empty object and orphans the
+old one. That is survivable because the edge is not authoritative for the
+workspace doc — every signed-in device holds a complete local replica
+(`WORKSPACE_DOC_ID = "workspace2"` in its own `DocsStore`). The first device to
+join the empty room hits the ordinary resubmit-from-version-vector path in
+`RoomActor::on_join_ok` against a server whose version vector is empty, uploads
+its whole doc, and the rest merge in by CRDT. No script, no cutover window, no
+operator step. Pinned by
+`abandoning_a_workspace_rooms_storage_is_reseeded_from_the_device`
+(`crates/engine/tests/edge_reconnect.rs`), which deletes the room's server-side
+doc under a running engine and requires the content back untouched.
+
+The corollary is the rule that matters more than the bump: **a room generation
+bump must never bump the local snapshot row id.** They look like the same kind
+of break and are not. Do both and there is nothing left to re-seed from, and an
+edge-side break that loses nothing becomes real data loss on every device at
+once. Recorded on `WORKSPACE_DOC_ID` itself, where somebody bumping the next
+generation will actually read it.
+
+**The org device registry does not move.** `orgdev1/{orgId}` is a separate room
+with its own lifetime; it never carried ws3's damage, and abandoning it would
+blank the one index a teammate needs before they can address the box at all
+(gh#66) — the workspace doc cannot stand in for it, being per-user by
+construction. Its generation counter is therefore independent, not a mirror of
+the workspace doc's.
+
+**A client pinned to ws3 is not an outage.** Worth stating explicitly because
+our engines retry a failed join *forever*, so a mismatch that did bite would be
+silent — no error, no log line, just a sidebar that never syncs. It does not
+bite: clients dial `/workspace/{orgId}/ws`, which names no generation, and the
+Worker derives the room from the caller's own auth claim. The room id inside
+protocol frames is an echo label neither side routes on — the DO stamps its
+`chatId` meta from the Worker's query param at upgrade time, before any
+JoinRequest exists, and the Rust client discards the room id on every inbound
+frame (`Ack` carries a `BatchId`, not a room). An engine still saying `ws3/…`
+therefore lands in the ws4 room and converges. We bumped
+`workspace_host.rs`'s derived label anyway, for logs and `EdgeHealth`, and said
+in the comment that it is hygiene rather than correctness — the next reader's
+obvious question is whether the two must match, and the answer is load-bearing.
+
+**iOS was the one place the bump could actually have destroyed something**, and
+it is the general lesson from gh#146 again: *an upstream change scoped by room
+name does not know about the clients only we have.* Upstream bumps one string in
+one Worker. Our iOS app used the room id for two jobs — the frame label, and the
+key for its on-device snapshot (`DocDisk`) — so bumping it naively would have
+orphaned the local replica: no instant sidebar render, and any edit made offline
+gone. Worse, `DocDisk.prune` protected the workspace snapshot from LRU eviction
+by matching the literal prefix `ws3_`; under a `ws4_` name the workspace doc
+becomes an ordinary session snapshot and is **deleted** as the 81st-oldest file.
+That is the `4aacc6d` failure mode exactly — a guard hard-coding the generation —
+except this one fails destructively rather than by force-trimming. So the disk
+key is now `workspace2/{org}/{user}`, stable across every room generation and
+named to match the engine's `WORKSPACE_DOC_ID`; the prune rule matches that
+stable name; and `loadWorkspace` adopts a pre-gh#148 `ws3_…` file once so
+nothing is lost on upgrade. The frame label moved to `ws4` alongside.
+
+That iOS session rooms have always joined as the bare `chatId` while the edge
+names those objects `s2/{chatId}` is, incidentally, the shipped proof that the
+frame label routes nothing.
+
+**`4aacc6d` was a prerequisite, and we already had it.** It exists precisely
+because a guard hard-coded the generation: `b019439` refused live-frontier
+force-trims on `ws3/` by literal string, and when upstream bumped to `ws4/` the
+protection evaporated silently and re-broke the same incident hours later. We
+took it in gh#146 as `3809996`, and `d864d36` generalised it to
+`isConcurrentWriteRoom` covering `orgdev{n}/` too. Landing `fb6492c` without it
+would have shipped exactly upstream's second outage. To stop that recurring by
+inspection, room names now come from `edge/src/rooms.ts` — the generation is one
+named constant instead of a literal in a route — and `rooms.test.ts` asserts the
+generator and the guard still agree, for the current generation and for the next
+several nobody has minted yet.
+
+Not verified live: the same caveat as the rest of the cluster. The bump is
+observable the moment it deploys — every workspace room in the fleet cold-starts
+empty and re-fills from devices — so the thing to watch on the first deploy is
+that `GET /workspace/{orgId}/stats` shows a room re-seeding rather than staying
+empty, which would mean no device won the race to upload.
 
 ### What we owe upstream
 

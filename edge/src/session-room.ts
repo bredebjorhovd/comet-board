@@ -3,7 +3,7 @@
  * hibernatable WebSockets (design §2, §3.1). Two doc kinds share this class:
  * chat session docs (room name = chatId, claim-on-first-join ownership, plus
  * the org-shared opt-in below) and org-wide docs (the per-user workspace doc
- * `ws3/{orgId}/{userId}` and the org device registry `orgdev1/{orgId}` —
+ * `ws4/{orgId}/{userId}` and the org device registry `orgdev1/{orgId}` —
  * org-membership authz enforced by the Worker, so the DO sees the
  * ROOM_KIND_HEADER stamp and skips ownership entirely).
  *

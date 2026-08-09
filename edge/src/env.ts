@@ -34,7 +34,7 @@ export const AUTH_USER_HEADER = "x-comet-auth-user";
 export const AUTH_ORG_HEADER = "x-comet-auth-org";
 
 /** Header the Worker stamps on requests forwarded into org-wide doc rooms —
- * the per-user workspace doc (`ws3/{orgId}/{userId}`) and the org device
+ * the per-user workspace doc (`ws4/{orgId}/{userId}`) and the org device
  * registry (`orgdev1/{orgId}`). Membership (JWT org claim == orgId) is
  * enforced at the Worker; the SessionRoom DO sees this and skips its per-chat
  * claim-on-first-join ownership discipline for the room. */
