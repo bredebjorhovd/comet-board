@@ -28,7 +28,7 @@ use comet_rpc::methods;
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, EngineHandle};
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator};
 use super::view::{
@@ -898,11 +898,13 @@ impl TerminalPanel {
                         let chat_drag = chat_owned.clone();
                         let ghost_title = title.clone();
                         // Comet tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
-                        // terminal glyph + label + close; active = white/8 wash.
-                        let (text_color, bg) = if selected {
-                            (theme.text, theme.white_alpha(0.08))
+                        // terminal glyph + label + close. The selected tab
+                        // takes the app's selected-row surface (gh#175) — a
+                        // tab strip is a list you also walk by keyboard.
+                        let text_color = if selected {
+                            theme.text
                         } else {
-                            (theme.text_subtle, gpui::transparent_black())
+                            theme.text_subtle
                         };
                         let close_btn = div()
                             .id(("terminal-tab-close", key))
@@ -937,12 +939,7 @@ impl TerminalPanel {
                             .pr(px(4.0))
                             .rounded(px(Theme::RADIUS_ROW))
                             // comet terminal-panel.tsx tab: `transition-colors`.
-                            .bg(motion::hover_blend(
-                                &format!("term-tab-{key}"),
-                                bg,
-                                theme.element_hover,
-                            ))
-                            .on_hover(motion::hover_listener(format!("term-tab-{key}")))
+                            .list_row(&theme, Bed::Shell, selected, format!("term-tab-{key}"))
                             .text_size(px(Theme::TEXT_DENSE))
                             .text_color(text_color)
                             .cursor_pointer()

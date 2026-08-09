@@ -47,6 +47,7 @@ use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
+use crate::theme::Bed;
 use chrono::DateTime;
 use comet_proto::view::board;
 use comet_proto::view::needs::{self as needs_view};
@@ -940,16 +941,6 @@ impl Shell {
         let qualifier: Option<SharedString> = title.qualifier.clone().map(Into::into);
         let ghost_name: SharedString = title.line().into();
         let fade_key = format!("space-row-{id}");
-        let rest_bg = if selected {
-            theme.glass_selected_bg()
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text_muted
-        };
         let select_id = id.clone();
         let menu_id = id.clone();
         let chevron_id = id.clone();
@@ -963,10 +954,7 @@ impl Shell {
             .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
-            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-            .on_hover(motion::hover_listener(fade_key))
+            .list_row(theme, Bed::Shell, selected, fade_key)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_space(select_id.clone(), cx);
@@ -1220,16 +1208,6 @@ impl Shell {
                 .into_any_element()
         };
         let fade_key = format!("chat-row-{id}");
-        let rest_bg = if selected {
-            theme.glass_selected_bg()
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text_muted
-        };
         let select_id = id.clone();
         let menu_id = id.clone();
         div()
@@ -1240,10 +1218,7 @@ impl Shell {
             .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
-            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-            .on_hover(motion::hover_listener(fade_key))
+            .list_row(theme, Bed::Shell, selected, fade_key)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 let id = select_id.clone();
@@ -1442,16 +1417,6 @@ impl Shell {
         };
         let subline = theme.text_subtle;
         let fade_key = format!("need-row-{}", need.chat_id);
-        let rest_bg = if selected {
-            theme.glass_selected_bg()
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text_muted
-        };
         let chat_id = need.chat_id.clone();
 
         div()
@@ -1462,10 +1427,7 @@ impl Shell {
             .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
-            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-            .on_hover(motion::hover_listener(fade_key))
+            .list_row(theme, Bed::Shell, selected, fade_key)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 let id = chat_id.clone();
@@ -1529,16 +1491,6 @@ impl Shell {
 
         let subline = theme.text_subtle;
         let fade_key = format!("orch-slot-{}", slot.chat_id);
-        let rest_bg = if selected {
-            theme.glass_selected_bg()
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text_muted
-        };
         let chat_id = slot.chat_id.clone();
         let menu_id = slot.chat_id.clone();
         // The ◆ is identity; state is carried honestly beside it — the spinner
@@ -1614,10 +1566,7 @@ impl Shell {
                 .rounded(px(Theme::RADIUS_ROW))
                 .px(px(Theme::SPACE_SM))
                 .py(px(6.0))
-                .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-                .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
-                .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-                .on_hover(motion::hover_listener(fade_key))
+                .list_row(theme, Bed::Shell, selected, fade_key)
                 .cursor_pointer()
                 // Opening it opens the thread — and marks it seen, the synced
                 // marker that clears the badge on every device.
@@ -1820,16 +1769,6 @@ impl Shell {
         );
         let subline = theme.text_subtle;
         let fade_key = format!("running-row-{}", row.chat_id);
-        let rest_bg = if selected {
-            theme.glass_selected_bg()
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text_muted
-        };
         let chat_id = row.chat_id.clone();
 
         div()
@@ -1841,10 +1780,7 @@ impl Shell {
             .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
-            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-            .on_hover(motion::hover_listener(fade_key))
+            .list_row(theme, Bed::Shell, selected, fade_key)
             .cursor_pointer()
             // Opening it opens the transcript, which is where answering it
             // happens. `select_chat` lands in the chat's own space on its own,
@@ -1903,15 +1839,8 @@ impl Shell {
             accent,
         );
 
-        let (hover, text) = (theme.element_hover, theme.text);
         let subline = theme.text_subtle;
         let fade_key = format!("agent-row-{}", agent.chat_id);
-        let rest_bg = if selected {
-            theme.glass_selected_bg()
-        } else {
-            theme.wash(0.0)
-        };
-        let rest_text = if selected { text } else { theme.text_muted };
         let chat_id = agent.chat_id.clone();
         // Past the cap the counter IS the warning: gh#70's clock will interrupt
         // this agent, and the number is the reason.
@@ -1929,10 +1858,7 @@ impl Shell {
             .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover))
-            .when(selected, |el| el.shadow(theme.glass_selected_shadows()))
-            .on_hover(motion::hover_listener(fade_key))
+            .list_row(theme, Bed::Shell, selected, fade_key)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 let id = chat_id.clone();
@@ -3268,7 +3194,6 @@ impl Shell {
             .is_some_and(|(_, online)| !online);
         let picked = row.clone();
         popover::menu_row_nav(theme, false, highlighted, format!("add-space-repo-{ix}"))
-            .when(highlighted, |el| el.shadow(theme.glass_selected_shadows()))
             .id(("add-space-repo", ix))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.add_space_pick_repo(picked.clone(), cx);
@@ -3422,15 +3347,15 @@ impl Shell {
                     .items_center()
                     .gap(px(8.0))
                     .text_size(px(Theme::TEXT_DENSE))
-                    .when(selected, |el| {
-                        el.bg(theme.glass_selected_bg())
-                            .shadow(theme.glass_selected_shadows())
-                            .text_color(theme.text)
+                    // Frozen once the question is answered: the row keeps its
+                    // selected surface but stops offering a hover.
+                    .when(!asking, |el| {
+                        let paint = theme.row(Bed::Shell, selected);
+                        el.bg(paint.rest).shadow(paint.ring).text_color(paint.text)
                     })
-                    .when(!selected, |el| el.text_color(theme.text_muted))
                     .when(asking, |el| {
                         el.cursor_pointer()
-                            .hover(|s| s.bg(theme.element_hover))
+                            .list_row(theme, Bed::Shell, selected, format!("add-space-host-{ix}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(flow) = this.add_space.as_mut() {
                                     flow.target = ix;
@@ -3798,9 +3723,6 @@ impl Shell {
                                 ix == active,
                                 format!("add-space-folder-{ix}"),
                             )
-                            // The active-tab/session selection language: the wash
-                            // plus the ring-only inset outline.
-                            .when(ix == active, |el| el.shadow(theme.glass_selected_shadows()))
                             .id(("add-space-folder", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.add_space_descend(full.clone(), is_repo, cx);
@@ -3903,17 +3825,12 @@ impl Shell {
                     .gap(px(8.0))
                     .text_size(px(Theme::TEXT_DENSE))
                     .cursor_pointer()
-                    .when(is_active, |el| {
-                        // The sidebar's selection language: glass wash +
-                        // ring-only inset outline.
-                        el.bg(theme.glass_selected_bg())
-                            .shadow(theme.glass_selected_shadows())
-                            .text_color(theme.text)
-                    })
-                    .when(!is_active, |el| {
-                        el.text_color(theme.text_muted)
-                            .hover(|s| s.bg(theme.element_hover))
-                    })
+                    .list_row(
+                        theme,
+                        Bed::Shell,
+                        is_active,
+                        format!("add-space-device-{ix}"),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.add_space_pick_device(pick.clone(), cx);
                     }))

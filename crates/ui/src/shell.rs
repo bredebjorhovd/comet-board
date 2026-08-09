@@ -49,7 +49,7 @@ use crate::state::{
     org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 use crate::transcript::{self, Transcript};
 
 // `pub(crate)` for one thing only: `spaces::status_dot_color`, the sidebar's
@@ -1941,17 +1941,14 @@ impl Shell {
                                 .px(px(Theme::SPACE_SM))
                                 .py(px(6.0))
                                 .text_size(px(Theme::TEXT_BODY))
-                                .when(selected, |el| {
-                                    el.bg(theme.wash(0.17))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                })
-                                .text_color(if selected {
-                                    theme.text
-                                } else {
-                                    theme.text_muted
-                                })
+                                .when(selected, |el| el.font_weight(gpui::FontWeight::MEDIUM))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme.wash(0.11)).text_color(theme.text))
+                                .list_row(
+                                    &theme,
+                                    Bed::Shell,
+                                    selected,
+                                    format!("settings-nav-{}", item.label()),
+                                )
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )

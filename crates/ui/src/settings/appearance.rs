@@ -10,7 +10,7 @@ use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px};
 
 use crate::settings::widgets;
 use crate::state::AppState;
-use crate::theme::{Theme, ThemeChoice};
+use crate::theme::{Bed, ListRow as _, Theme, ThemeChoice};
 
 /// A theme change the shell must apply + persist.
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +63,17 @@ impl gpui::Render for AppearancePage {
                 .py(px(16.0))
                 .min_h(px(72.0))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.wash(0.06)))
+                // The chosen theme is a selected row in a card that is WHITE
+                // in one of the two options this page offers: it steps down
+                // into the card and takes the hairline (gh#175). The radio
+                // still marks it — but the row no longer relies on a 16px
+                // glyph to say which one is yours.
+                .list_row(
+                    &theme,
+                    Bed::Card,
+                    selected,
+                    format!("appearance-row-{option}"),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| this.set(option, cx)))
                 .child(
                     div()
