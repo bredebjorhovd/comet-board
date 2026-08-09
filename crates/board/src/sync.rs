@@ -156,6 +156,46 @@ pub mod meta {
     }
 }
 
+/// Which `routing.toml` sections differ, for the reload's log line: an
+/// operator reading `syncd.log` wants to know *what* moved, and "the file
+/// changed" does not say.
+///
+/// Narration only. The rebuild decision is whole-struct equality, so a section
+/// missing from this list costs a vague log line and never a stale loop — the
+/// opposite of the hand-maintained comparison gh#189 was about. Returns `none`
+/// when only a credential changed.
+fn changed_sections(before: &RoutingConfig, after: &RoutingConfig) -> String {
+    let mut out = Vec::new();
+    if before.sync != after.sync {
+        out.push("sync");
+    }
+    if before.routes != after.routes {
+        out.push("routes");
+    }
+    if before.defaults != after.defaults {
+        out.push("defaults");
+    }
+    if before.github != after.github {
+        out.push("github");
+    }
+    if before.linear != after.linear {
+        out.push("linear");
+    }
+    if before.adopt != after.adopt {
+        out.push("adopt");
+    }
+    if before.users != after.users {
+        out.push("users");
+    }
+    if out.is_empty() {
+        // Either nothing in the file moved, or a section was added to the
+        // struct and not to this list. Both read the same way on purpose:
+        // vague, and never a reason not to rebuild.
+        return "none".into();
+    }
+    out.join("+")
+}
+
 impl SyncEngine {
     /// Build a live engine from the board's directories: open `board.db`, load
     /// `routing.toml`, read credentials, construct whichever source clients the
@@ -200,11 +240,28 @@ impl SyncEngine {
         })
     }
 
-    /// Rebuild when credentials or source configuration change on disk.
+    /// Rebuild when credentials or `routing.toml` change on disk.
     ///
-    /// The loop outlives the setup: adding a key or a repo should take effect
-    /// on the next cycle rather than requiring an engine restart nobody would
-    /// think to do. Returns `None` when nothing relevant changed.
+    /// The loop outlives the setup: an edit to the file should take effect on
+    /// the next cycle rather than requiring an engine restart nobody would
+    /// think to do. Returns `None` when nothing changed.
+    ///
+    /// The config test is the **whole** [`RoutingConfig`], not a list of the
+    /// fields worth noticing. It was such a list once — two credentials, the
+    /// repo list, and the route *count* — and each comparison was right when it
+    /// was written; the set stopped being complete the moment a `[defaults]`
+    /// key mattered (gh#189). Every key under `[defaults]` was invisible to a
+    /// running board, and so was editing a route in place, because the count
+    /// did not move. That is worse than a stale flag: all three surfaces that
+    /// write those keys — `comet-board routes defaults`, the desktop's
+    /// `WriteBoardConfig`, and the iOS orchestrator pin — report the file, so
+    /// the operator was told a change had landed while the loop that had to act
+    /// on it kept the config it booted with. A derived `PartialEq` cannot fall
+    /// behind the struct it is derived from.
+    ///
+    /// Parsed-config equality rather than a hash of the bytes, so reformatting
+    /// or a changed comment is not a rebuild — and an untouched file is not one
+    /// either, which is what keeps an idle board from rebuilding every cycle.
     pub fn reload_if_configuration_changed(&self) -> Option<SyncEngine> {
         let credentials = Credentials::load(&self.paths);
         let cfg = RoutingConfig::load_or_default(&self.paths.routing());
@@ -215,15 +272,15 @@ impl SyncEngine {
         // comparing only `github_token` would leave it polling as the old
         // identity until somebody restarted the engine (gh#58).
         let github_changed = credentials.github_auth() != self.credentials.github_auth();
-        let repos_changed = cfg.github.repos != self.cfg.github.repos;
-        let routes_changed = cfg.routes.len() != self.cfg.routes.len();
-        if !(linear_changed || github_changed || repos_changed || routes_changed) {
+        let config_changed = cfg != self.cfg;
+        if !(linear_changed || github_changed || config_changed) {
             return None;
         }
         self.log.info(format!(
             "configuration changed (linear credential:{linear_changed} \
              github credential:{github_changed} \
-             repos:{repos_changed} routes:{routes_changed}) — rebuilding"
+             routing.toml:{}) — rebuilding",
+            changed_sections(&self.cfg, &cfg)
         ));
         let rebuilt = Db::open(&self.paths.db())
             .and_then(|db| Self::build(db, cfg, self.paths.clone(), self.log.clone(), credentials));
@@ -3161,6 +3218,128 @@ mod tests {
             updated_at: crate::db::now(),
         })
         .unwrap();
+    }
+
+    /// One `[[route]]`, so a test can edit it in place without moving the
+    /// route count — the thing the old comparison keyed on.
+    fn one_route(runtime: &str, base: &str) -> String {
+        format!(
+            "[[route]]\nworkspace = \"offhand\"\nrepo = \"~/dev/comet\"\n\
+             runtime = \"{runtime}\"\nbase = \"{base}\"\n"
+        )
+    }
+
+    /// Put the engine's config and its `routing.toml` in the same state, which
+    /// is what a board that has just booted (or just reloaded) looks like.
+    fn write_and_adopt(e: &mut SyncEngine, toml: &str) {
+        std::fs::write(e.paths.routing(), toml).unwrap();
+        e.cfg = RoutingConfig::load(&e.paths.routing()).unwrap();
+    }
+
+    /// gh#189: a `[defaults]`-only edit is a configuration change.
+    ///
+    /// It was invisible to a running board — the reload compared two
+    /// credentials, the repo list and the route *count* — so a key written at
+    /// 10:00 did nothing to a loop that had loaded its config at 08:03, and
+    /// every surface that writes these keys reported the file as the truth.
+    #[test]
+    fn reload_notices_a_defaults_only_change() {
+        let e = engine(None);
+        std::fs::write(
+            e.paths.routing(),
+            "[defaults]\nnotify_dispatcher = false\nmax_concurrent_per_workspace = 7\n",
+        )
+        .unwrap();
+
+        let fresh = e
+            .reload_if_configuration_changed()
+            .expect("a defaults-only edit is a configuration change");
+        assert!(!fresh.cfg.defaults.notify_dispatcher);
+        assert_eq!(fresh.cfg.defaults.max_concurrent_per_workspace, 7);
+    }
+
+    /// The orchestrator pin (gh#166) is a `[defaults]` key, and it is the one
+    /// the box republishes as if the board had agreed. It has to reach the loop
+    /// that delivers to it, not just the file.
+    #[test]
+    fn reload_notices_a_freshly_pinned_orchestrator() {
+        let e = engine(None);
+        assert_eq!(e.cfg.defaults.orchestrator(), None);
+        std::fs::write(
+            e.paths.routing(),
+            "[defaults]\norchestrator_chat = \"chat-9\"\n",
+        )
+        .unwrap();
+
+        let fresh = e
+            .reload_if_configuration_changed()
+            .expect("pinning an orchestrator is a configuration change");
+        assert_eq!(fresh.cfg.defaults.orchestrator(), Some("chat-9"));
+    }
+
+    /// Editing a route rather than adding one: same count, different route.
+    #[test]
+    fn reload_notices_a_route_edited_in_place() {
+        let mut e = engine(None);
+        write_and_adopt(&mut e, &one_route("claude-code", "origin/HEAD"));
+        std::fs::write(e.paths.routing(), one_route("codex", "origin/main")).unwrap();
+
+        let fresh = e
+            .reload_if_configuration_changed()
+            .expect("editing a route in place is a configuration change");
+        assert_eq!(fresh.cfg.routes.len(), 1);
+        assert_eq!(fresh.cfg.routes[0].runtime, "codex");
+        assert_eq!(fresh.cfg.routes[0].base.as_deref(), Some("origin/main"));
+    }
+
+    /// The other half of the exit: an unchanged board must not rebuild itself
+    /// every cycle. Asked twice, because the loop asks every 30 seconds.
+    #[test]
+    fn reload_is_none_while_the_file_is_untouched() {
+        let mut e = engine(None);
+        // No file at all is the empty board, and it is not a change either.
+        assert!(e.reload_if_configuration_changed().is_none());
+
+        write_and_adopt(
+            &mut e,
+            &format!(
+                "[defaults]\nnotify_dispatcher = false\n\n[github]\nrepos = [\"o/r\"]\n\n{}",
+                one_route("claude-code", "origin/HEAD")
+            ),
+        );
+        assert!(e.reload_if_configuration_changed().is_none());
+        assert!(e.reload_if_configuration_changed().is_none());
+    }
+
+    /// Comments and formatting are not configuration: the comparison is the
+    /// parsed config, so rewriting the file without changing what it says
+    /// leaves the engine alone.
+    #[test]
+    fn reload_is_none_for_a_comment_only_edit() {
+        let mut e = engine(None);
+        write_and_adopt(&mut e, "[defaults]\nnotify_dispatcher = false\n");
+        std::fs::write(
+            e.paths.routing(),
+            "# the dispatcher hears nothing on this board\n[defaults]\n\nnotify_dispatcher = false\n",
+        )
+        .unwrap();
+
+        assert!(e.reload_if_configuration_changed().is_none());
+    }
+
+    /// The log line names the section that moved — vague enough to survive a
+    /// new section, specific enough to be worth reading.
+    #[test]
+    fn the_reload_log_names_which_section_changed() {
+        let before = RoutingConfig::default();
+        let mut after = before.clone();
+        after.defaults.notify_dispatcher = false;
+        assert_eq!(changed_sections(&before, &after), "defaults");
+
+        after.github.repos.push("o/r".into());
+        assert_eq!(changed_sections(&before, &after), "defaults+github");
+
+        assert_eq!(changed_sections(&before, &before), "none");
     }
 
     /// This cycle's session statuses, as the engine's board service builds
