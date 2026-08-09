@@ -7,6 +7,11 @@ publish.workspace = true
 
 [dependencies]
 comet-proto = { workspace = true }
+# For `UpdateStatus` and `version_newer` (gh#197). doctor reports what the
+# engine's release checker last saw at the edge; comparing versions is that
+# crate's rule and must not be re-derived here, or the two would disagree about
+# what "behind" means.
+comet-update = { workspace = true }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }

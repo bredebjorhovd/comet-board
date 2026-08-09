@@ -9,6 +9,14 @@ name: release
 # `curl -fsSL https://edge.comet.offhand.dev/install.sh | sh`), bumping
 # latest.txt.
 #
+# A release is published in two halves and is not done until both are: the
+# GitHub release goes up as a **prerelease**, and it is promoted only after the
+# edge has been asked, over its public host, whether it is serving this version
+# (gh#197). Every R2 put retries — the 502 that half-published v0.3.5 came from
+# api.cloudflare.com, not from the bucket — and latest.txt, the pointer
+# install.sh resolves, is written last and only after the artifacts it names
+# have been fetched back.
+#
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
 # workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
@@ -158,12 +166,21 @@ jobs:
       # releases uploading into the old one. Must precede download-artifact:
       # checkout cleans the workspace.
       - uses: actions/checkout@v4
-      - name: cloudflare account (from edge/wrangler.jsonc)
+      - name: cloudflare account + edge host (from edge/wrangler.jsonc)
         run: |
           acct=$(sed -n 's/.*"account_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
             edge/wrangler.jsonc | head -1)
           [ -n "$acct" ] || { echo "no account_id in edge/wrangler.jsonc"; exit 1; }
           echo "CLOUDFLARE_ACCOUNT_ID=$acct" >> "$GITHUB_ENV"
+          # Read for the same reason the account id is: the host that serves
+          # /releases/* is a fact about the edge, and the read-back below is
+          # only worth anything if it interrogates the host install.sh will
+          # actually ask. Moving the edge must not leave this verifying the
+          # old one and passing.
+          host=$(sed -n 's/.*"pattern"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            edge/wrangler.jsonc | head -1)
+          [ -n "$host" ] || { echo "no route pattern in edge/wrangler.jsonc"; exit 1; }
+          echo "EDGE_HOST=$host" >> "$GITHUB_ENV"
       # Not `dist/`: that path is tracked in the repo (desktop entry, icons).
       - uses: actions/download-artifact@v4
         with:
@@ -207,17 +224,39 @@ jobs:
 
           ---
           EOF
+      # Created as a **prerelease**, and promoted only after the edge is
+      # verified to be serving this version (gh#197). Publishing is two halves
+      # — assets onto the release, artifacts into R2 — and the second half can
+      # fail on its own, which is exactly what happened cutting v0.3.5: four
+      # assets attached, `latest.txt` still naming 0.3.4, and a release page
+      # that looked finished. The prerelease flag is what makes the half-done
+      # state legible to everything that reads a release rather than a run:
+      # `gh release view` says Pre-release, the "Latest" badge stays on the
+      # version the edge is actually handing out, and `/releases/latest` keeps
+      # pointing there too.
       - uses: softprops/action-gh-release@v2
+        id: release
         with:
           files: artifacts/*
           body_path: release-body.md
           generate_release_notes: true
+          prerelease: true
       - name: upload to R2 (edge.comet.offhand.dev/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
+          # Every put goes through scripts/r2-put.sh, which retries (gh#197) —
+          # the 502 that ended the v0.3.5 publish came from api.cloudflare.com
+          # rather than from the bucket, and the same put a moment later worked.
+          #
+          # Order is load-bearing and stated here so it cannot be shuffled by
+          # accident: artifacts, then manifest.json, then — after the read-back
+          # step below has seen all of them through the public host — latest.txt.
+          # The pointer is what install.sh and `comet update` resolve, so a
+          # pointer ahead of its artifacts hands every box a 404 mid-upgrade;
+          # that is strictly worse than the pointer lagging, which is only a box
+          # that does not upgrade.
           for f in artifacts/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
-              --file "$f" --remote
+            scripts/r2-put.sh "$(basename "$f")" "$f"
           done
           # manifest.json: version + per-artifact sha256 — the auto-updater
           # (crates/update) verifies downloads against it. Published before
@@ -229,8 +268,70 @@ jobs:
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
           printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
-            --file manifest.json --remote
+          scripts/r2-put.sh manifest.json manifest.json
+
+      # The gate between the two halves of the pointer rule above: nothing
+      # writes latest.txt until every artifact it will name has been fetched
+      # back through the host that serves them. Read over the public edge
+      # rather than out of the bucket on purpose — an object in R2 that the
+      # worker does not serve is not published, and this is the same request
+      # install.sh makes.
+      - name: artifacts are reachable before the pointer moves
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: |
+          base="https://$EDGE_HOST/releases"
+          for f in artifacts/*; do
+            name=$(basename "$f")
+            curl -fsS -I -o /dev/null "$base/$name" \
+              || { echo "::error::$base/$name is not being served — not moving latest.txt onto a release that cannot be downloaded"; exit 1; }
+          done
+          # `?v=` because the mutable objects are served with max-age=60
+          # (edge/src/index.ts): a cached copy of the *previous* manifest read
+          # back here would be reassurance about the wrong release.
+          got=$(curl -fsSL "$base/manifest.json?v=$GITHUB_RUN_ID" | jq -r .version)
+          [ "$got" = "$VERSION" ] \
+            || { echo "::error::manifest.json at the edge says '$got', expected '$VERSION'"; exit 1; }
+          echo "all $(ls artifacts | wc -l) artifact(s) + manifest.json served at $base"
+
+      - name: move the pointer (latest.txt)
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: |
           printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
-            --file latest.txt --remote
+          scripts/r2-put.sh latest.txt latest.txt
+          base="https://$EDGE_HOST/releases"
+          served=$(curl -fsSL "$base/latest.txt?v=$GITHUB_RUN_ID" | tr -d '[:space:]')
+          [ "$served" = "$VERSION" ] \
+            || { echo "::error::$base/latest.txt serves '$served' after the upload, expected '$VERSION'"; exit 1; }
+          echo "the edge now hands out $served"
+
+      # Only now is the release a release. Without a token there is no R2 half
+      # to verify and the GitHub release is the whole of it, so this runs
+      # either way — a repo with no Cloudflare secret must not accumulate
+      # permanent prereleases.
+      - name: promote the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `clear` before the flag: on a rerun of a publish that failed once,
+          # the warning below is on the body and this is what takes it off.
+          scripts/release-notice.sh clear "$GITHUB_REF_NAME"
+          gh release edit "$GITHUB_REF_NAME" --prerelease=false --latest
+          echo "v$VERSION published: assets on the release, artifacts at https://$EDGE_HOST/releases/" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The whole point of gh#197: a run that goes red while the release page
+      # looks finished teaches everyone who reads the page — humans included —
+      # the wrong answer. The release stays a prerelease (the step above never
+      # ran), and this writes the reason where somebody looking at the release
+      # will meet it rather than in a log nobody opens.
+      - name: say so on the release
+        if: failure() && steps.release.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "### v$VERSION did NOT publish"
+            echo "The GitHub release exists and is complete; the edge still serves the previous version."
+            echo "Re-run the failed job, then check https://$EDGE_HOST/releases/latest.txt."
+          } >> "$GITHUB_STEP_SUMMARY"
+          scripts/release-notice.sh add "$GITHUB_REF_NAME" "$EDGE_HOST"

@@ -39,6 +39,16 @@ pub struct EngineStatus {
     /// (gh#156). `None` when the engine could not be asked, or is old enough
     /// not to say — both leave the version check reading off the disk instead.
     pub version: Option<String>,
+    /// What the engine's release checker last saw at `{edge}/releases`
+    /// (gh#197) — the first frame of the `UpdateStatus` stream. `None` when the
+    /// engine could not be asked or does not know the verb; the check then says
+    /// "not checked" rather than inventing a verdict about the edge.
+    ///
+    /// Read from the engine rather than fetched here on purpose: doctor's own
+    /// network calls are to GitHub and Linear, about this box's config, and a
+    /// second opinion about the release feed would be a second thing that can
+    /// disagree with the updater that actually performs updates.
+    pub update: Option<comet_update::UpdateStatus>,
 }
 
 /// Check the environment. Plain stdout — the report is the output.
@@ -140,6 +150,15 @@ pub fn doctor(
         engine.version.as_deref(),
         std::env::current_exe().ok().as_deref(),
         &crate::config::data_dir().join("app"),
+    ));
+
+    // And whether this box is on the release the edge is handing out (gh#197).
+    // Directly under the pair above because it is the third version in the same
+    // sentence: the CLI, the engine beside it, and the one an upgrade would
+    // fetch.
+    checks.push(release_check(
+        engine.update.as_ref(),
+        chrono::Utc::now().timestamp_millis(),
     ));
 
     // Reachable from this shell is not the same as reachable from anywhere
@@ -553,6 +572,106 @@ fn installed_payload_version(app_root: &Path) -> Option<String> {
     let name = target.file_name()?.to_str()?;
     name.starts_with(|c: char| c.is_ascii_digit())
         .then(|| name.to_string())
+}
+
+/// Is this box on the release the edge is actually handing out (gh#197)?
+///
+/// The failure it exists for is a publish that half-landed. Releasing is two
+/// halves — assets onto the GitHub release, artifacts into the bucket the edge
+/// serves — and cutting v0.3.5 the second half died on a 502 from
+/// api.cloudflare.com. What that left was a release page with all four assets, a
+/// tag, and `latest.txt` still naming 0.3.4: `install.sh` reads `latest.txt`, so
+/// a box upgrading in that window is handed the *previous* release and reports
+/// success. It was caught because somebody checked the version by hand.
+///
+/// So the fact worth printing is the one nothing on a box could see: what the
+/// edge would give you if you upgraded right now, beside what you are running.
+/// Behind is printed and not failed — that is a box mid-window between a release
+/// and its next check, and failing it would go red on every machine for hours
+/// after every release.
+///
+/// The one state that fails is the edge serving something *older* than this box
+/// runs. That is not a box anybody forgot to upgrade; it is the install surface
+/// pointing backwards, and re-running the installer here — or on any box that
+/// has never installed at all — fetches the older release and calls it done.
+///
+/// `now_ms` is passed rather than read so the age line is testable.
+fn release_check(update: Option<&comet_update::UpdateStatus>, now_ms: i64) -> Check {
+    let name = "release".to_string();
+    let not_checked = |detail: &str| Check {
+        name: name.clone(),
+        ok: true,
+        detail: detail.to_string(),
+    };
+    let Some(update) = update else {
+        return not_checked("not checked — the engine did not answer");
+    };
+    let here = &update.current_version;
+    let Some(latest) = update.latest_version.as_deref() else {
+        // A just-booted engine has not run its first check yet; one that has and
+        // failed carries the reason, which is worth more than "unknown".
+        return not_checked(&match &update.error {
+            Some(err) => format!(
+                "not checked — v{here} here, and the engine's last look at the \
+                 edge failed ({err})"
+            ),
+            None => format!("not checked yet — v{here} here, the engine has not looked yet"),
+        });
+    };
+    // How stale the answer is. An engine checks every 6h, so a report quoting a
+    // version without saying when it learned it is quoting something that could
+    // predate the release being asked about.
+    let age = match update.checked_at {
+        Some(at) => format!(
+            " · last checked {} ago",
+            crate::overrun::human_secs((now_ms - at) / 1000)
+        ),
+        None => String::new(),
+    };
+
+    if latest == here {
+        return Check {
+            name,
+            ok: true,
+            detail: format!("v{here} — the version the edge is handing out{age}"),
+        };
+    }
+    if comet_update::version_newer(latest, here) {
+        return Check {
+            name,
+            ok: true,
+            detail: format!(
+                "v{here} here, but the edge serves v{latest} — this box is behind. \
+                 `comet update`, or re-run the installer: \
+                 curl -fsSL https://edge.comet.offhand.dev/install.sh | sh{age}"
+            ),
+        };
+    }
+    if comet_update::version_newer(here, latest) {
+        return Check {
+            name,
+            ok: false,
+            detail: format!(
+                "v{here} here, but the edge serves v{latest} — the install surface \
+                 points backwards. Anything that upgrades from it now gets v{latest} \
+                 and reports success, which is what a release that failed halfway \
+                 through publishing looks like from here. Check the release run for \
+                 v{here} and re-run its failed job{age}"
+            ),
+        };
+    }
+    // Neither newer nor equal: one of the two does not parse as a version — a
+    // truncated or garbage `latest.txt` is exactly the sort of thing a
+    // half-finished publish leaves, and the updater silently ignores it (an
+    // unparseable version is never "newer"), so this is the only place it shows.
+    Check {
+        name,
+        ok: false,
+        detail: format!(
+            "v{here} here, and the edge serves `{latest}`, which is not a version \
+             this can compare against — nothing will ever update from it{age}"
+        ),
+    }
 }
 
 /// Does the skill the agents read match the binary whose flags it documents
@@ -2018,6 +2137,10 @@ mod tests {
             // The version this crate was built at, so the `cli version` check
             // stays quiet in every test that is about something else.
             version: Some(env!("CARGO_PKG_VERSION").into()),
+            // No release answer, so the `release` check says "not checked" in
+            // every test that is about something else — the same reason the
+            // version above is the matching one.
+            update: None,
         }
     }
 
@@ -2136,6 +2259,90 @@ mod tests {
         let c = cli_version_check("0.3.4", None, None, &d.path().join("app"));
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("no engine to compare"), "{}", c.detail);
+    }
+
+    // --- release (gh#197) ---------------------------------------------------
+
+    fn update_status(here: &str, latest: Option<&str>) -> comet_update::UpdateStatus {
+        comet_update::UpdateStatus {
+            current_version: here.into(),
+            latest_version: latest.map(str::to_string),
+            update_available: latest.is_some_and(|l| comet_update::version_newer(l, here)),
+            checked_at: Some(0),
+            error: None,
+        }
+    }
+
+    /// The ordinary answer: the box runs what the edge hands out.
+    #[test]
+    fn a_box_on_the_published_release_passes() {
+        let c = release_check(Some(&update_status("0.3.5", Some("0.3.5"))), 60_000);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("v0.3.5"), "{}", c.detail);
+        // The age matters: a version quoted without one could predate the
+        // release being asked about.
+        assert!(c.detail.contains("last checked 1m ago"), "{}", c.detail);
+    }
+
+    /// Behind is reported, never failed — every box is behind for the window
+    /// between a release and its next check, and a doctor that goes red across
+    /// the fleet on every release teaches people to ignore it.
+    #[test]
+    fn a_box_behind_the_edge_is_reported_and_not_failed() {
+        let c = release_check(Some(&update_status("0.3.4", Some("0.3.5"))), 0);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("edge serves v0.3.5"), "{}", c.detail);
+        assert!(c.detail.contains("comet update"), "{}", c.detail);
+    }
+
+    /// The gh#197 state, seen from a box: the install surface points at a
+    /// version older than what runs here, so anything that upgrades from it —
+    /// including a machine installing for the first time — gets the old release
+    /// and reports success. That is a publish that half-landed, and it is the
+    /// one verdict here worth an exit code.
+    #[test]
+    fn an_edge_serving_an_older_release_than_this_box_fails() {
+        let c = release_check(Some(&update_status("0.3.5", Some("0.3.4"))), 0);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("points backwards"), "{}", c.detail);
+        assert!(c.detail.contains("re-run its failed job"), "{}", c.detail);
+    }
+
+    /// A truncated or garbage `latest.txt` is the other thing a half-finished
+    /// publish leaves. The updater ignores it in silence (an unparseable version
+    /// is never "newer"), so nothing else on the box would ever say so.
+    #[test]
+    fn an_uncomparable_version_at_the_edge_fails() {
+        let c = release_check(Some(&update_status("0.3.5", Some("nightly"))), 0);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not a version"), "{}", c.detail);
+    }
+
+    /// An engine that could not be asked, one that has not looked yet, and one
+    /// whose look failed: three different sentences, none of them a failure.
+    /// Doctor must not invent a verdict about the edge from silence.
+    #[test]
+    fn nothing_known_about_the_edge_is_never_a_failure() {
+        let none = release_check(None, 0);
+        assert!(none.ok);
+        assert!(
+            none.detail.contains("the engine did not answer"),
+            "{}",
+            none.detail
+        );
+
+        let mut booting = update_status("0.3.5", None);
+        booting.checked_at = None;
+        let c = release_check(Some(&booting), 0);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("has not looked yet"), "{}", c.detail);
+
+        let mut failed = update_status("0.3.5", None);
+        failed.checked_at = None;
+        failed.error = Some("dns error".into());
+        let c = release_check(Some(&failed), 0);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("dns error"), "{}", c.detail);
     }
 
     /// `current` pointed at something that is not a versioned dir is not a
@@ -2281,6 +2488,7 @@ mod tests {
             reachable: false,
             detail: "connection refused".into(),
             version: None,
+            update: None,
         };
         let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
