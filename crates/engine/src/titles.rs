@@ -264,6 +264,8 @@ async fn collect_text(
         account: None,
         // It names a chat. It does not touch a repo.
         push: None,
+        // …and it runs no tools at all, so it needs none of them on its PATH.
+        bin_dirs: Vec::new(),
     };
     let mut stream = harness.run(request, controls).await?;
     let mut text = String::new();

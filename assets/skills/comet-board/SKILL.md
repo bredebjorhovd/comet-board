@@ -8,6 +8,11 @@ chats running coding agents out. The board lives on ONE host device (the box);
 `comet-board` speaks to it over the local IPC, or from any other machine with
 `--device <box-name>`.
 
+The engine puts `comet-board` on your PATH — the copy it shipped with. If it is
+not there, say so and stop; do not carry on without the board. Work done off the
+board has no row, no provenance and no one who can see it (`comet-board doctor`
+reports this as **agent PATH**).
+
 **Read before acting. Never read board.db directly.**
 
 ```bash

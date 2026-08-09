@@ -9,6 +9,11 @@
 //! gh#107 added the second thing that rides the same hop: `GIT_AUTHOR_*` for
 //! whoever released the work, so a teammate's dispatch commits as the teammate
 //! while the box stays the committer.
+//!
+//! gh#184 added the third, and it rides a wider one: the directory holding the
+//! `comet-board` this engine shipped with goes on *every* run's PATH, not only
+//! a dispatched one's — the skill telling agents to run board verbs is
+//! installed for the whole box.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,7 +35,16 @@ use comet_proto::{
 /// and those are chat-less.
 #[derive(Default)]
 struct RecordingHarness {
-    seen: Mutex<Vec<(Option<String>, Option<comet_harness::PushCredentials>)>>,
+    seen: Mutex<Vec<Recorded>>,
+}
+
+/// One run as the harness saw it: which chat, what it pushes with, and which
+/// directories were put in front of its PATH.
+#[derive(Clone)]
+struct Recorded {
+    chat_id: Option<String>,
+    push: Option<comet_harness::PushCredentials>,
+    bin_dirs: Vec<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -61,7 +75,11 @@ impl Harness for RecordingHarness {
         self.seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((controls.chat_id.clone(), controls.push.clone()));
+            .push(Recorded {
+                chat_id: controls.chat_id.clone(),
+                push: controls.push.clone(),
+                bin_dirs: controls.bin_dirs.clone(),
+            });
         Ok(futures::stream::iter(vec![Ok(AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -106,6 +124,16 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
 
+    // Name the helper binary outright (gh#184): the engine resolves the
+    // directory it puts on every child's PATH from it, and a test that let the
+    // lookup fall through to PATH would assert something different on a box
+    // with `comet-board` installed than on one without.
+    let board_exe = dir.join("comet-board");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&board_exe, "").unwrap();
+    // SAFETY: single-test binary, set before the engine that reads it exists.
+    unsafe { std::env::set_var("COMET_BOARD_EXECUTABLE", &board_exe) };
+
     let harness = Arc::new(RecordingHarness::default());
     let registry = HarnessRegistry::new();
     registry.register(harness.clone());
@@ -120,8 +148,6 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     std::fs::create_dir_all(&paths.config_dir).unwrap();
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
-    let board_exe = dir.join("comet-board");
-    std::fs::write(&board_exe, "").unwrap();
     core.sessions
         .set_push_credentials(Arc::new(PushCredentials::with_board_exe(
             paths.clone(),
@@ -205,7 +231,7 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let chats: Vec<_> = recorded().into_iter().filter_map(|(id, _)| id).collect();
+        let chats: Vec<_> = recorded().into_iter().filter_map(|r| r.chat_id).collect();
         if ["chat-dispatched", "chat-authored", "chat-plain"]
             .iter()
             .all(|c| chats.iter().any(|id| id == c))
@@ -220,12 +246,13 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     }
 
     let seen = recorded();
-    let for_chat = |chat: &str| {
+    let run_for = |chat: &str| {
         seen.iter()
-            .find(|(id, _)| id.as_deref() == Some(chat))
-            .map(|(_, push)| push.clone())
+            .find(|r| r.chat_id.as_deref() == Some(chat))
+            .cloned()
             .unwrap_or_else(|| panic!("no run reached the harness for {chat}"))
     };
+    let for_chat = |chat: &str| run_for(chat).push;
 
     let push = for_chat("chat-dispatched").expect("the dispatched run has credentials");
     let env: std::collections::BTreeMap<_, _> = push.env.iter().cloned().collect();
@@ -301,6 +328,19 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         for_chat("chat-plain").is_none(),
         "a chat the board never dispatched was handed credentials"
     );
+
+    // gh#184: every run — the dispatched one, the authored one, and the chat
+    // the board never touched — can type `comet-board`. The failure this
+    // replaces was silent: an agent that cannot reach the board does not stop,
+    // it just gets on with the ticket without checking `dispatchable`,
+    // releasing sub-work through the board, or waiting for it.
+    for chat in ["chat-dispatched", "chat-authored", "chat-plain"] {
+        assert_eq!(
+            run_for(chat).bin_dirs,
+            vec![dir.clone()],
+            "{chat} could not have run comet-board"
+        );
+    }
 
     core.sessions.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
