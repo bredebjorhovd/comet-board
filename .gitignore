@@ -18,3 +18,5 @@ edge/dist/
 # swept into an unrelated `git stash` the way the same edits in the .pbxproj
 # were. apps/ios/Signing.local.xcconfig.example is the tracked template.
 apps/ios/Signing.local.xcconfig
+# Xcode per-user window/scheme state. Never useful to anyone else.
+**/xcuserdata/

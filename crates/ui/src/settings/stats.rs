@@ -10,7 +10,8 @@
 //!
 //! 1. **Spend** — list price against what the plans behind it cost. Never
 //!    summed: one figure is the board's, the other is a person's (gh#182).
-//! 2. **Work released** — dispatches, the day shape, and where they landed.
+//! 2. **Work released** — dispatches, where they landed, and the day chart:
+//!    bar height is tokens, the dispatch count rides in the caption (gh#226).
 //! 3. **Tokens** — what the price above was computed from, per model.
 //! 4. **When and where** — one grid crossing the hour against the space.
 //! 5. **Breakdown** — the same window cut by model, runtime, space, tracker or
@@ -57,8 +58,8 @@ use comet_proto::view::board;
 use comet_proto::view::rates::{Usd, human_usd};
 use comet_proto::view::stats::{
     BoardSpend, BoardStats, Breakdown, BreakdownRow, Dimension, HOURS, TokenTally, WINDOWS,
-    bar_fraction, hour_grid, human_minutes, human_multiple, human_tokens, peak_dispatches,
-    peak_tokens, percent, ranked_tokens,
+    bar_fraction, day_captions_fit, day_columns, hour_grid, human_minutes, human_multiple,
+    human_tokens, peak_tokens, percent, ranked_tokens,
 };
 use comet_rpc::methods;
 
@@ -77,13 +78,14 @@ const TALLY_ROWS: usize = 6;
 /// being a shape.
 const GRID_ROWS: usize = 5;
 
-/// Bar geometry for the throughput chart. Tall enough that a quiet day and a
-/// busy one are different at a glance, short enough to sit above the fold.
+/// Bar geometry for the day chart. Tall enough that a quiet day and a busy one
+/// are different at a glance, short enough to sit above the fold.
 const CHART_HEIGHT: f32 = 92.0;
 
-/// The token series, drawn as a strip inside the tokens block rather than as a
-/// card of its own — it qualifies the total above it.
-const SPARK_HEIGHT: f32 = 40.0;
+/// What a day that spent nothing draws instead of a bar (gh#226). One rule, so
+/// the quiet days line up as a baseline rather than as six slightly different
+/// nothings.
+const HAIRLINE: f32 = 1.0;
 
 /// The corner on a drawn mark — a chart column, a meter fill, a heat cell.
 ///
@@ -704,7 +706,8 @@ impl StatsPage {
     // -- block 2: work released ----------------------------------------------
 
     /// The throughput answer: how much was released, how it went, and the
-    /// shape of the days it went in.
+    /// shape of the days it went in — which is a shape in tokens, not in
+    /// dispatch counts (gh#226).
     fn render_delivery(stats: &BoardStats, theme: &Theme) -> AnyElement {
         let completion = percent(stats.completion_rate);
         // The qualifying line, assembled only from facts that exist. A board
@@ -778,69 +781,111 @@ impl StatsPage {
         Self::block(
             theme,
             "Work released",
-            // The legend only when there are bars to legend.
-            (peak_dispatches(&stats.daily) > 0).then(|| "solid bar = ended in done".to_string()),
+            // The legend only when there are bars to legend — and it says what
+            // the height is, because that is the thing a bar chart otherwise
+            // lets a reader assume (gh#226).
+            (!stats.daily.is_empty()).then(|| "bar height = tokens that day".to_string()),
             Self::body(14.0).child(head).child(split).into_any_element(),
         )
     }
 
-    /// Dispatches per day, with the share that ended `done` filled in.
+    /// The day chart: **height is tokens, the dispatch count is in the caption**
+    /// (gh#226).
     ///
-    /// Two tones in one bar rather than two bars: the question is what
-    /// proportion of a day's work landed, and side-by-side bars make that a
-    /// subtraction the reader has to do.
+    /// It plotted dispatches, split solid-and-quiet for the share that ended
+    /// `done`. Dispatches per day is nearly flat and nearly meaningless — two
+    /// of them can differ by twenty times in what they cost — so the shape said
+    /// almost nothing, and the one number that does vary was drawn as an
+    /// unlabelled strip in another block. Token volume is also what the spend
+    /// block above is computed from, so the two now read as one argument. The
+    /// completion share it gave up is a sentence in the headline above
+    /// (`82% ended in done`), where a proportion belongs.
+    ///
+    /// Every day in the window draws, including the ones that spent nothing: a
+    /// quiet day is a hairline under a dash, never a gap. A seven-day window on
+    /// a board that worked one day is a shape; one lonely bar reads as six days
+    /// the board failed to record.
     fn render_chart(stats: &BoardStats, theme: &Theme) -> AnyElement {
-        let peak = peak_dispatches(&stats.daily);
-        if peak == 0 {
+        let columns = day_columns(&stats.daily, &stats.daily_tokens);
+        if columns.is_empty() {
             return Self::note(theme, "Nothing was dispatched in this window.");
         }
-        let bars: Vec<AnyElement> = stats
-            .daily
+        let peak = peak_tokens(&stats.daily_tokens);
+        // A month of captions is a month of collisions; past the cap the
+        // columns go bare and the axis carries the range instead.
+        let captioned = day_captions_fit(columns.len());
+        let label = |theme: &Theme, text: String, strong: bool| {
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_center()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(if strong {
+                    theme.text_muted
+                } else {
+                    theme.text_subtle
+                })
+                .child(SharedString::from(text))
+        };
+        let bars: Vec<AnyElement> = columns
             .iter()
-            .map(|day| {
-                let total_h = CHART_HEIGHT * bar_fraction(day.dispatches, peak);
-                let done_h = CHART_HEIGHT
-                    * bar_fraction(day.done, peak).min(bar_fraction(day.dispatches, peak));
+            .map(|column| {
+                // A hairline where the bar would be, in the border's own tone:
+                // the day is present and it spent nothing, which is a different
+                // statement from a short accent bar somebody has to squint at.
+                let height = if column.is_quiet() {
+                    HAIRLINE
+                } else {
+                    (CHART_HEIGHT * column.fraction).max(2.0)
+                };
                 div()
                     .flex_1()
                     .min_w(px(3.0))
-                    .h(px(CHART_HEIGHT))
                     .flex()
                     .flex_col()
-                    .justify_end()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when(captioned, |el| {
+                        el.child(label(theme, column.value.clone(), !column.is_quiet()))
+                    })
                     .child(
-                        // The column: everything dispatched, quiet…
                         div()
                             .w_full()
-                            .h(px(total_h.max(if day.dispatches > 0 { 2.0 } else { 0.0 })))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(theme.accent.opacity(0.22))
+                            .h(px(CHART_HEIGHT))
                             .flex()
                             .flex_col()
                             .justify_end()
-                            // …and the part of it that landed, solid.
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(px(done_h))
-                                    .rounded(px(MARK_RADIUS))
-                                    .bg(theme.accent.opacity(0.85)),
-                            ),
+                            .child(div().w_full().h(px(height)).rounded(px(MARK_RADIUS)).bg(
+                                if column.is_quiet() {
+                                    theme.border
+                                } else {
+                                    theme.accent.opacity(0.85)
+                                },
+                            )),
                     )
+                    .when(captioned, |el| {
+                        el.child(label(theme, column.caption.clone(), false))
+                    })
                     .into_any_element()
             })
             .collect();
 
-        let first = stats
-            .daily
-            .first()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
-        let last = stats
-            .daily
-            .last()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
+        // The peak reads in tokens, like the bars. With the captions on, the
+        // range is already under every column and the axis is that one fact.
+        let middle = if peak > 0 {
+            format!("peak {}/day", human_tokens(peak))
+        } else {
+            "no day in this window reported tokens".to_string()
+        };
+        let (first, last) = if captioned {
+            (String::new(), String::new())
+        } else {
+            (
+                columns.first().map(|c| c.date.clone()).unwrap_or_default(),
+                columns.last().map(|c| c.date.clone()).unwrap_or_default(),
+            )
+        };
         div()
             .flex()
             .flex_col()
@@ -851,10 +896,9 @@ impl StatsPage {
                     .flex_row()
                     .items_end()
                     .gap(px(3.0))
-                    .h(px(CHART_HEIGHT))
                     .children(bars),
             )
-            .child(Self::axis(theme, first, format!("peak {peak}/day"), last))
+            .child(Self::axis(theme, first, middle, last))
             .into_any_element()
     }
 
@@ -1036,88 +1080,20 @@ impl StatsPage {
                     ),
             );
 
+        // No day strip here any more (gh#226): the day chart in the block above
+        // *is* the token series now, and drawing it twice on one page — once
+        // captioned, once as an unlabelled strip — is two answers to one
+        // question. What belongs under this headline is what it was spent on.
         Self::block(
             theme,
             "Tokens",
             coverage,
             Self::body(14.0)
                 .child(head)
-                .child(Self::render_spark(stats, theme))
                 .child(Self::seam(theme))
                 .child(Self::render_model_table(stats, theme))
                 .into_any_element(),
         )
-    }
-
-    /// Tokens per day, one tone.
-    ///
-    /// The dispatch chart in the block above splits its bars because "how much
-    /// of a day's work landed" is a proportion; this one does not, because
-    /// tokens have no such second number. What it does share is the day range —
-    /// the two series are generated from one calendar, so a spike here sits
-    /// under the day that caused it.
-    fn render_spark(stats: &BoardStats, theme: &Theme) -> AnyElement {
-        let peak = peak_tokens(&stats.daily_tokens);
-        if peak == 0 {
-            return Self::note(theme, "No day in this window has usage to show.");
-        }
-        let bars: Vec<AnyElement> = stats
-            .daily_tokens
-            .iter()
-            .map(|day| {
-                let total = day.usage.total();
-                // Against the peak day and not the total, for the reason the
-                // dispatch chart is: the question is which day was expensive.
-                let fraction = (total as f32 / peak as f32).clamp(0.0, 1.0);
-                div()
-                    .flex_1()
-                    .min_w(px(3.0))
-                    .h(px(SPARK_HEIGHT))
-                    .flex()
-                    .flex_col()
-                    .justify_end()
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(
-                                SPARK_HEIGHT * fraction + if total > 0 { 2.0 } else { 0.0 }
-                            ))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(theme.accent.opacity(0.7)),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        let first = stats
-            .daily_tokens
-            .first()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
-        let last = stats
-            .daily_tokens
-            .last()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap(px(3.0))
-                    .h(px(SPARK_HEIGHT))
-                    .children(bars),
-            )
-            .child(Self::axis(
-                theme,
-                first,
-                format!("peak {}/day", human_tokens(peak)),
-                last,
-            ))
-            .into_any_element()
     }
 
     /// The per-model rows, priced where the board could price them.
