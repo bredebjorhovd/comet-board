@@ -74,15 +74,16 @@ struct ActiveSection: View {
     private func header(needing: Int) -> some View {
         HStack(spacing: 6) {
             Text("Active")
-                .font(Theme.sans(11, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .font(Theme.sans(Theme.textCaption, weight: .medium))
+                .foregroundStyle(Theme.textSubtle)
             if needing > 0 {
                 Text("\(needing)")
-                    .font(Theme.mono(10, weight: .medium))
-                    .foregroundStyle(Theme.danger)
+                    .font(Theme.mono(Theme.textCaption, weight: .medium))
+                    .foregroundStyle(Theme.dangerText)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Theme.danger.opacity(0.14), in: Capsule())
+                    .background(Theme.danger.opacity(0.14),
+                                in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             Spacer(minLength: 0)
         }
@@ -100,24 +101,18 @@ struct RunningRowView: View {
     let row: RunningRow
     let now: Date
 
-    private var subline: Color { Theme.textMuted.opacity(0.5) }
+    private var subline: Color { Theme.textSubtle }
 
-    private var accent: Color {
-        switch row.state {
-        case .blocked: return boardStateColor(.blocked)
-        case .errored: return boardStateColor(.failed)
-        case .working: return boardStateColor(.working)
-        }
-    }
+    private var accent: Color { agentStateColor(row.state) }
 
     var body: some View {
         HStack(spacing: 8) {
             Text(row.state.glyph)
-                .font(Theme.mono(11))
+                .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(accent)
                 .frame(width: 10)
             Text(row.title)
-                .font(Theme.sans(13, weight: .medium))
+                .font(Theme.sans(Theme.textBody, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
             Spacer(minLength: 8)
@@ -125,20 +120,20 @@ struct RunningRowView: View {
             // recognised by, so the glyph alone would be doing too much.
             if row.state.needsAttention {
                 Text(row.state.label)
-                    .font(Theme.sans(11))
-                    .foregroundStyle(accent.opacity(0.9))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(accent)
                     .fixedSize()
             }
             if let elapsed = row.elapsedLabel(now: now) {
                 Text(elapsed)
-                    .font(Theme.mono(11))
+                    .font(Theme.mono(Theme.textCaption))
                     .foregroundStyle(subline)
                     .fixedSize()
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 }
 
@@ -150,46 +145,41 @@ struct AgentRowView: View {
     let agent: AgentRow
     let now: Date
 
-    private var subline: Color { Theme.textMuted.opacity(0.5) }
+    private var subline: Color { Theme.textSubtle }
 
-    /// The accent a live agent carries — routed through the board's own state
-    /// colours so a running attempt does not change colour on its way from the
-    /// board screen to this list.
-    private var accent: Color {
-        switch agent.state {
-        case .blocked: return boardStateColor(.blocked)
-        case .errored: return boardStateColor(.failed)
-        case .working: return boardStateColor(.working)
-        }
-    }
+    /// The accent a live agent carries — routed through the same status ramp as
+    /// the board's rows, so a running attempt does not change colour on its way
+    /// from the board screen to this list (gh#173).
+    private var accent: Color { agentStateColor(agent.state) }
 
     var body: some View {
         HStack(spacing: 8) {
             Text(agent.state.glyph)
-                .font(Theme.mono(11))
+                .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(accent)
                 .frame(width: 10)
             VStack(alignment: .leading, spacing: 2) {
                 // The chip fill is the white-wash language, not an accent
                 // tint — the accent stays on the state glyph.
                 Text(agent.identifier)
-                    .font(Theme.sans(12, weight: .medium))
+                    .font(Theme.sans(Theme.textDense, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Theme.elementActive, in: RoundedRectangle(cornerRadius: 5))
+                    .background(Theme.elementActive,
+                                in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 HStack(spacing: 4) {
                     if let branch = agent.branch {
                         LineIconView(.gitBranch, size: 11, color: subline)
                         Text(branch)
-                            .font(Theme.sans(11))
+                            .font(Theme.sans(Theme.textCaption))
                             .foregroundStyle(subline)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     } else {
                         Text(agent.state.label)
-                            .font(Theme.sans(11))
+                            .font(Theme.sans(Theme.textCaption))
                             .foregroundStyle(subline)
                     }
                 }
@@ -198,13 +188,13 @@ struct AgentRowView: View {
             if let elapsed = agent.elapsedLabel(now: now) {
                 let over = agent.overCap(now: now)
                 Text(elapsed)
-                    .font(Theme.mono(11, weight: over ? .semibold : .regular))
+                    .font(Theme.mono(Theme.textCaption, weight: over ? .semibold : .regular))
                     .foregroundStyle(over ? Theme.warning : subline)
                     .fixedSize()
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 }

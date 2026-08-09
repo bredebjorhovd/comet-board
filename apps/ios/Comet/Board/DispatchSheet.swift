@@ -90,7 +90,7 @@ struct DispatchSheet: View {
                     }
                     if let error {
                         Text(error)
-                            .font(Theme.sans(12))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.danger)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -134,21 +134,21 @@ struct DispatchSheet: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(target.row.identifier)
-                .font(Theme.mono(11))
+                .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(Theme.textMuted)
             Text(target.row.title)
-                .font(Theme.sans(15))
+                .font(Theme.sans(Theme.textTitle))
                 .foregroundStyle(Theme.text)
                 .fixedSize(horizontal: false, vertical: true)
             if let workspace = target.row.workspace {
                 Text("→ \(workspace)")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                    .font(Theme.sans(Theme.textDense))
+                    .foregroundStyle(Theme.textSubtle)
             }
             if target.wasLive {
                 Text("Ends the live attempt, then releases a fresh one.")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                    .font(Theme.sans(Theme.textDense))
+                    .foregroundStyle(Theme.textSubtle)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -217,7 +217,7 @@ struct DispatchSheet: View {
                 }
             }
             Text("Whose subscription the run spends. The board's host owns these logins — not this phone.")
-                .font(Theme.sans(11))
+                .font(Theme.sans(Theme.textCaption))
                 .foregroundStyle(Theme.textFaint)
                 .padding(.horizontal, 4)
         }
@@ -246,16 +246,16 @@ struct DispatchSheet: View {
             SheetLabel("Confirm")
             VStack(alignment: .leading, spacing: 8) {
                 Text(billsWarning(billedTo: billedTo, harness: harness))
-                    .font(Theme.sans(14))
+                    .font(Theme.sans(Theme.textBody))
                     .foregroundStyle(Theme.text)
                     .fixedSize(horizontal: false, vertical: true)
                 Text("The board is set to refuse this unless somebody says it out loud. "
                      + "Back out and pick your own account instead, or release it on theirs.")
-                    .font(Theme.sans(12))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Pick a different account") { confirmingBill = nil }
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(Theme.accent)
                     .padding(.top, 2)
             }
@@ -270,7 +270,7 @@ struct DispatchSheet: View {
 
     private func loadingRow(_ text: String) -> some View {
         Text(text)
-            .font(Theme.sans(13))
+            .font(Theme.sans(Theme.textBody))
             .foregroundStyle(Theme.textFaint)
             .padding(.horizontal, 16)
             .padding(.vertical, 12)

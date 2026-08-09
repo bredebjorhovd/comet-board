@@ -96,30 +96,30 @@ struct BoardDetailSheet: View {
             // The whole title. The list's one truncated line is what sent you
             // here; wrapping it is the entire point of the sheet.
             Text(row.title)
-                .font(Theme.sans(17, weight: .medium))
+                .font(Theme.sans(Theme.textTitle, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 6) {
                 Text(row.boardState.glyph)
-                    .font(Theme.mono(10))
+                    .font(Theme.mono(Theme.textCaption))
                     .foregroundStyle(boardStateColor(row.boardState))
                 Text(row.boardState.label)
-                    .font(Theme.sans(12))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textMuted)
             }
 
             if let placement = boardPlacementLine(row) {
                 Text(placement)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                    .font(Theme.sans(Theme.textDense))
+                    .foregroundStyle(Theme.textSubtle)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let history = boardHistoryLine(row, now: now) {
                 Text(history)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                    .font(Theme.sans(Theme.textDense))
+                    .foregroundStyle(Theme.textSubtle)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !row.labels.isEmpty {
@@ -127,11 +127,11 @@ struct BoardDetailSheet: View {
                 HStack(spacing: 5) {
                     ForEach(row.labels, id: \.self) { label in
                         Text(label)
-                            .font(Theme.sans(11))
+                            .font(Theme.sans(Theme.textCaption))
                             .foregroundStyle(Theme.textMuted)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
-                            .background(whiteAlpha(0.07), in: Capsule())
+                            .background(whiteAlpha(0.07), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                     }
                 }
                 .padding(.top, 2)
@@ -146,18 +146,18 @@ struct BoardDetailSheet: View {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small).tint(Theme.textMuted)
                 Text("Reading the issue…")
-                    .font(Theme.sans(13))
+                    .font(Theme.sans(Theme.textBody))
                     .foregroundStyle(Theme.textFaint)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .failed(let message):
             Text("Couldn't read the issue: \(message)")
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.danger)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .empty:
             Text(noBodyText)
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.textFaint)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .text(let text):
@@ -198,7 +198,7 @@ struct BoardDetailSheet: View {
                     .foregroundStyle(action.destructive ? Theme.danger : Theme.textMuted)
                     .frame(width: 22)
                 Text(action.label)
-                    .font(Theme.sans(15))
+                    .font(Theme.sans(Theme.textTitle))
                     .foregroundStyle(action.destructive ? Theme.danger : Theme.text)
                 Spacer(minLength: 8)
             }

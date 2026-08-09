@@ -91,12 +91,12 @@ struct BoardView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text("Board")
-                        .font(Theme.sans(13, weight: .medium))
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
                         .foregroundStyle(Theme.text)
                     if let host = model.board?.hostDeviceId {
                         Text("on \(model.deviceName(host))")
-                            .font(Theme.sans(10.5))
-                            .foregroundStyle(Theme.textMuted.opacity(0.6))
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.textSubtle)
                     }
                 }
             }
@@ -211,13 +211,13 @@ struct BoardView: View {
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Theme.textFaint)
                 Text(group.label)
-                    .font(Theme.sans(11, weight: .medium))
+                    .font(Theme.sans(Theme.textCaption, weight: .medium))
                     .foregroundStyle(group.route == nil
                         ? Theme.textFaint
-                        : Theme.textMuted.opacity(0.85))
+                        : Theme.textMuted)
                 Text("\(group.rows.count)")
-                    .font(Theme.mono(10))
-                    .foregroundStyle(Theme.textFaint.opacity(0.7))
+                    .font(Theme.mono(Theme.textCaption))
+                    .foregroundStyle(Theme.textFaint)
                 Spacer(minLength: 0)
             }
             .padding(.vertical, 4)
@@ -232,14 +232,14 @@ struct BoardView: View {
     private func sectionHeader(_ state: BoardState, count: Int) -> some View {
         HStack(spacing: 6) {
             Text(state.glyph)
-                .font(Theme.mono(10))
+                .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(boardStateColor(state))
             Text(state.label)
-                .font(Theme.sans(11, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .font(Theme.sans(Theme.textCaption, weight: .medium))
+                .foregroundStyle(Theme.textSubtle)
             Text("\(count)")
-                .font(Theme.mono(10))
-                .foregroundStyle(Theme.textFaint.opacity(0.7))
+                .font(Theme.mono(Theme.textCaption))
+                .foregroundStyle(Theme.textFaint)
             Spacer(minLength: 0)
         }
         .textCase(nil)
@@ -252,7 +252,7 @@ struct BoardView: View {
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(Theme.textFaint)
             Text(model.boardStatus ?? (model.boardAttached ? "Nothing on the board" : "Looking for the board…"))
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.textFaint)
                 .multilineTextAlignment(.center)
             if !model.boardAttached && model.boardStatus == nil {
@@ -268,16 +268,22 @@ struct BoardView: View {
     }
 }
 
-/// The state's colour, ported from the desktop panel's `state_color` so a row
-/// does not change colour on its way between surfaces.
+/// The accent a board state carries — the status ramp's answer, never this
+/// file's (gh#173), and a port of the desktop panel's `state_color`.
+///
+/// Blocked and failed share red (the glyph tells them apart), working is amber,
+/// review indigo; ready and done spend no colour at all, so they land on the
+/// row's own text tones — plain for a queued row, dim for history.
 func boardStateColor(_ state: BoardState) -> Color {
-    switch state {
-    case .blocked, .failed: return Theme.danger
-    case .working: return Theme.warning
-    case .review: return Theme.accent
-    case .ready: return Theme.text
-    case .done: return Theme.textFaint
-    }
+    if let status = Status.ofBoard(state) { return Theme.status(status) }
+    return state == .done ? Theme.textFaint : Theme.text
+}
+
+/// The accent a *live agent* carries — the same ramp as `boardStateColor`, so a
+/// running attempt does not change colour on its way from the board to Home
+/// (gh#103, gh#173).
+func agentStateColor(_ state: AgentState) -> Color {
+    Theme.status(Status.ofAgent(state))
 }
 
 // MARK: - Row
@@ -289,7 +295,7 @@ struct BoardTaskRowView: View {
     let onDispatch: () -> Void
     let onCancel: () -> Void
 
-    private var subline: Color { Theme.textMuted.opacity(0.5) }
+    private var subline: Color { Theme.textSubtle }
 
     var body: some View {
         let detail = boardRowDetail(row, now: now)
@@ -298,13 +304,13 @@ struct BoardTaskRowView: View {
                 // Line 1: state glyph, identifier, elapsed against the cap.
                 HStack(spacing: 8) {
                     Text(row.boardState.glyph)
-                        .font(Theme.mono(11))
+                        .font(Theme.mono(Theme.textCaption))
                         .foregroundStyle(boardStateColor(row.boardState))
                         .frame(width: 10)
                     // The repo-qualified token (gh#125): `tally #507`, because
                     // `gh#507` alone is ambiguous across repos.
                     Text(row.displayIdentifier)
-                        .font(Theme.mono(11))
+                        .font(Theme.mono(Theme.textCaption))
                         .foregroundStyle(Theme.textMuted)
                         .lineLimit(1)
                     Spacer(minLength: 8)
@@ -313,7 +319,7 @@ struct BoardTaskRowView: View {
                         // clock is about to end that attempt, and the number is
                         // the reason.
                         Text(elapsed)
-                            .font(Theme.mono(11, weight: detail.overCap ? .semibold : .regular))
+                            .font(Theme.mono(Theme.textCaption, weight: detail.overCap ? .semibold : .regular))
                             .foregroundStyle(detail.overCap ? Theme.warning : subline)
                             .fixedSize()
                     }
@@ -321,7 +327,7 @@ struct BoardTaskRowView: View {
 
                 // Line 2: the issue title.
                 Text(row.title)
-                    .font(Theme.sans(13))
+                    .font(Theme.sans(Theme.textBody))
                     .foregroundStyle(row.boardState == .done ? Theme.textMuted : Theme.text)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -331,7 +337,7 @@ struct BoardTaskRowView: View {
                 HStack(spacing: 6) {
                     if !detail.text.isEmpty {
                         Text(detail.text)
-                            .font(Theme.sans(11))
+                            .font(Theme.sans(Theme.textCaption))
                             .foregroundStyle(subline)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -340,8 +346,8 @@ struct BoardTaskRowView: View {
                         // True of an attempt for its whole life, so it rides
                         // beside the state's own facts rather than inside them.
                         Text(billing)
-                            .font(Theme.sans(11))
-                            .foregroundStyle(Theme.warning.opacity(0.85))
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.warning)
                             .lineLimit(1)
                     }
                     Spacer(minLength: 4)
@@ -351,7 +357,7 @@ struct BoardTaskRowView: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
         }
         .buttonStyle(PressWashButtonStyle())
         .contextMenu {
@@ -385,11 +391,11 @@ struct BoardTaskRowView: View {
     private func chip(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(Theme.sans(11, weight: .medium))
+                .font(Theme.sans(Theme.textCaption, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .background(whiteAlpha(0.07), in: Capsule())
+                .background(whiteAlpha(0.07), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
         }
         .buttonStyle(ChipPressButtonStyle())
     }
@@ -405,13 +411,13 @@ struct NoticeBar: View {
 
     var body: some View {
         Text(text)
-            .font(Theme.sans(12))
+            .font(Theme.sans(Theme.textDense))
             .foregroundStyle(Theme.text)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.border, lineWidth: 1))
+            .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+            .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(Theme.border, lineWidth: 1))
             .padding(.horizontal, 12)
             .padding(.bottom, 12)
             .transition(.move(edge: .bottom).combined(with: .opacity))

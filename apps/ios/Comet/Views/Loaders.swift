@@ -125,15 +125,17 @@ struct CometPulse: View {
 // MARK: - Status dot
 
 extension ChatIndicator {
-    /// shell/spaces.rs status_dot_color.
+    /// The dot's paint, through the one ramp (gh#173): `Status.ofChat` says
+    /// what the state MEANS and `Theme.status` is the only thing that turns a
+    /// meaning into a colour. This used to answer the question itself, and it
+    /// answered it differently from the board: pink here, amber there, about
+    /// the same running agent.
+    ///
+    /// Idle spends no hue — a chat nobody is waiting on is not a status, so
+    /// its dot is a hairline. The two dimming opacities that propped up the
+    /// old pink and emerald retired with the anchor.
     var dotColor: Color {
-        switch self {
-        case .working: return Theme.statusWorking.opacity(0.85)     // pink-400
-        case .awaitingInput: return Theme.accent.opacity(0.9)       // indigo
-        case .errored: return Theme.danger
-        case .completed: return Theme.statusCompleted.opacity(0.9)  // emerald-400
-        case .idle: return whiteAlpha(0.14)
-        }
+        Status.ofChat(self).map(Theme.status) ?? whiteAlpha(0.14)
     }
 }
 
@@ -149,6 +151,7 @@ struct StatusRail: View {
             if indicator == .working {
                 MiniSpinner()
             } else {
+                // round-ok: a status dot
                 Circle()
                     .fill(indicator.dotColor)
                     .frame(width: 6, height: 6)
@@ -169,11 +172,19 @@ struct HarnessBadge: View {
     var dimmed = false
     /// Color for marks that carry no brand color of their own (codex, cursor).
     /// Claude keeps its orange regardless.
-    var neutral: Color = Theme.text
+    var neutral: Color = Theme.textMuted
 
     var body: some View {
-        BrandMarkShape(mark: BrandMark.forHarness(harness))
-            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9))
+        // A brand mark that HAS a colour is art, and its dim is an alpha on
+        // that art. A neutral one is drawn in the same greys the labels beside
+        // it use, so it steps DOWN the ramp rather than being multiplied
+        // (gh#172) — `textSubtle` is the tone a dimmed label would take.
+        let brand = BrandMark.brandTint(for: harness)
+        // theme-opacity-ok: a brand's own ink, dimmed — not one of the four greys
+        let tint = brand.map { $0.opacity(dimmed ? 0.6 : 1) }
+            ?? (dimmed ? Theme.textSubtle : neutral)
+        return BrandMarkShape(mark: BrandMark.forHarness(harness))
+            .fill(tint)
             .frame(width: size, height: size)
     }
 }

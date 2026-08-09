@@ -118,7 +118,8 @@ final class RowVeil {
             else { continue }
             for run in attr[start..<end].runs {
                 let base: Color = attr[run.range].foregroundColor ?? Theme.text
-                // `.opacity` multiplies into the existing alpha — paint only.
+                // theme-opacity-ok: the streaming fade — an animation alpha
+                // over a tone that is already a token, not a new tone
                 attr[run.range].foregroundColor = base.opacity(alpha)
             }
         }

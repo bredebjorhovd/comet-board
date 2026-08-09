@@ -28,10 +28,10 @@ struct NeedsYouSection: View {
             if needs.isEmpty {
                 HStack(spacing: 6) {
                     Text("✓")
-                        .font(Theme.mono(11))
-                        .foregroundStyle(ChatIndicator.completed.dotColor)
+                        .font(Theme.mono(Theme.textCaption))
+                        .foregroundStyle(Theme.status(.settled))
                     Text(needsAllClear)
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textFaint)
                 }
                 .listRowBackground(Color.clear)
@@ -63,16 +63,16 @@ struct NeedsYouSection: View {
     private func header(count: Int) -> some View {
         HStack(spacing: 6) {
             Text(needsYouTitle)
-                .font(Theme.sans(11, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .font(Theme.sans(Theme.textCaption, weight: .medium))
+                .foregroundStyle(Theme.textSubtle)
             // The count is the header's whole answer: how many things want me.
             if count > 0 {
                 Text("\(count)")
-                    .font(Theme.mono(10, weight: .medium))
+                    .font(Theme.mono(Theme.textCaption, weight: .medium))
                     .foregroundStyle(Theme.accent)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Theme.accent.opacity(0.14), in: Capsule())
+                    .background(Theme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             Spacer(minLength: 0)
         }
@@ -85,28 +85,32 @@ struct NeedsYouSection: View {
 struct NeedRowView: View {
     let need: NeedRow
 
+    /// Said in the ramp's vocabulary rather than by naming hues (gh#173): a
+    /// question wants your eyes on a healthy run, a dead run is blocked, and a
+    /// report is settled. The desktop's `render_need_row` splits them the same
+    /// way and lands on the same three colours.
     private var accent: Color {
         switch need.kind {
-        case .question: return Theme.accent
-        case .deadRun: return Theme.danger
-        case .report: return ChatIndicator.completed.dotColor
+        case .question: return Theme.status(.review)
+        case .deadRun: return Theme.status(.blocked)
+        case .report: return Theme.status(.settled)
         }
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Text(need.kind.glyph)
-                .font(Theme.mono(11))
+                .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(accent)
                 .frame(width: 10)
             VStack(alignment: .leading, spacing: 2) {
                 Text(need.who)
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                 Text(need.what)
-                    .font(Theme.sans(11))
-                    .foregroundStyle(Theme.textMuted.opacity(0.5))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textSubtle)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -114,7 +118,7 @@ struct NeedRowView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 }
 
@@ -169,22 +173,22 @@ struct OrchestratorSlotView: View {
                     MiniSpinner()
                 } else {
                     Text("◆")
-                        .font(Theme.mono(11))
+                        .font(Theme.mono(Theme.textCaption))
                         .foregroundStyle(Theme.accent)
                 }
             }
             .frame(width: 10, height: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text(orchestratorName)
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                 // The latest report is the payload: brighter while unread.
                 Text(slot.preview ?? orchestratorNoReports)
-                    .font(Theme.sans(11))
+                    .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(slot.unseen
-                        ? Theme.text.opacity(0.7)
-                        : Theme.textMuted.opacity(0.5))
+                        ? Theme.text
+                        : Theme.textSubtle)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -193,20 +197,20 @@ struct OrchestratorSlotView: View {
             // last spoke otherwise.
             if slot.unseen {
                 Text("new")
-                    .font(Theme.sans(10, weight: .medium))
-                    .foregroundStyle(ChatIndicator.completed.dotColor)
+                    .font(Theme.sans(Theme.textCaption, weight: .medium))
+                    .foregroundStyle(Theme.status(.settled))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(ChatIndicator.completed.dotColor.opacity(0.14), in: Capsule())
+                    .background(Theme.status(.settled).opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             } else if let lastAt = slot.lastAt {
                 Text(relativeTime(lastAt))
-                    .font(Theme.sans(11))
-                    .foregroundStyle(Theme.textMuted.opacity(0.5))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textSubtle)
                     .fixedSize()
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 }

@@ -50,7 +50,7 @@ struct SpaceView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text(space?.displayName ?? "Space")
-                        .font(Theme.sans(13, weight: .medium))
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
                     if let space {
@@ -61,8 +61,8 @@ struct SpaceView: View {
                                 .lineLimit(1)
                                 .truncationMode(.head)
                         }
-                        .font(Theme.sans(10.5))
-                        .foregroundStyle(Theme.textMuted.opacity(0.6))
+                        .font(Theme.sans(Theme.textCaption))
+                        .foregroundStyle(Theme.textSubtle)
                     }
                 }
             }
@@ -89,13 +89,13 @@ struct SpaceView: View {
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(Theme.textFaint)
             Text("No sessions in this space")
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.textFaint)
             Button {
                 path.append(.newSession(spaceId: spaceId))
             } label: {
                 Text("Start a session")
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .padding(.horizontal, 16)
                     .frame(height: 36)
@@ -222,7 +222,7 @@ struct NewSpaceSheet: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(Theme.textFaint)
             TextField("Search repos…", text: $query)
-                .font(Theme.sans(15))
+                .font(Theme.sans(Theme.textTitle))
                 .foregroundStyle(Theme.text)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -246,7 +246,7 @@ struct NewSpaceSheet: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 44)
-        .background(whiteAlpha(0.05), in: Capsule())
+        .background(whiteAlpha(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
     }
 
     /// Two boards in one org is rare and unguessable, so it is the one case the
@@ -264,18 +264,19 @@ struct NewSpaceSheet: View {
                             target = ix
                         } label: {
                             HStack(spacing: 7) {
+                                // round-ok: a presence dot
                                 Circle()
                                     .fill(model.deviceOnline(candidate.deviceId)
-                                        ? Theme.statusCompleted.opacity(0.9) : whiteAlpha(0.18))
+                                        ? Theme.status(.settled) : whiteAlpha(0.18))
                                     .frame(width: 6, height: 6)
                                 Text(model.deviceName(candidate.deviceId))
-                                    .font(Theme.sans(13, weight: .medium))
+                                    .font(Theme.sans(Theme.textBody, weight: .medium))
                                     .foregroundStyle(selected ? Theme.text : Theme.textMuted)
                             }
                             .padding(.horizontal, 14)
                             .frame(height: 34)
                             .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05),
-                                        in: Capsule())
+                                        in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                         }
                         .buttonStyle(.plain)
                     }
@@ -289,7 +290,7 @@ struct NewSpaceSheet: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let error {
                     Text(error)
-                        .font(Theme.sans(13))
+                        .font(Theme.sans(Theme.textBody))
                         .foregroundStyle(Theme.danger)
                         .padding(.horizontal, 4)
                 }
@@ -319,12 +320,12 @@ struct NewSpaceSheet: View {
                     // an error: a board on a `GITHUB_TOKEN` has no installations
                     // to enumerate (gh#97), and its spaces are listed regardless.
                     Text(note)
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textFaint)
                         .padding(.horizontal, 4)
                 } else if !sweeping && hosts.isEmpty {
                     Text("No device in this org is hosting a board, so a new repo has nowhere to be cloned.")
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textFaint)
                         .padding(.horizontal, 4)
                 }
@@ -354,7 +355,7 @@ struct NewSpaceSheet: View {
                             // clone; it sits a shade quieter than the rows that
                             // open instantly.
                             .foregroundStyle(row.connected
-                                ? Theme.textMuted : Theme.textFaint.opacity(0.7))
+                                ? Theme.textMuted : Theme.textFaint)
                     } else {
                         LineIconView(.folder, size: 16, color: Theme.textMuted)
                     }
@@ -363,15 +364,15 @@ struct NewSpaceSheet: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(row.title)
-                        .font(Theme.sans(15))
+                        .font(Theme.sans(Theme.textTitle))
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
                         .truncationMode(.head)
                     if let subline = subline(row, connecting: isConnecting) {
                         Text(subline)
-                            .font(Theme.sans(12))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(row.connected && !model.deviceOnline(row.deviceId ?? "")
-                                ? Theme.warning.opacity(0.8) : Theme.textMuted.opacity(0.7))
+                                ? Theme.warning : Theme.textSubtle)
                             .lineLimit(1)
                     }
                 }
@@ -411,11 +412,11 @@ struct NewSpaceSheet: View {
                 .foregroundStyle(Theme.textFaint)
             Text(sweeping ? "Looking for your repos…"
                           : (query.isEmpty ? "No repos yet" : "No repos match"))
-                .font(Theme.sans(15, weight: .medium))
+                .font(Theme.sans(Theme.textTitle, weight: .medium))
                 .foregroundStyle(Theme.text)
             if !sweeping && query.isEmpty {
                 Text("Connect a repo from a board host, or browse a device's folders below.")
-                    .font(Theme.sans(13))
+                    .font(Theme.sans(Theme.textBody))
                     .foregroundStyle(Theme.textMuted)
                     .multilineTextAlignment(.center)
             }
@@ -535,17 +536,18 @@ struct FolderBrowser: View {
                         listing = nil
                     } label: {
                         HStack(spacing: 7) {
+                            // round-ok: a presence dot
                             Circle()
                                 .fill(model.deviceOnline(device.id)
-                                    ? Theme.statusCompleted.opacity(0.9) : whiteAlpha(0.18))
+                                    ? Theme.status(.settled) : whiteAlpha(0.18))
                                 .frame(width: 6, height: 6)
                             Text(device.name)
-                                .font(Theme.sans(13, weight: .medium))
+                                .font(Theme.sans(Theme.textBody, weight: .medium))
                                 .foregroundStyle(selected ? Theme.text : Theme.textMuted)
                         }
                         .padding(.horizontal, 14)
                         .frame(height: 36)
-                        .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: Capsule())
+                        .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                     }
                     .buttonStyle(.plain)
                 }
@@ -563,15 +565,15 @@ struct FolderBrowser: View {
             } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(listing?.parent == nil ? Theme.textFaint.opacity(0.4) : Theme.text)
+                    .foregroundStyle(listing?.parent == nil ? Theme.textFaint : Theme.text)
                     .frame(width: 32, height: 32)
-                    .background(whiteAlpha(0.06), in: Circle())
+                    .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             .buttonStyle(.plain)
             .disabled(listing?.parent == nil)
 
             Text(listing?.path ?? " ")
-                .font(Theme.mono(12))
+                .font(Theme.mono(Theme.textDense))
                 .foregroundStyle(Theme.textMuted)
                 .lineLimit(1)
                 .truncationMode(.head)
@@ -590,14 +592,14 @@ struct FolderBrowser: View {
             VStack(alignment: .leading, spacing: 8) {
                 if let error {
                     Text(error)
-                        .font(Theme.sans(13))
+                        .font(Theme.sans(Theme.textBody))
                         .foregroundStyle(Theme.danger)
                         .padding(.horizontal, 4)
                 }
                 let folders = (listing?.entries ?? []).filter(\.isDir)
                 if folders.isEmpty, !loading, error == nil, listing != nil {
                     Text("No folders here")
-                        .font(Theme.sans(13))
+                        .font(Theme.sans(Theme.textBody))
                         .foregroundStyle(Theme.textFaint)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 28)
@@ -614,7 +616,7 @@ struct FolderBrowser: View {
                 }
                 if listing?.truncated == true {
                     Text("Listing truncated — this folder has more entries.")
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textFaint)
                         .padding(.horizontal, 4)
                 }
@@ -634,20 +636,20 @@ struct FolderBrowser: View {
         } label: {
             HStack(spacing: 12) {
                 LineIconView(entry.isRepo ? .folderWithFiles : .folder, size: 16,
-                             color: entry.isRepo ? Theme.accent.opacity(0.85) : Theme.textMuted)
+                             color: entry.isRepo ? Theme.accent : Theme.textMuted)
                     .frame(width: 22)
                 Text(entry.name)
-                    .font(Theme.sans(15))
+                    .font(Theme.sans(Theme.textTitle))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 if entry.isRepo {
                     Text("git")
-                        .font(Theme.mono(10))
-                        .foregroundStyle(Theme.accent.opacity(0.85))
+                        .font(Theme.mono(Theme.textCaption))
+                        .foregroundStyle(Theme.accent)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(Theme.accent.opacity(0.12), in: Capsule())
+                        .background(Theme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 12, weight: .semibold))
@@ -676,10 +678,10 @@ struct FolderBrowser: View {
                 .font(.system(size: 30, weight: .light))
                 .foregroundStyle(Theme.textFaint)
             Text("No devices yet")
-                .font(Theme.sans(15, weight: .medium))
+                .font(Theme.sans(Theme.textTitle, weight: .medium))
                 .foregroundStyle(Theme.text)
             Text("Run Comet on a computer first — its folders will show up here.")
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.textMuted)
                 .multilineTextAlignment(.center)
         }

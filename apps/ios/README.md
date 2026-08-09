@@ -128,6 +128,35 @@ shared scheme, and a test target means editing `project.pbxproj` and
 would not close the gap either — what is missing is a macOS runner with a
 simulator, not a test framework.)
 
+### Keeping the design system honest (gh#181)
+
+`Theme/Theme.swift` is the other second implementation — the design system this
+repo owns lives in `crates/ui/src/theme.rs` and `comet_proto::view::status`, and
+the phone has to restate it because no Rust runs there. Restating it
+*differently* is a real bug and it happened: `boardStateColor` said amber and
+`ChatIndicator.dotColor` said pink about the same running agent, one screen
+apart, long after the desktop had settled that argument.
+
+```sh
+cargo test -p comet-ui --test ios_theme
+```
+
+Four checks, and unlike the stats fixture above **these run in CI** — they read
+Swift as text, so they need no simulator:
+
+- **Parity.** The status ramp, the three radii, the type scale and the four text
+  greys are the same numbers the desktop paints, and the greys are compared as
+  paint rather than as lightness.
+- **No text tone multiplied by an alpha** (gh#172) — hatch `theme-opacity-ok:`,
+  and it is for animation fades only.
+- **No literal radius or font size outside `Theme.swift`** (gh#174) — hatch
+  `scale-ok:`, for marks that are *drawn* rather than boxed.
+- **`Capsule()` / `Circle()` is a dot, a drawn cap or the send button** —
+  hatch `round-ok:`. One round thing on screen, and it is the one you press.
+
+A number that genuinely does not fit becomes a token on *both* ends, never an
+alpha or a literal on this one.
+
 ### Verifying the board against a real box
 
 `-e2e-board <repoPath>` drives gh#114's exit criteria headlessly, against a dev
@@ -220,9 +249,12 @@ Transcript/
                         tool-group folds, error/input chips
   Veil.swift            paint-only streaming fade (EMA-tracked duration,
                         1−(1−p)^1.6 curve)
-Composer/               glass pill, Send→Steer→Stop morph, QuestionPanel
+Composer/               glass card, Send→Steer→Stop morph, QuestionPanel
                         (paged, numbered options, 220ms auto-advance)
-Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
+Theme/                  theme.rs port (gh#181): oklch→sRGB converter, the four
+                        text greys, the `Status` vocabulary and the one function
+                        that turns a meaning into paint, three radii + the
+                        nesting rule, four type sizes + the reserved prose pair,
                         Geist/Geist Mono, motion timings + flavour words
 ```
 
@@ -249,6 +281,10 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Hover timestamps / copy | Context menus |
 | gpui `list()` sum-tree virtualization | `LazyVStack` + stable row ids + version fingerprints |
 | Stick-to-bottom spring, wheel-up breaks pin | Scroll-phase-gated pin + spring scrollTo, same 70/320pt thresholds |
+| `Theme::status` — four hues at one lightness, and every state type maps into `Status` once (gh#173) | `Theme.status` and the same `Status.ofBoard` / `ofAgent` / `ofChat`, so a working agent is the same amber on the board and on Home |
+| Three radii, four type sizes, four text greys (gh#172/gh#174) | The same numbers, asserted equal by `crates/ui/tests/ios_theme.rs` |
+| Light theme (gh#177) | Not ported — the phone is always-dark, and a light design is a design rather than an inversion |
+| Hover wash vs selection lift (gh#175) | Not ported — no pointer; `elementHover` is what a finger holds down |
 
 Status colors, fonts, spacing, markdown metrics, veil timing, command-ledger
 shapes, and the wire protocol are ports, not approximations — constants match

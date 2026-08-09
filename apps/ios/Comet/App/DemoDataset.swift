@@ -316,24 +316,39 @@ final class DemoDataset {
             return out
         }
 
+        // Hoisted rather than written inline: as one 25-argument initializer
+        // with arithmetic in a dozen of the arguments, this expression pushed
+        // the Swift type-checker past its budget and the file stopped
+        // compiling.
+        let tasksTouched: Int = max(1, Int(Double(attempts) * 0.82))
+        let outcomes: [String: Int] = [
+            "done": done, "failed": max(0, ended - done - 1), "cancelled": 1,
+        ]
+        let completionRate: Double? = ended > 0 ? Double(done) / Double(ended) : nil
+        let totalMinutes: Int64 = Int64(attempts) * 27
+        let coverage: Double? = attempts > 0 ? Double(metered) / Double(attempts) : nil
+        let landing = Landing(merged: max(0, done - 2), open: 2,
+                              closedUnmerged: 1, noPr: max(0, ended - done))
+        let friction = Friction(retriedTasks: 3, earlySettles: 1,
+                                blockedEntries: 4, overruns: 1)
+        let agentDispatched: Int = Int(Double(attempts) * 0.4)
+
         return BoardStats(
             sinceDays: sinceDays,
             attempts: attempts,
-            tasksTouched: max(1, Int(Double(attempts) * 0.82)),
-            outcomes: ["done": done, "failed": max(0, ended - done - 1), "cancelled": 1],
+            tasksTouched: tasksTouched,
+            outcomes: outcomes,
             live: live,
-            completionRate: ended > 0 ? Double(done) / Double(ended) : nil,
+            completionRate: completionRate,
             medianMinutes: 18,
             p90Minutes: 74,
             longestMinutes: 196,
-            totalMinutes: Int64(attempts) * 27,
+            totalMinutes: totalMinutes,
             tokens: tokens,
             attemptsWithTokens: metered,
-            tokenCoverage: attempts > 0 ? Double(metered) / Double(attempts) : nil,
-            landing: Landing(merged: max(0, done - 2), open: 2,
-                             closedUnmerged: 1, noPr: max(0, ended - done)),
-            friction: Friction(retriedTasks: 3, earlySettles: 1,
-                               blockedEntries: 4, overruns: 1),
+            tokenCoverage: coverage,
+            landing: landing,
+            friction: friction,
             daily: daily,
             dailyTokens: dailyTokens,
             hourOfDay: hours,
@@ -344,12 +359,15 @@ final class DemoDataset {
             byRuntime: split(attempts, [("claude-code", 0.74), ("codex", 0.26)]),
             bySource: split(attempts, [("github", 0.79), ("linear", 0.21)]),
             byAccount: split(attempts, [("brede@tally.no", 0.7), ("ana@tally.no", 0.3)]),
-            agentDispatched: Int(Double(attempts) * 0.4),
+            agentDispatched: agentDispatched,
             // Split exactly, remainder and all: a breakdown whose rows do not
             // add up to the headline is the one thing a table like this must
             // never do.
             tokensByModel: ["claude-fable-5": majority, "gpt-5.6-terra": remainder],
-            tokensByRuntime: ["claude-code": majority, "codex": remainder])
+            tokensByRuntime: ["claude-code": majority, "codex": remainder],
+            // The same 70/30 split `byAccount` uses, so who ran the attempts
+            // and what those attempts spent tell the same story (gh#182).
+            tokensByAccount: ["brede@tally.no": majority, "ana@tally.no": remainder])
     }
 
     /// One row per board state that has anything to say, in board order. The

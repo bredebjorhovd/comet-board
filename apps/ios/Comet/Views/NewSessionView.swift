@@ -57,7 +57,7 @@ struct NewSessionView: View {
                         .frame(width: 84, height: 84)
                         .opacity(0.22)
                     Text("What are we building?")
-                        .font(Theme.sans(15))
+                        .font(Theme.sans(Theme.textTitle))
                         .foregroundStyle(Theme.textFaint)
                 }
             }
@@ -78,12 +78,12 @@ struct NewSessionView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text("New session")
-                        .font(Theme.sans(13, weight: .medium))
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
                         .foregroundStyle(Theme.text)
                     if let space {
                         Text("\(space.displayName) · \(model.deviceName(space.deviceId))")
-                            .font(Theme.sans(10.5))
-                            .foregroundStyle(Theme.textMuted.opacity(0.6))
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.textSubtle)
                             .lineLimit(1)
                     }
                 }
@@ -157,12 +157,12 @@ struct NewSessionView: View {
                 HStack(spacing: 6) {
                     HarnessBadge(harness: harness, size: 15)
                     Text(selectedModel.label)
-                        .font(Theme.sans(13, weight: .medium))
-                        .foregroundStyle(Theme.text.opacity(0.9))
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
+                        .foregroundStyle(Theme.text)
                         .lineLimit(1)
                     if let reasoning {
                         Text(HarnessCatalog.reasoningLabel(reasoning))
-                            .font(Theme.sans(12))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.textMuted)
                     }
                     Image(systemName: "chevron.up.chevron.down")
@@ -171,7 +171,7 @@ struct NewSessionView: View {
                 }
                 .padding(.horizontal, 13)
                 .frame(height: 36)
-                .background(whiteAlpha(0.10), in: Capsule())
+                .background(whiteAlpha(0.10), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             .buttonStyle(ChipPressButtonStyle())
 
@@ -196,13 +196,13 @@ struct NewSessionView: View {
             HStack(spacing: 6) {
                 LineIconView(icon, size: 13, color: Theme.textMuted)
                 Text(label)
-                    .font(Theme.sans(13, weight: .medium))
-                    .foregroundStyle(Theme.text.opacity(0.9))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
+                    .foregroundStyle(Theme.text)
                     .lineLimit(1)
             }
             .padding(.horizontal, 12)
             .frame(height: 36)
-            .background(whiteAlpha(0.10), in: Capsule())
+            .background(whiteAlpha(0.10), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
         }
         .buttonStyle(ChipPressButtonStyle())
     }
@@ -272,12 +272,12 @@ struct NewSessionView: View {
 
     private func offlineNotice(space: Space) -> some View {
         Text("\(model.deviceName(space.deviceId)) is offline — the run will start when it reconnects.")
-            .font(Theme.sans(12))
-            .foregroundStyle(Theme.warning.opacity(0.9))
+            .font(Theme.sans(Theme.textDense))
+            .foregroundStyle(Theme.warningText)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(Theme.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+            .background(Theme.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
     }
@@ -460,12 +460,12 @@ struct ModelPickerSheet: View {
             HStack(spacing: 7) {
                 HarnessBadge(harness: h.id, size: 15, dimmed: !selected)
                 Text(h.label)
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(selected ? Theme.text : Theme.textMuted)
             }
             .padding(.horizontal, 14)
             .frame(height: 36)
-            .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: Capsule())
+            .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
         }
         .buttonStyle(.plain)
     }
@@ -492,10 +492,10 @@ struct ModelPickerSheet: View {
                         .frame(width: 22)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(checkout.isWorktree ? "Worktree" : "Local checkout")
-                            .font(Theme.sans(15))
+                            .font(Theme.sans(Theme.textTitle))
                             .foregroundStyle(Theme.text)
                         Text(checkout.cwd)
-                            .font(Theme.mono(11.5))
+                            .font(Theme.mono(Theme.textDense))
                             .foregroundStyle(Theme.textMuted)
                             .lineLimit(1)
                             .truncationMode(.head)
@@ -511,7 +511,7 @@ struct ModelPickerSheet: View {
             SheetLabel("Ref")
             if checkout.refs.isEmpty {
                 Text("Loading refs from the device…")
-                    .font(Theme.sans(13))
+                    .font(Theme.sans(Theme.textBody))
                     .foregroundStyle(Theme.textFaint)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 20)
@@ -527,7 +527,7 @@ struct ModelPickerSheet: View {
             }
             if let switchError {
                 Text(switchError)
-                    .font(Theme.sans(12.5))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.danger)
                     .padding(.horizontal, 4)
             }
@@ -552,11 +552,11 @@ struct ModelPickerSheet: View {
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ref.name)
-                        .font(Theme.sans(15))
+                        .font(Theme.sans(Theme.textTitle))
                         .foregroundStyle(Theme.text)
                     if let subtitle = refSubtitle(ref, checkout: checkout) {
                         Text(subtitle)
-                            .font(Theme.sans(12.5))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.textMuted)
                     }
                 }
@@ -625,7 +625,7 @@ struct RefPickerSheet: View {
                     SheetLabel("Ref")
                     if refs.isEmpty {
                         Text("Loading refs from the device…")
-                            .font(Theme.sans(13))
+                            .font(Theme.sans(Theme.textBody))
                             .foregroundStyle(Theme.textFaint)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 28)
@@ -641,7 +641,7 @@ struct RefPickerSheet: View {
                     }
                     if let error {
                         Text(error)
-                            .font(Theme.sans(12.5))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.danger)
                             .padding(.horizontal, 4)
                     }
@@ -690,11 +690,11 @@ struct RefPickerSheet: View {
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ref.name)
-                        .font(Theme.sans(15))
+                        .font(Theme.sans(Theme.textTitle))
                         .foregroundStyle(Theme.text)
                     if let subtitle = subtitle(for: ref) {
                         Text(subtitle)
-                            .font(Theme.sans(12.5))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.textMuted)
                     }
                 }
@@ -786,10 +786,10 @@ struct CheckoutPickerSheet: View {
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(Theme.sans(15))
+                        .font(Theme.sans(Theme.textTitle))
                         .foregroundStyle(Theme.text)
                     Text(subtitle)
-                        .font(Theme.sans(12.5))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textMuted)
                 }
                 Spacer(minLength: 8)

@@ -134,7 +134,7 @@ struct HomeView: View {
                 // gh#118: reaching a space no longer means owning a desktop —
                 // "+" offers the board's repos and clones one onto the box.
                 Text("No repos yet — tap ＋ to connect one")
-                    .font(Theme.sans(12))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -170,7 +170,7 @@ struct HomeView: View {
                 // that the list above just proved is busy.
                 let shelf = SpaceShelf(idle: chats.map(\.id), running: held.count)
                 Text(shelfNote(shelf) ?? "No sessions yet")
-                    .font(Theme.sans(12))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -202,8 +202,8 @@ struct HomeView: View {
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
-            .font(Theme.sans(11, weight: .medium))
-            .foregroundStyle(Theme.textMuted.opacity(0.6))
+            .font(Theme.sans(Theme.textCaption, weight: .medium))
+            .foregroundStyle(Theme.textSubtle)
             .textCase(nil)
             .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
     }
@@ -223,6 +223,7 @@ struct SpaceRow: View {
         HStack(spacing: 8) {
             // Leading 6pt aggregate dot — position stable, most-urgent member.
             let agg = model.spaceIndicator(space.id)
+            // round-ok: a status dot — the space's aggregate
             Circle()
                 .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
                 .frame(width: 6, height: 6)
@@ -241,15 +242,15 @@ struct SpaceRow: View {
             let title = model.spaceTitlesById[space.id]
                 ?? SpaceTitle(base: space.displayName, qualifier: nil)
             Text(title.base)
-                .font(Theme.sans(13, weight: .medium))
+                .font(Theme.sans(Theme.textBody, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .layoutPriority(1)
             if let qualifier = title.qualifier {
                 Text("· \(qualifier)")
-                    .font(Theme.sans(11))
-                    .foregroundStyle(Theme.textMuted.opacity(0.75))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textSubtle)
                     .lineLimit(1)
                     // Capped, as the sidebar caps it, and ranked with the base
                     // rather than above it: what the two of them squeeze is the
@@ -272,8 +273,8 @@ struct SpaceRow: View {
             // twice.
             if let running = runningLabel(model.spaceRunning(space.id)) {
                 Text(running)
-                    .font(Theme.sans(11))
-                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textSubtle)
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
@@ -283,19 +284,19 @@ struct SpaceRow: View {
             deviceTag.layoutPriority(1)
             Image(systemName: "chevron.right")
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Theme.textFaint.opacity(0.6))
+                .foregroundStyle(Theme.textFaint)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 8)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 
     private var deviceTag: some View {
         let online = model.deviceOnline(space.deviceId)
         let name = model.deviceName(space.deviceId)
         return Text(online ? "@ \(name)" : "@ \(name) · offline")
-            .font(Theme.sans(12))
-            .foregroundStyle(online ? Theme.textMuted.opacity(0.6) : Theme.warning.opacity(0.8))
+            .font(Theme.sans(Theme.textDense))
+            .foregroundStyle(online ? Theme.textSubtle : Theme.warning)
             .lineLimit(1)
     }
 }
@@ -318,7 +319,7 @@ struct ChatRow: View {
     /// Rail (6) + gap (8) — see `render_chat_row`'s `pl(px(14.0))`.
     private static let indent: CGFloat = StatusRail.width + 8
 
-    private var subline: Color { Theme.textMuted.opacity(0.5) }
+    private var subline: Color { Theme.textSubtle }
 
     var body: some View {
         let indicator = model.indicator(for: chat)
@@ -328,7 +329,7 @@ struct ChatRow: View {
                 StatusRail(indicator: indicator)
                 if showLocation {
                     Text(location)
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(subline)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -337,14 +338,14 @@ struct ChatRow: View {
                     Spacer(minLength: 4)
                 }
                 Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                    .font(Theme.sans(11))
+                    .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(subline)
                     .fixedSize()
             }
 
             // Line 2: the session title.
             Text(chat.displayTitle)
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -359,7 +360,7 @@ struct ChatRow: View {
                 if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
                     LineIconView(.gitBranch, size: 11, color: subline)
                     Text(branch)
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(subline)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -370,7 +371,7 @@ struct ChatRow: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 
     /// "space · device", with offline marker. The space name (not the cwd

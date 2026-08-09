@@ -70,12 +70,12 @@ struct StatsView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
                     Text("Board stats")
-                        .font(Theme.sans(13, weight: .medium))
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
                         .foregroundStyle(Theme.text)
                     if let host {
                         Text("on \(model.deviceName(host))")
-                            .font(Theme.sans(10.5))
-                            .foregroundStyle(Theme.textMuted.opacity(0.6))
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.textSubtle)
                     }
                 }
             }
@@ -126,19 +126,19 @@ struct StatsView: View {
                     sinceDays = window.days
                 } label: {
                     Text(window.label)
-                        .font(Theme.sans(12, weight: selected ? .medium : .regular))
+                        .font(Theme.sans(Theme.textDense, weight: selected ? .medium : .regular))
                         .foregroundStyle(selected ? Theme.text : Theme.textMuted)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
                         .background(selected ? Theme.elementActive : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: 7))
+                                    in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
                 .buttonStyle(ChipPressButtonStyle())
             }
         }
         .padding(2)
-        .background(whiteAlpha(0.02), in: RoundedRectangle(cornerRadius: 9))
-        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Theme.border, lineWidth: 1))
+        .background(whiteAlpha(0.02), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(Theme.border, lineWidth: 1))
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
         .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 6, trailing: 12))
@@ -157,7 +157,7 @@ struct StatsView: View {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(statsHeadline(stats))
-                        .font(Theme.sans(30, weight: .semibold))
+                        .font(Theme.sans(Theme.textFigure, weight: .semibold))
                         .foregroundStyle(Theme.text)
                     // Only facts that exist: a board with nothing ended has no
                     // rate and no median, and an em-dash for each would read as
@@ -165,7 +165,7 @@ struct StatsView: View {
                     Text(facts.isEmpty
                          ? "across \(stats.tasksTouched) task\(stats.tasksTouched == 1 ? "" : "s")"
                          : facts.joined(separator: " · "))
-                        .font(Theme.sans(12.5))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -182,8 +182,8 @@ struct StatsView: View {
             .padding(.vertical, 16)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.surfaceRaised.opacity(0.5),
-                        in: RoundedRectangle(cornerRadius: Theme.panelRadius))
-            .overlay(RoundedRectangle(cornerRadius: Theme.panelRadius)
+                        in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow)
                 .strokeBorder(Theme.border, lineWidth: 1))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -217,7 +217,7 @@ struct StatsView: View {
                         Spacer(minLength: 4)
                         Text(shortDay(stats.daily.last?.date ?? ""))
                     }
-                    .font(Theme.sans(10.5))
+                    .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(Theme.textFaint)
                 }
                 .padding(.horizontal, 8)
@@ -240,9 +240,12 @@ struct StatsView: View {
         return VStack(spacing: 0) {
             Spacer(minLength: 0)
             ZStack(alignment: .bottom) {
+                // scale-ok: a drawn column's own cap — a few points wide, and
+                // its corner relates to that width, not to a box it sits in
                 RoundedRectangle(cornerRadius: 3)
                     .fill(Theme.accent.opacity(0.22))
                     .frame(height: total)
+                // scale-ok: the same column, filled to its done share
                 RoundedRectangle(cornerRadius: 3)
                     .fill(Theme.accent.opacity(0.85))
                     .frame(height: done)
@@ -264,11 +267,11 @@ struct StatsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(humanTokens(stats.tokens.total))
-                            .font(Theme.sans(22, weight: .semibold))
+                            .font(Theme.sans(Theme.textFigure, weight: .semibold))
                             .foregroundStyle(Theme.text)
                         Text("processed")
-                            .font(Theme.sans(11.5))
-                            .foregroundStyle(Theme.textMuted.opacity(0.75))
+                            .font(Theme.sans(Theme.textDense))
+                            .foregroundStyle(Theme.textSubtle)
                         Spacer(minLength: 0)
                     }
                     ForEach(statsTokenLines(stats.tokens), id: \.label) { line in
@@ -289,8 +292,8 @@ struct StatsView: View {
                     let peak = models.first?.usage.total ?? 0
                     VStack(alignment: .leading, spacing: 7) {
                         Text("By model")
-                            .font(Theme.sans(11, weight: .medium))
-                            .foregroundStyle(Theme.textMuted.opacity(0.6))
+                            .font(Theme.sans(Theme.textCaption, weight: .medium))
+                            .foregroundStyle(Theme.textSubtle)
                         ForEach(models) { row in
                             tallyRow(label: row.label,
                                      value: humanTokens(row.usage.total),
@@ -373,14 +376,16 @@ struct StatsView: View {
     private func tallyRow(label: String, value: String, fraction: Double) -> some View {
         HStack(spacing: 10) {
             Text(label)
-                .font(Theme.sans(12))
+                .font(Theme.sans(Theme.textDense))
                 .foregroundStyle(Theme.textMuted)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(width: 108, alignment: .leading)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
+                    // round-ok: a bar's round cap, on a 5pt-tall track
                     Capsule().fill(whiteAlpha(0.05))
+                    // round-ok: the same bar, filled to its fraction
                     Capsule()
                         .fill(Theme.accent.opacity(0.55))
                         .frame(width: max(0, geo.size.width * fraction))
@@ -388,7 +393,7 @@ struct StatsView: View {
             }
             .frame(height: 5)
             Text(value)
-                .font(Theme.mono(11))
+                .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 46, alignment: .trailing)
         }
@@ -398,11 +403,11 @@ struct StatsView: View {
     private func factRow(_ label: String, _ value: String) -> some View {
         HStack(spacing: 12) {
             Text(label)
-                .font(Theme.sans(12.5))
+                .font(Theme.sans(Theme.textDense))
                 .foregroundStyle(Theme.textMuted)
             Spacer(minLength: 8)
             Text(value)
-                .font(Theme.sans(12.5, weight: .medium))
+                .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
         }
@@ -411,12 +416,12 @@ struct StatsView: View {
     private func header(_ title: String, aside: String?) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(title)
-                .font(Theme.sans(11, weight: .medium))
-                .foregroundStyle(Theme.textMuted.opacity(0.6))
+                .font(Theme.sans(Theme.textCaption, weight: .medium))
+                .foregroundStyle(Theme.textSubtle)
             if let aside {
                 Text(aside)
-                    .font(Theme.sans(10.5))
-                    .foregroundStyle(Theme.textFaint.opacity(0.8))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textFaint)
                     .lineLimit(2)
             }
         }
@@ -427,7 +432,7 @@ struct StatsView: View {
 
     private func note(_ text: String) -> some View {
         Text(text)
-            .font(Theme.sans(12.5))
+            .font(Theme.sans(Theme.textDense))
             .foregroundStyle(Theme.textFaint)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 8)
@@ -439,14 +444,14 @@ struct StatsView: View {
 
     private func errorStrip(_ message: String) -> some View {
         Text(message)
-            .font(Theme.sans(12))
-            .foregroundStyle(Theme.dangerSoft)
+            .font(Theme.sans(Theme.textDense))
+            .foregroundStyle(Theme.dangerText)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.danger.opacity(0.10),
-                        in: RoundedRectangle(cornerRadius: 8))
+                        in: RoundedRectangle(cornerRadius: Theme.radiusRow))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
             .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 4, trailing: 12))
@@ -456,7 +461,7 @@ struct StatsView: View {
         HStack(spacing: 8) {
             ProgressView().controlSize(.small).tint(Theme.textMuted)
             Text("Reading the board…")
-                .font(Theme.sans(12.5))
+                .font(Theme.sans(Theme.textDense))
                 .foregroundStyle(Theme.textFaint)
         }
         .padding(.horizontal, 8)

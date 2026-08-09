@@ -22,7 +22,7 @@ struct InlineCodeRenderer: TextRenderer {
                                   y: bounds.minY + 2,
                                   width: bounds.width + 4,
                                   height: bounds.height - 4)
-                context.fill(Path(roundedRect: rect, cornerRadius: 4.5), with: .color(wash))
+                context.fill(Path(roundedRect: rect, cornerRadius: MD.inlineCodeRadius), with: .color(wash))
             }
         }
         // Glyph pass.

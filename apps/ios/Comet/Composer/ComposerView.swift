@@ -63,9 +63,9 @@ struct ComposerShell<Chips: View>: View {
                     .padding(.trailing, 7)
             }
         }
-        .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: 28))
-        .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 28))
-        .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+        .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
         // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
         .padding(.horizontal, focused ? 10 : 16)
         .motionAnimation(Motion.resize, value: focused)
@@ -74,12 +74,17 @@ struct ComposerShell<Chips: View>: View {
 
     private var input: some View {
         TextField(placeholder, text: $draft, axis: .vertical)
-            .font(Theme.sans(16))
+            .font(Theme.sans(Theme.textProse))
             .foregroundStyle(Theme.text)
             .tint(Theme.text)
             .lineLimit(1...7)
             .focused($focused)
     }
+
+    /// round-ok: the send button — the one round thing on screen, and it is the
+    /// one you press. Named rather than written twice so the shape and the
+    /// reason for it stay together (gh#174).
+    private var sendShape: Circle { Circle() }
 
     private var actionButton: some View {
         Button {
@@ -97,6 +102,8 @@ struct ComposerShell<Chips: View>: View {
                         .controlSize(.small)
                         .tint(Theme.bg)
                 } else if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // scale-ok: the stop glyph DRAWN inside the send button —
+                    // a 12pt square whose corner is part of the mark
                     RoundedRectangle(cornerRadius: 3.5)
                         .fill(Theme.bg)
                         .frame(width: 12, height: 12)
@@ -108,8 +115,8 @@ struct ComposerShell<Chips: View>: View {
             }
             .frame(width: 36, height: 36)
             .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.10)),
-                        in: Circle())
-            .contentShape(Circle())
+                        in: sendShape)
+            .contentShape(sendShape)
         }
         .buttonStyle(.plain)
         .disabled(!buttonActive)
@@ -190,28 +197,28 @@ struct QuestionPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(question.header.uppercased())
-                    .font(Theme.sans(10.5, weight: .medium))
+                    .font(Theme.sans(Theme.textCaption, weight: .medium))
                     .kerning(1)
-                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                    .foregroundStyle(Theme.textSubtle)
                 Spacer()
                 if questions.count > 1 {
                     Text("\(page + 1)/\(questions.count)")
-                        .font(Theme.sans(10))
+                        .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(Theme.textMuted)
                         .padding(.horizontal, 6)
                         .frame(height: 20)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
             }
 
             Text(question.question)
-                .font(Theme.sans(15, weight: .medium))
+                .font(Theme.sans(Theme.textTitle, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .fixedSize(horizontal: false, vertical: true)
 
             if question.multiSelect == true {
                 Text("Select one or more options.")
-                    .font(Theme.sans(12))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textMuted)
             }
 
@@ -227,7 +234,7 @@ struct QuestionPanel: View {
                     get: { typed[question.id] ?? "" },
                     set: { typed[question.id] = $0 }
                 ))
-                .font(Theme.sans(13))
+                .font(Theme.sans(Theme.textBody))
                 .foregroundStyle(Theme.text)
                 .padding(.top, 6)
             }
@@ -237,25 +244,25 @@ struct QuestionPanel: View {
                     Button("Back") {
                         page -= 1
                     }
-                    .font(Theme.sans(13, weight: .medium))
+                    .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
                 }
                 Spacer()
                 Button(page < questions.count - 1 ? "Next" : "Submit") {
                     advance()
                 }
-                .font(Theme.sans(13, weight: .medium))
+                .font(Theme.sans(Theme.textBody, weight: .medium))
                 .foregroundStyle(Theme.bg)
                 .padding(.horizontal, 16)
                 .frame(height: 34)
-                .background(Theme.text, in: Capsule())
+                .background(Theme.text, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                 .opacity(canAdvance(question) ? 1 : 0.4)
                 .disabled(!canAdvance(question))
             }
         }
         .padding(16)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
-        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
         .padding(.horizontal, 12)
         .transition(.opacity)
     }
@@ -269,24 +276,24 @@ struct QuestionPanel: View {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(option)
-                        .font(Theme.sans(13.5, weight: .medium))
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
                         .foregroundStyle(Theme.text)
                         .multilineTextAlignment(.leading)
                 }
                 Spacer(minLength: 0)
                 if ix < 9 {
                     Text("\(ix + 1)")
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(Theme.textMuted)
                         .frame(width: 22, height: 22)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(isPicked ? whiteAlpha(0.09) : whiteAlpha(0.025),
-                        in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12)
+                        in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow)
                 .strokeBorder(isPicked ? whiteAlpha(0.16) : .clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
