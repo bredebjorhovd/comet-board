@@ -14,8 +14,9 @@
 //!
 //! 1. `rounded*(px(<number>))` — a radius that is not one of the three.
 //! 2. `text_size(px(<number>))` — a size that is not one of the six.
-//! 3. `rounded_full()` — the exception, and it is for status dots and the send
-//!    button. One round thing on screen, and it is the one you press.
+//! 3. `rounded_full()` — the exception, and it is for status dots, the send
+//!    button, and the account avatar, whose roundness is the meaning rather
+//!    than a corner treatment.
 //!
 //! The hatch for 1 and 2 is a `scale-ok: <reason>` comment on the same line or
 //! the line above; for 3 it is `round-ok: <reason>`. Both are for marks that
@@ -81,8 +82,8 @@ fn no_literal_radius_or_font_size_outside_the_theme() {
     );
 }
 
-/// The send button and the dots, and nothing else — every surviving
-/// `rounded_full()` says which it is.
+/// The send button, the dots and the avatar, and nothing else — every
+/// surviving `rounded_full()` says which it is.
 #[test]
 fn full_round_is_a_dot_or_the_send_button() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -109,8 +110,8 @@ fn full_round_is_a_dot_or_the_send_button() {
     report(
         violations,
         "unmarked full-round(s). Roundness that is not a status dot, a drawn \
-         cap or the send button belongs on the three-step scale; if it really \
-         is one of those, say so with a `round-ok: <reason>` comment:",
+         cap, an avatar or the send button belongs on the three-step scale; if \
+         it really is one of those, say so with a `round-ok: <reason>` comment:",
     );
 }
 
