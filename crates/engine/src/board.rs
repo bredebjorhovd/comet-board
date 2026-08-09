@@ -34,7 +34,7 @@ use comet_board::claims::AttemptReview;
 use comet_board::config::Paths;
 use comet_board::db::NewAttempt;
 use comet_board::dispatch::{
-    DispatchOrigin, DispatchOverrides, SpaceRef, build_spec, check_capacity, dispatcher_for,
+    DispatchOrigin, DispatchOverrides, RanOn, SpaceRef, build_spec, check_capacity, dispatcher_for,
     dispatcher_name, route_for, space_matches,
 };
 use comet_board::log::Logger;
@@ -789,19 +789,23 @@ fn handle_dispatch(
                 )),
             }
             // The upstream comment names the parent legibly: the issue
-            // identifier when the board dispatched it too, the chat id
-            // otherwise — not the raw task id. With no agent in the chain it
-            // falls back to the human who released it (gh#74), which is the
-            // difference between "dispatched by ana@example.com" and a comment
-            // that says nothing about who released the work. Plain, without
-            // gh#161's strength marker: this one is a public issue comment, and
-            // the audience for "the box checked this" is the operator and the
-            // orchestrator, not the repo.
-            let by =
-                dispatcher_name(&engine.db, &dispatcher).or_else(|| by.name().map(str::to_string));
+            // identifier when the board dispatched it too, the human who
+            // released it next (gh#74), and a bare chat id only when it has
+            // neither — see `dispatcher_name` for why that order and not the
+            // one gh#232 found. Plain, without gh#161's strength marker: this
+            // one is a public issue comment, and the audience for "the box
+            // checked this" is the operator and the orchestrator, not the repo.
+            let by = dispatcher_name(&engine.db, &dispatcher, by.name());
             engine.enqueue_dispatch(
                 &task,
-                &route.runtime,
+                // What ran, not what the route would have run: an attempt
+                // dispatched under `--runtime`/`--model` is recorded correctly
+                // everywhere else, and the comment is the surface that outlives
+                // all of them (gh#232).
+                RanOn {
+                    runtime: runtime_name,
+                    model: spec.model.as_deref(),
+                },
                 &route.workspace,
                 attempt_no,
                 by.as_deref(),
@@ -1419,7 +1423,12 @@ runtime = "mock"
         service
             .dispatch_task(
                 "gh:owner/widget#50",
-                DispatchOrigin::default(),
+                DispatchOrigin {
+                    chat: None,
+                    device: None,
+                    user: Some("brede@tally.no".into()),
+                    verified: None,
+                },
                 DispatchOverrides {
                     runtime: Some("opencode".into()),
                     model: Some("gpt-5.2".into()),
@@ -1444,6 +1453,23 @@ runtime = "mock"
         assert_eq!(attempt.runtime, "opencode");
         let rows = service.watch_rows().borrow().clone();
         assert_eq!(rows[0].runtime.as_deref(), Some("opencode"));
+
+        // …and so does the comment queued for the issue (gh#232). This is the
+        // one surface the override used to be dropped on the way to: the
+        // payload carried the *route's* runtime, so every dispatch this board
+        // ever made read `claude-code` upstream whatever actually ran. The
+        // model rides with it, because `opencode` alone says nothing about
+        // which model to compare the next attempt against.
+        let queued = db.pending_writebacks(10).unwrap();
+        let dispatch = queued
+            .iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        let payload: serde_json::Value = serde_json::from_str(&dispatch.payload).unwrap();
+        assert_eq!(payload["runtime"].as_str(), Some("opencode"));
+        assert_eq!(payload["model"].as_str(), Some("gpt-5.2"));
+        // And the human, not the chat id the frontend passed nothing for.
+        assert_eq!(payload["via"].as_str(), Some("brede@tally.no"));
 
         service.shutdown();
     }
@@ -2048,6 +2074,52 @@ max_concurrent_per_workspace = 1
             attempt.dispatched_by_pane.as_deref(),
             Some("chat-parent-30")
         );
+
+        service.shutdown();
+    }
+
+    /// gh#232: a `via` chat the board never dispatched resolves to no
+    /// identifier — the long-lived orchestrator case — and its id is a UUID.
+    /// The attempt row keeps it (it is the address a settle notice goes to),
+    /// and the public comment names the person instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_comment_names_the_person_over_an_unresolvable_chat_id() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#32", "gh#32");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#32",
+                DispatchOrigin {
+                    chat: Some("f31135c6-92d2-4efa-a0c1-1c740170f4c7".into()),
+                    device: None,
+                    user: Some("brede@tally.no".into()),
+                    verified: None,
+                },
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#32").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("live attempt");
+        assert_eq!(
+            attempt.dispatched_by_pane.as_deref(),
+            Some("f31135c6-92d2-4efa-a0c1-1c740170f4c7"),
+        );
+
+        let queued = db.pending_writebacks(10).unwrap();
+        let dispatch = queued
+            .iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        let payload: serde_json::Value = serde_json::from_str(&dispatch.payload).unwrap();
+        assert_eq!(payload["via"].as_str(), Some("brede@tally.no"));
 
         service.shutdown();
     }

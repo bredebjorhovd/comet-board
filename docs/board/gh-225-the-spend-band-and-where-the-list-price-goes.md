@@ -1,6 +1,6 @@
 # The spend band, and where the list price goes — **done** (gh#225)
 
-Part of §gh#171, and the second pass over the block §gh#179 built. That block
+Part of gh#171, and the second pass over the block §gh#179 built. That block
 was right about the order of the page and wrong about the room: it gave a whole
 card to one sentence, three figures wrapped across it at 32px gaps, and then
 spent nothing on the fact a reader needs to *act* on the headline.
@@ -71,7 +71,7 @@ story.
   dark-to-light left to right and an unchanged board redraws identically. A
   class nobody spent in is absent, not a zero-width segment nobody can see —
   `ranked_tokens`' rule, one axis over.
-- **One hue at four weights, not four hues.** The status ramp (§gh#173) means
+- **One hue at four weights, not four hues.** The status ramp (gh#173) means
   something on this page; borrowing a status colour to say `cache writes` would
   be a colour lying about what it names.
 
@@ -96,4 +96,4 @@ so there is nothing there to disagree with the rule and no case in the
 cross-language fixture (`hour_grid` is in the same position, for the same
 reason). Nothing on the wire changed: `CostSplit` is derived from the
 `BoardSpend` a board already sends, so an older box answers a newer viewport
-and the block draws anyway. §gh#181 is where the phone catches up.
+and the block draws anyway. gh#181 is where the phone catches up.

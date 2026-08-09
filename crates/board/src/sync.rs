@@ -27,6 +27,7 @@
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
+use crate::dispatch::RanOn;
 use crate::gc;
 use crate::log::Logger;
 use crate::model::*;
@@ -2929,13 +2930,19 @@ impl SyncEngine {
 
     // ---- writeback ------------------------------------------------------
 
+    /// `ran` is what the attempt actually runs under — the dispatch's overrides
+    /// where it made them, not the route's defaults (gh#232). The comment
+    /// outlives the chat, the row and the worktree, so it is the one surface
+    /// that cannot afford to name the route instead.
+    ///
     /// `via` is the dispatcher already named for a reader — an issue identifier,
-    /// or the chat an orchestrator is running in. `None` is the operator, and
-    /// says nothing upstream.
+    /// the human who released it, or the chat an orchestrator is running in.
+    /// `None` is a dispatch the board can put no name to, and says nothing
+    /// upstream.
     pub fn enqueue_dispatch(
         &self,
         task: &Task,
-        runtime: &str,
+        ran: RanOn<'_>,
         workspace: &str,
         attempt_no: usize,
         via: Option<&str>,
@@ -2947,7 +2954,11 @@ impl SyncEngine {
             task_id: task.id.clone(),
             kind: "dispatch".into(),
             payload: json!({
-                "runtime": runtime,
+                "runtime": ran.runtime,
+                // Absent when the dispatch named none, which is the harness
+                // default and not a fact this board can spell — the comment
+                // says the runtime alone rather than guessing at a model id.
+                "model": ran.model,
                 "workspace": workspace,
                 "attempt": attempt_no,
                 "via": via,
@@ -3112,22 +3123,7 @@ impl SyncEngine {
                                 "no started-type state for team {team}; commenting only"
                             ));
                         }
-                        let via = match payload["via"].as_str() {
-                            Some(v) => format!(" · dispatched by {v}"),
-                            None => String::new(),
-                        };
-                        let billed = dispatch_billing_suffix(&payload);
-                        linear.comment(
-                            &task.source_id,
-                            &format!(
-                                "Dispatched to comet · {} · space:{} · attempt {}{}{}",
-                                payload["runtime"].as_str().unwrap_or("?"),
-                                payload["workspace"].as_str().unwrap_or("?"),
-                                payload["attempt"].as_u64().unwrap_or(1),
-                                via,
-                                billed,
-                            ),
-                        )?;
+                        linear.comment(&task.source_id, &dispatch_comment(&payload))?;
                     }
                     "outcome" => {
                         let outcome = payload["outcome"].as_str().unwrap_or("done");
@@ -3234,23 +3230,7 @@ impl SyncEngine {
                 }
                 match w.kind.as_str() {
                     "dispatch" => {
-                        let via = match payload["via"].as_str() {
-                            Some(v) => format!(" · dispatched by {v}"),
-                            None => String::new(),
-                        };
-                        let billed = dispatch_billing_suffix(&payload);
-                        gh.comment(
-                            &repo,
-                            number,
-                            &format!(
-                                "Dispatched to comet · {} · space:{} · attempt {}{}{}",
-                                payload["runtime"].as_str().unwrap_or("?"),
-                                payload["workspace"].as_str().unwrap_or("?"),
-                                payload["attempt"].as_u64().unwrap_or(1),
-                                via,
-                                billed,
-                            ),
-                        )?;
+                        gh.comment(&repo, number, &dispatch_comment(&payload))?;
                     }
                     "outcome" => {
                         let outcome = payload["outcome"].as_str().unwrap_or("done");
@@ -3418,6 +3398,35 @@ fn blocked_comment(payload: &Value) -> String {
         payload["attempt"].as_u64().unwrap_or(1),
         Stopped::parse(payload["reason"].as_str().unwrap_or("")),
         payload["log"].as_str().unwrap_or("(none)"),
+    )
+}
+
+/// The line a dispatch leaves on the issue, rendered from the queued payload
+/// (gh#232).
+///
+/// One function for both sources because there is one sentence: Linear and
+/// GitHub had the same `format!` twice, and a fix to either was a fix to one
+/// half of the board's readers.
+///
+/// The model rides beside the runtime when the dispatch named one. For a board
+/// spreading work across harnesses that is the half worth having — `codex` says
+/// what ran, `codex · gpt-5.6-luna` says what to compare the next attempt
+/// against. Absent means the harness default, which the board does not know and
+/// so does not name.
+fn dispatch_comment(payload: &Value) -> String {
+    let field = |key: &str| payload[key].as_str().filter(|v| !v.trim().is_empty());
+    let segment = |prefix: &str, value: Option<&str>| match value {
+        Some(v) => format!(" · {prefix}{v}"),
+        None => String::new(),
+    };
+    format!(
+        "Dispatched to comet · {}{} · space:{} · attempt {}{}{}",
+        field("runtime").unwrap_or("?"),
+        segment("", field("model")),
+        field("workspace").unwrap_or("?"),
+        payload["attempt"].as_u64().unwrap_or(1),
+        segment("dispatched by ", field("via")),
+        dispatch_billing_suffix(payload),
     )
 }
 
@@ -3834,6 +3843,56 @@ mod tests {
 
     fn live(e: &SyncEngine) -> Attempt {
         e.db.attempts_for("linear:LIN-142").unwrap().remove(0)
+    }
+
+    /// The one line a dispatch leaves upstream, from the payload the queue
+    /// holds — including the model, which for a board spreading work across
+    /// harnesses is what makes the next comparison possible (gh#232).
+    #[test]
+    fn a_dispatch_comment_names_the_runtime_and_the_model_that_ran() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-232", "LIN-232", UpstreamState::Started);
+        let task = e.db.get_task("linear:LIN-232").unwrap().unwrap();
+        e.enqueue_dispatch(
+            &task,
+            RanOn {
+                runtime: "codex",
+                model: Some("gpt-5.6-luna"),
+            },
+            "comet-board",
+            1,
+            Some("brede@tally.no"),
+            None,
+        )
+        .unwrap();
+        let queued = e.db.pending_writebacks(10).unwrap();
+        let payload: Value = serde_json::from_str(&queued[0].payload).unwrap();
+        assert_eq!(
+            dispatch_comment(&payload),
+            "Dispatched to comet · codex · gpt-5.6-luna · space:comet-board · attempt 1 · \
+             dispatched by brede@tally.no"
+        );
+
+        // No model named is the harness default, which the board cannot spell —
+        // so it says the runtime alone rather than guessing.
+        e.enqueue_dispatch(
+            &task,
+            RanOn {
+                runtime: "claude-code",
+                model: None,
+            },
+            "comet-board",
+            2,
+            None,
+            None,
+        )
+        .unwrap();
+        let queued = e.db.pending_writebacks(10).unwrap();
+        let payload: Value = serde_json::from_str(&queued[1].payload).unwrap();
+        assert_eq!(
+            dispatch_comment(&payload),
+            "Dispatched to comet · claude-code · space:comet-board · attempt 2"
+        );
     }
 
     // ---- session reconciliation -----------------------------------------
