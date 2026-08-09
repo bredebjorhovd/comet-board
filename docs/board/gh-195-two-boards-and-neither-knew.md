@@ -3,7 +3,7 @@
 Noticed while working on the box on 2026-08-09: this account has **two** live
 boards. The Mac's — `~/.comet-native/board/state/board.db`, one route,
 `bredebjorhovd/attn`, the board that ran the 17 overnight attempts on 08-08. And
-the box's — same path on `comet@62.238.106.136`, 17 routes over 8 repos, 550
+the box's — same path on `comet@<box>`, 17 routes over 8 repos, 550
 rows. Each polls GitHub on its own timer. Neither knows the other is there.
 
 Nothing was broken, and nothing was keeping it that way. The two `[github]

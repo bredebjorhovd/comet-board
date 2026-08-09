@@ -3,16 +3,20 @@
 //!
 //! A space is a synced (device, folder) pair; the folder need NOT be a git
 //! repo. This service watches the workspace `spaces` rows owned by THIS device
-//! and keeps their `gitDetected`/`checkoutId` stamps truthful:
+//! and keeps their `gitDetected`/`checkoutId`/`branch` stamps truthful:
 //!
 //! - recheck on boot / when a space row is first observed;
 //! - a non-recursive `notify` watcher on the space folder — `.git` appearing or
-//!   vanishing (git init / de-git) kicks a recheck;
+//!   vanishing (git init / de-git) kicks a recheck — and a second one on the
+//!   folder's `.git`, whose direct child `HEAD` is rewritten by every checkout,
+//!   so switching branch shows up without waiting for the repair tick;
 //! - a slow 2-minute repair tick (native watchers coalesce/drop events).
 //!
 //! Stamps are written ONLY on change, so steady state never grows the oplog.
 //! Remote devices read `space.git_detected` straight from the doc — branch
-//! pickers and the diff sidebar gate on it with zero RPCs.
+//! pickers and the diff sidebar gate on it with zero RPCs — and `space.branch`
+//! the same way: it is what a *collapsed* space row says about where the
+//! folder is (gh#229), on a phone that will never run git against that disk.
 //!
 //! The repair tick also runs the orphan sweep: a chat created concurrently
 //! with a `deleteSpace` on another device can sync in after the cascade ran,
@@ -39,8 +43,8 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 struct SpaceEntry {
     path: PathBuf,
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the folder watcher alive; dropped on entry close.
-    _watcher: Option<notify::RecommendedWatcher>,
+    /// Keeps the folder + `.git` watchers alive; dropped on entry close.
+    _watchers: Vec<notify::RecommendedWatcher>,
 }
 
 struct SpacesSyncInner {
@@ -103,44 +107,52 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             continue; // deviceId/path are immutable — nothing to refresh
         }
         let (kick_tx, kick_rx) = mpsc::unbounded_channel();
-        // Non-recursive watcher on the space folder: `.git` appearing/vanishing
-        // among the direct children is exactly the signal we need. Watch
-        // failures are fine — the repair tick still converges.
-        let watcher = {
-            let tx = kick_tx.clone();
-            let result =
-                notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                    let Ok(event) = event else { return };
-                    if event
-                        .paths
-                        .iter()
-                        .any(|p| p.file_name().is_some_and(|n| n == ".git"))
-                    {
-                        let _ = tx.send(());
-                    }
-                });
-            match result {
-                Ok(mut watcher) => {
-                    use notify::Watcher as _;
-                    match watcher.watch(Path::new(&space.path), notify::RecursiveMode::NonRecursive)
-                    {
-                        Ok(()) => Some(watcher),
-                        Err(err) => {
-                            tracing::debug!(path = %space.path, error = %err, "spaces: watch failed");
-                            None
+        // Two non-recursive watchers, both filtered to the two names that mean
+        // something here: `.git` among the space folder's direct children is
+        // git init / de-git, and `HEAD` among `.git`'s is a checkout. Filtering
+        // matters on the second one — `.git/index` is rewritten by every `git
+        // status` a build script runs, and an unfiltered watch would spend
+        // three git subprocesses per keystroke-driven rebuild. Watch failures
+        // are fine (a folder that is not a repo has no `.git` to watch yet):
+        // the repair tick still converges.
+        let watchers = [PathBuf::from(&space.path), Path::new(&space.path).join(".git")]
+            .into_iter()
+            .filter_map(|target| {
+                let tx = kick_tx.clone();
+                let result = notify::recommended_watcher(
+                    move |event: Result<notify::Event, notify::Error>| {
+                        let Ok(event) = event else { return };
+                        if event
+                            .paths
+                            .iter()
+                            .any(|p| p.file_name().is_some_and(|n| n == ".git" || n == "HEAD"))
+                        {
+                            let _ = tx.send(());
+                        }
+                    },
+                );
+                match result {
+                    Ok(mut watcher) => {
+                        use notify::Watcher as _;
+                        match watcher.watch(&target, notify::RecursiveMode::NonRecursive) {
+                            Ok(()) => Some(watcher),
+                            Err(err) => {
+                                tracing::debug!(path = %target.display(), error = %err, "spaces: watch failed");
+                                None
+                            }
                         }
                     }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "spaces: watcher create failed");
+                        None
+                    }
                 }
-                Err(err) => {
-                    tracing::debug!(error = %err, "spaces: watcher create failed");
-                    None
-                }
-            }
-        };
+            })
+            .collect();
         let entry = Arc::new(SpaceEntry {
             path: PathBuf::from(&space.path),
             kick_tx: kick_tx.clone(),
-            _watcher: watcher,
+            _watchers: watchers,
         });
         entries.insert(id.to_string(), entry.clone());
         tokio::spawn(entry_task(
@@ -175,19 +187,28 @@ async fn entry_task(
     }
 }
 
-/// Probe git presence and stamp the row — write only on change.
+/// Probe git presence + the checked-out branch and stamp the row — write only
+/// on change.
 async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) {
     let detected = inner.repos.is_repo(path).await;
-    let checkout_id = if detected {
-        match inner.repos.checkout_identity(path).await {
+    let (checkout_id, branch) = if detected {
+        let checkout_id = match inner.repos.checkout_identity(path).await {
             Ok(identity) => Some(identity.id),
             Err(err) => {
                 tracing::debug!(space = %space_id, error = %err, "spaces: checkout identity failed");
                 None
             }
-        }
+        };
+        let branch = match inner.repos.current_branch(path).await {
+            Ok(branch) => Some(branch),
+            Err(err) => {
+                tracing::debug!(space = %space_id, error = %err, "spaces: branch read failed");
+                None
+            }
+        };
+        (checkout_id, branch)
     } else {
-        None
+        (None, None)
     };
     let current = match inner.workspace.read_spaces() {
         Ok(spaces) => spaces.into_iter().find(|s| s.id == space_id),
@@ -199,19 +220,32 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
     let Some(current) = current else {
         return; // deleted while checking
     };
-    if current.git_detected == detected && current.checkout_id == checkout_id {
+    if current.git_detected == detected
+        && current.checkout_id == checkout_id
+        && current.branch == branch
+    {
         return; // unchanged — no oplog growth
     }
-    match inner
-        .workspace
-        .set_space_git(space_id, detected, checkout_id.as_deref())
-    {
+    match inner.workspace.set_space_git(
+        space_id,
+        detected,
+        checkout_id.as_deref(),
+        branch.as_deref(),
+    ) {
         Ok(_) => {
             tracing::info!(space = %space_id, git = detected, "space git presence updated");
         }
         Err(err) => {
             tracing::warn!(space = %space_id, error = %err, "spaces: git stamp failed");
         }
+    }
+    // A folder that just became (or stopped being) a repo has the wrong
+    // watchers: the `.git` watch is installed at reconcile time and there was
+    // no `.git` to watch. Dropping the entry makes the next reconcile — which
+    // the stamp above just triggered, via the spaces watch — build it again
+    // with both watchers.
+    if current.git_detected != detected {
+        lock(&inner.entries).remove(space_id);
     }
 }
 

@@ -51,6 +51,14 @@ pub struct Space {
     /// (sha256(deviceId ‖ NUL ‖ git_dir)) — diff grouping key for root sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
+    /// Owner-stamped when git: the branch the space folder is checked out on,
+    /// `"HEAD"` when detached (gh#229). A collapsed space row is a container
+    /// with its contents hidden, and *where the folder is* is the one fact
+    /// that survives collapsing — it belongs to the folder, not to the chats
+    /// inside it, so it is stamped here rather than inferred from a member
+    /// chat's `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

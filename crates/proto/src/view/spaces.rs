@@ -202,6 +202,37 @@ fn path_tail(path: &str, depth: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// What a collapsed row says about where the folder is (gh#229)
+// ---------------------------------------------------------------------------
+
+/// Is this space a git work tree — the question the row's glyph answers.
+///
+/// Owner-stamped `git_detected` is the evidence, and the gh#118 slug is only a
+/// fallback for the row whose owner has not stamped it yet: a checkout is a
+/// checkout whether or not a board host is reachable to name its repo, and
+/// keying the glyph on the slug alone made every space look like a plain
+/// folder on a laptop that hosts no board — and, the other way round, gave the
+/// scratch directory the same mark as the repos the moment anything answered.
+pub fn is_repo_space(space: &Space, slug: Option<&str>) -> bool {
+    space.git_detected || slug.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// What the space row says it is checked out on, or `None` for a folder that
+/// is not a work tree (and for a row whose owner has not stamped one yet).
+///
+/// A detached HEAD is reported as `"HEAD"` by git and by
+/// [`crate::Space::branch`]; the row says `detached` instead, because "HEAD"
+/// is a branch name only to somebody who already knows it is not one.
+pub fn space_branch(space: &Space) -> Option<&str> {
+    let branch = space
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())?;
+    Some(if branch == "HEAD" { "detached" } else { branch })
+}
+
+// ---------------------------------------------------------------------------
 // One full row per chat (gh#138)
 // ---------------------------------------------------------------------------
 //
@@ -282,7 +313,15 @@ pub fn space_shelf<'a>(
 /// collapsed row used to hide and an expanded row used to prove by repeating
 /// the list.
 pub fn running_label(running: usize) -> Option<String> {
-    (running > 0).then(|| format!("· {running} running"))
+    running_count_label(running).map(|label| format!("· {label}"))
+}
+
+/// The same fact without the leading separator — for a surface that draws a
+/// status dot in front of it instead (gh#229: the desktop row pairs the count
+/// with a dot coloured by the most urgent chat under it, and `· 3 running`
+/// beside a dot says the separator twice).
+pub fn running_count_label(running: usize) -> Option<String> {
+    (running > 0).then(|| format!("{running} running"))
 }
 
 /// What an expanded shelf says INSTEAD of rows when Active holds all of them.
@@ -315,8 +354,38 @@ mod tests {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_work_tree_is_not_drawn_as_a_repo() {
+        let mut scratch = space("s1", "box", "/srv/scratch");
+        // No board answered, and the folder is nobody's checkout.
+        assert!(!is_repo_space(&scratch, None));
+        // A checkout is a checkout with no board host to name its repo…
+        scratch.git_detected = true;
+        assert!(is_repo_space(&scratch, None));
+        // …and a slug is evidence too, for the row whose owner is offline and
+        // has never stamped one.
+        let stale = space("s2", "box", "/srv/attn");
+        assert!(is_repo_space(&stale, Some("bredebjorhovd/attn")));
+        assert!(!is_repo_space(&stale, Some("   ")));
+    }
+
+    #[test]
+    fn a_collapsed_row_says_where_the_folder_is() {
+        let mut s = space("s1", "box", "/srv/attn");
+        assert_eq!(space_branch(&s), None);
+        s.branch = Some("main".into());
+        assert_eq!(space_branch(&s), Some("main"));
+        // git's own word for no branch is the one word a reader would take for
+        // a branch name.
+        s.branch = Some("HEAD".into());
+        assert_eq!(space_branch(&s), Some("detached"));
+        s.branch = Some("   ".into());
+        assert_eq!(space_branch(&s), None);
     }
 
     #[test]
