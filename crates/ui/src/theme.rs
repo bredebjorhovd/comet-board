@@ -124,8 +124,9 @@
 //! white object on the page, so the row steps DOWN into it and the hairline
 //! draws the edge of the well.
 //!
-//! `rounded_full()` survives in exactly one job — a dot, and the send button.
-//! One round thing on screen, and it is the one you press. `tests/scale.rs`
+//! `rounded_full()` survives in a job or two — a dot, the send button, and the
+//! account avatar (gh#230), where roundness IS the meaning: a face is not a
+//! box, and every avatar anyone has ever seen is a circle. `tests/scale.rs`
 //! holds the line: every remaining full-round needs a `round-ok:` marker
 //! saying which of those it is.
 //!

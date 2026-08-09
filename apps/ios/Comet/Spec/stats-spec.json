@@ -45,6 +45,7 @@
         "agentDispatched": 0,
         "attempts": 0,
         "attemptsWithTokens": 0,
+        "breakdown": [],
         "byAccount": {},
         "byRuntime": {},
         "bySource": {},
@@ -130,6 +131,7 @@
         "agentDispatched": 0,
         "attempts": 0,
         "attemptsWithTokens": 0,
+        "breakdown": [],
         "byAccount": {},
         "byRuntime": {},
         "bySource": {},
@@ -215,6 +217,7 @@
         "agentDispatched": 0,
         "attempts": 0,
         "attemptsWithTokens": 0,
+        "breakdown": [],
         "byAccount": {},
         "byRuntime": {},
         "bySource": {},
@@ -300,6 +303,7 @@
         "agentDispatched": 0,
         "attempts": 4,
         "attemptsWithTokens": 0,
+        "breakdown": [],
         "byAccount": {},
         "byRuntime": {},
         "bySource": {},
@@ -385,6 +389,7 @@
         "agentDispatched": 5,
         "attempts": 13,
         "attemptsWithTokens": 8,
+        "breakdown": [],
         "byAccount": {},
         "byRuntime": {
           "claude-code": 10,
@@ -600,6 +605,70 @@
         "agentDispatched": 5,
         "attempts": 13,
         "attemptsWithTokens": 8,
+        "breakdown": [
+          {
+            "dimension": "model",
+            "peak": 400250,
+            "ranking": "spend",
+            "rows": [
+              {
+                "cost": 0.40025,
+                "dispatches": 8,
+                "label": "claude-opus-5",
+                "unpricedTokens": 0,
+                "usage": {
+                  "cacheCreationTokens": 21000,
+                  "cacheReadTokens": 148000,
+                  "inputTokens": 9000,
+                  "outputTokens": 6000
+                }
+              },
+              {
+                "cost": 0.0,
+                "dispatches": 5,
+                "label": "gpt-5.6-terra",
+                "unpricedTokens": 1000,
+                "usage": {
+                  "cacheCreationTokens": 500,
+                  "cacheReadTokens": 0,
+                  "inputTokens": 400,
+                  "outputTokens": 100
+                }
+              }
+            ]
+          },
+          {
+            "dimension": "runtime",
+            "peak": 400250,
+            "ranking": "spend",
+            "rows": [
+              {
+                "cost": 0.40025,
+                "dispatches": 10,
+                "label": "claude-code",
+                "unpricedTokens": 0,
+                "usage": {
+                  "cacheCreationTokens": 21000,
+                  "cacheReadTokens": 148000,
+                  "inputTokens": 9000,
+                  "outputTokens": 6000
+                }
+              },
+              {
+                "cost": 0.0,
+                "dispatches": 3,
+                "label": "codex",
+                "unpricedTokens": 1000,
+                "usage": {
+                  "cacheCreationTokens": 500,
+                  "cacheReadTokens": 0,
+                  "inputTokens": 400,
+                  "outputTokens": 100
+                }
+              }
+            ]
+          }
+        ],
         "byAccount": {
           "ana@example.com": 2,
           "brede@tally.no": 11
@@ -988,6 +1057,7 @@
         "agentDispatched": 0,
         "attempts": 2,
         "attemptsWithTokens": 2,
+        "breakdown": [],
         "byAccount": {},
         "byRuntime": {},
         "bySource": {},
