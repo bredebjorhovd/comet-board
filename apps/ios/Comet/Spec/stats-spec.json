@@ -34,6 +34,34 @@
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
+        "landingHeadline": "0 tasks",
+        "landingInFlightNote": null,
+        "landingSegments": [
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 0,
         "peakTokens": 0,
         "spendLabel": "rates not configured",
@@ -88,6 +116,7 @@
         "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
+          "inFlight": 0,
           "merged": 0,
           "noPr": 0,
           "open": 0
@@ -120,6 +149,34 @@
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
+        "landingHeadline": "0 tasks",
+        "landingInFlightNote": null,
+        "landingSegments": [
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 0,
         "peakTokens": 0,
         "spendLabel": "rates not configured",
@@ -174,6 +231,7 @@
         "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
+          "inFlight": 0,
           "merged": 0,
           "noPr": 0,
           "open": 0
@@ -206,6 +264,34 @@
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
+        "landingHeadline": "0 tasks",
+        "landingInFlightNote": null,
+        "landingSegments": [
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 0,
         "peakTokens": 0,
         "spendLabel": "rates not configured",
@@ -260,6 +346,7 @@
         "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
+          "inFlight": 0,
           "merged": 0,
           "noPr": 0,
           "open": 0
@@ -292,6 +379,34 @@
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": false,
+        "landingHeadline": "0 tasks",
+        "landingInFlightNote": null,
+        "landingSegments": [
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 0,
         "peakTokens": 0,
         "spendLabel": "rates not configured",
@@ -346,6 +461,7 @@
         "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
+          "inFlight": 0,
           "merged": 0,
           "noPr": 0,
           "open": 0
@@ -378,6 +494,34 @@
         "hasSpend": false,
         "hasTokens": true,
         "isEmpty": false,
+        "landingHeadline": "9 tasks",
+        "landingInFlightNote": "2 still running — not landed anywhere yet",
+        "landingSegments": [
+          {
+            "count": 5,
+            "fraction": 0.5555555555555556,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 2,
+            "fraction": 0.2222222222222222,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 1,
+            "fraction": 0.1111111111111111,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 1,
+            "fraction": 0.1111111111111111,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 8,
         "peakTokens": 440,
         "spendLabel": "rates not configured",
@@ -549,7 +693,8 @@
         },
         "landing": {
           "closedUnmerged": 1,
-          "merged": 7,
+          "inFlight": 2,
+          "merged": 5,
           "noPr": 1,
           "open": 2
         },
@@ -594,6 +739,34 @@
         "hasSpend": true,
         "hasTokens": true,
         "isEmpty": false,
+        "landingHeadline": "9 tasks",
+        "landingInFlightNote": "2 still running — not landed anywhere yet",
+        "landingSegments": [
+          {
+            "count": 5,
+            "fraction": 0.5555555555555556,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 2,
+            "fraction": 0.2222222222222222,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 1,
+            "fraction": 0.1111111111111111,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 1,
+            "fraction": 0.1111111111111111,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 8,
         "peakTokens": 440,
         "spendLabel": "$0.40 at list price, plus 1.0k unpriced token(s) across 1 model(s)",
@@ -831,7 +1004,8 @@
         },
         "landing": {
           "closedUnmerged": 1,
-          "merged": 7,
+          "inFlight": 2,
+          "merged": 5,
           "noPr": 1,
           "open": 2
         },
@@ -1046,6 +1220,34 @@
         "hasSpend": false,
         "hasTokens": true,
         "isEmpty": false,
+        "landingHeadline": "0 tasks",
+        "landingInFlightNote": null,
+        "landingSegments": [
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
         "peakDispatches": 0,
         "peakTokens": 0,
         "spendLabel": "no rate for any model in this window (1.0k unpriced token(s))",
@@ -1100,6 +1302,7 @@
         "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
+          "inFlight": 0,
           "merged": 0,
           "noPr": 0,
           "open": 0

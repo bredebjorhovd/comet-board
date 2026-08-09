@@ -154,6 +154,18 @@ impl HourGrid {
 /// Where the work ended up, which is the question a completion rate only
 /// half-answers: an attempt can end `done` and leave a pull request nobody
 /// merged.
+///
+/// Four places, and the two at the bottom are the reason this is a shape and
+/// not a merge count (gh#228). *Closed unmerged* is a pull request somebody
+/// rejected or abandoned; *no PR raised* is an agent that settled having
+/// produced nothing. They are the only numbers on a stats page that say the
+/// board wasted its time, and a surface that folds either of them into "in
+/// review" has hidden the losses behind the one word that reads as patience.
+///
+/// [`in_flight`](Self::in_flight) is deliberately outside the four: work still
+/// running has not landed anywhere, and counting it under *no PR raised* —
+/// which is what a rule keyed on PR presence alone does — reports an agent
+/// that is still typing as an agent that came back empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Landing {
@@ -163,13 +175,129 @@ pub struct Landing {
     pub open: usize,
     /// Tasks whose pull request was closed without merging.
     pub closed_unmerged: usize,
-    /// Tasks that were worked on and never opened one at all.
+    /// Tasks whose attempts all settled and left no pull request behind.
     pub no_pr: usize,
+    /// Tasks with no pull request and an attempt still going — not a landing,
+    /// so it is not one of the four and never sits in the bar. A caption, at
+    /// most.
+    ///
+    /// Defaulted on the wire: a board that predates the split (gh#228) answers
+    /// without the key, and its four categories still decode.
+    #[serde(default)]
+    pub in_flight: usize,
+}
+
+/// One of the four places work lands, as an identity rather than a label.
+///
+/// Both viewports paint these from their own status ramp — merged is the
+/// settled hue, an open pull request is the review hue, closed-unmerged is
+/// blocked, nothing-raised is the working amber — and neither invents the
+/// ordering or the wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LandingKind {
+    Merged,
+    Open,
+    ClosedUnmerged,
+    NoPr,
+}
+
+impl LandingKind {
+    /// Best outcome first, so a bar reads left to right from landed to lost.
+    pub const ALL: [LandingKind; 4] = [
+        LandingKind::Merged,
+        LandingKind::Open,
+        LandingKind::ClosedUnmerged,
+        LandingKind::NoPr,
+    ];
+
+    /// What a legend calls it. `PR open` rather than `In review`: review is a
+    /// state a human is in, and the fact here is that the branch exists and
+    /// has not been taken.
+    pub fn label(self) -> &'static str {
+        match self {
+            LandingKind::Merged => "Merged",
+            LandingKind::Open => "PR open",
+            LandingKind::ClosedUnmerged => "Closed unmerged",
+            LandingKind::NoPr => "No PR raised",
+        }
+    }
+}
+
+/// One band of the landing bar: what it is, how many tasks, and the share of
+/// the bar it takes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LandingSegment {
+    pub kind: LandingKind,
+    pub label: String,
+    pub count: usize,
+    /// Share of [`Landing::total`], `0.0..=1.0`. Zero when the window landed
+    /// nothing — a bar over no tasks is not drawn, it is not drawn empty.
+    pub fraction: f64,
 }
 
 impl Landing {
+    /// The four that landed. Excludes [`in_flight`](Self::in_flight): a bar
+    /// whose widths were shares of unfinished work would move under the reader
+    /// as attempts end without a single task landing anywhere.
     pub fn total(&self) -> usize {
         self.merged + self.open + self.closed_unmerged + self.no_pr
+    }
+
+    /// Every task this accounts for, landed or still going — what the window
+    /// touched.
+    pub fn touched(&self) -> usize {
+        self.total() + self.in_flight
+    }
+
+    pub fn count(&self, kind: LandingKind) -> usize {
+        match kind {
+            LandingKind::Merged => self.merged,
+            LandingKind::Open => self.open,
+            LandingKind::ClosedUnmerged => self.closed_unmerged,
+            LandingKind::NoPr => self.no_pr,
+        }
+    }
+
+    /// The bar, as bands. **All four, always** — including the empty ones,
+    /// which are the point: a legend that drops `Closed unmerged 0` is a
+    /// legend where a reader cannot tell a window that lost nothing from a
+    /// surface that does not count losses. The renderer draws the non-empty
+    /// ones and lists them all.
+    pub fn segments(&self) -> Vec<LandingSegment> {
+        let total = self.total();
+        LandingKind::ALL
+            .iter()
+            .map(|kind| {
+                let count = self.count(*kind);
+                LandingSegment {
+                    kind: *kind,
+                    label: kind.label().to_string(),
+                    count,
+                    fraction: if total == 0 {
+                        0.0
+                    } else {
+                        count as f64 / total as f64
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// `11 tasks` — the headline over the bar. Tasks, never attempts: three
+    /// goes at one issue produce one pull request, and counting the attempts
+    /// would report the same merge three times.
+    pub fn headline(&self) -> String {
+        let n = self.total();
+        format!("{n} task{}", if n == 1 { "" } else { "s" })
+    }
+
+    /// The caption under it: what the bar leaves out. `None` when nothing is
+    /// still running, because "0 still running" is a line that says nothing.
+    pub fn in_flight_note(&self) -> Option<String> {
+        (self.in_flight > 0)
+            .then(|| format!("{} still running — not landed anywhere yet", self.in_flight))
     }
 }
 
@@ -1423,8 +1551,68 @@ mod tests {
             open: 2,
             closed_unmerged: 1,
             no_pr: 3,
+            in_flight: 2,
         };
         assert_eq!(l.total(), 15);
+        // The bar is over landed work; the two still running are a caption.
+        assert_eq!(l.touched(), 17);
+        assert_eq!(l.headline(), "15 tasks");
+        assert_eq!(
+            l.in_flight_note().as_deref(),
+            Some("2 still running — not landed anywhere yet")
+        );
+    }
+
+    #[test]
+    fn the_bar_keeps_the_two_categories_a_merge_count_hides() {
+        let l = Landing {
+            merged: 9,
+            open: 2,
+            closed_unmerged: 1,
+            no_pr: 3,
+            in_flight: 2,
+        };
+        let segments = l.segments();
+        // Four bands, best first, and the shares are of what landed — the two
+        // still running must not shrink the merged band.
+        assert_eq!(segments.len(), 4);
+        assert_eq!(
+            segments.iter().map(|s| s.count).collect::<Vec<_>>(),
+            vec![9, 2, 1, 3]
+        );
+        assert!((segments.iter().map(|s| s.fraction).sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!((segments[0].fraction - 9.0 / 15.0).abs() < 1e-9);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Merged", "PR open", "Closed unmerged", "No PR raised"]
+        );
+    }
+
+    #[test]
+    fn a_window_that_lost_nothing_still_says_so() {
+        // The whole point of gh#228: `Closed unmerged 0` is a fact, and a
+        // legend that drops it is one a reader cannot distinguish from a
+        // surface that never counted losses.
+        let clean = Landing {
+            merged: 4,
+            ..Default::default()
+        };
+        let segments = clean.segments();
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[2].count, 0);
+        assert_eq!(segments[2].fraction, 0.0);
+        assert_eq!(clean.in_flight_note(), None);
+
+        // Nothing landed at all: four zero bands and no division by nothing.
+        let empty = Landing {
+            in_flight: 1,
+            ..Default::default()
+        };
+        assert_eq!(empty.headline(), "0 tasks");
+        assert!(empty.segments().iter().all(|s| s.fraction == 0.0));
     }
 
     // -- tokens (gh#151) -----------------------------------------------------
@@ -1716,6 +1904,7 @@ mod tests {
             open: 1,
             closed_unmerged: 0,
             no_pr: 0,
+            in_flight: 1,
         };
         s.friction = Friction {
             retried_tasks: 1,
@@ -1755,6 +1944,7 @@ mod tests {
         assert!(json.get("agentDispatched").is_some());
         assert!(json["landing"].get("closedUnmerged").is_some());
         assert!(json["landing"].get("noPr").is_some());
+        assert!(json["landing"].get("inFlight").is_some());
         assert!(json["friction"].get("retriedTasks").is_some());
         assert!(json["friction"].get("blockedEntries").is_some());
         assert!(json["daily"][0].get("dispatches").is_some());
@@ -1779,9 +1969,21 @@ mod tests {
             .as_object_mut()
             .expect("an object")
             .remove("hoursByWorkspace");
-        let back: BoardStats = serde_json::from_value(older).expect("deserializes without it");
+        let back: BoardStats =
+            serde_json::from_value(older.clone()).expect("deserializes without it");
         assert!(back.hours_by_workspace.is_empty());
         assert_eq!(back.attempts, 4);
+
+        // Same for a board that predates the in-flight split (gh#228): the
+        // four landed categories still arrive, and nothing is reported as
+        // running.
+        older["landing"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("inFlight");
+        let back: BoardStats = serde_json::from_value(older).expect("deserializes without it");
+        assert_eq!(back.landing.in_flight, 0);
+        assert_eq!(back.landing.merged, 2);
     }
 }
 
@@ -1878,6 +2080,12 @@ mod spec {
                 // collapsed any two of them would be inventing a zero.
                 "hasSpend": stats.has_spend(),
                 "spendLabel": stats.spend_label(),
+                // gh#228. The bar both viewports draw: four bands, the two
+                // losses among them, and shares taken over what landed rather
+                // than over what was touched.
+                "landingHeadline": stats.landing.headline(),
+                "landingSegments": stats.landing.segments(),
+                "landingInFlightNote": stats.landing.in_flight_note(),
             }
         })
     }
@@ -1936,11 +2144,15 @@ mod spec {
         busy.tokens = usage(9_400, 6_100, 148_000, 21_500);
         busy.attempts_with_tokens = 8;
         busy.token_coverage = Some(8.0 / 13.0);
+        // Nine landed and two still going, which is the eleven tasks the window
+        // touched. The two live attempts above are on tasks that have raised
+        // nothing yet: touched by the window, landed nowhere in it.
         busy.landing = Landing {
-            merged: 7,
+            merged: 5,
             open: 2,
             closed_unmerged: 1,
             no_pr: 1,
+            in_flight: 2,
         };
         busy.friction = Friction {
             retried_tasks: 3,

@@ -327,8 +327,11 @@ final class DemoDataset {
         let completionRate: Double? = ended > 0 ? Double(done) / Double(ended) : nil
         let totalMinutes: Int64 = Int64(attempts) * 27
         let coverage: Double? = attempts > 0 ? Double(metered) / Double(attempts) : nil
+        // The live attempts ride in `inFlight`, not in `noPr` (gh#228): an
+        // agent still typing is not an agent that came back empty.
         let landing = Landing(merged: max(0, done - 2), open: 2,
-                              closedUnmerged: 1, noPr: max(0, ended - done))
+                              closedUnmerged: 1, noPr: max(0, ended - done),
+                              inFlight: live)
         let friction = Friction(retriedTasks: 3, earlySettles: 1,
                                 blockedEntries: 4, overruns: 1)
         let agentDispatched: Int = Int(Double(attempts) * 0.4)
