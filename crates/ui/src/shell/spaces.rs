@@ -2883,7 +2883,7 @@ impl Shell {
                 // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
                 // an opaque fill here killed the vibrancy every other float has.
                 .bg(theme.float_card())
-                .shadow_lg()
+                .shadow(theme.float_shadow())
                 .overflow_hidden()
                 .flex()
                 .flex_col()

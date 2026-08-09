@@ -111,7 +111,7 @@ pub fn section_card(theme: &Theme) -> gpui::Div {
         .rounded(px(Theme::RADIUS_CARD))
         .border_1()
         .border_color(theme.border)
-        .bg(theme.surface)
+        .bg(theme.card)
         .overflow_hidden()
         .flex()
         .flex_col()

@@ -4067,11 +4067,15 @@ mod tests {
             }
             // Working is the ramp's amber now, in both — not a fifth hue.
             assert_eq!(state_color(BoardState::Working, &theme), theme.warning);
-            // Ready and done spend no colour at all.
+            // Ready and done spend no colour at all. (Measured as channel
+            // spread, not HSL saturation — light's neutrals carry a trace of
+            // blue, and saturation is meaningless that close to white.)
             for state in [BoardState::Ready, BoardState::Done] {
-                assert_eq!(state_color(state, &theme).s, 0.0, "{state:?} paints a hue");
+                let tone = state_color(state, &theme);
+                assert!(!crate::theme::spends_colour(tone), "{state:?} paints a hue");
             }
-            assert_eq!(status_dot_color(ChatIndicator::Idle, &theme).s, 0.0);
+            let idle = status_dot_color(ChatIndicator::Idle, &theme);
+            assert!(!crate::theme::spends_colour(idle));
         }
     }
 

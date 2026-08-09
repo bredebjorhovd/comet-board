@@ -244,7 +244,7 @@ impl Render for DevicesPage {
                         // round-ok: presence dot
                         .rounded_full()
                         .border_2()
-                        .border_color(theme.surface)
+                        .border_color(theme.card)
                         .when(online, |el| {
                             el.bg(emerald).shadow(vec![gpui::BoxShadow {
                                 color: emerald.opacity(0.55),

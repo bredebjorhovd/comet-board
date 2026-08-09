@@ -2022,7 +2022,10 @@ mod tests {
     fn a_normal_meter_spends_no_colour() {
         for theme in [Theme::dark(), Theme::light()] {
             let normal = usage_color(UsageLevel::Normal, &theme);
-            assert_eq!(normal.s, 0.0, "a normal meter is a neutral rule");
+            assert!(
+                !crate::theme::spends_colour(normal),
+                "a normal meter is a neutral rule"
+            );
             assert_ne!(normal, theme.accent, "normal is not a state");
             assert_eq!(
                 usage_color(UsageLevel::Warn, &theme).h,

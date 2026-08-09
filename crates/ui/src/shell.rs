@@ -2896,7 +2896,7 @@ impl Shell {
                         .bg(motion::hover_blend(
                             "jump-pill",
                             theme.surface_raised,
-                            crate::theme::neutral(0.29),
+                            theme.surface_raised_hover,
                         ))
                         .on_hover(motion::hover_listener("jump-pill"))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3168,8 +3168,8 @@ impl Shell {
                 .rounded(px(Theme::RADIUS_CARD))
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.surface)
-                .shadow_lg()
+                .bg(theme.card)
+                .shadow(theme.float_shadow())
                 .flex()
                 .flex_col()
                 .items_center()
@@ -3408,8 +3408,8 @@ impl Shell {
             .rounded(px(Theme::RADIUS_CARD))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.surface)
-            .shadow_lg()
+            .bg(theme.card)
+            .shadow(theme.float_shadow())
             .flex()
             .flex_col()
             .child(
