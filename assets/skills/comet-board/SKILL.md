@@ -35,19 +35,46 @@ merged PR settles the row itself.
 ## Finishing: claim what you did
 
 Before you say you are done, tell the board what you changed — in **claims**,
-one per line, each anchored to the files it is about:
+one per line, each anchored to the files or symbols it is about:
 
 ```bash
 comet-board claim --task gh:owner/repo#183 <<'EOF'
 Claims are stored against the attempt :: crates/board/src/db.rs crates/board/src/model.rs
 The remainder is computed from the branch diff :: crates/board/src/claims.rs
+Both surfaces read one derivation per frame :: active_placements
 EOF
 ```
 
-`<sentence> :: <path> [<path>…]`. Paths are repo-relative; a directory
-(`crates/board/src/`) accounts for everything under it. A line with no `::`,
-or nothing after it, is **refused** — without file anchors a claim cannot be
-checked, and an unanchored summary is the thing this replaces.
+`<sentence> :: <anchor> [<anchor>…]`. An anchor is a **path** or a **symbol**,
+told apart by how it is spelled — never by a flag:
+
+- Anything with a `/` or a file extension is a **path**. Repo-relative; a
+  directory (`crates/board/src/`) accounts for everything under it. A bare
+  `db.rs` anchors nothing: three crates here have one.
+- Everything else is a **symbol** — `active_placements`, `shelf_note`. It
+  accounts for every changed file whose diff added or removed a line naming it.
+  Three characters minimum.
+
+A line with no `::`, or nothing after it, is **refused** — without an anchor a
+claim cannot be checked, and an unanchored summary is the thing this replaces.
+
+**If you finish without running the verb, write the block anyway.** Put it in
+your closing message and the board reads it off the attempt:
+
+````text
+```claims
+Claims are stored against the attempt :: crates/board/src/db.rs
+The remainder is computed from the branch diff :: crates/board/src/claims.rs
+```
+````
+
+Same format, same refusals. The verb is still better — it answers with the
+remainder while you can still act on it, and this does not. Say nothing and
+nothing breaks: the attempt settles and the PR opens as they always did, and
+the review says the contract went unanswered. Write a block that will not
+parse and the board records the refusal against the attempt rather than
+dropping it, so the review says *that* instead — which is worse to read than
+having claimed nothing.
 
 The reply is the part worth reading: the board diffs your branch and prints
 **every changed file no claim accounts for**. That set is computed from git, not

@@ -498,6 +498,17 @@ pub struct Attempt {
     /// the contract went unanswered — a fact a review must be able to shout
     /// about, and one a bare empty list cannot carry.
     pub claims_at: Option<String>,
+    /// Why the claims block this attempt wrote could not be read (§gh#235).
+    ///
+    /// Set only by the harvest off a finished attempt, and cleared the moment
+    /// a good set arrives — an agent that submits properly has superseded its
+    /// own bad block, and leaving the refusal beside the claims that replaced
+    /// it would be the same mistake appending claims would be.
+    ///
+    /// `None` with no claims is the ordinary claimless attempt and stays quiet.
+    /// `Some` is the one state that has to be loud: the agent did say what it
+    /// did, and the board could not read it.
+    pub claims_error: Option<String>,
 }
 
 impl Attempt {
@@ -618,6 +629,7 @@ pub(crate) mod tests {
             model: None,
             claims: Vec::new(),
             claims_at: None,
+            claims_error: None,
         }
     }
 

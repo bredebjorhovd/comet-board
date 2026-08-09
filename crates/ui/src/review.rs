@@ -57,7 +57,8 @@ use gpui::{
 };
 
 use comet_board::claims::{
-    AttemptReview, ChangedFile, ClaimView, DiffSource, FindingKind, Tone, Verdict,
+    AnchorKind, AttemptReview, ChangedFile, ClaimView, DiffSource, FindingKind, Tone, Verdict,
+    anchor_kind,
 };
 use comet_proto::view::board;
 use comet_rpc::methods;
@@ -337,7 +338,15 @@ impl ReviewPanel {
                         .children(matched),
                 )
             })
-            .children(claim.unmatched.iter().map(|path| {
+            // An anchor the diff refuses, labelled by what kind it was
+            // (§gh#235): "unchanged" is what a reviewer goes and checks about a
+            // path, and it is the wrong instruction entirely for a symbol no
+            // changed line names.
+            .children(claim.unmatched.iter().map(|anchor| {
+                let label = match anchor_kind(anchor) {
+                    AnchorKind::Path => format!("unchanged  {anchor}"),
+                    AnchorKind::Symbol => format!("not in the diff  {anchor}"),
+                };
                 div()
                     .pl(px(16.0))
                     .flex()
@@ -347,7 +356,7 @@ impl ReviewPanel {
                     .font_family(theme.font_mono.clone())
                     .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.danger)
-                    .child(SharedString::from(format!("unchanged  {path}")))
+                    .child(SharedString::from(label))
             }))
             .into_any_element()
     }
@@ -461,6 +470,34 @@ impl ReviewPanel {
 
     /// The claims, each carrying the diff facts for what it anchored.
     fn render_claims(review: &AttemptReview, theme: &Theme) -> AnyElement {
+        // A block that was written and could not be read (§gh#235). Ahead of
+        // the never-answered copy below and in the danger colour, because this
+        // attempt did describe its work and the description is the thing that
+        // went missing — the refusal is printed whole, since it names the line.
+        if let Some(err) = &review.claims_error {
+            return div()
+                .flex()
+                .flex_col()
+                .gap(px(Theme::SPACE_SM))
+                .child(Self::heading(theme, "CLAIMS", Some("unreadable".into())))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .text_color(theme.text)
+                        .child(SharedString::from(
+                            "This attempt wrote a claims block the board could not parse, \
+                             so nothing was recorded from it.",
+                        )),
+                )
+                .child(
+                    div()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.danger)
+                        .child(SharedString::from(err.clone())),
+                )
+                .into_any_element();
+        }
         // Never asked and claimed nothing are different facts, and this is the
         // last place they could be flattened into one.
         if !review.claimed() {
