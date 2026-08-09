@@ -35,10 +35,10 @@ pub struct DayBucket {
     pub done: usize,
 }
 
-/// One day's tokens, for the series drawn under the dispatch chart. Same days
-/// and the same zero rule as [`DayBucket`] — the two series are generated from
-/// one date range so a reader comparing them index by index is comparing the
-/// same day.
+/// One day's tokens, which is what the day chart is drawn from (gh#226). Same
+/// days and the same zero rule as [`DayBucket`] — the two series are generated
+/// from one date range so a reader comparing them index by index is comparing
+/// the same day.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenDay {
@@ -48,6 +48,49 @@ pub struct TokenDay {
     /// nothing is zero here and blank on the coverage line — the page says
     /// which of the two it is once, at the top, rather than per bar.
     pub usage: TokenUsage,
+}
+
+/// One column of the day chart: how tall it is, and the two lines around it
+/// (gh#226).
+///
+/// **Height is tokens, and the dispatch count rides in the caption.** The chart
+/// used to plot dispatches, which is nearly flat and nearly meaningless — two
+/// dispatches can differ by twenty times in what they cost. Token volume is
+/// what actually varies between days, and it is what the spend block above is
+/// computed from, so the two blocks now tell one story instead of two.
+///
+/// Nothing here is a new number: [`DayBucket`] and [`TokenDay`] are the same
+/// two series the board already gathered, zipped by date so a spike cannot land
+/// under the wrong day even if a board answered with series of different
+/// lengths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayColumn {
+    /// `YYYY-MM-DD`, box-local, from [`DayBucket::date`].
+    pub date: String,
+    /// What the day spent — the bar's height.
+    pub tokens: u64,
+    /// What ran that day — the number in the caption.
+    pub dispatches: usize,
+    /// The bar's share of the chart, `0.0..=1.0`, against the busiest day.
+    pub fraction: f32,
+    /// What rides above the bar: `1.31M`, or `—` on a day with nothing to show.
+    pub value: String,
+    /// And under it: `Mon 3 · 2`.
+    pub caption: String,
+}
+
+impl DayColumn {
+    /// A day with no tokens on it — drawn as a hairline where the bar would be,
+    /// never as an absent column. A seven-day window on a board that worked one
+    /// day is a shape; one lonely bar reads as six days the board forgot.
+    ///
+    /// It does not distinguish "nothing ran" from "what ran reported nothing":
+    /// the caption's dispatch count is the first of those, and the coverage line
+    /// at the top of the block is the second, said once rather than per bar.
+    pub fn is_quiet(&self) -> bool {
+        self.tokens == 0
+    }
 }
 
 /// One row of a tally — a workspace, a runtime, a source, a person.
@@ -529,6 +572,202 @@ impl CostSplit {
     }
 }
 
+// -- the breakdown (gh#227) --------------------------------------------------
+
+/// The ways one window can be cut apart.
+///
+/// One card with a toggle rather than three fixed columns of counts. The
+/// question a reader brings is always the same — *which row is the bill* — and
+/// only the axis they want it answered along changes between visits, so the
+/// axis is a control and not a layout decision taken once for them.
+///
+/// Model leads because it is the axis where the answer is usually a single row,
+/// and it is the one the shipped page could not ask at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Dimension {
+    /// What the run said it was running.
+    Model,
+    /// Which harness ran it.
+    Runtime,
+    /// Which workspace it went to.
+    Space,
+    /// Which tracker the task came from.
+    Tracker,
+    /// Whose subscription it spent — [`BoardStats::by_account`]'s key.
+    Account,
+}
+
+impl Dimension {
+    /// Every dimension, in the order the toggle offers them.
+    pub const ALL: [Dimension; 5] = [
+        Dimension::Model,
+        Dimension::Runtime,
+        Dimension::Space,
+        Dimension::Tracker,
+        Dimension::Account,
+    ];
+
+    /// The word on the segment.
+    pub fn label(self) -> &'static str {
+        match self {
+            Dimension::Model => "Model",
+            Dimension::Runtime => "Runtime",
+            Dimension::Space => "Space",
+            Dimension::Tracker => "Tracker",
+            Dimension::Account => "Account",
+        }
+    }
+}
+
+/// What a cut is ranked and scaled against.
+///
+/// Spend wherever the board could price the window, because that is the
+/// question the card is opened with. Tokens where it has rates for nothing in
+/// it, dispatches where nothing was metered at all — ranking rows by a number
+/// every one of them holds at zero is alphabetical order with extra steps, and
+/// a bar drawn against it is a row of empty tracks.
+///
+/// It is reported rather than inferred at the call site so the card can *say*
+/// which quantity it sorted by: a bar whose meaning changes with the window is
+/// one a reader has to be told about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Ranking {
+    Spend,
+    Tokens,
+    Dispatches,
+}
+
+impl Ranking {
+    /// How the card names it, beside its title.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Ranking::Spend => "by spend",
+            Ranking::Tokens => "by tokens",
+            Ranking::Dispatches => "by dispatches",
+        }
+    }
+}
+
+/// One row of the breakdown: a name, what it ran, what it spent, and what that
+/// would have cost.
+///
+/// `cost: None` is **unpriced**, never zero — the rule the money type is built
+/// on (gh#182), carried down to the row. A board with no rates configured
+/// answers every row with `None` and the card drops the column rather than
+/// printing a wall of `$0.00`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakdownRow {
+    pub label: String,
+    /// Attempts in this bucket — every attempt, not only the metered ones.
+    pub dispatches: usize,
+    /// What the metered ones spent.
+    pub usage: TokenUsage,
+    /// List price of that usage, priced per model so a bucket that ran two
+    /// models is priced at both their rates rather than at an average.
+    pub cost: Option<Usd>,
+    /// Tokens in this row the rate table could not price, and which are
+    /// therefore *not* in [`cost`](Self::cost). Carried rather than dropped:
+    /// the same reason [`BoardSpend::unpriced`] exists.
+    pub unpriced_tokens: u64,
+}
+
+impl BreakdownRow {
+    /// What this row is ranked and drawn against.
+    pub fn metric(&self, ranking: Ranking) -> u64 {
+        match ranking {
+            Ranking::Spend => self.cost.map_or(0, |c| c.micros.max(0) as u64),
+            Ranking::Tokens => self.usage.total(),
+            Ranking::Dispatches => self.dispatches as u64,
+        }
+    }
+}
+
+/// One cut of the window, ranked and ready to draw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Breakdown {
+    pub dimension: Dimension,
+    /// Biggest first by [`ranking`](Self::ranking), ties alphabetical, the tail
+    /// folded into one honest `n others`.
+    pub rows: Vec<BreakdownRow>,
+    pub ranking: Ranking,
+    /// The biggest row's metric — what the bars are scaled against, folded row
+    /// included, because `n others` is a real bucket and not a footnote.
+    pub peak: u64,
+}
+
+impl Breakdown {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// One row's share of the biggest, `0.0..=1.0`.
+    pub fn share(&self, row: &BreakdownRow) -> f32 {
+        if self.peak == 0 {
+            return 0.0;
+        }
+        (row.metric(self.ranking) as f32 / self.peak as f32).clamp(0.0, 1.0)
+    }
+
+    /// Is there a price to put in the last column at all? False on a board with
+    /// no rates, which drops the column rather than filling it with dashes.
+    pub fn is_priced(&self) -> bool {
+        self.rows.iter().any(|r| r.cost.is_some())
+    }
+}
+
+/// How many rows a cut shows before folding the rest into `n others`.
+pub const BREAKDOWN_ROWS: usize = 6;
+
+/// Rank one cut for reading (gh#227).
+///
+/// The same rule every tally here follows — biggest first, ties alphabetical so
+/// an unchanged board redraws identically, the tail folded into one row that
+/// carries what it stands for — applied to rows that hold three quantities
+/// instead of one, against whichever of them this window can actually be ranked
+/// on.
+///
+/// Like [`hour_grid`], this has no Swift counterpart yet: the phone's stats
+/// screen draws no breakdown, so there is nothing there to disagree with it.
+/// When it does, this is the arithmetic it adopts.
+pub fn rank_breakdown(dimension: Dimension, mut rows: Vec<BreakdownRow>, max: usize) -> Breakdown {
+    let ranking = if rows.iter().any(|r| r.cost.is_some_and(|c| !c.is_zero())) {
+        Ranking::Spend
+    } else if rows.iter().any(|r| !r.usage.is_zero()) {
+        Ranking::Tokens
+    } else {
+        Ranking::Dispatches
+    };
+    rows.sort_by(|a, b| {
+        b.metric(ranking)
+            .cmp(&a.metric(ranking))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    if max > 0 && rows.len() > max {
+        let tail = rows.split_off(max);
+        let priced: Vec<Usd> = tail.iter().filter_map(|r| r.cost).collect();
+        rows.push(BreakdownRow {
+            label: format!("{} others", tail.len()),
+            dispatches: tail.iter().map(|r| r.dispatches).sum(),
+            usage: tail.iter().map(|r| r.usage).sum(),
+            // `None` only when not one folded row had a price. A fold that
+            // reported zero for rows nobody could price would be the invented
+            // zero this whole half of the page is designed against.
+            cost: (!priced.is_empty()).then(|| priced.into_iter().sum()),
+            unpriced_tokens: tail.iter().map(|r| r.unpriced_tokens).sum(),
+        });
+    }
+    Breakdown {
+        dimension,
+        peak: rows.iter().map(|r| r.metric(ranking)).max().unwrap_or(0),
+        ranking,
+        rows,
+    }
+}
+
 /// Everything the board can say about its own throughput over a window.
 ///
 /// Field order is the order a page reads them in: what happened, how well, how
@@ -600,6 +839,21 @@ pub struct BoardStats {
     pub by_source: BTreeMap<String, usize>,
     /// Whose subscription the attempts spent, by the login's own name.
     pub by_account: BTreeMap<String, usize>,
+
+    /// The same window cut five ways, with tokens and money on every row
+    /// (gh#227) — the breakdown card's whole contents.
+    ///
+    /// Ranked and folded on the box rather than on the page, because the money
+    /// on a row cannot be derived from anything else here: a bucket's price is
+    /// its own tokens at the rates of the models *it* ran, and only the box has
+    /// the rate table. A dimension this window has nothing under is absent from
+    /// the vector, which is how the toggle comes to omit it rather than offer a
+    /// segment that opens onto nothing.
+    ///
+    /// Defaulted on the wire: a board that predates this field answers without
+    /// it, and the card is then simply not drawn.
+    #[serde(default)]
+    pub breakdown: Vec<Breakdown>,
     /// Released by an agent rather than by a person.
     pub agent_dispatched: usize,
 
@@ -654,6 +908,7 @@ impl BoardStats {
             by_runtime: BTreeMap::new(),
             by_source: BTreeMap::new(),
             by_account: BTreeMap::new(),
+            breakdown: Vec::new(),
             agent_dispatched: 0,
             tokens_by_model: BTreeMap::new(),
             tokens_by_runtime: BTreeMap::new(),
@@ -700,6 +955,12 @@ impl BoardStats {
             Some(spend) if !spend.has_price() => "nothing metered to price".to_string(),
             Some(spend) => spend.headline(),
         }
+    }
+
+    /// The cut along one axis, or `None` when this window has nothing under it
+    /// — which is the same thing as the toggle not offering it (gh#227).
+    pub fn cut(&self, dimension: Dimension) -> Option<&Breakdown> {
+        self.breakdown.iter().find(|b| b.dimension == dimension)
     }
 
     /// How the window is named on the page.
@@ -898,14 +1159,88 @@ pub fn bar_fraction(value: usize, peak: usize) -> f32 {
     (value as f32 / peak as f32).clamp(0.0, 1.0)
 }
 
-/// The busiest bucket in a day series — the scale every bar is drawn against.
+/// [`bar_fraction`] for a token count, which needs the whole `u64` range: a
+/// week can put nine figures through one bar.
+pub fn token_fraction(value: u64, peak: u64) -> f32 {
+    if peak == 0 {
+        return 0.0;
+    }
+    (value as f64 / peak as f64).clamp(0.0, 1.0) as f32
+}
+
+/// The busiest bucket in a day series — still what the dispatch counts are
+/// scaled against wherever one is drawn (the phone's chart, until gh#181).
 pub fn peak_dispatches(daily: &[DayBucket]) -> usize {
     daily.iter().map(|d| d.dispatches).max().unwrap_or(0)
 }
 
-/// The same, for the token series.
+/// The same, for the token series — the scale the desktop day chart is drawn
+/// against, and the figure its peak annotation reads out (gh#226).
 pub fn peak_tokens(daily: &[TokenDay]) -> u64 {
     daily.iter().map(|d| d.usage.total()).max().unwrap_or(0)
+}
+
+/// A bucket date as a chart caption says it: `Mon 3`.
+///
+/// Weekday and day-of-month, not the ISO date: under a bar, `2026-08-03` is ten
+/// characters of which two are news, and the weekday is the half of the date a
+/// reader is actually pattern-matching on. A date that will not parse is
+/// returned as it came rather than guessed at.
+pub fn short_day(date: &str) -> String {
+    use chrono::Datelike as _;
+    match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(day) => format!("{} {}", day.format("%a"), day.day()),
+        Err(_) => date.to_string(),
+    }
+}
+
+/// How many columns a day chart can caption before the labels collide.
+///
+/// A week fits comfortably and a month does not — at eleven pixels a caption is
+/// about fifty wide, and thirty of those want a chart no window is. Past this
+/// the columns are drawn bare and the axis under them carries the range, which
+/// is the shape a month is read for anyway.
+pub const CAPTIONED_COLUMNS: usize = 10;
+
+/// Whether a chart of `columns` days can carry a caption under every bar.
+pub fn day_captions_fit(columns: usize) -> bool {
+    columns <= CAPTIONED_COLUMNS
+}
+
+/// The day chart, ready to draw (gh#226): one column per day in the window,
+/// oldest first, quiet days included.
+///
+/// Driven by the dispatch series because that is the one built from the
+/// window's whole calendar; the tokens are looked up by date rather than by
+/// index, so two series that disagreed in length would draw short rather than
+/// draw a spike under the wrong day.
+pub fn day_columns(daily: &[DayBucket], daily_tokens: &[TokenDay]) -> Vec<DayColumn> {
+    let peak = peak_tokens(daily_tokens);
+    let spent: BTreeMap<&str, u64> = daily_tokens
+        .iter()
+        .map(|d| (d.date.as_str(), d.usage.total()))
+        .collect();
+    daily
+        .iter()
+        .map(|day| {
+            let tokens = spent.get(day.date.as_str()).copied().unwrap_or(0);
+            DayColumn {
+                date: day.date.clone(),
+                tokens,
+                dispatches: day.dispatches,
+                fraction: token_fraction(tokens, peak),
+                // An em dash, never `0` — the same rule the totals follow. A
+                // day that spent nothing has no figure to show, and a zero
+                // printed above a hairline is a number nobody needs to read.
+                value: if tokens == 0 {
+                    "—".to_string()
+                } else {
+                    human_tokens(tokens)
+                },
+                caption: format!("{} · {}", short_day(&day.date), day.dispatches),
+            }
+        })
+        .collect()
 }
 
 /// A duration in minutes, said the way a person would: `48m`, `3h 20m`, `2d 4h`.
@@ -1114,6 +1449,134 @@ mod tests {
         assert_eq!(grid.columns.len(), HOURS);
     }
 
+    // -- the breakdown (gh#227) ----------------------------------------------
+
+    fn row(label: &str, dispatches: usize, tokens: u64, dollars: Option<f64>) -> BreakdownRow {
+        BreakdownRow {
+            label: label.to_string(),
+            dispatches,
+            usage: TokenUsage {
+                input_tokens: tokens,
+                ..TokenUsage::default()
+            },
+            cost: dollars.map(Usd::from_dollars),
+            unpriced_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn a_priced_cut_ranks_on_the_money_and_scales_its_bars_against_it() {
+        let cut = rank_breakdown(
+            Dimension::Model,
+            vec![
+                row("gpt-5.6-terra", 4, 7_400_000, Some(38.0)),
+                row("claude-opus-5", 9, 31_200_000, Some(198.0)),
+                row("claude-sonnet-5", 2, 3_400_000, Some(14.0)),
+            ],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(cut.ranking, Ranking::Spend);
+        let labels: Vec<&str> = cut.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["claude-opus-5", "gpt-5.6-terra", "claude-sonnet-5"]
+        );
+        // The bar is the same quantity the rows are sorted by, or it is a
+        // second ordering drawn on top of the first.
+        assert_eq!(cut.share(&cut.rows[0]), 1.0);
+        assert!((cut.share(&cut.rows[1]) - 38.0 / 198.0).abs() < 0.001);
+        assert!(cut.is_priced());
+    }
+
+    #[test]
+    fn an_unpriced_cut_falls_back_to_tokens_and_then_to_dispatches() {
+        let tokens = rank_breakdown(
+            Dimension::Runtime,
+            vec![
+                row("claude-code", 3, 900, None),
+                row("codex", 9, 40_000, None),
+            ],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(tokens.ranking, Ranking::Tokens);
+        assert_eq!(tokens.rows[0].label, "codex", "tokens, not dispatches");
+        assert!(!tokens.is_priced(), "no rates is not a column of zeroes");
+
+        // Nothing metered at all: the only number left is how often it ran.
+        let counted = rank_breakdown(
+            Dimension::Tracker,
+            vec![row("github", 2, 0, None), row("linear", 7, 0, None)],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(counted.ranking, Ranking::Dispatches);
+        assert_eq!(counted.rows[0].label, "linear");
+        assert_eq!(counted.share(&counted.rows[0]), 1.0);
+    }
+
+    /// Rates that priced *nothing* is not the same as no rates: the rows carry
+    /// a real zero and the tokens are still what orders them.
+    #[test]
+    fn a_cut_priced_at_zero_is_ranked_on_what_it_actually_spent() {
+        let cut = rank_breakdown(
+            Dimension::Space,
+            vec![
+                BreakdownRow {
+                    unpriced_tokens: 900,
+                    ..row("edge", 3, 900, Some(0.0))
+                },
+                BreakdownRow {
+                    unpriced_tokens: 40_000,
+                    ..row("comet", 2, 40_000, Some(0.0))
+                },
+            ],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(cut.ranking, Ranking::Tokens);
+        assert_eq!(cut.rows[0].label, "comet");
+    }
+
+    #[test]
+    fn a_folded_cut_carries_every_quantity_it_stood_for() {
+        let cut = rank_breakdown(
+            Dimension::Account,
+            (1..=5)
+                .map(|n| row(&format!("a{n}"), n, n as u64 * 1_000, Some(n as f64)))
+                .collect(),
+            2,
+        );
+        assert_eq!(cut.rows.len(), 3);
+        let folded = &cut.rows[2];
+        assert_eq!(folded.label, "3 others");
+        assert_eq!(folded.dispatches, 1 + 2 + 3);
+        assert_eq!(folded.usage.total(), 6_000);
+        assert_eq!(folded.cost, Some(Usd::from_dollars(6.0)));
+        // Every dollar the cut was given is still in it after the fold.
+        assert_eq!(
+            cut.rows.iter().filter_map(|r| r.cost).sum::<Usd>(),
+            Usd::from_dollars(15.0)
+        );
+        // And `n others` is a bucket like any other: it scales the bars when it
+        // is the biggest one.
+        assert_eq!(cut.peak, folded.cost.expect("priced").micros as u64);
+        assert_eq!(cut.share(folded), 1.0);
+    }
+
+    #[test]
+    fn a_dimension_with_nothing_under_it_is_absent_rather_than_empty() {
+        let mut s = BoardStats::empty(Some(7));
+        assert_eq!(s.cut(Dimension::Model), None);
+        s.breakdown = vec![rank_breakdown(
+            Dimension::Runtime,
+            vec![row("claude-code", 1, 10, None)],
+            BREAKDOWN_ROWS,
+        )];
+        assert_eq!(s.cut(Dimension::Model), None, "not a segment on the toggle");
+        assert!(s.cut(Dimension::Runtime).is_some());
+        // The toggle's order is the type's, not the vector's.
+        assert_eq!(Dimension::ALL[0].label(), "Model");
+        assert_eq!(Dimension::ALL.len(), 5);
+    }
+
     #[test]
     fn a_multiple_gets_precise_where_precision_starts_to_matter() {
         assert_eq!(human_multiple(12.34), "12×");
@@ -1242,6 +1705,121 @@ mod tests {
         ];
         assert_eq!(peak_tokens(&daily), 440);
         assert_eq!(peak_tokens(&[]), 0);
+    }
+
+    // -- the day chart (gh#226) ----------------------------------------------
+
+    fn bucket(date: &str, dispatches: usize, done: usize) -> DayBucket {
+        DayBucket {
+            date: date.to_string(),
+            dispatches,
+            done,
+        }
+    }
+
+    fn spent_on(date: &str, tokens: u64) -> TokenDay {
+        TokenDay {
+            date: date.to_string(),
+            usage: usage(tokens, 0, 0, 0),
+        }
+    }
+
+    #[test]
+    fn a_day_column_is_as_tall_as_what_it_spent_and_says_what_it_ran() {
+        // Two dispatches and 3.1M tokens on the Monday, three dispatches and a
+        // twentieth of that on the Tuesday: the count is nearly flat and the
+        // volume is not, which is the whole reason the bar plots the second.
+        let daily = vec![bucket("2026-08-03", 2, 2), bucket("2026-08-04", 3, 1)];
+        let tokens = vec![
+            spent_on("2026-08-03", 3_100_000),
+            spent_on("2026-08-04", 155_000),
+        ];
+        let columns = day_columns(&daily, &tokens);
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].value, "3.10M");
+        assert_eq!(columns[0].caption, "Mon 3 · 2");
+        assert_eq!(columns[0].fraction, 1.0, "the busiest day is the scale");
+        assert_eq!(columns[1].value, "155k");
+        assert_eq!(columns[1].caption, "Tue 4 · 3");
+        assert_eq!(columns[1].fraction, 0.05);
+        assert!(columns.iter().all(|c| !c.is_quiet()));
+    }
+
+    /// The failure this chart is drawn against: a week where one day worked
+    /// must read as one busy day in seven, not as a single lonely bar.
+    #[test]
+    fn a_quiet_day_is_a_column_with_a_dash_over_it_and_not_an_absent_one() {
+        let daily = vec![
+            bucket("2026-08-03", 2, 2),
+            bucket("2026-08-04", 0, 0),
+            // Dispatched and never metered: still a quiet column, because the
+            // bar plots tokens — and the caption still says two ran.
+            bucket("2026-08-05", 2, 1),
+        ];
+        let columns = day_columns(&daily, &[spent_on("2026-08-03", 40_000)]);
+        assert_eq!(columns.len(), 3, "every day in the window draws");
+        assert!(!columns[0].is_quiet());
+        assert!(columns[1].is_quiet());
+        assert_eq!(columns[1].value, "—", "a dash, never a zero");
+        assert_eq!(columns[1].caption, "Tue 4 · 0");
+        assert_eq!(columns[1].fraction, 0.0);
+        assert!(columns[2].is_quiet());
+        assert_eq!(
+            columns[2].caption, "Wed 5 · 2",
+            "unmetered work still says what ran"
+        );
+    }
+
+    #[test]
+    fn a_window_that_metered_nothing_still_draws_its_days() {
+        // No peak to scale against is not a reason to draw nothing: the days
+        // are the shape, and the coverage line above says why they are flat.
+        let daily = vec![bucket("2026-08-03", 1, 1), bucket("2026-08-04", 2, 0)];
+        let columns = day_columns(&daily, &[]);
+        assert_eq!(columns.len(), 2);
+        assert!(columns.iter().all(|c| c.is_quiet() && c.fraction == 0.0));
+        assert_eq!(columns[1].caption, "Tue 4 · 2");
+        assert!(day_columns(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_column_takes_its_tokens_by_date_and_not_by_position() {
+        // A board that answered with a shorter token series must not put the
+        // spike under the wrong day.
+        let daily = vec![
+            bucket("2026-08-03", 1, 1),
+            bucket("2026-08-04", 1, 1),
+            bucket("2026-08-05", 1, 1),
+        ];
+        let columns = day_columns(&daily, &[spent_on("2026-08-05", 900)]);
+        assert_eq!(columns[0].tokens, 0);
+        assert_eq!(columns[2].tokens, 900);
+        assert_eq!(columns[2].value, "900");
+    }
+
+    #[test]
+    fn a_bar_scales_over_the_whole_token_range() {
+        // Nine figures through one bar is an ordinary week, and the `usize`
+        // rule beside this one would have to round them.
+        assert_eq!(token_fraction(0, 0), 0.0);
+        assert_eq!(token_fraction(5, 0), 0.0, "no peak is no bar, not a crash");
+        assert_eq!(token_fraction(1_000_000_000, 4_000_000_000), 0.25);
+        assert_eq!(token_fraction(9, 4), 1.0, "clamped, never overdrawn");
+    }
+
+    #[test]
+    fn a_caption_is_a_weekday_and_a_date_that_will_not_parse_is_left_alone() {
+        assert_eq!(short_day("2026-08-03"), "Mon 3");
+        assert_eq!(short_day("2026-12-25"), "Fri 25");
+        assert_eq!(short_day("whenever"), "whenever");
+    }
+
+    #[test]
+    fn a_month_of_columns_goes_bare_rather_than_illegible() {
+        assert!(day_captions_fit(1));
+        assert!(day_captions_fit(7), "the default window is captioned");
+        assert!(day_captions_fit(CAPTIONED_COLUMNS));
+        assert!(!day_captions_fit(30), "a month reads as a shape");
     }
 
     // -- the spend headline (gh#182 rendered by gh#179) -----------------------
@@ -1740,6 +2318,55 @@ mod spec {
             ("brede@tally.no", usage(9_000, 6_000, 148_000, 21_000)),
             ("ana@example.com", usage(400, 100, 0, 500)),
         ]);
+        // The same window cut two ways (gh#227), ranked and folded on the box.
+        // The phone draws no breakdown yet and ignores the key — what the
+        // fixture pins here is that it still decodes the rest of the reply when
+        // a newer board sends one, and what the shape it will read looks like.
+        priced.breakdown = vec![
+            rank_breakdown(
+                Dimension::Model,
+                vec![
+                    BreakdownRow {
+                        label: "claude-opus-5".into(),
+                        dispatches: 8,
+                        usage: usage(9_000, 6_000, 148_000, 21_000),
+                        cost: Some(Usd::from_dollars(0.400_25)),
+                        unpriced_tokens: 0,
+                    },
+                    BreakdownRow {
+                        label: "gpt-5.6-terra".into(),
+                        dispatches: 5,
+                        usage: usage(400, 100, 0, 500),
+                        // Metered, and priced at nothing because the table has
+                        // never heard of it — which is why the tokens it could
+                        // not price ride along on the row.
+                        cost: Some(Usd::ZERO),
+                        unpriced_tokens: 1_000,
+                    },
+                ],
+                BREAKDOWN_ROWS,
+            ),
+            rank_breakdown(
+                Dimension::Runtime,
+                vec![
+                    BreakdownRow {
+                        label: "claude-code".into(),
+                        dispatches: 10,
+                        usage: usage(9_000, 6_000, 148_000, 21_000),
+                        cost: Some(Usd::from_dollars(0.400_25)),
+                        unpriced_tokens: 0,
+                    },
+                    BreakdownRow {
+                        label: "codex".into(),
+                        dispatches: 3,
+                        usage: usage(400, 100, 0, 500),
+                        cost: Some(Usd::ZERO),
+                        unpriced_tokens: 1_000,
+                    },
+                ],
+                BREAKDOWN_ROWS,
+            ),
+        ];
         priced.spend = Some(spend(
             crate::view::rates::builtin(),
             &[

@@ -23,7 +23,8 @@ use std::sync::Arc;
 pub use comet_proto::TokenUsage;
 pub use comet_proto::view::rates::human_usd;
 pub use comet_proto::view::stats::{
-    BoardStats as Stats, DayBucket, Friction, HOURS, Landing, TokenDay, human_tokens,
+    BREAKDOWN_ROWS, BoardStats as Stats, Breakdown, BreakdownRow, DayBucket, Dimension, Friction,
+    HOURS, Landing, Ranking, TokenDay, human_tokens, rank_breakdown,
 };
 
 /// Whose subscription a dispatch that named no slot spent (gh#101).
@@ -32,6 +33,23 @@ pub use comet_proto::view::stats::{
 /// owner's plan is exactly the row the billing guard exists for, and
 /// "unattributed" would hide it.
 pub const THE_BOX: &str = "the box's own login";
+
+/// What a run that never announced a model is called (gh#151).
+///
+/// One spelling, used by every split that is keyed on the model, so an
+/// unnamed run appears as the same row in all of them.
+pub const UNNAMED_MODEL: &str = "unnamed model";
+
+/// One bucket of a [`Dimension`], on the way to a [`BreakdownRow`] (gh#227).
+///
+/// It carries its own model split because that is what makes the row's money
+/// exact: a runtime's dollars are its tokens at the rates of the models it ran.
+#[derive(Default)]
+struct Cut {
+    dispatches: usize,
+    usage: TokenUsage,
+    by_model: BTreeMap<String, TokenUsage>,
+}
 
 fn minutes(a: &Attempt) -> Option<i64> {
     let start = chrono::DateTime::parse_from_rfc3339(&a.started_at).ok()?;
@@ -169,22 +187,44 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
     // it actually ran, never at a board-wide average. Not on `Stats` itself —
     // it is arithmetic on the way to a figure, not a fact a page renders.
     let mut tokens_by_account_model: BTreeMap<(String, String), TokenUsage> = BTreeMap::new();
+    // The window cut five ways (gh#227), keyed on the axis and the row. One
+    // pass over the attempts fills all five, because every one of them is
+    // already on the row: which model, which harness, which space, which
+    // tracker, whose subscription.
+    let mut cuts: BTreeMap<(Dimension, String), Cut> = BTreeMap::new();
 
     for (task, a) in &attempts {
         match a.outcome {
             Some(o) => *outcomes.entry(o.as_str().to_string()).or_default() += 1,
             None => live += 1,
         }
+        let source = task.source.as_str().to_string();
         *by_workspace.entry(a.workspace.clone()).or_default() += 1;
         *by_runtime.entry(a.runtime.clone()).or_default() += 1;
-        *by_source
-            .entry(task.source.as_str().to_string())
-            .or_default() += 1;
+        *by_source.entry(source.clone()).or_default() += 1;
         // Whose subscription it spent (gh#101). A dispatch that named no slot
         // ran on the box's own login, and saying so is the point of the row —
         // "unattributed" would hide exactly the case the guard exists for.
         let payer = a.billed_to.clone().unwrap_or_else(|| THE_BOX.to_string());
         *by_account.entry(payer.clone()).or_default() += 1;
+        // What it ran, as the run itself reported it. Read here rather than
+        // inside the token block below because a dispatch belongs under its
+        // model whether or not the harness got round to metering it.
+        let model = a.model.clone().unwrap_or_else(|| UNNAMED_MODEL.to_string());
+        for (dimension, label) in [
+            (Dimension::Model, &model),
+            (Dimension::Runtime, &a.runtime),
+            (Dimension::Space, &a.workspace),
+            (Dimension::Tracker, &source),
+            (Dimension::Account, &payer),
+        ] {
+            let cut = cuts.entry((dimension, label.clone())).or_default();
+            cut.dispatches += 1;
+            if let Some(usage) = a.tokens {
+                cut.usage.add(usage);
+                cut.by_model.entry(model.clone()).or_default().add(usage);
+            }
+        }
         // An agent, by either name it can be known under. Counting only
         // `dispatched_by` counted only agents the board itself dispatched,
         // which is the one kind that almost never does the dispatching — so
@@ -208,7 +248,6 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         if let Some(usage) = a.tokens {
             tokens.add(usage);
             attempts_with_tokens += 1;
-            let model = a.model.clone().unwrap_or_else(|| "unnamed model".into());
             tokens_by_model.entry(model.clone()).or_default().add(usage);
             tokens_by_runtime
                 .entry(a.runtime.clone())
@@ -293,6 +332,31 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         )
     });
 
+    // The five cuts, priced and ranked (gh#227). A dimension this window has
+    // nothing under is left out of the vector entirely rather than sent as an
+    // empty one: the toggle is built from what is here, and a segment that
+    // opens onto no rows is a segment that should not have been offered.
+    let breakdown: Vec<Breakdown> = Dimension::ALL
+        .iter()
+        .filter_map(|dimension| {
+            let rows: Vec<BreakdownRow> = cuts
+                .iter()
+                .filter(|((d, _), _)| d == dimension)
+                .map(|((_, label), cut)| {
+                    let priced = prices.and_then(|p| p.price(&cut.by_model));
+                    BreakdownRow {
+                        label: label.clone(),
+                        dispatches: cut.dispatches,
+                        usage: cut.usage,
+                        cost: priced.map(|(cost, _)| cost),
+                        unpriced_tokens: priced.map_or(0, |(_, unpriced)| unpriced),
+                    }
+                })
+                .collect();
+            (!rows.is_empty()).then(|| rank_breakdown(*dimension, rows, BREAKDOWN_ROWS))
+        })
+        .collect();
+
     Stats {
         since_days,
         attempts: attempts.len(),
@@ -323,6 +387,7 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         by_runtime,
         by_source,
         by_account,
+        breakdown,
         agent_dispatched,
         spend,
         tokens_by_model,
@@ -695,7 +760,7 @@ mod tests {
                 attempt(20, 5, Some(Outcome::Cancelled), None),
             ],
         )];
-        let s = gather(&tasks, Some(7));
+        let mut s = gather(&tasks, Some(7));
         assert_eq!(s.daily.len(), 7);
         // Which local day each attempt lands in is not the point and must not
         // be assumed: at 00:05 the two are on opposite sides of midnight. The
@@ -721,6 +786,42 @@ mod tests {
                 .filter(|d| d.date != done_day && d.date != cancelled_day)
                 .all(|d| d.dispatches == 0),
             "every other day is present and empty"
+        );
+
+        // And what the chart makes of that (gh#226). A bucket per day was only
+        // half the promise: the other half is that a day with nothing in it is
+        // *drawn*, at zero height with a dash where its figure would be.
+        // Neither attempt reported tokens, so here every column is a quiet one.
+        let columns = comet_proto::view::stats::day_columns(&s.daily, &s.daily_tokens);
+        assert_eq!(columns.len(), 7);
+        assert!(columns.iter().all(|c| c.is_quiet() && c.value == "—"));
+        // A quiet bar still says what ran under it — the count the bars gave up
+        // is in the caption, and no dispatch is lost on the way there.
+        assert!(
+            columns
+                .iter()
+                .all(|c| c.caption.ends_with(&format!(" · {}", c.dispatches))),
+            "{:?}",
+            columns.iter().map(|c| &c.caption).collect::<Vec<_>>()
+        );
+        assert_eq!(columns.iter().map(|c| c.dispatches).sum::<usize>(), 2);
+        // Give one day some tokens and it is the only bar with height — the six
+        // around it stay present at zero rather than going missing, which is
+        // what made a week's work read as one lonely bar.
+        s.daily_tokens
+            .iter_mut()
+            .filter(|d| d.date == done_day)
+            .for_each(|d| d.usage = usage(90_000, 10_000, 0, 0));
+        let drawn = comet_proto::view::stats::day_columns(&s.daily, &s.daily_tokens);
+        let busy: Vec<&comet_proto::view::stats::DayColumn> =
+            drawn.iter().filter(|c| !c.is_quiet()).collect();
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].value, "100k");
+        assert_eq!(busy[0].fraction, 1.0);
+        assert_eq!(
+            drawn.iter().filter(|c| c.fraction == 0.0).count(),
+            6,
+            "the quiet days are present at zero height, not absent"
         );
     }
 
@@ -1090,6 +1191,131 @@ monthly_usd = 200
         assert_eq!(row.subsidy(), Some(0.1), "a tenth of what the plan cost");
         // And the plan is nowhere in the board's own figure.
         assert_eq!(spend.list_price, Usd::from_dollars(20.0));
+    }
+
+    // -- the breakdown (gh#227) ----------------------------------------------
+
+    fn cut(s: &Stats, dimension: Dimension) -> &Breakdown {
+        s.cut(dimension)
+            .unwrap_or_else(|| panic!("{dimension:?} is a dimension of this window"))
+    }
+
+    /// The dimension the shipped page could not ask about at all, and the one
+    /// the card exists for: which model is the bill.
+    #[test]
+    fn the_window_is_cut_by_model_and_every_row_carries_its_money() {
+        let tasks = vec![task(
+            "t1",
+            vec![
+                spent(
+                    60,
+                    "claude-opus-5",
+                    Some("brede@tally.no"),
+                    usage(1_000_000, 0, 0, 0),
+                ),
+                spent(
+                    50,
+                    "claude-opus-5",
+                    Some("brede@tally.no"),
+                    usage(1_000_000, 0, 0, 0),
+                ),
+                spent(
+                    40,
+                    "claude-haiku-4-5",
+                    Some("ana@example.com"),
+                    usage(1_000_000, 0, 0, 0),
+                ),
+            ],
+        )];
+        let s = gather_priced(&tasks, Some(7), &crate::prices::Prices::builtin());
+        let models = cut(&s, Dimension::Model);
+
+        assert_eq!(models.ranking, Ranking::Spend);
+        let labels: Vec<&str> = models.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["claude-opus-5", "claude-haiku-4-5"]);
+        assert_eq!(models.rows[0].dispatches, 2);
+        assert_eq!(models.rows[0].usage.total(), 2_000_000);
+        assert_eq!(models.rows[0].cost, Some(Usd::from_dollars(10.0)));
+        assert_eq!(models.rows[1].cost, Some(Usd::from_dollars(1.0)));
+        // The rows account for the headline they sit under.
+        assert_eq!(
+            models.rows.iter().filter_map(|r| r.cost).sum::<Usd>(),
+            s.spend.as_ref().expect("priced").list_price
+        );
+        // A bar drawn against the biggest row's money, which is what it sorted
+        // on — 10× the row under it.
+        assert_eq!(models.share(&models.rows[0]), 1.0);
+        assert_eq!(models.share(&models.rows[1]), 0.1);
+    }
+
+    /// The point of pricing per bucket rather than per board: a cut whose rows
+    /// ran different models is priced at each row's own rates.
+    #[test]
+    fn a_cut_is_priced_at_the_rates_of_the_models_that_row_actually_ran() {
+        let mut cheap = spent(60, "claude-haiku-4-5", None, usage(1_000_000, 0, 0, 0));
+        cheap.runtime = "codex".into();
+        cheap.workspace = "edge".into();
+        let dear = spent(50, "claude-opus-5", None, usage(1_000_000, 0, 0, 0));
+        let s = gather_priced(
+            &[task("t1", vec![cheap, dear])],
+            Some(7),
+            &crate::prices::Prices::builtin(),
+        );
+
+        let runtimes = cut(&s, Dimension::Runtime);
+        let by = |rows: &[BreakdownRow], label: &str| {
+            rows.iter()
+                .find(|r| r.label == label)
+                .unwrap_or_else(|| panic!("{label}"))
+                .cost
+        };
+        // Same tokens on both rows, five times the money on one of them. An
+        // average rate would have said $3 twice.
+        assert_eq!(
+            by(&runtimes.rows, "claude-code"),
+            Some(Usd::from_dollars(5.0))
+        );
+        assert_eq!(by(&runtimes.rows, "codex"), Some(Usd::from_dollars(1.0)));
+        let spaces = cut(&s, Dimension::Space);
+        assert_eq!(by(&spaces.rows, "edge"), Some(Usd::from_dollars(1.0)));
+    }
+
+    #[test]
+    fn a_dimension_this_window_has_nothing_under_is_not_offered_at_all() {
+        // Nothing ran: no cut has a row, so the card has no toggle to draw.
+        assert!(gather(&[], Some(7)).breakdown.is_empty());
+
+        // And a window that ran: every axis an attempt carries is a dimension,
+        // and each is present exactly once.
+        let s = gather(
+            &[task("t1", vec![attempt(30, 5, Some(Outcome::Done), None)])],
+            Some(7),
+        );
+        let offered: Vec<Dimension> = s.breakdown.iter().map(|b| b.dimension).collect();
+        assert_eq!(offered, Dimension::ALL.to_vec(), "in the toggle's order");
+        assert_eq!(cut(&s, Dimension::Tracker).rows[0].label, "linear");
+        assert_eq!(cut(&s, Dimension::Account).rows[0].label, THE_BOX);
+    }
+
+    /// A dispatch belongs under its model whether or not the harness metered
+    /// it — and a run that never said gets the one name every other split
+    /// gives it, rather than vanishing out of the count.
+    #[test]
+    fn an_unmetered_dispatch_is_still_a_row_and_is_ranked_on_what_is_left() {
+        let mut named = attempt(60, 5, Some(Outcome::Done), None);
+        named.model = Some("claude-opus-5".into());
+        let silent = attempt(50, 5, Some(Outcome::Done), None);
+        let s = gather(&[task("t1", vec![named, silent])], Some(7));
+
+        let models = cut(&s, Dimension::Model);
+        assert_eq!(models.ranking, Ranking::Dispatches, "nothing to rank on");
+        let labels: Vec<&str> = models.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["claude-opus-5", UNNAMED_MODEL]);
+        assert!(
+            !models.is_priced(),
+            "an unpriced gather has no money column"
+        );
+        assert!(models.rows.iter().all(|r| r.dispatches == 1));
     }
 
     #[test]

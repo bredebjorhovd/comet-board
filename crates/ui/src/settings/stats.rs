@@ -11,10 +11,19 @@
 //! 1. **Spend** — list price against what the plans behind it cost, and where
 //!    inside that price the money went. Never summed: one figure is the
 //!    board's, the other is a person's (gh#182).
-//! 2. **Work released** — dispatches, the day shape, and where they landed.
+//! 2. **Work released** — dispatches, where they landed, and the day chart:
+//!    bar height is tokens, the dispatch count rides in the caption (gh#226).
 //! 3. **Tokens** — what the price above was computed from, per model.
 //! 4. **When and where** — one grid crossing the hour against the space.
-//! 5. **Who ran it** — the runtime, the tracker, the subscription.
+//! 5. **Breakdown** — the same window cut by model, runtime, space, tracker or
+//!    account, with tokens and money on every row (gh#227).
+//!
+//! **Block five is one card and a toggle, not three columns.** It shipped as
+//! three fixed tallies of dispatch counts, which answered the wrong question
+//! twice: a count per runtime says nothing about what the runtime cost, and the
+//! axis that matters most — which model is the bill — was not on the page at
+//! all. The axis a reader wants changes between visits, so it is a control; and
+//! since the rows are about money, they are ordered and drawn against it.
 //!
 //! **The four rates are priced apart and then read together (gh#225).** A
 //! cache read is a tenth of fresh input and output is five times it, so the
@@ -58,9 +67,9 @@ use comet_proto::TokenUsage;
 use comet_proto::view::board;
 use comet_proto::view::rates::{Usd, human_usd};
 use comet_proto::view::stats::{
-    BoardSpend, BoardStats, CostSplit, HOURS, Tally, TokenTally, WINDOWS, bar_fraction, hour_grid,
-    human_minutes, human_multiple, human_tokens, peak_dispatches, peak_tokens, percent,
-    ranked_tokens, ranked_top,
+    BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit, Dimension, HOURS, TokenTally,
+    WINDOWS, bar_fraction, day_captions_fit, day_columns, hour_grid, human_minutes,
+    human_multiple, human_tokens, peak_tokens, percent, ranked_tokens,
 };
 use comet_rpc::methods;
 
@@ -68,7 +77,10 @@ use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::{Bed, ListRow as _, Theme};
 
-/// How many rows a tally shows before folding the rest into `n others`.
+/// How many rows the per-model table shows before folding the rest into
+/// `n others`. The breakdown's own cap is the board's
+/// ([`comet_proto::view::stats::BREAKDOWN_ROWS`]), because it folds before it
+/// sends.
 const TALLY_ROWS: usize = 6;
 
 /// How many spaces the crossed grid shows before folding. Fewer than a tally:
@@ -76,13 +88,14 @@ const TALLY_ROWS: usize = 6;
 /// being a shape.
 const GRID_ROWS: usize = 5;
 
-/// Bar geometry for the throughput chart. Tall enough that a quiet day and a
-/// busy one are different at a glance, short enough to sit above the fold.
+/// Bar geometry for the day chart. Tall enough that a quiet day and a busy one
+/// are different at a glance, short enough to sit above the fold.
 const CHART_HEIGHT: f32 = 92.0;
 
-/// The token series, drawn as a strip inside the tokens block rather than as a
-/// card of its own — it qualifies the total above it.
-const SPARK_HEIGHT: f32 = 40.0;
+/// What a day that spent nothing draws instead of a bar (gh#226). One rule, so
+/// the quiet days line up as a baseline rather than as six slightly different
+/// nothings.
+const HAIRLINE: f32 = 1.0;
 
 /// The cost-split bar (gh#225). A proportion, not a magnitude: the height
 /// carries no information, so it is the thickness of a rule and the width does
@@ -97,7 +110,7 @@ const SPLIT_BAR_HEIGHT: f32 = 10.0;
 /// the page, which is the same rule one level down.
 const MARK_RADIUS: f32 = 3.0;
 
-/// The label gutter shared by the crossed grid and the tallies, so the two
+/// The label gutter shared by the crossed grid and the breakdown, so the two
 /// blocks start their bars on the same vertical.
 const LABEL_WIDTH: f32 = 132.0;
 
@@ -122,6 +135,10 @@ pub struct StatsPage {
     /// The window in days; `None` is all time. Mirrors the CLI's
     /// `--since-days`, so the two surfaces are asking one question.
     since_days: Option<i64>,
+    /// Which axis the breakdown is cut along (gh#227). A view state, not a
+    /// query: every cut arrives in the one reply, so the toggle costs nothing
+    /// but a redraw.
+    dimension: Dimension,
     stats: Option<BoardStats>,
     /// The device that answered. `None` before the first reply, and on a board
     /// hosted right here.
@@ -138,6 +155,9 @@ impl StatsPage {
             // A week: long enough to have a shape, short enough that today is
             // still visible in it.
             since_days: Some(7),
+            // The axis where the answer is usually one row, and the one the
+            // page could not ask about at all before gh#227.
+            dimension: Dimension::Model,
             stats: None,
             host: None,
             loaded: false,
@@ -217,6 +237,16 @@ impl StatsPage {
         cx.notify();
     }
 
+    /// Switch the axis the breakdown is cut along. A redraw, never a reload —
+    /// all five cuts came down in the same reply.
+    fn set_dimension(&mut self, dimension: Dimension, cx: &mut Context<Self>) {
+        if self.dimension == dimension {
+            return;
+        }
+        self.dimension = dimension;
+        cx.notify();
+    }
+
     /// The host's display name, for the subtitle.
     fn host_label(&self, cx: &gpui::App) -> SharedString {
         let Some(host) = self.host.as_deref() else {
@@ -231,12 +261,17 @@ impl StatsPage {
             .unwrap_or_else(|| SharedString::from(host.to_string()))
     }
 
-    /// The window picker: a segmented row, current one filled.
-    fn render_windows(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div()
+    /// The track a segmented control's choices sit in.
+    ///
+    /// One recipe, used by the window picker and by the breakdown's dimension
+    /// toggle (gh#227): two segmented controls on one page that were built
+    /// twice would be two segmented controls that drift apart.
+    fn track(theme: &Theme) -> gpui::Div {
+        div()
             .flex()
             .flex_row()
             .items_center()
+            .flex_none()
             .gap(px(2.0))
             // The nesting rule (gh#174): segments at RADIUS_CHIP inside a track
             // at RADIUS_ROW want exactly one gutter between them, and then the
@@ -245,29 +280,59 @@ impl StatsPage {
             .rounded(px(Theme::RADIUS_ROW))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.white_alpha(0.02));
+            .bg(theme.white_alpha(0.02))
+    }
+
+    /// One choice in that track.
+    ///
+    /// The padding follows the type size rather than being a second knob: the
+    /// design gives 8×3 around an 11px segment and 10×4 around a 12px one,
+    /// which is one rule stated twice.
+    fn segment(
+        theme: &Theme,
+        id: String,
+        label: &str,
+        size: f32,
+        selected: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (pad_x, pad_y) = match size <= Theme::TEXT_CAPTION {
+            true => (8.0, 3.0),
+            false => (10.0, 4.0),
+        };
+        div()
+            .id(SharedString::from(id.clone()))
+            .px(px(pad_x))
+            .py(px(pad_y))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .text_size(px(size))
+            .font_weight(if selected {
+                gpui::FontWeight::MEDIUM
+            } else {
+                gpui::FontWeight::NORMAL
+            })
+            .when(!selected, |el| el.cursor_pointer())
+            // A segmented control inside a settings card: in light mode the
+            // card is white, so the chosen segment steps DOWN into it rather
+            // than trying to lift off it (gh#175).
+            .list_row(theme, Bed::Card, selected, id)
+            .child(SharedString::from(label.to_string()))
+    }
+
+    /// The window picker: a segmented row, current one filled.
+    fn render_windows(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = Self::track(theme);
         for (days, label) in WINDOWS {
             let selected = self.since_days == *days;
             let days = *days;
             row = row.child(
-                div()
-                    .id(SharedString::from(format!("stats-window-{label}")))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .rounded(px(Theme::RADIUS_CHIP))
-                    .text_size(px(Theme::TEXT_DENSE))
-                    .font_weight(if selected {
-                        gpui::FontWeight::MEDIUM
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .when(!selected, |el| el.cursor_pointer())
-                    // A segmented control inside a settings card: in light
-                    // mode the card is white, so the chosen window steps DOWN
-                    // into it rather than trying to lift off it (gh#175).
-                    .list_row(theme, Bed::Card, selected, format!("stats-window-{label}"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_window(days, cx)))
-                    .child(SharedString::from(*label)),
+                Self::segment(
+                    theme,
+                    format!("stats-window-{label}"),
+                    label,
+                    Theme::TEXT_DENSE,
+                    selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_window(days, cx))),
             );
         }
         row.into_any_element()
@@ -277,6 +342,25 @@ impl StatsPage {
 
     /// A block: heading, an optional aside, and a body.
     fn block(theme: &Theme, title: &str, aside: Option<String>, body: AnyElement) -> AnyElement {
+        Self::block_with(theme, title, aside, None, body)
+    }
+
+    /// The same block with a control in its header (gh#227).
+    ///
+    /// The aside moves to the left, under the title's baseline, when there is
+    /// one: a caption and a segmented control both pinned to the right edge
+    /// would read as one crowded object rather than as a label and a switch.
+    fn block_with(
+        theme: &Theme,
+        title: &str,
+        aside: Option<String>,
+        control: Option<AnyElement>,
+        body: AnyElement,
+    ) -> AnyElement {
+        let (beside_title, at_the_edge) = match control.is_some() {
+            true => (aside, None),
+            false => (None, aside),
+        };
         widgets::section_card(theme)
             // `section_card` carries the settings stack's own `mt(24)`, which
             // in this column double-spaces on top of `dashboard_column`'s gap.
@@ -293,23 +377,40 @@ impl StatsPage {
                     .gap(px(10.0))
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(title.to_string())),
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap(px(8.0))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(title.to_string())),
+                            )
+                            .when_some(beside_title, |el, aside| {
+                                el.child(Self::caption(theme, aside))
+                            }),
                     )
-                    .when_some(aside, |el, aside| {
-                        el.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .text_color(theme.text_subtle)
-                                .child(SharedString::from(aside)),
-                        )
-                    }),
+                    .when_some(at_the_edge, |el, aside| {
+                        el.child(Self::caption(theme, aside))
+                    })
+                    .when_some(control, |el, control| el.child(control)),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    /// The small subdued line a block heads or ends with.
+    fn caption(theme: &Theme, copy: String) -> AnyElement {
+        div()
+            .min_w_0()
+            .truncate()
+            .text_size(px(Theme::TEXT_CAPTION))
+            .text_color(theme.text_subtle)
+            .child(SharedString::from(copy))
             .into_any_element()
     }
 
@@ -802,7 +903,8 @@ impl StatsPage {
     // -- block 2: work released ----------------------------------------------
 
     /// The throughput answer: how much was released, how it went, and the
-    /// shape of the days it went in.
+    /// shape of the days it went in — which is a shape in tokens, not in
+    /// dispatch counts (gh#226).
     fn render_delivery(stats: &BoardStats, theme: &Theme) -> AnyElement {
         let completion = percent(stats.completion_rate);
         // The qualifying line, assembled only from facts that exist. A board
@@ -876,69 +978,111 @@ impl StatsPage {
         Self::block(
             theme,
             "Work released",
-            // The legend only when there are bars to legend.
-            (peak_dispatches(&stats.daily) > 0).then(|| "solid bar = ended in done".to_string()),
+            // The legend only when there are bars to legend — and it says what
+            // the height is, because that is the thing a bar chart otherwise
+            // lets a reader assume (gh#226).
+            (!stats.daily.is_empty()).then(|| "bar height = tokens that day".to_string()),
             Self::body(14.0).child(head).child(split).into_any_element(),
         )
     }
 
-    /// Dispatches per day, with the share that ended `done` filled in.
+    /// The day chart: **height is tokens, the dispatch count is in the caption**
+    /// (gh#226).
     ///
-    /// Two tones in one bar rather than two bars: the question is what
-    /// proportion of a day's work landed, and side-by-side bars make that a
-    /// subtraction the reader has to do.
+    /// It plotted dispatches, split solid-and-quiet for the share that ended
+    /// `done`. Dispatches per day is nearly flat and nearly meaningless — two
+    /// of them can differ by twenty times in what they cost — so the shape said
+    /// almost nothing, and the one number that does vary was drawn as an
+    /// unlabelled strip in another block. Token volume is also what the spend
+    /// block above is computed from, so the two now read as one argument. The
+    /// completion share it gave up is a sentence in the headline above
+    /// (`82% ended in done`), where a proportion belongs.
+    ///
+    /// Every day in the window draws, including the ones that spent nothing: a
+    /// quiet day is a hairline under a dash, never a gap. A seven-day window on
+    /// a board that worked one day is a shape; one lonely bar reads as six days
+    /// the board failed to record.
     fn render_chart(stats: &BoardStats, theme: &Theme) -> AnyElement {
-        let peak = peak_dispatches(&stats.daily);
-        if peak == 0 {
+        let columns = day_columns(&stats.daily, &stats.daily_tokens);
+        if columns.is_empty() {
             return Self::note(theme, "Nothing was dispatched in this window.");
         }
-        let bars: Vec<AnyElement> = stats
-            .daily
+        let peak = peak_tokens(&stats.daily_tokens);
+        // A month of captions is a month of collisions; past the cap the
+        // columns go bare and the axis carries the range instead.
+        let captioned = day_captions_fit(columns.len());
+        let label = |theme: &Theme, text: String, strong: bool| {
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_center()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(if strong {
+                    theme.text_muted
+                } else {
+                    theme.text_subtle
+                })
+                .child(SharedString::from(text))
+        };
+        let bars: Vec<AnyElement> = columns
             .iter()
-            .map(|day| {
-                let total_h = CHART_HEIGHT * bar_fraction(day.dispatches, peak);
-                let done_h = CHART_HEIGHT
-                    * bar_fraction(day.done, peak).min(bar_fraction(day.dispatches, peak));
+            .map(|column| {
+                // A hairline where the bar would be, in the border's own tone:
+                // the day is present and it spent nothing, which is a different
+                // statement from a short accent bar somebody has to squint at.
+                let height = if column.is_quiet() {
+                    HAIRLINE
+                } else {
+                    (CHART_HEIGHT * column.fraction).max(2.0)
+                };
                 div()
                     .flex_1()
                     .min_w(px(3.0))
-                    .h(px(CHART_HEIGHT))
                     .flex()
                     .flex_col()
-                    .justify_end()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when(captioned, |el| {
+                        el.child(label(theme, column.value.clone(), !column.is_quiet()))
+                    })
                     .child(
-                        // The column: everything dispatched, quiet…
                         div()
                             .w_full()
-                            .h(px(total_h.max(if day.dispatches > 0 { 2.0 } else { 0.0 })))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(theme.accent.opacity(0.22))
+                            .h(px(CHART_HEIGHT))
                             .flex()
                             .flex_col()
                             .justify_end()
-                            // …and the part of it that landed, solid.
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(px(done_h))
-                                    .rounded(px(MARK_RADIUS))
-                                    .bg(theme.accent.opacity(0.85)),
-                            ),
+                            .child(div().w_full().h(px(height)).rounded(px(MARK_RADIUS)).bg(
+                                if column.is_quiet() {
+                                    theme.border
+                                } else {
+                                    theme.accent.opacity(0.85)
+                                },
+                            )),
                     )
+                    .when(captioned, |el| {
+                        el.child(label(theme, column.caption.clone(), false))
+                    })
                     .into_any_element()
             })
             .collect();
 
-        let first = stats
-            .daily
-            .first()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
-        let last = stats
-            .daily
-            .last()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
+        // The peak reads in tokens, like the bars. With the captions on, the
+        // range is already under every column and the axis is that one fact.
+        let middle = if peak > 0 {
+            format!("peak {}/day", human_tokens(peak))
+        } else {
+            "no day in this window reported tokens".to_string()
+        };
+        let (first, last) = if captioned {
+            (String::new(), String::new())
+        } else {
+            (
+                columns.first().map(|c| c.date.clone()).unwrap_or_default(),
+                columns.last().map(|c| c.date.clone()).unwrap_or_default(),
+            )
+        };
         div()
             .flex()
             .flex_col()
@@ -949,10 +1093,9 @@ impl StatsPage {
                     .flex_row()
                     .items_end()
                     .gap(px(3.0))
-                    .h(px(CHART_HEIGHT))
                     .children(bars),
             )
-            .child(Self::axis(theme, first, format!("peak {peak}/day"), last))
+            .child(Self::axis(theme, first, middle, last))
             .into_any_element()
     }
 
@@ -1134,88 +1277,20 @@ impl StatsPage {
                     ),
             );
 
+        // No day strip here any more (gh#226): the day chart in the block above
+        // *is* the token series now, and drawing it twice on one page — once
+        // captioned, once as an unlabelled strip — is two answers to one
+        // question. What belongs under this headline is what it was spent on.
         Self::block(
             theme,
             "Tokens",
             coverage,
             Self::body(14.0)
                 .child(head)
-                .child(Self::render_spark(stats, theme))
                 .child(Self::seam(theme))
                 .child(Self::render_model_table(stats, theme))
                 .into_any_element(),
         )
-    }
-
-    /// Tokens per day, one tone.
-    ///
-    /// The dispatch chart in the block above splits its bars because "how much
-    /// of a day's work landed" is a proportion; this one does not, because
-    /// tokens have no such second number. What it does share is the day range —
-    /// the two series are generated from one calendar, so a spike here sits
-    /// under the day that caused it.
-    fn render_spark(stats: &BoardStats, theme: &Theme) -> AnyElement {
-        let peak = peak_tokens(&stats.daily_tokens);
-        if peak == 0 {
-            return Self::note(theme, "No day in this window has usage to show.");
-        }
-        let bars: Vec<AnyElement> = stats
-            .daily_tokens
-            .iter()
-            .map(|day| {
-                let total = day.usage.total();
-                // Against the peak day and not the total, for the reason the
-                // dispatch chart is: the question is which day was expensive.
-                let fraction = (total as f32 / peak as f32).clamp(0.0, 1.0);
-                div()
-                    .flex_1()
-                    .min_w(px(3.0))
-                    .h(px(SPARK_HEIGHT))
-                    .flex()
-                    .flex_col()
-                    .justify_end()
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(
-                                SPARK_HEIGHT * fraction + if total > 0 { 2.0 } else { 0.0 }
-                            ))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(theme.accent.opacity(0.7)),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        let first = stats
-            .daily_tokens
-            .first()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
-        let last = stats
-            .daily_tokens
-            .last()
-            .map(|d| d.date.clone())
-            .unwrap_or_default();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap(px(3.0))
-                    .h(px(SPARK_HEIGHT))
-                    .children(bars),
-            )
-            .child(Self::axis(
-                theme,
-                first,
-                format!("peak {}/day", human_tokens(peak)),
-                last,
-            ))
-            .into_any_element()
     }
 
     /// The per-model rows, priced where the board could price them.
@@ -1617,96 +1692,178 @@ impl StatsPage {
             .into_any_element()
     }
 
-    // -- block 5: who ran it -------------------------------------------------
+    // -- block 5: the breakdown ----------------------------------------------
 
-    /// The three remaining single-axis tallies, side by side in one block:
-    /// which harness, which tracker, whose subscription.
-    fn render_who(stats: &BoardStats, theme: &Theme) -> Option<AnyElement> {
-        let columns: Vec<AnyElement> = [
-            ("Runtime", &stats.by_runtime),
-            ("Tracker", &stats.by_source),
-            ("Subscription", &stats.by_account),
-        ]
-        .into_iter()
-        .filter(|(_, tally)| !tally.is_empty())
-        .map(|(heading, tally)| Self::tally_column(theme, heading, ranked_top(tally, TALLY_ROWS)))
-        .collect();
-        if columns.is_empty() {
-            return None;
+    /// The same window cut five ways, one axis at a time (gh#227).
+    ///
+    /// This was three fixed columns of dispatch counts, which answered the
+    /// wrong question twice: a count per runtime says nothing about what the
+    /// runtime cost, and the axis that matters most — the model — was not on
+    /// the page at all. So the axis is a toggle, and every row carries the two
+    /// numbers a reader is here for: what it spent and what that cost.
+    ///
+    /// The toggle is built from the cuts the board actually sent, so a
+    /// dimension this window has nothing under is absent rather than a segment
+    /// that opens onto an empty card.
+    fn render_breakdown(
+        &self,
+        stats: &BoardStats,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        // A window that dropped the chosen axis falls back to the first one it
+        // does have, WITHOUT moving the selection: switching to 24 hours and
+        // back should return to the axis the reader picked, not to whatever
+        // the quiet window happened to offer.
+        let cut = stats
+            .cut(self.dimension)
+            .or_else(|| stats.breakdown.first())?;
+        let priced = cut.is_priced();
+        let unpriced: u64 = cut.rows.iter().map(|r| r.unpriced_tokens).sum();
+        let rows: Vec<AnyElement> = cut
+            .rows
+            .iter()
+            .map(|row| Self::breakdown_row(theme, cut, row, priced))
+            .collect();
+        let mut body = Self::body(14.0).child(
+            div()
+                .flex()
+                .flex_col()
+                // Tighter than a block's own gap: these are rows of one table,
+                // not stacked facts.
+                .gap(px(9.0))
+                .children(rows),
+        );
+        if priced && unpriced > 0 {
+            body = body.child(Self::caption(
+                theme,
+                format!(
+                    "{} token(s) here ran on a model with no rate, and so are in no price above.",
+                    human_tokens(unpriced)
+                ),
+            ));
         }
-        Some(Self::block(
+        Some(Self::block_with(
             theme,
-            "Who ran it",
-            None,
-            Self::body(14.0)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_start()
-                        .gap(px(24.0))
-                        .children(columns),
-                )
-                .into_any_element(),
+            "Breakdown",
+            // What the rows are ordered by, said out loud: the bar is drawn
+            // against the same quantity, and on an unpriced window that is
+            // tokens rather than money.
+            Some(cut.ranking.caption().to_string()),
+            Some(Self::render_dimensions(stats, self.dimension, theme, cx)),
+            body.into_any_element(),
         ))
     }
 
-    /// One tally as a headed column of label + bar + count.
-    fn tally_column(theme: &Theme, heading: &str, rows: Vec<Tally>) -> AnyElement {
-        let peak = rows.iter().map(|t| t.count).max().unwrap_or(0);
-        let children: Vec<AnyElement> = rows
-            .into_iter()
-            .map(|row| {
-                let fraction = bar_fraction(row.count, peak);
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(Theme::TEXT_DENSE))
-                            .text_color(theme.text)
-                            .child(SharedString::from(row.label)),
-                    )
-                    .child(
-                        div()
-                            .w(px(64.0))
-                            .flex_none()
-                            .h(px(6.0))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(theme.white_alpha(0.05))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(fraction))
-                                    .rounded(px(MARK_RADIUS))
-                                    .bg(theme.accent.opacity(0.6)),
-                            ),
-                    )
-                    .child(Self::cell(theme, format!("{}", row.count), 28.0, false))
-                    .into_any_element()
-            })
-            .collect();
+    /// The axis toggle: one segment per cut the board sent.
+    fn render_dimensions(
+        stats: &BoardStats,
+        current: Dimension,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let offered: Vec<Dimension> = stats.breakdown.iter().map(|b| b.dimension).collect();
+        // The fallback above chooses a cut; the toggle has to agree with it, or
+        // a window without the chosen axis would fill one card and highlight a
+        // different segment.
+        let shown = offered
+            .iter()
+            .copied()
+            .find(|d| *d == current)
+            .or_else(|| offered.first().copied());
+        let mut row = Self::track(theme);
+        for dimension in offered {
+            row = row.child(
+                Self::segment(
+                    theme,
+                    format!("stats-dimension-{}", dimension.label()),
+                    dimension.label(),
+                    Theme::TEXT_CAPTION,
+                    Some(dimension) == shown,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_dimension(dimension, cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// One row: what it is, how big a share of the window it is, what it spent,
+    /// and what that cost.
+    fn breakdown_row(
+        theme: &Theme,
+        cut: &Breakdown,
+        row: &BreakdownRow,
+        priced: bool,
+    ) -> AnyElement {
+        let fraction = cut.share(row);
         div()
-            .flex_grow(1.0)
-            .flex_basis(px(0.0))
-            .min_w(px(240.0))
             .flex()
-            .flex_col()
-            .gap(px(8.0))
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(heading)),
+                    // The gutter the crossed grid uses, so the two blocks start
+                    // their bars on the same vertical.
+                    .w(px(LABEL_WIDTH))
+                    .flex_none()
+                    .truncate()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(row.label.clone())),
             )
-            .children(children)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(40.0))
+                    .h(px(6.0))
+                    .rounded(px(MARK_RADIUS))
+                    .bg(theme.white_alpha(0.05))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(fraction))
+                            .rounded(px(MARK_RADIUS))
+                            .bg(theme.accent.opacity(0.6)),
+                    ),
+            )
+            .child(Self::cell(theme, Self::row_tokens(row), 52.0, false))
+            .when(priced, |el| {
+                el.child(
+                    div()
+                        .w(px(44.0))
+                        .flex_none()
+                        .text_right()
+                        .truncate()
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        // The loudest thing on the row, because it is the one
+                        // the card is opened for.
+                        .text_color(theme.text)
+                        .child(SharedString::from(Self::row_price(row))),
+                )
+            })
             .into_any_element()
+    }
+
+    /// A row's tokens — a dash where it reported none, never a zero that would
+    /// read as work that was free.
+    fn row_tokens(row: &BreakdownRow) -> String {
+        match row.usage.is_zero() {
+            true => "—".into(),
+            false => human_tokens(row.usage.total()),
+        }
+    }
+
+    /// A row's money, with the two ways there is none said as a dash: nothing
+    /// metered here, and nothing here the rate table could price.
+    fn row_price(row: &BreakdownRow) -> String {
+        match row.cost {
+            Some(cost) if !row.usage.is_zero() && (!cost.is_zero() || row.unpriced_tokens == 0) => {
+                human_usd(cost)
+            }
+            _ => "—".into(),
+        }
     }
 }
 
@@ -1791,14 +1948,15 @@ impl Render for StatsPage {
         }
 
         // Five blocks, and the order is the argument: what it cost, what it
-        // ran, what it spent that on, when and where, and who.
+        // ran, what it spent that on, when and where, and the same window cut
+        // whichever way the reader wants it.
         column = column
             .child(Self::render_spend(&stats, &theme))
             .child(Self::render_delivery(&stats, &theme))
             .child(Self::render_tokens(&stats, &theme))
             .child(Self::render_when_and_where(&stats, &theme));
-        if let Some(who) = Self::render_who(&stats, &theme) {
-            column = column.child(who);
+        if let Some(breakdown) = self.render_breakdown(&stats, &theme, cx) {
+            column = column.child(breakdown);
         }
 
         scroll_page(column)
