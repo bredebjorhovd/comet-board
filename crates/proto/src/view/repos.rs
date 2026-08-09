@@ -323,6 +323,7 @@ mod tests {
             git_detected: true,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
         }
     }

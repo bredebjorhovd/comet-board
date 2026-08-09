@@ -372,6 +372,56 @@ pub fn chat_location(chat: &Chat) -> Option<String> {
     }
 }
 
+/// Split a chat title into the task identifier it was named for and the rest —
+/// `"gh#144 · the shelf is not a landfill"` → `(Some("gh#144"), "the shelf …")`.
+///
+/// A board-dispatched chat is called `<identifier> · <task title>`
+/// (`comet_board::runtime::DispatchSpec::chat_title`), which puts the half you
+/// recognise first — right for eliding, wrong for scanning: the identifier
+/// reads as the first two words of a sentence, so finding a ticket in a shelf
+/// means reading every row. Surfaces that can draw a chip draw this one ahead
+/// of the title (gh#229) and find it by shape instead.
+///
+/// Conservative on purpose: a chat a human named `notes · draft` keeps its
+/// whole title, because inventing a chip for it would be inventing provenance.
+/// The head qualifies only if it looks like an identifier the board mints —
+/// `gh#144`, `gh!220` or `LIN-142` — and never if it has whitespace in it.
+pub fn chat_ticket(title: &str) -> (Option<&str>, &str) {
+    let Some((head, rest)) = title.split_once(" · ") else {
+        return (None, title);
+    };
+    let rest = rest.trim();
+    if rest.is_empty() || !is_task_identifier(head) {
+        return (None, title);
+    }
+    (Some(head), rest)
+}
+
+/// `gh#144` / `gh!220` (github issues and pull requests) or `LIN-142` (linear).
+fn is_task_identifier(head: &str) -> bool {
+    if head.is_empty() || head.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // `<source>#<number>` / `<source>!<number>`: a non-empty source and digits.
+    if let Some((source, number)) = head.split_once(['#', '!']) {
+        return !source.is_empty()
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit());
+    }
+    // `TEAM-142`: linear's own spelling, upper-case team key and digits.
+    match head.split_once('-') {
+        Some((team, number)) => {
+            !team.is_empty()
+                && team
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool summaries (pure)
 // ---------------------------------------------------------------------------
@@ -808,6 +858,61 @@ mod checkout_tests {
         assert_eq!(
             checkout_label(CheckoutKind::NewWorktree, Some(&plain("main"))),
             "New worktree"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+
+    #[test]
+    fn a_board_chat_hands_over_its_identifier_and_keeps_the_rest() {
+        assert_eq!(
+            chat_ticket("gh#144 · what the morning after showed"),
+            (Some("gh#144"), "what the morning after showed")
+        );
+        assert_eq!(
+            chat_ticket("gh!220 · a claim is a sentence"),
+            (Some("gh!220"), "a claim is a sentence")
+        );
+        assert_eq!(
+            chat_ticket("LIN-142 · the Today window"),
+            (Some("LIN-142"), "the Today window")
+        );
+        // The full `gh:owner/repo#87` spelling is an identifier too — the board
+        // shortens it on the chat name, and a caller passing the long one back
+        // should not be told it is prose.
+        assert_eq!(
+            chat_ticket("gh:owner/repo#87 · onboard in one verb"),
+            (Some("gh:owner/repo#87"), "onboard in one verb")
+        );
+    }
+
+    #[test]
+    fn a_title_a_human_wrote_is_left_whole() {
+        // A chip here would claim a ticket exists behind the chat. None does.
+        for title in [
+            "notes · draft",
+            "gh#draft · not a number",
+            "#144 · no source",
+            "gh# · no number",
+            "lin-142 · lower case is not linear's spelling",
+            "New session",
+            "gh#144",
+            "gh#144 · ",
+        ] {
+            assert_eq!(chat_ticket(title), (None, title), "{title}");
+        }
+    }
+
+    #[test]
+    fn only_the_first_separator_splits() {
+        // The task title carries its own `·` often enough — the chip takes the
+        // head and the row keeps every word after it.
+        assert_eq!(
+            chat_ticket("gh#171 · a system · not a dozen greys"),
+            (Some("gh#171"), "a system · not a dozen greys")
         );
     }
 }

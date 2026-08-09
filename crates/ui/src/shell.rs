@@ -2216,7 +2216,14 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(needs_section)
-                            .children(orchestrator_slot)
+                            .children(orchestrator_slot.map(|slot| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(slot)
+                                    .child(Self::render_orchestrator_rule(theme))
+                                    .into_any_element()
+                            }))
                             .children(active_section)
                             .child(spaces_section)
                             .child(div().pb(px(Theme::SPACE_SM))),
