@@ -203,6 +203,25 @@ export const livePresence = (
   return live;
 };
 
+/** True for rooms whose doc EVERY device writes concurrently, which is what
+ * makes a live-frontier force-trim unsafe: a shallow start at the live
+ * frontier orphans any peer whose next ops depend on the history just
+ * discarded (see the force-trim guard in `maybeTrimHistory`). Pure so the rule
+ * is testable without a DO, like [`livePresence`] and [`chatRoomAccess`].
+ *
+ * Two shapes qualify here, and the pattern must survive a generation bump —
+ * upstream matched the literal `ws3/`, and when the room name moved to `ws4`
+ * the protection silently evaporated and a live-frontier trim stranded
+ * in-flight peers (upstream 4aacc6d). So: any `ws{n}/` per-user workspace doc,
+ * and any `orgdev{n}/` org device registry. The registry is OURS (gh#66 —
+ * upstream has no such room), and it has exactly the hazardous shape: every
+ * device in the org writes its own row into one shared doc, continuously.
+ *
+ * Chat rooms are single-owner and named as bare ids, so they never match and
+ * keep the immediate live-frontier trim the whale-import incident needed. */
+export const isConcurrentWriteRoom = (chatId: string | undefined): boolean =>
+  /^(ws|orgdev)\d+\//.test(chatId ?? "");
+
 /** What a caller may do with a chat room (gh#66).
  * - `claim`  — unclaimed; the first joiner becomes its owner;
  * - `owner`  — the claiming user, from any of their devices;
@@ -1335,15 +1354,11 @@ export class SessionRoom implements DurableObject {
       // heap with the same megabytes.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
-      // Any workspace-room generation (ws3/, ws4/, …) — matching the literal
-      // "ws3/" silently dropped this protection when fb6492c bumped the room
-      // name to ws4: the ws4 room force-trimmed at the LIVE frontier on
-      // 2026-08-05 02:37Z (and likely 00:55Z), stranding in-flight peers —
-      // the exact incident b019439 added this guard for. Chat rooms are bare
-      // UUIDs (hex — never a "ws" prefix), so the pattern cannot collide.
-      if (/^ws\d+\//.test(this.getMeta("chatId") ?? "")) {
-        // WORKSPACE rooms: never force-trim at the LIVE frontier. Every
-        // device writes this doc concurrently, so a live-frontier shallow
+      // Which rooms every device writes at once — see [`isConcurrentWriteRoom`]
+      // for why the pattern is generation-agnostic and why our org device
+      // registry has to be in it too.
+      if (isConcurrentWriteRoom(this.getMeta("chatId"))) {
+        // Never force-trim these at the LIVE frontier: a live-frontier shallow
         // start orphans any peer whose next ops depend on history just
         // discarded — their pushes InvalidUpdate forever and, worse, a
         // post-wedge-break trim can shallow-lock the room before all
