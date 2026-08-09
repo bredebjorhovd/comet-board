@@ -7,8 +7,10 @@ issues come in, a dispatch releases a task into a comet chat with a coding
 agent, and session state reconciles back to the board and the trackers.
 Agents read the board and dispatch from it themselves.
 
-Pin one chat as the board's **orchestrator** and it receives every settle,
-block, orphan and cap warning on the board — so one long-lived agent can
+A settle or a block goes to the chat that released the work. Pin one chat as
+the board's **orchestrator** and it receives everything no other agent can be
+told about — work you released from the panel or the phone, work whose
+dispatching chat is gone, and every cap warning — so one long-lived agent can
 dispatch, review, retry and report while your job reduces to reading its
 summaries. [docs/orchestrator.md](docs/orchestrator.md) is the brief to open
 that chat with.

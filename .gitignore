@@ -8,4 +8,7 @@ node_modules
 .wrangler
 build/
 edge/dist/
-.edge-setup.env
+# Setup-wizard answers. They hold a box's address and whatever credentials that
+# wizard collected, and this repo is public — one `git add -A` is all it takes.
+# Globbed rather than listed: the next wizard should not have to remember this.
+.*-setup.env
