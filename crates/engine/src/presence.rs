@@ -78,7 +78,7 @@ pub const RELAY_MISS_STRIKES: u32 = 2;
 /// only ever retract devices IT could have seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresenceRoom {
-    /// `ws3/{orgId}/{userId}` — this user's own fleet.
+    /// `ws4/{orgId}/{userId}` — this user's own fleet.
     Workspace,
     /// `orgdev1/{orgId}` — every device in the org.
     Org,

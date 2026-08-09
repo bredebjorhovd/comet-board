@@ -40,13 +40,24 @@ final class WorkspaceStore {
 
     func start() {
         guard room == nil else { return }
-        let roomId = "ws3/\(config.orgId)/\(config.userId)"
+        // The room id we put in our own frames. It is a label, not an address:
+        // we dial `/workspace/{orgId}/ws` and the Worker derives the real room
+        // from our auth claim, so this string routes nothing — `SessionStore`
+        // has always proved it, joining chats as the bare `chatId` while the
+        // edge names those objects `s2/{chatId}`. Keeping the generation in
+        // step is for logs; a stale one would still land in the right room
+        // (gh#148, and see edge/src/rooms.ts for the generation ladder).
+        let roomId = "ws4/\(config.orgId)/\(config.userId)"
+        // The on-disk key, deliberately independent of that generation — see
+        // `DocDisk.workspaceId`. The local snapshot is what re-seeds a room
+        // whose storage was abandoned; it must outlive the room, not follow it.
+        let diskId = DocDisk.workspaceId(orgId: config.orgId, userId: config.userId)
         // Local-first: hydrate from the on-device snapshot before joining —
         // the sidebar renders immediately and the join backfills incrementally.
-        if DocDisk.load(into: doc, id: roomId) {
+        if DocDisk.loadWorkspace(into: doc, orgId: config.orgId, userId: config.userId) {
             project()
         }
-        saver = DocSaver(docId: roomId, doc: doc)
+        saver = DocSaver(docId: diskId, doc: doc)
         let client = RoomClient(roomId: roomId, doc: doc) { [config] in
             await config.workspaceSocketURL()
         } events: { [weak self] event in

@@ -99,7 +99,7 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    status rows (Working indicator; staleness-checked client-side so a crashed backend never shows
    eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
    behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
-   class, doc id `ws2/{orgId}` — the `2` is the spaces-overhaul destructive break), with presence
+   class, doc id `ws4/{orgId}/{userId}` — see the generation ladder below), with presence
    via Loro `EphemeralStore` (replaces the 15s heartbeat writes). Presence is DERIVED by the edge
    from each room's socket set and pushed on join/close, never beaten in by clients: a `%EPH`
    frame wakes the Durable Object, so a 15s client heartbeat meant a room that could never
@@ -116,12 +116,41 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    Volume is tiny (index rows, no transcripts), so oplog growth is negligible and daily compaction
    applies anyway.
 
-   *Per-user, with one exception:* the room is really `ws3/{orgId}/{userId}` — spaces, chats and
+   *Per-user, with one exception:* the room is really `ws4/{orgId}/{userId}` — spaces, chats and
    sessions are private to the person who made them. Devices are the exception (gh#66): a
    teammate who cannot see the box cannot address it, cannot sweep it for a board, and cannot
    reach the shared work on it. So device rows are ALSO published to an org-wide registry doc
    (`orgdev1/{orgId}`, `comet_engine::org_devices`), and `WatchDevices` serves the union.
    Presence beats on both rooms.
+
+   *The generation counter, and why abandoning storage is cheap:* the leading number is a
+   destructive break — `ws2` the spaces overhaul, `ws3` the per-user privacy split
+   (`ws2/{orgId}` → `ws3/{orgId}/{userId}`), `ws4` the 2026-08-04 incident break (gh#148).
+   A room name is the Durable Object's identity (`idFromName`), so bumping it allocates virgin
+   storage and orphans the old instance, which is never dialed again and hibernates at ~zero
+   cost. That is survivable because **the edge is not authoritative for this doc**: every
+   signed-in device holds a complete local replica (`workspace2` in its own `DocsStore`), so a
+   virgin room is re-seeded by the first device to join — the ordinary
+   resubmit-from-version-vector path on a server whose version vector is empty — and merged into
+   by the rest. There is no migration script, no cutover window, and no operator step. The
+   corollary is a rule: **a room generation bump must never bump the local snapshot row id.**
+   Bump both and there is nothing left to re-seed from, and an edge-side break that loses
+   nothing becomes real data loss on every device at once.
+
+   Two properties keep the bump transparent rather than a flag day, and both are pinned by
+   tests. First, generations are **worker-internal**: clients dial `/workspace/{orgId}/ws`,
+   which names no generation, and the room id inside protocol frames is an echo label that
+   neither side routes on — so an engine still saying `ws3/…` lands in the ws4 room and
+   converges. This matters because our engines retry a failed join *forever*: a version skew
+   that did bite would be a silent outage, not an error. Second, the force-trim guard
+   (`isConcurrentWriteRoom`) classifies rooms **by name**, and upstream's version matched the
+   literal `ws3/` — when the room became `ws4/` the protection silently evaporated and re-broke
+   the incident it was written for. Hence a generation-agnostic pattern, and hence
+   `edge/src/rooms.test.ts` asserting the name generator and the guard still agree.
+
+   The org device registry is deliberately **not** bumped in sympathy. It is a separate room
+   with its own lifetime, it did not carry ws3's damaged storage, and abandoning it would blank
+   the one index by which a teammate can find the box at all.
 
 3. **Mirror layer** (`comet-doc` crate) — Rust equivalent of loro-mirror: typed structs for the
    schema, **incremental** application of `doc.subscribe` diffs into cached state (no full

@@ -1,6 +1,6 @@
 //! WorkspaceHost — owns the per-user `WorkspaceDoc` (ARCHITECTURE §2.2, made
 //! per-user for privacy): local snapshot persistence, edge room sync
-//! (`ws3/{orgId}/{userId}`, offline-tolerant — spaces/sessions are private to
+//! (`ws4/{orgId}/{userId}`, offline-tolerant — spaces/sessions are private to
 //! their owner, never org-visible), the device registry row for THIS device,
 //! and the typed watch channels the WatchChats/WatchDevices/WatchSessions RPC
 //! streams are fed from.
@@ -40,6 +40,14 @@ use crate::{EngineError, now_ms};
 /// row is simply never read again. (The per-user room break — `ws2/{orgId}` →
 /// `ws3/{orgId}/{userId}` — needed no row-id bump: the local store itself moved
 /// to `orgs/{org}/{user}/`, so the old snapshot is unreachable anyway.)
+///
+/// A ROOM generation bump must never bump this row (gh#148, `ws3/` → `ws4/`).
+/// The edge is not authoritative for the workspace doc — this local snapshot
+/// is. Abandoning a room's storage is survivable precisely because every
+/// device still holds the doc here and re-uploads it into the virgin room on
+/// first join ([`RoomActor`]'s resubmit-from-version-vector path). Bump both
+/// at once and there is nothing left to re-seed FROM: an edge-side break that
+/// loses nothing becomes real data loss on every device simultaneously.
 pub const WORKSPACE_DOC_ID: &str = "workspace2";
 /// Legacy (pre-spaces) snapshot row — best-effort deleted on open.
 const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
@@ -113,7 +121,7 @@ pub struct WorkspaceHostConfig {
     /// `std::env::consts::OS`-style platform string.
     pub platform: String,
     pub org_id: String,
-    /// The signed-in user — workspace docs are per-user (`ws3/{orgId}/{userId}`):
+    /// The signed-in user — workspace docs are per-user (`ws4/{orgId}/{userId}`):
     /// spaces/sessions are private to their owner, never org-visible.
     pub user_id: String,
     /// When present, the host joins `/workspace/{orgId}/ws`. `None` = fully offline
@@ -442,10 +450,20 @@ impl WorkspaceHost {
             format!("/workspace/{org_id}/ws"),
             Some(&self.inner.config.device_id),
         );
-        // `ws3/{orgId}/{userId}` = the per-user privacy room (must match the
-        // edge's join id, which it derives from the caller's own auth claim —
-        // a mismatched user can never join).
-        let room_id = format!("ws3/{}/{}", org_id, self.inner.config.user_id);
+        // The room id carried inside our protocol frames. It is a LABEL, not
+        // an address: the URL above is what selects the Durable Object, and
+        // the edge derives the real room name (`ws{n}/{orgId}/{userId}`) from
+        // the caller's own auth claim, so a mismatched user can never join
+        // regardless of what we write here.
+        //
+        // Keeping the generation in step with the edge is therefore hygiene
+        // for logs and health output, NOT a correctness requirement — and that
+        // is deliberate (gh#148). A generation bump has to be a transparent
+        // migration: an engine that has not been updated still lands in the
+        // new room and converges, because nothing on either side routes on
+        // this string. Our engines retry a failed join forever, so a version
+        // skew that DID matter would be a silent outage, not an error.
+        let room_id = format!("ws4/{}/{}", org_id, self.inner.config.user_id);
         let weak = Arc::downgrade(&self.inner);
         spawn_room_join(
             url,

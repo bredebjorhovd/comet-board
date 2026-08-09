@@ -135,15 +135,48 @@ impl FakeEdge {
         state.members.clear();
         state.host_connected = false;
     }
+
+    /// A room-generation break (gh#148): the Worker starts naming a room
+    /// `ws4/…` where it said `ws3/…`, so `idFromName` resolves to a DIFFERENT
+    /// Durable Object — one whose storage has never been written. Modelled
+    /// here as what it actually is from the client's side: the room this
+    /// device syncs into answers with an empty doc, and every socket cycles.
+    ///
+    /// Deliberately NOT the same call as [`Self::redeploy`]. A redeploy keeps
+    /// the storage; this abandons it. The whole question of the ticket is
+    /// whether the second one is survivable, so it has to be expressible.
+    fn abandon_room_storage(&self, room_id: &str) {
+        self.state.lock().expect("lock").docs.remove(room_id);
+        self.redeploy();
+    }
+
+    /// Read a room's SERVER-side doc as a workspace doc — what a device that
+    /// has never seen this workspace before would be backfilled with.
+    fn room_chat_ids(&self, room_id: &str) -> Vec<String> {
+        let Some(doc) = self.state.lock().expect("lock").docs.get(room_id).cloned() else {
+            return Vec::new();
+        };
+        let Ok(snapshot) = doc.export(ExportMode::Snapshot) else {
+            return Vec::new();
+        };
+        let mirror = LoroDoc::new();
+        if mirror.import(&snapshot).is_err() {
+            return Vec::new();
+        }
+        comet_doc::WorkspaceDoc::from_doc(mirror)
+            .read_chats()
+            .map(|chats| chats.into_iter().map(|chat| chat.id).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// The room id the edge derives from a room path, mirroring the real edge's
-/// derivation (`ws3/{org}/{user}`, `orgdev1/{org}`, and the chat id itself).
+/// derivation (`ws4/{org}/{user}`, `orgdev1/{org}`, and the chat id itself).
 fn room_id_for(path: &str) -> Option<String> {
     let path = path.split('?').next().unwrap_or(path);
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match parts.as_slice() {
-        ["workspace", org, "ws"] => Some(format!("ws3/{org}/{USER}")),
+        ["workspace", org, "ws"] => Some(format!("ws4/{org}/{USER}")),
         ["org", org, "devices", "ws"] => Some(format!("orgdev1/{org}")),
         ["session", chat, "ws"] => Some((*chat).to_string()),
         _ => None,
@@ -520,7 +553,7 @@ async fn an_edge_redeploy_is_survived_without_a_restart() {
     let _relay = core.start_host_relay(&edge.url);
     core.doc_host.open("chat-live").expect("open chat");
 
-    let workspace_room = format!("ws3/{ORG}/{USER}");
+    let workspace_room = format!("ws4/{ORG}/{USER}");
     let registry_room = format!("orgdev1/{ORG}");
 
     wait_until("the first joins", || {
@@ -743,6 +776,71 @@ async fn a_chat_opened_while_the_edge_is_down_still_joins_later() {
     .await;
     wait_until("the handle to report itself connected", || {
         handle.connected()
+    })
+    .await;
+}
+
+/// gh#148 — retiring a workspace-room generation (`ws3/` → `ws4/`) is a
+/// migration nobody performs.
+///
+/// A generation bump renames the room, and a room name IS the Durable Object's
+/// identity: the new name resolves to a different object with EMPTY storage.
+/// Upstream did this because ws3's update log had been left causally broken by
+/// the 2026-08-04 abort-thrash and could not be repaired in place — the point
+/// of the bump is precisely to walk away from that storage.
+///
+/// Walking away is only safe because the edge is not authoritative for this
+/// doc. Every signed-in device keeps a complete local replica (`workspace2` in
+/// its own `DocsStore`), so the virgin room is re-seeded by whoever joins it
+/// first and merged into by the rest. Nothing is copied server-side; there is
+/// no migration script, no cutover window, and no operator step.
+///
+/// So assert the property the whole plan rests on: take a device with a
+/// populated workspace, delete the room's server-side storage out from under
+/// it, and require the content back — with nobody restarting anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoning_a_workspace_rooms_storage_is_reseeded_from_the_device() {
+    let edge = fake_edge().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let core = assemble(dir.path(), &edge.url);
+    let workspace_room = format!("ws4/{ORG}/{USER}");
+
+    core.workspace
+        .create_space("space-a", "device-box", "/tmp/space-a", None, false)
+        .expect("create space row");
+    core.workspace
+        .create_chat("chat-a", "space-a", None, None)
+        .expect("create chat row");
+
+    wait_until("the workspace to reach the edge at all", || {
+        edge.room_chat_ids(&workspace_room) == ["chat-a"]
+    })
+    .await;
+
+    // The bump. From here the device is talking to storage that has never
+    // heard of it — the ws4 object on its very first request.
+    edge.abandon_room_storage(&workspace_room);
+    assert!(
+        edge.room_chat_ids(&workspace_room).is_empty(),
+        "the point of a generation bump is that the new room starts empty"
+    );
+
+    // Nobody is told to do anything. The rejoin's resubmit-from-version-vector
+    // path sees a server that holds nothing, and uploads the whole local doc.
+    wait_until("the abandoned room to be re-seeded from the local replica", || {
+        edge.room_chat_ids(&workspace_room) == ["chat-a"]
+    })
+    .await;
+
+    // And the room is live afterwards, not merely re-populated: a chat created
+    // after the break syncs the ordinary way.
+    core.workspace
+        .create_chat("chat-b", "space-a", None, None)
+        .expect("create chat row after the break");
+    wait_until("the re-seeded room to keep taking writes", || {
+        let mut ids = edge.room_chat_ids(&workspace_room);
+        ids.sort();
+        ids == ["chat-a", "chat-b"]
     })
     .await;
 }

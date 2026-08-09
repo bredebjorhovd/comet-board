@@ -33,7 +33,7 @@ pub struct EdgeHealth {
     /// at all. Down means invisible, whatever else is up.
     #[serde(default)]
     pub host_relay: Option<bool>,
-    /// `ws3/{orgId}/{userId}` — this user's private workspace room (chats,
+    /// `ws4/{orgId}/{userId}` — this user's private workspace room (chats,
     /// spaces, sessions, presence).
     #[serde(default)]
     pub workspace_room: Option<bool>,
