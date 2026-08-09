@@ -333,6 +333,14 @@ struct AgentAccountParams {
 #[serde(rename_all = "camelCase")]
 struct StartAgentLoginParams {
     harness: HarnessId,
+    /// Normally routing metadata, read here as meaning (gh#193): the accounts
+    /// page sends it only when the switcher points at a device that is not the
+    /// one the operator is looking at, so by the time it arrives *here* — the
+    /// engine it names — it says the browser that will finish this login is on
+    /// some other machine. Codex needs to know: its default flow waits on a
+    /// callback to its own loopback, which that browser can never reach.
+    #[serde(default)]
+    target_device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1220,7 +1228,9 @@ fn forwardable(method: &str) -> bool {
             | methods::RESIZE_TERMINAL
             | methods::CLOSE_TERMINAL
             // Agent accounts are per-device CLI logins (the device switcher
-            // retargets which device's logins are shown).
+            // retargets which device's logins are shown). `StartAgentLogin`
+            // additionally *reads* the passthrough: a forwarded login is one
+            // whose browser is on another machine (gh#193).
             | methods::LIST_AGENT_ACCOUNTS
             | methods::ACTIVATE_AGENT_ACCOUNT
             | methods::FORGET_AGENT_ACCOUNT
@@ -1896,9 +1906,14 @@ impl RpcService for EngineRpc {
             }
             methods::START_AGENT_LOGIN => {
                 let p: StartAgentLoginParams = parse_params(params)?;
+                // Two independent tells that nobody is sitting at this device:
+                // the caller named it by id (the switcher only does that for a
+                // device that is not its own), or the call came in over the
+                // relay instead of this device's IPC. Either is enough.
+                let remote = p.target_device_id.is_some() || caller.is_verified();
                 let start = self
                     .agent_accounts
-                    .start_login(p.harness)
+                    .start_login(p.harness, remote)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&start)
@@ -1981,6 +1996,23 @@ mod tests {
         .expect("ui param shape");
         assert_eq!(p.account_id, "acct-1");
         assert_eq!(p.harness, HarnessId::ClaudeCode);
+    }
+
+    /// gh#193: `StartAgentLogin` reads the routing passthrough as meaning. The
+    /// accounts page omits it for its own device and sends it for every other,
+    /// which is exactly the question Codex has to answer before it picks a
+    /// flow — so the binding is the whole feature, not a detail of it.
+    #[test]
+    fn start_agent_login_params_carry_the_remote_signal() {
+        let local: StartAgentLoginParams =
+            parse_params(serde_json::json!({ "harness": "codex" })).expect("local shape");
+        assert_eq!(local.harness, HarnessId::Codex);
+        assert_eq!(local.target_device_id, None);
+
+        let remote: StartAgentLoginParams =
+            parse_params(serde_json::json!({ "harness": "codex", "targetDeviceId": "device-box" }))
+                .expect("relayed shape");
+        assert_eq!(remote.target_device_id.as_deref(), Some("device-box"));
     }
 
     /// gh#74: the panel and the TUI hand-write these keys. `account` decides

@@ -23,6 +23,18 @@
 //!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
 //!    until its loopback callback lands.
 //!
+//! **Codex on a device you are not sitting at** (gh#193): the accounts RPCs are
+//! relay-forwardable, so Settings → Accounts with the switcher pointed at a box
+//! runs that login *on the box* — and plain `codex login` binds a fixed loopback
+//! port there (measured: `127.0.0.1:1455`) and waits for OpenAI to redirect to
+//! it. The operator opens the authorize URL on their laptop, the redirect hits
+//! their laptop's localhost, and the box polls a login that can never land.
+//! So a login [`AgentAccounts::start_login`] is told is `remote` uses
+//! `codex login --device-auth` instead: the CLI prints a one-time code, polls
+//! OpenAI directly, and the operator enters the code at
+//! `auth.openai.com/codex/device` from whatever device has a browser. Local
+//! logins keep the loopback flow — it is nicer when the browser is right there.
+//!
 //! Per-run accounts (gh#59): a swap is engine-wide and mutates the dir a live
 //! run is reading, so a run that wants a *specific* account never swaps.
 //! [`AgentAccounts::materialize`] writes the slot into a config dir of its own
@@ -70,6 +82,18 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Where `codex login --device-auth` sends the operator. Only a fallback: the
+/// URL is read off the child's own output, and this stands in for the one run
+/// whose banner we somehow failed to scrape — the code is live for 15 minutes
+/// either way, and a dead link would waste all of them.
+const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
+/// Device code authorization is an account-side grant that can be switched off,
+/// and when it is, ChatGPT refuses every code — which reads exactly like a
+/// mistyped one. Nothing in the CLI's output says otherwise, so every
+/// device-auth failure carries the possibility (gh#193).
+const DEVICE_AUTH_HINT: &str = " If the code was refused: device code \
+    authorization may be turned off for that ChatGPT account — enable it under \
+    Settings → Security (on a Business or Enterprise workspace an admin has to).";
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -78,6 +102,12 @@ const USAGE_TTL: Duration = Duration::from_secs(60);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long `start_login` waits for `codex` to print its banner. The loopback
+/// flow's URL is built locally and appears at once; the device-code banner
+/// costs a round trip to OpenAI first, and that one is worth waiting out —
+/// returning without the code would leave the operator nothing to type.
+const CODEX_BANNER_WAIT: Duration = Duration::from_secs(5);
+const CODEX_DEVICE_CODE_WAIT: Duration = Duration::from_secs(20);
 
 /// Filesystem knobs — env-resolved in production ([`AgentAccountsConfig::detect`]),
 /// explicit in tests.
@@ -212,6 +242,10 @@ enum LoginFlow {
         output: Arc<Mutex<String>>,
         /// `Some(code)` once the child exited (`None` code = killed by signal).
         exit: Arc<Mutex<Option<Option<i32>>>>,
+        /// `--device-auth` rather than the loopback flow (gh#193). Decides two
+        /// things: this flow holds no loopback port, so it never has to be
+        /// superseded; and its failures carry [`DEVICE_AUTH_HINT`].
+        device_auth: bool,
     },
 }
 
@@ -245,6 +279,11 @@ struct Inner {
     /// leased slots are skipped by the usage refresher exactly as the live
     /// login is.
     leases: Mutex<HashMap<String, usize>>,
+    /// Does the `codex` on this device understand `login --device-auth`
+    /// (gh#193)? Probed once — the answer changes only when the CLI is
+    /// upgraded, and the probe is a process spawn on a path someone is
+    /// waiting on. `None` = not asked yet.
+    codex_device_auth: Mutex<Option<bool>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -300,6 +339,7 @@ impl AgentAccounts {
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
                 leases: Mutex::new(HashMap::new()),
+                codex_device_auth: Mutex::new(None),
             }),
         }
     }
@@ -690,11 +730,21 @@ impl AgentAccounts {
 
     // ── add-account OAuth flows ─────────────────────────────────────────────
 
-    pub async fn start_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
+    /// `remote` = this login is being driven for a device the operator is not
+    /// sitting at (gh#193) — the call carried a `targetDeviceId`, or it arrived
+    /// over the relay rather than this device's own IPC. Only Codex cares: it
+    /// is the difference between a loopback callback that can land and one that
+    /// cannot. Claude's flow is a code the operator carries by hand in both
+    /// directions, so it is already device-agnostic.
+    pub async fn start_login(
+        &self,
+        harness: HarnessId,
+        remote: bool,
+    ) -> Result<AgentLoginStart, EngineError> {
         self.sweep_flows();
         match harness {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
-            HarnessId::Codex => self.start_codex_login().await,
+            HarnessId::Codex => self.start_codex_login(remote).await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -730,20 +780,53 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::PasteCode,
+            user_code: None,
         }
     }
 
-    async fn start_codex_login(&self) -> Result<AgentLoginStart, EngineError> {
-        // At most ONE codex login flow at a time: `codex login` binds a fixed
-        // loopback OAuth port, so a lingering earlier flow makes every retry exit
-        // on EADDRINUSE. Starting a new flow supersedes — and reaps — any pending.
-        let stale: Vec<String> = lock(&self.inner.flows)
-            .iter()
-            .filter(|(_, f)| matches!(f, LoginFlow::Codex { .. }))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in stale {
-            self.cancel_login(&id);
+    async fn start_codex_login(&self, remote: bool) -> Result<AgentLoginStart, EngineError> {
+        // A login driven for another device has no browser on that device to
+        // redirect to; `codex login --device-auth` is the flow that needs none
+        // (gh#193). Version-gated rather than assumed: older `codex` builds
+        // reject the flag, and silently falling back to loopback would put us
+        // right back to polling a login that cannot land.
+        let device_auth = remote
+            && match self.codex_supports_device_auth().await {
+                Some(true) => true,
+                Some(false) => {
+                    return Err(EngineError::Other(
+                        "That device's `codex` is too old to sign in without a browser on \
+                         it — `codex login --device-auth` is not in this build. Update codex \
+                         there, or add the account from the device itself."
+                            .into(),
+                    ));
+                }
+                // The probe could not run at all (no `codex` on PATH, most
+                // likely). Carry on and let the spawn below say so properly.
+                None => true,
+            };
+
+        // At most ONE *loopback* codex login flow at a time: plain `codex login`
+        // binds a fixed loopback OAuth port, so a lingering earlier flow makes
+        // every retry exit on EADDRINUSE. Starting a new one supersedes — and
+        // reaps — any pending. Device-auth flows bind nothing and are left alone.
+        if !device_auth {
+            let stale: Vec<String> = lock(&self.inner.flows)
+                .iter()
+                .filter(|(_, f)| {
+                    matches!(
+                        f,
+                        LoginFlow::Codex {
+                            device_auth: false,
+                            ..
+                        }
+                    )
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                self.cancel_login(&id);
+            }
         }
 
         let login_id = new_id();
@@ -755,8 +838,12 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut child = match tokio::process::Command::new("codex")
-            .arg("login")
+        let mut command = tokio::process::Command::new("codex");
+        command.arg("login");
+        if device_auth {
+            command.arg("--device-auth");
+        }
+        let mut child = match command
             .env("CODEX_HOME", &home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -778,7 +865,8 @@ impl AgentAccounts {
 
         // codex prints the authorize URL (to stderr as of 0.142 — scan both
         // streams) and usually opens the browser itself; grab it so the app can
-        // open it too.
+        // open it too. Under `--device-auth` the same banner carries the
+        // one-time code, which is the whole payload of that flow.
         let output = Arc::new(Mutex::new(String::new()));
         for pipe in [
             child
@@ -846,24 +934,86 @@ impl AgentAccounts {
                 started_at: Instant::now(),
                 output: output.clone(),
                 exit: exit.clone(),
+                device_auth,
             },
         );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let url = loop {
-            if let Some(url) = scan_openai_url(&lock(&output)) {
-                break url;
+        // Wait for the banner. The loopback flow only wants the URL and can
+        // live without it (the CLI opened a browser itself); device auth wants
+        // the code, and there is nothing to show without it.
+        let deadline = Instant::now()
+            + if device_auth {
+                CODEX_DEVICE_CODE_WAIT
+            } else {
+                CODEX_BANNER_WAIT
+            };
+        let (url, user_code) = loop {
+            let banner = strip_ansi(&lock(&output));
+            let url = scan_openai_url(&banner);
+            let code = device_auth.then(|| scan_device_code(&banner)).flatten();
+            if (device_auth && code.is_some()) || (!device_auth && url.is_some()) {
+                break (url, code);
             }
             if lock(&exit).is_some() || Instant::now() > deadline {
-                break String::new();
+                break (url, code);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
+
+        if device_auth && user_code.is_none() {
+            // No code means the operator has nothing to enter — polling from
+            // here would be the exact silence gh#193 is about. Say so instead,
+            // in codex's own words where it left any.
+            let reason = last_output_line(&lock(&output))
+                .unwrap_or_else(|| "codex printed no device code".to_string());
+            self.cancel_login(&login_id);
+            return Err(EngineError::Other(format!(
+                "Could not start device sign-in on that device: {reason}.{DEVICE_AUTH_HINT}"
+            )));
+        }
+
         Ok(AgentLoginStart {
             login_id,
-            url,
-            mode: AgentLoginMode::Browser,
+            url: url.unwrap_or_else(|| {
+                if device_auth {
+                    CODEX_DEVICE_AUTH_URL.to_string()
+                } else {
+                    String::new()
+                }
+            }),
+            mode: if device_auth {
+                AgentLoginMode::DeviceCode
+            } else {
+                AgentLoginMode::Browser
+            },
+            user_code,
         })
+    }
+
+    /// Does the `codex` on this device understand `login --device-auth`?
+    /// `None` = the probe itself could not run, which is not the same answer as
+    /// "no" — a missing CLI is the spawn path's error to report, with its own
+    /// wording. Cached across calls (see [`Inner::codex_device_auth`]).
+    async fn codex_supports_device_auth(&self) -> Option<bool> {
+        if let Some(known) = *lock(&self.inner.codex_device_auth) {
+            return Some(known);
+        }
+        let output = tokio::process::Command::new("codex")
+            .args(["login", "--help"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        // `--help` is not guaranteed to exit 0 on every build; the flag list is
+        // what is being read, so take whichever stream carried it.
+        let help = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let supported = help.contains("--device-auth");
+        *lock(&self.inner.codex_device_auth) = Some(supported);
+        Some(supported)
     }
 
     /// Exchange the pasted `code#state` for tokens and save the account as a slot
@@ -1029,7 +1179,7 @@ impl AgentAccounts {
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
         self.sweep_flows();
-        let (home, exit, output) = match lock(&self.inner.flows).get(login_id) {
+        let (home, exit, output, device_auth) = match lock(&self.inner.flows).get(login_id) {
             None => {
                 return Err(EngineError::Other(
                     "This sign-in attempt expired — start again.".into(),
@@ -1042,8 +1192,12 @@ impl AgentAccounts {
                 });
             }
             Some(LoginFlow::Codex {
-                home, exit, output, ..
-            }) => (home.clone(), exit.clone(), output.clone()),
+                home,
+                exit,
+                output,
+                device_auth,
+                ..
+            }) => (home.clone(), exit.clone(), output.clone(), *device_auth),
         };
         if let Some(detected) = read_json(&home.join("auth.json")).and_then(parse_codex_auth) {
             self.snapshot_detected(HarnessId::Codex, &detected)?;
@@ -1056,16 +1210,16 @@ impl AgentAccounts {
         let exited = *lock(&exit);
         if let Some(code) = exited {
             self.cancel_login(login_id);
-            let message = if code == Some(0) {
+            let mut message = if code == Some(0) {
                 "codex login finished without credentials.".to_string()
             } else {
-                lock(&output)
-                    .trim()
-                    .lines()
-                    .last()
-                    .unwrap_or("sign-in failed")
-                    .to_string()
+                last_output_line(&lock(&output)).unwrap_or_else(|| "sign-in failed".to_string())
             };
+            // A device-auth run that ends without credentials is most often the
+            // grant, not the typing — and codex's own last line will not say so.
+            if device_auth {
+                message.push_str(DEVICE_AUTH_HINT);
+            }
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Error,
                 message: Some(message),
@@ -1077,8 +1231,9 @@ impl AgentAccounts {
         })
     }
 
-    /// Drop a flow: kill a pending `codex login` child (it holds the fixed
-    /// loopback OAuth port) and reclaim its throwaway home dir. Idempotent.
+    /// Drop a flow: kill a pending `codex login` child (a loopback one holds the
+    /// fixed OAuth port; a device-auth one is sitting on a poll loop against
+    /// OpenAI) and reclaim its throwaway home dir. Idempotent.
     pub fn cancel_login(&self, login_id: &str) {
         let flow = lock(&self.inner.flows).remove(login_id);
         if let Some(LoginFlow::Codex { child, home, .. }) = flow {
@@ -1883,6 +2038,91 @@ fn scan_openai_url(output: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// The one-time code out of a `codex login --device-auth` banner. As of 0.146
+/// that banner reads:
+///
+/// ```text
+/// 2. Enter this one-time code (expires in 15 minutes)
+///    IELQ-BRG2G
+/// ```
+///
+/// Anchored on the sentence rather than on the code's shape, so a stray
+/// uppercase token elsewhere in the output can never be mistaken for it; the
+/// shape check then keeps a reworded banner from handing back prose. Expects
+/// the ANSI already stripped — codex paints the code cyan.
+fn scan_device_code(output: &str) -> Option<String> {
+    let rest = output.split_once("one-time code")?.1;
+    rest.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| is_device_code(line))
+        .map(str::to_string)
+}
+
+/// `IELQ-BRG2G`: uppercase alphanumerics in `-`-separated groups. Deliberately
+/// loose on group count and length (OpenAI's is 4-5 today) and strict on the
+/// alphabet, which is what separates a code from a sentence.
+fn is_device_code(line: &str) -> bool {
+    let groups: Vec<&str> = line.split('-').collect();
+    groups.len() >= 2
+        && line.len() <= 24
+        && groups.iter().all(|g| {
+            g.len() >= 3
+                && g.chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+        })
+}
+
+/// Terminal colour and cursor control out of captured child output, so the
+/// scanners match on text and the app never renders an escape sequence. codex
+/// paints both the URL and the code, and `\e[0m` runs right up against them —
+/// a URL scan that stops at whitespace would otherwise carry the reset along.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI (`\e[…` terminated by @-~) and OSC (`\e]…` terminated by BEL or
+        // ST) cover everything the CLIs emit; any other escape is two chars.
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The last thing a child said, as a human-readable line — what a failed login
+/// gets to explain itself with. Stripped and trimmed; `None` when it said
+/// nothing at all.
+fn last_output_line(output: &str) -> Option<String> {
+    strip_ansi(output)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Minimal percent-encoding for OAuth query params (matches `encodeURIComponent`
 /// for the constant inputs used here).
 fn urlencode(input: &str) -> String {
@@ -1959,6 +2199,67 @@ mod tests {
             Some("https://auth.openai.com/authorize?x=1")
         );
         assert_eq!(scan_openai_url("nothing here"), None);
+    }
+
+    /// Verbatim `codex login --device-auth` (0.146.0), colour and all — the
+    /// banner these scanners exist to read. Captured, not composed.
+    const DEVICE_AUTH_BANNER: &str = "\nWelcome to Codex [v\u{1b}[90m0.146.0\u{1b}[0m]\n\
+        \u{1b}[90mOpenAI's command-line coding agent\u{1b}[0m\n\n\
+        Follow these steps to sign in with ChatGPT using device code authorization:\n\n\
+        1. Open this link in your browser and sign in to your account\n   \
+        \u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\n\
+        2. Enter this one-time code \u{1b}[90m(expires in 15 minutes)\u{1b}[0m\n   \
+        \u{1b}[94mIELQ-BRG2G\u{1b}[0m\n\n\
+        \u{1b}[90mContinue only if you started this login in Codex. If a website or another \
+        person gave you this code, cancel.\u{1b}[0m\n\n";
+
+    #[test]
+    fn device_auth_banner_yields_code_and_url() {
+        let banner = strip_ansi(DEVICE_AUTH_BANNER);
+        assert_eq!(scan_device_code(&banner).as_deref(), Some("IELQ-BRG2G"));
+        // The reset sequence sits flush against the URL — without stripping,
+        // "stop at whitespace" swallows it and the link is dead.
+        assert_eq!(
+            scan_openai_url(&banner).as_deref(),
+            Some("https://auth.openai.com/codex/device")
+        );
+        assert!(
+            scan_openai_url(DEVICE_AUTH_BANNER)
+                .unwrap()
+                .contains('\u{1b}')
+        );
+    }
+
+    #[test]
+    fn device_code_scan_is_anchored_and_shaped() {
+        // Uppercase tokens before the anchor are not the code.
+        assert_eq!(
+            scan_device_code("Welcome to CODEX-CLI\none-time code\n  WXYZ-12345\n").as_deref(),
+            Some("WXYZ-12345")
+        );
+        // A reworded banner that stops printing a code hands back nothing
+        // rather than a sentence.
+        assert_eq!(
+            scan_device_code("Enter this one-time code in your browser to continue\n"),
+            None
+        );
+        // Loopback output has no anchor at all.
+        assert_eq!(scan_device_code("Starting local login server…"), None);
+    }
+
+    #[test]
+    fn ansi_stripping_and_last_line() {
+        assert_eq!(strip_ansi("\u{1b}[94mplain\u{1b}[0m"), "plain");
+        // OSC 8 hyperlinks (BEL- and ST-terminated) leave only their label.
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;https://x\u{7}label\u{1b}]8;;\u{1b}\\"),
+            "label"
+        );
+        assert_eq!(
+            last_output_line("\u{1b}[31mrequest failed\u{1b}[0m\n\n").as_deref(),
+            Some("request failed")
+        );
+        assert_eq!(last_output_line("   \n\n"), None);
     }
 
     #[test]

@@ -373,7 +373,7 @@ async fn claude_login_flow_is_pkce_paste_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (accounts, _) = test_accounts(tmp.path());
     let start = accounts
-        .start_login(HarnessId::ClaudeCode)
+        .start_login(HarnessId::ClaudeCode, false)
         .await
         .expect("start");
     assert!(
@@ -389,6 +389,20 @@ async fn claude_login_flow_is_pkce_paste_code() {
     );
     let mode = serde_json::to_value(start.mode).expect("mode");
     assert_eq!(mode, serde_json::json!("paste-code"));
+    assert_eq!(start.user_code, None);
+
+    // gh#193: remoteness only decides which flow *Codex* can finish. Claude's
+    // code is copied out of a browser and typed back in by a person, so it
+    // works the same whichever device the CLI it is destined for sits on.
+    let remote = accounts
+        .start_login(HarnessId::ClaudeCode, true)
+        .await
+        .expect("start (remote)");
+    assert_eq!(
+        serde_json::to_value(remote.mode).expect("mode"),
+        serde_json::json!("paste-code")
+    );
+    accounts.cancel_login(&remote.login_id);
 
     // Claude flows poll as pending (paste-code completes them); cancel drops the
     // flow so the next poll reports it expired.
@@ -773,6 +787,35 @@ async fn rpc_dispatch_for_m5c_methods() {
             .contains("claude.ai/oauth/authorize")
     );
     let login_id = start["loginId"].as_str().expect("loginId").to_string();
+    // gh#193: the same call addressed at this device by id lands here rather
+    // than being forwarded, and Claude's flow is unchanged by the remoteness —
+    // its code is carried by hand in both directions already. (Codex is the one
+    // that switches to `--device-auth`; exercising that would spawn the CLI and
+    // reach OpenAI, so it stays out of the suite.)
+    let device_id = client
+        .call(methods::LOCAL_DEVICE, serde_json::json!({}))
+        .await
+        .expect("LocalDevice")["deviceId"]
+        .as_str()
+        .expect("deviceId")
+        .to_string();
+    let addressed = client
+        .call(
+            methods::START_AGENT_LOGIN,
+            serde_json::json!({ "harness": "claude-code", "targetDeviceId": device_id }),
+        )
+        .await
+        .expect("StartAgentLogin addressed at this device");
+    assert_eq!(addressed["mode"], "paste-code");
+    assert!(addressed.get("userCode").is_none());
+    client
+        .call(
+            methods::CANCEL_AGENT_LOGIN,
+            serde_json::json!({ "loginId": addressed["loginId"] }),
+        )
+        .await
+        .expect("CancelAgentLogin");
+
     let poll = client
         .call(
             methods::POLL_AGENT_LOGIN,
