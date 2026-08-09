@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 use comet_board::evidence::RanCommand;
 use comet_proto::{AgentEvent, TokenUsage, ToolCall};
 
+/// How much of a chat's assistant text [`RunJournal::final_text`] keeps.
+///
+/// Generous against what it is for — a claims block of a hundred lines is a few
+/// kilobytes — and small against what a long run journals, which is the point:
+/// this is read once per settle and never rendered.
+pub const MESSAGE_TAIL: usize = 64 * 1024;
+
 /// What [`RunJournal::tokens`] found in a chat's journal: everything it spent,
 /// and the model the harness said was spending it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -275,6 +282,69 @@ impl RunJournal {
             }
         }
         Ok(Some(out))
+    }
+
+    /// The tail of what the agent said in this chat, for the claims harvest
+    /// (§gh#235).
+    ///
+    /// The journal already holds every `TextDelta` and every run's `Done`
+    /// result; this concatenates them and keeps the last [`MESSAGE_TAIL`]
+    /// bytes. A tail, not a transcript: the block a finished attempt writes is
+    /// at the end by construction, and a run that talked for a megabyte is not
+    /// a run whose opening paragraph is where its claims are.
+    ///
+    /// The bound is applied on a **character** boundary — the buffer is drained
+    /// by whole deltas rather than sliced at a byte offset, so a multi-byte
+    /// character never gets cut in half and the caller is never handed a
+    /// mangled path.
+    ///
+    /// `None` is "no journal for this chat"; `Some("")` is a run that never
+    /// said anything, which parses to no claims either way.
+    pub fn final_text(&self, chat_id: &str) -> Result<Option<String>, JournalError> {
+        const TEXT_TAG: &str = r#""type":"textDelta""#;
+        const DONE_TAG: &str = r#""type":"done""#;
+        let path = self.path_for(chat_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // Kept as the pieces that arrived rather than one string, so trimming
+        // to the tail is dropping whole pieces off the front.
+        let mut parts: std::collections::VecDeque<String> = Default::default();
+        let mut held = 0usize;
+        let mut push = |text: String, parts: &mut std::collections::VecDeque<String>| {
+            held += text.len();
+            parts.push_back(text);
+            while held > MESSAGE_TAIL && parts.len() > 1 {
+                if let Some(dropped) = parts.pop_front() {
+                    held -= dropped.len();
+                }
+            }
+        };
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.contains(TEXT_TAG) && !line.contains(DONE_TAG) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<JournalLine>(&line) else {
+                continue;
+            };
+            match parsed.event {
+                AgentEvent::TextDelta { text } => push(text, &mut parts),
+                // A harness that reports its final message once, whole, rather
+                // than as deltas. Both are appended: one of them is empty on
+                // any given harness, and a harness that does both would only be
+                // saying the same thing twice — which a fence search does not
+                // care about.
+                AgentEvent::Done {
+                    result: Some(result),
+                    ..
+                } if !result.is_empty() => push(result, &mut parts),
+                _ => {}
+            }
+        }
+        Ok(Some(parts.into_iter().collect()))
     }
 
     /// The last event in a chat's journal, if any (ignores a torn tail line).
@@ -542,5 +612,75 @@ mod tests {
         let all = journal.replay("chat-1", 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].0, 2);
+    }
+
+    // ---- the closing message, for the claims harvest (§gh#235) ------------
+
+    /// Deltas and `Done` results alike: one harness streams the final message,
+    /// another reports it whole, and the fence search does not care which.
+    #[test]
+    fn the_closing_message_is_the_chats_own_words_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &started("mock")).unwrap();
+        journal.append("chat-1", &text("```claims\n")).unwrap();
+        journal
+            .append("chat-1", &text("Did the storage :: src/db.rs\n"))
+            .unwrap();
+        journal.append("chat-1", &text("```")).unwrap();
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: Some("\nand that is that.".into()),
+                    error: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        let said = journal.final_text("chat-1").unwrap().expect("a journal");
+        assert!(said.contains("```claims"), "{said}");
+        assert!(said.contains("Did the storage :: src/db.rs"), "{said}");
+        assert!(said.ends_with("and that is that."), "{said}");
+    }
+
+    /// A chat that never ran is `None`; one that ran and said nothing is an
+    /// empty string. Both harvest to no claims, and neither is an error.
+    #[test]
+    fn a_chat_with_no_journal_and_a_chat_that_said_nothing_are_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.final_text("never-ran").unwrap(), None);
+        journal.append("chat-1", &started("mock")).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(journal.final_text("chat-1").unwrap().as_deref(), Some(""));
+    }
+
+    /// The tail, and the tail is where the block is: an agent writes its
+    /// claims when the work is done.
+    #[test]
+    fn a_long_run_keeps_the_end_of_what_it_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let filler = "x".repeat(4096);
+        journal
+            .append("chat-1", &text("the opening paragraph"))
+            .unwrap();
+        for _ in 0..40 {
+            journal.append("chat-1", &text(&filler)).unwrap();
+        }
+        journal
+            .append("chat-1", &text("```claims\nDid it :: src/a.rs\n```"))
+            .unwrap();
+
+        let said = journal.final_text("chat-1").unwrap().unwrap();
+        assert!(said.len() <= MESSAGE_TAIL + filler.len());
+        assert!(said.ends_with("```"), "the end survives");
+        assert!(
+            !said.contains("the opening paragraph"),
+            "and the front is what falls off"
+        );
     }
 }

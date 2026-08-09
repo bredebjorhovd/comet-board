@@ -93,6 +93,10 @@ icon_assets![
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
     (LOGOUT_2, "logout-2"),
+    // The logout-2 door with its arrow reversed (like the sidebar flip): the
+    // account footer's signed-out state needs the way IN, and the embedded set
+    // has no login glyph. One shape, read in two directions.
+    (LOGIN_2, "login-2"),
     (MAGNIFER, "magnifer"),
     (COMMAND, "command"),
     (DOCUMENT, "document"),

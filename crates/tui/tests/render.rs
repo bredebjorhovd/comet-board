@@ -28,6 +28,7 @@ fn space(id: &str, path: &str) -> Space {
         git_detected: true,
         git_checked_at: None,
         checkout_id: None,
+        branch: None,
         created_at: Utc::now(),
     }
 }

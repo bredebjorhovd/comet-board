@@ -81,6 +81,9 @@ const SIDEBAR_MIN: u16 = 22;
 
 /// Columns the sidebar insets its rows from its own fill, per side.
 const SIDEBAR_PAD: u16 = 2;
+/// Columns a space row's branch may claim (gh#229) — the sidebar is 32 wide at
+/// most, so a long worktree branch has to leave the repo name something.
+const BRANCH_MAX_COLS: usize = 12;
 /// The composer grows with its content up to this many text rows.
 const COMPOSER_MAX_ROWS: u16 = 8;
 /// The main pane's own margin — one column of terminal background down each
@@ -372,6 +375,7 @@ fn draw_sidebar_row(
             label,
             attention,
             running,
+            branch,
             ..
         } => {
             let base = if selected {
@@ -395,6 +399,15 @@ fn draw_sidebar_row(
             let count = spaces::running_label(*running)
                 .map(|label| format!(" {label}"))
                 .unwrap_or_default();
+            // Where the folder is (gh#229), on the row that keeps saying it
+            // once the space is collapsed. It takes its columns after the
+            // count and before the name for the same reason the count does: a
+            // truncated branch is a lie about the checkout, a truncated repo
+            // name is still the repo you were looking at.
+            let branch = branch
+                .as_deref()
+                .map(|branch| format!(" · {}", wrap::truncate(branch, BRANCH_MAX_COLS)))
+                .unwrap_or_default();
             let mut spans = vec![
                 Span::styled(dot.to_string(), dot_style),
                 Span::styled(
@@ -402,7 +415,9 @@ fn draw_sidebar_row(
                         " {}",
                         wrap::truncate(
                             label,
-                            width.saturating_sub(2 + wrap::width_of(&count))
+                            width.saturating_sub(
+                                2 + wrap::width_of(&count) + wrap::width_of(&branch)
+                            )
                         )
                     ),
                     base.patch(if selected {
@@ -412,6 +427,9 @@ fn draw_sidebar_row(
                     }),
                 ),
             ];
+            if !branch.is_empty() {
+                spans.push(Span::styled(branch, base.patch(theme.hint())));
+            }
             if !count.is_empty() {
                 spans.push(Span::styled(count, base.patch(theme.hint())));
             }

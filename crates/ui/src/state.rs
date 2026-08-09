@@ -1371,6 +1371,7 @@ mod tests {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
     }

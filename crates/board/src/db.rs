@@ -22,7 +22,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      dispatched_by_device, dispatched_by_user, dispatched_by_verified, billed_to, \
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
-     cache_sweepable_at, cache_swept_at, claims, claims_at";
+     cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -89,6 +89,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
         claims_at: r.get(42)?,
+        claims_error: r.get(43)?,
     })
 }
 
@@ -274,6 +275,11 @@ impl Db {
               -- witness for the first.
               claims TEXT,
               claims_at TEXT,
+              -- Why the block a finished attempt wrote could not be read
+              -- (§gh#235). Its own column beside the two above because it is
+              -- the third answer they cannot express between them: never
+              -- asked, answered, and answered in a way the board threw away.
+              claims_error TEXT,
               -- The branch diff and the run's own commands, snapshotted off
               -- the live attempt (§gh#183). Kept out of the columns every
               -- board read selects: the board loads every attempt of every
@@ -451,6 +457,11 @@ impl Db {
                 ("claims_at", "TEXT"),
                 ("changed_files", "TEXT"),
                 ("run_evidence", "TEXT"),
+                // The refusal an attempt's own claims block earned (§gh#235).
+                // NULL on every row that came before, which is what they are:
+                // nothing read a block off them, so none of them wrote one
+                // badly.
+                ("claims_error", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -1020,14 +1031,32 @@ impl Db {
     /// itself, and appending would leave a review reading a superseded claim
     /// beside the one that replaced it. `claims_at` moves with them, so the
     /// stamp always says when the *current* set was written.
+    ///
+    /// Clears `claims_error` for the same reason (§gh#235): a set that parsed
+    /// supersedes the block that did not, and a review showing both would be
+    /// showing a draft beside its correction.
     pub fn set_attempt_claims(
         &self,
         attempt_id: i64,
         claims: &[crate::claims::Claim],
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE attempts SET claims = ?2, claims_at = ?3 WHERE id = ?1",
+            "UPDATE attempts SET claims = ?2, claims_at = ?3, claims_error = NULL WHERE id = ?1",
             params![attempt_id, serde_json::to_string(claims)?, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Record that this attempt wrote a claims block the board could not read
+    /// (§gh#235).
+    ///
+    /// Written instead of the claims, never beside them: a row where
+    /// `claims_at` is NULL and this is set is an attempt that answered and was
+    /// not understood, which is the one claim state that has to be loud.
+    pub fn set_attempt_claims_error(&self, attempt_id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET claims_error = ?2 WHERE id = ?1",
+            params![attempt_id, error],
         )?;
         Ok(())
     }

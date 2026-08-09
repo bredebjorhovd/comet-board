@@ -82,6 +82,11 @@ const SPACE_ROW_SLOT: f32 = 31.0;
 /// the whole row: past this it elides too, and the chevron stays put.
 const SPACE_QUALIFIER_MAX: f32 = 132.0;
 
+/// How much of a space row the branch may claim (gh#229). Narrower than the
+/// qualifier: a branch name is a location, not an identity, so `board-gh-229-…`
+/// eliding is a shortened fact rather than an ambiguous row.
+const SPACE_BRANCH_MAX: f32 = 96.0;
+
 /// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
 /// animation restarts (the session-tab idiom, vertical).
 ///
@@ -693,7 +698,11 @@ impl Shell {
                     let space_attention = attention.get(&space.id).copied();
                     let slug = slugs.get(&space.id).map(String::as_str);
                     let title = titles[ix].clone();
-                    let repo = slug.is_some();
+                    let repo = spaces_view::is_repo_space(&space, slug);
+                    // Where this folder is, for the row that has to say it
+                    // while collapsed (gh#229) — owner-stamped, so it costs no
+                    // RPC and is true on a phone that will never see the disk.
+                    let branch = spaces_view::space_branch(&space).map(str::to_string);
                     let expanded = self.space_expanded(&space.id) && !drag_active;
                     // What Active holds for this space — the count the row
                     // wears, and the rows the shelf therefore skips.
@@ -710,6 +719,7 @@ impl Shell {
                         space,
                         title,
                         repo,
+                        branch,
                         expanded,
                         is_selected,
                         space_attention,
@@ -912,15 +922,22 @@ impl Shell {
         cx.notify();
     }
 
-    /// One space row: repo glyph + repo-first title, trailing disclosure
-    /// chevron. No device suffix — the device is named once per group
-    /// ([`Self::render_device_header`]). Click activates (and discloses);
-    /// the chevron toggles disclosure without activating.
+    /// One space row, left to right: repo/folder glyph, repo-first title, the
+    /// branch it is checked out on, then — against the right edge — the count
+    /// of its chats the Active list is drawing and the disclosure chevron. No
+    /// device suffix: the device is named once per group
+    /// ([`Self::render_device_header`]). Click activates (and discloses); the
+    /// chevron toggles disclosure without activating.
+    ///
+    /// `branch` is what the folder is checked out on (gh#229). It is on the
+    /// SPACE row and not only on the chats inside it because collapsing a
+    /// space is how you get an overview, and a per-chat branch is exactly the
+    /// information that disappears when you do.
     ///
     /// `running` is how many of the space's chats the Active list is drawing
-    /// (gh#138). It reads as a compact `· 3 running` beside the title — the
-    /// fact that keeps the two surfaces tied together now that the shelf below
-    /// no longer repeats those rows.
+    /// (gh#138) — the fact that keeps the two surfaces tied together now that
+    /// the shelf below no longer repeats those rows. `attention` colours the
+    /// dot in front of that count: the most urgent state among them.
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
@@ -929,6 +946,7 @@ impl Shell {
         space: Space,
         title: spaces_view::SpaceTitle,
         repo: bool,
+        branch: Option<String>,
         expanded: bool,
         selected: bool,
         attention: Option<ChatIndicator>,
@@ -980,15 +998,6 @@ impl Shell {
                     cx.new(|_| SpaceGhost { name, repo })
                 },
             )
-            // Status dot LEADS the row (like session rows) so its position is
-            // stable — appearing/disappearing at the right edge made the row
-            // jitter (user request). Faint at rest, colored under attention.
-            .child(
-                // round-ok: status dot
-                div().size(px(6.0)).rounded_full().flex_none().bg(attention
-                    .map(|status| status_dot_color(status, theme))
-                    .unwrap_or_else(|| theme.white_alpha(0.14))),
-            )
             // The glyph says what a space IS in a repo-first product: a repo
             // (a host supplied the gh#118 link), or a plain folder for the
             // scratch directory that is nobody's repo. Not the OS symbol for
@@ -1030,21 +1039,62 @@ impl Shell {
                         .child(SharedString::from(format!("· {tail}"))),
                 )
             })
-            // "· 3 running" (gh#138): where the space's live rows went. Muted
-            // and after the name — the dot already said how urgent, this says
-            // how many, and neither needs to shout.
-            .when_some(spaces_view::running_label(running), |el, label| {
+            // Where the folder is, immediately after the name (gh#229): a
+            // collapsed space is a container with its contents hidden, and
+            // this is the one fact about it that collapsing must not take
+            // away. It sits with the name rather than at the far edge because
+            // it is part of what the row IS — `attn` on `wt/review` is a
+            // different place from `attn` on `main`.
+            .when_some(branch, |el, branch| {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(Theme::TEXT_CAPTION))
+                        .max_w(px(SPACE_BRANCH_MAX))
+                        .truncate()
+                        .text_size(px(Theme::TEXT_DENSE))
                         .line_height(px(17.0))
-                        .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(theme.text_subtle)
-                        .child(SharedString::from(label)),
+                        .child(SharedString::from(branch)),
                 )
             })
             .child(div().flex_1())
+            // "3 running" (gh#138) against the right edge, behind a dot in the
+            // colour of the most urgent chat under this row: where the space's
+            // live rows went, and how badly one of them wants a human. The dot
+            // used to lead the row and be permanently present — faint when
+            // nothing was live — which spent the row's first pixels on a fact
+            // most rows do not have. Both halves appear together or not at
+            // all, and neither moves the name when they do: the spacer above
+            // absorbs it.
+            .when_some(spaces_view::running_count_label(running), |el, label| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .size(px(5.0))
+                                // round-ok: status dot
+                                .rounded_full()
+                                .flex_none()
+                                .bg(attention
+                                    .map(|status| status_dot_color(status, theme))
+                                    .unwrap_or_else(|| theme.white_alpha(0.14))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .line_height(px(17.0))
+                                .font_weight(gpui::FontWeight::NORMAL)
+                                .text_color(theme.text_subtle)
+                                .child(SharedString::from(label)),
+                        ),
+                )
+            })
             // The disclosure chevron: glyph-swapped like the Changes-pane fold
             // (gpui at this rev has no rotation transform). Click toggles
             // without activating the space.
@@ -1144,23 +1194,39 @@ impl Shell {
                 .children(rows)
                 .into_any_element()
         };
-        // The indent rule starts under the space row's status dot and hands
-        // the rows a visible left edge: these BELONG to the row above.
+        // The guide rail: a hairline the disclosed rows hang off, starting
+        // under the space row's glyph and holding them a clear step to its
+        // right — these BELONG to the row above (gh#229 sets the measures:
+        // 9px out, 14px in, one hairline).
         div()
-            .ml(px(11.0))
-            .pl(px(6.0))
+            .ml(px(9.0))
+            .pl(px(14.0))
             .my(px(2.0))
             .border_l_1()
-            .border_color(theme.white_alpha(0.08))
+            .border_color(theme.border)
             .flex()
             .flex_col()
             .child(body)
             .into_any_element()
     }
 
-    /// One disclosed session: status rail + title + time-ago, harness/branch
-    /// underneath. Two lines, not three — the space line is gone because the
-    /// nesting already says it (gh#124's "no information twice").
+    /// One disclosed session, in one of two shapes (gh#229).
+    ///
+    /// A chat the board dispatched is **one line**: status dot, its identifier
+    /// as a chip, the branch it is working on, the time. No prose title at
+    /// all — the title is `gh#144 · <the issue's own title>` (gh#139), and in
+    /// a shelf of them the identifier reads as the first two words of a
+    /// sentence you have to finish before you know which row you are on. The
+    /// chip is found by shape; the branch is the thing you would have gone
+    /// looking for next, and it is where the issue's title used to be.
+    ///
+    /// A chat a human started keeps its **title** and puts the branch on a
+    /// second line behind the harness's own mark — the row has a name worth
+    /// reading, and which harness is running it is the fact its sibling row
+    /// gets from its identifier.
+    ///
+    /// Neither shape repeats the space, because the row is IN the space
+    /// (gh#124's "no information twice").
     #[allow(clippy::too_many_arguments)]
     fn render_space_session_row(
         &self,
@@ -1173,9 +1239,15 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = chat.id.clone();
-        let title: SharedString =
-            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
-                .into();
+        // Which of the two shapes this row is — see
+        // [`comet_proto::view::chat_ticket`] for what counts as an identifier
+        // and why a title a human wrote is left whole.
+        let line =
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()));
+        let (ticket, rest) = comet_proto::view::chat_ticket(&line);
+        let ticketed = ticket.is_some();
+        let ticket: Option<SharedString> = ticket.map(|t| SharedString::from(t.to_string()));
+        let title: SharedString = rest.to_string().into();
         let time_ago: SharedString =
             format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
         let harness = chat.config.as_ref().map(|c| c.harness);
@@ -1185,10 +1257,20 @@ impl Shell {
             .map(str::trim)
             .filter(|b| !b.is_empty())
             .map(|b| SharedString::from(b.to_string()));
+        // What the flexible middle of the row carries: the branch beside the
+        // chip, the title on a chat with no chip — and the title again for a
+        // dispatched chat with no branch (one that ran in the space's own
+        // checkout), because a chip and a clock with nothing between them is
+        // not a row.
+        let headline: SharedString = if ticketed {
+            branch.clone().unwrap_or_else(|| title.clone())
+        } else {
+            title.clone()
+        };
         let subline = theme.text_subtle;
         let status_rail: AnyElement = if status == ChatIndicator::Working {
             div()
-                .w(px(6.0))
+                .w(px(5.0))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -1200,7 +1282,7 @@ impl Shell {
                 .into_any_element()
         } else {
             div()
-                .size(px(6.0))
+                .size(px(5.0))
                 // round-ok: status dot
                 .rounded_full()
                 .flex_none()
@@ -1231,7 +1313,9 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status rail, ◆ for the orchestrator's chat, title, time.
+            // Line 1: status dot, ◆ for the orchestrator's chat, then either
+            // `<chip> <branch>` (a dispatched attempt) or the chat's title,
+            // then the time.
             .child(
                 div()
                     .w_full()
@@ -1252,14 +1336,37 @@ impl Shell {
                                 )),
                         )
                     })
+                    // The chip wears the Active list's attempt-chip clothes —
+                    // the same wash fill, the same radius — because it is the
+                    // same fact about the same chat, one section apart. Mono,
+                    // because an identifier is a token and not a word.
+                    .when_some(ticket, |el, ticket| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px(px(6.0))
+                                .rounded(px(Theme::RADIUS_CHIP))
+                                .bg(theme.wash(0.11))
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .line_height(px(18.0))
+                                .text_color(theme.text_muted)
+                                .child(ticket),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(Theme::TEXT_BODY))
+                            .text_size(px(if ticketed {
+                                Theme::TEXT_DENSE
+                            } else {
+                                Theme::TEXT_BODY
+                            }))
                             .line_height(px(17.0))
-                            .child(title),
+                            .when(ticketed, |el| el.text_color(subline))
+                            .child(headline),
                     )
                     .child(
                         div()
@@ -1269,44 +1376,44 @@ impl Shell {
                             .child(time_ago),
                     ),
             )
-            // Line 2: harness brand mark; sessions with a branch append it.
-            .child(
-                div()
-                    .w_full()
-                    .pl(px(14.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
+            // Line 2, for a chat whose name is its own: the harness's mark in
+            // its own brand colour, then the branch. The dispatched rows above
+            // spend this line's information on line one instead — which is why
+            // they do not have one, and why the shelf does not reserve height
+            // for a line most of its rows would leave blank.
+            .when(!ticketed, |el| {
+                el.child(
+                    div()
+                        .w_full()
+                        .pl(px(13.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .when_some(
+                            harness.map(crate::pickers::harness_brand_icon),
+                            |el, (path, tint)| {
+                                el.child(
+                                    icon(path)
+                                        .size(px(10.0))
+                                        .flex_none()
+                                        .text_color(tint.unwrap_or(subline)),
+                                )
+                            },
+                        )
+                        .when_some(branch, |el, branch| {
                             el.child(
-                                icon(path)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline)),
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .line_height(px(15.0))
+                                    .text_color(subline)
+                                    .child(branch),
                             )
-                        },
-                    )
-                    .when_some(branch, |el, branch| {
-                        el.child(
-                            icon(icons::GIT_BRANCH)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(subline),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .line_height(px(14.0))
-                                .text_color(subline)
-                                .child(branch),
-                        )
-                    }),
-            )
+                        }),
+                )
+            })
             .into_any_element()
     }
 
@@ -1620,6 +1727,24 @@ impl Shell {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The hairline under the orchestrator's slot (gh#229).
+    ///
+    /// The slot is a chat row like any other and it is not one of the chats:
+    /// it is pinned, it outlives every attempt, and it is the only row above
+    /// that the reader is expected to talk TO rather than check on. Order
+    /// alone said that faintly — the rule says it in a way you do not have to
+    /// have been told.
+    pub(super) fn render_orchestrator_rule(theme: &Theme) -> AnyElement {
+        div()
+            .mt(px(3.0))
+            .mx(px(9.0))
+            .mb(px(4.0))
+            .h(px(1.0))
+            .flex_none()
+            .bg(theme.border)
+            .into_any_element()
     }
 
     /// The "Active" section (gh#123): everything alive on the box in one
@@ -2302,6 +2427,7 @@ impl Shell {
                             git_detected: true,
                             git_checked_at: None,
                             checkout_id: None,
+                            branch: None,
                             created_at: Utc::now(),
                         };
                         shell.state.update(cx, |s, cx| {
@@ -2483,6 +2609,7 @@ impl Shell {
             git_detected,
             git_checked_at: None,
             checkout_id: None,
+            branch: None,
             created_at: Utc::now(),
         };
         self.state.update(cx, |s, cx| {

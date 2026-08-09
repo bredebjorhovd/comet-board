@@ -508,6 +508,196 @@ impl BoardSpend {
         let plan = self.subscriptions_in_window()?;
         (!plan.is_zero()).then(|| self.list_price.dollars() / plan.dollars())
     }
+
+    /// Where the list price goes (gh#225): the same money, grouped by the kind
+    /// of token it bought rather than by the model that bought it.
+    ///
+    /// The per-model table answers *which model was expensive*; this answers
+    /// *which of the four rates was*, and they are not the same question. A week
+    /// that spent most of its price on 1.2M output tokens and a tenth of it on
+    /// 35M cached ones is a week where the cache is working and the writing is
+    /// what costs — which nothing else on the page can tell you.
+    ///
+    /// Priced models only, exactly like [`list_price`](Self::list_price): a
+    /// model the table has never heard of has no rate to attribute its tokens
+    /// to, and guessing one would put a number under a bar that means nothing.
+    pub fn cost_split(&self) -> CostSplit {
+        let mut slices: Vec<CostSlice> = CostClass::ALL
+            .into_iter()
+            .map(|class| {
+                let mut cost = Usd::ZERO;
+                let mut tokens = 0u64;
+                for model in &self.by_model {
+                    let spent = class.tokens(model.usage);
+                    tokens = tokens.saturating_add(spent);
+                    cost += class.rate(&model.rate).per_million(spent);
+                }
+                CostSlice {
+                    class,
+                    cost,
+                    tokens,
+                    share: 0.0,
+                }
+            })
+            // A class nobody spent anything in is not a segment of a bar about
+            // where the money went — `ranked_tokens`' rule, one axis over.
+            .filter(|slice| slice.tokens > 0 || !slice.cost.is_zero())
+            .collect();
+        slices.sort_by(|a, b| b.cost.cmp(&a.cost).then_with(|| a.class.cmp(&b.class)));
+
+        let total: Usd = slices.iter().map(|s| s.cost).sum();
+        let tokens: u64 = slices
+            .iter()
+            .fold(0u64, |sum, s| sum.saturating_add(s.tokens));
+        if !total.is_zero() {
+            for slice in &mut slices {
+                slice.share = (slice.cost.dollars() / total.dollars()).clamp(0.0, 1.0);
+            }
+        }
+        CostSplit {
+            slices,
+            total,
+            tokens,
+        }
+    }
+}
+
+// -- where the list price goes (gh#225) --------------------------------------
+
+/// One of the four ways a token costs money.
+///
+/// The rates are priced apart ([`ModelRate`], gh#182) and then every surface
+/// adds them straight back up, so the page could say what a window cost and not
+/// where the money went. That is the fact worth having: a coding agent's usage
+/// is lopsided by construction — tens of millions of cached-input tokens
+/// against a few hundred thousand output ones — and once priced, the small
+/// bucket is usually the expensive one. The two readings point at opposite
+/// fixes, and a single total points at neither.
+///
+/// Declared in order of what a token costs in each: output is the dearest per
+/// token, a cache read a tenth of fresh input. That order is only the tie-break
+/// — [`BoardSpend::cost_split`] ranks on money actually spent, which is a
+/// different question and the one a reader is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CostClass {
+    Output,
+    CacheWrite,
+    Input,
+    CacheRead,
+}
+
+impl CostClass {
+    /// Every class, dearest per token first.
+    pub const ALL: [CostClass; 4] = [
+        CostClass::Output,
+        CostClass::CacheWrite,
+        CostClass::Input,
+        CostClass::CacheRead,
+    ];
+
+    /// What a legend calls it. Said from the reader's side — `cached input`
+    /// rather than `cache_read_tokens` — because the point of the split is that
+    /// somebody who has never read [`TokenUsage`] can act on it.
+    pub fn label(self) -> &'static str {
+        match self {
+            CostClass::Output => "output",
+            CostClass::CacheWrite => "cache writes",
+            CostClass::Input => "uncached input",
+            CostClass::CacheRead => "cached input",
+        }
+    }
+
+    /// The bucket of a usage this class prices.
+    pub fn tokens(self, usage: TokenUsage) -> u64 {
+        match self {
+            CostClass::Output => usage.output_tokens,
+            CostClass::CacheWrite => usage.cache_creation_tokens,
+            CostClass::Input => usage.input_tokens,
+            CostClass::CacheRead => usage.cache_read_tokens,
+        }
+    }
+
+    /// The per-million rate that bucket is priced at.
+    pub fn rate(self, rate: &ModelRate) -> Usd {
+        match self {
+            CostClass::Output => rate.output,
+            CostClass::CacheWrite => rate.cache_write,
+            CostClass::Input => rate.input,
+            CostClass::CacheRead => rate.cache_read,
+        }
+    }
+}
+
+/// One class's share of the list price: what it cost, and what it cost it on.
+///
+/// Both halves, always. `$52` alone is a number to nod at; `$52 across 34.8M
+/// tokens` beside `$93 across 1.24M` is the sentence the block exists to say.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostSlice {
+    pub class: CostClass,
+    pub cost: Usd,
+    pub tokens: u64,
+    /// Of the priced total, `0.0..=1.0` — the width of this segment of the bar.
+    pub share: f64,
+}
+
+impl CostSlice {
+    pub fn label(&self) -> &'static str {
+        self.class.label()
+    }
+
+    /// The legend line: `output $93 / 1.24M`.
+    pub fn legend(&self) -> String {
+        format!(
+            "{} {} / {}",
+            self.class.label(),
+            human_usd(self.cost),
+            human_tokens(self.tokens)
+        )
+    }
+}
+
+/// The list price regrouped by what kind of token it was spent on (gh#225).
+///
+/// Nothing new is recorded and nothing is re-priced: this is the same four
+/// products [`ModelRate::cost`] already sums per model, kept apart across
+/// models instead of collapsed. Which is why [`total`](Self::total) is
+/// [`BoardSpend::list_price`] exactly rather than nearly — the terms are the
+/// same terms, rounded in the same places.
+///
+/// Unlike the rules beside it this one has no Swift counterpart yet: the
+/// phone's stats screen draws no split, so there is nothing there to disagree
+/// with it and no case in the cross-language fixture. When it does, this is the
+/// arithmetic it adopts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostSplit {
+    /// Biggest spend first, ties in [`CostClass::ALL`] order so an unchanged
+    /// board redraws identically. A class with nothing in it is absent, not a
+    /// zero-width segment nobody can hover.
+    pub slices: Vec<CostSlice>,
+    /// The four classes summed — the priced total, and the denominator every
+    /// share is taken against.
+    pub total: Usd,
+    /// The tokens behind that total. Priced tokens only: what the board could
+    /// not price is [`BoardSpend::unpriced_tokens`] and stays there.
+    pub tokens: u64,
+}
+
+impl CostSplit {
+    /// Nothing to draw. A window with no priced tokens, or one whose whole
+    /// price rounds to zero — either way a bar of four empty segments would be
+    /// a picture of nothing, and the page says so in prose instead.
+    pub fn is_empty(&self) -> bool {
+        self.slices.is_empty() || self.total.is_zero()
+    }
+
+    /// Where the money actually went — the first slice, since they are ranked.
+    pub fn largest(&self) -> Option<&CostSlice> {
+        self.slices.first()
+    }
 }
 
 // -- the breakdown (gh#227) --------------------------------------------------
@@ -1885,6 +2075,120 @@ mod tests {
         );
         assert_eq!(free.subscriptions_in_window(), Some(Usd::ZERO));
         assert_eq!(free.subsidy(), None);
+    }
+
+    // -- where the list price goes (gh#225) ----------------------------------
+
+    /// One priced model, at a rate written the way the table writes it.
+    fn model(label: &str, input: f64, output: f64, usage: TokenUsage) -> ModelSpend {
+        let rate = ModelRate::published(input, output);
+        ModelSpend {
+            label: label.to_string(),
+            rate_key: label.to_string(),
+            source: RateSource::Builtin,
+            rate,
+            usage,
+            cost: rate.cost(usage),
+        }
+    }
+
+    fn split_of(models: Vec<ModelSpend>) -> BoardSpend {
+        BoardSpend {
+            rates: crate::view::rates::RateTable::empty("2026-06-24"),
+            list_price: models.iter().map(|m| m.cost).sum(),
+            by_model: models,
+            unpriced: Vec::new(),
+            unpriced_tokens: 0,
+            accounts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_split_ranks_on_money_and_adds_up_to_the_price_it_splits() {
+        // A week shaped like a coding agent's: cached input dwarfs everything
+        // in tokens, and output costs the most anyway. That inversion is the
+        // whole reason the block exists.
+        let spend = split_of(vec![
+            model(
+                "claude-opus-5",
+                5.0,
+                25.0,
+                usage(2_000_000, 1_000_000, 30_000_000, 3_000_000),
+            ),
+            model(
+                "claude-haiku-4-5",
+                1.0,
+                5.0,
+                usage(100_000, 240_000, 4_800_000, 900_000),
+            ),
+        ]);
+        let split = spend.cost_split();
+        assert!(!split.is_empty());
+        // Biggest spend first, and the reader's ordering is not the token one.
+        let labels: Vec<&str> = split.slices.iter().map(|s| s.label()).collect();
+        assert_eq!(
+            labels,
+            ["output", "cache writes", "cached input", "uncached input"]
+        );
+        assert_eq!(split.largest().expect("a biggest class").label(), "output");
+        // The same terms `ModelRate::cost` sums, kept apart — so the split is
+        // the list price exactly, not nearly. A breakdown that did not add up
+        // to the figure above it would be the one thing this page must not do.
+        assert_eq!(split.total, spend.list_price);
+        assert_eq!(
+            split.slices.iter().map(|s| s.cost).sum::<Usd>(),
+            spend.list_price
+        );
+        // And the tokens are the tokens, both readings of them.
+        assert_eq!(
+            split.tokens,
+            spend.by_model.iter().map(|m| m.usage.total()).sum::<u64>()
+        );
+        let cached = split
+            .slices
+            .iter()
+            .find(|s| s.class == CostClass::CacheRead)
+            .expect("cached input");
+        assert_eq!(cached.tokens, 34_800_000);
+        assert_eq!(cached.legend(), "cached input $15.48 / 34.80M");
+        // Shares are of the priced total and cover it.
+        let shares: f64 = split.slices.iter().map(|s| s.share).sum();
+        assert!((shares - 1.0).abs() < 1e-9, "{shares}");
+    }
+
+    #[test]
+    fn a_class_nobody_spent_in_is_absent_rather_than_an_empty_segment() {
+        // A harness that reports no cache at all: two classes, not four with
+        // two of them drawn as slivers of nothing.
+        let spend = split_of(vec![model(
+            "gpt-5.6-luna",
+            2.0,
+            10.0,
+            usage(500_000, 200_000, 0, 0),
+        )]);
+        let split = spend.cost_split();
+        assert_eq!(split.slices.len(), 2);
+        assert!(split.slices.iter().all(|s| s.tokens > 0));
+        assert_eq!(split.total, spend.list_price);
+    }
+
+    #[test]
+    fn a_window_with_nothing_priced_has_no_bar_to_draw() {
+        // The empty state the block collapses to prose for: nothing priced, and
+        // a rate table full of zeroes, which are two ways to have no picture.
+        assert!(split_of(Vec::new()).cost_split().is_empty());
+        let free = split_of(vec![model(
+            "local-llama",
+            0.0,
+            0.0,
+            usage(1_000, 500, 0, 0),
+        )]);
+        let split = free.cost_split();
+        assert!(split.is_empty(), "a price of zero is not a shape");
+        // The tokens are still real, and still counted — it is the *money* that
+        // has no shape here.
+        assert_eq!(split.tokens, 1_500);
+        assert_eq!(split.largest().map(|s| s.label()), Some("output"));
     }
 
     #[test]
