@@ -141,7 +141,11 @@ display EXCLUDED. File paths refer to the reference repo.
 - OpenTerminal{chatId,cols,rows}->TerminalSession; SubscribeTerminal{id,afterSeq?}->stream
   (Data{seq,data}|Exit{seq,code,signal?}); WriteTerminal; ResizeTerminal; CloseTerminal
 - ListAgentAccounts{forceUsage?}; ActivateAgentAccount; ForgetAgentAccount; StartAgentLogin ->
-  {loginId,url,mode:paste-code|browser}; CompleteAgentLogin{code}; PollAgentLogin; CancelAgentLogin
+  {loginId,url,mode:paste-code|browser|device-code,userCode?}; CompleteAgentLogin{code};
+  PollAgentLogin; CancelAgentLogin. `mode` is not per-harness alone: a Codex login addressed
+  at another device (`targetDeviceId`, or any call off the relay) gets `device-code` — the
+  loopback callback plain `codex login` waits for lands on the operator's machine, not the
+  box's (gh#193).
 ### DataRpc (IPC-only)
 - WatchDevices/WatchChats{deviceId?}/WatchSessions{deviceId?}/WatchDocMessages{chatId}(KEEP)/
   WatchCheckoutDiffs -> streams. (WatchMessages, WatchUsage DROPPED.)

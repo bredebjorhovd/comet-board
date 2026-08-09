@@ -386,13 +386,20 @@ pub struct AgentAccountWarning {
 }
 
 /// `StartAgentLogin` reply: open `url`, then either paste the code back
-/// (`CompleteAgentLogin`) or poll until the browser flow lands (`PollAgentLogin`).
+/// (`CompleteAgentLogin`), poll until the browser flow lands (`PollAgentLogin`),
+/// or read `userCode` out to the operator and poll.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLoginStart {
     pub login_id: String,
     pub url: String,
     pub mode: AgentLoginMode,
+    /// [`AgentLoginMode::DeviceCode`] only: the one-time code the operator
+    /// types in at `url`, on whatever device has a browser. It travels
+    /// outward — unlike [`AgentLoginMode::PasteCode`], nothing is ever pasted
+    /// back into the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,7 +408,13 @@ pub enum AgentLoginMode {
     /// Claude: the user pastes the OAuth code back into the app.
     PasteCode,
     /// Codex: the CLI's loopback callback completes in the browser; poll until done.
+    /// Only ever offered for a login on the device the app is running on — the
+    /// callback lands on *that* machine's `127.0.0.1` and nowhere else.
     Browser,
+    /// Codex on a device the operator is not sitting at (gh#193): the CLI polls
+    /// OpenAI itself, so no callback has to reach the signing-in machine. Show
+    /// `user_code` to be typed at `url` elsewhere, and poll until done.
+    DeviceCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

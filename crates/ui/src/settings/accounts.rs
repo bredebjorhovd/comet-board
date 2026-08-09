@@ -162,6 +162,16 @@ enum LoginFlow {
         message: Option<SharedString>,
         error: Option<SharedString>,
     },
+    /// Codex on another device (gh#193): show the one-time code to enter at the
+    /// URL — on whatever device has a browser, which is this one — while the
+    /// remote CLI polls OpenAI. Same poll loop as `Browser`; different story,
+    /// because the code goes *out* rather than coming back.
+    DeviceCode {
+        harness: HarnessId,
+        start: AgentLoginStart,
+        message: Option<SharedString>,
+        error: Option<SharedString>,
+    },
 }
 
 impl LoginFlow {
@@ -170,7 +180,8 @@ impl LoginFlow {
         let harness = match self {
             LoginFlow::Starting { harness }
             | LoginFlow::PasteCode { harness, .. }
-            | LoginFlow::Browser { harness, .. } => *harness,
+            | LoginFlow::Browser { harness, .. }
+            | LoginFlow::DeviceCode { harness, .. } => *harness,
         };
         match harness {
             HarnessId::Codex => "Add Codex account",
@@ -533,6 +544,15 @@ impl AccountsPage {
                                 });
                                 page.spawn_poll(cx);
                             }
+                            AgentLoginMode::DeviceCode => {
+                                page.login = Some(LoginFlow::DeviceCode {
+                                    harness,
+                                    start,
+                                    message: None,
+                                    error: None,
+                                });
+                                page.spawn_poll(cx);
+                            }
                         }
                     }
                     Err(err) => {
@@ -595,9 +615,12 @@ impl AccountsPage {
         cx.notify();
     }
 
-    /// The browser-wait poll loop: PollAgentLogin every 1.5s until Done/Error.
+    /// The wait loop shared by both poll-shaped flows (browser callback and
+    /// device code): PollAgentLogin every 1.5s until Done/Error.
     fn spawn_poll(&mut self, cx: &mut Context<Self>) {
-        let Some(LoginFlow::Browser { start, .. }) = &self.login else {
+        let (Some(LoginFlow::Browser { start, .. }) | Some(LoginFlow::DeviceCode { start, .. })) =
+            &self.login
+        else {
             return;
         };
         let login_id = start.login_id.clone();
@@ -615,7 +638,9 @@ impl AccountsPage {
                     .call(methods::POLL_AGENT_LOGIN, params.clone())
                     .await;
                 let outcome = this.update(cx, |page, cx| {
-                    let Some(LoginFlow::Browser { message, error, .. }) = &mut page.login else {
+                    let (Some(LoginFlow::Browser { message, error, .. })
+                    | Some(LoginFlow::DeviceCode { message, error, .. })) = &mut page.login
+                    else {
                         return true; // dialog dismissed — stop polling
                     };
                     match result.as_ref().ok().and_then(|value| {
@@ -666,9 +691,9 @@ impl AccountsPage {
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
         let login_id = match &self.login {
-            Some(LoginFlow::PasteCode { start, .. }) | Some(LoginFlow::Browser { start, .. }) => {
-                Some(start.login_id.clone())
-            }
+            Some(LoginFlow::PasteCode { start, .. })
+            | Some(LoginFlow::Browser { start, .. })
+            | Some(LoginFlow::DeviceCode { start, .. }) => Some(start.login_id.clone()),
             _ => None,
         };
         self.login = None;
@@ -1029,28 +1054,80 @@ impl AccountsPage {
                     )
                     .into_any_element()
             }
+            // The two poll-shaped flows share everything below the code chip —
+            // spinner, error line, lone Cancel — and differ only in what the
+            // operator is being asked to do with a browser.
             LoginFlow::Browser {
+                start,
+                message,
+                error,
+                ..
+            }
+            | LoginFlow::DeviceCode {
                 start,
                 message,
                 error,
                 ..
             } => {
                 let has_error = error.is_some();
+                let user_code: Option<SharedString> = matches!(login, LoginFlow::DeviceCode { .. })
+                    .then(|| start.user_code.clone())
+                    .flatten()
+                    .map(SharedString::from);
+                let device_code = user_code.is_some();
                 div()
                     .flex()
                     .flex_col()
                     .child(div().mt(px(8.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in to OpenAI in your browser. The new login is \
-                         captured in an isolated profile — your current session is untouched \
-                         until you switch.",
+                        if device_code {
+                            "That device has no browser to finish in, so it is waiting on \
+                             OpenAI for a code instead. Sign in here to the account you want \
+                             to add, enter the code below, and leave this open. The new login \
+                             is captured in an isolated profile over there — its current \
+                             session is untouched until you switch."
+                        } else {
+                            "Finish signing in to OpenAI in your browser. The new login is \
+                             captured in an isolated profile — your current session is \
+                             untouched until you switch."
+                        },
                     )))
                     .child(url_link(
                         "login-open-url-browser",
-                        "Reopen the sign-in page",
+                        if device_code {
+                            "Open the OpenAI device page"
+                        } else {
+                            "Reopen the sign-in page"
+                        },
                         &start.url,
                         cx,
                     ))
+                    .when_some(user_code, |el, code| {
+                        // The payload of the whole dialog: big and monospaced,
+                        // because it is read off this screen and typed by hand.
+                        // No hair-space tracking (the menu-heading trick) —
+                        // this is a string someone transcribes character for
+                        // character, and nothing invisible belongs in it.
+                        el.child(
+                            div()
+                                .mt(px(14.0))
+                                .px(px(14.0))
+                                .py(px(10.0))
+                                .rounded(px(8.0))
+                                .bg(theme.white_alpha(0.05))
+                                .flex()
+                                .flex_row()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .font_family(theme.font_mono.clone())
+                                        .text_size(px(22.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(code),
+                                ),
+                        )
+                    })
                     .when(!has_error, |el| {
                         el.child(
                             div()
@@ -1065,7 +1142,11 @@ impl AccountsPage {
                                         .text_size(px(12.5))
                                         .text_color(theme.text_muted)
                                         .child(message.clone().unwrap_or_else(|| {
-                                            SharedString::from("Waiting for the browser…")
+                                            SharedString::from(if device_code {
+                                                "Waiting for the code to be entered…"
+                                            } else {
+                                                "Waiting for the browser…"
+                                            })
                                         })),
                                 ),
                         )
