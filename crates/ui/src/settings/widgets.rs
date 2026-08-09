@@ -30,7 +30,7 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
         .gap(px(10.0))
         .child(
             div()
-                .text_size(px(16.0))
+                .text_size(px(Theme::TEXT_TITLE))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(SharedString::from(title.to_string())),
@@ -38,7 +38,7 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
         .when_some(count, |el, count| {
             el.child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(format!("{count}"))),
             )
@@ -49,7 +49,7 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
 pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
     div()
         .mt(px(4.0))
-        .text_size(px(13.0))
+        .text_size(px(Theme::TEXT_BODY))
         .text_color(theme.text_muted)
         .child(copy.into())
 }
@@ -59,7 +59,7 @@ pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div 
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(24.0))
-        .rounded(px(12.0))
+        .rounded(px(Theme::RADIUS_CARD))
         .border_1()
         .border_color(theme.border)
         .bg(theme.surface)
@@ -88,7 +88,7 @@ pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
     div()
         .flex_none()
         .size(px(36.0))
-        .rounded(px(10.0))
+        .rounded(px(Theme::RADIUS_ROW))
         .border_1()
         .border_color(theme.border)
         .bg(theme.white_alpha(0.03))
@@ -107,7 +107,7 @@ pub fn row_title(theme: &Theme, title: impl Into<SharedString>) -> gpui::Div {
     div()
         .min_w_0()
         .truncate()
-        .text_size(px(13.5))
+        .text_size(px(Theme::TEXT_BODY))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.text)
         .child(title.into())
@@ -124,7 +124,7 @@ pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
         .items_center()
         .gap_x(px(8.0))
         .gap_y(px(2.0))
-        .text_size(px(11.5))
+        .text_size(px(Theme::TEXT_CAPTION))
         .text_color(theme.text_subtle);
     let mut first = true;
     for fragment in fragments {
@@ -147,10 +147,10 @@ pub fn badge(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
         .flex_none()
         .px(px(8.0))
         .py(px(2.0))
-        .rounded_full()
+        .rounded(px(Theme::RADIUS_CHIP))
         .border_1()
         .border_color(theme.border)
-        .text_size(px(10.5))
+        .text_size(px(Theme::TEXT_CAPTION))
         .text_color(theme.text_muted)
         .child(label.into())
 }
@@ -164,9 +164,9 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
         .flex_none()
         .px(px(8.0))
         .py(px(2.0))
-        .rounded_full()
+        .rounded(px(Theme::RADIUS_CHIP))
         .bg(emerald.opacity(0.12))
-        .text_size(px(10.5))
+        .text_size(px(Theme::TEXT_CAPTION))
         .text_color(emerald_text)
         .child(label.into())
 }
@@ -181,10 +181,10 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
         .flex_row()
         .items_center()
         .gap(px(6.0))
-        .rounded(px(8.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .px(px(10.0))
         .py(px(6.0))
-        .text_size(px(12.0))
+        .text_size(px(Theme::TEXT_DENSE))
         .text_color(theme.text_muted)
         .cursor_pointer()
 }
@@ -206,11 +206,11 @@ pub fn error_strip(message: impl Into<SharedString>) -> gpui::Div {
         .mt(px(16.0))
         .px(px(16.0))
         .py(px(12.0))
-        .rounded(px(12.0))
+        .rounded(px(Theme::RADIUS_CARD))
         .border_1()
         .border_color(red.opacity(0.2))
         .bg(red.opacity(0.06))
-        .text_size(px(12.5))
+        .text_size(px(Theme::TEXT_DENSE))
         .text_color(red_text)
         .flex()
         .flex_row()
@@ -236,11 +236,11 @@ pub fn warning_strip(message: impl Into<SharedString>) -> gpui::Div {
         .mt(px(8.0))
         .px(px(16.0))
         .py(px(10.0))
-        .rounded(px(12.0))
+        .rounded(px(Theme::RADIUS_CARD))
         .border_1()
         .border_color(amber.opacity(0.2))
         .bg(amber.opacity(0.06))
-        .text_size(px(12.0))
+        .text_size(px(Theme::TEXT_DENSE))
         .text_color(amber_text)
         .flex()
         .flex_row()

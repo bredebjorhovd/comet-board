@@ -332,14 +332,14 @@ impl MembersPage {
         div()
             .flex_none()
             .size(px(36.0))
-            .rounded(px(10.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .border_1()
             .border_color(theme.border)
             .bg(theme.white_alpha(0.03))
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(13.0))
+            .text_size(px(Theme::TEXT_BODY))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(if muted {
                 theme.text_subtle
@@ -363,7 +363,7 @@ impl MembersPage {
                     .gap(px(10.0))
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(SharedString::from("Invite a teammate")),
@@ -381,31 +381,33 @@ impl MembersPage {
                                     .flex()
                                     .items_center()
                                     .px(px(12.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(Theme::RADIUS_ROW))
                                     .border_1()
                                     .border_color(theme.border)
                                     .bg(theme.bg)
-                                    .text_size(px(13.0))
+                                    .text_size(px(Theme::TEXT_BODY))
                                     .child(input),
                             )
                             .child(
                                 popover::btn_primary(
                                     &theme,
-                                    if inviting { "Sending…" } else { "Send invite" },
+                                    if inviting {
+                                        "Sending…"
+                                    } else {
+                                        "Send invite"
+                                    },
                                 )
                                 .id("invite-send")
                                 .h(px(36.0))
                                 .flex()
                                 .items_center()
                                 .when(inviting, |el| el.opacity(0.5))
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.submit_invite(cx)),
-                                ),
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_invite(cx))),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(theme.text_subtle)
                             .child(SharedString::from(
                                 "They get an email with a join link. Anyone in the workspace can \
@@ -436,7 +438,7 @@ impl MembersPage {
                 .px(px(20.0))
                 .py(px(24.0))
                 .text_center()
-                .text_size(px(13.0))
+                .text_size(px(Theme::TEXT_BODY))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from("No pending invitations"))
                 .into_any_element(),
@@ -553,7 +555,7 @@ impl Render for MembersPage {
                         .px(px(20.0))
                         .py(px(40.0))
                         .text_center()
-                        .text_size(px(14.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from("No members yet")),
                 )
@@ -622,11 +624,11 @@ impl Render for MembersPage {
                                 .mt(px(16.0))
                                 .px(px(16.0))
                                 .py(px(10.0))
-                                .rounded(px(12.0))
+                                .rounded(px(Theme::RADIUS_CARD))
                                 .border_1()
                                 .border_color(theme.border)
                                 .bg(theme.white_alpha(0.03))
-                                .text_size(px(12.5))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(theme.text_muted)
                                 .child(message),
                         )
@@ -637,7 +639,7 @@ impl Render for MembersPage {
                         el.child(
                             div()
                                 .mt(px(24.0))
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from("Pending invitations")),

@@ -116,7 +116,7 @@ impl Render for ArchivedPage {
                     .flex_row()
                     .items_center()
                     .gap(px(12.0))
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
                     .px(px(12.0))
                     .py(px(8.0))
                     .hover(|s| s.bg(theme.white_alpha(0.03)))
@@ -132,7 +132,7 @@ impl Render for ArchivedPage {
                         div()
                             .flex_none()
                             .size(px(32.0))
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .border_1()
                             .border_color(theme.border)
                             .flex()
@@ -160,7 +160,7 @@ impl Render for ArchivedPage {
                                         div()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(px(13.0))
+                                            .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(theme.text)
                                             .child(title),
@@ -168,7 +168,7 @@ impl Render for ArchivedPage {
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_size(px(11.0))
+                                            .text_size(px(Theme::TEXT_CAPTION))
                                             .text_color(theme.text_subtle)
                                             .child(time_ago),
                                     ),
@@ -183,7 +183,7 @@ impl Render for ArchivedPage {
                                     .flex_row()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .text_size(px(11.0))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(theme.text_subtle);
                                 let both = device.is_some() && location.is_some();
                                 if let Some(device) = device {
@@ -212,10 +212,10 @@ impl Render for ArchivedPage {
                             .gap(px(6.0))
                             .px(px(10.0))
                             .py(px(4.0))
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
                             .border_1()
                             .border_color(theme.border)
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .opacity(if row_hovered || is_busy { 1.0 } else { 0.0 })
                             .when(is_busy, |el| el.opacity(0.4))
@@ -262,18 +262,13 @@ impl Render for ArchivedPage {
                 .child(
                     div()
                         .mt(px(12.0))
-                        .text_size(px(14.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_muted)
                         .child(SharedString::from("Nothing archived")),
                 )
-                .child(
-                    div()
-                        .mt(px(4.0))
-                        .text_size(px(12.0))
-                        .child(SharedString::from(
-                            "Right-click a session in the sidebar to archive it.",
-                        )),
-                )
+                .child(div().mt(px(4.0)).text_size(px(Theme::TEXT_DENSE)).child(
+                    SharedString::from("Right-click a session in the sidebar to archive it."),
+                ))
                 .into_any_element()
         } else {
             div()

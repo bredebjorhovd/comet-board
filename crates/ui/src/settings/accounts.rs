@@ -323,7 +323,7 @@ impl AccountsPage {
             .flex_none()
             .h(px(28.0))
             .px(px(8.0))
-            .rounded(px(6.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .flex()
             .flex_row()
             .items_center()
@@ -355,7 +355,7 @@ impl AccountsPage {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text)
                     .child(trigger_label),
@@ -363,6 +363,7 @@ impl AccountsPage {
             .child(
                 div()
                     .size(px(6.0))
+                    // round-ok: status dot
                     .rounded_full()
                     .flex_none()
                     .bg(if effective == local_id {
@@ -419,7 +420,7 @@ impl AccountsPage {
                             el.child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(10.5))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from("You")),
                             )
@@ -428,6 +429,7 @@ impl AccountsPage {
                         .child(
                             div()
                                 .size(px(6.0))
+                                // round-ok: status dot
                                 .rounded_full()
                                 .flex_none()
                                 .bg(if is_local {
@@ -736,7 +738,7 @@ impl AccountsPage {
             .flex_row()
             .items_center()
             .gap(px(8.0))
-            .text_size(px(11.5))
+            .text_size(px(Theme::TEXT_CAPTION))
             .text_color(theme.text_subtle)
             .child(
                 div()
@@ -751,6 +753,7 @@ impl AccountsPage {
                     .min_w(px(56.0))
                     .max_w(px(230.0))
                     .h(px(5.0))
+                    // round-ok: usage bar — a 5px bar with round caps, not a box
                     .rounded_full()
                     .overflow_hidden()
                     .bg(theme.white_alpha(0.07))
@@ -761,6 +764,7 @@ impl AccountsPage {
                                 // A 1.5% floor keeps tiny non-zero usage
                                 // visible (comet `max(used, 1.5)%`).
                                 .w(gpui::relative(fraction.max(0.015)))
+                                // round-ok: the bar fill, capped to match its track
                                 .rounded_full()
                                 .bg(fill),
                         )
@@ -840,21 +844,15 @@ impl AccountsPage {
                 .child(
                     div()
                         .id(("account-forget", ix))
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .px(px(6.0))
                         .py(px(4.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .when(is_busy, |el| el.opacity(0.5))
-                        .hover(|s| {
-                            s.bg(theme.white_alpha(0.06)).text_color(theme.text)
-                        })
+                        .hover(|s| s.bg(theme.white_alpha(0.06)).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(
-                                methods::FORGET_AGENT_ACCOUNT,
-                                &forget_account,
-                                cx,
-                            );
+                            this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
                         }))
                         .child(
                             crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
@@ -871,8 +869,8 @@ impl AccountsPage {
                         .id(("account-switch", ix))
                         .px(px(8.0))
                         .py(px(4.0))
-                        .rounded(px(6.0))
-                        .text_size(px(11.5))
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .when(is_busy, |el| el.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.account_action(
@@ -899,14 +897,14 @@ impl AccountsPage {
                     .flex_none()
                     .self_center()
                     .size(px(32.0))
-                    .rounded_full()
+                    .rounded(px(Theme::RADIUS_ROW))
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.white_alpha(0.03))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.0))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
                     .child(initial),
@@ -926,7 +924,7 @@ impl AccountsPage {
                                 div()
                                     .mt(px(6.0))
                                     .truncate()
-                                    .text_size(px(11.5))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from(if account.switchable {
                                         "Usage unavailable"
@@ -969,22 +967,23 @@ impl AccountsPage {
         let red_text = crate::theme::oklch(0.81, 0.108, 19.6); // red-300
         let login = self.login.as_ref()?;
         let title = login.title();
-        let url_link = |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
-            let open_url = url.to_string();
-            // "Reopen the …" text link (comet: `text-[12px] hover:underline`).
-            div()
-                .id(id)
-                .mt(px(6.0))
-                .text_size(px(12.0))
-                .text_color(theme.text_subtle)
-                .truncate()
-                .cursor_pointer()
-                .hover(|s| s.text_color(theme.text))
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.open_url(&open_url);
-                }))
-                .child(SharedString::from(label))
-        };
+        let url_link =
+            |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
+                let open_url = url.to_string();
+                // "Reopen the …" text link (comet: `text-[12px] hover:underline`).
+                div()
+                    .id(id)
+                    .mt(px(6.0))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.open_url(&open_url);
+                    }))
+                    .child(SharedString::from(label))
+            };
         let body: AnyElement = match login {
             LoginFlow::Starting { .. } => div()
                 .mt(px(8.0))
@@ -1014,16 +1013,19 @@ impl AccountsPage {
                     ))
                     .child(
                         div().mt(px(12.0)).child(
-                            popover::dialog_field(&theme, self.code_input.clone().into_any_element())
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(13.0)),
+                            popover::dialog_field(
+                                &theme,
+                                self.code_input.clone().into_any_element(),
+                            )
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(Theme::TEXT_BODY)),
                         ),
                     )
                     .when_some(error.clone(), |el, message| {
                         el.child(
                             div()
                                 .mt(px(8.0))
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(red_text)
                                 .child(message),
                         )
@@ -1113,7 +1115,7 @@ impl AccountsPage {
                                 .mt(px(14.0))
                                 .px(px(14.0))
                                 .py(px(10.0))
-                                .rounded(px(8.0))
+                                .rounded(px(Theme::RADIUS_ROW))
                                 .bg(theme.white_alpha(0.05))
                                 .flex()
                                 .flex_row()
@@ -1121,7 +1123,7 @@ impl AccountsPage {
                                 .child(
                                     div()
                                         .font_family(theme.font_mono.clone())
-                                        .text_size(px(22.0))
+                                        .text_size(px(Theme::TEXT_FIGURE))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text)
                                         .child(code),
@@ -1139,7 +1141,7 @@ impl AccountsPage {
                                 .child(crate::loaders::gradient_spinner("login-poll", &theme, 3.0))
                                 .child(
                                     div()
-                                        .text_size(px(12.5))
+                                        .text_size(px(Theme::TEXT_DENSE))
                                         .text_color(theme.text_muted)
                                         .child(message.clone().unwrap_or_else(|| {
                                             SharedString::from(if device_code {
@@ -1155,26 +1157,21 @@ impl AccountsPage {
                         el.child(
                             div()
                                 .mt(px(12.0))
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(red_text)
                                 .child(message),
                         )
                     })
                     .child(
-                        div()
-                            .mt(px(16.0))
-                            .flex()
-                            .flex_row()
-                            .justify_end()
-                            .child(
-                                popover::btn_ghost(
-                                    &theme,
-                                    if has_error { "Close" } else { "Cancel" },
-                                    "login-cancel",
-                                )
-                                .id("login-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
-                            ),
+                        div().mt(px(16.0)).flex().flex_row().justify_end().child(
+                            popover::btn_ghost(
+                                &theme,
+                                if has_error { "Close" } else { "Cancel" },
+                                "login-cancel",
+                            )
+                            .id("login-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                        ),
                     )
                     .into_any_element()
             }
@@ -1197,40 +1194,40 @@ impl AccountsPage {
         theme: &Theme,
     ) -> AnyElement {
         use crate::motion::{self, AnimationExt as _};
-        let ghost = |w: gpui::Length, h: f32, round_full: bool| {
+        // One shape for every placeholder — the badge it stands in for stopped
+        // being a full-round pill when the radii closed (gh#174).
+        let ghost = |w: gpui::Length, h: f32| {
             div()
                 .w(w)
                 .h(px(h))
                 .flex_none()
-                .map(|el| {
-                    if round_full {
-                        el.rounded_full()
-                    } else {
-                        el.rounded(px(4.0))
-                    }
-                })
+                .rounded(px(Theme::RADIUS_CHIP))
                 .bg(theme.white_alpha(0.05))
         };
-        let meters = div().mt(px(8.0)).flex().flex_col().gap(px(7.0)).children(
-            (0..2).map(|_| {
+        let meters = div()
+            .mt(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .children((0..2).map(|_| {
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .child(ghost(px(48.0).into(), 9.0, false))
+                    .child(ghost(px(48.0).into(), 9.0))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(56.0))
                             .max_w(px(230.0))
                             .h(px(5.0))
+                            // round-ok: the usage-bar placeholder, capped like the bar
                             .rounded_full()
                             .bg(theme.white_alpha(0.04)),
                     )
-                    .child(ghost(px(64.0).into(), 9.0, false))
-            }),
-        );
+                    .child(ghost(px(64.0).into(), 9.0))
+            }));
         let inner = div()
             .flex()
             .flex_row()
@@ -1241,14 +1238,14 @@ impl AccountsPage {
                     .flex_none()
                     .self_center()
                     .size(px(32.0))
-                    .rounded_full()
+                    .rounded(px(Theme::RADIUS_ROW))
                     .bg(theme.white_alpha(0.05)),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(ghost(px(176.0).into(), 13.0, false).max_w(gpui::relative(0.6)))
+                    .child(ghost(px(176.0).into(), 13.0).max_w(gpui::relative(0.6)))
                     .child(meters),
             )
             .child(
@@ -1257,7 +1254,7 @@ impl AccountsPage {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .child(ghost(px(64.0).into(), 21.0, true)),
+                    .child(ghost(px(64.0).into(), 21.0)),
             );
         div()
             .px(px(20.0))
@@ -1333,7 +1330,7 @@ impl Render for AccountsPage {
                                 .child(provider_mark(harness, &theme))
                                 .child(
                                     div()
-                                        .text_size(px(14.0))
+                                        .text_size(px(Theme::TEXT_BODY))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text)
                                         .child(SharedString::from(name)),
@@ -1373,7 +1370,7 @@ impl Render for AccountsPage {
                         .child(
                             div()
                                 .mt(px(4.0))
-                                .text_size(px(11.5))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from("Click to retry")),
                         )
@@ -1409,7 +1406,7 @@ impl Render for AccountsPage {
                                     .px(px(20.0))
                                     .py(px(32.0))
                                     .text_center()
-                                    .text_size(px(14.0))
+                                    .text_size(px(Theme::TEXT_BODY))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from(if supports_login(harness) {
                                         format!(
@@ -1442,7 +1439,7 @@ impl Render for AccountsPage {
                                 .into_any_element()
                         } else if has_rows {
                             div()
-                                .text_size(px(11.5))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .text_color(theme.text_subtle)
                                 .child(SharedString::from("Signed in via opencode"))
                                 .into_any_element()
@@ -1464,7 +1461,7 @@ impl Render for AccountsPage {
                                     .child(provider_mark(harness, &theme))
                                     .child(
                                         div()
-                                            .text_size(px(14.0))
+                                            .text_size(px(Theme::TEXT_BODY))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(theme.text)
                                             .child(SharedString::from(name)),
@@ -1505,7 +1502,7 @@ impl Render for AccountsPage {
                                 widgets::ghost_action(&theme)
                                     .id("accounts-refresh")
                                     .flex_none()
-                                    .text_size(px(12.5))
+                                    .text_size(px(Theme::TEXT_DENSE))
                                     .hover(widgets::ghost_hover(&theme))
                                     .when(refreshing, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1542,7 +1539,7 @@ impl Render for AccountsPage {
                     .child(
                         div()
                             .mt(px(24.0))
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .line_height(px(19.0))
                             .text_color(theme.text_subtle)
                             .child(SharedString::from(

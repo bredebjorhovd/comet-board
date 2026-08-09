@@ -530,7 +530,7 @@ impl Render for RoutingPage {
                     card = card.child(
                         widgets::card_row(&theme, true).child(
                             div()
-                                .text_size(px(12.5))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(
                                     "No routes — every row on the board reads `no route`.",
@@ -549,7 +549,7 @@ impl Render for RoutingPage {
                     .child(
                         div()
                             .mt(px(28.0))
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
                             .child(SharedString::from("Not on the board yet")),
@@ -725,7 +725,7 @@ impl RoutingPage {
                 .child(widgets::row_title(theme, "Onboard a repo"))
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(
                             "The repos the board's GitHub App can see. Onboarding clones on \
@@ -768,7 +768,7 @@ impl RoutingPage {
             card = card.child(
                 widgets::card_row(theme, false).child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text_muted)
                         .child(note),
                 ),
@@ -780,7 +780,7 @@ impl RoutingPage {
                 card = card.child(
                     widgets::card_row(theme, false).child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(SharedString::from("Asking the board what its App can see…")),
                     ),
@@ -791,7 +791,7 @@ impl RoutingPage {
                     card = card.child(
                         widgets::card_row(theme, false).child(
                             div()
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(theme.text_muted)
                                 .child(note),
                         ),
@@ -887,7 +887,7 @@ impl RoutingPage {
         for line in lines {
             row = row.child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(line)),
             );
@@ -969,7 +969,7 @@ impl RoutingPage {
                     ))
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(theme.text_subtle)
                             .child(SharedString::from(dialog.field.empty_hint())),
                     )

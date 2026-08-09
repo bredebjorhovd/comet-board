@@ -241,6 +241,7 @@ impl Render for DevicesPage {
                         .bottom(px(-3.0))
                         .right(px(-3.0))
                         .size(px(9.0))
+                        // round-ok: presence dot
                         .rounded_full()
                         .border_2()
                         .border_color(theme.surface)
@@ -296,7 +297,7 @@ impl Render for DevicesPage {
                     div()
                         .id(("device-id", ix))
                         .font_family(theme.font_mono.clone())
-                        .text_size(px(10.5))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(if id_copied {
                             theme.settled_text()
                         } else {
@@ -362,7 +363,7 @@ impl Render for DevicesPage {
                     .px(px(20.0))
                     .py(px(40.0))
                     .text_center()
-                    .text_size(px(14.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from("No devices registered")),
             )

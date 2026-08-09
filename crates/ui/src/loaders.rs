@@ -208,7 +208,7 @@ pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
 /// rev).
 pub fn loading_word(theme: &Theme) -> impl IntoElement {
     div()
-        .text_size(px(11.0))
+        .text_size(px(Theme::TEXT_CAPTION))
         .text_color(theme.text_subtle)
         .child(SharedString::from(
             "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",

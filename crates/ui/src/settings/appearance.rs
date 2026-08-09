@@ -73,7 +73,7 @@ impl gpui::Render for AppearancePage {
                         .flex_col()
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from(title)),
@@ -81,7 +81,7 @@ impl gpui::Render for AppearancePage {
                         .child(
                             div()
                                 .mt(px(2.0))
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(description)),
                         ),
@@ -123,6 +123,7 @@ fn theme_radio(theme: &Theme, selected: bool) -> gpui::Div {
         div()
             .flex_none()
             .size(px(18.0))
+            // round-ok: a radio ring — square it and it reads as a checkbox
             .rounded_full()
             .bg(theme.accent)
             .flex()
@@ -137,6 +138,7 @@ fn theme_radio(theme: &Theme, selected: bool) -> gpui::Div {
         div()
             .flex_none()
             .size(px(18.0))
+            // round-ok: the empty radio ring
             .rounded_full()
             .border_1()
             .border_color(theme.border_strong)

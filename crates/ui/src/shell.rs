@@ -1923,7 +1923,7 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .pt(px(12.0))
                             .pb(px(4.0))
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_subtle)
                             .child(SharedString::from("Settings")),
@@ -1937,10 +1937,10 @@ impl Shell {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .rounded(px(8.0))
+                                .rounded(px(Theme::RADIUS_ROW))
                                 .px(px(Theme::SPACE_SM))
                                 .py(px(6.0))
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .when(selected, |el| {
                                     el.bg(theme.wash(0.17))
                                         .font_weight(gpui::FontWeight::MEDIUM)
@@ -1973,10 +1973,10 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
-                        .rounded(px(8.0))
+                        .rounded(px(Theme::RADIUS_ROW))
                         .px(px(Theme::SPACE_SM))
                         .py(px(6.0))
-                        .text_size(px(13.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.wash(0.11)).text_color(theme.text))
@@ -2123,10 +2123,10 @@ impl Shell {
                         .mb(px(Theme::SPACE_SM))
                         .px(px(Theme::SPACE_SM))
                         .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .border_1()
                         .border_color(theme.danger)
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.danger)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2187,13 +2187,13 @@ impl Shell {
             // SPACE_SM padding — doubling it read as a hole (user report).
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
+            .rounded(px(Theme::RADIUS_CHIP))
             .bg(chip_bg)
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .text_size(px(11.0))
+            .text_size(px(Theme::TEXT_CAPTION))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
             .child(
@@ -2307,7 +2307,7 @@ impl Shell {
         let mut trigger = div()
             .id("user-menu")
             .flex_none()
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(Theme::SPACE_SM))
             .flex()
@@ -2339,12 +2339,12 @@ impl Shell {
                 div()
                     .size(px(28.0))
                     .flex_none()
-                    .rounded_full()
+                    .rounded(px(Theme::RADIUS_ROW))
                     .bg(theme.text)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.0))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.bg)
                     .child(initial),
@@ -2358,7 +2358,7 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .line_height(px(17.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
@@ -2367,7 +2367,7 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .line_height(px(15.0))
                             .text_color(theme.text_muted)
                             .child(SharedString::from("Alpha")),
@@ -2396,7 +2396,7 @@ impl Shell {
                         .px(px(8.0))
                         .pt(px(6.0))
                         .pb(px(4.0))
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .truncate()
                         .child(user_email.unwrap_or(user_line)),
@@ -2714,7 +2714,7 @@ impl Shell {
                         .child(
                             div()
                                 .mt(px(24.0))
-                                .text_size(px(16.0))
+                                .text_size(px(Theme::TEXT_TITLE))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from("Pick a repo to get started")),
@@ -2722,7 +2722,7 @@ impl Shell {
                         .child(
                             div()
                                 .mt(px(6.0))
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(
                                     // gh#118: the picker's front door is repos,
@@ -2770,7 +2770,7 @@ impl Shell {
                         .child(
                             div()
                                 .mt(px(24.0))
-                                .text_size(px(14.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .text_color(theme.text_muted)
                                 .child(helper),
                         ),
@@ -2849,7 +2849,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(13.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text)
                         .child("Drop images to attach"),
                 )
@@ -2882,7 +2882,7 @@ impl Shell {
                     div()
                         .id("jump-to-bottom-btn")
                         .h(px(30.0))
-                        .rounded_full()
+                        .rounded(px(Theme::RADIUS_ROW))
                         .border_1()
                         .border_color(theme.border)
                         .shadow_md()
@@ -2908,13 +2908,13 @@ impl Shell {
                         }))
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from("↓")),
                         )
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .text_color(theme.text)
                                 .child(SharedString::from("Scroll to bottom")),
                         ),
@@ -3014,7 +3014,7 @@ impl Shell {
             .items_center()
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG + 8.0))
-            .text_size(px(11.0));
+            .text_size(px(Theme::TEXT_CAPTION));
 
         let Some(chat_id) = state.selected_chat.clone() else {
             return strip.into_any_element();
@@ -3035,7 +3035,7 @@ impl Shell {
                     .child(loaders::gradient_spinner("working-indicator", &theme, 2.5))
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(format!("{word}…"))),
                     )
@@ -3057,7 +3057,7 @@ impl Shell {
                 .child(loaders::gradient_spinner("sending-indicator", &theme, 2.5))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text_muted)
                         .child(SharedString::from("Sending…")),
                 )
@@ -3105,7 +3105,7 @@ impl Shell {
             .left(px(0.0));
         let card = div()
             .size_full()
-            .rounded(px(12.0))
+            .rounded(px(Theme::RADIUS_CARD))
             .border_1()
             .border_color(theme.border)
             .bg(bg)
@@ -3142,7 +3142,7 @@ impl Shell {
                 .gap(px(Theme::SPACE_MD))
                 .child(
                     div()
-                        .text_size(px(14.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(error.clone())),
                 )
@@ -3151,10 +3151,10 @@ impl Shell {
                         .id("retry-engine")
                         .px(px(12.0))
                         .py(px(6.0))
-                        .rounded(px(8.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .border_1()
                         .border_color(theme.border)
-                        .text_size(px(13.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.element_hover))
@@ -3168,7 +3168,7 @@ impl Shell {
                 .w(px(360.0))
                 .px(px(32.0))
                 .py(px(40.0))
-                .rounded(px(12.0))
+                .rounded(px(Theme::RADIUS_CARD))
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.surface)
@@ -3186,7 +3186,7 @@ impl Shell {
                 .child(
                     div()
                         .mt(px(24.0))
-                        .text_size(px(18.0))
+                        .text_size(px(Theme::TEXT_TITLE))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
                         .child(SharedString::from("Log in to Comet")),
@@ -3195,7 +3195,7 @@ impl Shell {
                     div()
                         .mt(px(6.0))
                         .mb(px(24.0))
-                        .text_size(px(13.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .line_height(px(19.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(
@@ -3210,9 +3210,9 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_ROW))
                         .bg(theme.text)
-                        .text_size(px(14.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.bg)
                         .cursor_pointer()
@@ -3282,7 +3282,7 @@ impl Shell {
                                 .id("orgs-retry")
                                 .px(px(Theme::SPACE_SM))
                                 .py(px(3.0))
-                                .rounded(px(Theme::CONTROL_RADIUS))
+                                .rounded(px(Theme::RADIUS_CHIP))
                                 .border_1()
                                 .border_color(theme.border)
                                 .text_color(theme.text)
@@ -3301,7 +3301,7 @@ impl Shell {
                     .child(
                         div()
                             .pb(px(8.0))
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_subtle)
                             .child(SharedString::from(
@@ -3315,11 +3315,11 @@ impl Shell {
                                 .id(("org-row", ix))
                                 .px(px(12.0))
                                 .py(px(8.0))
-                                .rounded(px(8.0))
+                                .rounded(px(Theme::RADIUS_ROW))
                                 .border_1()
                                 .border_color(theme.border)
                                 .bg(theme.bg)
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .text_color(theme.text)
                                 .when(submitting, |el| el.opacity(0.5))
                                 .cursor_pointer()
@@ -3343,7 +3343,7 @@ impl Shell {
             .child(
                 div()
                     .pb(px(8.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(
@@ -3363,11 +3363,11 @@ impl Shell {
                             .flex()
                             .items_center()
                             .px(px(12.0))
-                            .rounded(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .border_1()
                             .border_color(theme.border)
                             .bg(theme.bg)
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .child(invite_input),
                     )
                     .child(
@@ -3377,10 +3377,10 @@ impl Shell {
                             .px(px(16.0))
                             .flex()
                             .items_center()
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .border_1()
                             .border_color(theme.border)
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .when(submitting, |el| el.opacity(0.5))
@@ -3408,7 +3408,7 @@ impl Shell {
             .w(px(400.0))
             .px(px(32.0))
             .py(px(36.0))
-            .rounded(px(12.0))
+            .rounded(px(Theme::RADIUS_CARD))
             .border_1()
             .border_color(theme.border)
             .bg(theme.surface)
@@ -3424,7 +3424,7 @@ impl Shell {
             .child(
                 div()
                     .mt(px(20.0))
-                    .text_size(px(18.0))
+                    .text_size(px(Theme::TEXT_TITLE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from("Create your workspace")),
@@ -3433,7 +3433,7 @@ impl Shell {
                 div()
                     .mt(px(6.0))
                     .mb(px(24.0))
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(blurb),
@@ -3451,11 +3451,11 @@ impl Shell {
                             .flex()
                             .items_center()
                             .px(px(12.0))
-                            .rounded(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .border_1()
                             .border_color(theme.border)
                             .bg(theme.bg)
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .child(name_input),
                     )
                     .child(
@@ -3465,9 +3465,9 @@ impl Shell {
                             .px(px(16.0))
                             .flex()
                             .items_center()
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .bg(theme.text)
-                            .text_size(px(14.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.bg)
                             .when(submitting, |el| el.opacity(0.5))
@@ -3487,7 +3487,7 @@ impl Shell {
                 el.child(
                     div()
                         .mt(px(16.0))
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .line_height(px(17.0))
                         .text_color(theme.danger_text())
                         .child(message),
@@ -3497,7 +3497,7 @@ impl Shell {
                 div().mt(px(24.0)).flex().flex_row().child(
                     div()
                         .id("org-signout")
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text_subtle)
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
@@ -3630,7 +3630,7 @@ fn window_control_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .cursor_pointer()
         // comet window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
@@ -3703,7 +3703,7 @@ fn header_icon_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .cursor_pointer()
         // comet __root.tsx header buttons: `transition-colors`.
         .bg(motion::hover_blend(
@@ -3787,7 +3787,7 @@ impl Render for Shell {
             .bg(frost)
             .text_color(text)
             .font_family(font)
-            .text_size(px(14.0))
+            .text_size(px(Theme::TEXT_BODY))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
@@ -3921,7 +3921,7 @@ impl Render for Shell {
                     .mb(px(8.0))
                     .mr(px(right_gap))
                     .ml(px(8.0))
-                    .rounded(px(12.0))
+                    .rounded(px(Theme::RADIUS_CARD))
                     .border_color(border_color)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (comet
