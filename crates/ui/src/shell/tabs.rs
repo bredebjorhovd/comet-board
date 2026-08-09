@@ -20,6 +20,7 @@
 use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
+use crate::theme::Bed;
 use comet_proto::ChatIndicator;
 
 /// Fixed tab width (terminal tabs use 118; session titles get a bit more).
@@ -253,12 +254,22 @@ impl Shell {
                 // `on_hover` per element, and the state listener wins.
                 // Three tones, three states: the selected tab reads as a
                 // title, hover lifts to body, the rest sit at label weight.
+                // The surface comes from the app's row helper — a tab is a
+                // list row that happens to be horizontal (gh#175).
+                let paint = theme.row(Bed::Shell, is_selected);
                 let (text_color, bg) = if is_selected {
-                    (theme.text, theme.glass_selected_bg())
+                    (
+                        paint.text,
+                        if is_hovered {
+                            paint.hovered
+                        } else {
+                            paint.rest
+                        },
+                    )
                 } else if is_hovered {
-                    (theme.text_muted, theme.element_hover)
+                    (theme.text_muted, paint.hovered)
                 } else {
-                    (theme.text_subtle, theme.wash(0.0))
+                    (theme.text_subtle, paint.rest)
                 };
                 let brand = harness.map(crate::pickers::harness_brand_icon);
                 let select_id = id.clone();
@@ -329,7 +340,7 @@ impl Shell {
                     .text_size(px(Theme::TEXT_DENSE))
                     .text_color(text_color)
                     .bg(bg)
-                    .when(is_selected, |el| el.shadow(theme.glass_selected_shadows()))
+                    .shadow(paint.ring.clone())
                     .cursor_pointer()
                     // Tabs sit inside the titlebar drag strip — carve them out.
                     // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
@@ -430,15 +441,12 @@ impl Shell {
             .justify_center()
             .rounded(px(Theme::RADIUS_CHIP))
             .cursor_pointer()
-            .bg(if on_canvas && has_space {
-                theme.glass_selected_bg()
-            } else {
-                motion::hover_blend("session-tab-new", theme.wash(0.0), theme.wash(0.12))
-            })
-            .when(on_canvas && has_space, |el| {
-                el.shadow(theme.glass_selected_shadows())
-            })
-            .on_hover(motion::hover_listener("session-tab-new"))
+            .list_row(
+                &theme,
+                Bed::Shell,
+                on_canvas && has_space,
+                "session-tab-new",
+            )
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
