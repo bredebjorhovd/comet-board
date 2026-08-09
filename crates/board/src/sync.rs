@@ -2970,6 +2970,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();
@@ -2993,6 +2994,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
         })
         .unwrap()
@@ -3781,6 +3783,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();

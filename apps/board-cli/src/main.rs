@@ -708,41 +708,45 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => {
-            let (engine, spaces, accounts, edge) = match runtime.block_on(fetch_spaces(port)) {
-                Ok(info) => (
-                    EngineStatus {
-                        reachable: true,
-                        detail: format!(
-                            "listening on 127.0.0.1:{port} (device {}, {} space(s) here)",
-                            info.device,
-                            info.spaces.len()
-                        ),
-                        version: info.version,
-                    },
-                    Some(info.spaces),
-                    Some(info.accounts),
-                    info.edge,
-                ),
-                Err(e) => (
-                    EngineStatus {
-                        reachable: false,
-                        detail: format!(
-                            "not reachable on 127.0.0.1:{port} ({e:#}) — start `comet` or \
-                             `comet headless`"
-                        ),
-                        version: None,
-                    },
-                    None,
-                    None,
-                    None,
-                ),
-            };
+            let (engine, spaces, accounts, edge, members) =
+                match runtime.block_on(fetch_spaces(port)) {
+                    Ok(info) => (
+                        EngineStatus {
+                            reachable: true,
+                            detail: format!(
+                                "listening on 127.0.0.1:{port} (device {}, {} space(s) here)",
+                                info.device,
+                                info.spaces.len()
+                            ),
+                            version: info.version,
+                        },
+                        Some(info.spaces),
+                        Some(info.accounts),
+                        info.edge,
+                        info.members,
+                    ),
+                    Err(e) => (
+                        EngineStatus {
+                            reachable: false,
+                            detail: format!(
+                                "not reachable on 127.0.0.1:{port} ({e:#}) — start `comet` or \
+                                 `comet headless`"
+                            ),
+                            version: None,
+                        },
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                };
             let checks = comet_board::doctor::doctor(
                 &paths,
                 &engine,
                 spaces.as_deref(),
                 accounts.as_deref(),
                 edge.as_ref(),
+                members,
             )?;
             if !comet_board::doctor::print_doctor(&checks) {
                 std::process::exit(1);
@@ -1167,6 +1171,11 @@ struct EngineInfo {
     spaces: Vec<Space>,
     accounts: Vec<comet_proto::AgentAccount>,
     edge: Option<comet_proto::EdgeHealth>,
+    /// How many people are in this workspace (gh#161). `None` when the engine
+    /// could not be asked, or has no WorkOS session to ask with — doctor then
+    /// says the fallback account was not checked rather than inventing a
+    /// one-person box.
+    members: Option<usize>,
 }
 
 /// This device's spaces, from the engine: `LocalDevice` for the device id (and
@@ -1221,12 +1230,26 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             .await
             .ok()
             .and_then(|v| serde_json::from_value(v).ok());
+        // Best-effort again, and for one line of doctor's report: an engine in
+        // dev mode or signed out answers an empty roster, and a workspace of
+        // nobody is not a workspace of one — so an empty answer stays `None`.
+        let members: Option<usize> = client
+            .call(methods::LIST_MEMBERS, serde_json::json!({}))
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("members")
+                    .and_then(|m| m.as_array())
+                    .map(|m| m.len())
+                    .filter(|n| *n > 0)
+            });
         Ok::<_, anyhow::Error>(EngineInfo {
             device,
             version,
             spaces: mine,
             accounts,
             edge,
+            members,
         })
     };
     tokio::time::timeout(FETCH_TIMEOUT, fetch)

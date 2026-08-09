@@ -4,8 +4,9 @@
 //! relay and speaking ordinary [`RpcClient`] RPC over it).
 //!
 //! Frame encoding (must stay byte-identical to `edge/src/device-room.ts`):
-//! `uleb128(header_len) ‖ UTF-8 JSON header ‖ payload`, header `{s, k, to?, from?}`.
-//! - client → DO: the DO stamps `from = connId` and forwards to the host socket;
+//! `uleb128(header_len) ‖ UTF-8 JSON header ‖ payload`, header `{s, k, to?, from?, u?, o?}`.
+//! - client → DO: the DO stamps `from = connId` — and `u`/`o`, the identity the edge
+//!   verified for that socket (gh#161) — and forwards to the host socket;
 //! - host → DO: must carry `to = connId`; the DO strips routing keys and delivers;
 //! - relay control frames use kind [`RELAY_KIND`] with payload `{"error": code}` —
 //!   codes `host_offline`, `host_closed`, `client_gone`, `client_closed`;
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{RpcClient, RpcError, RpcService, serve_connection};
+use crate::{Caller, RpcClient, RpcError, RpcService, serve_connection_as};
 
 /// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
 /// leading space — clients compare with equality; a mismatch makes host_offline invisible).
@@ -67,8 +68,8 @@ const SILENCE_LEASE: Duration = Duration::from_secs(40);
 // ---------------------------------------------------------------------------
 
 /// The JSON frame header. Field order matters for byte-parity with the TS encoder
-/// (`JSON.stringify` of `{s, k, to?, from?}`); absent routing keys are omitted, not null.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// (`JSON.stringify` of `{s, k, to?, from?, u?, o?}`); absent keys are omitted, not null.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceFrameHeader {
     /// Stream id, unique per (connId, logical stream).
     pub s: String,
@@ -80,6 +81,18 @@ pub struct DeviceFrameHeader {
     /// Routing: client → host origin (stamped by the relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// The WorkOS user id the edge verified for the sending socket, stamped by
+    /// the relay the way `from` is (gh#161). Never written by a client and
+    /// never read off the payload: the DO builds this header itself from the
+    /// `x-comet-auth-user` the Worker put on the socket's own request, so a
+    /// frontend cannot set it and a frame that arrives *without* it did not
+    /// come through the relay at all — it came from the host's own device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub u: Option<String>,
+    /// The verified org claim that rode with `u`, when the caller's session
+    /// carried one. Same provenance, same rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub o: Option<String>,
 }
 
 impl DeviceFrameHeader {
@@ -87,14 +100,22 @@ impl DeviceFrameHeader {
         Self {
             s: s.into(),
             k: k.into(),
-            to: None,
-            from: None,
+            ..Self::default()
         }
     }
 
     pub fn with_to(mut self, conn_id: impl Into<String>) -> Self {
         self.to = Some(conn_id.into());
         self
+    }
+
+    /// The identity the relay stamped on this frame, as the RPC layer's
+    /// [`Caller`]. All-unset for a frame that carries none.
+    pub fn caller(&self) -> Caller {
+        Caller {
+            user: self.u.clone().filter(|v| !v.is_empty()),
+            org: self.o.clone().filter(|v| !v.is_empty()),
+        }
     }
 }
 
@@ -353,14 +374,26 @@ struct VirtualConn {
     in_tx: mpsc::Sender<String>,
 }
 
+/// What a virtual connection is keyed by: the relay's `connId` **and** the
+/// verified identity stamped beside it.
+///
+/// The identity is part of the key rather than a property of the conn because
+/// `connId` is chosen by the dialing client (`?connId=`), so two different
+/// people can pick the same string. Keying on the pair means the second one
+/// gets their own dispatch loop under their own [`Caller`] instead of
+/// inheriting whoever opened the id first — the one way a frame could
+/// otherwise be served as somebody it is not.
+type ConnKey = (String, Option<String>);
+
 fn make_virtual_conn(
     service: Arc<dyn RpcService>,
     conn_id: String,
+    caller: Caller,
     host_out: mpsc::Sender<Vec<u8>>,
 ) -> VirtualConn {
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
     let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<String>(256);
-    tokio::spawn(serve_connection(service, srv_out_tx, in_rx));
+    tokio::spawn(serve_connection_as(service, srv_out_tx, in_rx, caller));
     tokio::spawn(async move {
         while let Some(text) = srv_out_rx.recv().await {
             let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(conn_id.clone());
@@ -392,7 +425,7 @@ async fn host_session(
     let (mut sink, mut stream) = ws.split();
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
-    let mut conns: HashMap<String, VirtualConn> = HashMap::new();
+    let mut conns: HashMap<ConnKey, VirtualConn> = HashMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
@@ -445,7 +478,7 @@ async fn host_session(
 
 async fn handle_host_frame(
     bytes: &[u8],
-    conns: &mut HashMap<String, VirtualConn>,
+    conns: &mut HashMap<ConnKey, VirtualConn>,
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
@@ -463,7 +496,10 @@ async fn handle_host_frame(
         let code = relay_error_code(&payload).unwrap_or_default();
         if let Some(conn_id) = header.from.as_deref().or(header.to.as_deref()) {
             tracing::debug!(conn = %conn_id, %code, "device-room: client conn torn down");
-            conns.remove(conn_id);
+            // Every identity that used this conn id, not just the one the
+            // teardown frame happens to be stamped with: the socket is gone,
+            // so nothing keyed to it can still be spoken to.
+            conns.retain(|(id, _), _| id != conn_id);
         }
         return;
     }
@@ -485,12 +521,16 @@ async fn handle_host_frame(
     if header.k != RPC_KIND {
         return; // future stream kinds (term, tunnel)
     }
-    let Some(from) = header.from else {
+    let Some(from) = header.from.clone() else {
         return;
     };
+    // Whoever the edge verified for this socket, carried on the frame the relay
+    // built. Nothing here consults the payload: the RPC body is the client's to
+    // write, and this is not.
+    let caller = header.caller();
     let conn = conns
-        .entry(from.clone())
-        .or_insert_with(|| make_virtual_conn(service.clone(), from, out_tx.clone()));
+        .entry((from.clone(), caller.user.clone()))
+        .or_insert_with(|| make_virtual_conn(service.clone(), from, caller, out_tx.clone()));
     let text = String::from_utf8_lossy(&payload).into_owned();
     if conn.in_tx.send(text).await.is_err() {
         tracing::warn!("device-room: virtual conn dispatch loop gone");
@@ -924,6 +964,37 @@ mod tests {
         let expected = br#"{"s":"s1","k":"term","to":"c9"}"#;
         assert_eq!(routed[0] as usize, expected.len());
         assert_eq!(&routed[1..1 + expected.len()], expected);
+    }
+
+    /// gh#161: the relay stamps the verified caller beside `from`, and the two
+    /// encoders have to agree about it down to the key order — the DO writes
+    /// these frames and this decoder reads them.
+    #[test]
+    fn the_verified_caller_rides_the_header_in_the_ts_key_order() {
+        let mut h = header("rpc", "rpc");
+        h.from = Some("c1".into());
+        h.u = Some("user_01".into());
+        h.o = Some("org_01".into());
+        let frame = encode_device_frame(&h, b"{}").expect("encode");
+        let expected = br#"{"s":"rpc","k":"rpc","from":"c1","u":"user_01","o":"org_01"}"#;
+        assert_eq!(frame[0] as usize, expected.len());
+        assert_eq!(&frame[1..1 + expected.len()], expected);
+        let (decoded, payload) = decode_device_frame(&frame).expect("decode");
+        assert_eq!(decoded, h);
+        assert_eq!(payload, b"{}");
+        assert_eq!(decoded.caller().user(), Some("user_01"));
+
+        // A frame with no stamp is a local one, and says so rather than
+        // reading as an anonymous remote caller.
+        let bare = header("rpc", "rpc");
+        assert_eq!(bare.caller(), Caller::LOCAL);
+        assert!(!bare.caller().is_verified());
+
+        // Older peers send neither key; that has to stay decodable.
+        let (old, _) =
+            decode_device_frame(&encode_device_frame(&header("a", "rpc"), b"").expect("encode"))
+                .expect("decode");
+        assert_eq!(old.u, None);
     }
 
     #[test]

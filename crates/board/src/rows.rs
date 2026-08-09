@@ -82,6 +82,10 @@ pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> Task
         // deliver to. The device id stays off the wire: it identifies a laptop,
         // not a person, and a reader has no way to resolve one.
         dispatched_by_user: live.or(last).and_then(|a| a.dispatched_by_user.clone()),
+        // …and how much that name is worth (gh#161). Carried beside it rather
+        // than folded into the string, so a viewport can render the difference
+        // in its own idiom instead of parsing a suffix out of a name.
+        dispatched_by_verified: live.or(last).is_some_and(|a| a.dispatched_by_verified),
         last_outcome: closed
             .and_then(|a| a.outcome)
             .map(|o| o.as_str().to_string()),
@@ -200,6 +204,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();
@@ -234,6 +239,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: Some("laptop-ana".into()),
             dispatched_by_user: Some("ana@example.com".into()),
+            dispatched_by_verified: false,
             billed_to: None,
         })
         .unwrap();
@@ -268,6 +274,7 @@ mod tests {
                 repo_path: None,
                 dispatched_by_device: None,
                 dispatched_by_user: None,
+                dispatched_by_verified: false,
                 billed_to: None,
             })
             .unwrap();
@@ -286,6 +293,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
         })
         .unwrap();
@@ -349,6 +357,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
         })
         .unwrap();
@@ -420,6 +429,7 @@ mod tests {
             repo_path: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
+            dispatched_by_verified: false,
             billed_to: None,
         })
         .unwrap();

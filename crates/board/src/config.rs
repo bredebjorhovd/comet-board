@@ -555,9 +555,12 @@ pub struct Defaults {
     /// outright (`--bill`). `off` says nothing, which is the right answer on a
     /// box where one person's plan pays for everything.
     ///
-    /// A seatbelt, not a lock: the match is the dispatching frontend's `viaUser`
-    /// claim against the agent-account's email, and the box cannot check that
-    /// claim until #66's verified identity lands. See [`crate::billing`].
+    /// What the match is made of depends on where the dispatch came from
+    /// (gh#161): a relayed one is compared against the identity the edge
+    /// verified and the relay stamped on the frame, which no frontend can
+    /// write; one issued on the box carries no stamp and is compared against
+    /// the frontend's `viaUser`, which is all a local shell can be asked for.
+    /// See [`crate::billing`].
     #[serde(default = "default_billing_guard")]
     pub billing_guard: String,
 }
