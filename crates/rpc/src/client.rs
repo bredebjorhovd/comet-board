@@ -153,7 +153,7 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
     if let Some(err) = frame.err {
         match shared.lock().remove(&id) {
             Some(Pending::Call(tx)) => {
-                let _ = tx.send(Err(RpcError::Failed(err)));
+                let _ = tx.send(Err(RpcError::from_wire(frame.code.as_deref(), err)));
             }
             Some(Pending::Stream(_)) | None => {
                 // Stream errored: the sender drop closes the receiver.

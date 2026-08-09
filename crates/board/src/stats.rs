@@ -563,6 +563,18 @@ mod tests {
 
     // -- the dashboard's series (gh#143) ------------------------------------
 
+    /// The local day an attempt started `mins_ago` minutes back, as the bucket
+    /// key `day_series` builds. Buckets are LOCAL dates, so "10 minutes ago" is
+    /// only "today" until 00:10 — these tests were red in CI for the first
+    /// twenty minutes of every UTC day until they asked this instead of
+    /// assuming (found 2026-08-09 00:08 UTC).
+    fn bucket_of(mins_ago: i64) -> String {
+        (chrono::Local::now() - chrono::Duration::minutes(mins_ago))
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
     #[test]
     fn a_window_draws_a_bar_for_every_day_including_the_quiet_ones() {
         // Two dispatches today and nothing for the six days before it: the
@@ -577,15 +589,26 @@ mod tests {
         )];
         let s = gather(&tasks, Some(7));
         assert_eq!(s.daily.len(), 7);
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        let last = s.daily.last().unwrap();
-        assert_eq!(last.date, today);
-        assert_eq!(last.dispatches, 2);
-        assert_eq!(last.done, 1, "only the one that ended done");
-        assert!(s.daily[..6].iter().all(|d| d.dispatches == 0));
+        // Which local day each attempt lands in is not the point and must not
+        // be assumed: at 00:05 the two are on opposite sides of midnight. The
+        // properties are that the window has a bar per day, that the dispatches
+        // are in the days they actually happened, and that every other day is
+        // present and empty.
+        let done_day = bucket_of(10);
+        let cancelled_day = bucket_of(20);
+        let bar = |date: &str| s.daily.iter().find(|d| d.date == date).unwrap_or_else(|| panic!("{date} is in the window"));
+        assert_eq!(bar(&done_day).done, 1, "only the one that ended done");
+        assert!(bar(&done_day).dispatches >= 1);
+        assert!(bar(&cancelled_day).dispatches >= 1);
+        assert_eq!(s.daily.iter().map(|d| d.dispatches).sum::<usize>(), 2);
+        assert_eq!(s.daily.iter().map(|d| d.done).sum::<usize>(), 1);
+        assert!(
+            s.daily
+                .iter()
+                .filter(|d| d.date != done_day && d.date != cancelled_day)
+                .all(|d| d.dispatches == 0),
+            "every other day is present and empty"
+        );
     }
 
     #[test]
@@ -739,9 +762,11 @@ mod tests {
         let dates: Vec<&str> = s.daily.iter().map(|d| d.date.as_str()).collect();
         let token_dates: Vec<&str> = s.daily_tokens.iter().map(|d| d.date.as_str()).collect();
         assert_eq!(dates, token_dates);
-        assert_eq!(s.daily_tokens.last().unwrap().usage.total(), 1_100);
+        let day = bucket_of(10);
+        let spent = s.daily_tokens.iter().find(|d| d.date == day).expect("the day is in the window");
+        assert_eq!(spent.usage.total(), 1_100);
         assert!(
-            s.daily_tokens[..6].iter().all(|d| d.usage.is_zero()),
+            s.daily_tokens.iter().filter(|d| d.date != day).all(|d| d.usage.is_zero()),
             "quiet days are present with zeroes, like the bars above them"
         );
     }

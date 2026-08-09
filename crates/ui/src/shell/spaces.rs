@@ -50,7 +50,7 @@ use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use chrono::DateTime;
 use comet_proto::view::board;
 use comet_proto::view::needs::{self as needs_view};
-use comet_proto::view::repos::{self, RepoOffer, RepoRow, SpaceSlug};
+use comet_proto::view::repos::{self, RepoOffer, RepoRow, SpaceSlug, UnreachableHost};
 use comet_proto::view::spaces as spaces_view;
 use comet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
@@ -171,6 +171,59 @@ struct RepoHost {
     note: Option<SharedString>,
 }
 
+/// Whether a failed [`methods::LIST_REPO_SPACES`] is the device's own answer —
+/// "I host no board" — rather than a call that never landed (gh#155).
+///
+/// [`comet_rpc::RpcError::Refused`] is the engine's explicit refusal (`board()` on a device
+/// with no board service). `UnknownMethod` is the same answer from a device too
+/// old to know the question — it replied, and its reply rules it out. Everything
+/// else (transport, relay 500, timeout, a closed link) means nobody was asked,
+/// which is a fact about the connection and belongs on screen.
+fn hosts_no_board(err: &comet_rpc::RpcError) -> bool {
+    matches!(
+        err,
+        comet_rpc::RpcError::Refused(_) | comet_rpc::RpcError::UnknownMethod(_)
+    )
+}
+
+/// One device about to be asked [`methods::LIST_REPO_SPACES`], with everything
+/// the sweep will need if it never answers (gh#155).
+///
+/// Gathered up front because silence carries no facts: a device that does not
+/// reply cannot tell you its name, and by the time the call has failed the
+/// question "did we expect this one to answer?" is exactly the question that
+/// decides whether the operator sees a warning.
+struct Candidate {
+    /// Relay target: `None` is this device (no `targetDeviceId` passthrough).
+    target: Option<String>,
+    name: String,
+    /// The fleet believed this device was away before it was asked
+    /// (`HostPresence::Offline`).
+    offline: bool,
+    /// It owns at least one space in the workspace doc — so its silence costs
+    /// this list something real.
+    hosts_spaces: bool,
+}
+
+impl Candidate {
+    /// What to report when this device fails to answer — `None` when the
+    /// honest answer is to say nothing.
+    ///
+    /// A device that is switched off, and holds nothing here, is not news: the
+    /// operator's phone is asleep for all but minutes of the day, hosts no
+    /// board and never will, and a palette that warned about it on every open
+    /// would teach him to skip the strip long before the morning it is the box
+    /// that has gone quiet. Silent-when-it-should-speak was the bug; loud-every-
+    /// time is how the fix gets reverted.
+    fn silence(&self, detail: String) -> Option<UnreachableHost> {
+        (!self.offline || self.hosts_spaces).then(|| UnreachableHost {
+            device: self.name.clone(),
+            detail: Some(detail),
+            believed_offline: self.offline,
+        })
+    }
+}
+
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
 /// across the top, the repo list (or the folder browser) on the left, a rail on
 /// the right, kbd-hint footer. One surface — switching doors or picking a device
@@ -180,6 +233,11 @@ pub(super) struct AddSpaceFlow {
     /// The board hosts the sweep found. Empty after a completed sweep = no
     /// device here hosts a board, which makes the repo list the spaces alone.
     hosts: Vec<RepoHost>,
+    /// The devices the sweep could not ask (gh#155). Empty is the only state in
+    /// which [`AddSpaceFlow::hosts`] is the whole truth — anything in here means
+    /// the list below is short by an unknown amount, and the palette says so
+    /// instead of letting the shorter list read as complete.
+    unreachable: Vec<UnreachableHost>,
     /// Which host an onboard clones onto — an index into `hosts`. Only ever
     /// asked about when there is more than one.
     target: usize,
@@ -359,6 +417,12 @@ impl Shell {
     /// [`methods::LIST_REPO_SPACES`] contract the ⌘K palette uses, run
     /// whenever the space/device membership changes so the sidebar can name
     /// spaces by their repo without opening the palette first.
+    ///
+    /// A sweep every device answered is authoritative and replaces what is
+    /// held. One that lost a device to a broken relay is not, and merges
+    /// instead (gh#155): the alternative is every space on the box silently
+    /// reverting to its folder basename the moment the box goes quiet — the
+    /// picker's bug, wearing the sidebar's clothes.
     pub(super) fn refresh_space_slugs(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -370,26 +434,41 @@ impl Shell {
         let candidates = board::host_candidates(&devices, local.as_deref());
         self.slug_task = Some(cx.spawn(async move |this, cx| {
             let mut links: Vec<SpaceSlug> = Vec::new();
+            let mut complete = true;
             for candidate in candidates {
                 let mut params = serde_json::json!({});
                 if let (Some(target), Some(object)) = (candidate.as_deref(), params.as_object_mut())
                 {
                     object.insert("targetDeviceId".into(), serde_json::json!(target));
                 }
-                let Ok(value) = engine
+                let value = match engine
                     .client()
                     .call(methods::LIST_REPO_SPACES, params)
                     .await
-                else {
-                    continue;
+                {
+                    Ok(value) => value,
+                    // Refused: this device hosts no board, and has no links to
+                    // contribute. The sweep is still whole.
+                    Err(err) if hosts_no_board(&err) => continue,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
                 };
                 let Ok(reply) = serde_json::from_value::<RepoSpacesReply>(value) else {
+                    complete = false;
                     continue;
                 };
                 links.extend(reply.spaces);
             }
             this.update(cx, |shell, cx| {
-                shell.state.update(cx, |s, _| s.apply_space_slugs(links));
+                shell.state.update(cx, |s, _| {
+                    if complete {
+                        s.apply_space_slugs(links);
+                    } else {
+                        s.merge_space_slugs(links);
+                    }
+                });
                 cx.notify();
             })
             .ok();
@@ -1966,6 +2045,7 @@ impl Shell {
         self.add_space = Some(AddSpaceFlow {
             mode: AddSpaceMode::Repos,
             hosts: Vec::new(),
+            unreachable: Vec::new(),
             target: 0,
             repos: Loadable::Idle,
             onboarding: None,
@@ -2023,13 +2103,22 @@ impl Shell {
     }
 
     /// Ask every device whether it hosts a board, and take the whole list of
-    /// answers (gh#118).
+    /// answers (gh#118) — including the devices that could not give one
+    /// (gh#155).
     ///
     /// Sweeping past the first answer costs almost nothing and buys the one fact
     /// onboarding needs: a device hosting no board refuses
     /// [`methods::LIST_REPO_SPACES`] before it does any git or GitHub work — the
     /// same "said nothing at all" contract the board panel rules candidates out
     /// with — so only real hosts are slow, and only real hosts are counted.
+    ///
+    /// That contract holds only for devices that *answered*. A refusal
+    /// ([`comet_rpc::RpcError::Refused`]) is an answer — "I host no board" — and rules the
+    /// device out silently, as it always did. Any other error means the call
+    /// never landed, which is a different fact with a different owner: the
+    /// device is recorded as unreachable and the palette names it, because
+    /// dropping it would hand back a short list wearing the face of a complete
+    /// one (the free-tier relay outage that produced this issue).
     fn load_repo_hosts(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             if let Some(flow) = self.add_space.as_mut() {
@@ -2041,32 +2130,87 @@ impl Shell {
             let state = self.state.read(cx);
             (state.devices.clone(), state.local_device_id.clone())
         };
-        let candidates = board::host_candidates(&devices, local.as_deref());
+        // Everything the sweep needs to know about a device is settled before it
+        // is asked, because a device that does not answer tells you nothing
+        // about itself: its name (an unnamed device is not something anybody can
+        // act on), whether the fleet already believed it was away, and whether
+        // its silence costs this list anything.
+        let candidates: Vec<Candidate> = {
+            let now = Utc::now();
+            let state = self.state.read(cx);
+            board::host_candidates(&devices, local.as_deref())
+                .into_iter()
+                .map(|target| {
+                    let device_id = target.clone().or_else(|| local.clone());
+                    let name = match device_id.as_deref() {
+                        Some(id) => state.device_name(id).unwrap_or(id).to_string(),
+                        None => "this device".to_string(),
+                    };
+                    let (offline, hosts_spaces) = match device_id.as_deref() {
+                        Some(id) => (
+                            // gh#126's three-state, and only its middle verdict
+                            // counts as absence: `SyncDown` means this viewer
+                            // cannot hear, which is no evidence about the device
+                            // — and is precisely the state the outage behind
+                            // gh#155 put the box in.
+                            state.host_presence(id, now) == crate::state::HostPresence::Offline,
+                            state.spaces.iter().any(|s| s.device_id == id),
+                        ),
+                        None => (false, true),
+                    };
+                    Candidate {
+                        target,
+                        name,
+                        offline,
+                        hosts_spaces,
+                    }
+                })
+                .collect()
+        };
         if let Some(flow) = self.add_space.as_mut() {
             flow.repos = Loadable::Loading;
             flow.hosts.clear();
+            flow.unreachable.clear();
             flow.target = 0;
         }
         self.repo_task_set(cx.spawn(async move |this, cx| {
             let mut hosts: Vec<RepoHost> = Vec::new();
+            let mut unreachable: Vec<UnreachableHost> = Vec::new();
             for candidate in candidates {
                 let mut params = serde_json::json!({});
-                if let (Some(target), Some(object)) = (candidate.as_deref(), params.as_object_mut())
+                if let (Some(target), Some(object)) =
+                    (candidate.target.as_deref(), params.as_object_mut())
                 {
                     object.insert("targetDeviceId".into(), serde_json::json!(target));
                 }
-                let Ok(value) = engine
+                let value = match engine
                     .client()
                     .call(methods::LIST_REPO_SPACES, params)
                     .await
-                else {
-                    continue;
+                {
+                    Ok(value) => value,
+                    // "I host no board." Not a host, nothing to report.
+                    Err(err) if hosts_no_board(&err) => continue,
+                    Err(err) => {
+                        if let Some(host) = candidate.silence(format!("{err}")) {
+                            unreachable.push(host);
+                        }
+                        continue;
+                    }
                 };
-                let Ok(reply) = serde_json::from_value::<RepoSpacesReply>(value) else {
-                    continue;
+                let reply = match serde_json::from_value::<RepoSpacesReply>(value) {
+                    Ok(reply) => reply,
+                    // It answered, and we cannot read the answer — its repos are
+                    // just as missing, so it counts the same way.
+                    Err(err) => {
+                        if let Some(host) = candidate.silence(format!("unreadable reply: {err}")) {
+                            unreachable.push(host);
+                        }
+                        continue;
+                    }
                 };
                 hosts.push(RepoHost {
-                    target: candidate,
+                    target: candidate.target,
                     device_id: reply.device_id,
                     links: reply.spaces,
                     offers: reply
@@ -2085,6 +2229,7 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 if let Some(flow) = shell.add_space.as_mut() {
                     flow.hosts = hosts;
+                    flow.unreachable = unreachable;
                     flow.repos = Loadable::Ready(());
                 }
                 cx.notify();
@@ -2187,11 +2332,18 @@ impl Shell {
         if flow.onboarding.is_some() {
             return;
         }
+        let silence = repos::unreachable_note(&flow.unreachable)
+            .or_else(|| repos::absent_note(&flow.unreachable));
         let Some(host) = flow.host() else {
             if let Some(flow) = self.add_space.as_mut() {
-                flow.error = Some(
-                    "No device here hosts a board, so there is nowhere to clone this repo".into(),
-                );
+                // Which of these is true decides what to do next, so the refusal
+                // has to say (gh#155): install a board, fix the relay, or go and
+                // wake the box.
+                flow.error = Some(match silence {
+                    Some(note) => format!("Nowhere to clone this repo yet — {note}").into(),
+                    None => "No device here hosts a board, so there is nowhere to clone this repo"
+                        .into(),
+                });
             }
             cx.notify();
             return;
@@ -2871,8 +3023,17 @@ impl Shell {
                 .collect()
         };
 
-        if rows.is_empty() {
-            return if sweeping {
+        // What the sweep could not ask sits ABOVE the list it is short of
+        // (gh#155) — a footnote under a plausible-looking list is exactly how
+        // the operator missed this the first time.
+        let banner = self.render_unreachable_banner(theme, cx);
+        let lost_a_host = self
+            .add_space
+            .as_ref()
+            .is_some_and(|f| !f.unreachable.is_empty());
+
+        let list: AnyElement = if rows.is_empty() {
+            if sweeping {
                 div()
                     .px(px(8.0))
                     .py(px(10.0))
@@ -2884,52 +3045,195 @@ impl Shell {
                     .py(px(16.0))
                     .text_size(px(12.5))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from(if query_empty {
+                    .child(SharedString::from(if !query_empty {
+                        "No repos match"
+                    } else if lost_a_host {
+                        // Empty because nobody could be asked is not the same
+                        // emptiness as "you have no repos yet", and offering the
+                        // folder browser as the answer would be advice about the
+                        // wrong problem.
+                        "Nothing from the devices that answered"
+                    } else {
                         // Nothing to pick and nothing wrong: this is a fresh
                         // install with no board yet, and the second door is the
                         // honest answer rather than an error.
                         "No repos yet — browse this device's folders instead (→)"
-                    } else {
-                        "No repos match"
                     }))
                     .into_any_element()
-            };
-        }
+            }
+        } else {
+            // The 6px gutters live on a WRAPPER, outside the scroll viewport: see
+            // the folder list's note — the wheel's max offset eats bottom padding.
+            div()
+                .flex_1()
+                .min_h_0()
+                .py(px(6.0))
+                .child(
+                    div()
+                        .id("add-space-repos")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(list_scroll)
+                        .px(px(8.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                            // `is_some()` first: two `None`s are equal, and without
+                            // it every space that is not a GitHub checkout would
+                            // spin forever.
+                            let connecting = onboarding.is_some()
+                                && onboarding.as_deref() == row.slug.as_deref();
+                            self.render_repo_row(
+                                theme,
+                                ix,
+                                ix == active,
+                                connecting,
+                                &device_labels,
+                                row,
+                                cx,
+                            )
+                        })),
+                )
+                .into_any_element()
+        };
 
-        // The 6px gutters live on a WRAPPER, outside the scroll viewport: see
-        // the folder list's note — the wheel's max offset eats bottom padding.
-        div()
-            .flex_1()
-            .min_h_0()
-            .py(px(6.0))
-            .child(
+        match banner {
+            None => list,
+            Some(banner) => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(banner)
+                .child(div().flex_1().min_h_0().flex().flex_col().child(list))
+                .into_any_element(),
+        }
+    }
+
+    /// What the sweep could not ask, in whichever of two voices is honest
+    /// (gh#155).
+    ///
+    /// A device that was expected to answer and did not gets the warning strip:
+    /// named, the transport's own words underneath, and Retry — warning
+    /// coloured rather than danger, because nothing is broken and the repos that
+    /// DID answer are right below. A device the fleet already knew was away gets
+    /// one muted line and no Retry, since retrying a switched-off machine cannot
+    /// succeed. When both are true, both are said.
+    fn render_unreachable_banner(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let flow = self.add_space.as_ref()?;
+        let headline = repos::unreachable_note(&flow.unreachable);
+        let absent = repos::absent_note(&flow.unreachable);
+        if headline.is_none() {
+            // Nothing to warn about; at most a quiet statement of the fleet's
+            // own state, which gets no border, no icon and no button.
+            return absent.map(|note| {
                 div()
-                    .id("add-space-repos")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(list_scroll)
-                    .px(px(8.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                        // `is_some()` first: two `None`s are equal, and without
-                        // it every space that is not a GitHub checkout would
-                        // spin forever.
-                        let connecting =
-                            onboarding.is_some() && onboarding.as_deref() == row.slug.as_deref();
-                        self.render_repo_row(
-                            theme,
-                            ix,
-                            ix == active,
-                            connecting,
-                            &device_labels,
-                            row,
-                            cx,
+                    .flex_none()
+                    .mx(px(14.0))
+                    .mt(px(10.0))
+                    .text_size(px(11.5))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.55))
+                    .child(SharedString::from(note))
+                    .into_any_element()
+            });
+        }
+        let headline = headline?;
+        // One line for the details, deduplicated: three devices behind the same
+        // dead relay have the same thing wrong with them. Only the warned-about
+        // devices contribute — an offline phone's transport error is not
+        // evidence about anything.
+        let mut details: Vec<&str> = Vec::new();
+        for detail in flow
+            .unreachable
+            .iter()
+            .filter(|h| !h.believed_offline)
+            .filter_map(|h| h.detail.as_deref())
+        {
+            if !details.contains(&detail) {
+                details.push(detail);
+            }
+        }
+        let detail = details.join(" · ");
+        Some(
+            div()
+                .flex_none()
+                .mx(px(8.0))
+                .mt(px(8.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(8.0))
+                .bg(theme.warning.opacity(0.10))
+                .border_1()
+                .border_color(theme.warning.opacity(0.28))
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(8.0))
+                .child(
+                    icon(icons::DANGER_TRIANGLE)
+                        .size(px(13.0))
+                        .flex_none()
+                        .mt(px(1.0))
+                        .text_color(theme.warning.opacity(0.9)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .line_height(px(16.0))
+                                .text_color(theme.text.opacity(0.9))
+                                .child(SharedString::from(headline)),
                         )
-                    })),
-            )
-            .into_any_element()
+                        .when(!detail.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .line_height(px(15.0))
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from(detail)),
+                            )
+                        })
+                        // A device that is merely away rides along quietly under
+                        // the one that is actually wrong.
+                        .when_some(absent, |el, note| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .line_height(px(15.0))
+                                    .text_color(theme.text_muted.opacity(0.55))
+                                    .child(SharedString::from(note)),
+                            )
+                        }),
+                )
+                .child(
+                    popover::btn_ghost(theme, "Retry", "add-space-retry-sweep")
+                        .id("add-space-retry-sweep")
+                        .flex_none()
+                        .h(px(22.0))
+                        .px(px(8.0))
+                        .py(px(0.0))
+                        .rounded(px(5.0))
+                        .text_size(px(11.5))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.load_repo_hosts(cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     /// One repo row: mark, name, and what is true about it. Click opens the
@@ -3039,6 +3343,11 @@ impl Shell {
             .unwrap_or_default();
         let target = flow.map(|f| f.target).unwrap_or(0);
         let sweeping = flow.is_some_and(|f| matches!(f.repos, Loadable::Loading | Loadable::Idle));
+        // Two different reasons the sweep might have come up empty, and they
+        // are not the same advice: one is worth retrying, the other is worth
+        // waking a machine for.
+        let lost_a_host = flow.is_some_and(|f| repos::unreachable_note(&f.unreachable).is_some());
+        let host_away = flow.and_then(|f| repos::absent_note(&f.unreachable));
         let note = flow.and_then(|f| f.host()).and_then(|h| h.note.clone());
         let (names, presence): (
             std::collections::HashMap<String, String>,
@@ -3155,6 +3464,18 @@ impl Shell {
 
         let info: SharedString = if sweeping {
             "Looking for the board…".into()
+        } else if hosts.is_empty() && lost_a_host {
+            // "No device hosts a board" is a claim about every device, and the
+            // sweep did not get to make it (gh#155).
+            "No board answered, and a device could not be reached — retry before \
+             concluding there is none."
+                .into()
+        } else if hosts.is_empty() && host_away.is_some() {
+            // Same incomplete sweep, different cure: nothing here can reach a
+            // machine that is switched off, and Retry would only say so again.
+            "No board answered, and a device is offline — a repo has nowhere to \
+             be cloned until it is back."
+                .into()
         } else if hosts.is_empty() {
             "No device here hosts a board, so a repo has nowhere to be cloned.".into()
         } else if asking {
@@ -3887,5 +4208,92 @@ impl Shell {
         }
 
         overlays
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use comet_rpc::RpcError;
+
+    /// The line gh#155 turns on: which failures mean "this device is not a
+    /// host" (and vanish from the picker), and which mean "this device was
+    /// never asked" (and get named). Before the split every one of these was
+    /// the same `Err`, so a box behind a 500 was deleted exactly like a laptop
+    /// that hosts nothing.
+    #[test]
+    fn only_an_answer_rules_a_device_out() {
+        // Answers. The device spoke, and the answer is "not me".
+        assert!(hosts_no_board(&RpcError::Refused(
+            "board unavailable".into()
+        )));
+        assert!(hosts_no_board(&RpcError::UnknownMethod(
+            "ListRepoSpaces".into()
+        )));
+        // Silence. Nothing was asked, so nothing was ruled out — these are the
+        // free-tier Durable Object outage, in the three shapes it arrives in.
+        assert!(!hosts_no_board(&RpcError::Transport(
+            "device room unreachable: 500".into()
+        )));
+        assert!(!hosts_no_board(&RpcError::Closed));
+        assert!(!hosts_no_board(&RpcError::Failed(
+            "cannot reach device box: remote routing unavailable (offline)".into()
+        )));
+    }
+
+    fn candidate(name: &str, offline: bool, hosts_spaces: bool) -> Candidate {
+        Candidate {
+            target: Some(name.to_string()),
+            name: name.to_string(),
+            offline,
+            hosts_spaces,
+        }
+    }
+
+    /// Whose silence is worth saying out loud. The operator's fleet is Mac +
+    /// box + iPhone, and the phone is asleep essentially always — so a rule
+    /// that warned about every device that failed the call would put a warning
+    /// on the palette on every open, which is how the strip stops being read
+    /// before the morning the box is the one that went quiet.
+    #[test]
+    fn a_device_nobody_expected_to_answer_is_not_news() {
+        // The phone: switched off, hosts nothing here. Nothing is missing, so
+        // nothing is said.
+        assert_eq!(
+            candidate("iPhone", true, false).silence("timeout".into()),
+            None
+        );
+
+        // The box, believed present, failing the call — the gh#155 case, and
+        // the loud one. `SyncDown` reaches here as `offline: false`, which is
+        // what the Durable Object outage produced.
+        let reached = candidate("box", false, true)
+            .silence("device room unreachable: 500".into())
+            .expect("a device believed present must be reported");
+        assert!(!reached.believed_offline);
+        assert_eq!(
+            repos::unreachable_note(std::slice::from_ref(&reached)).as_deref(),
+            Some("Could not reach box — any repos hosted there are missing from this list.")
+        );
+
+        // The box, switched off, holding spaces: its repos really are missing,
+        // so it is stated — but quietly, and with no Retry to offer.
+        let away = candidate("box", true, true)
+            .silence("timeout".into())
+            .expect("an offline device that holds spaces still costs the list something");
+        assert!(away.believed_offline);
+        assert_eq!(repos::unreachable_note(std::slice::from_ref(&away)), None);
+        assert_eq!(
+            repos::absent_note(std::slice::from_ref(&away)).as_deref(),
+            Some("box is offline — repos hosted there are not listed.")
+        );
+
+        // A device believed present is reported whether or not it holds spaces:
+        // what it could have offered is exactly what we failed to find out.
+        assert!(
+            candidate("laptop", false, false)
+                .silence("timeout".into())
+                .is_some()
+        );
     }
 }

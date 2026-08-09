@@ -243,10 +243,48 @@ pub enum RpcError {
     BadParams(String),
     #[error("{0}")]
     Failed(String),
+    /// The device answered, and the answer is *no*: it does not host what the
+    /// call is about (gh#155). Distinct from [`RpcError::Failed`] because a
+    /// caller sweeping devices has to tell "not me" apart from "I never got
+    /// asked" — a laptop that hosts no board and a box behind a broken relay
+    /// are the same `Err` otherwise, and a picker that treats both as "not a
+    /// host" shows a short list as the whole truth.
+    #[error("{0}")]
+    Refused(String),
     #[error("transport: {0}")]
     Transport(String),
     #[error("connection closed")]
     Closed,
+}
+
+impl RpcError {
+    /// The wire tag for the variants a caller distinguishes across the
+    /// connection. `None` = the ordinary failure, which needs no tag.
+    ///
+    /// Only refusals are tagged: transport-shaped errors are produced by
+    /// whichever hop noticed, never carried, so they have no wire form to keep.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            RpcError::Refused(_) => Some(codes::REFUSED),
+            _ => None,
+        }
+    }
+
+    /// Rebuild an error from a peer's `{err, code}` — the inverse of
+    /// [`RpcError::code`]. An unknown (or absent) code is an ordinary failure,
+    /// so an older peer degrades to today's behaviour rather than breaking.
+    pub fn from_wire(code: Option<&str>, message: String) -> Self {
+        match code {
+            Some(codes::REFUSED) => RpcError::Refused(message),
+            _ => RpcError::Failed(message),
+        }
+    }
+}
+
+/// Wire tags for [`RpcError::code`].
+pub mod codes {
+    /// [`RpcError::Refused`]: the device answered, and the answer is "not me".
+    pub const REFUSED: &str = "refused";
 }
 
 /// A client-originated frame.
@@ -269,6 +307,12 @@ pub struct ServerFrame {
     pub ok: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
+    /// Which *kind* of error `err` is, when the kind is one a caller acts on
+    /// ([`RpcError::code`], gh#155). Absent on ordinary failures and on frames
+    /// from peers that predate the tag, both of which read as
+    /// [`RpcError::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -339,6 +383,7 @@ mod tests {
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
                 "Boom" => Err(RpcError::Failed("boom".into())),
+                "NotMe" => Err(RpcError::Refused("not me".into())),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -398,6 +443,37 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    /// gh#155: a device sweep has to tell "I host no board" from "the call
+    /// never landed", and both cross the wire as a string today. The kind rides
+    /// along on the frame, so a refusal arrives as a refusal — and an ordinary
+    /// failure does not become one.
+    #[tokio::test]
+    async fn a_refusal_stays_a_refusal_across_the_wire() {
+        let client = memory_client(Arc::new(TestService));
+        let err = client
+            .call("NotMe", serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Refused(m) if m == "not me"));
+
+        let err = client
+            .call("Boom", serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::Failed(_)));
+
+        // An older peer sends no code at all; its errors read as ordinary
+        // failures rather than as refusals.
+        assert!(matches!(
+            RpcError::from_wire(None, "whatever".into()),
+            RpcError::Failed(_)
+        ));
+        assert!(matches!(
+            RpcError::from_wire(Some("something-newer"), "whatever".into()),
+            RpcError::Failed(_)
+        ));
     }
 
     #[tokio::test]
