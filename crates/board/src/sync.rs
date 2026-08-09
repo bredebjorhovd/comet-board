@@ -105,6 +105,10 @@ enum Told {
     /// The channel is switched off in config. Only `notify_dispatcher` has a
     /// switch; the pin's absence is [`Told::NoOne`].
     Off,
+    /// The chat in this role is the attempt's own, so prompting it would be
+    /// the agent being told about itself. Reachable only through a hand-set
+    /// `--via`, or a pin on a board-dispatched chat.
+    Itself,
 }
 
 /// Agent statuses for this cycle, keyed by chat id (the id stored in
@@ -1280,6 +1284,24 @@ impl SyncEngine {
         self.enqueue_outcome_note(task, Outcome::Failed, None, Some(&note))?;
         self.log
             .warn(format!("{}: attempt failed — {note}", task.identifier));
+        // The cap's *warning* goes straight to the orchestrator, because a run
+        // that is still going is nothing for a dispatcher to act on. Its
+        // ending is the opposite, and until gh#194 it went to nobody: the
+        // attempt closed, the checkout and the chat went on their retention
+        // clocks, and the agent whose plan that task was a step in waited for
+        // a settle that was never coming. A close the board decided on its own
+        // is the *most* owed notice, not the least.
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome: Outcome::Failed,
+                evidence: None,
+                pr_url: None,
+                note: Some(note),
+            },
+        );
         Ok(())
     }
 
@@ -1708,6 +1730,7 @@ impl SyncEngine {
                 outcome: Outcome::Orphaned,
                 evidence: None,
                 pr_url: None,
+                note: Some("its chat is gone".into()),
             },
         );
         Ok(())
@@ -1906,6 +1929,7 @@ impl SyncEngine {
                 outcome: Outcome::Done,
                 evidence: Some(evidence),
                 pr_url: pr_url.map(str::to_string),
+                note: None,
             },
         );
         Ok(())
@@ -1969,6 +1993,40 @@ impl SyncEngine {
         self.post_webhook(task, attempt, &signal);
     }
 
+    /// Announce a close the board did not settle: an attempt somebody ended
+    /// from the panel, the phone or the CLI (gh#194).
+    ///
+    /// The board's own closes reach [`SyncEngine::announce`] through
+    /// [`SyncEngine::settle`] and its neighbours, all of them inside this
+    /// crate. A cancel is decided in the engine's board service instead —
+    /// it owns the interrupt — and so ended an attempt on exactly the channels
+    /// a settle uses minus every one of them. The operator who pressed the key
+    /// knows; the agent that released the work and is waiting on that step
+    /// does not, and it is the party with something to do about it.
+    ///
+    /// `note` is what the outcome comment says upstream, so the chat and the
+    /// issue describe one close in one wording.
+    pub fn announce_ended(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        outcome: Outcome,
+        note: &str,
+    ) {
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome,
+                evidence: None,
+                pr_url: None,
+                note: Some(note.to_string()),
+            },
+        );
+    }
+
     /// The line that keeps a dropped notice from being a silence.
     ///
     /// Both agent-facing addresses came up empty, so this event is now the row
@@ -1983,12 +2041,14 @@ impl SyncEngine {
             Told::NoOne => "no chat released it",
             Told::Unreachable => "the chat that released it is gone",
             Told::Off => "`notify_dispatcher` is off",
+            Told::Itself => "`--via` named the attempt's own chat",
         };
         let second = match orchestrator {
             Told::Yes => return,
             // The pin has no switch: unset *is* nobody to tell.
             Told::NoOne | Told::Off => "no orchestrator is pinned",
             Told::Unreachable => "the pinned orchestrator could not be told",
+            Told::Itself => "the pin is this attempt's own chat",
         };
         self.log.warn(format!(
             "{}: {} reached no agent — {first}, and {second}; the board row and the comment \
@@ -2011,6 +2071,13 @@ impl SyncEngine {
     /// is why this returns [`Told`] and not a bool: [`Told::NoOne`] is an
     /// operator's dispatch and [`Told::Unreachable`] is a dispatcher that did
     /// not survive its child, and both of those are the orchestrator's to hear.
+    ///
+    /// **Every exit says why in the log** (gh#194). It used to have three that
+    /// did not — the switch, an attempt nobody released, and a chat that
+    /// dispatched into itself — and the symptom of any of them was a settle
+    /// with no notice line of any kind against it. That is a state a `grep` for
+    /// the task cannot tell from a settle path that never ran, and telling
+    /// those two apart on the box took a read of the whole log.
     fn wake_dispatcher(
         &self,
         runtime: &dyn Runtime,
@@ -2018,24 +2085,47 @@ impl SyncEngine {
         attempt: &Attempt,
         signal: &Signal,
     ) -> Told {
-        if !self.cfg.defaults.notify_dispatcher {
-            return Told::Off;
-        }
+        // The address is read before the switch, so the line each exit writes
+        // names the thing to go and fix. `notify_dispatcher` off on an attempt
+        // nobody released is not a routing decision that lost a notice — it is
+        // an empty address, and saying "the switch is off" about it would send
+        // an operator to a knob that changes nothing.
         let Some(chat) = attempt.dispatched_by_pane.as_deref() else {
+            self.log.info(format!(
+                "{}: {} has no chat that released it — an operator's dispatch records \
+                 none, so this is the orchestrator's to hear",
+                task.identifier,
+                signal.event(),
+            ));
             return Told::NoOne;
         };
         // A chat that dispatched into itself would be prompted about its own
         // settle. Not reachable through `comet-board dispatch` (a dispatch
         // makes a fresh chat), but a hand-set `--via` can say anything.
         if Some(chat) == attempt.pane_id.as_deref() {
-            return Told::NoOne;
+            self.log.warn(format!(
+                "{}: {} was not queued into {chat} — that is the attempt's own chat, so \
+                 `--via` named the agent rather than whoever released it",
+                task.identifier,
+                signal.event(),
+            ));
+            return Told::Itself;
+        }
+        if !self.cfg.defaults.notify_dispatcher {
+            self.log.warn(format!(
+                "{}: {} was not queued into the chat that released it ({chat}) — \
+                 `[defaults] notify_dispatcher` is off",
+                task.identifier,
+                signal.event(),
+            ));
+            return Told::Off;
         }
         // The dispatcher is usually a long-lived orchestrator that outlives
         // many children, but attempts cap at two hours and chats archive as
         // their task settles (§gh#139), so a dispatcher that did not survive
         // its own child is ordinary rather than exceptional. Not an error —
         // just a notice that now needs a different addressee.
-        if !self.chat_can_be_told(runtime, task, chat) {
+        if !self.chat_can_be_told(runtime, task, "the chat that released it", chat) {
             return Told::Unreachable;
         }
         let text = notify::dispatcher_message(task, attempt, signal);
@@ -2099,7 +2189,12 @@ impl SyncEngine {
             return Told::NoOne;
         };
         if Some(chat) == attempt.pane_id.as_deref() {
-            return Told::NoOne;
+            self.log.warn(format!(
+                "{}: the pinned orchestrator ({chat}) is this attempt's own chat — it is not \
+                 prompted about itself; `doctor` names the pin",
+                task.identifier
+            ));
+            return Told::Itself;
         }
         let Some(runtime) = runtime else {
             self.log.warn(format!(
@@ -2108,7 +2203,7 @@ impl SyncEngine {
             ));
             return Told::Unreachable;
         };
-        if !self.chat_can_be_told(runtime, task, chat) {
+        if !self.chat_can_be_told(runtime, task, "the pinned orchestrator", chat) {
             return Told::Unreachable;
         }
         let text = notify::orchestrator_message(task, attempt, event);
@@ -2136,19 +2231,26 @@ impl SyncEngine {
     /// thing for both: a chat that has been archived is not an error, it is
     /// simply nobody to tell, and an unreadable answer is a reason to say
     /// nothing rather than to prompt into the dark.
-    fn chat_can_be_told(&self, runtime: &dyn Runtime, task: &Task, chat: &str) -> bool {
+    /// `role` names which of the two channels is asking, so the line reads as
+    /// the answer to a question somebody asked rather than as a stray fact
+    /// about a chat id (gh#194) — an operator grepping a task's whole life
+    /// should not have to hold the routing order in their head to know which
+    /// notice went nowhere.
+    fn chat_can_be_told(&self, runtime: &dyn Runtime, task: &Task, role: &str, chat: &str) -> bool {
         match runtime.chat_alive(chat) {
             Ok(true) => true,
             Ok(false) => {
                 self.log.info(format!(
-                    "{}: chat {chat} is gone — nothing delivered there",
+                    "{}: {role} ({chat}) is gone — nothing delivered there",
                     task.identifier
                 ));
                 false
             }
             Err(e) => {
-                self.log
-                    .warn(format!("{}: checking chat {chat}: {e}", task.identifier));
+                self.log.warn(format!(
+                    "{}: checking {role} ({chat}): {e}",
+                    task.identifier
+                ));
                 false
             }
         }
@@ -4591,6 +4693,142 @@ mod tests {
         assert!(log.contains("no chat released it"), "{log}");
     }
 
+    // ---- every skipped notice leaves a trace (gh#194) --------------------
+
+    /// The report this issue was filed on, re-run against gh#165's rework: a
+    /// dispatcher recorded on the attempt, `notify_dispatcher` on, and the
+    /// settle prompted into that chat. It works, and it says in the log that it
+    /// worked — which is what "no notice line of any kind" was the absence of.
+    #[test]
+    fn a_settle_with_a_dispatcher_recorded_reaches_it_and_says_so() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        assert!(e.cfg.defaults.notify_dispatcher, "as the box had it");
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(rt.prompts()[0].0, "chat-parent");
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            log.contains("on_settled queued into the chat that released it (chat-parent)"),
+            "one greppable line per delivered notice: {log}"
+        );
+    }
+
+    /// The switch turned off used to be the first of three exits that returned
+    /// without a word, so a board configured to say nothing looked exactly like
+    /// a board whose settle path never ran. It is the knob to go and turn, so
+    /// the line names it.
+    #[test]
+    fn a_dispatcher_the_switch_silenced_is_named_in_the_log() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        e.cfg.defaults.notify_dispatcher = false;
+        e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        // The pin caught it, so `note_unheard` says nothing — which is exactly
+        // the case the old code left with no trace at all.
+        assert_eq!(rt.prompts()[0].0, "chat-boss");
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log.contains("chat that released it (chat-parent)"), "{log}");
+        assert!(
+            log.contains("`[defaults] notify_dispatcher` is off"),
+            "{log}"
+        );
+    }
+
+    /// The second silent exit: an attempt nobody released. Not a fault — most
+    /// of a solo operator's board is this — but a settle whose log says nothing
+    /// about a dispatcher is a settle an operator cannot tell from one whose
+    /// notice was dropped, so it says which.
+    #[test]
+    fn an_attempt_nobody_released_says_that_much() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(rt.prompts()[0].0, "chat-boss");
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log.contains("has no chat that released it"), "{log}");
+    }
+
+    /// The third, and the one that reads as a bug rather than a setting: a
+    /// hand-set `--via` naming the attempt's own chat. The board will not
+    /// prompt an agent about itself, and the only way anybody learns that the
+    /// `--via` was wrong is this line.
+    #[test]
+    fn a_via_that_names_the_attempts_own_chat_is_not_a_silent_drop() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert!(rt.prompts().is_empty(), "never prompted about itself");
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log.contains("that is the attempt's own chat"), "{log}");
+        assert!(
+            log.contains("`--via` named the attempt's own chat"),
+            "and again in the reached-nobody line: {log}"
+        );
+    }
+
+    /// A chat that is gone is logged by the check both channels share, so the
+    /// line has to name which channel was asking — otherwise a task whose
+    /// dispatcher *and* pin have both been archived leaves two identical lines
+    /// and no way to tell them apart.
+    #[test]
+    fn a_gone_chat_is_logged_against_the_channel_that_wanted_it() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending_without(None, &["chat-parent", "chat-boss"]);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            log.contains("the chat that released it (chat-parent) is gone"),
+            "{log}"
+        );
+        assert!(
+            log.contains("the pinned orchestrator (chat-boss) is gone"),
+            "{log}"
+        );
+    }
+
     /// The kill switch, and the whole of it: no pin, no notices. The chat that
     /// was pinned goes back to being an ordinary chat with nothing arriving in
     /// it, which is what makes unpinning safe to reach for.
@@ -5162,6 +5400,61 @@ max_duration = "{max_duration}"
             e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
             BoardState::Failed
         );
+    }
+
+    /// gh#194: the cap's *warning* goes to the orchestrator because a run that
+    /// is still going is nothing for a dispatcher to act on. Its ending is the
+    /// opposite — the step that agent was waiting on is over and will not
+    /// finish — and it used to reach nobody at all: the row closed, the
+    /// checkout and the chat started their retention clocks, and the only trace
+    /// of the whole event was a colour on a board nothing was watching.
+    #[test]
+    fn an_attempt_killed_at_the_cap_tells_the_agent_that_released_it() {
+        let e = engine(None);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        age_attempt(&e, a, 3 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Failed));
+        let prompts = rt.prompts.borrow().clone();
+        let told = prompts
+            .iter()
+            .find(|(chat, _)| chat == "chat-parent")
+            .unwrap_or_else(|| panic!("the chat that released it: {prompts:?}"));
+        assert!(
+            told.1.contains("work you released has finished"),
+            "{}",
+            told.1
+        );
+        // `failed` alone reads as a dispatch that never produced an agent. The
+        // reason the outcome comment carries upstream rides the notice too, so
+        // the chat and the issue describe one close in one wording.
+        assert!(told.1.contains("failed — timed out after 3h"), "{}", told.1);
+        assert!(told.1.contains("cap 2h"), "{}", told.1);
+    }
+
+    /// And the same ending with nobody to address it is a logged drop rather
+    /// than a silence — the cap is the one close no human asked for, so an
+    /// unwitnessed one is the worst kind to leave untraced.
+    #[test]
+    fn a_cap_kill_nobody_can_be_told_about_says_so() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        let rt = CapWatcher::default();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        age_attempt(&e, a, 3 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Failed));
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log.contains("on_settled reached no agent"), "{log}");
     }
 
     /// gh#70's second hole. The engine crashed past its revival budget, so the

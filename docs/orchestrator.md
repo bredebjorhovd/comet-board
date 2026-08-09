@@ -44,6 +44,13 @@ ordinary chat again, with everything in it intact.
   only window in which reading its chat can change how it ends. It belongs to no
   dispatcher, because nothing has finished for one to be waiting on.
 
+An **ending** here is any of the four, not only the settle: a run that finished,
+an attempt whose chat vanished, one somebody cancelled, and one the cap killed.
+The last two used to reach nobody at all — the row closed, its checkout and chat
+went on their retention clocks, and the only trace was a colour on a board
+nothing was watching (gh#194). Each says why on its outcome line, in the same
+words the comment upstream uses.
+
 **Not** a settle a live dispatcher already handled. When the chat that released
 the work is there to be prompted, it is told and you are not — `notify_dispatcher`
 is on by default and is the first addressee. That is what makes a pin usable on

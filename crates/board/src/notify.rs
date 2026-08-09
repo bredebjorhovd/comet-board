@@ -16,7 +16,10 @@
 //!    `[defaults] notify_dispatcher` is still the switch, and since gh#165 it
 //!    is on by default and tried **first**, because it is the precise channel:
 //!    it prompts the one agent whose plan that task was a step in, and nobody
-//!    else.
+//!    else. *Every* ending, since gh#194 — a run that finished, a chat that
+//!    vanished, a cancel somebody pressed, a duration cap that bit — because
+//!    what this reader is waiting on is the step being over, not the step
+//!    going well.
 //! 3. **The pinned orchestrator.** The agent whose job is the *board*, not one
 //!    task on it ([`orchestrator_message`]). It is the **addressee of last
 //!    resort**, and that is the whole of its job: work no agent released (the
@@ -80,6 +83,15 @@ pub enum Signal {
         /// attempt the board ended for another reason (its chat vanished).
         evidence: Option<Evidence>,
         pr_url: Option<String>,
+        /// Why it ended, for the closes no evidence describes: the duration
+        /// cap, an operator's cancel (gh#194). `None` for a settle, where
+        /// `evidence` is the answer and a second phrasing of it would only be
+        /// a way for the two to disagree.
+        ///
+        /// The same clause the outcome comment carries upstream, so the agent
+        /// reading its chat and the human reading the issue are told the same
+        /// thing about the same close.
+        note: Option<String>,
     },
 }
 
@@ -159,7 +171,10 @@ pub fn summary(task: &Task, signal: &Signal) -> String {
             task.title,
         ),
         Signal::Settled {
-            outcome, pr_url, ..
+            outcome,
+            pr_url,
+            note,
+            ..
         } => {
             let tail = match (outcome, pr_url.as_deref()) {
                 (Outcome::Done, Some(url)) => format!(" · {url}"),
@@ -167,9 +182,10 @@ pub fn summary(task: &Task, signal: &Signal) -> String {
                 _ => String::new(),
             };
             format!(
-                "{} settled as {} ({} · attempt {n}){tail}",
+                "{} settled as {}{} ({} · attempt {n}){tail}",
                 task.identifier,
                 outcome.as_str(),
+                why(note.as_deref()),
                 task.title,
             )
         }
@@ -211,6 +227,7 @@ pub fn dispatcher_message(task: &Task, attempt: &Attempt, signal: &Signal) -> St
             outcome,
             evidence,
             pr_url,
+            note,
         } => {
             let mut s = "comet-board: work you released has finished.\n\n".to_string();
             s.push_str(&settled_block(
@@ -219,6 +236,7 @@ pub fn dispatcher_message(task: &Task, attempt: &Attempt, signal: &Signal) -> St
                 *outcome,
                 *evidence,
                 pr_url.as_deref(),
+                note.as_deref(),
             ));
             s.push_str(
                 "\nNo agent is working on it any more. `comet-board list --json` for the \
@@ -249,12 +267,14 @@ fn settled_block(
     outcome: Outcome,
     evidence: Option<Evidence>,
     pr_url: Option<&str>,
+    note: Option<&str>,
 ) -> String {
     let mut s = format!(
-        "{}  attempt {} · {}",
+        "{}  attempt {} · {}{}",
         task_lines(task),
         attempt_no(task),
         outcome.as_str(),
+        why(note),
     );
     if let Some(e) = evidence {
         s.push_str(&format!(" (settled on {})", e.as_str()));
@@ -308,6 +328,15 @@ fn unsticks(why: Stopped) -> &'static str {
              Nothing further happens until somebody picks it up.\n"
         }
     }
+}
+
+/// A [`Signal::Settled::note`] as it reads beside the outcome it qualifies —
+/// `failed — timed out after 2h 5m` — and nothing at all when there is none.
+///
+/// One renderer rather than one per audience, for [`settled_block`]'s reason:
+/// the webhook's `text` and the two agent notices are describing one close.
+fn why(note: Option<&str>) -> String {
+    note.map(|n| format!(" — {n}")).unwrap_or_default()
 }
 
 /// Which task, in the two lines every notice opens with. Shared for the same
@@ -368,12 +397,14 @@ pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> St
             outcome,
             evidence,
             pr_url,
+            note,
         }) => s.push_str(&settled_block(
             task,
             attempt,
             *outcome,
             *evidence,
             pr_url.as_deref(),
+            note.as_deref(),
         )),
         Event::Signal(Signal::Blocked(why)) => s.push_str(&blocked_block(task, attempt, *why)),
         Event::CapWarning {
@@ -480,10 +511,15 @@ pub fn webhook_payload(task: &Task, attempt: &Attempt, signal: &Signal, at: &str
             outcome,
             evidence,
             pr_url,
+            note,
         } => {
             map.insert("outcome".into(), json!(outcome.as_str()));
             map.insert("evidence".into(), json!(evidence.map(Evidence::as_str)));
             map.insert("pr_url".into(), json!(pr_url));
+            // Present and null on every settle rather than absent on most: a
+            // receiver routing on `outcome` should not have to tell "the board
+            // said nothing about why" from "this build did not have the field".
+            map.insert("note".into(), json!(note));
         }
     }
     body
@@ -685,6 +721,7 @@ mod tests {
                 outcome: Outcome::Done,
                 evidence: Some(Evidence::PullRequest),
                 pr_url: Some("https://github.com/o/r/pull/7".into()),
+                note: None,
             },
             "2026-08-06T00:00:00Z",
         );
@@ -704,6 +741,7 @@ mod tests {
                 outcome: Outcome::Done,
                 evidence: Some(Evidence::Commits),
                 pr_url: None,
+                note: None,
             },
         );
         assert!(m.contains("LIN-142"));
@@ -758,6 +796,7 @@ mod tests {
             outcome: Outcome::Done,
             evidence: Some(Evidence::PullRequest),
             pr_url: Some("https://github.com/o/r/pull/7".into()),
+            note: None,
         };
         let to_dispatcher = dispatcher_message(&t, &a, &signal);
         let to_orchestrator = orchestrator_message(&t, &a, &Event::Signal(&signal));
@@ -767,6 +806,7 @@ mod tests {
             Outcome::Done,
             Some(Evidence::PullRequest),
             Some("https://github.com/o/r/pull/7"),
+            None,
         );
         assert!(to_dispatcher.contains(&block));
         assert!(to_orchestrator.contains(&block));

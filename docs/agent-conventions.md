@@ -152,8 +152,10 @@ is this board's `review`.
   spawning a second agent. Concurrency caps also refuse at capacity — report
   the refusal, do not cancel someone else's work to make room.
 - **Cancel** with `comet-board cancel --task <id>`. This ends the *attempt*,
-  not the issue: the row returns to `ready` with its history intact. It does
-  not notify a parent agent that may be waiting on it — say so if one exists.
+  not the issue: the row returns to `ready` with its history intact. The chat
+  that released the attempt is told, on the same channel a settle uses and in
+  the same words — so cancelling somebody else's work interrupts them, and is
+  still yours to explain.
 - **Retry** with `comet-board retry --task <id>`, not cancel-then-dispatch. On
   a `blocked` row it ends the live attempt and releases a fresh one in the same
   call; done as two commands the row is `ready` in between and a concurrency
@@ -172,7 +174,9 @@ is this board's `review`.
   plainly that you are leaving it running. A board with `notify_dispatcher`
   on — the default — prompts you in this chat when work you released settles
   or blocks, and it is the first addressee: what reaches you does not also
-  reach the board's orchestrator. What you will *not* be told about is work
+  reach the board's orchestrator. *Every* ending arrives, not only the happy
+  one: an attempt someone cancelled, and one the duration cap killed, come
+  through the same channel with a line saying which. What you will *not* be told about is work
   you did not release; that is the orchestrator's, and only when this chat
   could not be told. You cannot see either setting from here, and a chat that
   is archived before its child finishes is told nothing at all, so never
