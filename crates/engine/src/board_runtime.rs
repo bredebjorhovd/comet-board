@@ -1,5 +1,5 @@
 //! `CometRuntime` — the board's [`Runtime`] trait implemented against engine
-//! internals (docs/BOARD.md §H2).
+//! internals (§runtime-impl).
 //!
 //! What herdr-board's `herdr.rs` drove over a mux socket, this does with the
 //! primitives directly: worktrees via [`Repos`], chats via [`WorkspaceHost`],
@@ -40,7 +40,7 @@ pub struct CometRuntime {
     /// The same merged local+remote session stream `WatchSessions` serves —
     /// one mirror, so the board can never disagree with the frontends.
     sessions: watch::Receiver<Vec<Session>>,
-    /// The engine's run journal — the settle authority (docs/BOARD.md §H4):
+    /// The engine's run journal — the settle authority (§settle-logic):
     /// `last_run_end` reads a chat's final journaled event off it.
     journal: Arc<RunJournal>,
     /// The device's saved agent logins — a dispatch naming one materializes it

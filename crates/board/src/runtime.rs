@@ -134,8 +134,8 @@ pub fn runtime_name(harness: HarnessId) -> &'static str {
 ///
 /// The mapping is deliberately lossy in one direction only: comet has no
 /// separate `done` (its Idle covers both), and the board's `Done`/`Idle` split
-/// is resolved by the settle logic, not here — a run that *ended* is visible in
-/// the run journal, which is the settle authority. See `docs/BOARD.md` §settle.
+/// is resolved by the settle logic, not here — a run that *ended* is visible
+/// in the run journal, which is the settle authority. See §settle-logic.
 pub fn agent_status(session: Option<&Session>, now: DateTime<Utc>) -> AgentStatus {
     let Some(s) = session else {
         // No session row for this chat: nothing has ever run in it, or the row
@@ -168,7 +168,7 @@ pub fn agent_status(session: Option<&Session>, now: DateTime<Utc>) -> AgentStatu
 /// How the last run in a chat ended, as the run journal records it — the
 /// board's view of comet's `DoneStatus`.
 ///
-/// This is the fact §H4's settle logic keys off: a run ending is a journal
+/// This is the fact §settle-logic keys off: a run ending is a journal
 /// event (`AgentEvent::Done`), not an inference from an idle-looking status,
 /// so "the turn ended, now check the checkout" needs no debounce clock. The
 /// distinction the *status* mapping cannot make — `Errored` and
@@ -341,11 +341,12 @@ pub trait Runtime {
     fn chat_alive(&self, chat_id: &str) -> anyhow::Result<bool>;
 
     /// Where the chat runs — its row's cwd, recorded at creation. `None` when
-    /// the chat is gone or never recorded one. Review delivery (H5) compares
-    /// this against the authoring attempt's checkout before delivering: an
-    /// operator can re-point a chat at another repo, and a review pasted into
-    /// a session that moved on reaches the wrong author. What herdr-board read
-    /// off the pane's live cwd, comet states on the chat row.
+    /// the chat is gone or never recorded one. Review delivery
+    /// (§review-delivery) compares this against the authoring attempt's
+    /// checkout before delivering: an operator can re-point a chat at another
+    /// repo, and a review pasted into a session that moved on reaches the
+    /// wrong author. What herdr-board read off the pane's live cwd, comet
+    /// states on the chat row.
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>>;
 
     /// Reclaim a finished attempt's checkout and the local branch it was cut
@@ -481,8 +482,9 @@ pub trait Runtime {
 
     /// How the chat's most recent run ended, straight off the run journal:
     /// `Some` when the journal's last event is a `Done`, `None` while a run is
-    /// mid-stream (or nothing has ever run). The settle authority §H4 names —
-    /// see [`RunEnd`] for why the session status cannot carry this.
+    /// mid-stream (or nothing has ever run). The settle authority
+    /// §settle-logic names — see [`RunEnd`] for why the session status cannot
+    /// carry this.
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>>;
 
     /// What the chat has spent so far, summed off the same run journal

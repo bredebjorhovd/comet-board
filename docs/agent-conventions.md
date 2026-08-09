@@ -118,74 +118,74 @@ running) → `review` (finished or PR open) → `failed` → `done` (issue close
 Note `done` means the *issue* is closed; an agent that finished with a PR open
 is this board's `review`.
 
-1. **Check `dispatchable` first.** False means `dispatch` will refuse — `gone`
-   tells you why: the issue vanished upstream, or no route matches. Only the
-   second is fixed by a route in `routing.toml`, which is Brede's call, not
-   yours.
-2. **Release work** with `comet-board dispatch --task <id>`. This cuts a git
-   worktree, creates a chat in the routed space, starts the agent and queues
-   the route's brief through the command ledger. It returns once the chat
-   exists; the engine takes it from there. `--runtime` and `--model` override
-   the route's runtime and that harness's default model for the one dispatch;
-   both are checked against the engine's catalogs first, and an unknown value
-   is refused naming the valid set, so a typo costs an error rather than an
-   attempt. The row's default runtime is on the row (`runtime`). A runtime the
-   box lists but cannot start — its CLI is not installed, or it is signed out —
-   is refused the same way, saying which of the two is wrong;
-   `comet-board doctor` names the harnesses that box can actually run.
-3. **Accounts are the operator's choice, not yours.** `routing.toml` decides
-   which teammate's Claude/Codex subscription a route's work is billed to.
-   `dispatch --account <id>` overrides it; do not pass it unless you were told
-   which account to use. Spending someone else's limits is not yours to
-   decide, and the board deliberately does not infer one from who dispatched.
-   `dispatch` prints a line on stderr when a release charges somebody other
-   than whoever it is attributed to — repeat it, do not swallow it. Under
-   `[defaults] billing_guard = "require-own"` such a release is *refused*
-   instead; `--bill <slot-or-email>` is the acknowledgement that overrides the
-   refusal, and passing it is a decision about someone else's money. Report the
-   refusal and let a human make it.
-4. **Provenance is automatic.** A board-dispatched chat carries its own id as
-   `COMET_BOARD_CHAT_ID`, and `dispatch` passes it along — the board records
-   your chat as the parent of what you release. Never pass `--via` unless
-   releasing work on behalf of a chat that is not you.
-5. **One live attempt per task.** A second dispatch fails cleanly rather than
-   spawning a second agent. Concurrency caps also refuse at capacity — report
-   the refusal, do not cancel someone else's work to make room.
-6. **Cancel** with `comet-board cancel --task <id>`. This ends the *attempt*,
-   not the issue: the row returns to `ready` with its history intact. It does
-   not notify a parent agent that may be waiting on it — say so if one exists.
-7. **Retry** with `comet-board retry --task <id>`, not cancel-then-dispatch. On
-   a `blocked` row it ends the live attempt and releases a fresh one in the same
-   call; done as two commands the row is `ready` in between and a concurrency
-   cap or another agent can take the slot. On a `failed` or `ready` row nothing
-   is live and it is an ordinary dispatch. It takes the same `--runtime`,
-   `--model` and `--account` overrides as `dispatch` — a retry under a different
-   model is the usual reason to retry at all. Retrying a blocked row **discards
-   the question its agent was waiting on**: read the chat first if the answer
-   was the point.
-8. **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes
-   after every sync cycle, status refresh and dispatch, so there is no sync
-   command to run first. `wait` holds the same subscription open, so it answers
-   as soon as the answer is true.
-9. **After releasing work, do not fall silent about it.** That leaves the human
-   to notice the agent finished and to prompt you. Either `wait` for it, or say
-   plainly that you are leaving it running. A board with `notify_dispatcher`
-   on — the default — prompts you in this chat when work you released settles
-   or blocks, and it is the first addressee: what reaches you does not also
-   reach the board's orchestrator. What you will *not* be told about is work
-   you did not release; that is the orchestrator's, and only when this chat
-   could not be told. You cannot see either setting from here, and a chat that
-   is archived before its child finishes is told nothing at all, so never
-   promise that you will be woken. Note also that `wait` does **not** return on
-   `blocked` by default: an agent that stops to ask a question holds its
-   attempt open, and a plain `wait` on it hangs until somebody answers. Pass
-   `--blocked-is-settled` to be called back on the question too; either way the
-   blocked agent comments on its own issue, which is the human's signal, not
-   yours.
-10. **Never dispatch speculatively.** Releasing work starts a real agent in a
-    real repo that commits and opens PRs. A human keypress — or an explicit
-    instruction — releases tasks. Reading the board is always safe; dispatching
-    is not.
+- **Check `dispatchable` first.** False means `dispatch` will refuse — `gone`
+  tells you why: the issue vanished upstream, or no route matches. Only the
+  second is fixed by a route in `routing.toml`, which is Brede's call, not
+  yours.
+- **Release work** with `comet-board dispatch --task <id>`. This cuts a git
+  worktree, creates a chat in the routed space, starts the agent and queues
+  the route's brief through the command ledger. It returns once the chat
+  exists; the engine takes it from there. `--runtime` and `--model` override
+  the route's runtime and that harness's default model for the one dispatch;
+  both are checked against the engine's catalogs first, and an unknown value
+  is refused naming the valid set, so a typo costs an error rather than an
+  attempt. The row's default runtime is on the row (`runtime`). A runtime the
+  box lists but cannot start — its CLI is not installed, or it is signed out —
+  is refused the same way, saying which of the two is wrong;
+  `comet-board doctor` names the harnesses that box can actually run.
+- **Accounts are the operator's choice, not yours.** `routing.toml` decides
+  which teammate's Claude/Codex subscription a route's work is billed to.
+  `dispatch --account <id>` overrides it; do not pass it unless you were told
+  which account to use. Spending someone else's limits is not yours to
+  decide, and the board deliberately does not infer one from who dispatched.
+  `dispatch` prints a line on stderr when a release charges somebody other
+  than whoever it is attributed to — repeat it, do not swallow it. Under
+  `[defaults] billing_guard = "require-own"` such a release is *refused*
+  instead; `--bill <slot-or-email>` is the acknowledgement that overrides the
+  refusal, and passing it is a decision about someone else's money. Report the
+  refusal and let a human make it.
+- **Provenance is automatic.** A board-dispatched chat carries its own id as
+  `COMET_BOARD_CHAT_ID`, and `dispatch` passes it along — the board records
+  your chat as the parent of what you release. Never pass `--via` unless
+  releasing work on behalf of a chat that is not you.
+- **One live attempt per task.** A second dispatch fails cleanly rather than
+  spawning a second agent. Concurrency caps also refuse at capacity — report
+  the refusal, do not cancel someone else's work to make room.
+- **Cancel** with `comet-board cancel --task <id>`. This ends the *attempt*,
+  not the issue: the row returns to `ready` with its history intact. It does
+  not notify a parent agent that may be waiting on it — say so if one exists.
+- **Retry** with `comet-board retry --task <id>`, not cancel-then-dispatch. On
+  a `blocked` row it ends the live attempt and releases a fresh one in the same
+  call; done as two commands the row is `ready` in between and a concurrency
+  cap or another agent can take the slot. On a `failed` or `ready` row nothing
+  is live and it is an ordinary dispatch. It takes the same `--runtime`,
+  `--model` and `--account` overrides as `dispatch` — a retry under a different
+  model is the usual reason to retry at all. Retrying a blocked row **discards
+  the question its agent was waiting on**: read the chat first if the answer
+  was the point.
+- **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes
+  after every sync cycle, status refresh and dispatch, so there is no sync
+  command to run first. `wait` holds the same subscription open, so it answers
+  as soon as the answer is true.
+- **After releasing work, do not fall silent about it.** That leaves the human
+  to notice the agent finished and to prompt you. Either `wait` for it, or say
+  plainly that you are leaving it running. A board with `notify_dispatcher`
+  on — the default — prompts you in this chat when work you released settles
+  or blocks, and it is the first addressee: what reaches you does not also
+  reach the board's orchestrator. What you will *not* be told about is work
+  you did not release; that is the orchestrator's, and only when this chat
+  could not be told. You cannot see either setting from here, and a chat that
+  is archived before its child finishes is told nothing at all, so never
+  promise that you will be woken. Note also that `wait` does **not** return on
+  `blocked` by default: an agent that stops to ask a question holds its
+  attempt open, and a plain `wait` on it hangs until somebody answers. Pass
+  `--blocked-is-settled` to be called back on the question too; either way the
+  blocked agent comments on its own issue, which is the human's signal, not
+  yours.
+- **Never dispatch speculatively.** Releasing work starts a real agent in a
+  real repo that commits and opens PRs. A human keypress — or an explicit
+  instruction — releases tasks. Reading the board is always safe; dispatching
+  is not.
 
 **One chat may be pinned as the board's orchestrator.** If this one is, you
 receive a `comet-board:` prompt for everything on the board that no other agent
@@ -307,8 +307,15 @@ changes, and `--device` is unnecessary wherever the board is local.
 unreachable repos, routes pointing at spaces that do not exist, an engine that
 is not listening. Prefer it to guessing.
 
+The rules above are a bulleted list on purpose. They used to be numbered, and
+the numbers said nothing — no rule cites another by its number, and nothing in
+the code does either. What the numbering did do is make two agents adding a
+rule at once a renumbering conflict instead of a keep-both one (gh#203). Add a
+rule by adding a bullet.
+
 Source lives in this repo (`apps/board-cli`, `crates/board`); `docs/BOARD.md`
-maps the port, and herdr-board's README documents the inherited behavior. The
+maps the port, and its per-item write-ups are one file each in `docs/board/`
+(gh#203), and herdr-board's README documents the inherited behavior. The
 short form of this text is the `comet-board` skill, which ships inside the
 binary and is what a Claude session discovers on its own — `comet-board skill
 install` puts it where sessions on this machine will find it (`docs/skill.md`).

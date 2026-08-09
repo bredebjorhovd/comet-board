@@ -22,7 +22,7 @@
 //! Ported from herdr-board's `adopt.rs`; a herdr *workspace* is a comet
 //! *space*. The label-picker flow survives as [`preview`] + the `labels`
 //! argument to [`adopt_with`] — same decision, different surface (CLI flags
-//! now, H7's screen later).
+//! now, §board-view's screen later).
 
 use crate::config::{RoutingConfig, shorten_home};
 use anyhow::{Context, Result, bail};
@@ -381,9 +381,9 @@ pub fn adopt(path: &Path, u: &Unadopted) -> Result<Adopted> {
 /// Adopt a repo: write the route it needs and the `[github] repos` entry, and
 /// leave a suggestion for the one thing that cannot be derived.
 ///
-/// `labels` is what the operator chose (CLI `--labels`, or H7's picker).
-/// `None` keeps the global `[github] labels` — which is what adoption always
-/// did, and is right whenever the repo's tracker is curated.
+/// `labels` is what the operator chose (CLI `--labels`, or §board-view's
+/// picker). `None` keeps the global `[github] labels` — which is what adoption
+/// always did, and is right whenever the repo's tracker is curated.
 pub fn adopt_with(path: &Path, u: &Unadopted, labels: Option<&[String]>) -> Result<Adopted> {
     let before = read(path)?;
     let mut text = before.clone();

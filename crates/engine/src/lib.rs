@@ -107,7 +107,7 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
-    /// Host the board service (docs/BOARD.md §H1). Default on via
+    /// Host the board service (§board-service). Default on via
     /// [`board_enabled_from_env`] (`COMET_BOARD=0` disables); with no board
     /// config on disk the loop is idle-cheap.
     pub board: bool,
@@ -635,7 +635,7 @@ impl Engine {
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
-        // The board service (docs/BOARD.md §H1): the sync loop herdr-board ran
+        // The board service (§board-service): the sync loop herdr-board ran
         // as `syncd`, fed by the same merged session stream `WatchSessions`
         // serves. Failure to start is a warning, not fatal — the engine's job
         // is chats, and the board is an addition.

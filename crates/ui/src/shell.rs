@@ -414,7 +414,7 @@ pub struct Shell {
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     changes: Option<Entity<Changes>>,
-    /// The task board (docs/BOARD.md §H10). Unlike the terminal and changes
+    /// The task board (§gh#70). Unlike the terminal and changes
     /// panes it is a GLOBAL view — the queue across every workspace — so its
     /// open flag lives on the shell, not in [`SessionPanels`]. And unlike them
     /// it is **not** lazy: its `WatchBoard` stream feeds the sidebar's Agents
@@ -995,7 +995,7 @@ impl Shell {
         changes
     }
 
-    /// Cmd/Ctrl+Shift+B and the tab-strip button (docs/BOARD.md §H10). The
+    /// Cmd/Ctrl+Shift+B and the tab-strip button (§gh#70). The
     /// board is a global queue, so unlike the per-session terminal/changes
     /// flags this one lives on the shell. Width animates 200 ms in the shared
     /// right-dock slot, which shows one thing at a time: opening the board

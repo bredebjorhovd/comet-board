@@ -1,5 +1,5 @@
 //! The settle decision: what the end of a run means for the attempt that owns
-//! the chat (docs/BOARD.md §H4).
+//! the chat (§settle-logic).
 //!
 //! Ported from herdr-board's `settled.rs` and the settle half of its `sync.rs`
 //! — the *decision*, deliberately without the machinery that surrounded it.
@@ -150,7 +150,8 @@ pub fn decide(end: RunEnd, pr_open: bool, commits: impl FnOnce() -> Commits) -> 
     }
 }
 
-/// Should a *closed* attempt go back to work? (herdr gh#34, kept per §H4.)
+/// Should a *closed* attempt go back to work? (herdr gh#34, kept per
+/// §settle-logic.)
 ///
 /// `redispatched` refuses on a task that already has a live attempt — that
 /// attempt is the current one, and the partial unique index would refuse the
@@ -178,7 +179,8 @@ mod tests {
 
     /// The agent's own statement outranks everything, including how the run
     /// exited: the PR exists, so the work is reviewable, so the attempt is
-    /// finished. No clock, no second sample — the whole of §H4's headline.
+    /// finished. No clock, no second sample — the whole of §settle-logic's
+    /// headline.
     #[test]
     fn a_pull_request_closes_the_attempt_whatever_the_run_said() {
         for end in [RunEnd::Completed, RunEnd::Interrupted, RunEnd::Errored] {
@@ -237,10 +239,11 @@ mod tests {
         );
     }
 
-    /// The `reopened` half of §H4's contract starts here: an errored run is
-    /// not closed, so the retry that follows lands on the same attempt row.
-    /// Commits do not change that — the agent committed and *then* died, which
-    /// is exactly the case where "finished" would be the opposite of true.
+    /// The `reopened` half of §settle-logic's contract starts here: an errored
+    /// run is not closed, so the retry that follows lands on the same attempt
+    /// row. Commits do not change that — the agent committed and *then* died,
+    /// which is exactly the case where "finished" would be the opposite of
+    /// true.
     #[test]
     fn an_errored_run_stays_live_even_with_commits() {
         assert_eq!(
@@ -253,7 +256,7 @@ mod tests {
 
     /// Between turns is not finished: a run can end cleanly with nothing to
     /// show because the agent is mid-conversation. The attempt stays live and
-    /// the row renders a dim idle marker, exactly as before H4.
+    /// the row renders a dim idle marker, exactly as before §settle-logic.
     #[test]
     fn a_clean_end_with_no_artifacts_settles_nothing() {
         assert_eq!(

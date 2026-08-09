@@ -100,8 +100,7 @@ whoever released it. Nothing rejects it — the commit lands, the push succeeds,
 the PR opens — and it reads as the box owner's on GitHub. On a repo behind a
 contributor gate (Vercel attributes a deployment to the commit's *author*, and
 on a team plan that attribution is a gate) it is a refused deploy, reported on
-the deployment rather than on the push. `docs/BOARD.md` §H22 is the long
-version.
+the deployment rather than on the push. §gh#107 is the long version.
 
 Under the hood this is `[users]` in the board's `routing.toml`, which was a
 hand-edit before gh#162. It still is a file you can open; the verb is what

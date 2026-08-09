@@ -1,23 +1,24 @@
 //! The board service — the engine hosting what herdr-board's `syncd` ran as a
-//! separate daemon (docs/BOARD.md §H1), plus the dispatch/cancel verbs and the
-//! `WatchBoard` rows feed the RPC surface serves (§H2).
+//! separate daemon (§board-service), plus the dispatch/cancel verbs and the
+//! `WatchBoard` rows feed the RPC surface serves (§runtime-impl).
 //!
 //! Three inputs drive the board:
 //!
 //! - **The sync interval** (`[sync] interval` in `routing.toml`, default 30s):
 //!   poll Linear/GitHub, reconcile session state, derive states, drain the
-//!   writeback queue, deliver review comments (§H5) against the pulls the
-//!   cycle just polled. This is the loop with lifecycle authority — orphaning
-//!   rides its steady clock, so a burst of events cannot age an attempt faster
-//!   than wall time.
+//!   writeback queue, deliver review comments (§review-delivery) against the
+//!   pulls the cycle just polled. This is the loop with lifecycle authority —
+//!   orphaning rides its steady clock, so a burst of events cannot age an
+//!   attempt faster than wall time.
 //! - **The session watch** (the same merged stream `WatchSessions` serves):
 //!   each snapshot is mapped through `comet_board::runtime::agent_status` and
 //!   written onto live attempts as a status-only refresh, so a `blocked` agent
 //!   is visible on the board the moment it asks, not on the next tick.
-//! - **Commands** (`DispatchTask` / `CancelTask`): executed on the loop thread,
-//!   because `board.db` has one writer and it is this one. Dispatch resolution
-//!   is `comet_board::dispatch`; execution is the [`Runtime`] — H3 grows the
-//!   pipeline (concurrency caps, dispatcher provenance) around the same seam.
+//! - **Commands** (`DispatchTask` / `CancelTask`): executed on the loop
+//!   thread, because `board.db` has one writer and it is this one. Dispatch
+//!   resolution is `comet_board::dispatch`; execution is the [`Runtime`] —
+//!   §dispatch-pipeline grows the pipeline (concurrency caps, dispatcher
+//!   provenance) around the same seam.
 //!
 //! The sources are blocking HTTP and SQLite wants one writer, so everything
 //! runs on a dedicated thread; the async side only forwards watch snapshots
@@ -396,8 +397,9 @@ fn run_loop(
         match rx.recv_timeout(wait) {
             Ok(Msg::Sessions(sessions)) => {
                 let mapped = map_statuses(&sessions);
-                // The event fast path: statuses, plus §H4's settle/reopen —
-                // the clocked lifecycle (orphaning) stays on the interval.
+                // The event fast path: statuses, plus §settle-logic's
+                // settle/reopen — the clocked lifecycle (orphaning) stays on
+                // the interval.
                 match engine.refresh_statuses_with(&mapped, Some(runtime.as_ref())) {
                     Ok(true) => publish_rows(&engine, &feeds.rows, &log),
                     Ok(false) => {}
@@ -502,7 +504,7 @@ fn publish_rows(engine: &SyncEngine, rows: &watch::Sender<Vec<TaskRow>>, log: &L
     }
 }
 
-/// One dispatch, on the loop thread (docs/BOARD.md §H2/H3).
+/// One dispatch, on the loop thread (§runtime-impl/§dispatch-pipeline).
 ///
 /// The refusals come first — live attempt, route, capacity, space — so nothing
 /// is created for a dispatch that cannot happen. Then ordering is deliberate:
@@ -1108,9 +1110,9 @@ runtime = "mock"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_run_ending_settles_an_attempt_with_a_pull_request() {
-        // §H4 through the service: the session flipping Working → Idle is the
-        // run-end event, and with a PR recorded the attempt closes on it —
-        // no interval tick, no clock.
+        // §settle-logic through the service: the session flipping Working →
+        // Idle is the run-end event, and with a PR recorded the attempt closes
+        // on it — no interval tick, no clock.
         let paths = scratch_paths();
         seed_task(&paths, "gh:owner/widget#4", "gh#4");
         seed_attempt(&paths, "gh:owner/widget#4", "chat-4");

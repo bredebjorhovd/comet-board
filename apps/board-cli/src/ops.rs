@@ -1,5 +1,5 @@
 //! The agent-facing half of `comet-board`: list / dispatch / retry / cancel /
-//! wait / new — docs/BOARD.md §H6.
+//! wait / new — §board-cli.
 //!
 //! Everything that reads or moves the live board goes through the engine's
 //! typed RPC on the localhost IPC port, exactly as `comet-tui` attaches: the
@@ -36,8 +36,9 @@ use std::time::Duration;
 /// immediately; anything slower than this is a listener that is not the engine.
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Set in a board-dispatched chat's environment (H3), so `dispatch` from inside
-/// one inherits identity the way `HERDR_PANE_ID` provided it under herdr.
+/// Set in a board-dispatched chat's environment (§dispatch-pipeline), so
+/// `dispatch` from inside one inherits identity the way `HERDR_PANE_ID`
+/// provided it under herdr.
 pub const CHAT_ID_ENV: &str = "COMET_BOARD_CHAT_ID";
 
 /// The engine connection plus which device's board it drives (gh#73).

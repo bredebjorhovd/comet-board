@@ -9,7 +9,7 @@ A ground-up native rewrite of [comet](../comet) — a multi-device controller fo
   Everything device-side is Rust.
 - Feature parity with comet **except token-usage display in the transcript/docs** (poor fit for
   CRDTs; excluded). The board keeps its own token totals in `board.db` for its stats page — a
-  different store with a different lifetime (gh#151, docs/BOARD.md §H35).
+  different store with a different lifetime (§gh#151).
 - Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
 - One binary, **headed or headless**. Smooth transitions/animations matching the original

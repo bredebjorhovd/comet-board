@@ -135,7 +135,7 @@ impl ShortcutId {
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
-            // The board is a comet-native addition (docs/BOARD.md H10); there is
+            // The board is a comet-native addition (§gh#70); there is
             // no comet `SHORTCUT_DEFINITIONS` entry to quote.
             ShortcutId::ToggleBoard => "Toggle board",
         }

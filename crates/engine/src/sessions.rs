@@ -163,7 +163,7 @@ impl SessionsEngine {
     }
 
     /// The run journal this engine appends to — the board's settle authority
-    /// (docs/BOARD.md §H4): `CometRuntime::last_run_end` reads it.
+    /// (§settle-logic): `CometRuntime::last_run_end` reads it.
     pub fn journal(&self) -> Arc<RunJournal> {
         self.inner.journal.clone()
     }

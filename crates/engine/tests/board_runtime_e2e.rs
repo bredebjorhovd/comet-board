@@ -1,5 +1,6 @@
-//! H2 end-to-end: `CometRuntime` (the board's `Runtime` trait against engine
-//! internals) driven through a real assembled engine with the mock harness.
+//! §runtime-impl end-to-end: `CometRuntime` (the board's `Runtime` trait
+//! against engine internals) driven through a real assembled engine with the
+//! mock harness.
 //!
 //! dispatch → worktree cut on the spec's branch, chat created in the space,
 //! brief queued and *executed*; prompt → a second turn; cancel → interrupt +
@@ -234,7 +235,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     )
     .await;
     assert!(runtime.chat_alive(&handle.chat_id).unwrap());
-    // The journal fact §H4's settle logic reads: the turn's `Done` is the
+    // The journal fact §settle-logic reads: the turn's `Done` is the
     // chat's last journaled event, and it completed.
     assert_eq!(
         runtime.last_run_end(&handle.chat_id).unwrap(),
