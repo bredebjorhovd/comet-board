@@ -32,9 +32,48 @@ desktop's pulldown-cmark config).
 - **Demo mode**: fully offline dataset with a scripted streaming reply and a
   board (rows in every state, two live attempts wired to real demo chats) —
   explore the UI with no infrastructure. Launch args for screenshot rigs:
-  `-demo [-route chat:<id>|space:<id>|board] [-sheet dispatch] [-stream]`.
+  `-demo [-route chat:<id>|space:<id>|board|stats] [-sheet dispatch] [-stream]`.
   `-route`/`-sheet` work against a live edge too, which is where the rows that
   matter are.
+
+### Keeping the ported rules honest (gh#157)
+
+Several files here are second implementations of rules that live in Rust —
+`StatsModels.swift`, `SpaceRows.swift`, `BoardModels.swift` — because no Rust
+runs on this device. Two implementations of one rule is how a phone comes to
+disagree with a laptop about a number somebody is deciding on, so for the stats
+rules the *cases* live outside both languages:
+
+```sh
+cargo test -p comet-proto stats     # the Rust half + the fixture guard
+scripts/ios-stats-spec.sh           # the Swift half, in the simulator
+```
+
+`crates/proto/src/view/stats.rs` (mod `spec`) generates
+`Comet/Spec/stats-spec.json` — every rule's inputs and expected outputs, plus
+real serialized `BoardStats` values so the decode is checked too — and fails
+when the checked-in file stops matching the Rust. `SpecRunner` (launch arg
+`-spec`) asserts the Swift functions against the same file. Whichever side
+moves is the side that fails. After changing a rule in Rust:
+
+```sh
+UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats && scripts/ios-stats-spec.sh
+```
+
+**Run the second command. The fixture is a prompt, not an enforcement.** Only
+the Rust half runs in CI — the Swift half needs a simulator, and no CI here has
+one. So the failure mode is quiet and it looks like success: change a rule in
+Rust, the guard goes red, you regenerate, CI goes green, and the phone is now
+wrong about that rule until somebody runs the script. Regenerating the fixture
+is not the end of the job; it is the *notice* that the other half of the job
+exists. Treat a `UPDATE_STATS_SPEC=1` run without an `ios-stats-spec.sh` run in
+the same change as an unfinished change.
+
+A launch-arg runner rather than XCTest: this project has one target and one
+shared scheme, and a test target means editing `project.pbxproj` and
+`Comet.xcscheme`. `-bench` and `-e2e` already work this way. (A test target
+would not close the gap either — what is missing is a macOS runner with a
+simulator, not a test framework.)
 
 ### Verifying the board against a real box
 
@@ -70,6 +109,12 @@ Board/
                         content, elapsed against the route's cap
   DispatchSheet.swift   runtime + account pickers with billing chips (gh#74/#101)
                         and the `require-own` confirm
+  StatsModels.swift     view/stats.rs port (gh#143/gh#151): the `BoardStats`
+                        wire shape (decoded strictly — a skewed field is an
+                        error, never a zero) plus the renderer's arithmetic —
+                        ranking a tally, scaling a bar, phrasing a duration,
+                        folding a tail into `n others`, and the honest empties.
+                        Held to the Rust by a shared fixture — see below
   ActiveSection.swift   the one live group (gh#103 + gh#117, merged by gh#123),
                         phone-shaped: attempts with identifier chips, unmanaged
                         runs by bare title, needs-you first
@@ -78,8 +123,11 @@ Models/
                         union of spaces + the board App's grant, its box-first
                         order, and the name-before-owner search rank
   SpaceRows.swift       view/spaces.rs port (gh#138): names made unique within a
-                        device's spaces, and the split that gives a chat one
-                        full row — Active's while it runs, its own when idle
+                        device's spaces — as `SpaceTitle { base, qualifier }`,
+                        two fields so a row that elides from the right cannot
+                        cut the half that tells it from its twin (gh#144) —
+                        and the split that gives a chat one full row: Active's
+                        while it runs, its own when idle
 Sync/
   LoroProtocol.swift    loro-protocol 0.3 wire codec (byte-compatible port of
                         the crate's encoding.rs: magic/varBytes/type/payload)
@@ -130,6 +178,8 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Folder browser: device tabs + remote listing | Same, as a pushed screen (ListFolders over the device-room relay, git repos badged) |
 | ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; unary `call` **and** streaming `subscribe` (`{item}`/`{done}`, `{id,cancel}` on drop); used for ListFolders, direct-to-host `Mutate {createSpace}`, and the board four |
 | Board panel (`ui/src/board.rs`) | Board screen: same sections/glyphs/metadata, dispatch + retry as a sheet (`Board/`) |
+| Settings → Board stats: a 1160px two-column dashboard (gh#143/gh#151) | Stats screen off the board: the headline panel (count, qualifying facts, per-space split) and one column of evidence under it — no tile rows, no side-by-side panels, no hour-of-day |
+| Sidebar chat menu: unpin the orchestrator (gh#144) | Long-press the pinned slot on Home — the phone's only route to `routes defaults orchestrator_chat --unset` |
 | Sidebar Agents section (gh#103) | Same section on Home, between Spaces and Sessions |
 | Board host sweep with `targetDeviceId` | Same candidate order, dialling each device's room directly — the phone has no local engine to forward through |
 | Hover timestamps / copy | Context menus |

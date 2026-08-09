@@ -10,6 +10,9 @@ enum Route: Hashable {
     case chat(String)
     case newSession(spaceId: String)
     case board
+    /// What the board did with the work it was given (gh#143) — a screen off
+    /// the board, because it answers a question about the board.
+    case stats
 }
 
 struct HomeView: View {
@@ -49,6 +52,7 @@ struct HomeView: View {
                 case .chat(let id): SessionView(chatId: id)
                 case .newSession(let spaceId): NewSessionView(spaceId: spaceId, path: $path)
                 case .board: BoardView(path: $path)
+                case .stats: StatsView()
                 }
             }
             .toolbar {
@@ -211,6 +215,10 @@ struct SpaceRow: View {
     @Environment(AppModel.self) private var model
     let space: Space
 
+    /// How wide a qualifier may get before it truncates — the sidebar's
+    /// `SPACE_QUALIFIER_MAX`, so both surfaces cut the tail at the same place.
+    static let qualifierMax: CGFloat = 132
+
     var body: some View {
         HStack(spacing: 8) {
             // Leading 6pt aggregate dot — position stable, most-urgent member.
@@ -223,22 +231,56 @@ struct SpaceRow: View {
                 .foregroundStyle(Theme.textMuted)
             // Unique within its device's spaces (gh#138): a repo slug names a
             // repo, and one machine can hold a checkout AND a worktree of it.
-            Text(model.spaceTitlesById[space.id] ?? space.displayName)
+            //
+            // The qualifier is drawn beside the base rather than appended to it
+            // (gh#144). This row elides from the right, so one glued string
+            // loses the tail FIRST — both checkouts of one repo would read
+            // `bredebjorhovd/attn…` again, and the fix would be invisible
+            // exactly where it was needed. Beside it, the tail has a width of
+            // its own to lose or keep.
+            let title = model.spaceTitlesById[space.id]
+                ?? SpaceTitle(base: space.displayName, qualifier: nil)
+            Text(title.base)
                 .font(Theme.sans(13, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+            if let qualifier = title.qualifier {
+                Text("· \(qualifier)")
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted.opacity(0.75))
+                    .lineLimit(1)
+                    // Capped, as the sidebar caps it, and ranked with the base
+                    // rather than above it: what the two of them squeeze is the
+                    // device tag, which the row can afford to abbreviate.
+                    //
+                    // A truncated qualifier still separates the rows here — a
+                    // phone space is named by its folder, so the tail's LAST
+                    // segment repeats the base and the part that differs is at
+                    // the front, where truncation never reaches.
+                    .frame(maxWidth: SpaceRow.qualifierMax, alignment: .leading)
+                    .layoutPriority(1)
+            }
             // "· 3 running" — where this space's live rows went. The dot said
             // how urgent; this says how many, and the sessions list below no
             // longer repeats them.
+            //
+            // Lowest priority of the four, and the only one that may vanish on
+            // a narrow row: the leading dot already colours when this space has
+            // something live, so the count is the one fact here that is said
+            // twice.
             if let running = runningLabel(model.spaceRunning(space.id)) {
                 Text(running)
                     .font(Theme.sans(11))
                     .foregroundStyle(Theme.textMuted.opacity(0.6))
                     .lineLimit(1)
-                    .fixedSize()
             }
             Spacer(minLength: 8)
-            deviceTag
+            // Ranked with the name: a device that has gone offline cannot run
+            // this space's sessions at all, and a warning that gets squeezed
+            // off the row is a warning nobody sees.
+            deviceTag.layoutPriority(1)
             Image(systemName: "chevron.right")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(Theme.textFaint.opacity(0.6))
