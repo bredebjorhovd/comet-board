@@ -635,7 +635,7 @@ impl Repos {
     }
 
     /// Cut a worktree on an exact branch name — the board's dispatch path
-    /// (docs/BOARD.md §H2), where the branch comes from routing.toml's
+    /// (§runtime-impl), where the branch comes from routing.toml's
     /// `branch_template` rather than a generated `comet/…` name.
     ///
     /// A fresh branch starts at `base` **fetched from origin** (gh#67), not at

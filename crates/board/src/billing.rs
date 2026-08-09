@@ -160,7 +160,7 @@ impl Attribution {
     }
 }
 
-/// Who a dispatch bills, resolved at release time (docs/BOARD.md §H11).
+/// Who a dispatch bills, resolved at release time (§gh#68).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Billing {
     /// The email whose subscription the run spends: the named slot's login, or

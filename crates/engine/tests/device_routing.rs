@@ -1039,12 +1039,11 @@ async fn the_relay_admits_the_org_and_refuses_everyone_else() {
 /// gh#161: the box compares against an identity the edge verified, not one the
 /// frontend typed.
 ///
-/// Two laptops dispatch the same task into the same box under
-/// `billing_guard = "require-own"`, and each sends a `viaUser` naming the box's
-/// owner — the exact lie §H15 said walked straight through. The teammate is
-/// refused, and refused *naming them*; the owner's own laptop gets past the
-/// guard and fails on the next thing, which is what "past the guard" looks like
-/// from outside.
+/// Two laptops dispatch the same task into the same box under `billing_guard =
+/// "require-own"`, and each sends a `viaUser` naming the box's owner — the
+/// exact lie §gh#74 said walked straight through. The teammate is refused, and
+/// refused *naming them*; the owner's own laptop gets past the guard and fails
+/// on the next thing, which is what "past the guard" looks like from outside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn require_own_refuses_the_teammate_the_relay_names_not_the_user_they_claim() {
     use comet_board::db::{Db, UpsertTask};

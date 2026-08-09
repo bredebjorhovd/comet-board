@@ -12,18 +12,18 @@
 //! [`AgentStatus`], and [`SyncEngine::reconcile_sessions`] writes them onto
 //! live attempts. No screens, no vitals, no nudges.
 //!
-//! Settle decisions (§H4) key off run-journal events: a run ending is a
-//! recorded fact, so "the turn ended, now check the checkout" needs no
+//! Settle decisions (§settle-logic) key off run-journal events: a run ending
+//! is a recorded fact, so "the turn ended, now check the checkout" needs no
 //! debounce clock. The decision itself is [`crate::settled::decide`]; the
 //! artifact checks and the wrongly-settled rewatch live here, on both the
 //! interval reconcile (catch-up) and the event path (the moment the run ends).
 //!
 //! ## What is deliberately NOT here yet
 //!
-//! - **Unadopted detection** — lives in [`crate::adopt`] (H8), walking comet
-//!   spaces on demand from `comet-board adopt` / `doctor` rather than on the
-//!   sync cycle; H7's board view decides whether a periodic sweep earns a
-//!   place here.
+//! - **Unadopted detection** — lives in [`crate::adopt`] (§adopt-doctor-init),
+//!   walking comet spaces on demand from `comet-board adopt` / `doctor` rather
+//!   than on the sync cycle; §board-view decides whether a periodic sweep
+//!   earns a place here.
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::db::{Db, NewWriteback, Reaped};
@@ -311,8 +311,9 @@ impl SyncEngine {
     }
 
     /// As [`SyncEngine::sync_once`], with the [`Runtime`] the settle logic
-    /// consults for run-journal facts (§H4). `None` — the read-only callers —
-    /// still settles on `Idle`, but leaves an errored end unrecognised.
+    /// consults for run-journal facts (§settle-logic). `None` — the read-only
+    /// callers — still settles on `Idle`, but leaves an errored end
+    /// unrecognised.
     pub fn sync_once_with(
         &self,
         statuses: Option<&SessionStatuses>,
@@ -730,7 +731,7 @@ impl SyncEngine {
     /// detection". Half the answer: whether those commits are anywhere but
     /// this box is [`SyncEngine::commits_are_on_origin`], and the two together
     /// are [`SyncEngine::attempt_commits`], which [`SyncEngine::maybe_settle`]
-    /// consumes (§H4). The ranking of what they measure is
+    /// consumes (§settle-logic). The ranking of what they measure is
     /// [`crate::settled::decide`].
     pub fn attempt_has_commits(&self, worktree: Option<&str>, base_sha: Option<&str>) -> bool {
         let Some(worktree) = worktree else {
@@ -914,14 +915,15 @@ impl SyncEngine {
     /// - A chat that has *never* had a session row is indistinguishable from a
     ///   dispatch whose first run has not started yet (the brief sits in the
     ///   command ledger until the host device executes it). Ticks are counted
-    ///   for observability, but the verdict needs `Runtime::chat_alive` — H2.
-    ///   Nothing is orphaned on absence-of-evidence alone.
-    /// - Settling (§H4): a live attempt whose chat's last run has ended is
-    ///   checked for artifacts — see [`SyncEngine::maybe_settle`]. This is the
-    ///   catch-up path (the event path settles the moment the run ends); it
-    ///   makes no fresh PR lookup because the cycle polled seconds ago.
-    /// - Re-opening (§H4's inverse): a settled attempt whose chat is working
-    ///   again — [`SyncEngine::rewatch_settled_attempts`].
+    ///   for observability, but the verdict needs `Runtime::chat_alive` —
+    ///   §runtime-impl. Nothing is orphaned on absence-of-evidence alone.
+    /// - Settling (§settle-logic): a live attempt whose chat's last run has
+    ///   ended is checked for artifacts — see [`SyncEngine::maybe_settle`].
+    ///   This is the catch-up path (the event path settles the moment the run
+    ///   ends); it makes no fresh PR lookup because the cycle polled seconds
+    ///   ago.
+    /// - Re-opening (§settle-logic's inverse): a settled attempt whose chat is
+    ///   working again — [`SyncEngine::rewatch_settled_attempts`].
     ///
     /// Call this on the steady sync interval only. Session-watch *events*
     /// should go through [`SyncEngine::refresh_statuses`] instead, so a burst
@@ -967,7 +969,8 @@ impl SyncEngine {
                     if ticks == 2 {
                         self.log.warn(format!(
                             "{} chat {} has no session and has never worked — \
-                             leaving it until liveness can be checked (H2)",
+                             leaving it until liveness can be checked \
+                             (§runtime-impl)",
                             task.identifier, chat_id
                         ));
                     }
@@ -1004,9 +1007,9 @@ impl SyncEngine {
             if status == AgentStatus::Working && !attempt.saw_working {
                 self.db.set_saw_working(attempt.id)?;
             }
-            // §H4: the turn ended — check the checkout. No fresh PR lookup on
-            // this path: the cycle polled GitHub moments ago, so the recorded
-            // PR state is as fresh as a lookup would be.
+            // §settle-logic: the turn ended — check the checkout. No fresh PR
+            // lookup on this path: the cycle polled GitHub moments ago, so the
+            // recorded PR state is as fresh as a lookup would be.
             let settled = self.maybe_settle(runtime, &task, &attempt, status, false)?;
             // Blocked *and* settled is an errored run whose pull request was
             // already open: the work is reviewable, so it is a settle and not
@@ -1028,11 +1031,11 @@ impl SyncEngine {
     /// Copy what an attempt's chat has spent onto its row (gh#151).
     ///
     /// The engine's run journal is the source and the attempt row is the
-    /// record, because the two have different lifetimes: §H33 archives a chat
-    /// once nobody is coming back to it, and a journal can be compacted or
-    /// lost, while the attempt survives for as long as the board has a history
-    /// to report on. So this is a copy taken while the evidence is still
-    /// there, not a lookup deferred to whenever somebody opens the page.
+    /// record, because the two have different lifetimes: §gh#144 archives a
+    /// chat once nobody is coming back to it, and a journal can be compacted
+    /// or lost, while the attempt survives for as long as the board has a
+    /// history to report on. So this is a copy taken while the evidence is
+    /// still there, not a lookup deferred to whenever somebody opens the page.
     ///
     /// Called on every reconcile of a live attempt rather than once at close:
     /// an attempt can end by being orphaned, capped or cancelled — paths where
@@ -1710,7 +1713,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    // ---- settling (§H4) --------------------------------------------------
+    // ---- settling (§settle-logic) -----------------------------------------
 
     /// Has this attempt's chat's last run ended, and if so how did it end?
     ///
@@ -1751,8 +1754,8 @@ impl SyncEngine {
         }
     }
 
-    /// The §H4 settle check: if this attempt's run has ended, weigh the
-    /// artifacts and maybe close it. Returns whether it settled.
+    /// The §settle-logic settle check: if this attempt's run has ended, weigh
+    /// the artifacts and maybe close it. Returns whether it settled.
     ///
     /// `ask_github` allows the two targeted GitHub lookups the decision can
     /// want — an unrecorded pull request, and (gh#69) a branch pushed without
@@ -1877,8 +1880,9 @@ impl SyncEngine {
 
     /// Close an attempt whose evidence cleared the bar, and tell everyone who
     /// was waiting on it: the tracker, the agent that released it, and the
-    /// operator's out-of-band channel. The §H4 half of what herdr-board's
-    /// `settle` did, now including its AGE-25 dispatcher wake (gh#71).
+    /// operator's out-of-band channel. The §settle-logic half of what
+    /// herdr-board's `settle` did, now including its AGE-25 dispatcher wake
+    /// (gh#71).
     fn settle(
         &self,
         runtime: Option<&dyn Runtime>,
@@ -2028,9 +2032,9 @@ impl SyncEngine {
         }
         // The dispatcher is usually a long-lived orchestrator that outlives
         // many children, but attempts cap at two hours and chats archive as
-        // their task settles (§H31), so a dispatcher that did not survive its
-        // own child is ordinary rather than exceptional. Not an error — just a
-        // notice that now needs a different addressee.
+        // their task settles (§gh#139), so a dispatcher that did not survive
+        // its own child is ordinary rather than exceptional. Not an error —
+        // just a notice that now needs a different addressee.
         if !self.chat_can_be_told(runtime, task, chat) {
             return Told::Unreachable;
         }
@@ -2258,8 +2262,8 @@ impl SyncEngine {
             && (attempt.agent_status != Some(AgentStatus::Blocked) || attempt.blocked_count == 0)
     }
 
-    /// Look again at attempts the board has already closed (§H4's inverse,
-    /// herdr gh#34: "a settle the board got wrong").
+    /// Look again at attempts the board has already closed (§settle-logic's
+    /// inverse, herdr gh#34: "a settle the board got wrong").
     ///
     /// An attempt settles on evidence, and evidence can be wrong — commits are
     /// routinely there long before the work is done. A settled attempt whose
@@ -2384,15 +2388,16 @@ impl SyncEngine {
     ///   becomes blocked when it asks something, unblocked the moment it is
     ///   answered — and waiting an interval tick to notice makes the board lie
     ///   about the one thing it exists to show.
-    /// - **Settling (§H4).** A transition onto a settled-looking status *is*
-    ///   the run-end event arriving; this is the "the turn ended, now check
-    ///   the checkout" moment the run journal replaced the 60-second clock
-    ///   with. Checked on the transition only — the interval reconcile owns
-    ///   the steady re-check, so a burst of unchanged snapshots costs no git.
-    /// - **Re-opening (§H4's inverse).** comet's `Working` is written by the
-    ///   engine that runs the agent and staleness-gated on the way in, so —
-    ///   unlike herdr's screen-sampled `working` — acting on it immediately
-    ///   cannot flap a finished row.
+    /// - **Settling (§settle-logic).** A transition onto a settled-looking
+    ///   status *is* the run-end event arriving; this is the "the turn ended,
+    ///   now check the checkout" moment the run journal replaced the 60-second
+    ///   clock with. Checked on the transition only — the interval reconcile
+    ///   owns the steady re-check, so a burst of unchanged snapshots costs no
+    ///   git.
+    /// - **Re-opening (§settle-logic's inverse).** comet's `Working` is
+    ///   written by the engine that runs the agent and staleness-gated on the
+    ///   way in, so — unlike herdr's screen-sampled `working` — acting on it
+    ///   immediately cannot flap a finished row.
     pub fn refresh_statuses(&self, statuses: &SessionStatuses) -> Result<bool> {
         self.refresh_statuses_with(statuses, None)
     }
@@ -3443,8 +3448,8 @@ mod tests {
     fn a_chat_that_never_started_is_not_orphaned_on_absence() {
         // A dispatch whose brief sits in the command ledger has no session row
         // yet — indistinguishable, from here, from a chat that is gone. The
-        // verdict needs `Runtime::chat_alive` (H2); until then absence of
-        // evidence must not end an attempt that may not have begun.
+        // verdict needs `Runtime::chat_alive` (§runtime-impl); until then
+        // absence of evidence must not end an attempt that may not have begun.
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -3477,8 +3482,9 @@ mod tests {
     #[test]
     fn an_idle_status_leaves_the_attempt_live() {
         // "only finalize on explicit done detection or user action". The run
-        // ended, and the checkout was checked (§H4) — but this attempt has no
-        // worktree, no commits and no PR, and between turns is not finished.
+        // ended, and the checkout was checked (§settle-logic) — but this
+        // attempt has no worktree, no commits and no PR, and between turns is
+        // not finished.
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -3709,7 +3715,7 @@ mod tests {
         );
     }
 
-    // ---- settling on run events (§H4) ------------------------------------
+    // ---- settling on run events (§settle-logic) ---------------------------
 
     use crate::runtime::{DispatchHandle, DispatchSpec};
 
@@ -3848,8 +3854,8 @@ mod tests {
 
     #[test]
     fn a_pull_request_settles_the_attempt_the_moment_the_run_ends() {
-        // The whole §H4 headline: no clock, no second sample. The run ended,
-        // a PR is open — the agent said it is finished, so it is.
+        // The whole §settle-logic headline: no clock, no second sample. The
+        // run ended, a PR is open — the agent said it is finished, so it is.
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -4085,11 +4091,11 @@ mod tests {
 
     #[test]
     fn an_errored_run_keeps_the_attempt_for_the_retry() {
-        // §H4's `reopened` contract, first half: an `Errored`→retried run is
-        // the same attempt, not a new one. The errored end never closes the
-        // row — even over commits — so the retry lands on it, and the clean
-        // end that follows settles it with nothing reopened and nothing
-        // double-counted.
+        // §settle-logic's `reopened` contract, first half: an
+        // `Errored`→retried run is the same attempt, not a new one. The
+        // errored end never closes the row — even over commits — so the retry
+        // lands on it, and the clean end that follows settles it with nothing
+        // reopened and nothing double-counted.
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -4513,8 +4519,9 @@ mod tests {
 
     /// The second case the pin exists for, and the one that used to be a
     /// dropped notice: attempts cap at two hours and chats archive as their
-    /// task settles (§H31), so a dispatcher that did not survive its own child
-    /// is ordinary. The event still matters — it just needs another addressee.
+    /// task settles (§gh#139), so a dispatcher that did not survive its own
+    /// child is ordinary. The event still matters — it just needs another
+    /// addressee.
     #[test]
     fn a_settle_whose_dispatcher_is_gone_hops_to_the_orchestrator() {
         let mut e = engine(None);
@@ -4722,7 +4729,7 @@ mod tests {
         assert_eq!(rt.prompts().len(), 1, "the dispatcher hears about it too");
     }
 
-    // ---- the settle the board got wrong (§H4's inverse) ------------------
+    // ---- the settle the board got wrong (§settle-logic's inverse) ---------
 
     /// Settle an attempt on commits, returning its checkout for cleanup.
     fn settled_on_commits(e: &SyncEngine, attempt: i64) -> std::path::PathBuf {
@@ -4817,7 +4824,7 @@ mod tests {
     #[test]
     fn the_event_path_settles_on_the_transition() {
         // The moment the run ends — not the next interval tick. The 60-second
-        // clock this replaces is the whole of §H4.
+        // clock this replaces is the whole of §settle-logic.
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -5241,8 +5248,8 @@ max_duration = "{max_duration}"
 
     /// A dispatch whose brief never reached a chat is the most stranded row of
     /// the lot: no session, no `saw_working`, so orphaning deliberately leaves
-    /// it (H2). The clock is what closes it — with nothing to interrupt, and
-    /// the reason still written back.
+    /// it (§runtime-impl). The clock is what closes it — with nothing to
+    /// interrupt, and the reason still written back.
     #[test]
     fn a_dispatch_that_never_got_a_chat_is_closed_by_the_clock_too() {
         let e = engine(None);
@@ -7412,8 +7419,9 @@ max_duration = "{max_duration}"
     }
 
     /// The one way an archived chat comes back by itself: the settle was wrong
-    /// and the agent is working in it again (§H4's inverse). Nobody should have
-    /// to go to Settings → Archived to find the chat the board just re-opened.
+    /// and the agent is working in it again (§settle-logic's inverse). Nobody
+    /// should have to go to Settings → Archived to find the chat the board
+    /// just re-opened.
     #[test]
     fn a_reopened_attempt_gets_its_chat_back_off_the_shelf() {
         let e = engine(None);

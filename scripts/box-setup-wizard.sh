@@ -247,7 +247,7 @@ else
 fi
 note "This is the box's own identity, and the committer on everything it runs."
 note "A teammate dispatching this board authors as themselves instead — map"
-note "their sign-in email in routing.toml's [users] (stage 10, docs/BOARD.md H18)."
+note "their sign-in email in routing.toml's [users] (stage 10, §gh#101)."
 
 # ── 4 ──────────────────────────────────────────────────────────────────
 stage "Install comet + comet-board"

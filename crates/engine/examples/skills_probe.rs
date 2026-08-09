@@ -8,7 +8,7 @@
 //!
 //! The second form is the one worth knowing: point it at an agent account's
 //! materialized dir and it shows what a *dispatched* run can actually invoke,
-//! which is not what the box user's shell would find (docs/BOARD.md §gh#59).
+//! which is not what the box user's shell would find (§gh#59).
 //! With a `/query` it also runs the composer's own trigger and filter, so what
 //! it prints is exactly the menu the picker would show.
 fn main() {

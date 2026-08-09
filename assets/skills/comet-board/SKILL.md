@@ -46,32 +46,32 @@ skips that flag hangs on a child's question forever.
 
 Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 
-1. Check `dispatchable` first — false means no route; fixing routes is the
-   operator's call (`comet-board routes`, or Settings → Board routing).
-2. Provenance is automatic: your chat id rides COMET_BOARD_CHAT_ID; never
-   fabricate `--via`.
-3. One live attempt per task; a second dispatch fails cleanly. Caps refuse at
-   max_concurrent — report, don't cancel someone else's work.
-4. **Billing**: a dispatch naming no account runs on the box owner's Claude
-   login. Pass `--account <slot>` for whoever should pay; the picker rows and
-   the CLI warn on cross-billing (billing_guard).
-5. Cancel ends the attempt, not the issue; the row returns to ready.
-6. After releasing work, wait for it or say plainly you're leaving it running.
-   Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
-   default) — and is the first addressee, so what reaches you does not also
-   reach the board's orchestrator. Never promise you'll be woken: the setting
-   is invisible from here and an archived chat is told nothing.
-7. Never dispatch speculatively — a human keypress or explicit instruction
-   releases tasks. Reading is always safe.
-8. New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
-   one verb). New *person*: `comet-board member add <their-sign-in-email>
-   --github <login>`, or their dispatches commit under the box owner's name —
-   `comet-board member list` shows who is mapped and who has no agent account
-   (docs/teammate.md). `comet-board doctor` explains a board that looks wrong.
-9. **Screenshots in a PR description**: commit them and link them with a
-   relative path from a markdown file in the repo. A
-   `raw.githubusercontent.com/<owner>/<repo>/<branch>/…` URL is broken on a
-   private repo and dies with the branch on merge — silently, both times.
+- Check `dispatchable` first — false means no route; fixing routes is the
+  operator's call (`comet-board routes`, or Settings → Board routing).
+- Provenance is automatic: your chat id rides COMET_BOARD_CHAT_ID; never
+  fabricate `--via`.
+- One live attempt per task; a second dispatch fails cleanly. Caps refuse at
+  max_concurrent — report, don't cancel someone else's work.
+- **Billing**: a dispatch naming no account runs on the box owner's Claude
+  login. Pass `--account <slot>` for whoever should pay; the picker rows and
+  the CLI warn on cross-billing (billing_guard).
+- Cancel ends the attempt, not the issue; the row returns to ready.
+- After releasing work, wait for it or say plainly you're leaving it running.
+  Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
+  default) — and is the first addressee, so what reaches you does not also
+  reach the board's orchestrator. Never promise you'll be woken: the setting
+  is invisible from here and an archived chat is told nothing.
+- Never dispatch speculatively — a human keypress or explicit instruction
+  releases tasks. Reading is always safe.
+- New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
+  one verb). New *person*: `comet-board member add <their-sign-in-email>
+  --github <login>`, or their dispatches commit under the box owner's name —
+  `comet-board member list` shows who is mapped and who has no agent account
+  (docs/teammate.md). `comet-board doctor` explains a board that looks wrong.
+- **Screenshots in a PR description**: commit them and link them with a
+  relative path from a markdown file in the repo. A
+  `raw.githubusercontent.com/<owner>/<repo>/<branch>/…` URL is broken on a
+  private repo and dies with the branch on merge — silently, both times.
 
 The pinned orchestrator's fuller brief: docs/orchestrator.md.
 

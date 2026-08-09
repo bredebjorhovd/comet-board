@@ -1,13 +1,14 @@
 // The board, on the phone: a standing `WatchBoard` subscription over the
 // device-room relay, plus the dispatch/retry/cancel verbs.
 //
-// The board store lives on exactly ONE device — wherever the board service runs,
-// usually the always-on box (docs/BOARD.md §H9). The desktop finds it by asking
-// its own engine to forward with `targetDeviceId`; the phone has no engine of
-// its own, so it dials each candidate's device room directly and calls the same
-// relay-forwardable methods there. Same sweep, same rule for ruling a candidate
-// out — the engine refuses `WatchBoard` outright when it hosts no board, so a
-// stream that ends without ever delivering a frame has said "not me".
+// The board store lives on exactly ONE device — wherever the board service
+// runs, usually the always-on box (§gh#55). The desktop finds it by asking its
+// own engine to forward with `targetDeviceId`; the phone has no engine of its
+// own, so it dials each candidate's device room directly and calls the same
+// relay-forwardable methods there. Same sweep, same rule for ruling a
+// candidate out — the engine refuses `WatchBoard` outright when it hosts no
+// board, so a stream that ends without ever delivering a frame has said "not
+// me".
 //
 // The subscription is STANDING, not opened when a board screen appears: the
 // Agents section on Home is presence, and presence that only works after you

@@ -558,7 +558,7 @@ impl Shell {
         // cluster.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
-        // The board toggle (docs/BOARD.md §H10): a sibling of the changes
+        // The board toggle (§gh#70): a sibling of the changes
         // toggle, showing an active wash while the board dock is open. Not
         // gated on git — the board is a global queue, not a checkout view.
         let board_active = self.board_open;

@@ -1,5 +1,5 @@
 //! `comet-board` — the board's command line, and the agents' entry point
-//! (docs/BOARD.md §H6; the operator trio landed with §H8).
+//! (§board-cli; the operator trio landed with §adopt-doctor-init).
 //!
 //! A thin binary over `crates/board`, attaching to the local engine exactly as
 //! `comet-tui` does: the engine owns the board loop and the workspace doc, and
@@ -32,6 +32,10 @@ mod ops;
 // runtime reads it — `skill show` prints the asset, which this keeps honest.
 #[cfg(test)]
 mod skill_doc;
+// Test-only, same job one document over: every `§` reference in the repo has
+// to name a file in `docs/board/` (gh#203).
+#[cfg(test)]
+mod board_docs;
 
 /// Same default as `apps/comet` and `comet-tui`.
 const DEFAULT_IPC_PORT: u16 = 27654;

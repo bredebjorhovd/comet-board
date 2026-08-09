@@ -26,8 +26,9 @@ ships inside the binary — `comet-board skill install` writes it into
 `~/.claude/skills/`, and dispatched agents get their own copy automatically
 ([docs/skill.md](docs/skill.md)).
 
-Board code lives in `crates/board`; the port's status, design mapping, and
-remaining work are in [docs/BOARD.md](docs/BOARD.md). Upstream comet is the
+Board code lives in `crates/board`; the port's status and design mapping are in
+[docs/BOARD.md](docs/BOARD.md), and each item of the work is its own file in
+[docs/board/](docs/board/) — `ls` it for the index. Upstream comet is the
 `upstream` remote; everything below this section is its README.
 
 ## Local (edge-less) mode — the fork's primary deployment

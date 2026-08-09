@@ -1591,7 +1591,7 @@ impl RpcService for EngineRpc {
                 self.mutate(p)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            // Board surface (comet-board fork, docs/BOARD.md §H2). Served off
+            // Board surface (comet-board fork, §runtime-impl). Served off
             // the board service's loop; absent when the board is disabled.
             methods::WATCH_BOARD => Ok(RpcReply::Stream(watch_stream(self.board()?.watch_rows()))),
             methods::WATCH_BOARD_ORCHESTRATOR => Ok(RpcReply::Stream(watch_stream(

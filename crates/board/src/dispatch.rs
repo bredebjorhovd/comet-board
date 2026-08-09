@@ -1,5 +1,6 @@
 //! Resolving a task + its route into a [`DispatchSpec`] — the planning half of
-//! herdr-board's `dispatch.rs`, in comet vocabulary (docs/BOARD.md §H2/H3).
+//! herdr-board's `dispatch.rs`, in comet vocabulary
+//! (§runtime-impl/§dispatch-pipeline).
 //!
 //! Deliberately only the *decisions* live here: task → route → branch → brief,
 //! plus the two refusals a dispatch owes its caller before anything is created
@@ -160,8 +161,8 @@ pub fn check_billing(
 ///   checked and the relay stamped onto the frame, which no frontend can write
 ///   (gh#161). Absent means the call carried no relay stamp, which is a fact
 ///   too — it came in over this box's own IPC port;
-/// - `device` and `user` stay claims, exactly as §H15 described them. `user` is
-///   the fallback for the local case and the record for everything else.
+/// - `device` and `user` stay claims, exactly as §gh#74 described them. `user`
+///   is the fallback for the local case and the record for everything else.
 ///
 /// Whose subscription a run spends is still the explicit `account` (gh#59),
 /// never inferred from any of these. What `verified` buys is the *comparison*:
@@ -842,7 +843,7 @@ mod tests {
         assert!(!space_matches(None, "/home/x/dev/other", "widget"));
     }
 
-    // ---- concurrency + provenance (H3) ----------------------------------
+    // ---- concurrency + provenance (§dispatch-pipeline) --------------------
 
     use crate::db::{Db, NewAttempt, UpsertTask};
     use crate::model::{Dispatcher, Outcome};

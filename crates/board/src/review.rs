@@ -1,5 +1,5 @@
 //! Deliver pull-request review comments back into the chat that wrote the PR
-//! (docs/BOARD.md §H5; herdr-board gh#13).
+//! (§review-delivery; herdr-board gh#13).
 //!
 //! An orchestrator reviews a task and writes its feedback on the pull request.
 //! The agent that wrote the PR never sees it: it is sitting in a live chat with
@@ -17,7 +17,7 @@
 //! board sees a new comment and delivers it back, forever.
 //!
 //! herdr-board closed that loop with three mechanisms. Only the first survives
-//! the port, and the other two are dropped *on purpose* (docs/BOARD.md §H5):
+//! the port, and the other two are dropped *on purpose* (§review-delivery):
 //!
 //! 1. **A per-PR watermark, per endpoint**, of the last comment id consumed.
 //!    An id below the watermark can never come back, so nothing is delivered

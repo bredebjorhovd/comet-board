@@ -1,4 +1,4 @@
-//! The board panel (docs/BOARD.md §H10): the herdr task board as a citizen of
+//! The board panel (§gh#70): the herdr task board as a citizen of
 //! the desktop app — a right dock toggled with Cmd/Ctrl+Shift+B, fed by the
 //! engine's `WatchBoard` stream.
 //!
