@@ -361,6 +361,17 @@ pub fn render_review(review: &AttemptReview) -> String {
     if let Some(pr) = &review.pr_url {
         let _ = writeln!(out, "  {pr}");
     }
+    // The verdict, before any of the sections it was derived from. Read from
+    // `claims::verdict` rather than phrased here, so this terminal and the
+    // desktop review screen cannot come to different conclusions about the
+    // same attempt.
+    let verdict = review.verdict();
+    let _ = writeln!(
+        out,
+        "  {} {}",
+        if verdict.tone.loud() { "!" } else { "·" },
+        verdict.text
+    );
     out.push('\n');
     claims_section(review, &mut out);
     out.push('\n');
@@ -478,12 +489,13 @@ fn remainder_section(review: &AttemptReview, out: &mut String) {
             review.remainder.unclaimed.len()
         );
         for file in &review.remainder.unclaimed {
-            let counts = if file.binary {
-                "binary".to_string()
-            } else {
-                format!("+{} −{}", file.added, file.removed)
-            };
-            let _ = writeln!(out, "  {:<2} {:<52} {counts}", file.status, file.path);
+            let _ = writeln!(
+                out,
+                "  {:<2} {:<52} {}",
+                file.status,
+                file.path,
+                file.counts()
+            );
         }
     }
     if matches!(review.diff, comet_board::claims::DiffSource::Recorded) {

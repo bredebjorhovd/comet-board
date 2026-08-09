@@ -1323,6 +1323,24 @@ pub fn detail_actions(row: &TaskRow) -> Vec<RowAction> {
     out
 }
 
+/// Is there anything to review on this row (§gh#180)?
+///
+/// One attempt is enough, and the state is deliberately not consulted. A
+/// finished attempt, a failed one and a cancelled one all left a branch and a
+/// run journal behind them, and "what did it actually change before it stopped"
+/// is the same question in all three cases — arguably the most useful one on a
+/// row that failed. What has no answer is a row nothing has ever run on: there
+/// is no attempt, so there is no diff, no claims and no journal, and a surface
+/// that offered the door anyway would be offering an empty room.
+///
+/// Not a [`RowAction`]: the action set is the verbs the *board* offers, and
+/// they must mean the same thing on every surface that draws them. Reviewing is
+/// a place a surface may or may not have, so the rule about which rows have one
+/// lives here and the affordance stays each surface's own.
+pub fn reviewable(row: &TaskRow) -> bool {
+    row.attempts > 0
+}
+
 /// The URL an action opens, or `None` for the ones that are not links.
 pub fn action_url(row: &TaskRow, action: RowAction) -> Option<&str> {
     match action {
@@ -2950,6 +2968,27 @@ mod tests {
             row_actions(&blocked),
             vec![RowAction::Retry, RowAction::OpenChat, RowAction::Cancel]
         );
+    }
+
+    /// The review door opens on anything that has run (§gh#180), which is a
+    /// different question from what state the row is in — a failed attempt has
+    /// the most interesting diff on the board.
+    #[test]
+    fn anything_that_has_run_can_be_reviewed_whatever_state_it_ended_in() {
+        for state in [
+            BoardState::Working,
+            BoardState::Blocked,
+            BoardState::Review,
+            BoardState::Failed,
+            BoardState::Done,
+        ] {
+            let mut ran = row("1", state);
+            ran.attempts = 1;
+            assert!(reviewable(&ran), "{state:?} has an attempt to review");
+        }
+        // A row nobody has dispatched has no attempt, so no diff, no claims and
+        // no journal. The door would open on an empty room.
+        assert!(!reviewable(&row("2", BoardState::Ready)));
     }
 
     #[test]

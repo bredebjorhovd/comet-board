@@ -495,7 +495,7 @@ const PEEK_BODY_MAX_H: f32 = 220.0;
 /// file's (gh#173). Blocked and failed share red (the glyph tells them apart),
 /// working is amber, review indigo; ready and done spend no colour, so they
 /// land on the row's own text tones — plain for a queued row, dim for history.
-fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
     match crate::theme::Status::of_board(state) {
         Some(status) => theme.status(status),
         None if state == BoardState::Done => theme.text_faint,
@@ -850,6 +850,25 @@ impl BoardModel {
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
+
+/// The board panel's one outward verb.
+///
+/// Everything else the panel does it does itself — dispatch, cancel, select a
+/// chat — because those are board operations against the board's host. Opening
+/// a review is not: it is a **route change**, which belongs to the shell, and a
+/// panel that reached over and set the shell's route would be a dock that owns
+/// the window.
+#[derive(Debug, Clone)]
+pub enum BoardEvent {
+    /// Show one attempt's review (gh#180), with the chat that authored it in
+    /// the column beside it. `chat_id` is `None` where the attempt's chat is
+    /// gone — the review outlives it, which is why the claims live on the
+    /// attempt rather than in the transcript.
+    OpenReview {
+        task_id: String,
+        chat_id: Option<String>,
+    },
+}
 
 /// The board dock, and the shell's standing source of board rows.
 ///
@@ -1801,6 +1820,33 @@ impl BoardPanel {
         .detach();
     }
 
+    /// `r`: open the selected row's review (gh#180).
+    ///
+    /// Offered on any row that has been attempted at all, not only on `review`
+    /// rows: a failed attempt and a cancelled one both left a branch and a run
+    /// journal behind them, and "what did it actually change before it gave up"
+    /// is the same question this screen answers for a finished one. A row
+    /// nothing has ever run on has no attempt to review, and says so.
+    fn open_review(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
+        if !board::reviewable(row) {
+            self.set_notice(
+                format!(
+                    "{} has never been dispatched — nothing to review",
+                    row.identifier
+                ),
+                cx,
+            );
+            return;
+        }
+        cx.emit(BoardEvent::OpenReview {
+            task_id: row.id.clone(),
+            chat_id: row.chat_id.clone(),
+        });
+    }
+
     /// Jump to a running task's chat (herdr-board's `g`): the attempt's chat is
     /// where the work is, and comet's answer to a pane is a chat. The board
     /// gives way — the chat is the destination.
@@ -2214,6 +2260,15 @@ impl BoardPanel {
             "f" if mods.shift => {
                 self.model.clear_filter();
                 cx.notify();
+                cx.stop_propagation();
+            }
+            // `r`: review what the selected row's attempt actually changed
+            // (gh#180). A route change and not a board verb, so it leaves by
+            // event — see [`BoardEvent`].
+            "r" if !mods.modified() => {
+                if let Some(id) = self.model.selected_task().map(|row| row.id.clone()) {
+                    self.open_review(&id, cx);
+                }
                 cx.stop_propagation();
             }
             _ => {}
@@ -3695,13 +3750,43 @@ impl BoardPanel {
         };
 
         let actions = board::detail_actions(&row);
-        let action_row: Option<AnyElement> = (!actions.is_empty()).then(|| {
+        // The review (gh#180) leads the chip row on any row that has been
+        // attempted, and it is spelled for what it opens rather than for what
+        // it is: "what changed" is the question, and it is not the PR's answer
+        // to it. Deliberately NOT a `RowAction`: the shared action set is the
+        // verbs the *board* offers on a row, and this one navigates the desktop
+        // window — a phone drawing a chip for a screen it does not have would
+        // be a promise the set cannot keep.
+        let reviewable = board::reviewable(&row);
+        let action_row: Option<AnyElement> = (reviewable || !actions.is_empty()).then(|| {
+            let review_id = id.clone();
             div()
                 .flex_none()
                 .flex()
                 .flex_row()
                 .flex_wrap()
                 .gap(px(5.0))
+                .when(reviewable, |el| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("board-peek-review-{id}")))
+                            .flex_none()
+                            .h(px(22.0))
+                            .px(px(9.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
+                            .bg(theme.wash(0.12))
+                            .flex()
+                            .items_center()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.accent)
+                            .hover(|s| s.bg(theme.wash(0.18)))
+                            .child(SharedString::from("Review changes"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_review(&review_id, cx);
+                            })),
+                    )
+                })
                 .children(actions.into_iter().map(|action| {
                     let target = id.clone();
                     div()
@@ -3789,6 +3874,9 @@ impl BoardPanel {
             .map(|action| format!("enter to {}", action.verb()));
         let picking = self.dispatch.is_some();
         let peek_open = self.peek;
+        // Only on rows that have something to review (gh#180): a hint for a key
+        // that will answer "never dispatched" is worse than no hint.
+        let reviewable = self.model.selected_task().is_some_and(board::reviewable);
 
         let content: SharedString = if let Some(notice) = notice {
             notice
@@ -3808,6 +3896,9 @@ impl BoardPanel {
             // that does not exist.
             if selected_task.is_some() {
                 hints.push(if peek_open { "space closes" } else { "space to open" });
+            }
+            if reviewable {
+                hints.push("r to review");
             }
             hints.push("f filter · / find");
             if filter_active {
@@ -3848,6 +3939,8 @@ pub fn init(cx: &mut App) {
     };
     cx.bind_keys([gpui::KeyBinding::new(toggle, ToggleBoard, None)]);
 }
+
+impl gpui::EventEmitter<BoardEvent> for BoardPanel {}
 
 impl Render for BoardPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
