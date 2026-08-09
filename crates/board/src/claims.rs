@@ -31,18 +31,36 @@
 //! One claim per line:
 //!
 //! ```text
-//! <what you did> :: <path> [<path>…]
+//! <what you did> :: <anchor> [<anchor>…]
 //! ```
 //!
 //! `::` is the separator and the **last** one on the line wins, because a
-//! sentence about `Db::open` is a sentence somebody will write. Paths are
-//! separated by whitespace or commas, are repo-relative, and may name a
+//! sentence about `Db::open` is a sentence somebody will write. Anchors are
+//! separated by whitespace or commas.
+//!
+//! An anchor is a **path** or a **symbol** (§gh#235), told apart by how it is
+//! spelled and never by a flag: anything with a `/` or a file extension is a
+//! path, everything else is a symbol. Paths are repo-relative and may name a
 //! directory — `crates/board/src/` accounts for every changed file under it,
 //! which is the honest spelling for "I rewrote this module" and is visibly
-//! coarser than naming the files.
+//! coarser than naming the files. A symbol — `active_placements`,
+//! `shelf_note` — accounts for every changed file whose diff added or removed
+//! a line naming it, which is the anchor a reviewer actually has in mind when
+//! the claim is about one function rather than one file.
 //!
 //! A leading `-` or `*` bullet is tolerated: agents write lists, and refusing
 //! one over its punctuation teaches nothing.
+//!
+//! ## Where the block comes from
+//!
+//! `comet-board claim` is the interactive half — it answers with the
+//! remainder, to the one party still able to do something about it. The other
+//! half is [`harvest`]: an agent that finished without running the verb still
+//! leaves its claims in a fenced ```` ```claims ```` block in what it said,
+//! and the board reads them off the finished attempt rather than losing them
+//! (§gh#235). Neither is required. An attempt that claimed nothing settles
+//! exactly as it did before any of this existed — but a block that *was*
+//! written and could not be parsed is reported, never dropped.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -62,15 +80,88 @@ pub const MAX_CLAIMS: usize = 100;
 /// here is prose wearing an anchor.
 pub const MAX_TEXT: usize = 400;
 
-/// One claim: a sentence, and the paths it is about.
+/// The shortest thing that can be a symbol anchor (§gh#235). Two characters
+/// name half a diff, and an anchor matching everything checks nothing.
+pub const MIN_SYMBOL: usize = 3;
+
+/// How many distinct symbols one changed file records. A bound on a column the
+/// board writes on every reconcile — and truncation fails safe, because a
+/// symbol that fell off the end comes back as an *unmatched* anchor rather than
+/// as a silent match.
+pub const MAX_FILE_SYMBOLS: usize = 200;
+
+/// How much unified diff [`attach_symbols`] will read. A branch that moved more
+/// than this is one where the remainder, not the symbol index, is the thing
+/// worth reading.
+pub const MAX_DIFF_BYTES: usize = 4 << 20;
+
+/// One claim: a sentence, and the anchors it is about.
 ///
-/// `files` is never empty — [`parse`] is the only way to build one from agent
-/// input and it refuses an anchorless claim outright, so anything stored
-/// against an attempt is checkable by construction.
+/// `files` and `symbols` are never *both* empty — [`parse`] is the only way to
+/// build one from agent input and it refuses an anchorless claim outright, so
+/// anything stored against an attempt is checkable by construction.
+///
+/// Two fields rather than one list of a tagged enum because the column is
+/// already written: every claim recorded before §gh#235 is a `{text, files}`
+/// object, and `symbols` defaulting to empty reads those rows back as exactly
+/// what they were — path-anchored claims — with no migration and no guess.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub text: String,
     pub files: Vec<String>,
+    /// Symbol anchors: a function, type or constant the change is about
+    /// (§gh#235). Matched against the identifiers the diff's own changed lines
+    /// name, so this is checked against git like every other anchor here.
+    #[serde(default)]
+    pub symbols: Vec<String>,
+}
+
+impl Claim {
+    /// Every anchor this claim carries, in the order it was written. What a
+    /// surface counts when it says how many things a claim is anchored to.
+    pub fn anchors(&self) -> impl Iterator<Item = &String> {
+        self.files.iter().chain(&self.symbols)
+    }
+}
+
+/// Is an anchor a path or a symbol (§gh#235)?
+///
+/// Told from the spelling, deliberately, and never from a sigil: the design's
+/// own reference claims are written `shell/spaces.rs` and `active_placements`,
+/// and a format that made an agent declare which kind it meant would be a
+/// format agents get wrong in a way nothing can detect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorKind {
+    Path,
+    Symbol,
+}
+
+/// The longest thing after a final `.` that still reads as a file extension.
+/// `db.rs`, `Cargo.toml`, `schema.graphql` — past this it is punctuation in a
+/// sentence, not a suffix.
+const MAX_EXTENSION: usize = 9;
+
+/// Which kind of anchor this is.
+///
+/// A `/` settles it. Otherwise a trailing `.ext` — short, alphanumeric, with
+/// something in front of it — makes it a path, so `db.rs` stays the path it
+/// obviously is (and stays subject to [`accounts_for`]'s refusal to match on a
+/// bare filename). Everything else is a symbol.
+pub fn anchor_kind(anchor: &str) -> AnchorKind {
+    if anchor.contains('/') {
+        return AnchorKind::Path;
+    }
+    match anchor.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= MAX_EXTENSION
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            AnchorKind::Path
+        }
+        _ => AnchorKind::Symbol,
+    }
 }
 
 /// One file the attempt's branch touched, as git reports it.
@@ -90,6 +181,16 @@ pub struct ChangedFile {
     /// A binary file, which has no line counts to give.
     #[serde(default)]
     pub binary: bool,
+    /// Identifiers this file's diff added or removed a line naming — what a
+    /// symbol anchor is matched against (§gh#235).
+    ///
+    /// Read off the unified diff by [`attach_symbols`], capped, and empty when
+    /// the board never read one. Empty is therefore "not known", and it fails
+    /// in the direction the rest of this module fails in: an unrecorded symbol
+    /// makes an anchor come back *unmatched*, which is loud, rather than
+    /// quietly accounting for a file nobody looked at.
+    #[serde(default)]
+    pub symbols: Vec<String>,
 }
 
 impl ChangedFile {
@@ -111,11 +212,15 @@ pub struct ClaimView {
     pub text: String,
     /// The paths the claim named, as submitted.
     pub files: Vec<String>,
-    /// Changed files those paths account for.
+    /// The symbols the claim named, as submitted (§gh#235).
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// Changed files the claim's anchors — of either kind — account for.
     pub matched: Vec<String>,
-    /// Paths the claim named that the diff does not contain. Not an error and
-    /// not dropped: a claim anchored to a file nothing happened to is a claim
-    /// that cannot be checked, and saying so is the point.
+    /// Anchors the claim named that the diff does not contain: a path nothing
+    /// happened to, or a symbol no changed line names. Not an error and not
+    /// dropped — a claim that cannot be checked is exactly the thing this
+    /// screen exists to say out loud.
     pub unmatched: Vec<String>,
 }
 
@@ -209,6 +314,15 @@ pub struct AttemptReview {
     /// means it never answered the contract at all, which is a different fact
     /// from claiming nothing and must not render as one.
     pub claimed_at: Option<String>,
+    /// Why the block this attempt wrote could not be read (§gh#235).
+    ///
+    /// An agent that answered the contract badly is not the same as one that
+    /// never answered it: the first wrote down what it did and the board threw
+    /// it away, which is a fact about the board as much as about the agent.
+    /// `None` on every attempt that never wrote a block — the ordinary case,
+    /// and the quiet one.
+    #[serde(default)]
+    pub claims_error: Option<String>,
     #[serde(flatten)]
     pub remainder: Remainder,
     /// Every file the branch touched — the denominator behind the remainder.
@@ -265,20 +379,39 @@ pub fn parse(input: &str, worktree: Option<&str>) -> Result<Vec<Claim>> {
             );
         };
         let text = line[..split].trim();
-        let files: Vec<String> = line[split + ANCHOR.len()..]
+        let mut files: Vec<String> = Vec::new();
+        let mut symbols: Vec<String> = Vec::new();
+        for anchor in line[split + ANCHOR.len()..]
             .split([',', ' ', '\t'])
             .map(str::trim)
             .filter(|p| !p.is_empty())
-            .map(|p| normalize(p, worktree))
-            .collect();
-        if text.is_empty() {
-            bail!("a claim with paths and nothing said about them: {line}");
+        {
+            // Normalized first: the quotes and the worktree prefix an agent
+            // pastes are noise on both kinds of anchor, and `active_placements`
+            // survives it unchanged.
+            let anchor = normalize(anchor, worktree);
+            if anchor.is_empty() {
+                continue;
+            }
+            match anchor_kind(&anchor) {
+                AnchorKind::Path => files.push(anchor),
+                AnchorKind::Symbol if anchor.chars().count() < MIN_SYMBOL => bail!(
+                    "`{anchor}` is too short to anchor anything (symbols are {MIN_SYMBOL}+ \
+                     characters): {line}\n\
+                     A one- or two-letter symbol names half the diff, and an anchor that \
+                     matches everything checks nothing."
+                ),
+                AnchorKind::Symbol => symbols.push(anchor),
+            }
         }
-        if files.is_empty() {
+        if text.is_empty() {
+            bail!("a claim with anchors and nothing said about them: {line}");
+        }
+        if files.is_empty() && symbols.is_empty() {
             bail!(
-                "no paths after `{ANCHOR}` in: {line}\n\
-                 Name the files the claim is about; a claim nothing anchors \
-                 cannot be checked against the diff."
+                "no anchors after `{ANCHOR}` in: {line}\n\
+                 Name the files or the symbols the claim is about; a claim nothing \
+                 anchors cannot be checked against the diff."
             );
         }
         if text.chars().count() > MAX_TEXT {
@@ -291,6 +424,7 @@ pub fn parse(input: &str, worktree: Option<&str>) -> Result<Vec<Claim>> {
         claims.push(Claim {
             text: text.to_string(),
             files: dedup(files),
+            symbols: dedup(symbols),
         });
     }
     if claims.is_empty() {
@@ -306,6 +440,101 @@ pub fn parse(input: &str, worktree: Option<&str>) -> Result<Vec<Claim>> {
         );
     }
     Ok(claims)
+}
+
+// ---- the block, off the finished attempt (§gh#235) ------------------------
+
+/// The fence an agent writes its claims in when it is finishing rather than
+/// running a verb.
+pub const BLOCK_TAG: &str = "claims";
+
+/// What a finished attempt's own words amounted to (§gh#235).
+///
+/// Three answers and not two, because "said nothing" and "said something the
+/// board could not read" must not settle to the same row. The first is the
+/// behaviour every attempt had before this existed; the second is a fact about
+/// this attempt that somebody has to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Harvest {
+    /// No `claims` block anywhere in what the agent said. The attempt is
+    /// claimless and settles exactly as it always did.
+    None,
+    /// A block that parsed.
+    Claims(Vec<Claim>),
+    /// A block that did not parse, and why — in [`parse`]'s own words, which
+    /// name the offending line.
+    Malformed(String),
+}
+
+/// The body of the last ```` ```claims ```` block in `text`, if there is one.
+///
+/// The **last**, on [`Db::set_attempt_claims`]'s rule: an agent that wrote the
+/// block twice is correcting itself, and reading the superseded one would be
+/// reviewing a draft. Anything after the tag on the fence line is ignored, and
+/// an unterminated block runs to the end of the text — a message truncated
+/// mid-fence still carries claims, and refusing them over a missing ``` would
+/// teach nobody anything.
+///
+/// [`Db::set_attempt_claims`]: crate::db::Db::set_attempt_claims
+pub fn find_block(text: &str) -> Option<&str> {
+    let mut found: Option<(usize, usize)> = None;
+    // `None` outside any fence; `Some(None)` inside somebody else's fenced
+    // block — a shell snippet, a diff — which is skipped whole so a `claims`
+    // fence quoted inside one is not read as ours; `Some(Some(start))` inside
+    // a claims block whose body begins at `start`.
+    let mut open: Option<Option<usize>> = None;
+    let mut cursor = 0usize;
+    for line in text.split_inclusive('\n') {
+        let start = cursor;
+        cursor += line.len();
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("```")
+            .or_else(|| trimmed.strip_prefix("~~~"))
+        else {
+            continue;
+        };
+        match open {
+            // A closing fence. Whatever is written on it is decoration.
+            Some(body) => {
+                if let Some(body) = body {
+                    found = Some((body, start));
+                }
+                open = None;
+            }
+            None if rest.trim().eq_ignore_ascii_case(BLOCK_TAG) => open = Some(Some(cursor)),
+            None => open = Some(None),
+        }
+    }
+    // An unterminated `claims` fence still counts, to the end of the text.
+    if let Some(Some(body)) = open {
+        found = Some((body, text.len()));
+    }
+    found.map(|(a, b)| text[a..b].trim_matches('\n'))
+}
+
+/// Read an agent's claims off what it said when it finished (§gh#235).
+///
+/// The non-interactive half of the contract. `comet-board claim` is better —
+/// it answers with the remainder while the agent can still act on it — but an
+/// agent that finished without running it has still written down what it did,
+/// and losing that is a worse outcome than reading it late.
+///
+/// Never an error to the caller: a claimless attempt is [`Harvest::None`] and
+/// settles as it always did, and a block that will not parse comes back as
+/// [`Harvest::Malformed`] to be stored and shown. Nothing here may stand
+/// between a finished run and its PR.
+pub fn harvest(text: &str, worktree: Option<&str>) -> Harvest {
+    let Some(block) = find_block(text) else {
+        return Harvest::None;
+    };
+    if block.trim().is_empty() {
+        return Harvest::None;
+    }
+    match parse(block, worktree) {
+        Ok(claims) => Harvest::Claims(claims),
+        Err(e) => Harvest::Malformed(format!("{e:#}")),
+    }
 }
 
 /// A submitted path as the diff spells it: repo-relative, forward slashes, no
@@ -352,6 +581,116 @@ pub fn accounts_for(claim_path: &str, changed: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Does this changed file's diff name this symbol (§gh#235)?
+///
+/// Exact, case-sensitive, over the identifiers [`attach_symbols`] read off the
+/// file's own added and removed lines. Not a substring test and not a fuzzy
+/// one: `note` must not answer for `shelf_note`, for the same reason `db.rs`
+/// does not answer for `crates/board/src/db.rs`.
+///
+/// A symbol on a changed line is positive evidence about *that* file, which is
+/// what a path anchor could never be — and it is evidence the agent did not
+/// author, which is the whole rule. What it does not claim to be is a
+/// definition: a rename touches every call site, and a review that listed only
+/// the file holding the `fn` would be hiding the other eleven. Every file a
+/// symbol reaches is printed under the claim, so an anchor that swept more than
+/// its author meant is visible in the same place its matches are.
+pub fn names_symbol(symbol: &str, file: &ChangedFile) -> bool {
+    !symbol.is_empty() && file.symbols.iter().any(|s| s == symbol)
+}
+
+/// Record, on each changed file, the identifiers its diff added or removed a
+/// line naming — the index a symbol anchor is checked against (§gh#235).
+///
+/// `diff` is a unified diff of the same range the changed set came from, read
+/// from git by the caller. Read with no language knowledge at all, on purpose:
+/// a per-language parser is what §gh#183 named as a follow-up rather than
+/// half-built, and a lexical scan of the lines that actually moved is both
+/// honest about what it knows and the same for Rust, Swift, TOML and the shell
+/// script somebody will add next.
+///
+/// Bounded twice — [`MAX_DIFF_BYTES`] of input, [`MAX_FILE_SYMBOLS`] per file —
+/// because this is written into the attempt row on every reconcile. Both bounds
+/// lose symbols, and losing one costs an anchor its match, which the review
+/// reports. Neither can invent one.
+pub fn attach_symbols(files: &mut [ChangedFile], diff: &str) {
+    let by_path: std::collections::HashMap<String, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(ix, f)| (f.path.clone(), ix))
+        .collect();
+    // Deduplicated per file as we go: a diff repeats an identifier on every
+    // line it touched, and the column stores the set.
+    let mut seen: std::collections::HashSet<(usize, &str)> = Default::default();
+    let mut current: Option<usize> = None;
+    let mut read = 0usize;
+    for line in diff.lines() {
+        read += line.len() + 1;
+        if read > MAX_DIFF_BYTES {
+            break;
+        }
+        // `+++ b/path` names the file the following hunks are about. A deleted
+        // file's is `/dev/null`, so `--- a/path` is the fallback and not the
+        // primary: on every other file the two agree and the `+++` is the one
+        // that is right about a rename.
+        if let Some(path) = line.strip_prefix("+++ ") {
+            current = header_path(path).and_then(|p| by_path.get(p).copied());
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("--- ") {
+            if let Some(p) = header_path(path) {
+                current = by_path.get(p).copied();
+            }
+            continue;
+        }
+        let Some(ix) = current else { continue };
+        let Some(body) = line
+            .strip_prefix('+')
+            .or_else(|| line.strip_prefix('-'))
+            .filter(|_| !line.starts_with("+++") && !line.starts_with("---"))
+        else {
+            continue;
+        };
+        for ident in identifiers(body) {
+            if files[ix].symbols.len() >= MAX_FILE_SYMBOLS {
+                break;
+            }
+            if seen.insert((ix, ident)) {
+                files[ix].symbols.push(ident.to_string());
+            }
+        }
+    }
+}
+
+/// The path out of a `+++ b/crates/board/src/db.rs` header, or `None` for
+/// `/dev/null` and for the `+++` of a diff that carries no path.
+fn header_path(header: &str) -> Option<&str> {
+    let path = header.split('\t').next()?.trim();
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path),
+    )
+}
+
+/// The identifiers on one changed line: runs of `[A-Za-z0-9_]` that start with
+/// a letter or an underscore and are long enough to anchor anything.
+///
+/// Not tokenized per language and not filtered by keyword. A keyword anchor is
+/// nonsense that matches most of the diff, and the review prints every file an
+/// anchor reached — so a useless anchor is visible rather than quietly
+/// excluded by a list that would be wrong for the next language anyway.
+fn identifiers(line: &str) -> impl Iterator<Item = &str> {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| {
+            w.chars().count() >= MIN_SYMBOL
+                && w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        })
+}
+
 /// Map claims onto the diff and return what they do not account for.
 ///
 /// `changed` is the branch's diff, read from git by the caller — never from
@@ -365,20 +704,34 @@ pub fn remainder(claims: &[Claim], changed: &[ChangedFile]) -> Remainder {
     for claim in claims {
         let mut matched = Vec::new();
         let mut unmatched = Vec::new();
-        for path in &claim.files {
+        // Both kinds of anchor, resolved the same way: each one either names
+        // changed files or names nothing, and naming nothing is reportable
+        // rather than fatal.
+        for (anchor, is_path) in claim
+            .files
+            .iter()
+            .map(|a| (a, true))
+            .chain(claim.symbols.iter().map(|a| (a, false)))
+        {
             let hits: Vec<String> = changed
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| accounts_for(path, &f.path))
+                .filter(|(_, f)| {
+                    if is_path {
+                        accounts_for(anchor, &f.path)
+                    } else {
+                        names_symbol(anchor, f)
+                    }
+                })
                 .map(|(ix, f)| {
                     accounted[ix] = true;
                     f.path.clone()
                 })
                 .collect();
             if hits.is_empty() {
-                unmatched.push(path.clone());
-                if !unmatched_anchors.contains(path) {
-                    unmatched_anchors.push(path.clone());
+                unmatched.push(anchor.clone());
+                if !unmatched_anchors.contains(anchor) {
+                    unmatched_anchors.push(anchor.clone());
                 }
             } else {
                 for hit in hits {
@@ -391,6 +744,7 @@ pub fn remainder(claims: &[Claim], changed: &[ChangedFile]) -> Remainder {
         views.push(ClaimView {
             text: claim.text.clone(),
             files: claim.files.clone(),
+            symbols: claim.symbols.clone(),
             matched,
             unmatched,
         });
@@ -452,6 +806,7 @@ pub fn review(
                 .map(str::to_string),
         },
         claimed_at: attempt.claims_at.clone(),
+        claims_error: attempt.claims_error.clone(),
         remainder,
         changed,
         diff,
@@ -523,6 +878,11 @@ pub enum FindingKind {
     /// The attempt never answered the claim contract. Distinct from claiming
     /// nothing, and it must never render as one.
     NeverClaimed,
+    /// The attempt wrote a claims block the board could not parse (§gh#235).
+    /// Louder than [`FindingKind::NeverClaimed`] and deliberately so: silence
+    /// is an absence of evidence, and a refused block is a description of the
+    /// work that exists and that nobody can check.
+    MalformedClaims,
     /// There is no diff to read: no checkout on disk and nothing recorded.
     NoDiff,
 }
@@ -535,6 +895,7 @@ impl FindingKind {
             | FindingKind::Uncommitted
             | FindingKind::UnsupportedClaims
             | FindingKind::NeverPassed
+            | FindingKind::MalformedClaims
             | FindingKind::Unchecked => Tone::Alarm,
             FindingKind::NeverClaimed | FindingKind::NoDiff => Tone::Unknown,
         }
@@ -553,6 +914,15 @@ pub struct Finding {
 pub struct Verdict {
     pub tone: Tone,
     pub text: String,
+}
+
+/// The first line of a refusal, for a verdict bar that gets one line.
+///
+/// [`parse`]'s messages are two paragraphs — the offending line, then what the
+/// format is — because the agent reading them is about to try again. A reviewer
+/// reading them is not, and the whole text is still on the row underneath.
+fn first_line(message: &str) -> &str {
+    message.lines().next().unwrap_or(message).trim()
 }
 
 /// `1 file` / `2 files` — said the same way everywhere rather than `file(s)`.
@@ -587,7 +957,20 @@ impl AttemptReview {
             return out;
         }
         let changed = self.changed.len();
-        if !self.claimed() {
+        // Before the never-claimed line, and instead of it: this attempt did
+        // answer, and what it wrote is sitting on the row unread. Reported
+        // rather than dropped is the whole of §gh#235's second half.
+        if let Some(err) = &self.claims_error {
+            out.push(Finding {
+                kind: FindingKind::MalformedClaims,
+                text: format!(
+                    "this attempt wrote a claims block the board could not read, \
+                     so nothing accounts for its {}: {}",
+                    count(changed, "changed file", "changed files"),
+                    first_line(err)
+                ),
+            });
+        } else if !self.claimed() {
             out.push(Finding {
                 kind: FindingKind::NeverClaimed,
                 text: format!(
@@ -673,10 +1056,7 @@ impl AttemptReview {
             },
             None => Verdict {
                 tone: Tone::Settled,
-                text: format!(
-                    "all {} changed files are accounted for",
-                    self.changed.len()
-                ),
+                text: format!("all {} changed files are accounted for", self.changed.len()),
             },
         }
     }
@@ -726,6 +1106,9 @@ pub fn parse_diff(numstat: &str, name_status: &str) -> Vec<ChangedFile> {
             added: added.parse().unwrap_or(0),
             removed: removed.parse().unwrap_or(0),
             binary,
+            // Filled by `attach_symbols` from a unified diff of the same range,
+            // which is a third `git diff` and so the caller's to run.
+            symbols: Vec::new(),
         });
     }
     out
@@ -744,6 +1127,15 @@ mod tests {
             added: 10,
             removed: 2,
             binary: false,
+            symbols: Vec::new(),
+        }
+    }
+
+    /// The same file, with the identifiers a symbol anchor is matched against.
+    fn changed_naming(path: &str, symbols: &[&str]) -> ChangedFile {
+        ChangedFile {
+            symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            ..changed(path)
         }
     }
 
@@ -1341,6 +1733,303 @@ mod tests {
         );
         assert_eq!(r.verdict().tone, Tone::Unknown);
         assert_eq!(r.verdict().text, "this attempt's branch changed nothing");
+    }
+
+    // ---- anchors: a path or a symbol (§gh#235) ---------------------------
+
+    /// The whole rule, and it is only a rule about spelling.
+    #[test]
+    fn an_anchor_is_a_path_or_a_symbol_by_how_it_is_written() {
+        for path in [
+            "crates/board/src/db.rs",
+            "shell/spaces.rs",
+            "db.rs",
+            "Cargo.toml",
+            "crates/board/src/",
+            "docs/board",
+        ] {
+            assert_eq!(anchor_kind(path), AnchorKind::Path, "{path}");
+        }
+        for symbol in [
+            "active_placements",
+            "shelf_note",
+            "AttemptReview",
+            "set_attempt_claims",
+        ] {
+            assert_eq!(anchor_kind(symbol), AnchorKind::Symbol, "{symbol}");
+        }
+    }
+
+    /// The design's own reference claims, which under §gh#183 parsed and then
+    /// matched nothing.
+    #[test]
+    fn the_designs_reference_claims_parse_into_both_kinds() {
+        let claims = parse(
+            "A live chat's row is drawn by Active :: shell/spaces.rs view/spaces.rs\n\
+             Both surfaces read one derivation per frame :: active_placements\n\
+             An expanded space says so :: shelf_note",
+            None,
+        )
+        .unwrap();
+        assert_eq!(claims[0].files, ["shell/spaces.rs", "view/spaces.rs"]);
+        assert!(claims[0].symbols.is_empty());
+        assert!(claims[1].files.is_empty());
+        assert_eq!(claims[1].symbols, ["active_placements"]);
+        assert_eq!(claims[2].symbols, ["shelf_note"]);
+    }
+
+    /// A claim may carry both kinds at once, and the anchorless refusal is
+    /// unchanged — a symbol is a second way to anchor, never a way out of it.
+    #[test]
+    fn a_claim_can_mix_anchors_but_still_needs_one() {
+        let claims = parse("Rewrote it :: crates/ui/src/review.rs claim_row", None).unwrap();
+        assert_eq!(claims[0].files, ["crates/ui/src/review.rs"]);
+        assert_eq!(claims[0].symbols, ["claim_row"]);
+        assert_eq!(claims[0].anchors().count(), 2);
+        assert!(parse("Just prose about the work", None).is_err());
+        assert!(parse("Said something ::", None).is_err());
+    }
+
+    /// Two characters name half a diff, so they are refused by name rather
+    /// than accepted and silently matched against everything.
+    #[test]
+    fn a_symbol_too_short_to_anchor_anything_is_refused() {
+        let err = parse("Renamed it :: id", None).unwrap_err().to_string();
+        assert!(err.contains("too short to anchor"), "{err}");
+    }
+
+    #[test]
+    fn a_symbol_accounts_for_the_changed_files_whose_diff_names_it() {
+        let claims = parse("One derivation per frame :: active_placements", None).unwrap();
+        let r = remainder(
+            &claims,
+            &[
+                changed_naming(
+                    "crates/ui/src/shell/spaces.rs",
+                    &["active_placements", "row"],
+                ),
+                changed_naming("crates/proto/src/view/spaces.rs", &["active_placements"]),
+                changed_naming("Cargo.lock", &["comet_board"]),
+            ],
+        );
+        assert_eq!(
+            r.claims[0].matched,
+            [
+                "crates/ui/src/shell/spaces.rs",
+                "crates/proto/src/view/spaces.rs"
+            ]
+        );
+        assert_eq!(
+            r.unclaimed.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            ["Cargo.lock"]
+        );
+    }
+
+    /// `accounts_for`'s rule, applied to the other kind of anchor: a prefix is
+    /// not a match, or the generous reading claims files nobody looked at.
+    #[test]
+    fn a_symbol_anchor_is_matched_whole_and_reported_when_it_is_not() {
+        let claims = parse("Touched the note :: note", None).unwrap();
+        let file = changed_naming("crates/ui/src/shelf.rs", &["shelf_note"]);
+        let r = remainder(&claims, &[file]);
+        assert!(!r.claims[0].anchored());
+        assert_eq!(r.unmatched_anchors, ["note"]);
+        assert_eq!(r.unclaimed.len(), 1);
+    }
+
+    /// A symbol nothing changed names is the second-loudest row on the screen,
+    /// exactly like a path nothing happened to — one list, both kinds.
+    #[test]
+    fn an_unmatched_symbol_lands_beside_an_unmatched_path() {
+        let claims = parse("Did two things :: src/gone.rs never_written", None).unwrap();
+        let r = remainder(&claims, &[changed_naming("src/here.rs", &["something"])]);
+        assert_eq!(r.claims[0].unmatched, ["src/gone.rs", "never_written"]);
+        assert_eq!(r.unmatched_anchors, ["src/gone.rs", "never_written"]);
+    }
+
+    // ---- the symbol index, off the diff -----------------------------------
+
+    #[test]
+    fn the_symbol_index_is_read_off_the_lines_that_moved() {
+        let mut files = vec![changed("crates/board/src/claims.rs")];
+        attach_symbols(
+            &mut files,
+            "diff --git a/crates/board/src/claims.rs b/crates/board/src/claims.rs\n\
+             --- a/crates/board/src/claims.rs\n\
+             +++ b/crates/board/src/claims.rs\n\
+             @@ -1,2 +1,3 @@\n\
+             +pub fn names_symbol(symbol: &str) -> bool {\n\
+             -fn untouched_context() {}\n\
+             \x20fn context_line_nobody_edited() {}\n",
+        );
+        assert!(files[0].symbols.iter().any(|s| s == "names_symbol"));
+        // A removed line moved too: deleting a function is a change to it.
+        assert!(files[0].symbols.iter().any(|s| s == "untouched_context"));
+        // Context is not evidence — that is the whole reason for `-U0`.
+        assert!(
+            !files[0]
+                .symbols
+                .iter()
+                .any(|s| s == "context_line_nobody_edited")
+        );
+    }
+
+    /// The `+++`/`---` headers are not changed lines, and a file the diff names
+    /// that the changed set does not know about is skipped rather than guessed.
+    #[test]
+    fn the_symbol_index_ignores_headers_and_unknown_files() {
+        let mut files = vec![changed("src/a.rs")];
+        attach_symbols(
+            &mut files,
+            "--- a/src/a.rs\n\
+             +++ b/src/a.rs\n\
+             +let alpha = 1;\n\
+             --- a/src/unknown.rs\n\
+             +++ b/src/unknown.rs\n\
+             +let beta = 2;\n",
+        );
+        // `let` is in there too: no keyword list, on purpose — an anchor on a
+        // keyword matches most of the diff and the review prints what it
+        // reached, which is a better answer than a list that is wrong for the
+        // next language.
+        assert!(files[0].symbols.iter().any(|s| s == "alpha"));
+        assert!(!files[0].symbols.iter().any(|s| s == "beta"));
+    }
+
+    /// A new file's `---` is `/dev/null`; the `+++` is what names it.
+    #[test]
+    fn a_new_file_is_named_by_the_plus_header() {
+        let mut files = vec![changed("src/new.rs")];
+        attach_symbols(
+            &mut files,
+            "--- /dev/null\n+++ b/src/new.rs\n+pub const SHELF_NOTE: u8 = 1;\n",
+        );
+        assert!(files[0].symbols.iter().any(|s| s == "SHELF_NOTE"));
+    }
+
+    #[test]
+    fn the_symbol_index_is_capped_per_file() {
+        let mut files = vec![changed("src/wide.rs")];
+        let mut diff = String::from("+++ b/src/wide.rs\n");
+        for i in 0..(MAX_FILE_SYMBOLS + 50) {
+            diff.push_str(&format!("+let sym_{i} = {i};\n"));
+        }
+        attach_symbols(&mut files, &diff);
+        assert_eq!(files[0].symbols.len(), MAX_FILE_SYMBOLS);
+    }
+
+    // ---- the block, off a finished attempt (§gh#235) ----------------------
+
+    #[test]
+    fn a_claims_block_is_read_out_of_a_closing_message() {
+        let said = "I have finished and pushed the branch.\n\n\
+                    ```claims\n\
+                    Storage lives on the attempt :: crates/board/src/db.rs\n\
+                    The remainder comes off the diff :: remainder\n\
+                    ```\n\n\
+                    The PR is open.";
+        let Harvest::Claims(claims) = harvest(said, None) else {
+            panic!("expected claims");
+        };
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].files, ["crates/board/src/db.rs"]);
+        assert_eq!(claims[1].symbols, ["remainder"]);
+    }
+
+    /// The exit condition: an attempt that said nothing is not an attempt the
+    /// harvest has an opinion about.
+    #[test]
+    fn a_message_with_no_block_harvests_nothing() {
+        assert_eq!(harvest("Done. The tests pass.", None), Harvest::None);
+        assert_eq!(harvest("", None), Harvest::None);
+        assert_eq!(harvest("```claims\n\n```\n", None), Harvest::None);
+    }
+
+    /// Reported, never dropped — and in `parse`'s own words, which name the
+    /// line that did it.
+    #[test]
+    fn a_malformed_block_comes_back_as_a_refusal() {
+        let Harvest::Malformed(why) = harvest("```claims\nI did some work\n```", None) else {
+            panic!("expected a refusal");
+        };
+        assert!(why.contains("I did some work"), "{why}");
+        assert!(why.contains("::"), "{why}");
+    }
+
+    /// `set_attempt_claims`'s rule, applied to the block: an agent that wrote
+    /// it twice is correcting itself.
+    #[test]
+    fn the_last_block_wins() {
+        let Harvest::Claims(claims) = harvest(
+            "```claims\nFirst pass :: src/a.rs\n```\n\
+             then I found more.\n\
+             ```claims\nSecond pass :: src/b.rs\n```\n",
+            None,
+        ) else {
+            panic!("expected claims");
+        };
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].files, ["src/b.rs"]);
+    }
+
+    /// A `claims` fence quoted inside a shell block is documentation, not a
+    /// submission — the outer fence is skipped whole.
+    #[test]
+    fn a_block_quoted_inside_another_fence_is_not_read() {
+        let said = "Here is how it works:\n\
+                    ```bash\n\
+                    cat <<'EOF'\n\
+                    ```claims\n\
+                    Not mine :: src/nope.rs\n\
+                    EOF\n\
+                    ```\n";
+        assert_eq!(harvest(said, None), Harvest::None);
+    }
+
+    /// A message cut off mid-block still carries claims. Refusing them over a
+    /// missing fence would teach nobody anything.
+    #[test]
+    fn an_unterminated_block_still_counts() {
+        let Harvest::Claims(claims) = harvest("```claims\nDid it :: src/a.rs\n", None) else {
+            panic!("expected claims");
+        };
+        assert_eq!(claims[0].files, ["src/a.rs"]);
+    }
+
+    // ---- a refused block, read (§gh#235) ----------------------------------
+
+    /// Louder than silence, and instead of it: this attempt answered, and the
+    /// answer is what went missing.
+    #[test]
+    fn a_refused_block_is_alarming_where_saying_nothing_is_merely_unknown() {
+        let quiet = reviewed(
+            "",
+            None,
+            vec![changed("src/a.rs")],
+            Some(0),
+            RunEvidence::default(),
+        );
+        assert_eq!(quiet.findings()[0].kind, FindingKind::NeverClaimed);
+        assert_eq!(quiet.verdict().tone, Tone::Unknown);
+
+        let attempt = Attempt {
+            claims_error: Some("no `::` in: I did some work\nA claim is a sentence…".into()),
+            ..attempt_with(vec![], None)
+        };
+        let task = task_with(attempt.clone());
+        let loud = review(
+            &task,
+            &attempt,
+            vec![changed("src/a.rs")],
+            DiffSource::Checkout,
+            Some(0),
+            RunEvidence::default(),
+        );
+        assert_eq!(loud.findings()[0].kind, FindingKind::MalformedClaims);
+        assert_eq!(loud.verdict().tone, Tone::Alarm);
+        // One line in the verdict; the whole refusal is still on the row.
+        assert!(loud.verdict().text.contains("I did some work"));
+        assert!(!loud.verdict().text.contains('\n'));
     }
 
     #[test]

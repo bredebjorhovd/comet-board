@@ -1174,7 +1174,82 @@ impl SyncEngine {
         let numstat = git_out(worktree, &["diff", "--numstat", "--no-renames", &range])?;
         let name_status = git_out(worktree, &["diff", "--name-status", "--no-renames", &range])
             .unwrap_or_default();
-        Some(crate::claims::parse_diff(&numstat, &name_status))
+        let mut changed = crate::claims::parse_diff(&numstat, &name_status);
+        // A third read of the same range, for the symbol anchors (§gh#235).
+        // `-U0` because only the lines that actually moved are evidence: a
+        // symbol three lines above the edit is context the agent did not touch,
+        // and letting it anchor a claim would be exactly the generous reading
+        // this module refuses everywhere else.
+        if let Some(diff) = git_out(worktree, &["diff", "-U0", "--no-renames", &range]) {
+            crate::claims::attach_symbols(&mut changed, &diff);
+        }
+        Some(changed)
+    }
+
+    /// Read an agent's claims off the attempt it just finished (§gh#235).
+    ///
+    /// The fallback half of the contract. `comet-board claim` is the better
+    /// path and the one the skill asks for first, because it answers with the
+    /// remainder while the agent can still act on it — but an agent that
+    /// finished without running it has still written down what it did, in the
+    /// fenced block the skill asks for, and reading that late beats losing it.
+    ///
+    /// Three things this must never do, and each is why it returns nothing:
+    ///
+    /// - **Overwrite.** An attempt that already answered is left alone; the
+    ///   submitted set is the agent's considered answer and this is a scrape.
+    /// - **Block.** Every failure here — no runtime, no journal, no block, a
+    ///   block that will not parse — leaves the settle to carry on. A claimless
+    ///   attempt settles exactly as it did before any of this existed, which is
+    ///   the ticket's own exit condition.
+    /// - **Drop a malformed block silently.** That one is recorded on the row,
+    ///   where the review says it out loud
+    ///   ([`crate::claims::FindingKind::MalformedClaims`]).
+    fn harvest_claims(&self, runtime: Option<&dyn Runtime>, attempt: &Attempt) {
+        if attempt.claims_at.is_some() {
+            return;
+        }
+        let Some(runtime) = runtime else { return };
+        let Some(chat_id) = attempt.pane_id.as_deref() else {
+            return;
+        };
+        let text = match runtime.run_message(chat_id) {
+            Ok(Some(text)) => text,
+            Ok(None) => return,
+            Err(e) => {
+                self.log
+                    .warn(format!("message for chat {chat_id} unreadable: {e:#}"));
+                return;
+            }
+        };
+        match crate::claims::harvest(&text, attempt.worktree.as_deref()) {
+            crate::claims::Harvest::None => {}
+            crate::claims::Harvest::Claims(claims) => {
+                match self.db.set_attempt_claims(attempt.id, &claims) {
+                    Ok(()) => self.log.info(format!(
+                        "attempt {} claimed {} change(s) in its closing message",
+                        attempt.id,
+                        claims.len()
+                    )),
+                    Err(e) => self.log.warn(format!(
+                        "recording claims for attempt {}: {e:#}",
+                        attempt.id
+                    )),
+                }
+            }
+            crate::claims::Harvest::Malformed(why) => {
+                self.log.warn(format!(
+                    "attempt {} wrote a claims block that would not parse: {why}",
+                    attempt.id
+                ));
+                if let Err(e) = self.db.set_attempt_claims_error(attempt.id, &why) {
+                    self.log.warn(format!(
+                        "recording the claims refusal for attempt {}: {e:#}",
+                        attempt.id
+                    ));
+                }
+            }
+        }
     }
 
     /// Record an agent's claims against an attempt, and hand back the review
@@ -2142,6 +2217,12 @@ impl SyncEngine {
         // (§gh#183). The event path settles the instant a run ends, so it can
         // close an attempt no interval reconcile has seen since its final
         // commit — and that commit is the one the review is about.
+        //
+        // The harvest goes first (§gh#235): the claims it may find are the
+        // agent's own, and the snapshot below is what they are checked against.
+        // Neither can fail the settle — a claimless attempt reaches its PR the
+        // way it always did.
+        self.harvest_claims(runtime, attempt);
         self.record_review_facts(runtime, attempt);
         self.db.close_attempt(attempt.id, Outcome::Done)?;
         self.enqueue_outcome(task, Outcome::Done, pr_url)?;
@@ -8378,5 +8459,162 @@ max_duration = "{max_duration}"
         );
         assert_eq!(review.evidence.checks[0].runs, 2);
         assert!(review.evidence.checks[0].ever_passed());
+    }
+
+    // ---- the claims block, off a finished attempt (§gh#235) ---------------
+
+    /// A runtime whose chat said something when it finished — the only new
+    /// question the harvest asks of one.
+    struct Closing(&'static str);
+
+    impl Runtime for Closing {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("settling never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("settling never cancels")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(Some(RunEnd::Completed))
+        }
+        fn run_message(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(Some(self.0.to_string()))
+        }
+    }
+
+    /// Settle a task whose run just ended cleanly with a PR already open, on
+    /// the runtime given — the shortest honest path to `settle`.
+    ///
+    /// With a real checkout under it, because a review with no diff to read
+    /// reports only that (§gh#183) and would drown out every claim finding
+    /// these tests are here for.
+    fn settled_with(rt: &dyn Runtime) -> (SyncEngine, i64) {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        agent_worked_in(&e, a, Work::Pushed);
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/18"),
+            Some(18),
+            true,
+        )
+        .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(rt))
+            .unwrap();
+        (e, a)
+    }
+
+    #[test]
+    fn a_closing_message_with_a_claims_block_is_read_onto_the_attempt() {
+        let (e, a) = settled_with(&Closing(
+            "All done, PR is up.\n\n\
+             ```claims\n\
+             Storage lives on the attempt :: crates/board/src/db.rs\n\
+             The remainder comes off the diff :: remainder\n\
+             ```\n",
+        ));
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        assert_eq!(attempt.outcome, Some(Outcome::Done), "and it still settles");
+        assert!(attempt.claims_at.is_some(), "the contract was answered");
+        assert_eq!(attempt.claims.len(), 2);
+        assert_eq!(attempt.claims[0].files, ["crates/board/src/db.rs"]);
+        assert_eq!(attempt.claims[1].symbols, ["remainder"]);
+        assert!(attempt.claims_error.is_none());
+    }
+
+    /// The ticket's exit condition: nothing about claims may stand between a
+    /// finished run and its pull request.
+    #[test]
+    fn an_attempt_that_claimed_nothing_settles_exactly_as_it_always_did() {
+        let (e, a) = settled_with(&Closing("Done. The tests pass and the PR is open."));
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        assert_eq!(attempt.outcome, Some(Outcome::Done));
+        assert!(attempt.claims.is_empty());
+        assert!(attempt.claims_at.is_none(), "never asked, never answered");
+        assert!(attempt.claims_error.is_none(), "and nothing to report");
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        assert!(!review.claimed());
+        assert_eq!(
+            review.findings()[0].kind,
+            crate::claims::FindingKind::NeverClaimed
+        );
+    }
+
+    /// Reported, never dropped — and it still does not hold up the settle.
+    #[test]
+    fn a_malformed_block_is_recorded_against_the_attempt_rather_than_dropped() {
+        let (e, a) = settled_with(&Closing(
+            "Finished.\n\n```claims\nI rewrote the storage layer\n```\n",
+        ));
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        assert_eq!(attempt.outcome, Some(Outcome::Done), "and it still settles");
+        assert!(attempt.claims.is_empty());
+        assert!(attempt.claims_at.is_none());
+        let why = attempt.claims_error.expect("the refusal is on the row");
+        assert!(why.contains("I rewrote the storage layer"), "{why}");
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        let finding = &review.findings()[0];
+        assert_eq!(finding.kind, crate::claims::FindingKind::MalformedClaims);
+        assert!(
+            finding.kind.tone().loud(),
+            "louder than having said nothing"
+        );
+    }
+
+    /// The harvest is a scrape and the verb is an answer. An attempt that
+    /// already submitted keeps what it submitted.
+    #[test]
+    fn a_harvest_never_overwrites_what_the_agent_submitted() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr(
+            "linear:LIN-142",
+            Some("https://github.com/o/r/pull/18"),
+            Some(18),
+            true,
+        )
+        .unwrap();
+        e.submit_claims(None, "linear:LIN-142", "The considered answer :: src/a.rs")
+            .unwrap();
+
+        let rt = Closing("```claims\nA later afterthought :: src/b.rs\n```");
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        assert_eq!(attempt.outcome, Some(Outcome::Done));
+        assert_eq!(attempt.claims.len(), 1);
+        assert_eq!(attempt.claims[0].files, ["src/a.rs"]);
+    }
+
+    /// A good set supersedes a bad block: the refusal goes with it, or the
+    /// review would show a draft beside its correction.
+    #[test]
+    fn submitting_claims_clears_an_earlier_refusal() {
+        let (e, a) = settled_with(&Closing("```claims\nno anchor here\n```"));
+        assert!(e.db.get_attempt(a).unwrap().unwrap().claims_error.is_some());
+
+        e.submit_claims(None, "linear:LIN-142", "Said properly :: src/a.rs")
+            .unwrap();
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+        assert!(attempt.claims_error.is_none());
+        assert_eq!(attempt.claims.len(), 1);
+        assert!(attempt.claims_at.is_some());
     }
 }
