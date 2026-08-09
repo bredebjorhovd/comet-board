@@ -306,14 +306,31 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
     // Where the work landed, counted per TASK and not per attempt: three goes
     // at one issue produce one pull request, and counting the attempts would
     // report the same merge three times. Only tasks touched in the window.
+    //
+    // The last two branches are the ones that need the ATTEMPTS and not just
+    // the pull request (gh#228). A task with no PR is either an agent that
+    // came back empty or an agent still typing, and those are opposite facts:
+    // the first is the board wasting its time, the second is the board
+    // working. Keyed on PR presence alone they are one number, and the loss
+    // hides inside it.
     let mut landing = Landing::default();
     for task in tasks.iter().filter(|t| touched.contains(t.id.as_str())) {
+        // A PR that exists says where the work went whatever the attempts are
+        // doing — a retry running under an already-merged branch is still a
+        // merge. Without one, the attempts in this window are the only witness.
+        let still_going = task
+            .attempts
+            .iter()
+            .filter(|a| started_within(a, since_days))
+            .any(|a| a.outcome.is_none());
         if task.pr_merged {
             landing.merged += 1;
         } else if task.pr_open {
             landing.open += 1;
         } else if task.pr_number.is_some() {
             landing.closed_unmerged += 1;
+        } else if still_going {
+            landing.in_flight += 1;
         } else {
             landing.no_pr += 1;
         }
@@ -432,6 +449,21 @@ pub fn print(s: &Stats) {
     }
     if let (Some(med), Some(max)) = (s.median_minutes, s.longest_minutes) {
         println!("  {med} min median, {max} min longest");
+    }
+    // Where it landed, all four categories and the losses among them (gh#228)
+    // — off the same segments the two viewports draw, so the CLI cannot come
+    // to call a rejected pull request something else.
+    if s.landing.total() > 0 {
+        let landed: Vec<String> = s
+            .landing
+            .segments()
+            .iter()
+            .map(|seg| format!("{} {}", seg.count, seg.label))
+            .collect();
+        println!("  landed: {}", landed.join(", "));
+    }
+    if let Some(note) = s.landing.in_flight_note() {
+        println!("  {note}");
     }
     if s.friction.retried_tasks > 0 {
         println!(
@@ -893,7 +925,47 @@ mod tests {
         assert_eq!(s.landing.open, 1);
         assert_eq!(s.landing.closed_unmerged, 1);
         assert_eq!(s.landing.no_pr, 1);
+        assert_eq!(s.landing.in_flight, 0);
         assert_eq!(s.landing.total(), s.tasks_touched);
+    }
+
+    #[test]
+    fn an_agent_still_typing_is_not_an_agent_that_came_back_empty() {
+        // gh#228: both tasks have no pull request, and keyed on that alone
+        // they are one number — which is how a loss comes to read as work in
+        // flight. The attempts are what tells them apart.
+        let settled_empty = task("t1", vec![attempt(60, 5, Some(Outcome::Done), None)]);
+        let still_going = task("t2", vec![attempt(10, 0, None, None)]);
+        // A second go still running on a task whose first go already ended:
+        // the task has not landed anywhere, so it is not a loss yet either.
+        let retrying = task(
+            "t3",
+            vec![
+                attempt(90, 5, Some(Outcome::Failed), None),
+                attempt(5, 0, None, None),
+            ],
+        );
+
+        let s = gather(&[settled_empty, still_going, retrying], None);
+        assert_eq!(s.landing.no_pr, 1, "only the one that came back empty");
+        assert_eq!(s.landing.in_flight, 2);
+        // The bar is over what landed; the rest is a caption beside it.
+        assert_eq!(s.landing.total(), 1);
+        assert_eq!(s.landing.touched(), s.tasks_touched);
+
+        // A merged pull request is a merge whatever a retry is doing under it.
+        let mut merged_and_retrying = task(
+            "t4",
+            vec![
+                attempt(90, 5, Some(Outcome::Done), None),
+                attempt(5, 0, None, None),
+            ],
+        );
+        merged_and_retrying.pr_number = Some(11);
+        merged_and_retrying.pr_merged = true;
+        let s = gather(&[merged_and_retrying], None);
+        assert_eq!(s.landing.merged, 1);
+        assert_eq!(s.landing.in_flight, 0);
     }
 
     #[test]

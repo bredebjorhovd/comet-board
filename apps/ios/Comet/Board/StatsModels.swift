@@ -112,13 +112,98 @@ struct TokenTally: Decodable, Hashable, Identifiable {
 
 /// Where the work ended up — the question a completion rate only half-answers:
 /// an attempt can end `done` and leave a pull request nobody merged.
+///
+/// Four places, and the two at the bottom are the reason this is a shape and
+/// not a merge count (gh#228). *Closed unmerged* is a pull request somebody
+/// rejected or abandoned; *no PR raised* is an agent that settled having
+/// produced nothing. They are the only numbers on a stats screen that say the
+/// board wasted its time, and folding either into "in review" hides the loss
+/// behind the one word that reads as patience.
+///
+/// `inFlight` is deliberately outside the four: work still running has not
+/// landed anywhere, and counting it under *no PR raised* reports an agent that
+/// is still typing as an agent that came back empty. Absent from an older
+/// board's reply, which decodes as nothing running.
 struct Landing: Decodable, Hashable {
     var merged: Int = 0
     var open: Int = 0
     var closedUnmerged: Int = 0
     var noPr: Int = 0
+    var inFlight: Int = 0
 
+    /// The four that landed — `comet_proto::view::stats::Landing::total`.
     var total: Int { merged + open + closedUnmerged + noPr }
+
+    /// Every task this accounts for, landed or still going.
+    var touched: Int { total + inFlight }
+
+    func count(_ kind: LandingKind) -> Int {
+        switch kind {
+        case .merged: merged
+        case .open: open
+        case .closedUnmerged: closedUnmerged
+        case .noPr: noPr
+        }
+    }
+
+    /// The bar, as bands — `Landing::segments`. **All four, always**,
+    /// including the empty ones: a legend that drops `Closed unmerged 0` is
+    /// one a reader cannot tell from a surface that never counted losses.
+    var segments: [LandingSegment] {
+        LandingKind.all.map { kind in
+            let count = count(kind)
+            return LandingSegment(
+                kind: kind,
+                label: kind.label,
+                count: count,
+                fraction: total == 0 ? 0 : Double(count) / Double(total))
+        }
+    }
+
+    /// `11 tasks` — the headline over the bar. Tasks, never attempts.
+    var headline: String { "\(total) task\(total == 1 ? "" : "s")" }
+
+    /// What the bar leaves out. `nil` when nothing is still running, because
+    /// "0 still running" is a line that says nothing.
+    var inFlightNote: String? {
+        inFlight > 0 ? "\(inFlight) still running — not landed anywhere yet" : nil
+    }
+}
+
+/// One of the four places work lands, as an identity rather than a label —
+/// `comet_proto::view::stats::LandingKind`. The screen paints these from the
+/// status ramp: merged is settled, an open pull request is review,
+/// closed-unmerged is blocked, nothing-raised is the working amber.
+enum LandingKind: String, Decodable, Hashable {
+    case merged
+    case open
+    case closedUnmerged
+    case noPr
+
+    /// Best outcome first, so a bar reads left to right from landed to lost.
+    static let all: [LandingKind] = [.merged, .open, .closedUnmerged, .noPr]
+
+    /// `PR open` rather than `In review`: review is a state a human is in, and
+    /// the fact here is that the branch exists and has not been taken.
+    var label: String {
+        switch self {
+        case .merged: "Merged"
+        case .open: "PR open"
+        case .closedUnmerged: "Closed unmerged"
+        case .noPr: "No PR raised"
+        }
+    }
+}
+
+/// One band of the landing bar: what it is, how many tasks, and the share of
+/// the bar it takes.
+struct LandingSegment: Decodable, Hashable, Identifiable {
+    var id: String { kind.rawValue }
+    var kind: LandingKind
+    var label: String
+    var count: Int
+    /// Share of `Landing.total`, `0...1`. Zero when the window landed nothing.
+    var fraction: Double
 }
 
 /// The friction numbers — the board reporting on how often the work had to be
@@ -540,23 +625,16 @@ func statsHeadline(_ stats: BoardStats) -> String {
     "\(stats.attempts) dispatch\(stats.attempts == 1 ? "" : "es")"
 }
 
-/// The label-and-value rows under "At a glance": where the work landed, what
-/// it cost in time, and what it cost in friction.
+/// The label-and-value rows under "At a glance": what the work cost in time,
+/// and what it cost in friction.
 ///
 /// One list rather than four cards, for the phone's version of the reason the
 /// desktop collapsed them (gh#143): a fact per card is what makes a screen a
-/// scroll.
+/// scroll. Where the work *landed* left this list in gh#228 — as four rows it
+/// could only ever be a merge count with the losses folded away, so it is a
+/// bar with a legend of its own.
 func statsGlanceLines(_ stats: BoardStats) -> [(label: String, value: String)] {
     var rows: [(label: String, value: String)] = []
-    let landing = stats.landing
-    if landing.total > 0 {
-        rows.append(("Merged", "\(landing.merged) of \(landing.total)"))
-        if landing.open > 0 { rows.append(("In review", "\(landing.open)")) }
-        if landing.closedUnmerged > 0 {
-            rows.append(("Closed unmerged", "\(landing.closedUnmerged)"))
-        }
-        if landing.noPr > 0 { rows.append(("No pull request", "\(landing.noPr)")) }
-    }
     rows.append(("Agent time", humanMinutes(stats.totalMinutes)))
     if let p90 = stats.p90Minutes { rows.append(("Nine in ten within", humanMinutes(p90))) }
     // Friction earns a line when there is any, and one honest line when there

@@ -48,6 +48,7 @@ struct StatsView: View {
                          + "Release a task and this fills in.")
                 } else {
                     answerPanel(stats)
+                    landingSection(stats)
                     dailySection(stats)
                     tokensSection(stats)
                     glanceSection(stats)
@@ -188,6 +189,124 @@ struct StatsView: View {
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
             .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 4, trailing: 12))
+        }
+    }
+
+    // MARK: Where the work landed (gh#228)
+
+    /// One proportional bar over the four places a task ends up, with a legend
+    /// that names all four and counts them.
+    ///
+    /// It was four rows in "At a glance" — `Merged 18 of 19`, `In review 1` —
+    /// and the two that mattered most were the two it could not produce. A
+    /// pull request somebody rejected and an agent that came back with nothing
+    /// are the only numbers on this screen that say the board wasted its time,
+    /// and both read as the same patient "in review". So the four categories
+    /// are one shape, the two losses carry their own hues off the status ramp,
+    /// and every category stays in the legend at zero: a reader must be able
+    /// to tell a window that lost nothing from a screen that does not count
+    /// losses.
+    ///
+    /// The bar is over tasks that LANDED. Work still running is a caption
+    /// under it and never a band — a proportion of unfinished work moves while
+    /// nothing lands.
+    @ViewBuilder
+    private func landingSection(_ stats: BoardStats) -> some View {
+        let landing = stats.landing
+        if landing.touched > 0 {
+            let bands = landing.segments.filter { $0.count > 0 }
+            Section {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text(landing.headline)
+                        .font(Theme.sans(Theme.textFigure, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                    if !bands.isEmpty {
+                        GeometryReader { geo in
+                            HStack(spacing: 2) {
+                                ForEach(bands) { band in
+                                    // scale-ok: a drawn band's own cap — 12pt
+                                    // tall, and its corner relates to that,
+                                    // not to a box it sits in
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(landingTone(band.kind))
+                                        .frame(width: bandWidth(band.fraction,
+                                                                across: geo.size.width,
+                                                                bands: bands.count))
+                                }
+                            }
+                        }
+                        .frame(height: Self.landingBar)
+                    }
+                    ForEach(landing.segments) { segment in
+                        legendRow(segment)
+                    }
+                    // What the bar leaves out, said out loud rather than
+                    // counted as an agent that produced nothing.
+                    if let note = landing.inFlightNote {
+                        Text(note)
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.textSubtle)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 6, trailing: 12))
+            } header: {
+                header("Where the work landed", aside: nil)
+            }
+        }
+    }
+
+    /// The bar's thickness. Thicker than a tally's 5pt rule: this is a
+    /// proportion to be read, not a magnitude to be compared, and four hues in
+    /// a hairline is a stripe nobody can name.
+    private static let landingBar: CGFloat = 12
+
+    /// The floor under a band, so one merge out of ninety is a sliver you can
+    /// see rather than a rounding error. Bands grow from here, which is also
+    /// why four of them always fit the track.
+    private static let landingBandMin: CGFloat = 6
+
+    /// The legend's colour chip.
+    private static let landingSwatch: CGFloat = 8
+
+    private func bandWidth(_ fraction: Double, across width: CGFloat, bands: Int) -> CGFloat {
+        let gaps = CGFloat(max(0, bands - 1)) * 2
+        let free = max(0, width - gaps - CGFloat(bands) * Self.landingBandMin)
+        return Self.landingBandMin + free * fraction
+    }
+
+    /// A category's hue, off the status ramp: merged is settled, an open pull
+    /// request is review, a closed one is blocked, and nothing raised is the
+    /// working amber. The desktop paints the same four (`landing_tone`).
+    private func landingTone(_ kind: LandingKind) -> Color {
+        switch kind {
+        case .merged: Theme.settled
+        case .open: Theme.accent
+        case .closedUnmerged: Theme.danger
+        case .noPr: Theme.warning
+        }
+    }
+
+    /// Chip, name, count — and an empty category keeps its row and gives up
+    /// its hue, because the count is the fact and four lit chips over three
+    /// real numbers is a bar that disagrees with its own legend.
+    private func legendRow(_ segment: LandingSegment) -> some View {
+        let empty = segment.count == 0
+        return HStack(spacing: 8) {
+            // scale-ok: the bar's own mark at 8pt, in the legend
+            RoundedRectangle(cornerRadius: 3)
+                .fill(empty ? Theme.border : landingTone(segment.kind))
+                .frame(width: Self.landingSwatch, height: Self.landingSwatch)
+            Text(segment.label)
+                .font(Theme.sans(Theme.textDense))
+                .foregroundStyle(empty ? Theme.textSubtle : Theme.textMuted)
+            Spacer(minLength: 8)
+            Text("\(segment.count)")
+                .font(Theme.sans(Theme.textDense, weight: .medium))
+                .foregroundStyle(empty ? Theme.textSubtle : Theme.text)
         }
     }
 

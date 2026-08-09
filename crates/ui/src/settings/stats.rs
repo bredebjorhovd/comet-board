@@ -13,6 +13,8 @@
 //!    board's, the other is a person's (gh#182).
 //! 2. **Work released** — dispatches, where they landed, and the day chart:
 //!    bar height is tokens, the dispatch count rides in the caption (gh#226).
+//!    Where it landed is one proportional bar over four categories, not a
+//!    merge count (gh#228).
 //! 3. **Tokens** — what the price above was computed from, per model.
 //! 4. **When and where** — one grid crossing the hour against the space.
 //! 5. **Breakdown** — the same window cut by model, runtime, space, tracker or
@@ -33,6 +35,14 @@
 //! input, with what each one cost and what it bought. Thirty-five million
 //! cached tokens for a fifth of what a million output tokens cost is the whole
 //! story of where the money goes, and no other view of these numbers tells it.
+//!
+//! **Block two draws its outcomes rather than listing them.** `Merged 18 of
+//! 19` and `In review 1` were four definition-list rows that could not produce
+//! the two facts worth having: a pull request somebody rejected, and an agent
+//! that settled having produced nothing. Both hid inside "in review" — the one
+//! word a queue of healthy work also reads as. They are the only numbers here
+//! that say the board wasted its time, so they are their own hues in one bar
+//! and their own rows in its legend, present even at zero (gh#228).
 //!
 //! **The crossing is the point of block four.** "When do I release work" and
 //! "which spaces" were two cards, and the interesting fact — that the evening
@@ -67,8 +77,8 @@ use comet_proto::TokenUsage;
 use comet_proto::view::board;
 use comet_proto::view::rates::{Usd, human_usd};
 use comet_proto::view::stats::{
-    BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit, Dimension, HOURS, TokenTally,
-    WINDOWS, bar_fraction, day_captions_fit, day_columns, hour_grid, human_minutes,
+    BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit, Dimension, HOURS, LandingKind,
+    TokenTally, WINDOWS, bar_fraction, day_captions_fit, day_columns, hour_grid, human_minutes,
     human_multiple, human_tokens, peak_tokens, percent, ranked_tokens,
 };
 use comet_rpc::methods;
@@ -113,6 +123,19 @@ const MARK_RADIUS: f32 = 3.0;
 /// The label gutter shared by the crossed grid and the breakdown, so the two
 /// blocks start their bars on the same vertical.
 const LABEL_WIDTH: f32 = 132.0;
+
+/// The landing bar's thickness (gh#228). Thicker than a tally's 6px rule: this
+/// one is a proportion to be read, not a row's magnitude to be compared, and
+/// four hues at 6px is a stripe nobody can name.
+const LANDING_BAR: f32 = 12.0;
+
+/// The floor under a band, so one merge out of ninety is a sliver you can see
+/// and point at rather than a rounding error. Bands grow from here, which is
+/// also why the bar never overflows its track.
+const LANDING_BAND_MIN: f32 = 6.0;
+
+/// The legend's colour chip.
+const SWATCH: f32 = 8.0;
 
 /// One row of the per-model table: what ran, what it spent, and — when the
 /// board could price it — what that would have cost.
@@ -972,6 +995,9 @@ impl StatsPage {
                     .flex()
                     .flex_col()
                     .gap(px(9.0))
+                    .when_some(Self::render_landing(stats, theme), |el, landing| {
+                        el.child(landing).child(Self::seam(theme))
+                    })
                     .children(Self::glance_lines(stats, theme)),
             );
 
@@ -1114,41 +1140,163 @@ impl StatsPage {
             .into_any_element()
     }
 
-    /// The facts that qualify the headline — where the work landed, what it
-    /// cost in friction, and who released it. Four cards' worth of numbers as
-    /// label-and-value rows: a card per fact is what made this page a scroll.
-    fn glance_lines(stats: &BoardStats, theme: &Theme) -> Vec<AnyElement> {
+    /// **Where the work landed** (gh#228): one proportional bar over the four
+    /// places a task ends up, with a legend that names all four and counts
+    /// them.
+    ///
+    /// It was a definition list — `Merged 18 of 19`, `In review 1` — and the
+    /// two rows that mattered most were the two it could not produce. A pull
+    /// request somebody rejected and an agent that came back with nothing are
+    /// the only numbers on this page that say the board wasted its time, and
+    /// both were folded into the same "in review" that a queue of healthy work
+    /// reads as. So the four categories are drawn as ONE shape, the two losses
+    /// have their own hues off the status ramp, and every category is in the
+    /// legend even at zero: a reader has to be able to tell a window that lost
+    /// nothing from a surface that does not count losses.
+    ///
+    /// The bar is over tasks that landed. Work still running is a caption
+    /// under it and never a band, because a proportion of unfinished work is a
+    /// proportion that moves while nothing lands.
+    fn render_landing(stats: &BoardStats, theme: &Theme) -> Option<AnyElement> {
         let landing = stats.landing;
-        let mut rows: Vec<AnyElement> = Vec::new();
-        if landing.total() > 0 {
-            rows.push(Self::line(
-                theme,
-                "Merged",
-                format!("{} of {}", landing.merged, landing.total()),
-            ));
-            if landing.open > 0 {
-                rows.push(Self::line(theme, "In review", format!("{}", landing.open)));
-            }
-            if landing.closed_unmerged > 0 {
-                rows.push(Self::line(
-                    theme,
-                    "Closed unmerged",
-                    format!("{}", landing.closed_unmerged),
-                ));
-            }
-            if landing.no_pr > 0 {
-                rows.push(Self::line(
-                    theme,
-                    "No pull request",
-                    format!("{}", landing.no_pr),
-                ));
-            }
+        let segments = landing.segments();
+        if landing.touched() == 0 {
+            return None;
         }
-        rows.push(Self::line(
+
+        // A window whose work is all still running has no shape yet: a blank
+        // track over four zeroes says less than the caption underneath, which
+        // says the whole of it.
+        let landed = landing.total() > 0;
+        let bar = landed.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .w_full()
+                .h(px(LANDING_BAR))
+                .children(segments.iter().filter(|s| s.count > 0).map(|s| {
+                    div()
+                        // Grow from the floor rather than sizing to the share,
+                        // so a single-task band stays visible and four bands
+                        // still fit the track exactly.
+                        .flex_grow(s.fraction as f32)
+                        .flex_basis(px(0.0))
+                        .min_w(px(LANDING_BAND_MIN))
+                        .h_full()
+                        // scale-ok: a drawn band's own cap — 12px tall, and
+                        // its corner belongs to that, not to the card it sits
+                        // in (the chart columns beside it are capped the same).
+                        .rounded(px(MARK_RADIUS))
+                        .bg(Self::landing_tone(theme, s.kind))
+                        .into_any_element()
+                }))
+        });
+
+        // Every category, including the empty ones — see above. Nothing at all
+        // landed is the one case with no legend, because four zeroes is not a
+        // list of categories, it is the caption written four times.
+        let shown = if landed { segments.as_slice() } else { &[] };
+        let legend: Vec<AnyElement> = shown
+            .iter()
+            .map(|s| {
+                let empty = s.count == 0;
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(SWATCH))
+                            .h(px(SWATCH))
+                            // scale-ok: a legend chip is the bar's own mark at 8px;
+                            // its corner belongs to those 8px, not to the card.
+                            .rounded(px(MARK_RADIUS))
+                            // A category with nothing in it keeps its row and
+                            // gives up its hue: the count is the fact, and four
+                            // lit chips over three real numbers is a bar that
+                            // disagrees with its own legend.
+                            .bg(if empty {
+                                theme.border
+                            } else {
+                                Self::landing_tone(theme, s.kind)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(if empty {
+                                theme.text_subtle
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(SharedString::from(s.label.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if empty { theme.text_subtle } else { theme.text })
+                            .child(SharedString::from(format!("{}", s.count))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(9.0))
+                .child(Self::caption(theme, "Where the work landed".into()))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_FIGURE))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(SharedString::from(landing.headline())),
+                )
+                .when_some(bar, |el, bar| el.child(bar))
+                .children(legend)
+                // What the bar leaves out, said out loud rather than counted
+                // as an agent that produced nothing.
+                .when_some(landing.in_flight_note(), |el, note| {
+                    el.child(Self::caption(theme, note))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// A category's hue, off the status ramp both viewports paint from: merged
+    /// is settled, an open pull request is review, a closed one is blocked,
+    /// and nothing raised is the working amber. The two losses are the two
+    /// loud colours on the page, which is the point of drawing them at all.
+    fn landing_tone(theme: &Theme, kind: LandingKind) -> gpui::Hsla {
+        match kind {
+            LandingKind::Merged => theme.settled,
+            LandingKind::Open => theme.accent,
+            LandingKind::ClosedUnmerged => theme.danger,
+            LandingKind::NoPr => theme.warning,
+        }
+    }
+
+    /// The facts that qualify the headline — what the work cost in time, and
+    /// what it cost in friction. Four cards' worth of numbers as
+    /// label-and-value rows: a card per fact is what made this page a scroll.
+    /// Where it *landed* is the bar above these (gh#228), not a row among them.
+    fn glance_lines(stats: &BoardStats, theme: &Theme) -> Vec<AnyElement> {
+        let mut rows: Vec<AnyElement> = vec![Self::line(
             theme,
             "Agent time",
             human_minutes(stats.total_minutes),
-        ));
+        )];
         if let Some(p90) = stats.p90_minutes {
             rows.push(Self::line(theme, "Nine in ten within", human_minutes(p90)));
         }

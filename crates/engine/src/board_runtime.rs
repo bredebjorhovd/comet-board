@@ -361,6 +361,13 @@ impl Runtime for CometRuntime {
     fn run_commands(&self, chat_id: &str) -> anyhow::Result<Option<Vec<RanCommand>>> {
         Ok(self.journal.commands(chat_id)?)
     }
+
+    /// The tail of what the agent said, off the same journal once more
+    /// (§gh#235) — where a finished attempt's claims block is, when it wrote
+    /// one instead of running the verb. See [`RunJournal::final_text`].
+    fn run_message(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.journal.final_text(chat_id)?)
+    }
 }
 
 /// The repo a linked worktree belongs to, asked of the checkout itself.
