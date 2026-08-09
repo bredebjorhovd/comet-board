@@ -21,7 +21,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      overrun_warned_at, repo_path, collectable_at, collected_at,
      dispatched_by_device, dispatched_by_user, dispatched_by_verified, billed_to, \
      chat_archivable_at, chat_archived_at, \
-     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model";
+     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
+     cache_sweepable_at, cache_swept_at";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -78,6 +79,8 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
             }),
         },
         model: r.get(38)?,
+        cache_sweepable_at: r.get(39)?,
+        cache_swept_at: r.get(40)?,
     })
 }
 
@@ -244,7 +247,16 @@ impl Db {
               -- the tokens. The route's override is not it: most routes name
               -- none, so the column would be NULL exactly where the breakdown
               -- needs it most.
-              model TEXT
+              model TEXT,
+              -- When the build output inside this checkout became nobody's, and
+              -- when the board last deleted it (gh#186). Kept apart from
+              -- `collectable_at`/`collected_at` because they mean different
+              -- things: those say the checkout is gone, these say a cache
+              -- inside a checkout that is still there was swept. Writing a
+              -- sweep as a collection would have the board reporting checkouts
+              -- reclaimed that are still on the disk, still on their branches.
+              cache_sweepable_at TEXT,
+              cache_swept_at TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -397,6 +409,13 @@ impl Db {
                 ("cache_read_tokens", "INTEGER"),
                 ("cache_creation_tokens", "INTEGER"),
                 ("model", "TEXT"),
+                // Build-output sweeping (gh#186). Existing rows keep NULL on
+                // both, which reads as "never marked, never swept" — so the
+                // 109 GiB already sitting in the worktree root is swept on the
+                // same terms as tomorrow's, from the first sweep that finds
+                // its attempt closed. That backlog is what this is about.
+                ("cache_sweepable_at", "TEXT"),
+                ("cache_swept_at", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -761,6 +780,60 @@ impl Db {
         self.conn.execute(
             "UPDATE attempts SET collected_at = ?2 WHERE id = ?1",
             params![attempt_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Start or stop the sweep clock on the build output inside an attempt's
+    /// checkout (gh#186).
+    ///
+    /// Stamps *now* only if nothing is stamped, for
+    /// [`Self::set_attempt_collectable`]'s reason: the window is measured from
+    /// when the cache first became nobody's, and re-stamping every sweep would
+    /// push the sweep a cycle further out forever.
+    pub fn set_attempt_cache_sweepable(&self, attempt_id: i64, sweepable: bool) -> Result<()> {
+        if sweepable {
+            self.conn.execute(
+                "UPDATE attempts SET cache_sweepable_at = ?2
+                  WHERE id = ?1 AND cache_sweepable_at IS NULL",
+                params![attempt_id, now()],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE attempts SET cache_sweepable_at = NULL WHERE id = ?1",
+                params![attempt_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record that the build output inside this attempt's checkout is gone
+    /// (gh#186).
+    ///
+    /// Deliberately *not* [`Self::set_attempt_collected`]: `collected_at` means
+    /// the worktree and its branch are gone, and a cache sweep is not that. A
+    /// board that recorded one as the other would report checkouts reclaimed
+    /// that are still on the disk — and would then never reclaim them.
+    pub fn set_attempt_cache_swept(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET cache_swept_at = ?2 WHERE id = ?1",
+            params![attempt_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget that the board swept this checkout's build output (gh#186) — the
+    /// re-open path, where an agent is about to build in there again.
+    ///
+    /// Both stamps go. A cache is the one thing here that comes *back*: unlike a
+    /// deleted worktree or an archived chat, the next build recreates it, and a
+    /// `cache_swept_at` left standing would keep the attempt out of the sweep
+    /// for good while a fresh 36 GB accumulated behind it.
+    pub fn clear_attempt_cache_swept(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET cache_swept_at = NULL, cache_sweepable_at = NULL
+              WHERE id = ?1",
+            params![attempt_id],
         )?;
         Ok(())
     }

@@ -285,6 +285,21 @@ impl Runtime for CometRuntime {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    /// Sweep the build output out of a finished attempt's checkout (gh#186),
+    /// leaving the checkout and its branch exactly where they are.
+    ///
+    /// No git and no `Repos`: a `target/` is not a worktree registration, and
+    /// removing one is a directory delete the board's own
+    /// [`comet_board::gc::sweep_build_output`] does — which is where the walk's
+    /// refusals (never `.git`, never a symlink, never below the depth bound) are
+    /// stated and tested. This is here for the ownership rule rather than for the
+    /// mechanism: the process that cut the worktrees is the one allowed to delete
+    /// inside them, so a read-only board process keeps the clock and sweeps
+    /// nothing.
+    fn reclaim_build_output(&self, worktree: &str) -> anyhow::Result<comet_board::gc::Swept> {
+        Ok(comet_board::gc::sweep_build_output(Path::new(worktree)))
+    }
+
     /// Whose subscription a dispatch would spend (gh#101) — the slot's login,
     /// or this device's own when the dispatch names no slot.
     ///

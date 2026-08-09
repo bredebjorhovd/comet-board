@@ -273,11 +273,21 @@ so in the PR description rather than spending the remaining minutes on another
 lap. Finishing inside the grace settles the attempt `done` on your artifacts as
 normal — the cap only takes what nothing else has closed.
 
+**Your build output goes as soon as your run ends.** `target/`, `node_modules/`,
+`.next/` and `.turbo/` inside your checkout are swept once your attempt closes —
+not when the task leaves the board, and not when your pull request merges
+(`retain_build_output`, `on-settle` by default). The checkout itself stays, on
+its branch, with everything you wrote in it; only the cache goes. So if you are
+resumed to answer review comments, expect the first build to be a cold one, and
+do not keep anything you care about inside those directories. The reason is
+arithmetic: a checkout is about 14 MB and its `target/` is 20–36 GB, and a box
+keeping a week of the second one runs out of disk mid-run — yours.
+
 **Your chat is filed away once the work is over, not deleted.** As soon as the
 task leaves the board — merged, closed upstream, or marked done — the board
 archives the chat it dispatched you into; the checkout you worked in is
-reclaimed on its own, week-long clock (`archive_chats` / `retain_worktrees`,
-both per route). Never while
+reclaimed on its own, week-long clock (`archive_chats`, per route;
+`retain_worktrees`, board-wide). Never while
 your attempt is live or blocked, and never while a pull request is still in
 review: a chat in review is how the board delivers comments back to you, so it
 outlives everything else. The transcript survives archiving, Settings →

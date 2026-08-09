@@ -436,6 +436,8 @@ mod tests {
             collected_at: None,
             chat_archivable_at: None,
             chat_archived_at: None,
+            cache_sweepable_at: None,
+            cache_swept_at: None,
             dispatched_by_device: None,
             dispatched_by_user: None,
             dispatched_by_verified: false,

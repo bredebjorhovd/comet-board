@@ -377,6 +377,35 @@ pub trait Runtime {
         anyhow::bail!("this runtime cannot reclaim worktrees")
     }
 
+    /// Delete the build output inside a finished attempt's checkout (gh#186) —
+    /// `target/`, `node_modules/` and the rest of
+    /// [`crate::gc::BUILD_OUTPUT_DIRS`] — leaving the checkout itself alone.
+    ///
+    /// The counterpart to [`Runtime::reclaim_worktree`] and emphatically not a
+    /// weaker version of it: that one hands the whole directory and its branch
+    /// back, this one removes a cache from inside a checkout that stays, on its
+    /// branch, ready for the next `cargo build` and for the agent review delivery
+    /// resumes in it. A checkout is 14 MB and its build output is 20–36 GB, which
+    /// is why they cannot share a clock.
+    ///
+    /// Through the runtime rather than done in place for
+    /// [`Runtime::reclaim_worktree`]'s reason: the process that owns the
+    /// worktrees is the one that may delete inside them, and a read-only board
+    /// process is welcome to keep the clock and sweep nothing.
+    ///
+    /// Best-effort and idempotent by contract: a checkout that is gone, or one
+    /// nothing was ever built in, is an empty [`crate::gc::Swept`]. Directories
+    /// that would not delete come back in [`crate::gc::Swept::failed`] rather
+    /// than as an `Err` — one unreadable directory must not keep the other 30 GB.
+    ///
+    /// The default is a refusal rather than a no-op, like
+    /// [`Runtime::reclaim_worktree`]'s: a runtime that cannot do this must not
+    /// have the board recording caches as swept that are still on the disk.
+    fn reclaim_build_output(&self, worktree: &str) -> anyhow::Result<crate::gc::Swept> {
+        let _ = worktree;
+        anyhow::bail!("this runtime cannot sweep build output")
+    }
+
     /// Put a chat on or off its space's shelf (gh#139) — the archive half of
     /// [`Runtime::cancel`], without the interrupt.
     ///

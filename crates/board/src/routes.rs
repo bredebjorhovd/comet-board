@@ -232,10 +232,13 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("orchestrator_chat", Kind::Str),
     ("new_source", Kind::Str),
     ("max_duration", Kind::Str),
-    // Both retentions (gh#72, gh#139): the shelf and the disk fill up on a box
-    // nobody has a shell on, which is the box where this surface is the only
-    // way to say how long they may.
+    // All three retentions (gh#72, gh#139, gh#186): the shelf and the disk fill
+    // up on a box nobody has a shell on, which is the box where this surface is
+    // the only way to say how long they may. The build output is the one that
+    // fills a disk in a day rather than a month, so it is the one somebody
+    // reaches for while the disk is already full.
     ("retain_worktrees", Kind::Str),
+    ("retain_build_output", Kind::Str),
     ("archive_chats", Kind::Str),
     ("billing_guard", Kind::Str),
 ];

@@ -410,6 +410,43 @@ pub fn parse_chat_retention(s: &str) -> std::result::Result<Option<u64>, String>
     })
 }
 
+/// Parse a `retain_build_output` value (gh#186) — [`parse_retention`] with the
+/// same `on-settle` spelling [`parse_chat_retention`] needs, meaning the same
+/// thing: no window at all.
+///
+/// It is the default here, and the reason is arithmetic. A checkout is 14 MB and
+/// its `target/` is 20–36 GB; nothing reads the second one after the run ends,
+/// and a box with a 150 GB disk cannot hold a week of them. `on-settle` sweeps
+/// the build output as the *attempt* ends — not when the task leaves the board,
+/// which is `retain_worktrees`'s much longer clock — so the only thing an
+/// immediate sweep ever costs is one rebuild in the checkout, and only if
+/// somebody comes back to it at all.
+///
+/// A duration (`2h`, `1d`) buys that rebuild back for a box with disk to spare.
+/// `off` keeps every cache for as long as its checkout lives, which is what the
+/// board did before this existed and what filled the disk. A bare `0` is
+/// rejected for [`parse_chat_retention`]'s reason: it reads as "no window" here
+/// and "keep forever" there, and guessing between opposites is worse than asking.
+pub fn parse_build_retention(s: &str) -> std::result::Result<Option<u64>, String> {
+    let t = s.trim().to_ascii_lowercase();
+    if matches!(
+        t.as_str(),
+        "on-settle" | "on settle" | "immediately" | "now"
+    ) {
+        return Ok(Some(0));
+    }
+    if matches!(t.as_str(), "0" | "0s" | "0m" | "0h" | "0d") {
+        return Err(format!(
+            "`{s}` is ambiguous here — write `on-settle` to sweep build output as \
+             soon as the attempt ends, or `off` to keep it for as long as the \
+             checkout lives"
+        ));
+    }
+    parse_retention(s).map_err(|_| {
+        format!("`{s}` is not a duration; write it like `on-settle`, `2h`, `1d`, or `off`")
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
@@ -534,6 +571,26 @@ pub struct Defaults {
     /// and what `doctor`'s worktree check exists to make visible.
     #[serde(default = "default_retain_worktrees")]
     pub retain_worktrees: String,
+    /// How long the *build output inside* a finished attempt's checkout is kept
+    /// (gh#186) — `target/`, `node_modules/`, and the rest of
+    /// [`crate::gc::BUILD_OUTPUT_DIRS`].
+    ///
+    /// A separate, much shorter clock than
+    /// [`retain_worktrees`](Self::retain_worktrees), because the two are kept
+    /// for different reasons: a checkout is evidence, at 14 MB, and its build
+    /// output is a cache, at 20–36 GB. Governed by one window they were kept for
+    /// the same week, and a week of Rust checkouts does not fit on a 150 GB disk
+    /// — the box that prompted this hit 76% with eight of them, 99.96% of it
+    /// regenerable.
+    ///
+    /// This clock starts when the *attempt* ends, and does not wait for the task
+    /// to leave the board or for a pull request to close: nothing reads `target/`
+    /// after the run does. `on-settle` (the default) is no window at all. The one
+    /// guard is that nobody is building in there — see
+    /// [`crate::gc::cache_standing`]. `off` keeps every cache for as long as its
+    /// checkout lives.
+    #[serde(default = "default_retain_build_output")]
+    pub retain_build_output: String,
     /// How long a board-dispatched chat is kept on its space's shelf before the
     /// board archives it (gh#139). The same clock
     /// [`retain_worktrees`](Self::retain_worktrees) runs on — it starts when
@@ -609,6 +666,10 @@ fn default_archive_chats() -> String {
     "on-settle".into()
 }
 
+fn default_retain_build_output() -> String {
+    "on-settle".into()
+}
+
 fn default_new_source() -> String {
     "linear".into()
 }
@@ -642,6 +703,7 @@ impl Default for Defaults {
             new_source: default_new_source(),
             max_duration: default_max_duration(),
             retain_worktrees: default_retain_worktrees(),
+            retain_build_output: default_retain_build_output(),
             archive_chats: default_archive_chats(),
             billing_guard: default_billing_guard(),
         }
@@ -1072,6 +1134,9 @@ impl RoutingConfig {
         if let Err(e) = parse_chat_retention(&self.defaults.archive_chats) {
             out.push(format!("[defaults] archive_chats {e}"));
         }
+        if let Err(e) = parse_build_retention(&self.defaults.retain_build_output) {
+            out.push(format!("[defaults] retain_build_output {e}"));
+        }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
         // nothing — silently, which is the failure this table exists to fix.
@@ -1225,6 +1290,24 @@ impl RoutingConfig {
     pub fn retain_worktrees_secs(&self) -> Option<u64> {
         parse_retention(&self.defaults.retain_worktrees)
             .unwrap_or_else(|_| parse_retention(&default_retain_worktrees()).ok().flatten())
+    }
+
+    /// How long the build output inside a finished attempt's checkout is kept,
+    /// in seconds. `Some(0)` is `on-settle` — swept as the attempt ends — and
+    /// `None` is "for as long as the checkout lives": sweeping off (gh#186).
+    ///
+    /// Board-wide for [`Self::retain_worktrees_secs`]'s reason, and more so: what
+    /// a cache costs is disk, the disk is the box's and not the route's, and a
+    /// per-route window would be one more place for 36 GB to hide behind a key
+    /// nobody set. An unparseable value falls back to the default window, never
+    /// to "keep forever" — the wrong way to fail here is the one that fills the
+    /// disk silently.
+    pub fn retain_build_output_secs(&self) -> Option<u64> {
+        parse_build_retention(&self.defaults.retain_build_output).unwrap_or_else(|_| {
+            parse_build_retention(&default_retain_build_output())
+                .ok()
+                .flatten()
+        })
     }
 
     /// How long a finished attempt's chat stays on its space's shelf, in
@@ -1926,6 +2009,44 @@ runtime = "claude"
         // A grace period is still a grace period.
         assert_eq!(parse_chat_retention("2d"), Ok(Some(2 * 86_400)));
         assert_eq!(parse_chat_retention("off"), Ok(None));
+    }
+
+    // ---- the build output inside the checkout (gh#186) --------------------
+
+    /// The three windows a dispatch's leavings age on, and why they differ. The
+    /// checkout keeps its week because somebody may go back for 14 MB; the cache
+    /// inside it keeps nothing, because at 20–36 GB a week of them does not fit
+    /// on the disk and nothing reads them after the run.
+    #[test]
+    fn build_output_and_the_checkout_holding_it_are_on_different_clocks() {
+        let c = RoutingConfig::default();
+        assert_eq!(c.retain_worktrees_secs(), Some(7 * 86_400));
+        assert_eq!(c.retain_build_output_secs(), Some(0));
+        assert_eq!(c.archive_chats_secs(None), Some(0));
+    }
+
+    #[test]
+    fn the_build_output_window_is_a_setting_and_never_silently_off() {
+        for spelling in ["on-settle", "immediately", "NOW"] {
+            assert_eq!(parse_build_retention(spelling), Ok(Some(0)), "{spelling}");
+        }
+        assert_eq!(parse_build_retention("2h"), Ok(Some(2 * 3_600)));
+        assert_eq!(parse_build_retention("off"), Ok(None));
+        // Same opposite readings of one character as the shelf's, refused for
+        // the same reason.
+        for zero in ["0", "0h"] {
+            let err = parse_build_retention(zero).expect_err(zero);
+            assert!(err.contains("on-settle") && err.contains("off"), "{err}");
+        }
+        // A typo is refused by validation rather than read as "keep forever" —
+        // failing towards a full disk is the bug this key exists to fix.
+        let c: RoutingConfig =
+            toml::from_str("[defaults]\nretain_build_output = \"a while\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[defaults] retain_build_output"), "{err}");
+        // …and a config that reached the sweep with one anyway sweeps on the
+        // default window, never on "never".
+        assert_eq!(c.retain_build_output_secs(), Some(0));
     }
 
     #[test]
