@@ -559,6 +559,11 @@ fn handle_dispatch(
         }
         engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
         engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
+        // Not announced, unlike the cancel this borrows its interrupt from
+        // (gh#194): a retry is the same work continuing on the same branch, and
+        // the dispatcher hears about the attempt that replaces this one. A
+        // notice saying the step was cancelled, moments before the one saying
+        // it is running again, is two events for one.
         engine.log.info(format!(
             "retrying {}: replaced live attempt {}",
             task.identifier, attempt.id
@@ -774,6 +779,17 @@ fn handle_cancel(
         }
         engine.db.close_attempt(attempt.id, Outcome::Cancelled)?;
         engine.enqueue_outcome(&task, Outcome::Cancelled, None)?;
+        // The operator pressed the key and knows. The agent that released this
+        // work is somewhere else waiting on the step, and until gh#194 a cancel
+        // was the one ending it could never learn about — the attempt closed on
+        // every channel a settle uses except all of them.
+        engine.announce_ended(
+            Some(runtime),
+            &task,
+            attempt,
+            Outcome::Cancelled,
+            "cancelled from the board",
+        );
         engine.rederive_all()?;
         log.info(format!("cancelled {}", task.identifier));
         return Ok(());
@@ -782,6 +798,10 @@ fn handle_cancel(
     // panel still offers cancel on: nothing to interrupt, just the outcome to
     // change. The same state matrix that derived `failed` from the outcome is
     // what `cancelled` un-derives to `ready`, so the operator can re-dispatch.
+    //
+    // Not announced either (gh#194): this attempt already ended, and whoever
+    // was owed a notice got one then. What changes here is the row's colour and
+    // what the operator may do next, which is not an agent's business.
     if let Some(attempt) = task.last_closed_attempt()
         && matches!(attempt.outcome, Some(Outcome::Failed | Outcome::Orphaned))
     {
@@ -863,6 +883,9 @@ mod tests {
     struct FakeRuntime {
         dispatched: std::sync::Mutex<Vec<DispatchSpec>>,
         cancelled: std::sync::Mutex<Vec<String>>,
+        /// Chat id → text, for the notices the board queues into a chat
+        /// rather than the dispatches it starts.
+        prompted: std::sync::Mutex<Vec<(String, String)>>,
         /// What `chat_alive` answers — flip to fake an archived/gone chat.
         alive: std::sync::atomic::AtomicBool,
         /// The device's saved logins, as `account_email` answers them (gh#101):
@@ -891,6 +914,7 @@ mod tests {
             Self {
                 dispatched: Default::default(),
                 cancelled: Default::default(),
+                prompted: Default::default(),
                 alive: std::sync::atomic::AtomicBool::new(true),
                 logins: Default::default(),
                 spawn_in_dispatch: std::sync::atomic::AtomicBool::new(false),
@@ -913,7 +937,11 @@ mod tests {
                 cwd: format!("/worktrees/{}", spec.branch),
             })
         }
-        fn prompt(&self, _chat_id: &str, _text: &str) -> anyhow::Result<()> {
+        fn prompt(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
+            self.prompted
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
             Ok(())
         }
         fn cancel(&self, chat_id: &str) -> anyhow::Result<()> {
@@ -1015,6 +1043,32 @@ mod tests {
 
     fn seed_attempt(paths: &Paths, task_id: &str, chat_id: &str) {
         seed_attempt_in(paths, task_id, chat_id, "offhand");
+    }
+
+    /// An attempt an *agent* released, which is what `dispatched_by_pane`
+    /// records — the chat a settle, a block or a cancel is owed a notice in.
+    fn seed_attempt_via(paths: &Paths, task_id: &str, chat_id: &str, parent: &str) {
+        let db = Db::open(&paths.db()).unwrap();
+        let a = db
+            .insert_attempt(&NewAttempt {
+                task_id: task_id.into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                repo_path: None,
+                branch: None,
+                dispatched_by: None,
+                dispatched_by_pane: Some(parent.into()),
+                base_sha: None,
+                account: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        db.set_attempt_pane(a, chat_id).unwrap();
     }
 
     fn seed_attempt_in(paths: &Paths, task_id: &str, chat_id: &str, workspace: &str) {
@@ -2003,6 +2057,47 @@ max_concurrent_per_workspace = 1
         // Cancelling again is an error a caller can read, not a crash.
         let err = service.cancel_task("gh:owner/widget#9").await.unwrap_err();
         assert!(err.to_string().contains("no live attempt"), "{err}");
+
+        service.shutdown();
+    }
+
+    /// gh#194: a cancel is an ending like any other for the agent that released
+    /// the work. The operator pressed the key and knows; the dispatcher is
+    /// somewhere else waiting on a step that is now never finishing, and until
+    /// this it was the one ending it could not learn about — the attempt closed
+    /// on every channel a settle uses except all of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_tells_the_agent_that_released_the_work() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#94", "gh#94");
+        seed_attempt_via(&paths, "gh:owner/widget#94", "chat-94", "chat-parent");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![]);
+
+        service.cancel_task("gh:owner/widget#94").await.unwrap();
+
+        let prompted = runtime.prompted.lock().unwrap().clone();
+        let told = prompted
+            .iter()
+            .find(|(chat, _)| chat == "chat-parent")
+            .unwrap_or_else(|| panic!("the chat that released it: {prompted:?}"));
+        assert!(
+            told.1.contains("work you released has finished"),
+            "{}",
+            told.1
+        );
+        // And why, because `cancelled` on its own does not say whether the
+        // board gave up or a person did.
+        assert!(
+            told.1.contains("cancelled — cancelled from the board"),
+            "{}",
+            told.1
+        );
+        assert!(
+            !prompted.iter().any(|(chat, _)| chat == "chat-94"),
+            "the agent being interrupted is not also prompted: {prompted:?}"
+        );
 
         service.shutdown();
     }
