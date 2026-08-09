@@ -476,16 +476,15 @@ const ROW_PAD_Y: f32 = 5.0;
 /// panel that grew with a long issue would push the cursor's own row off screen.
 const PEEK_BODY_MAX_H: f32 = 220.0;
 
-/// The accent a board state carries, matching the TUI's palette: blocked and
-/// failed share red (the glyph tells them apart), working is amber, review
-/// indigo, ready plain text, done dim.
+/// The accent a board state carries — the status ramp's answer, never this
+/// file's (gh#173). Blocked and failed share red (the glyph tells them apart),
+/// working is amber, review indigo; ready and done spend no colour, so they
+/// land on the row's own text tones — plain for a queued row, dim for history.
 fn state_color(state: BoardState, theme: &Theme) -> gpui::Hsla {
-    match state {
-        BoardState::Blocked | BoardState::Failed => theme.danger,
-        BoardState::Working => theme.warning,
-        BoardState::Review => theme.accent,
-        BoardState::Ready => theme.text,
-        BoardState::Done => theme.text_faint,
+    match crate::theme::Status::of_board(state) {
+        Some(status) => theme.status(status),
+        None if state == BoardState::Done => theme.text_faint,
+        None => theme.text,
     }
 }
 
@@ -514,18 +513,11 @@ fn action_color(action: RowAction, theme: &Theme) -> gpui::Hsla {
     }
 }
 
-/// The accent a *live agent* carries in the sidebar — routed through
-/// [`state_color`] so a running attempt does not change colour on its way from
-/// the board pane to the sidebar (gh#103).
+/// The accent a *live agent* carries in the sidebar — routed through the same
+/// status ramp as [`state_color`], so a running attempt does not change colour
+/// on its way from the board pane to the sidebar (gh#103, gh#173).
 pub fn agent_state_color(state: board::AgentState, theme: &Theme) -> gpui::Hsla {
-    state_color(
-        match state {
-            board::AgentState::Blocked => BoardState::Blocked,
-            board::AgentState::Errored => BoardState::Failed,
-            board::AgentState::Working => BoardState::Working,
-        },
-        theme,
-    )
+    theme.status(crate::theme::Status::of_agent(state))
 }
 
 /// The `[process exited]`-free reason a working/blocked row's metadata names
@@ -2474,7 +2466,8 @@ impl BoardPanel {
         let confirmed = self.host_confirmed;
         let pinned = self.host_pinned;
         let host = self.host.clone();
-        let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+        // Online: the settled hue, the same green the Devices page paints.
+        let emerald = theme.settled;
 
         // "on {host}", in the title's own type size so it reads as part of the
         // panel's name rather than as a control that happens to be nearby.
@@ -3996,6 +3989,52 @@ mod tests {
             agent_state_color(AgentState::Working, &theme),
             agent_state_color(AgentState::Blocked, &theme)
         );
+    }
+
+    /// The board pane and the sidebar must agree on every state they BOTH
+    /// render (gh#173). They did not: a working agent was amber here and pink
+    /// there, one keystroke apart on screen.
+    ///
+    /// The pairs are the states that name the same thing in both vocabularies.
+    /// `AwaitingInput` is deliberately absent: the board has no such state — it
+    /// files a question under `blocked` together with the dead runs, and the
+    /// Needs-you inbox (gh#122) is where the two are told apart, in the same
+    /// review hue the chat dot uses.
+    #[test]
+    fn the_board_and_the_sidebar_agree_on_every_shared_state() {
+        use crate::shell::spaces::status_dot_color;
+        use comet_proto::ChatIndicator;
+        for theme in [Theme::dark(), Theme::light()] {
+            for (state, indicator) in [
+                (BoardState::Working, ChatIndicator::Working),
+                (BoardState::Failed, ChatIndicator::Errored),
+                (BoardState::Blocked, ChatIndicator::Errored),
+            ] {
+                assert_eq!(
+                    state_color(state, &theme),
+                    status_dot_color(indicator, &theme),
+                    "{state:?} and {indicator:?} disagree"
+                );
+            }
+            // And the sidebar's own two renderings of one live agent agree.
+            for (agent, indicator) in [
+                (board::AgentState::Working, ChatIndicator::Working),
+                (board::AgentState::Errored, ChatIndicator::Errored),
+            ] {
+                assert_eq!(
+                    agent_state_color(agent, &theme),
+                    status_dot_color(indicator, &theme),
+                    "{agent:?} and {indicator:?} disagree"
+                );
+            }
+            // Working is the ramp's amber now, in both — not a fifth hue.
+            assert_eq!(state_color(BoardState::Working, &theme), theme.warning);
+            // Ready and done spend no colour at all.
+            for state in [BoardState::Ready, BoardState::Done] {
+                assert_eq!(state_color(state, &theme).s, 0.0, "{state:?} paints a hue");
+            }
+            assert_eq!(status_dot_color(ChatIndicator::Idle, &theme).s, 0.0);
+        }
     }
 
     #[test]

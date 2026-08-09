@@ -292,8 +292,8 @@ impl Shell {
                         .into_any_element()
                 } else {
                     // Working animates (the sidebar's miniaturized gradient
-                    // spinner) instead of a static pink dot; every other
-                    // non-idle status stays a dot.
+                    // spinner) instead of a static dot; every other non-idle
+                    // status stays a dot.
                     let dot = spaces::status_dot_color(status, &theme);
                     div()
                         .size(px(20.0))

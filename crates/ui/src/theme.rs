@@ -28,9 +28,94 @@
 //! Non-text opacity — washes, scrims, fills, hairlines, animation fades — is
 //! untouched by the rule; those are what [`Theme::wash`] and
 //! [`Theme::white_alpha`] are for.
+//!
+//! # Four status hues, one lightness (gh#173)
+//!
+//! Colour that means something — a state, not a surface — comes from ONE ramp:
+//! four hues at [`Theme::STATUS_L`] lightness and [`Theme::STATUS_C`] chroma, so
+//! no state shouts louder than another by accident. Before the anchor, amber sat
+//! at L 0.828 and indigo at L 0.673, and the warning read twice as loud as the
+//! accent even where it meant less; a fifth hue (pink) had been added for
+//! "working" precisely because the amber read as alarm. Pink retired when amber
+//! came down to the anchor.
+//!
+//! [`Status`] is the vocabulary, [`Theme::status`] the only function that turns
+//! it into paint. Every state a board row, an agent row, a chat row or a tab dot
+//! can be in maps into [`Status`] exactly once ([`Status::of_board`],
+//! [`Status::of_agent`], [`Status::of_chat`]) — which is how the board pane and
+//! the sidebar stopped disagreeing about the colour of a working agent (amber in
+//! one, pink in the other, one keystroke apart on screen). States that mean
+//! "nothing is happening" — ready, done, idle — map to `None` and spend no
+//! colour at all: the absence of a hue is a state too.
 
+use comet_proto::ChatIndicator;
+use comet_proto::view::board::{AgentState, BoardState};
+use comet_proto::view::status;
 use gpui::{App, Global, Hsla, Rgba, SharedString, hsla};
 use serde::{Deserialize, Serialize};
+
+/// What a state MEANS, in the only vocabulary the status ramp understands.
+///
+/// Four meanings, four hues — see the module docs. The types a state arrives in
+/// (a board row's [`BoardState`], a live attempt's [`AgentState`], a chat's
+/// [`ChatIndicator`]) each translate into this once, so two panes rendering the
+/// same state cannot pick different paint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Status {
+    /// Stopped, and it needs a human: blocked, failed, errored.
+    Blocked,
+    /// Running on its own — an agent is working, in the board pane AND in the
+    /// sidebar.
+    Working,
+    /// Finished and unlooked-at: review, a question, and the links and focus
+    /// that lead there.
+    Review,
+    /// Settled: seen, healthy, online.
+    Settled,
+}
+
+impl Status {
+    /// A board row's state as a meaning. `None` for the states that spend no
+    /// colour: `ready` is a queue entry (it reads as its own text) and `done` is
+    /// history.
+    pub fn of_board(state: BoardState) -> Option<Self> {
+        match state {
+            // One hue for both — the glyph tells a dead run from a gate.
+            BoardState::Blocked | BoardState::Failed => Some(Status::Blocked),
+            BoardState::Working => Some(Status::Working),
+            BoardState::Review => Some(Status::Review),
+            BoardState::Ready | BoardState::Done => None,
+        }
+    }
+
+    /// A live attempt's state as a meaning — the board's vocabulary, since an
+    /// agent row is a board row that moved into the sidebar (gh#103). It is the
+    /// COARSE reading: a question and a corpse are both `blocked` here, told
+    /// apart by the row's glyph.
+    pub fn of_agent(state: AgentState) -> Self {
+        match state {
+            AgentState::Blocked | AgentState::Errored => Status::Blocked,
+            AgentState::Working => Status::Working,
+        }
+    }
+
+    /// A chat's display status as a meaning. `None` for idle — a chat nobody is
+    /// waiting on is not a status, and its dot is a hairline, not a hue.
+    ///
+    /// This is the FINE reading, where a dot has no glyph to carry the
+    /// difference: a question is the review hue (something wants your eyes, and
+    /// the run is healthy), a dead run is the blocked hue. The Needs-you inbox
+    /// splits them the same way and in the same colours (gh#122).
+    pub fn of_chat(status: ChatIndicator) -> Option<Self> {
+        match status {
+            ChatIndicator::Working => Some(Status::Working),
+            ChatIndicator::AwaitingInput => Some(Status::Review),
+            ChatIndicator::Errored => Some(Status::Blocked),
+            ChatIndicator::Completed => Some(Status::Settled),
+            ChatIndicator::Idle => None,
+        }
+    }
+}
 
 /// Which theme variant the app paints with. Persisted in [`crate::settings::UiSettings`]
 /// (`theme` key) and overridable per-run with `COMET_THEME=dark|light`.
@@ -117,15 +202,22 @@ pub struct Theme {
     /// floor, so anything a user is meant to READ sits at `text_subtle` or up.
     pub text_faint: Hsla,
 
-    // ---- paint: accents ----
-    /// Accent — indigo (working indicator, links, selection tint).
+    // ---- paint: the status ramp (four hues, one L, one C — see module docs) ----
+    /// Accent — indigo, [`Status::Review`]'s hue: review, a question, links,
+    /// focus, selection tint.
     pub accent: Hsla,
-    /// Stronger accent for fills.
+    /// The accent hue at fill weight — off the ramp on purpose: a filled button
+    /// is not a status, and a status-weight fill under white text would not hold
+    /// contrast. Same hue, so the two read as one colour.
     pub accent_strong: Hsla,
-    /// Danger — red (errors, stop button).
+    /// Danger — red, [`Status::Blocked`]'s hue: errors, the stop button.
     pub danger: Hsla,
-    /// Warning — amber (offline notices, awaiting-input).
+    /// Warning — amber, [`Status::Working`]'s hue: a running agent, offline
+    /// notices.
     pub warning: Hsla,
+    /// Settled — emerald, [`Status::Settled`]'s hue: finished chats, an online
+    /// device, an active account.
+    pub settled: Hsla,
 
     // ---- fonts ----
     /// UI font family (bundling of Geist lands with asset work; until then the
@@ -166,6 +258,26 @@ impl Theme {
     pub const PANEL_RADIUS: f32 = 10.0;
     /// Small control radius (buttons, chips).
     pub const CONTROL_RADIUS: f32 = 6.0;
+    // ---- the status ramp (gh#173) ----
+    // Defined in `comet-proto` (`view::status`), not here: the terminal app
+    // paints the same meanings and must land on the same hues.
+    /// The lightness every status hue is anchored to in dark. One number, so
+    /// "how loud is this state" is decided by the state and never by its hue.
+    pub const STATUS_L: f32 = status::L;
+    /// The same anchor for light, walked down so the hues keep contrast on a
+    /// near-white surface (~5:1, the same step the text ramp takes).
+    pub const STATUS_L_LIGHT: f32 = status::L_LIGHT;
+    /// The chroma every status hue carries.
+    pub const STATUS_C: f32 = status::C;
+    /// Blocked · failed · errored.
+    pub const HUE_BLOCKED: f32 = status::BLOCKED;
+    /// Working — an agent is running.
+    pub const HUE_WORKING: f32 = status::WORKING;
+    /// Review · a question · links · focus.
+    pub const HUE_REVIEW: f32 = status::REVIEW;
+    /// Settled · seen · online.
+    pub const HUE_SETTLED: f32 = status::SETTLED;
+
     /// Base spacing steps.
     pub const SPACE_XS: f32 = 4.0;
     pub const SPACE_SM: f32 = 8.0;
@@ -207,10 +319,12 @@ impl Theme {
             text_muted: neutral(0.728),           // #a7a7a7 —  8.4:1
             text_subtle: neutral(0.598),          // #7f7f7f —  5.1:1
             text_faint: neutral(0.508),           // #656565 —  3.5:1
-            accent: oklch(0.673, 0.182, 276.935), // indigo-400
-            accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
-            danger: oklch(0.704, 0.191, 22.216),  // red-400
-            warning: oklch(0.828, 0.189, 84.429), // amber-400
+            // The status ramp — one lightness, one chroma, four hues.
+            accent: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_REVIEW),
+            accent_strong: oklch(0.62, 0.19, Self::HUE_REVIEW),
+            danger: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_BLOCKED),
+            warning: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_WORKING),
+            settled: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_SETTLED),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -238,10 +352,12 @@ impl Theme {
             text_muted: neutral(0.412),           // #4b4b4b
             text_subtle: neutral(0.528),          // #6b6b6b
             text_faint: neutral(0.619),           // #868686
-            accent: oklch(0.511, 0.262, 276.966), // indigo, darkened for white
-            accent_strong: oklch(0.457, 0.24, 277.023),
-            danger: oklch(0.60, 0.22, 26.0),
-            warning: oklch(0.70, 0.16, 76.0),
+            // The same ramp, one anchor lower so the hues hold on white.
+            accent: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_REVIEW),
+            accent_strong: oklch(0.47, 0.19, Self::HUE_REVIEW),
+            danger: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_BLOCKED),
+            warning: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_WORKING),
+            settled: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_SETTLED),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -265,6 +381,20 @@ impl Theme {
             ThemeChoice::Light
         } else {
             ThemeChoice::Dark
+        }
+    }
+
+    /// **The** answer to "what colour is this state" (gh#173). The board pane,
+    /// the sidebar's agent rows, the chat rows and the tab dots all arrive here,
+    /// so a state cannot be one colour in one pane and another colour a
+    /// keystroke away. States with no [`Status`] paint no hue — see the module
+    /// docs.
+    pub fn status(&self, status: Status) -> Hsla {
+        match status {
+            Status::Blocked => self.danger,
+            Status::Working => self.warning,
+            Status::Review => self.accent,
+            Status::Settled => self.settled,
         }
     }
 
@@ -329,6 +459,18 @@ impl Theme {
             oklch(0.555, 0.163, 48.998) // amber-700
         } else {
             oklch(0.924, 0.12, 95.746) // amber-200
+        }
+    }
+
+    /// The settled text/icon tone for THIS theme's presence UI (the "Active"
+    /// badge, a copied id's confirmation): pale green on the near-black chip,
+    /// the darker green on white — see [`Self::danger_text`]. On the ramp's hue,
+    /// off its lightness, because this one sits ON a fill of its own colour.
+    pub fn settled_text(&self) -> Hsla {
+        if self.light {
+            oklch(0.46, 0.13, Self::HUE_SETTLED)
+        } else {
+            oklch(0.88, 0.11, Self::HUE_SETTLED)
         }
     }
 
@@ -576,15 +718,74 @@ mod tests {
     #[test]
     fn oklch_accents_match_reference() {
         // Reference values computed independently (CSS Color 4 matrices).
+        let (l, c) = (Theme::STATUS_L, Theme::STATUS_C);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 265.0)), [127, 168, 255]); // review
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 25.0)), [247, 133, 125]); // blocked
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 75.0)), [222, 156, 49]); // working
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 160.0)), [71, 197, 140]); // settled
+    }
+
+    #[test]
+    fn the_status_ramp_is_one_lightness_and_one_chroma() {
+        // The whole point of gh#173: a state's loudness is decided by the state,
+        // not by which hue it happened to be given.
+        for (theme, l) in [
+            (Theme::dark(), Theme::STATUS_L),
+            (Theme::light(), Theme::STATUS_L_LIGHT),
+        ] {
+            for (status, hue) in [
+                (Status::Blocked, Theme::HUE_BLOCKED),
+                (Status::Working, Theme::HUE_WORKING),
+                (Status::Review, Theme::HUE_REVIEW),
+                (Status::Settled, Theme::HUE_SETTLED),
+            ] {
+                assert_eq!(
+                    theme.status(status),
+                    oklch(l, Theme::STATUS_C, hue),
+                    "{status:?} is off the ramp"
+                );
+            }
+            // And it lands: the four hues sit within a quarter of one another in
+            // measured luminance (dark 1.14x, light 1.23x — the light anchor
+            // clips emerald a little). The old palette spread 1.96x: amber-400
+            // at 0.56 against indigo-400 at 0.29, the "twice as loud" this ramp
+            // exists to end.
+            let lums: Vec<f32> = [
+                Status::Blocked,
+                Status::Working,
+                Status::Review,
+                Status::Settled,
+            ]
+            .into_iter()
+            .map(|s| relative_luminance(theme.status(s)))
+            .collect();
+            let (lo, hi) = lums
+                .iter()
+                .fold((f32::MAX, 0.0f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            assert!(hi / lo < 1.25, "status hues differ in loudness: {lums:?}");
+        }
+    }
+
+    #[test]
+    fn quiet_states_spend_no_colour() {
+        // Ready, done and idle are states too — the ones with no hue.
+        assert_eq!(Status::of_board(BoardState::Ready), None);
+        assert_eq!(Status::of_board(BoardState::Done), None);
+        assert_eq!(Status::of_chat(ChatIndicator::Idle), None);
+    }
+
+    #[test]
+    fn a_working_agent_is_one_colour() {
+        // The bug gh#173 names: amber in the board pane, pink in the sidebar.
+        let t = Theme::dark();
         assert_eq!(
-            srgb_u8(oklch_to_srgb(0.673, 0.182, 276.935)),
-            [124, 134, 255]
-        ); // indigo-400
+            t.status(Status::of_agent(AgentState::Working)),
+            t.status(Status::of_chat(ChatIndicator::Working).unwrap())
+        );
         assert_eq!(
-            srgb_u8(oklch_to_srgb(0.704, 0.191, 22.216)),
-            [255, 100, 103]
-        ); // red-400
-        assert_eq!(srgb_u8(oklch_to_srgb(0.828, 0.189, 84.429)), [255, 185, 0]); // amber-400
+            Status::of_board(BoardState::Working),
+            Some(Status::of_agent(AgentState::Working))
+        );
     }
 
     #[test]
@@ -793,17 +994,31 @@ mod tests {
 
     #[test]
     fn light_accents_are_the_darker_shades() {
-        // Light mode darkens the accents so they keep contrast on white (dark
-        // uses the bright 400-shades). Pinned to this crate's own oklch
-        // conversion (which differs a hair from CSS Color 4's matrices).
-        let t = Theme::light();
-        assert_eq!(srgb_u8(oklch_to_srgb(0.511, 0.262, 276.966)), [79, 57, 246]);
-        assert_eq!(srgb_u8(oklch_to_srgb(0.457, 0.24, 277.023)), [67, 45, 215]);
-        assert_eq!(srgb_u8(oklch_to_srgb(0.60, 0.22, 26.0)), [230, 43, 48]);
-        assert_eq!(srgb_u8(oklch_to_srgb(0.70, 0.16, 76.0)), [214, 141, 0]);
-        // The light accents are visibly darker than the dark theme's.
-        assert!(t.accent.l < Theme::dark().accent.l);
-        assert!(t.danger.l < Theme::dark().danger.l);
+        // Light mode walks the ramp down one anchor so the hues keep contrast on
+        // white (dark sits at the bright anchor). Pinned to this crate's own
+        // oklch conversion (which differs a hair from CSS Color 4's matrices).
+        let (l, c) = (Theme::STATUS_L_LIGHT, Theme::STATUS_C);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 265.0)), [73, 109, 195]);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 25.0)), [181, 74, 70]);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 75.0)), [160, 98, 0]);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 160.0)), [0, 137, 84]);
+        // Every hue on the light ramp is visibly darker than the dark theme's,
+        // and the strong accent is darker still than the accent it fills for.
+        let (t, dark) = (Theme::light(), Theme::dark());
+        for status in [
+            Status::Blocked,
+            Status::Working,
+            Status::Review,
+            Status::Settled,
+        ] {
+            assert!(
+                relative_luminance(t.status(status)) < relative_luminance(dark.status(status)),
+                "{status:?} did not darken for light"
+            );
+        }
+        for t in [Theme::light(), Theme::dark()] {
+            assert!(relative_luminance(t.accent_strong) < relative_luminance(t.accent));
+        }
     }
 
     #[test]

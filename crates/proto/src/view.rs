@@ -522,23 +522,65 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     summary
 }
 
-/// The status-dot palette, as oklch triples (L, C, H°).
+/// The status ramp: four hues at one lightness and one chroma (gh#173).
 ///
 /// Colors live here rather than in either viewport because the *meaning* of a
-/// dot must not differ between surfaces — a session that reads "running" in the
+/// hue must not differ between surfaces — a session that reads "running" in the
 /// desktop app cannot read "error" in the terminal. Each frontend converts to
 /// its own color type; `comet-ui` has the oklch→sRGB math, `comet-tui` pins the
 /// converted values with a test.
+///
+/// The lightness is the point. Before the anchor the palette agreed on chroma
+/// (≈0.19) and nothing else: amber sat at L 0.828 and indigo at L 0.673, so the
+/// warning read twice as loud as the accent even where it meant less — which is
+/// why a fifth hue (pink) had been introduced for "running", to escape an amber
+/// that shouted. One lightness retires the pink.
+pub mod status {
+    /// The lightness every status hue is anchored to on a dark surface.
+    pub const L: f32 = 0.74;
+    /// The same anchor on a light surface — walked down so the hues keep
+    /// contrast on near-white (~5:1).
+    pub const L_LIGHT: f32 = 0.55;
+    /// The chroma every status hue carries. The old palette already agreed on
+    /// ≈0.19; 0.14 is that intent at the new lightness, where 0.19 would push
+    /// amber and emerald out of sRGB.
+    pub const C: f32 = 0.14;
+
+    /// Blocked · failed · errored.
+    pub const BLOCKED: f32 = 25.0;
+    /// Working — an agent is running. Board pane AND sidebar.
+    pub const WORKING: f32 = 75.0;
+    /// Review · a question · links · focus.
+    pub const REVIEW: f32 = 265.0;
+    /// Settled · seen · online.
+    pub const SETTLED: f32 = 160.0;
+
+    /// A hue at the dark anchor, as an oklch triple (L, C, H°).
+    pub const fn dark(hue: f32) -> (f32, f32, f32) {
+        (L, C, hue)
+    }
+
+    /// A hue at the light anchor.
+    pub const fn light(hue: f32) -> (f32, f32, f32) {
+        (L_LIGHT, C, hue)
+    }
+}
+
+/// The status-dot palette, as oklch triples (L, C, H°) — the [`status`] ramp
+/// read through a chat's display status.
 pub mod dot {
-    /// Running. Pink, not amber: the harsh yellow read as a warning, and running
-    /// is routine (user request).
-    pub const WORKING: (f32, f32, f32) = (0.718, 0.202, 349.761);
-    /// Asking a question. Indigo — must read differently from "busy" at a glance.
-    pub const AWAITING: (f32, f32, f32) = (0.673, 0.182, 276.935);
-    /// Errored. Red-400.
-    pub const ERRORED: (f32, f32, f32) = (0.704, 0.191, 22.216);
-    /// Finished but unseen. Emerald — reads as "ready for you".
-    pub const COMPLETED: (f32, f32, f32) = (0.765, 0.177, 163.223);
+    use super::status;
+
+    /// Running. Amber, at the anchor: running is routine, and the ramp is what
+    /// keeps it from shouting.
+    pub const WORKING: (f32, f32, f32) = status::dark(status::WORKING);
+    /// Asking a question. The review hue — something wants your eyes, and it
+    /// must read differently from "busy" at a glance.
+    pub const AWAITING: (f32, f32, f32) = status::dark(status::REVIEW);
+    /// Errored. The blocked hue.
+    pub const ERRORED: (f32, f32, f32) = status::dark(status::BLOCKED);
+    /// Finished but unseen. The settled hue — reads as "ready for you".
+    pub const COMPLETED: (f32, f32, f32) = status::dark(status::SETTLED);
 }
 
 // ---------------------------------------------------------------------------

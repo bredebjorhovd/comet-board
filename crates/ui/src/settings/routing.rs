@@ -839,7 +839,10 @@ impl RoutingPage {
             // A repo already polled and routed keeps its row — "is this one set
             // up?" is half of why the panel gets opened — but nothing to press.
             .when(on_board, |el| {
-                el.child(widgets::badge_active(SharedString::from("On the board")))
+                el.child(widgets::badge_active(
+                    theme,
+                    SharedString::from("On the board"),
+                ))
             })
             .when(!on_board, |el| {
                 el.child(
