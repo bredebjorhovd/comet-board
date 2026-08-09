@@ -42,7 +42,7 @@ use comet_rpc::methods;
 
 use crate::settings::widgets;
 use crate::state::AppState;
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 
 /// How many rows a tally card shows before folding the rest into `n others`.
 const TALLY_ROWS: usize = 6;
@@ -204,15 +204,11 @@ impl StatsPage {
                     } else {
                         gpui::FontWeight::NORMAL
                     })
-                    .text_color(if selected {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .when(selected, |el| el.bg(theme.element_active))
-                    .when(!selected, |el| {
-                        el.hover(|s| s.bg(theme.element_hover)).cursor_pointer()
-                    })
+                    .when(!selected, |el| el.cursor_pointer())
+                    // A segmented control inside a settings card: in light
+                    // mode the card is white, so the chosen window steps DOWN
+                    // into it rather than trying to lift off it (gh#175).
+                    .list_row(theme, Bed::Card, selected, format!("stats-window-{label}"))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_window(days, cx)))
                     .child(SharedString::from(*label)),
             );

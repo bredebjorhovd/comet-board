@@ -32,7 +32,7 @@ use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 
 // ---------------------------------------------------------------------------
 // Constants + pure decision logic
@@ -3038,7 +3038,7 @@ impl Composer {
                             .px(px(8.0))
                             .py(px(6.0))
                             .cursor_pointer()
-                            .when(active, |el| el.bg(theme.white_alpha(0.07)))
+                            .list_row(&theme, Bed::Shell, active, format!("skill-row-{ix}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.skill_selected = ix;
                                 this.accept_skill(cx);

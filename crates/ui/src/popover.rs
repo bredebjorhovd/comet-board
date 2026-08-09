@@ -14,7 +14,7 @@
 use gpui::{Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px};
 
 use crate::motion::{self, AnimationExt as _, COMET_PULSE};
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 
 // ---------------------------------------------------------------------------
 // Loadable — async slot state shared by pickers/settings pages
@@ -288,13 +288,16 @@ pub fn modal(
 }
 
 /// One menu row (comet `menuItem`): `gap-2.5 rounded-lg px-2 py-1.5
-/// text-[13px]`, active = `bg-white/10 text-foreground`, hover wash
-/// `white/[0.08]` fading over `transition-colors` (floating-styles.ts) via the
-/// per-`fade_key` [`motion::hover_blend`]. The caller adds the id/click
-/// listener — `fade_key` must be unique app-wide and stable across frames
-/// (the id string is a good choice).
+/// text-[13px]`, painted by the app's one row helper ([`Theme::row`]) — the
+/// active row on its own raised surface, everything else taking the flat hover
+/// wash as the pointer passes. A menu floats over the shell, so the bed is
+/// [`Bed::Shell`] even when the menu was opened from a settings card.
+///
+/// The caller adds the id/click listener — `fade_key` must be unique app-wide
+/// and stable across frames (the id string is a good choice). The row is a
+/// plain `Div`; `.id(...)` afterwards makes it stateful.
 pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) -> gpui::Div {
-    let row = div()
+    div()
         .flex()
         .flex_row()
         .items_center()
@@ -303,38 +306,25 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .py(px(6.0))
         .rounded(px(Theme::RADIUS_CHIP))
         .text_size(px(Theme::TEXT_BODY))
-        .cursor_pointer();
-    if active {
-        row.bg(theme.wash(0.14)).text_color(theme.text)
-    } else {
-        let fade_key = fade_key.into();
-        let mut row = row
-            .text_color(motion::hover_blend(&fade_key, theme.text_muted, theme.text))
-            .bg(motion::hover_blend(
-                &fade_key,
-                theme.wash(0.0),
-                theme.wash(0.14),
-            ));
-        // Imperative form — the caller's `.id(...)` makes the element stateful
-        // (hover listeners need element state, `.on_hover` needs `Stateful`).
-        row.interactivity().on_hover(motion::hover_listener(fade_key));
-        row
-    }
+        .cursor_pointer()
+        .list_row(theme, Bed::Shell, active, fade_key)
 }
 
-/// [`menu_row`] with a distinct keyboard-navigation highlight: a selected row
-/// carries the full `bg-white/10` wash, the keyboard cursor the lighter
-/// `bg-white/[0.08]` (comet's `data-[highlighted]` styling) — two selected-
-/// looking rows never appear at once.
+/// [`menu_row`] in a list you also walk with the keyboard: the CURSOR gets the
+/// selected treatment, because in a palette the keyboard cursor is the row
+/// that is yours (gh#175). The row that merely holds the current value —
+/// usually off-screen by the time you have typed — keeps its check mark and
+/// the bright text tone, and no surface of its own. Two rows never look
+/// selected at once.
 pub fn menu_row_nav(
     theme: &Theme,
     selected: bool,
     highlighted: bool,
     fade_key: impl Into<SharedString>,
 ) -> gpui::Div {
-    let row = menu_row(theme, selected, fade_key);
-    if !selected && highlighted {
-        row.bg(theme.wash(0.14)).text_color(theme.text)
+    let row = menu_row(theme, highlighted, fade_key);
+    if selected && !highlighted {
+        row.text_color(theme.text)
     } else {
         row
     }

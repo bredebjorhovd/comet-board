@@ -84,7 +84,7 @@ use crate::icons::{self, icon};
 use crate::motion;
 use crate::popover;
 use crate::state::{AppState, EngineHandle};
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 
 // One runtime a dispatch can be pointed at, as the engine's `ListBoardRuntimes`
 // reports it — the same set `build_spec` validates an override against. Its
@@ -2680,18 +2680,7 @@ impl BoardPanel {
             // there, and two hairlines a pixel apart is a border.
             .when(!first, |el| el.border_t_1().border_color(theme.border))
             .cursor_pointer()
-            // Hover brightens from wherever the row rests — a selected section
-            // never darkens toward a weaker wash.
-            .bg(motion::hover_blend(
-                &fade_key,
-                selected_bg(&theme, selected),
-                if selected {
-                    theme.wash(0.18)
-                } else {
-                    theme.wash(0.06)
-                },
-            ))
-            .on_hover(motion::hover_listener(&fade_key))
+            .list_row(&theme, Bed::Shell, selected, &fade_key)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.model.toggle_collapsed(state);
                 cx.notify();
@@ -2781,16 +2770,7 @@ impl BoardPanel {
             .pl(px(Theme::SPACE_LG + 12.0))
             .pr(px(Theme::SPACE_LG))
             .cursor_pointer()
-            .bg(motion::hover_blend(
-                &fade_key,
-                selected_bg(&theme, selected),
-                if selected {
-                    theme.wash(0.18)
-                } else {
-                    theme.wash(0.06)
-                },
-            ))
-            .on_hover(motion::hover_listener(&fade_key))
+            .list_row(&theme, Bed::Shell, selected, &fade_key)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.model.toggle_group(state, toggle_route.as_deref());
                 cx.notify();
@@ -2878,16 +2858,7 @@ impl BoardPanel {
             .justify_center()
             .px(px(Theme::SPACE_LG))
             .cursor_pointer()
-            .bg(motion::hover_blend(
-                &fade_key,
-                selected_bg(&theme, selected),
-                if selected {
-                    theme.wash(0.18)
-                } else {
-                    theme.wash(0.05)
-                },
-            ))
-            .on_hover(motion::hover_listener(&fade_key))
+            .list_row(&theme, Bed::Shell, selected, &fade_key)
             // A row is a door (gh#132): clicking one selects it AND opens the
             // peek, because a truncated title that answers a click with nothing
             // is what made the extra text feel like a tooltip. `enter` still
@@ -3862,14 +3833,6 @@ impl BoardPanel {
             })
             .child(content)
             .into_any_element()
-    }
-}
-
-fn selected_bg(theme: &Theme, selected: bool) -> gpui::Hsla {
-    if selected {
-        theme.glass_selected_bg()
-    } else {
-        theme.wash(0.0)
     }
 }
 

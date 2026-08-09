@@ -60,6 +60,35 @@
 //! the padding being [`Theme::NEST_GUTTER`], which is the gutter the cards
 //! already used. A row at 10 inside a card at 14 reads as one object.
 //!
+//! # Hover is tone, selection is elevation (gh#175)
+//!
+//! Hover and selection used to be the same paint one notch apart — a 14% wash
+//! against a 16% wash, with selection's only real telling a 1px inset ring at
+//! 9% white. In a list you navigate by keyboard while the pointer rests
+//! somewhere else — which is every board list, every space list, every
+//! settings list — you could not tell which row was YOURS from which one
+//! happened to be under the mouse.
+//!
+//! They are split by KIND, not by amount, and [`Theme::row`] is the one place
+//! that answers it:
+//!
+//! - **Hover is a flat wash.** [`Theme::element_hover`], the same weak neutral
+//!   tone a button gets. No edge, no structure, nothing but tone.
+//! - **Selection lifts the row onto its own surface**, with a hairline round
+//!   it ([`RowPaint::ring`], an inset shadow — nothing may paint BEHIND a
+//!   glass row).
+//!
+//! Two channels, no ambiguity, and no colour is spent on "this one":
+//! monochrome on purpose, because the status hues above mean STATE and
+//! selection is not a state.
+//!
+//! Elevation only means something relative to the surface underneath, so the
+//! row says what it sits on ([`Bed`]). On the shell a selected row lifts —
+//! toward light in dark mode, to white in light mode. Inside a settings card
+//! in light mode there is nowhere left to lift: the card is already the raised
+//! white object on the page, so the row steps DOWN into it and the hairline
+//! draws the edge of the well.
+//!
 //! `rounded_full()` survives in exactly one job — a dot, and the send button.
 //! One round thing on screen, and it is the one you press. `tests/scale.rs`
 //! holds the line: every remaining full-round needs a `round-ok:` marker
@@ -78,7 +107,9 @@
 use comet_proto::ChatIndicator;
 use comet_proto::view::board::{AgentState, BoardState};
 use comet_proto::view::status;
-use gpui::{App, Global, Hsla, Rgba, SharedString, hsla};
+use gpui::{
+    App, BoxShadow, Global, Hsla, InteractiveElement, Rgba, SharedString, Styled, hsla, point, px,
+};
 use serde::{Deserialize, Serialize};
 
 /// What a state MEANS, in the only vocabulary the status ramp understands.
@@ -143,6 +174,104 @@ impl Status {
         }
     }
 }
+
+/// What a list row SITS ON — because elevation is relative, and a row can only
+/// lift away from something (gh#175).
+///
+/// Two beds, because the app has two: everything floating over the window, and
+/// the settings pages' cards. Which one a row is in decides which way its
+/// selection moves — see [`Theme::row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bed {
+    /// The shell and everything over it: the sidebar's space/chat/agent lists,
+    /// the board pane, session and terminal tabs, popovers, pickers, the
+    /// palette. Dim in dark and bright-but-translucent in light, and in both
+    /// there is room above for a selected row to lift into.
+    Shell,
+    /// Inside a settings card ([`crate::settings::widgets::section_card`]).
+    /// In light that card is already the raised white object on the page: a
+    /// row cannot lift out of it without competing with it, so it steps down
+    /// instead. In dark the card is near-black and the row lifts as usual.
+    Card,
+}
+
+/// The paint for one list row, in the two channels that cannot be mistaken for
+/// each other: a flat wash for the pointer, a change of SURFACE plus a
+/// hairline for the selection (gh#175).
+///
+/// Built by [`Theme::row`] — the one helper every list in the app asks. Apply
+/// it whole with [`ListRow::list_row`], or read the fields when the row already
+/// owns its `on_hover` (the session tabs track hover in view state).
+#[derive(Debug, Clone)]
+pub struct RowPaint {
+    /// Background at rest.
+    pub rest: Hsla,
+    /// Background with the pointer over the row. For a selected row this is
+    /// [`Self::rest`] plus the hover step, so hovering the row you already
+    /// picked brightens IT rather than dropping it back to an unselected tone.
+    pub hovered: Hsla,
+    /// The selected row's hairline, as an INSET shadow: gpui paints those on
+    /// top of the background, edges only. Drop shadows are filled rects
+    /// painted behind the element and would show through a translucent row as
+    /// an opaque plate. Empty for an unselected row — hover has no edge, and
+    /// that is the whole point.
+    pub ring: Vec<BoxShadow>,
+    /// Text tone at rest: the bright tone when selected, the reading tone
+    /// otherwise.
+    pub text: Hsla,
+    /// Text tone under the pointer — the bright tone, always.
+    pub text_hovered: Hsla,
+}
+
+impl RowPaint {
+    /// Paint a row with the pair: background (fading between [`Self::rest`]
+    /// and [`Self::hovered`]), the selected hairline, the text tone, and the
+    /// hover listener that drives the fade.
+    ///
+    /// `fade_key` must be unique app-wide and stable across frames — the
+    /// element's own id string is the usual choice. gpui allows exactly one
+    /// `on_hover` per element, so a row that tracks hover in view state reads
+    /// the fields instead of calling this.
+    pub fn apply<E: Styled + InteractiveElement>(
+        self,
+        el: E,
+        fade_key: impl Into<SharedString>,
+    ) -> E {
+        let key = fade_key.into();
+        let mut el = el
+            .bg(crate::motion::hover_blend(&key, self.rest, self.hovered))
+            .text_color(crate::motion::hover_blend(
+                &key,
+                self.text,
+                self.text_hovered,
+            ))
+            .shadow(self.ring);
+        el.interactivity()
+            .on_hover(crate::motion::hover_listener(key));
+        el
+    }
+}
+
+/// `.list_row(…)` on any element: the whole hover/selected answer in one call.
+///
+/// The list rows of this app are written in a dozen files and were, before
+/// gh#175, each assembling their own four lines of rest-wash / hover-blend /
+/// selected-wash / ring. This is the one call that replaces them.
+pub trait ListRow: Styled + InteractiveElement + Sized {
+    /// Paint this element as a list row on `bed` — see [`Theme::row`] and
+    /// [`RowPaint::apply`].
+    fn list_row(
+        self,
+        theme: &Theme,
+        bed: Bed,
+        selected: bool,
+        fade_key: impl Into<SharedString>,
+    ) -> Self {
+        theme.row(bed, selected).apply(self, fade_key)
+    }
+}
+
+impl<E: Styled + InteractiveElement + Sized> ListRow for E {}
 
 /// Which theme variant the app paints with. Persisted in [`crate::settings::UiSettings`]
 /// (`theme` key) and overridable per-run with `COMET_THEME=dark|light`.
@@ -209,10 +338,10 @@ pub struct Theme {
     pub surface: Hsla,
     /// Raised surface: popovers, dialogs, cards.
     pub surface_raised: Hsla,
-    /// Hover wash for interactive rows/buttons (white, low alpha).
+    /// The hover wash, and the ONLY hover wash: a flat, weak, neutral tone for
+    /// rows and buttons alike. Selection is not a heavier version of this —
+    /// it is a different channel entirely ([`Theme::row`], gh#175).
     pub element_hover: Hsla,
-    /// Active/selected wash (white, slightly higher alpha).
-    pub element_active: Hsla,
     /// Hairline border — white at low alpha.
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
@@ -341,6 +470,32 @@ impl Theme {
     /// Settled · seen · online.
     pub const HUE_SETTLED: f32 = status::SETTLED;
 
+    // ---- hover is tone, selection is elevation (gh#175) ----
+    /// How far a selected row lifts off a DARK bed — the alpha of the
+    /// soft-white plate it becomes. More than twice the hover wash, because
+    /// it is a different surface and not more of the same one; and no more
+    /// than that, because the sublines on a selected row are painted in
+    /// [`Self::text_subtle`] and every point of lift costs them contrast (at
+    /// this step they hold ~3.3:1, where the wash it replaces gave ~3.5:1).
+    const SELECT_LIFT: f32 = 0.16;
+    /// The same lift on a light SHELL: near-white, still translucent enough
+    /// that the window vibrancy reads through the row.
+    const SELECT_WHITE: f32 = 0.85;
+    /// How far a selected row sinks INTO a white card, where lifting would
+    /// only compete with the card's own elevation.
+    const SELECT_SINK: f32 = 0.18;
+    /// What the pointer adds ON TOP of a selected row: the same small step in
+    /// whichever direction that row already moved.
+    const SELECT_HOVER_STEP: f32 = 0.06;
+    /// The selected row's hairline over a dark bed (white) and over a light
+    /// one (black). Twice the 0.09 ring it replaces, because the ring is no
+    /// longer a detail that distinguishes two near-identical washes — it is
+    /// half the signal, and it has to read at a glance across a long list.
+    /// The light ring runs heavier still: a white row on a near-white panel
+    /// is carried almost entirely by its edge.
+    const SELECT_EDGE: f32 = 0.18;
+    const SELECT_EDGE_LIGHT: f32 = 0.22;
+
     /// Base spacing steps.
     pub const SPACE_XS: f32 = 4.0;
     pub const SPACE_SM: f32 = 8.0;
@@ -371,17 +526,18 @@ impl Theme {
     pub fn dark() -> Self {
         Self {
             light: false,
-            bg: grey(6),      // main panel — sampled #060606
+            bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
             surface_raised: neutral(0.235),
-            element_hover: wash(0.14),
-            element_active: wash(0.16),
+            // Half the 0.14 it replaces: hover no longer has to carry
+            // "selected" too, so it can go back to being a hint (gh#175).
+            element_hover: wash(0.07),
             border: white_alpha(0.08),
             border_strong: white_alpha(0.14),
-            text: neutral(0.938),                 // #ebebeb — 16.9:1 on bg
-            text_muted: neutral(0.728),           // #a7a7a7 —  8.4:1
-            text_subtle: neutral(0.598),          // #7f7f7f —  5.1:1
-            text_faint: neutral(0.508),           // #656565 —  3.5:1
+            text: neutral(0.938),        // #ebebeb — 16.9:1 on bg
+            text_muted: neutral(0.728),  // #a7a7a7 —  8.4:1
+            text_subtle: neutral(0.598), // #7f7f7f —  5.1:1
+            text_faint: neutral(0.508),  // #656565 —  3.5:1
             // The status ramp — one lightness, one chroma, four hues.
             accent: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_REVIEW),
             accent_strong: oklch(0.62, 0.19, Self::HUE_REVIEW),
@@ -402,19 +558,18 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             light: true,
-            bg: neutral(0.985),         // main panel — near-white
-            surface: neutral(0.965),    // shell / sidebar — one step down
+            bg: neutral(0.985),      // main panel — near-white
+            surface: neutral(0.965), // shell / sidebar — one step down
             surface_raised: neutral(0.92),
-            element_hover: black_wash(0.08),
-            element_active: black_wash(0.10),
+            element_hover: black_wash(0.06),
             border: black_wash(0.10),
             border_strong: black_wash(0.16),
             // The same four contrast steps, walked the other way: 16.9 / 8.4 /
             // 5.1 / 3.5 against the near-white `bg`.
-            text: neutral(0.212),                 // #191919
-            text_muted: neutral(0.412),           // #4b4b4b
-            text_subtle: neutral(0.528),          // #6b6b6b
-            text_faint: neutral(0.619),           // #868686
+            text: neutral(0.212),        // #191919
+            text_muted: neutral(0.412),  // #4b4b4b
+            text_subtle: neutral(0.528), // #6b6b6b
+            text_faint: neutral(0.619),  // #868686
             // The same ramp, one anchor lower so the hues hold on white.
             accent: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_REVIEW),
             accent_strong: oklch(0.47, 0.19, Self::HUE_REVIEW),
@@ -483,23 +638,60 @@ impl Theme {
         }
     }
 
-    /// Selected-state glass treatment for this theme (tabs, session rows, space
-    /// rows): a TRANSLUCENT wash the vibrancy reads through — heavier flat
-    /// washes blocked the glass (user request).
-    pub fn glass_selected_bg(&self) -> Hsla {
-        self.wash(0.14)
-    }
-
-    /// The selected chip's bright outline, as an INSET shadow — see the dark
-    /// variant's notes; direction flips with [`Self::white_alpha`].
-    pub fn glass_selected_shadows(&self) -> Vec<gpui::BoxShadow> {
-        vec![gpui::BoxShadow {
-            color: self.white_alpha(0.09),
-            offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-            blur_radius: gpui::px(0.0),
-            spread_radius: gpui::px(1.0),
-            inset: true,
-        }]
+    /// **The** answer to "is this row hovered or is it mine" (gh#175) — for
+    /// every list in the app: the sidebar's spaces and chats and agents, the
+    /// board's sections and rows, the tabs, the menus and pickers, the
+    /// settings lists.
+    ///
+    /// The two states differ by KIND, not by amount. Hover is a flat wash and
+    /// nothing else. Selection puts the row on its own surface and draws a
+    /// hairline round it — a channel hover never uses, so a pointer resting on
+    /// row 4 can never be confused with a keyboard cursor on row 9. No colour
+    /// is spent either way: the status hues mean state, and selection is not a
+    /// state.
+    ///
+    /// Which way the surface moves depends on `bed`, because elevation is
+    /// relative to what the row sits on. Dark beds have headroom, so the row
+    /// lifts toward light. A light shell lifts to white. A light settings card
+    /// has nowhere left to lift — it IS the raised white object on the page —
+    /// so the row steps down into it and the hairline draws the well.
+    pub fn row(&self, bed: Bed, selected: bool) -> RowPaint {
+        if !selected {
+            return RowPaint {
+                // Rest on a zero-alpha wash of THIS theme's tone, never on
+                // transparent black: the hover fade interpolates from here and
+                // must stay theme-toned the whole way (see [`Self::wash`]).
+                rest: self.wash(0.0),
+                hovered: self.element_hover,
+                ring: Vec::new(),
+                text: self.text_muted,
+                text_hovered: self.text,
+            };
+        }
+        let (rest, hovered, edge) = match (bed, self.light) {
+            (Bed::Card, true) => (
+                black_wash(Self::SELECT_SINK),
+                black_wash(Self::SELECT_SINK + Self::SELECT_HOVER_STEP),
+                black_wash(Self::SELECT_EDGE_LIGHT),
+            ),
+            (Bed::Shell, true) => (
+                white_alpha(Self::SELECT_WHITE),
+                white_alpha(Self::SELECT_WHITE + Self::SELECT_HOVER_STEP),
+                black_wash(Self::SELECT_EDGE_LIGHT),
+            ),
+            (_, false) => (
+                wash(Self::SELECT_LIFT),
+                wash(Self::SELECT_LIFT + Self::SELECT_HOVER_STEP),
+                white_alpha(Self::SELECT_EDGE),
+            ),
+        };
+        RowPaint {
+            rest,
+            hovered,
+            ring: hairline_ring(edge),
+            text: self.text,
+            text_hovered: self.text,
+        }
     }
 
     /// The danger text/icon tone for THIS theme's error UI (error chips,
@@ -631,26 +823,18 @@ pub fn white_alpha(alpha: f32) -> Hsla {
     hsla(0.0, 0.0, 1.0, alpha)
 }
 
-/// Selected-state glass treatment (tabs, session rows, space rows): a
-/// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
-/// the glass (user request). DARK-theme primitive; light mode uses
-/// [`Theme::glass_selected_bg`].
-pub fn glass_selected_bg() -> Hsla {
-    wash(0.14)
-}
-
-/// The selected chip's bright outline, as an INSET shadow: gpui paints inset
-/// shadows ON TOP of the background, edges only — a border with zero layout
-/// cost. Drop shadows are filled rects painted BEHIND the element, and behind
-/// a 5% fill they showed straight through as an opaque dark plate with a
-/// greyed ring (user report) — nothing may paint behind a glass chip.
-/// DARK-theme primitive; light mode uses [`Theme::glass_selected_shadows`].
-pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
-    vec![gpui::BoxShadow {
-        color: white_alpha(0.09),
-        offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-        blur_radius: gpui::px(0.0),
-        spread_radius: gpui::px(1.0),
+/// A 1px hairline round an element, as an INSET shadow: gpui paints those ON
+/// TOP of the background, edges only — a border with zero layout cost. Drop
+/// shadows are filled rects painted BEHIND the element, and behind a
+/// translucent fill they showed straight through as an opaque plate with a
+/// greyed ring (user report) — nothing may paint behind a glass row. The
+/// selected row's edge ([`Theme::row`]) is the one caller that matters.
+pub fn hairline_ring(color: Hsla) -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color,
+        offset: point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(1.0),
         inset: true,
     }]
 }
@@ -720,6 +904,18 @@ pub(crate) fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
         (r - g) / delta + 4.0
     } / 6.0;
     (h, s, l)
+}
+
+/// Source-over composite of a translucent tone onto an opaque one — what the
+/// eye actually receives. A wash has no brightness of its own; comparing one
+/// against another (a hover wash against a selected row's lift, say) is only
+/// meaningful once both have landed on the surface they are painted on.
+pub fn composite(over: Hsla, under: Hsla) -> Hsla {
+    let (a, b) = (Rgba::from(over), Rgba::from(under));
+    let t = over.a.clamp(0.0, 1.0);
+    let lerp = |x: f32, y: f32| y + (x - y) * t;
+    let (h, s, l) = rgb_to_hsl(lerp(a.r, b.r), lerp(a.g, b.g), lerp(a.b, b.b));
+    hsla(h, s, l, 1.0)
 }
 
 /// WCAG relative luminance of an OPAQUE color (alpha is ignored — a translucent
@@ -931,16 +1127,122 @@ mod tests {
             assert_eq!(c.l, 1.0, "hairlines are white");
             assert!(c.a > 0.0 && c.a < 0.25, "low alpha, got {}", c.a);
         }
-        // Washes are translucent soft-white with enough alpha to read at the
-        // glass scrim's brightness ceiling.
-        for c in [t.element_hover, t.element_active] {
-            assert_eq!(c.l, 0.92, "washes are soft-white");
-            assert!(c.a >= 0.05 && c.a < 0.35, "alpha in band, got {}", c.a);
-        }
+        // The hover wash is translucent soft-white with enough alpha to read
+        // at the glass scrim's brightness ceiling.
+        assert_eq!(t.element_hover.l, 0.92, "washes are soft-white");
+        assert!(
+            t.element_hover.a >= 0.05 && t.element_hover.a < 0.35,
+            "alpha in band, got {}",
+            t.element_hover.a
+        );
         assert!(t.border.a < t.border_strong.a);
-        // Hover intentionally equals the active fill (selection differs by
-        // its ring, not brightness — user request).
-        assert!(t.element_hover.a <= t.element_active.a);
+    }
+
+    /// The gh#175 rule, and the test that replaces the one asserting hover
+    /// EQUALS the active fill: the two states must differ in kind.
+    #[test]
+    fn hover_is_tone_and_selection_is_elevation() {
+        for t in [Theme::dark(), Theme::light()] {
+            for bed in [Bed::Shell, Bed::Card] {
+                let idle = t.row(bed, false);
+                let picked = t.row(bed, true);
+
+                // Hover is tone and nothing else — a flat wash with no edge,
+                // over a row that paints nothing at rest.
+                assert!(
+                    idle.ring.is_empty(),
+                    "hover must draw no structure (light={}, {bed:?})",
+                    t.light
+                );
+                assert_eq!(idle.rest.a, 0.0, "an untouched row paints nothing");
+                assert_eq!(
+                    idle.hovered, t.element_hover,
+                    "a row's hover is the app's one hover wash"
+                );
+
+                // Selection is the other channel: its own surface, with a
+                // hairline round it that hover never has.
+                assert_eq!(picked.ring.len(), 1, "a selected row is edged");
+                assert!(
+                    picked.ring[0].inset,
+                    "nothing may paint BEHIND a translucent row"
+                );
+
+                // And the surface really is a different one, not a heavier
+                // dose of the hover wash: the step from hover to selected is
+                // bigger than the step from rest to hover.
+                let on = |c: Hsla| composite(c, t.surface);
+                let (rest, hover, sel) = (on(idle.rest), on(idle.hovered), on(picked.rest));
+                assert!(
+                    contrast_ratio(sel, hover) > contrast_ratio(hover, rest),
+                    "selection reads as more-hover, not as elevation \
+                     (light={}, {bed:?}): {:.3} vs {:.3}",
+                    t.light,
+                    contrast_ratio(sel, hover),
+                    contrast_ratio(hover, rest)
+                );
+
+                // Elevation is relative to the bed. Everything lifts except a
+                // row inside a light card, where there is nowhere left to go.
+                let down = t.light && bed == Bed::Card;
+                let lifted = relative_luminance(sel) > relative_luminance(hover);
+                assert_eq!(
+                    lifted, !down,
+                    "wrong direction off the bed (light={}, {bed:?})",
+                    t.light
+                );
+
+                // A row that lifts costs the metadata printed on it some
+                // contrast, so the lift is bounded by what those sublines can
+                // pay. This floor is why selection leans on its hairline
+                // rather than on ever more wash.
+                assert!(
+                    contrast_ratio(t.text_subtle, sel) >= 3.0,
+                    "sublines on the selected row read at only {:.2}:1 \
+                     (light={}, {bed:?})",
+                    contrast_ratio(t.text_subtle, sel),
+                    t.light
+                );
+
+                // No colour is spent on "this one" — the status hues mean
+                // state, and selection is not a state.
+                for c in [idle.rest, idle.hovered, picked.rest, picked.hovered] {
+                    assert_eq!(c.s, 0.0, "selection must spend no colour");
+                }
+                assert_eq!(picked.ring[0].color.s, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_selected_row_inside_a_white_card_is_unmistakable() {
+        // The subtle case (gh#175): the settings cards are near-white in
+        // light mode, so the row steps DOWN and its hairline draws the well.
+        let t = Theme::light();
+        let picked = t.row(Bed::Card, true);
+        let hovered = t.row(Bed::Card, false).hovered;
+        let card = t.surface;
+        let (sel, hov) = (composite(picked.rest, card), composite(hovered, card));
+        assert!(relative_luminance(sel) < relative_luminance(card));
+        // Told apart from the merely-hovered row by the fill alone...
+        assert!(
+            contrast_ratio(sel, hov) > 1.25,
+            "only {:.3}:1 between selected and hovered",
+            contrast_ratio(sel, hov)
+        );
+        // ...and again by the edge, which reads against the row's own fill.
+        assert!(contrast_ratio(composite(picked.ring[0].color, sel), sel) > 1.15);
+    }
+
+    #[test]
+    fn composite_lands_between_the_two_tones() {
+        let white = hsla(0.0, 0.0, 1.0, 1.0);
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        // A fully transparent wash leaves the surface alone; an opaque one
+        // replaces it; half lands halfway.
+        assert_eq!(composite(white.opacity(0.0), black), black);
+        assert_eq!(composite(white, black), white);
+        assert!((composite(white.opacity(0.5), black).l - 0.5).abs() < 0.01);
     }
 
     #[test]
@@ -1081,18 +1383,23 @@ mod tests {
             assert_eq!(c.l, 0.0, "hairlines are black");
             assert!(c.a > 0.0 && c.a < 0.25, "low alpha, got {}", c.a);
         }
-        // Washes are translucent soft-black that darken a near-white surface.
-        for c in [t.element_hover, t.element_active] {
-            assert_eq!(c.l, 0.0, "washes are soft-black");
-            assert!(c.a >= 0.05 && c.a < 0.35, "alpha in band, got {}", c.a);
-        }
+        // The hover wash is a translucent soft-black that darkens a near-white
+        // surface.
+        assert_eq!(t.element_hover.l, 0.0, "washes are soft-black");
+        assert!(
+            t.element_hover.a >= 0.05 && t.element_hover.a < 0.35,
+            "alpha in band, got {}",
+            t.element_hover.a
+        );
         assert!(t.border.a < t.border_strong.a);
-        assert!(t.element_hover.a <= t.element_active.a);
         // The theme primitives mirror the fields.
         assert_eq!(t.wash(0.14).l, 0.0);
         assert_eq!(t.white_alpha(0.09).l, 0.0);
-        assert_eq!(t.glass_selected_bg().l, 0.0);
-        assert!(t.glass_selected_shadows()[0].color.l < 0.5);
+        // A selected row on the light shell is the one wash that runs the
+        // other way: it lifts to WHITE, edged in black so the lift reads.
+        let picked = t.row(Bed::Shell, true);
+        assert_eq!(picked.rest.l, 1.0);
+        assert_eq!(picked.ring[0].color.l, 0.0);
     }
 
     #[test]

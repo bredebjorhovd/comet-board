@@ -37,7 +37,7 @@ use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
-use crate::theme::Theme;
+use crate::theme::{Bed, ListRow as _, Theme};
 
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
@@ -2019,19 +2019,18 @@ impl Pickers {
                             .rounded(px(Theme::RADIUS_ROW))
                             .text_size(px(Theme::TEXT_DENSE))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(if is_viewed {
-                                theme.text
-                            } else {
-                                theme.text_muted
+                            // A locked-out harness takes no hover: the row is
+                            // not going to answer.
+                            .when(is_disabled, |el| {
+                                el.opacity(0.35).text_color(theme.text_muted)
                             })
-                            .when(is_viewed, |el| {
-                                el.bg(theme.glass_selected_bg())
-                                    .shadow(theme.glass_selected_shadows())
-                            })
-                            .when(is_disabled, |el| el.opacity(0.35))
                             .when(!is_disabled, |el| {
-                                el.cursor_pointer()
-                                    .hover(|s| s.bg(theme.white_alpha(0.06)))
+                                el.cursor_pointer().list_row(
+                                    &theme,
+                                    Bed::Shell,
+                                    is_viewed,
+                                    format!("harness-tab-{ix}"),
+                                )
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -2089,9 +2088,6 @@ impl Pickers {
                             ix == active,
                             format!("model-row-{ix}"),
                         )
-                        .when(is_selected || ix == active, |el| {
-                            el.shadow(theme.glass_selected_shadows())
-                        })
                         .id(("model-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.pick_model(id.clone(), cx);
@@ -2306,12 +2302,17 @@ impl Pickers {
                         .gap(px(4.0))
                         .children(levels.into_iter().enumerate().map(|(ix, level)| {
                             let is_active = current == Some(level);
-                            trait_chip(&theme, is_active, ix == nav_active)
-                                .id(("reasoning-row", ix))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_reasoning(level, cx);
-                                }))
-                                .child(SharedString::from(reasoning_label(level)))
+                            trait_chip(
+                                &theme,
+                                is_active,
+                                ix == nav_active,
+                                format!("reasoning-row-{ix}"),
+                            )
+                            .id(("reasoning-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_reasoning(level, cx);
+                            }))
+                            .child(SharedString::from(reasoning_label(level)))
                         })),
                 )
                 .into_any_element()
@@ -2366,6 +2367,7 @@ impl Pickers {
                                             &theme,
                                             is_active,
                                             option_base + choice_ix == nav_active,
+                                            format!("trait-choice-{opt_ix}-{choice_ix}"),
                                         )
                                         .id(("trait-choice", opt_ix * 32 + choice_ix))
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2395,30 +2397,38 @@ impl Pickers {
 
 /// A segmented choice chip for the traits inspector (reasoning ladder /
 /// model options): the key-cap voice — every chip carries a faint fill so it
-/// reads as a pressable segment (bare text read as labels, not buttons);
-/// the active/keyboard-highlighted chip adds the app-wide wash + glass ring.
-/// The caller adds id/click/label.
-fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
-    div()
-        .h(px(24.0))
-        .px(px(10.0))
-        .rounded(px(Theme::RADIUS_CHIP))
-        .flex()
-        .flex_row()
-        .items_center()
-        .text_size(px(Theme::TEXT_CAPTION))
-        .cursor_pointer()
-        .when(active, |el| {
-            el.bg(theme.glass_selected_bg()).text_color(theme.text)
-        })
-        .when(!active, |el| {
-            el.bg(theme.white_alpha(0.04))
-                .text_color(theme.text_subtle)
-                .hover(|s| s.bg(theme.element_hover))
-        })
-        .when(active || highlighted, |el| {
-            el.shadow(theme.glass_selected_shadows())
-        })
+/// reads as a pressable segment (bare text read as labels, not buttons).
+///
+/// Three readings, and no two of them are the same kind of mark (gh#175): the
+/// chosen chip sits on the selected row's raised surface, the keyboard cursor
+/// borrows that surface's hairline WITHOUT the lift, and the pointer paints
+/// the flat hover wash. The caller adds id/click/label.
+fn trait_chip(
+    theme: &Theme,
+    active: bool,
+    highlighted: bool,
+    fade_key: impl Into<SharedString>,
+) -> gpui::Div {
+    let mut paint = theme.row(Bed::Shell, active);
+    if !active {
+        paint.rest = theme.white_alpha(0.04);
+        paint.text = theme.text_subtle;
+        if highlighted {
+            paint.ring = theme.row(Bed::Shell, true).ring;
+        }
+    }
+    paint.apply(
+        div()
+            .h(px(24.0))
+            .px(px(10.0))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .flex()
+            .flex_row()
+            .items_center()
+            .text_size(px(Theme::TEXT_CAPTION))
+            .cursor_pointer(),
+        fade_key,
+    )
 }
 
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
