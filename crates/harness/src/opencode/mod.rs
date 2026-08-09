@@ -57,7 +57,7 @@ use normalize::Event;
 
 /// Locate the device's installed opencode CLI: `OPENCODE_EXECUTABLE`, then
 /// PATH, then common install locations GUI launches miss.
-fn resolve_opencode_executable() -> Option<PathBuf> {
+pub(crate) fn resolve_opencode_executable() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("OPENCODE_EXECUTABLE")
         && !p.is_empty()
     {

@@ -17,7 +17,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use comet_board::runtime::{DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime};
+use comet_board::runtime::{
+    DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
+};
 use comet_doc::SessionCommandPayload;
 use comet_proto::{
     AgentEvent, ChatConfig, DoneStatus, RunRequest, SandboxLevel, Session, SessionStatus,
@@ -296,6 +298,21 @@ impl Runtime for CometRuntime {
         account: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         Ok(self.accounts.billed_email(harness, account))
+    }
+
+    /// What this box can actually run (gh#187) — the same answer
+    /// `ListBoardRuntimes` gives its pickers, so what a dispatch refuses and
+    /// what a picker warned about cannot drift apart.
+    fn harness_availability(
+        &self,
+        harness: comet_proto::HarnessId,
+        account: Option<&str>,
+    ) -> anyhow::Result<Option<RuntimeUnavailable>> {
+        Ok(crate::runtimes::availability(
+            &self.accounts,
+            harness,
+            account,
+        ))
     }
 
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>> {

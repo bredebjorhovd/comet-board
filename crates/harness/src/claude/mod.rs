@@ -43,7 +43,7 @@ use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 /// then PATH, then common install locations GUI launches miss (whose PATH the
 /// login shell never shaped). Resolved per call — cheap, and PATH may be
 /// adopted from the login shell after startup.
-fn resolve_claude_executable() -> Option<PathBuf> {
+pub(crate) fn resolve_claude_executable() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
         && !p.is_empty()
     {

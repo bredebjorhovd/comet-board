@@ -694,8 +694,10 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         "the rows are B's board: {rows}"
     );
 
-    // The verbs forward too. `ListBoardRuntimes` is a static catalog, so its
-    // reply proves routing rather than board health.
+    // The verbs forward too. `ListBoardRuntimes` is served off the harness
+    // catalog rather than the board loop, so its reply proves routing rather
+    // than board health — and since gh#187 it answers for the *target* device,
+    // which is what makes A's picker honest about what B can start.
     let runtimes = client
         .call(
             methods::LIST_BOARD_RUNTIMES,

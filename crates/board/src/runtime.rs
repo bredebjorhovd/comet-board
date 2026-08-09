@@ -80,6 +80,11 @@ pub const RUNTIME_NAMES: &[&str] = &[
 /// [`crate::rows::TaskRow`] does; what the list *contains* is this module's.
 pub use comet_proto::view::board::RuntimeOption;
 
+/// Why a runtime cannot start on a given device (gh#187) — re-exported beside
+/// [`RuntimeOption`] because it is the field that turned that list from a
+/// constant into an answer about a box.
+pub use comet_proto::view::board::RuntimeUnavailable;
+
 /// The runtimes a dispatch can be told to use, in picker order.
 ///
 /// One canonical name per harness — the aliases `RUNTIME_NAMES` also accepts
@@ -87,6 +92,12 @@ pub use comet_proto::view::board::RuntimeOption;
 /// route saying `openai-codex` still dispatches to the codex harness, and a
 /// picker offering both would be offering the same thing twice. `mock` is
 /// listed because it is dispatchable on purpose (`demo`, integration tests).
+///
+/// Every entry comes back [`RuntimeOption::available`]: which names are
+/// *spellable* is a property of the board, and this crate has no view of any
+/// device. Whether each could actually start is stamped on by whoever answers
+/// for a device — `comet_engine::runtimes` (gh#187) — which is also what
+/// [`Runtime::harness_availability`] asks before a dispatch cuts anything.
 pub fn runtime_options() -> Vec<RuntimeOption> {
     use HarnessId::*;
     [
@@ -101,6 +112,7 @@ pub fn runtime_options() -> Vec<RuntimeOption> {
         name: runtime_name(id).to_string(),
         label: label.to_string(),
         harness: id,
+        unavailable: None,
     })
     .collect()
 }
@@ -404,6 +416,36 @@ pub trait Runtime {
         harness: HarnessId,
         account: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
+        let _ = (harness, account);
+        Ok(None)
+    }
+
+    /// Could a dispatch on `harness` actually start on this runtime's device
+    /// (gh#187)? `Ok(None)` is yes.
+    ///
+    /// Asked before the attempt row exists, for exactly the reason
+    /// [`crate::runtime::DispatchSpec::account`] is resolved before the chat
+    /// is: a dispatch that gets as far as a worktree and a chat before
+    /// discovering the CLI is not installed has spent the expensive part on the
+    /// cheap fact, and left a row somebody has to clean up.
+    ///
+    /// `account` is the slot the dispatch would spend, so an implementation
+    /// can tell "this device's own login is missing" from "this run reads a
+    /// slot's login and never the device's".
+    ///
+    /// The default is `Ok(None)` rather than a refusal — the [`account_email`]
+    /// rule, not the [`reclaim_worktree`] one. A runtime that cannot say which
+    /// harnesses its device has must not be the reason a legitimate dispatch is
+    /// refused; the harness itself still fails the run, loudly, the way it
+    /// always did.
+    ///
+    /// [`account_email`]: Runtime::account_email
+    /// [`reclaim_worktree`]: Runtime::reclaim_worktree
+    fn harness_availability(
+        &self,
+        harness: HarnessId,
+        account: Option<&str>,
+    ) -> anyhow::Result<Option<RuntimeUnavailable>> {
         let _ = (harness, account);
         Ok(None)
     }

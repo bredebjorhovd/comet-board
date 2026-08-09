@@ -124,7 +124,10 @@ is this board's `review`.
    the route's runtime and that harness's default model for the one dispatch;
    both are checked against the engine's catalogs first, and an unknown value
    is refused naming the valid set, so a typo costs an error rather than an
-   attempt. The row's default runtime is on the row (`runtime`).
+   attempt. The row's default runtime is on the row (`runtime`). A runtime the
+   box lists but cannot start — its CLI is not installed, or it is signed out —
+   is refused the same way, saying which of the two is wrong;
+   `comet-board doctor` names the harnesses that box can actually run.
 3. **Accounts are the operator's choice, not yours.** `routing.toml` decides
    which teammate's Claude/Codex subscription a route's work is billed to.
    `dispatch --account <id>` overrides it; do not pass it unless you were told

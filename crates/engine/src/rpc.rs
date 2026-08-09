@@ -1587,12 +1587,15 @@ impl RpcService for EngineRpc {
             methods::WATCH_BOARD_ORCHESTRATOR => Ok(RpcReply::Stream(watch_stream(
                 self.board()?.watch_orchestrator(),
             ))),
-            // The runtimes a dispatch can be pointed at — a static catalog from
-            // the board core, so the pickers and the engine validate against
-            // the same set. Not board-loop state: served regardless of the
-            // service's health.
+            // The runtimes a dispatch can be pointed at, and whether each could
+            // actually start *here* (gh#187) — the board core's names, stamped
+            // with this device's answer, so the pickers and the engine validate
+            // against the same set and warn about the same gaps. Forwardable,
+            // which is the point: a laptop's picker is asking about the box the
+            // work would land on, not about the laptop. Not board-loop state:
+            // served regardless of the service's health.
             methods::LIST_BOARD_RUNTIMES => {
-                RpcReply::value(&comet_board::runtime::runtime_options())
+                RpcReply::value(&crate::runtimes::options(&self.agent_accounts))
             }
             methods::DISPATCH_TASK => {
                 let p: DispatchTaskParams = parse_params(params)?;

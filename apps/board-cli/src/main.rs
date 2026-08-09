@@ -764,7 +764,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor => {
-            let (engine, spaces, accounts, edge, members) =
+            let (engine, spaces, accounts, edge, members, runtimes) =
                 match runtime.block_on(fetch_spaces(port)) {
                     Ok(info) => (
                         EngineStatus {
@@ -780,6 +780,7 @@ fn main() -> Result<()> {
                         Some(info.accounts),
                         info.edge,
                         info.members,
+                        Some(info.runtimes),
                     ),
                     Err(e) => (
                         EngineStatus {
@@ -794,6 +795,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         None,
+                        None,
                     ),
                 };
             let checks = comet_board::doctor::doctor(
@@ -803,6 +805,7 @@ fn main() -> Result<()> {
                 accounts.as_deref(),
                 edge.as_ref(),
                 members,
+                runtimes.as_deref(),
             )?;
             if !comet_board::doctor::print_doctor(&checks) {
                 std::process::exit(1);
@@ -1371,6 +1374,10 @@ struct EngineInfo {
     /// says the fallback account was not checked rather than inventing a
     /// one-person box.
     members: Option<usize>,
+    /// Which harnesses this device can actually start (gh#187). Empty from an
+    /// engine too old to answer, which doctor reports as "not checked" rather
+    /// than as a box that can run nothing.
+    runtimes: Vec<comet_proto::view::board::RuntimeOption>,
 }
 
 /// This device's spaces, from the engine: `LocalDevice` for the device id (and
@@ -1438,6 +1445,14 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
                     .map(|m| m.len())
                     .filter(|n| *n > 0)
             });
+        // What this box can actually run (gh#187) — best-effort like the rest:
+        // an engine that predates the verb leaves doctor saying "not checked".
+        let runtimes: Vec<comet_proto::view::board::RuntimeOption> = client
+            .call(methods::LIST_BOARD_RUNTIMES, serde_json::json!({}))
+            .await
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
         Ok::<_, anyhow::Error>(EngineInfo {
             device,
             version,
@@ -1445,6 +1460,7 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             accounts,
             edge,
             members,
+            runtimes,
         })
     };
     tokio::time::timeout(FETCH_TIMEOUT, fetch)
