@@ -339,6 +339,202 @@ impl BoardSpend {
     }
 }
 
+// -- the breakdown (gh#227) --------------------------------------------------
+
+/// The ways one window can be cut apart.
+///
+/// One card with a toggle rather than three fixed columns of counts. The
+/// question a reader brings is always the same — *which row is the bill* — and
+/// only the axis they want it answered along changes between visits, so the
+/// axis is a control and not a layout decision taken once for them.
+///
+/// Model leads because it is the axis where the answer is usually a single row,
+/// and it is the one the shipped page could not ask at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Dimension {
+    /// What the run said it was running.
+    Model,
+    /// Which harness ran it.
+    Runtime,
+    /// Which workspace it went to.
+    Space,
+    /// Which tracker the task came from.
+    Tracker,
+    /// Whose subscription it spent — [`BoardStats::by_account`]'s key.
+    Account,
+}
+
+impl Dimension {
+    /// Every dimension, in the order the toggle offers them.
+    pub const ALL: [Dimension; 5] = [
+        Dimension::Model,
+        Dimension::Runtime,
+        Dimension::Space,
+        Dimension::Tracker,
+        Dimension::Account,
+    ];
+
+    /// The word on the segment.
+    pub fn label(self) -> &'static str {
+        match self {
+            Dimension::Model => "Model",
+            Dimension::Runtime => "Runtime",
+            Dimension::Space => "Space",
+            Dimension::Tracker => "Tracker",
+            Dimension::Account => "Account",
+        }
+    }
+}
+
+/// What a cut is ranked and scaled against.
+///
+/// Spend wherever the board could price the window, because that is the
+/// question the card is opened with. Tokens where it has rates for nothing in
+/// it, dispatches where nothing was metered at all — ranking rows by a number
+/// every one of them holds at zero is alphabetical order with extra steps, and
+/// a bar drawn against it is a row of empty tracks.
+///
+/// It is reported rather than inferred at the call site so the card can *say*
+/// which quantity it sorted by: a bar whose meaning changes with the window is
+/// one a reader has to be told about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Ranking {
+    Spend,
+    Tokens,
+    Dispatches,
+}
+
+impl Ranking {
+    /// How the card names it, beside its title.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Ranking::Spend => "by spend",
+            Ranking::Tokens => "by tokens",
+            Ranking::Dispatches => "by dispatches",
+        }
+    }
+}
+
+/// One row of the breakdown: a name, what it ran, what it spent, and what that
+/// would have cost.
+///
+/// `cost: None` is **unpriced**, never zero — the rule the money type is built
+/// on (gh#182), carried down to the row. A board with no rates configured
+/// answers every row with `None` and the card drops the column rather than
+/// printing a wall of `$0.00`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakdownRow {
+    pub label: String,
+    /// Attempts in this bucket — every attempt, not only the metered ones.
+    pub dispatches: usize,
+    /// What the metered ones spent.
+    pub usage: TokenUsage,
+    /// List price of that usage, priced per model so a bucket that ran two
+    /// models is priced at both their rates rather than at an average.
+    pub cost: Option<Usd>,
+    /// Tokens in this row the rate table could not price, and which are
+    /// therefore *not* in [`cost`](Self::cost). Carried rather than dropped:
+    /// the same reason [`BoardSpend::unpriced`] exists.
+    pub unpriced_tokens: u64,
+}
+
+impl BreakdownRow {
+    /// What this row is ranked and drawn against.
+    pub fn metric(&self, ranking: Ranking) -> u64 {
+        match ranking {
+            Ranking::Spend => self.cost.map_or(0, |c| c.micros.max(0) as u64),
+            Ranking::Tokens => self.usage.total(),
+            Ranking::Dispatches => self.dispatches as u64,
+        }
+    }
+}
+
+/// One cut of the window, ranked and ready to draw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Breakdown {
+    pub dimension: Dimension,
+    /// Biggest first by [`ranking`](Self::ranking), ties alphabetical, the tail
+    /// folded into one honest `n others`.
+    pub rows: Vec<BreakdownRow>,
+    pub ranking: Ranking,
+    /// The biggest row's metric — what the bars are scaled against, folded row
+    /// included, because `n others` is a real bucket and not a footnote.
+    pub peak: u64,
+}
+
+impl Breakdown {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// One row's share of the biggest, `0.0..=1.0`.
+    pub fn share(&self, row: &BreakdownRow) -> f32 {
+        if self.peak == 0 {
+            return 0.0;
+        }
+        (row.metric(self.ranking) as f32 / self.peak as f32).clamp(0.0, 1.0)
+    }
+
+    /// Is there a price to put in the last column at all? False on a board with
+    /// no rates, which drops the column rather than filling it with dashes.
+    pub fn is_priced(&self) -> bool {
+        self.rows.iter().any(|r| r.cost.is_some())
+    }
+}
+
+/// How many rows a cut shows before folding the rest into `n others`.
+pub const BREAKDOWN_ROWS: usize = 6;
+
+/// Rank one cut for reading (gh#227).
+///
+/// The same rule every tally here follows — biggest first, ties alphabetical so
+/// an unchanged board redraws identically, the tail folded into one row that
+/// carries what it stands for — applied to rows that hold three quantities
+/// instead of one, against whichever of them this window can actually be ranked
+/// on.
+///
+/// Like [`hour_grid`], this has no Swift counterpart yet: the phone's stats
+/// screen draws no breakdown, so there is nothing there to disagree with it.
+/// When it does, this is the arithmetic it adopts.
+pub fn rank_breakdown(dimension: Dimension, mut rows: Vec<BreakdownRow>, max: usize) -> Breakdown {
+    let ranking = if rows.iter().any(|r| r.cost.is_some_and(|c| !c.is_zero())) {
+        Ranking::Spend
+    } else if rows.iter().any(|r| !r.usage.is_zero()) {
+        Ranking::Tokens
+    } else {
+        Ranking::Dispatches
+    };
+    rows.sort_by(|a, b| {
+        b.metric(ranking)
+            .cmp(&a.metric(ranking))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    if max > 0 && rows.len() > max {
+        let tail = rows.split_off(max);
+        let priced: Vec<Usd> = tail.iter().filter_map(|r| r.cost).collect();
+        rows.push(BreakdownRow {
+            label: format!("{} others", tail.len()),
+            dispatches: tail.iter().map(|r| r.dispatches).sum(),
+            usage: tail.iter().map(|r| r.usage).sum(),
+            // `None` only when not one folded row had a price. A fold that
+            // reported zero for rows nobody could price would be the invented
+            // zero this whole half of the page is designed against.
+            cost: (!priced.is_empty()).then(|| priced.into_iter().sum()),
+            unpriced_tokens: tail.iter().map(|r| r.unpriced_tokens).sum(),
+        });
+    }
+    Breakdown {
+        dimension,
+        peak: rows.iter().map(|r| r.metric(ranking)).max().unwrap_or(0),
+        ranking,
+        rows,
+    }
+}
+
 /// Everything the board can say about its own throughput over a window.
 ///
 /// Field order is the order a page reads them in: what happened, how well, how
@@ -410,6 +606,21 @@ pub struct BoardStats {
     pub by_source: BTreeMap<String, usize>,
     /// Whose subscription the attempts spent, by the login's own name.
     pub by_account: BTreeMap<String, usize>,
+
+    /// The same window cut five ways, with tokens and money on every row
+    /// (gh#227) — the breakdown card's whole contents.
+    ///
+    /// Ranked and folded on the box rather than on the page, because the money
+    /// on a row cannot be derived from anything else here: a bucket's price is
+    /// its own tokens at the rates of the models *it* ran, and only the box has
+    /// the rate table. A dimension this window has nothing under is absent from
+    /// the vector, which is how the toggle comes to omit it rather than offer a
+    /// segment that opens onto nothing.
+    ///
+    /// Defaulted on the wire: a board that predates this field answers without
+    /// it, and the card is then simply not drawn.
+    #[serde(default)]
+    pub breakdown: Vec<Breakdown>,
     /// Released by an agent rather than by a person.
     pub agent_dispatched: usize,
 
@@ -464,6 +675,7 @@ impl BoardStats {
             by_runtime: BTreeMap::new(),
             by_source: BTreeMap::new(),
             by_account: BTreeMap::new(),
+            breakdown: Vec::new(),
             agent_dispatched: 0,
             tokens_by_model: BTreeMap::new(),
             tokens_by_runtime: BTreeMap::new(),
@@ -510,6 +722,12 @@ impl BoardStats {
             Some(spend) if !spend.has_price() => "nothing metered to price".to_string(),
             Some(spend) => spend.headline(),
         }
+    }
+
+    /// The cut along one axis, or `None` when this window has nothing under it
+    /// — which is the same thing as the toggle not offering it (gh#227).
+    pub fn cut(&self, dimension: Dimension) -> Option<&Breakdown> {
+        self.breakdown.iter().find(|b| b.dimension == dimension)
     }
 
     /// How the window is named on the page.
@@ -922,6 +1140,134 @@ mod tests {
         assert_eq!(grid.rows[0].hours.len(), HOURS);
         assert_eq!(grid.rows[0].total, 6);
         assert_eq!(grid.columns.len(), HOURS);
+    }
+
+    // -- the breakdown (gh#227) ----------------------------------------------
+
+    fn row(label: &str, dispatches: usize, tokens: u64, dollars: Option<f64>) -> BreakdownRow {
+        BreakdownRow {
+            label: label.to_string(),
+            dispatches,
+            usage: TokenUsage {
+                input_tokens: tokens,
+                ..TokenUsage::default()
+            },
+            cost: dollars.map(Usd::from_dollars),
+            unpriced_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn a_priced_cut_ranks_on_the_money_and_scales_its_bars_against_it() {
+        let cut = rank_breakdown(
+            Dimension::Model,
+            vec![
+                row("gpt-5.6-terra", 4, 7_400_000, Some(38.0)),
+                row("claude-opus-5", 9, 31_200_000, Some(198.0)),
+                row("claude-sonnet-5", 2, 3_400_000, Some(14.0)),
+            ],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(cut.ranking, Ranking::Spend);
+        let labels: Vec<&str> = cut.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["claude-opus-5", "gpt-5.6-terra", "claude-sonnet-5"]
+        );
+        // The bar is the same quantity the rows are sorted by, or it is a
+        // second ordering drawn on top of the first.
+        assert_eq!(cut.share(&cut.rows[0]), 1.0);
+        assert!((cut.share(&cut.rows[1]) - 38.0 / 198.0).abs() < 0.001);
+        assert!(cut.is_priced());
+    }
+
+    #[test]
+    fn an_unpriced_cut_falls_back_to_tokens_and_then_to_dispatches() {
+        let tokens = rank_breakdown(
+            Dimension::Runtime,
+            vec![
+                row("claude-code", 3, 900, None),
+                row("codex", 9, 40_000, None),
+            ],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(tokens.ranking, Ranking::Tokens);
+        assert_eq!(tokens.rows[0].label, "codex", "tokens, not dispatches");
+        assert!(!tokens.is_priced(), "no rates is not a column of zeroes");
+
+        // Nothing metered at all: the only number left is how often it ran.
+        let counted = rank_breakdown(
+            Dimension::Tracker,
+            vec![row("github", 2, 0, None), row("linear", 7, 0, None)],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(counted.ranking, Ranking::Dispatches);
+        assert_eq!(counted.rows[0].label, "linear");
+        assert_eq!(counted.share(&counted.rows[0]), 1.0);
+    }
+
+    /// Rates that priced *nothing* is not the same as no rates: the rows carry
+    /// a real zero and the tokens are still what orders them.
+    #[test]
+    fn a_cut_priced_at_zero_is_ranked_on_what_it_actually_spent() {
+        let cut = rank_breakdown(
+            Dimension::Space,
+            vec![
+                BreakdownRow {
+                    unpriced_tokens: 900,
+                    ..row("edge", 3, 900, Some(0.0))
+                },
+                BreakdownRow {
+                    unpriced_tokens: 40_000,
+                    ..row("comet", 2, 40_000, Some(0.0))
+                },
+            ],
+            BREAKDOWN_ROWS,
+        );
+        assert_eq!(cut.ranking, Ranking::Tokens);
+        assert_eq!(cut.rows[0].label, "comet");
+    }
+
+    #[test]
+    fn a_folded_cut_carries_every_quantity_it_stood_for() {
+        let cut = rank_breakdown(
+            Dimension::Account,
+            (1..=5)
+                .map(|n| row(&format!("a{n}"), n, n as u64 * 1_000, Some(n as f64)))
+                .collect(),
+            2,
+        );
+        assert_eq!(cut.rows.len(), 3);
+        let folded = &cut.rows[2];
+        assert_eq!(folded.label, "3 others");
+        assert_eq!(folded.dispatches, 1 + 2 + 3);
+        assert_eq!(folded.usage.total(), 6_000);
+        assert_eq!(folded.cost, Some(Usd::from_dollars(6.0)));
+        // Every dollar the cut was given is still in it after the fold.
+        assert_eq!(
+            cut.rows.iter().filter_map(|r| r.cost).sum::<Usd>(),
+            Usd::from_dollars(15.0)
+        );
+        // And `n others` is a bucket like any other: it scales the bars when it
+        // is the biggest one.
+        assert_eq!(cut.peak, folded.cost.expect("priced").micros as u64);
+        assert_eq!(cut.share(folded), 1.0);
+    }
+
+    #[test]
+    fn a_dimension_with_nothing_under_it_is_absent_rather_than_empty() {
+        let mut s = BoardStats::empty(Some(7));
+        assert_eq!(s.cut(Dimension::Model), None);
+        s.breakdown = vec![rank_breakdown(
+            Dimension::Runtime,
+            vec![row("claude-code", 1, 10, None)],
+            BREAKDOWN_ROWS,
+        )];
+        assert_eq!(s.cut(Dimension::Model), None, "not a segment on the toggle");
+        assert!(s.cut(Dimension::Runtime).is_some());
+        // The toggle's order is the type's, not the vector's.
+        assert_eq!(Dimension::ALL[0].label(), "Model");
+        assert_eq!(Dimension::ALL.len(), 5);
     }
 
     #[test]
@@ -1436,6 +1782,55 @@ mod spec {
             ("brede@tally.no", usage(9_000, 6_000, 148_000, 21_000)),
             ("ana@example.com", usage(400, 100, 0, 500)),
         ]);
+        // The same window cut two ways (gh#227), ranked and folded on the box.
+        // The phone draws no breakdown yet and ignores the key — what the
+        // fixture pins here is that it still decodes the rest of the reply when
+        // a newer board sends one, and what the shape it will read looks like.
+        priced.breakdown = vec![
+            rank_breakdown(
+                Dimension::Model,
+                vec![
+                    BreakdownRow {
+                        label: "claude-opus-5".into(),
+                        dispatches: 8,
+                        usage: usage(9_000, 6_000, 148_000, 21_000),
+                        cost: Some(Usd::from_dollars(0.400_25)),
+                        unpriced_tokens: 0,
+                    },
+                    BreakdownRow {
+                        label: "gpt-5.6-terra".into(),
+                        dispatches: 5,
+                        usage: usage(400, 100, 0, 500),
+                        // Metered, and priced at nothing because the table has
+                        // never heard of it — which is why the tokens it could
+                        // not price ride along on the row.
+                        cost: Some(Usd::ZERO),
+                        unpriced_tokens: 1_000,
+                    },
+                ],
+                BREAKDOWN_ROWS,
+            ),
+            rank_breakdown(
+                Dimension::Runtime,
+                vec![
+                    BreakdownRow {
+                        label: "claude-code".into(),
+                        dispatches: 10,
+                        usage: usage(9_000, 6_000, 148_000, 21_000),
+                        cost: Some(Usd::from_dollars(0.400_25)),
+                        unpriced_tokens: 0,
+                    },
+                    BreakdownRow {
+                        label: "codex".into(),
+                        dispatches: 3,
+                        usage: usage(400, 100, 0, 500),
+                        cost: Some(Usd::ZERO),
+                        unpriced_tokens: 1_000,
+                    },
+                ],
+                BREAKDOWN_ROWS,
+            ),
+        ];
         priced.spend = Some(spend(
             crate::view::rates::builtin(),
             &[

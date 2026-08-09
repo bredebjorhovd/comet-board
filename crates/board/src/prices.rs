@@ -116,6 +116,32 @@ impl Prices {
         self.plans.iter().find(|p| p.describes(account))
     }
 
+    /// What one bucket of the window cost, and what that price leaves out
+    /// (gh#227).
+    ///
+    /// The per-account arithmetic below, made available to any other cut of the
+    /// same window: a runtime's dollars are its own tokens at the rates of the
+    /// models *it* ran, never the board's average rate applied to its share. On
+    /// a box running one cheap model beside one expensive one, an average is
+    /// wrong by a multiple in both directions at once.
+    ///
+    /// `None` is rates not configured — the same "said out loud, never a
+    /// confident zero" [`spend`](Self::spend) answers with.
+    pub fn price(&self, by_model: &BTreeMap<String, TokenUsage>) -> Option<(Usd, u64)> {
+        if self.table.is_empty() {
+            return None;
+        }
+        let mut priced = Usd::ZERO;
+        let mut unpriced = 0u64;
+        for (model, spent) in by_model {
+            match self.table.rate_for(model) {
+                Some(found) => priced += found.rate.cost(*spent),
+                None => unpriced += spent.total(),
+            }
+        }
+        Some((priced, unpriced))
+    }
+
     /// Price a window.
     ///
     /// `None` is **rates not configured** — the state a page says out loud
