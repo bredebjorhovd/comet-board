@@ -230,7 +230,7 @@ pub fn doctor(
             // the box's own identity below, and always printed for the same
             // reason the duration cap is: with no map every dispatch commits as
             // the box, which looks exactly like a map that is working.
-            checks.push(dispatch_authorship_check(&cfg));
+            checks.push(dispatch_authorship_check(&cfg, accounts));
 
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
@@ -706,35 +706,46 @@ fn git_identity_check(id: &git_identity::BoxIdentity) -> Check {
 /// is exactly right on a box only one person dispatches from; what it must not
 /// do is stay invisible, because "everything lands as the box" and "the map is
 /// working" look identical on GitHub until somebody reads the commit list.
-fn dispatch_authorship_check(cfg: &RoutingConfig) -> Check {
+///
+/// `accounts` is the box's saved CLI logins, which are here for the pairing
+/// gh#162 named: a mapped teammate with no login of their own commits as
+/// themselves and spends somebody else's subscription. The two facts live in
+/// different places, which is exactly why nothing had put them on one line.
+/// `None` — the engine could not be asked — says nothing about the pairing
+/// rather than reporting every teammate as missing one.
+fn dispatch_authorship_check(cfg: &RoutingConfig, accounts: Option<&[AgentAccount]>) -> Check {
     let name = "dispatch authorship".to_string();
     if cfg.users.is_empty() {
         return Check {
             name,
             ok: true,
             detail: "no `[users]` map — every dispatch commits under this box's own git \
-                     identity, whoever released it. Map a teammate's sign-in email to \
-                     their GitHub address to have their work land as theirs: \
-                     `[users]` / `\"ana@example.com\" = \
-                     \"22494697+ana@users.noreply.github.com\"`"
+                     identity, whoever released it. `comet-board member add \
+                     <their-sign-in-email> --github <login>` maps a teammate so their \
+                     work lands as theirs; docs/teammate.md is the rest of the sequence"
                 .into(),
         };
     }
     // Named, with what each one resolves to, because the mapping is the part
     // that is silently wrong: an address for the wrong account still commits,
     // still pushes, and attributes to somebody else entirely.
+    let roster = crate::members::roster(cfg, accounts);
     let mut entries = Vec::new();
     let mut unresolved = Vec::new();
     let mut unlinked = Vec::new();
-    for (who, value) in &cfg.users {
-        match git_identity::parse_author(value) {
+    let mut slotless = Vec::new();
+    for m in &roster.members {
+        match &m.author {
             Some(author) => {
-                if !git_identity::is_github_noreply(&author.email) {
-                    unlinked.push(who.clone());
+                if !m.noreply {
+                    unlinked.push(m.user.clone());
                 }
-                entries.push(format!("{who} → {} <{}>", author.name, author.email));
+                if roster.accounts_known && m.needs_account() {
+                    slotless.push(m.user.clone());
+                }
+                entries.push(format!("{} → {} <{}>", m.user, author.name, author.email));
             }
-            None => unresolved.push(format!("{who} = \"{value}\"")),
+            None => unresolved.push(format!("{} = \"{}\"", m.user, m.value)),
         }
     }
     let mut sentences = Vec::new();
@@ -752,6 +763,18 @@ fn dispatch_authorship_check(cfg: &RoutingConfig) -> Check {
         sentences.push(format!(
             "Not an address at all: {} — those dispatches commit as the box",
             unresolved.join(", ")
+        ));
+    }
+    // The other half of onboarding, on the line that already names the person
+    // (gh#162). Mapped and slotless is not a config error — one shared
+    // subscription is a real arrangement — but it is the half nobody thinks
+    // about, and it is invisible until a usage page says so.
+    if !slotless.is_empty() {
+        sentences.push(format!(
+            "No agent account of their own for {} — their runs spend whichever \
+             subscription the route names, or this box's own (see Agent accounts, \
+             docs/teammate.md)",
+            slotless.join(", ")
         ));
     }
     let detail = sentences.join(". ");
@@ -2956,10 +2979,22 @@ mod tests {
     /// commit list. Said out loud, in both states, like the duration cap.
     #[test]
     fn doctor_says_whose_name_a_teammates_dispatch_commits_under() {
-        let empty = dispatch_authorship_check(&RoutingConfig::default());
+        let empty = dispatch_authorship_check(&RoutingConfig::default(), None);
         assert!(empty.ok, "{}", empty.detail);
         assert!(
             empty.detail.starts_with("no `[users]` map"),
+            "{}",
+            empty.detail
+        );
+        // The line points at the verb that fixes it, rather than at TOML to
+        // hand-write (gh#162) — the whole reason onboarding was oral tradition.
+        assert!(
+            empty.detail.contains("comet-board member add"),
+            "{}",
+            empty.detail
+        );
+        assert!(
+            empty.detail.contains("docs/teammate.md"),
             "{}",
             empty.detail
         );
@@ -2970,7 +3005,7 @@ mod tests {
              \"kim@example.com\" = \"kim\"\n",
         )
         .unwrap();
-        let c = dispatch_authorship_check(&cfg);
+        let c = dispatch_authorship_check(&cfg, None);
         assert!(c.ok, "{}", c.detail);
         // Every entry named, with what it resolves to: an address for the wrong
         // account commits and pushes exactly as happily as the right one.
@@ -3005,6 +3040,48 @@ mod tests {
                 .any(|p| p.contains("[users] \"kim@example.com\"")),
             "{:?}",
             cfg.problems()
+        );
+    }
+
+    /// The pairing nobody thinks about (gh#162): mapped, so their commits are
+    /// theirs, and no login of their own, so their runs spend somebody else's
+    /// subscription. Two facts in two files, and until this line they were
+    /// never printed together.
+    #[test]
+    fn doctor_names_a_mapped_teammate_with_no_agent_account() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[users]\n\"ana@example.com\" = \"1+ana@users.noreply.github.com\"\n\
+             \"sam@example.com\" = \"2+sam@users.noreply.github.com\"\n",
+        )
+        .unwrap();
+        let accounts = [account(
+            "slot-ana",
+            "ana@example.com",
+            comet_proto::HarnessId::ClaudeCode,
+        )];
+        let c = dispatch_authorship_check(&cfg, Some(&accounts));
+        assert!(c.ok, "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("No agent account of their own for sam@example.com"),
+            "{}",
+            c.detail
+        );
+        // Ana has one; naming her too would make the line noise on a box where
+        // everybody is set up.
+        assert!(
+            !c.detail.contains("for ana@example.com, sam@example.com"),
+            "{}",
+            c.detail
+        );
+
+        // An engine that could not be asked says nothing about the pairing,
+        // rather than accusing everybody of missing a slot (gh#155).
+        let unknown = dispatch_authorship_check(&cfg, None);
+        assert!(
+            !unknown.detail.contains("No agent account"),
+            "{}",
+            unknown.detail
         );
     }
 

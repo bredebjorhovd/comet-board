@@ -239,6 +239,18 @@ enum Command {
         #[command(subcommand)]
         command: RoutesCommand,
     },
+    /// Who else drives this board — the `[users]` map that decides whose name
+    /// a teammate's dispatched commits carry (gh#162).
+    ///
+    /// Over the RPC like `routes`, so `--device` reaches the box: the map is a
+    /// file on the board's host, and the credential that resolves a GitHub
+    /// login into an address is the board's App.
+    ///
+    /// `docs/teammate.md` is the sequence this verb is step three of.
+    Member {
+        #[command(subcommand)]
+        command: MemberCommand,
+    },
     /// Put a repo the board has never seen on the board: clone it, give it a
     /// space, and route it — one verb (gh#97).
     ///
@@ -347,6 +359,50 @@ enum SkillCommand {
     },
     /// Print the skill this binary ships, stamped with its version.
     Show,
+}
+
+#[derive(Subcommand)]
+enum MemberCommand {
+    /// Map a teammate's sign-in email to their GitHub identity, so their
+    /// dispatches commit as them.
+    ///
+    /// Idempotent: re-running with the same person changes nothing, and
+    /// re-running with a different address corrects the entry rather than
+    /// adding a second. Until this exists for someone, every task they release
+    /// commits under the box's own git identity — which on a repo behind a
+    /// contributor gate is a refused deploy, not a cosmetic error.
+    Add {
+        /// The email they sign in to comet with. That is what a dispatch
+        /// arrives as, and it is the only thing the board can key the map on.
+        email: String,
+        /// Their GitHub login (`ana`), or the
+        /// `<id>+<login>@users.noreply.github.com` address from
+        /// <https://github.com/settings/emails>. A bare login is resolved
+        /// through the board's GitHub credential; an address is taken as
+        /// written, and `Name <address>` carries a name with it.
+        #[arg(long)]
+        github: String,
+        /// The name their commits show. Defaults to the GitHub login, which is
+        /// what the address alone would have said anyway.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// The map, the box's agent-account slots, and who has one without the
+    /// other.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take somebody out of the map — offboarding, or an entry for the wrong
+    /// account.
+    ///
+    /// Their dispatches go back to committing under the box's own identity.
+    /// Nothing else about them changes: their agent-account slot, their org
+    /// membership and the chats they already have are all elsewhere.
+    Remove {
+        /// The sign-in email, as `member list` prints it.
+        email: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -766,6 +822,28 @@ fn main() -> Result<()> {
             let board = ops::attach(port, device).await?;
             routes(&board, command).await
         }),
+        Command::Member { command } => {
+            // Read before the round trip, for the same reason `onboard` parses
+            // its slug here: an argument that is neither an address nor a
+            // login costs an error naming what to type, not a call to the box
+            // that comes back with the same news. The box checks both halves
+            // again — this is where the *words* are good, not where the rule
+            // lives.
+            if let MemberCommand::Add { email, github, .. } = &command {
+                comet_board::members::parse_github(github)?;
+                if !comet_board::git_identity::plausible_email(email.trim()) {
+                    bail!(
+                        "`{email}` is not a sign-in email. The first argument is the \
+                         address they sign in to comet with — that is what a dispatch \
+                         arrives as — and their GitHub login goes in --github."
+                    );
+                }
+            }
+            runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                member(&board, command).await
+            })
+        }
         Command::Onboard {
             slug,
             dir,
@@ -984,6 +1062,123 @@ fn describe(state: &comet_board::skill::State) -> String {
         State::Missing => "missing".into(),
         State::Unreadable(e) => format!("unreadable ({e})"),
     }
+}
+
+/// `comet-board member …` — the `[users]` map, written rather than hand-edited
+/// (gh#162).
+///
+/// The same RPC surface `routes` drives, so every write re-parses, re-validates
+/// and leaves a `.bak`; what is different is that the *value* may need a GitHub
+/// round trip, which happens on the board's host because that is where the
+/// credential is.
+async fn member(board: &ops::Board, command: MemberCommand) -> Result<()> {
+    match command {
+        MemberCommand::Add {
+            email,
+            github,
+            name,
+        } => {
+            // Read first so the result can say what actually changed. Adding
+            // somebody who is already mapped must not read as having done
+            // something — that is what makes re-running the documented
+            // sequence safe.
+            let before = ops::read_config(board).await?;
+            let was = mapped(&before, &email);
+            let after = ops::write_config(
+                board,
+                serde_json::json!({
+                    "op": "member", "user": email, "github": github, "name": name
+                }),
+            )
+            .await?;
+            let now = mapped(&after, &email);
+            let unchanged = was.is_some() && was == now;
+            match (&was, &now) {
+                (Some(_), Some(now)) if unchanged => {
+                    println!("{email} → {now} (already mapped; nothing changed)")
+                }
+                (Some(was), Some(now)) => println!("{email} → {now} (was {was})"),
+                (_, Some(now)) => println!("{email} → {now}"),
+                // The write validated, so the entry is there; only a config
+                // that stopped parsing could get here.
+                (_, None) => println!("{email} mapped"),
+            }
+            if !unchanged {
+                ops::print_write_result(&after);
+            }
+            // What is still missing for this person, said now rather than
+            // discovered when their first run lands on somebody else's plan.
+            let accounts = ops::agent_accounts(board).await;
+            if let Some(cfg) = &after.routing.config {
+                let roster = comet_board::members::roster(cfg, accounts.as_deref());
+                if roster
+                    .members
+                    .iter()
+                    .any(|m| m.user.eq_ignore_ascii_case(email.trim()) && m.needs_account())
+                {
+                    println!(
+                        "no agent account on this box is theirs yet — until there is one, \
+                         their runs spend whichever subscription the route names, or the \
+                         box's own. Sign one in under Agent accounts (docs/teammate.md)"
+                    );
+                }
+            }
+            Ok(())
+        }
+        MemberCommand::List { json } => {
+            let cfg = ops::read_config(board).await?;
+            let accounts = ops::agent_accounts(board).await;
+            let parsed = cfg.routing.config.clone().unwrap_or_default();
+            if cfg.routing.config.is_none() {
+                // The map is unreadable, not empty. Say which before printing
+                // a roster of nothing.
+                eprintln!(
+                    "{} does not parse, so the map below is empty rather than read:\n  {}",
+                    cfg.routing.path,
+                    cfg.routing.problems.join("\n  ")
+                );
+            }
+            let roster = comet_board::members::roster(&parsed, accounts.as_deref());
+            ops::print_roster(&roster, board.host(), json)
+        }
+        MemberCommand::Remove { email } => {
+            let before = ops::read_config(board).await?;
+            let Some(was) = mapped(&before, &email) else {
+                // Idempotent in the direction that matters: removing somebody
+                // who is not there changed nothing, and saying so is not an
+                // error.
+                println!("{email} is not in the map — nothing to remove");
+                return Ok(());
+            };
+            let after = ops::write_config(
+                board,
+                serde_json::json!({ "op": "user", "user": email, "value": null }),
+            )
+            .await?;
+            println!("{email} removed (was {was}) — their dispatches commit as the box again");
+            ops::print_write_result(&after);
+            Ok(())
+        }
+    }
+}
+
+/// The `[users]` value for one person, as the config now stands.
+///
+/// Case-insensitive, because that is how the map is read at dispatch time
+/// (`RoutingConfig::git_author_for`) — a lookup that disagreed with the reader
+/// would report a change that did not happen.
+fn mapped(cfg: &ops::BoardConfig, email: &str) -> Option<String> {
+    let email = email.trim();
+    cfg.routing
+        .config
+        .as_ref()?
+        .users
+        .iter()
+        .find_map(|(k, v)| {
+            k.trim()
+                .eq_ignore_ascii_case(email)
+                .then(|| v.trim().to_string())
+        })
 }
 
 /// `comet-board routes …` — the routing.toml surface (gh#75).

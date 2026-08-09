@@ -25,6 +25,7 @@ pub mod git_credentials;
 pub mod git_identity;
 pub mod init;
 pub mod log;
+pub mod members;
 pub mod model;
 pub mod notify;
 pub mod onboard;

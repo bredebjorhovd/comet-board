@@ -267,6 +267,32 @@ deliver_reviews = true
 # name = "Florin-AS/Tally"
 # writeback = false
 
+# Who the people driving this board are, on GitHub. Keyed by the email each one
+# signs in to comet with — that is what a dispatch arrives as — and valued with
+# their git author address:
+#
+# [users]
+# "ana@example.com" = "22494697+ana@users.noreply.github.com"
+# "sam@example.com" = "Sam Ito <8134+samito@users.noreply.github.com>"
+#
+# With an entry here, that person's dispatched commits are authored by them;
+# the box stays the committer, which is what actually happened. With none,
+# every dispatch commits under the box's own git identity whoever released it —
+# nothing rejects that, and it reads as the box owner's work on GitHub until
+# somebody looks. On a repo behind a contributor gate it is a refused deploy.
+#
+# Write it with the verb rather than by hand: `comet-board member add
+# ana@example.com --github ana` resolves the login through the board's GitHub
+# credential, refuses a value that is not an address, and is idempotent.
+# `comet-board member list` prints the map beside this device's agent-account
+# slots and says who has one without the other — the pairing being the half
+# nobody thinks about, since a mapped teammate with no slot spends somebody
+# else's subscription. docs/teammate.md is the whole sequence.
+#
+# A file rather than a directory service: a two-person box does not need one,
+# and nothing here can answer "which GitHub account is this person?" on its own
+# — the board's App may not read anybody's verified addresses.
+
 # The board lists git repos that have a comet space but no config here, in an
 # UNADOPTED section. Ignoring is needed because you open a chat in plenty of
 # repos you are only reading — another org's, a dependency, something you

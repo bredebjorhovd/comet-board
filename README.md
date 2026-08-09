@@ -13,6 +13,12 @@ dispatch, review, retry and report while your job reduces to reading its
 summaries. [docs/orchestrator.md](docs/orchestrator.md) is the brief to open
 that chat with.
 
+A second person on the box is five steps — invite, they join, `comet-board
+member add`, their agent-account slot, the App on their repos — and every one
+of them is invisible until it is missing.
+[docs/teammate.md](docs/teammate.md) is that sequence, with what each step
+fixes if skipped and which `comet-board doctor` line confirms it.
+
 Sessions on your own machine learn the board's conventions from a skill that
 ships inside the binary — `comet-board skill install` writes it into
 `~/.claude/skills/`, and dispatched agents get their own copy automatically

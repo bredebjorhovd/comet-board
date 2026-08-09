@@ -56,7 +56,10 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 7. Never dispatch speculatively — a human keypress or explicit instruction
    releases tasks. Reading is always safe.
 8. New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
-   one verb). `comet-board doctor` explains a board that looks wrong.
+   one verb). New *person*: `comet-board member add <their-sign-in-email>
+   --github <login>`, or their dispatches commit under the box owner's name —
+   `comet-board member list` shows who is mapped and who has no agent account
+   (docs/teammate.md). `comet-board doctor` explains a board that looks wrong.
 9. **Screenshots in a PR description**: commit them and link them with a
    relative path from a markdown file in the repo. A
    `raw.githubusercontent.com/<owner>/<repo>/<branch>/…` URL is broken on a
@@ -88,6 +91,10 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `routes set <route> <key> [value]` | `--unset` | Set one key on one route: `routes set 2 account brede-personal` |
 | `routes defaults <key> [value]` | `--unset` | Set one key under `[defaults]`: `routes defaults max_duration 4h` |
 | `routes edit` | — | Open `routing.toml` in `$EDITOR` and write it back, validated |
+| `member` | — | Who else drives this board — the `[users]` map that decides whose name a teammate's dispatched commits carry (gh#162) |
+| `member add <email>` | `--github`, `--name` | Map a teammate's sign-in email to their GitHub identity, so their dispatches commit as them |
+| `member list` | `--json` | The map, the box's agent-account slots, and who has one without the other |
+| `member remove <email>` | — | Take somebody out of the map — offboarding, or an entry for the wrong account |
 | `onboard [slug]` | `--dir`, `--labels`, `--all-issues`, `--json` | Put a repo the board has never seen on the board: clone it, give it a space, and route it — one verb (gh#97) |
 | `adopt [slug]` | `--labels`, `--all-issues`, `--ignore` | Offer git-detected spaces the board is not watching; adopt one by slug |
 | `skill` | — | Install this skill — the one you are reading — where agents on this machine will find it |
