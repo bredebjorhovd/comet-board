@@ -144,11 +144,14 @@ base = "origin/HEAD"
 #                configurable here and not conditional on who is watching: it
 #                is the task's trail, and it is the only one that survives the
 #                night. (GitHub still obeys `[github] writeback` per repo.)
-#   the agent    `notify_dispatcher`, below — a dispatching orchestrator gets
-#                a prompt in its own chat when the work it released settles.
-#   the board's  `orchestrator_chat`, below — one pinned chat that hears about
-#   orchestrator every settle, block, orphan and cap warning, including work it
-#                did not release itself.
+#   the agent    `notify_dispatcher`, below — the chat that released the work
+#                gets a prompt when it settles or blocks. On by default, and
+#                tried first: it is the precise channel, prompting the one agent
+#                whose plan that task was a step in.
+#   the board's  `orchestrator_chat`, below — one pinned chat, and the addressee
+#   orchestrator of last resort: work no chat released, work whose dispatching
+#                chat is gone, and the cap warning. What the dispatcher was told
+#                is never repeated to it.
 #   you          `notify` + `notify_webhook`, here. The only channel that
 #                reaches somebody looking at neither the board nor the tracker.
 #
@@ -162,11 +165,19 @@ base = "origin/HEAD"
 # POST.
 # notify = true
 # notify_webhook = "https://hooks.example.com/comet-board"
-# The pinned orchestrator: one chat that receives everything and drives the
-# board. `notify_dispatcher` wakes whoever released each task, which is right
-# for a chat waiting on one thing and wrong for the agent whose job is the whole
-# board — it has to hear about work you released from the panel and work a
-# sibling released too. Name its chat id here and it does.
+# The dispatcher wake: when an agent released a task through the board, prompt
+# it in its own chat as that task settles or blocks. On, because it is the
+# precise channel — the reader is the one agent whose plan that task was a step
+# in, and a chat told about the two or three things it released is nothing like
+# a chat told about the whole board. Turn it off where you dispatch from chats
+# that are you at a prompt rather than agents; `notify_webhook` above is the
+# channel for that reader, and every settle then falls to the pin below.
+# notify_dispatcher = true
+# The pinned orchestrator: one chat that drives the board and hears what nobody
+# else can be told — work you released from the panel or the phone (which
+# records no chat), work whose dispatching chat has been archived since, and the
+# cap warning, which is about a run that is still going. What the dispatcher was
+# told is never repeated here; that is what keeps a pin usable on a busy board.
 #
 # It is an ordinary chat: no workspace slot (the board did not dispatch it),
 # though everything it releases counts against the caps like anyone's, and it
