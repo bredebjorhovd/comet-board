@@ -49,6 +49,47 @@ pub struct EngineStatus {
     /// second opinion about the release feed would be a second thing that can
     /// disagree with the updater that actually performs updates.
     pub update: Option<comet_update::UpdateStatus>,
+    /// The other devices on this account that answered with a board of their
+    /// own (gh#195). `None` when the sweep could not be run at all — the engine
+    /// was not reachable, so nothing was asked and nothing may be claimed.
+    pub peers: Option<Peers>,
+}
+
+/// What a sweep of the other devices found (gh#195).
+///
+/// Three facts, and the third is the one gh#155 paid for: a device that was
+/// asked and refused hosts no board, a device that could not be asked says
+/// nothing at all, and reporting the second as the first is how a board goes
+/// missing from a report that looks complete.
+#[derive(Debug, Clone, Default)]
+pub struct Peers {
+    /// Other devices that answered with a board of their own.
+    pub boards: Vec<PeerBoard>,
+    /// Devices that were present and still could not be asked — display names.
+    /// Their silence is a fact about the connection, not about their board.
+    pub unreachable: Vec<String>,
+    /// How many other devices the sweep asked, present or not.
+    pub asked: usize,
+}
+
+/// A second board, as its own host describes it (gh#195).
+///
+/// Only the two fields that can collide. A board is not a problem for being
+/// somewhere else; it is a problem for polling a source this one also polls,
+/// because both boards then see the same issue as `ready` and either can
+/// release it.
+#[derive(Debug, Clone)]
+pub struct PeerBoard {
+    /// The device's display name, or its id when it has none.
+    pub device: String,
+    /// The `owner/repo` slugs under its `[github] repos`.
+    pub repos: Vec<String>,
+    /// The Linear team keys its routes match on.
+    pub linear_teams: Vec<String>,
+    /// Why its config could not be read as a config, when it could not be —
+    /// the peer answered, but with a `routing.toml` that does not parse, so
+    /// what it polls is unknown rather than empty.
+    pub unparsed: bool,
 }
 
 /// Check the environment. Plain stdout — the report is the output.
@@ -175,6 +216,15 @@ pub fn doctor(
     // every harness on every device and a dispatch to a missing CLI failed
     // after the worktree was cut.
     checks.push(harnesses_check(runtimes));
+
+    // And whether anything *else* on this account is a board (gh#195). Beside
+    // the engine checks because it is the same conversation — the sweep runs
+    // over the same IPC connection, one relayed call per device — and because
+    // every check under it describes this board as though it were the only one.
+    checks.push(board_hosts_check(
+        routing.as_ref().ok(),
+        engine.peers.as_ref(),
+    ));
 
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
@@ -835,6 +885,162 @@ fn harnesses_check(runtimes: Option<&[RuntimeOption]>) -> Check {
         ok: !ready.is_empty(),
         detail,
     }
+}
+
+/// Is this the only board on the account, and if not, does the other one poll
+/// anything this one does (gh#195)?
+///
+/// The failure it exists for has no symptom until it has a bad one. Two boards
+/// existed on this account for months — the Mac's, one route, and the box's,
+/// seventeen — each with its own `board.db`, each polling GitHub, neither aware
+/// the other was there. Nothing was wrong, and nothing was enforcing that:
+/// `[github] repos` is per-board config, so the day one slug appears in both
+/// lists both boards see the same issue as `ready` and `dispatchable`, and
+/// either can release it. Two agents, two worktrees, two branches on one ticket
+/// — and each board's row looks perfectly normal, because the other's attempt is
+/// invisible to it.
+///
+/// So the fact worth printing is the one no single board could see: who else is
+/// polling, and what. A second board is *reported and not failed* — two boards
+/// over disjoint repos is a legitimate setup, and the design's "one host device"
+/// is about where the store lives, not about how many may exist. What fails is
+/// an actual collision: a repo or a Linear team on both lists, which is the race
+/// itself rather than the shape that permits it.
+///
+/// `local` is `None` when this board's own `routing.toml` does not parse — the
+/// peers are still named, since who else is out there is worth knowing even
+/// then, but nothing is compared against a config that could not be read.
+fn board_hosts_check(local: Option<&RoutingConfig>, peers: Option<&Peers>) -> Check {
+    let name = "board hosts".to_string();
+    let Some(peers) = peers else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine did not answer, so no other device was asked".into(),
+        };
+    };
+    // Said whenever it applies, on every branch below: a sweep that skipped a
+    // device is a sweep whose silence proves nothing (gh#155), and "no other
+    // board" from an incomplete sweep is exactly the reassuring sentence this
+    // check must never print by accident.
+    let unreachable = match peers.unreachable.as_slice() {
+        [] => String::new(),
+        names => format!(
+            " · could not ask {} — a board there would be invisible from here",
+            names.join(", ")
+        ),
+    };
+
+    if peers.boards.is_empty() {
+        let detail = match peers.asked {
+            0 => "this device is the only one registered — nothing else on this account \
+                  can be polling"
+                .to_string(),
+            n => format!(
+                "the only board among {n} device(s) on this account — the rest host none{unreachable}"
+            ),
+        };
+        return Check {
+            name,
+            ok: true,
+            detail,
+        };
+    }
+
+    // What each of them polls, named rather than counted: the operator's next
+    // move is to take a slug out of one of two files, and that needs the slug.
+    let census = peers
+        .boards
+        .iter()
+        .map(|b| format!("{} ({})", b.device, polls(b)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let Some(local) = local else {
+        return Check {
+            name,
+            ok: true,
+            detail: format!(
+                "{} other board(s) on this account: {census}. Nothing compared against \
+                 this one — its routing.toml did not parse{unreachable}",
+                peers.boards.len()
+            ),
+        };
+    };
+
+    let clashes = overlaps(local, &peers.boards);
+    if clashes.is_empty() {
+        return Check {
+            name,
+            ok: true,
+            detail: format!(
+                "{} other board(s) on this account: {census} — nothing they poll is \
+                 also polled here, which is the only thing keeping them out of each \
+                 other's work{unreachable}",
+                peers.boards.len()
+            ),
+        };
+    }
+    Check {
+        name,
+        ok: false,
+        detail: format!(
+            "{} — polled by this board and by the other. Both see the same issue as \
+             ready, either can dispatch it, and neither records the other's attempt: \
+             two agents, two worktrees, two branches on one ticket. Take it off one of \
+             the two boards (`[github] repos`, or the route's `linear_team`){unreachable}",
+            clashes.join(" · ")
+        ),
+    }
+}
+
+/// What one peer board polls, in one clause. `unparsed` is its own sentence
+/// because "polls nothing" and "would not say" are different answers, and the
+/// second is the one where a collision cannot be ruled out.
+fn polls(board: &PeerBoard) -> String {
+    if board.unparsed {
+        return "its routing.toml does not parse — what it polls is unknown".into();
+    }
+    let mut parts = Vec::new();
+    if !board.repos.is_empty() {
+        parts.push(board.repos.join(", "));
+    }
+    if !board.linear_teams.is_empty() {
+        parts.push(format!("linear {}", board.linear_teams.join(", ")));
+    }
+    if parts.is_empty() {
+        return "polls nothing".into();
+    }
+    parts.join(" · ")
+}
+
+/// Every source both this board and a peer poll, as sentences naming the peer.
+///
+/// Case-insensitively, and for both sources. GitHub treats `Tally` and `tally`
+/// as one repo and so does its API, so a comparison that did not would miss the
+/// collision on exactly the day somebody retyped a slug from memory — and the
+/// point of this check is to catch the one nobody noticed.
+fn overlaps(local: &RoutingConfig, boards: &[PeerBoard]) -> Vec<String> {
+    let fold = |s: &String| s.trim().to_ascii_lowercase();
+    let repos: Vec<String> = local.github.repos.iter().map(fold).collect();
+    let teams: Vec<String> = local
+        .linear_teams()
+        .iter()
+        .map(|t| t.trim().to_ascii_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    for board in boards {
+        for repo in &board.repos {
+            if repos.contains(&fold(repo)) {
+                out.push(format!("{repo} is on {} too", board.device));
+            }
+        }
+        for team in &board.linear_teams {
+            if teams.contains(&fold(team)) {
+                out.push(format!("linear team {team} is on {} too", board.device));
+            }
+        }
+    }
+    out
 }
 
 /// Does this box have a git identity, and will GitHub attribute what it signs
@@ -2285,6 +2491,9 @@ mod tests {
             // every test that is about something else — the same reason the
             // version above is the matching one.
             update: None,
+            // No sweep, for the same reason: every test that is not about the
+            // other devices on the account gets "not checked" (gh#195).
+            peers: None,
         }
     }
 
@@ -2551,6 +2760,164 @@ mod tests {
         );
     }
 
+    // --- board hosts (gh#195) ------------------------------------------------
+
+    fn cfg_polling(repos: &[&str], team: Option<&str>) -> RoutingConfig {
+        let mut text = format!(
+            "[github]\nrepos = [{}]\n",
+            repos
+                .iter()
+                .map(|r| format!("\"{r}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Some(team) = team {
+            text.push_str(&format!(
+                "\n[[route]]\nmatch = {{ linear_team = \"{team}\" }}\nworkspace = \"w\"\n\
+                 repo = \"/nowhere\"\nruntime = \"claude-code\"\n"
+            ));
+        }
+        toml::from_str(&text).expect("the fixture parses")
+    }
+
+    fn peer(device: &str, repos: &[&str]) -> PeerBoard {
+        PeerBoard {
+            device: device.into(),
+            repos: repos.iter().map(|r| (*r).to_string()).collect(),
+            linear_teams: Vec::new(),
+            unparsed: false,
+        }
+    }
+
+    /// The account this issue was found on: a Mac board and a box board, one
+    /// route and seventeen, no repo in common. Legitimate, and worth saying out
+    /// loud — the fact nothing on either machine could see.
+    #[test]
+    fn a_second_board_over_disjoint_repos_is_reported_and_not_failed() {
+        let peers = Peers {
+            boards: vec![peer("box", &["tally/Tally", "tally/oppgang"])],
+            unreachable: Vec::new(),
+            asked: 2,
+        };
+        let c = board_hosts_check(
+            Some(&cfg_polling(&["bredebjorhovd/attn"], None)),
+            Some(&peers),
+        );
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("box"), "{}", c.detail);
+        // Named, not counted: the operator's next move needs the slugs.
+        assert!(c.detail.contains("tally/Tally"), "{}", c.detail);
+    }
+
+    /// The day one slug lands in both lists. Both boards call the issue ready,
+    /// either dispatches it, and neither row shows the other's attempt — the
+    /// one state worth an exit code.
+    #[test]
+    fn one_repo_on_two_boards_fails() {
+        let peers = Peers {
+            boards: vec![peer("box", &["bredebjorhovd/ATTN"])],
+            unreachable: Vec::new(),
+            asked: 1,
+        };
+        let c = board_hosts_check(
+            Some(&cfg_polling(&["bredebjorhovd/attn"], None)),
+            Some(&peers),
+        );
+        // Case-folded: GitHub reads the two spellings as one repo, and a check
+        // that did not would miss the collision it exists for.
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("bredebjorhovd/ATTN"), "{}", c.detail);
+        assert!(c.detail.contains("box"), "{}", c.detail);
+    }
+
+    /// The same race over the other source. A Linear team is polled by team
+    /// key, so two boards matching on `AGE` collide exactly as two `repos`
+    /// lists do.
+    #[test]
+    fn one_linear_team_on_two_boards_fails() {
+        let peers = Peers {
+            boards: vec![PeerBoard {
+                device: "box".into(),
+                repos: Vec::new(),
+                linear_teams: vec!["AGE".into()],
+                unparsed: false,
+            }],
+            unreachable: Vec::new(),
+            asked: 1,
+        };
+        let c = board_hosts_check(Some(&cfg_polling(&[], Some("AGE"))), Some(&peers));
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("AGE"), "{}", c.detail);
+    }
+
+    /// gh#155's lesson on this surface: a device that could not be asked is not
+    /// a device that hosts no board, and a sweep that says "the only board" on
+    /// an incomplete answer is the reassuring sentence this must never print by
+    /// accident.
+    #[test]
+    fn a_device_that_could_not_be_asked_is_named_rather_than_ruled_out() {
+        let peers = Peers {
+            boards: Vec::new(),
+            unreachable: vec!["box".into()],
+            asked: 2,
+        };
+        let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&peers));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("could not ask box"), "{}", c.detail);
+        assert!(c.detail.contains("invisible from here"), "{}", c.detail);
+    }
+
+    /// A lone device: nothing else on the account can be polling, and there is
+    /// no warning to give.
+    #[test]
+    fn the_only_device_on_the_account_says_so() {
+        let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&Peers::default()));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("only one registered"), "{}", c.detail);
+    }
+
+    /// A peer whose own `routing.toml` will not parse polls *something*
+    /// unknown, which is not the same as polling nothing — the collision it may
+    /// be in cannot be ruled out, and the line says so.
+    #[test]
+    fn a_peer_whose_config_does_not_parse_is_unknown_not_empty() {
+        let peers = Peers {
+            boards: vec![PeerBoard {
+                device: "box".into(),
+                repos: Vec::new(),
+                linear_teams: Vec::new(),
+                unparsed: true,
+            }],
+            unreachable: Vec::new(),
+            asked: 1,
+        };
+        let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&peers));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("unknown"), "{}", c.detail);
+    }
+
+    /// No sweep at all — a laptop with the engine down. "Not checked", never
+    /// "no other board": the same rule every other engine-fed check follows.
+    #[test]
+    fn no_sweep_is_not_checked_rather_than_no_other_board() {
+        let checks = doctor(
+            &tmp().1,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "board hosts")
+            .expect("board hosts is always reported");
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
+    }
+
     fn edge_check_in(checks: &[Check]) -> &Check {
         checks
             .iter()
@@ -2633,6 +3000,7 @@ mod tests {
             detail: "connection refused".into(),
             version: None,
             update: None,
+            peers: None,
         };
         let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));

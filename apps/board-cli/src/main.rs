@@ -780,6 +780,15 @@ fn main() -> Result<()> {
                             ),
                             version: info.version,
                             update: info.update,
+                            // Its own conversation, on its own clock (gh#195):
+                            // every call in it is a relay round trip to another
+                            // machine, and the local report must not wait on a
+                            // box that is asleep. A sweep that fails outright
+                            // is `None` — "not checked", never "no other
+                            // board".
+                            peers: runtime
+                                .block_on(sweep_boards(port, &info.device, info.edge.as_ref()))
+                                .ok(),
                         },
                         Some(info.spaces),
                         Some(info.accounts),
@@ -796,6 +805,9 @@ fn main() -> Result<()> {
                             ),
                             version: None,
                             update: None,
+                            // Nothing was asked, so nothing may be claimed
+                            // about the other devices either (gh#195).
+                            peers: None,
                         },
                         None,
                         None,
@@ -1362,6 +1374,133 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
     }
 }
 
+/// How long the whole sweep of the other devices gets (gh#195).
+///
+/// Every call in it leaves this machine, and `doctor` is a report somebody is
+/// waiting on: a box that has gone away must cost the report a few seconds, not
+/// a minute. Devices the budget runs out on are reported as unasked rather than
+/// as hosting nothing, which is the same distinction gh#155 drew for the picker.
+const SWEEP_BUDGET: Duration = Duration::from_secs(8);
+
+/// Is a failed [`methods::READ_BOARD_CONFIG`] the device's own answer — "I host
+/// no board" — rather than a call that never landed (gh#155)?
+///
+/// `Refused` is `EngineRpc::board()` on a device with no board service, and
+/// `UnknownMethod` is the same answer from an engine too old to know the
+/// question: both replied, and their reply rules them out. Everything else
+/// (transport, a relay 500, a timeout) means nobody was asked, and a board over
+/// there would be invisible from here — which is a fact about the connection,
+/// and belongs in the report as one.
+fn hosts_no_board(err: &comet_rpc::RpcError) -> bool {
+    matches!(
+        err,
+        comet_rpc::RpcError::Refused(_) | comet_rpc::RpcError::UnknownMethod(_)
+    )
+}
+
+/// Which other devices on this account host a board of their own, and what it
+/// polls (gh#195).
+///
+/// One relayed [`methods::READ_BOARD_CONFIG`] per device, over a connection of
+/// its own so only `doctor` pays for it. The reply is the peer's `routing.toml`
+/// as the peer reads it — the same call the settings page uses — so what comes
+/// back is what that board is actually polling rather than what this box
+/// believes about it.
+///
+/// A device that never answers is only reported when it was *present* at the
+/// time (`host_presence`): this fleet is a Mac, a box and a phone, and a phone
+/// is asleep essentially always. Warning about the phone on every run is how a
+/// line stops being read before the day it has something to say.
+async fn sweep_boards(
+    port: u16,
+    local_device: &str,
+    edge: Option<&comet_proto::EdgeHealth>,
+) -> Result<comet_board::doctor::Peers> {
+    let client: RpcClient = connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
+    let devices: Vec<comet_proto::Device> = {
+        let mut stream = tokio::time::timeout(
+            FETCH_TIMEOUT,
+            client.subscribe(methods::WATCH_DEVICES, serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out listing devices"))??;
+        let snapshot = stream
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("WatchDevices stream ended before a snapshot"))?;
+        serde_json::from_value(snapshot)?
+    };
+
+    let now = chrono::Utc::now();
+    let deadline = tokio::time::Instant::now() + SWEEP_BUDGET;
+    let mut peers = comet_board::doctor::Peers::default();
+    for device in devices.iter().filter(|d| d.id != local_device) {
+        peers.asked += 1;
+        // Gathered before the call, like gh#155's candidates: a device that
+        // says nothing cannot tell you whether it was expected to answer.
+        let present = matches!(
+            comet_proto::view::host_presence(false, device.last_seen_at, edge, now),
+            comet_proto::view::HostPresence::Online
+        );
+        let name = if device.name.is_empty() {
+            device.id.clone()
+        } else {
+            device.name.clone()
+        };
+        let answer = tokio::time::timeout_at(
+            deadline,
+            client.call(
+                methods::READ_BOARD_CONFIG,
+                serde_json::json!({ "targetDeviceId": device.id }),
+            ),
+        )
+        .await;
+        match answer {
+            Ok(Ok(reply)) => peers.boards.push(peer_board(name, &reply)),
+            // Answered, and the answer is "no board here".
+            Ok(Err(e)) if hosts_no_board(&e) => {}
+            // Never landed, or the budget ran out before it could.
+            Ok(Err(_)) | Err(_) => {
+                if present {
+                    peers.unreachable.push(name);
+                }
+            }
+        }
+    }
+    Ok(peers)
+}
+
+/// One peer's [`comet_board::doctor::PeerBoard`], from its `ReadBoardConfig`
+/// reply.
+///
+/// A reply whose `config` is absent is a board whose `routing.toml` does not
+/// parse — reported as unknown rather than as empty, because "polls nothing"
+/// would rule out a collision this cannot see.
+fn peer_board(device: String, reply: &serde_json::Value) -> comet_board::doctor::PeerBoard {
+    let config = reply
+        .get("routing")
+        .and_then(|r| r.get("config"))
+        .and_then(|c| serde_json::from_value::<comet_board::config::RoutingConfig>(c.clone()).ok());
+    match config {
+        Some(cfg) => comet_board::doctor::PeerBoard {
+            device,
+            repos: cfg.github.repos.clone(),
+            linear_teams: cfg
+                .linear_teams()
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
+            unparsed: false,
+        },
+        None => comet_board::doctor::PeerBoard {
+            device,
+            repos: Vec::new(),
+            linear_teams: Vec::new(),
+            unparsed: true,
+        },
+    }
+}
+
 /// What one loopback conversation with the local engine yields.
 ///
 /// A struct rather than a tuple because doctor wants nearly all of it and the
@@ -1492,4 +1631,74 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
     tokio::time::timeout(FETCH_TIMEOUT, fetch)
         .await
         .map_err(|_| anyhow::anyhow!("timed out after {}s", FETCH_TIMEOUT.as_secs()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two halves of gh#155's rule, on the verb this sweep uses: a refusal
+    /// is the device's own answer, and a dead connection is not an answer at
+    /// all.
+    #[test]
+    fn a_refusal_rules_a_device_out_and_a_dead_link_does_not() {
+        assert!(hosts_no_board(&comet_rpc::RpcError::Refused(
+            "board unavailable".into()
+        )));
+        assert!(hosts_no_board(&comet_rpc::RpcError::UnknownMethod(
+            "ReadBoardConfig".into()
+        )));
+        assert!(!hosts_no_board(&comet_rpc::RpcError::Transport(
+            "relay 500".into()
+        )));
+        assert!(!hosts_no_board(&comet_rpc::RpcError::Closed));
+    }
+
+    /// What the box would answer: its `routing.toml`, parsed, with the repos it
+    /// polls and the Linear teams its routes match on.
+    #[test]
+    fn a_peers_reply_carries_what_that_board_polls() {
+        let reply = serde_json::json!({
+            "routing": {
+                "path": "/home/comet/.comet-native/board/routing.toml",
+                "exists": true,
+                "text": "",
+                "config": {
+                    "github": { "repos": ["tally/Tally", "tally/oppgang"] },
+                    "route": [{
+                        "match": { "linear_team": "AGE" },
+                        "workspace": "tally",
+                        "repo": "/home/comet/code/tally",
+                        "runtime": "claude-code",
+                    }],
+                },
+                "problems": [],
+                "backup": false,
+            },
+            "unadopted": [],
+        });
+        let board = peer_board("box".into(), &reply);
+        assert!(!board.unparsed);
+        assert_eq!(board.repos, ["tally/Tally", "tally/oppgang"]);
+        assert_eq!(board.linear_teams, ["AGE"]);
+    }
+
+    /// A peer whose config did not parse answers without one. "Polls nothing"
+    /// would rule out a collision this cannot see, so it is unknown instead.
+    #[test]
+    fn a_peer_with_no_parse_is_unknown_rather_than_empty() {
+        let reply = serde_json::json!({
+            "routing": {
+                "path": "/home/comet/.comet-native/board/routing.toml",
+                "exists": true,
+                "text": "[[route]\n",
+                "problems": ["routing.toml does not parse"],
+                "backup": false,
+            },
+            "unadopted": [],
+        });
+        let board = peer_board("box".into(), &reply);
+        assert!(board.unparsed);
+        assert!(board.repos.is_empty());
+    }
 }
