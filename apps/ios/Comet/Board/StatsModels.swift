@@ -138,11 +138,134 @@ struct Friction: Decodable, Hashable {
     }
 }
 
+// MARK: - Spend (gh#182)
+//
+// The board counts tokens; these are what it costs. Two facts, kept apart on
+// purpose: the LIST PRICE of what the board ran (its own number, summed over
+// the models it could price) and the SUBSCRIPTIONS behind that work (per
+// account, entered by a person). They are never added together — on a box
+// carrying several teammates' slots, one "cost" field would be summing other
+// people's bills and calling it the board's spend.
+//
+// Amounts arrive as plain dollars. The rate arithmetic itself is the box's
+// (`comet_board::prices`); this side only reads and phrases the result.
+
+/// What one model costs per million tokens, in each of the four buckets
+/// `TokenUsage` counts. Four rates and not one: a cache read is a tenth of
+/// fresh input and a cache write a premium on it, and an agent replaying a long
+/// context every turn is overwhelmingly cache reads.
+struct ModelRate: Decodable, Hashable {
+    var input: Double
+    var output: Double
+    var cacheRead: Double
+    var cacheWrite: Double
+}
+
+/// One model's tokens, priced — with the rate it was priced at, because a
+/// figure with no provenance is one nobody can check.
+struct ModelSpend: Decodable, Hashable, Identifiable {
+    var id: String { label }
+    /// The model as the run reported it.
+    var label: String
+    /// The table row that priced it — shorter than `label` when a dated model
+    /// id priced off its family.
+    var rateKey: String
+    /// `builtin` (the dated table inside the box's binary) or `config` (an
+    /// override in its `routing.toml`).
+    var source: String
+    var rate: ModelRate
+    var usage: TokenUsage
+    var cost: Double
+}
+
+/// A plan a human wrote down: what an agent account costs its owner per month.
+struct AccountPlan: Decodable, Hashable {
+    var label: String?
+    var monthly: Double
+}
+
+/// What one account's work would have cost at the meter, beside what its
+/// subscription actually costs. Never one number: see the section note.
+struct AccountSpend: Decodable, Hashable, Identifiable {
+    var id: String { label }
+    var label: String
+    var attempts: Int
+    var usage: TokenUsage
+    var listPrice: Double
+    var unpricedTokens: UInt64
+    /// `nil` is unconfigured, and not zero — comet never sees anybody's bill.
+    var plan: AccountPlan?
+    /// The plan's share of this window. `nil` for an all-time window, which
+    /// cannot be pro-rated, or an unconfigured plan.
+    var planInWindow: Double?
+
+    /// How far the subscription carried it: list price as a multiple of what
+    /// the plan cost over the same window. `nil` when either half is missing or
+    /// the plan is free — a ratio against zero is not a number.
+    /// Mirrors `stats::AccountSpend::subsidy`.
+    var subsidy: Double? {
+        guard let plan = planInWindow, plan != 0 else { return nil }
+        return listPrice / plan
+    }
+}
+
+/// The rate set a figure was computed from — the date included, because a
+/// price list is a snapshot and a page that hid its age would be implying
+/// freshness it does not have.
+struct RateTable: Decodable, Hashable {
+    /// `YYYY-MM-DD`, when the shipped half was last checked against published
+    /// pricing.
+    var asOf: String
+    var entries: [String: ModelRate]
+    /// Which of those the box's `routing.toml` overrode.
+    var overridden: [String]
+}
+
+/// What the window cost.
+struct BoardSpend: Decodable, Hashable {
+    var rates: RateTable
+    var listPrice: Double
+    var byModel: [ModelSpend]
+    /// Models with tokens and no rate. Present, never folded into the total: a
+    /// breakdown that dropped what it could not price would not add up to the
+    /// token counts on the same screen.
+    var unpriced: [TokenTally]
+    var unpricedTokens: UInt64
+    var accounts: [AccountSpend]
+
+    /// Did every metered model have a rate?
+    /// Mirrors `stats::BoardSpend::is_complete`.
+    var isComplete: Bool { unpriced.isEmpty }
+
+    /// Any money to show at all.
+    /// Mirrors `stats::BoardSpend::has_price`.
+    var hasPrice: Bool { !byModel.isEmpty }
+
+    /// The headline, said once — with what it could not account for attached
+    /// rather than left implied.
+    /// Mirrors `stats::BoardSpend::headline`.
+    var headline: String {
+        let price = humanUsd(listPrice)
+        if isComplete { return "\(price) at list price" }
+        return "\(price) at list price, plus \(humanTokens(unpricedTokens)) "
+            + "unpriced token(s) across \(unpriced.count) model(s)"
+    }
+
+    /// What the operator pays per month across every account with a plan.
+    /// Their plans, not the board's spend.
+    /// Mirrors `stats::BoardSpend::monthly_subscriptions`.
+    var monthlySubscriptions: Double {
+        accounts.compactMap { $0.plan?.monthly }.reduce(0, +)
+    }
+}
+
 /// Everything the board can say about its own throughput over a window.
 ///
 /// Strictly decoded — no per-field defaults. A field whose name skewed would
 /// otherwise arrive as a zero and read as a real one; the screen says
-/// "unreadable" instead, which is the truth.
+/// "unreadable" instead, which is the truth. `spend` is the one exception and
+/// for the opposite reason: absent *is* a state, and it means "rates not
+/// configured".
 struct BoardStats: Decodable, Hashable {
     /// The window these numbers cover, in days. `nil` means everything.
     var sinceDays: Int64?
@@ -187,11 +310,39 @@ struct BoardStats: Decodable, Hashable {
 
     var tokensByModel: [String: TokenUsage]
     var tokensByRuntime: [String: TokenUsage]
+    /// Tokens by whose subscription paid for them. `byAccount` says who ran how
+    /// many attempts; this says what those attempts spent.
+    var tokensByAccount: [String: TokenUsage]
+
+    /// What it cost, and what the plans behind it cost (gh#182). `nil` is
+    /// **rates not configured** — a state said out loud rather than drawn as a
+    /// confident `$0.00`. A board that was given rates and simply spent nothing
+    /// arrives with a `spend` whose total is zero, and those are different
+    /// facts.
+    var spend: BoardSpend?
 
     /// Whether any attempt in the window reported tokens — the gate the token
     /// half of the screen renders behind. A wall of zeroes would say the work
     /// was free rather than that it was never metered.
     var hasTokens: Bool { attemptsWithTokens > 0 }
+
+    /// Is there a priced figure to show? False covers both halves of "no": no
+    /// rates at all, and rates that matched none of the models this window ran.
+    /// Mirrors `stats::BoardStats::has_spend`.
+    var hasSpend: Bool { spend?.hasPrice ?? false }
+
+    /// The sentence the money half leads with — including the two ways there is
+    /// no number, which are the ones worth saying out loud.
+    /// Mirrors `stats::BoardStats::spend_label`.
+    var spendLabel: String {
+        guard let spend else { return "rates not configured" }
+        if spend.hasPrice { return spend.headline }
+        if spend.unpricedTokens > 0 {
+            return "no rate for any model in this window "
+                + "(\(humanTokens(spend.unpricedTokens)) unpriced token(s))"
+        }
+        return "nothing metered to price"
+    }
 
     /// Nothing ran. Distinct from "nothing finished".
     var isEmpty: Bool { attempts == 0 }
@@ -265,6 +416,20 @@ func humanTokens(_ tokens: UInt64) -> String {
     if tokens >= 10 * thousand { return String(format: "%.0fk", value / Double(thousand)) }
     if tokens >= thousand { return String(format: "%.1fk", value / Double(thousand)) }
     return "\(tokens)"
+}
+
+/// An amount as a screen shows it: `$0.0042`, `$1.32`, `$248`.
+///
+/// Three tiers. Cents is the default scale money is read at; over a hundred
+/// dollars they are noise on a figure nobody acts on to the cent, and under one
+/// cent they are the difference between a real amount and a `$0.00` that reads
+/// as free — which is the thing the whole spend half is designed against.
+/// Mirrors `rates::human_usd`.
+func humanUsd(_ dollars: Double) -> String {
+    let abs = Swift.abs(dollars)
+    if abs >= 100 { return String(format: "$%.0f", dollars) }
+    if abs >= 0.01 || abs == 0 { return String(format: "$%.2f", dollars) }
+    return String(format: "$%.4f", dollars)
 }
 
 /// A bar's share of its chart, `0...1`, scaled against the largest bucket —

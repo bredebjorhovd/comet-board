@@ -8,10 +8,11 @@
 //!
 //! Deliberately descriptive. It reports what happened; it does not grade it.
 
-use crate::config::Paths;
+use crate::config::{Paths, RoutingConfig};
 use crate::db::Db;
 use crate::log::Logger;
 use crate::model::{Attempt, Outcome, Task};
+use crate::prices::Prices;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,9 +21,17 @@ use std::sync::Arc;
 /// reply without linking this crate (the [`crate::runtime::RuntimeOption`]
 /// split, for the same reason). What it *contains* is this module's.
 pub use comet_proto::TokenUsage;
+pub use comet_proto::view::rates::human_usd;
 pub use comet_proto::view::stats::{
     BoardStats as Stats, DayBucket, Friction, Landing, TokenDay, human_tokens,
 };
+
+/// Whose subscription a dispatch that named no slot spent (gh#101).
+///
+/// Said out loud rather than left blank: work that quietly ran on the box
+/// owner's plan is exactly the row the billing guard exists for, and
+/// "unattributed" would hide it.
+pub const THE_BOX: &str = "the box's own login";
 
 fn minutes(a: &Attempt) -> Option<i64> {
     let start = chrono::DateTime::parse_from_rfc3339(&a.started_at).ok()?;
@@ -108,7 +117,22 @@ fn token_day_series(days: &[String], counts: &BTreeMap<String, TokenUsage>) -> V
         .collect()
 }
 
+/// The window's numbers, unpriced.
+///
+/// Kept for callers that have no rates to hand and want the throughput half —
+/// the spend is `None`, which every surface reads as "rates not configured"
+/// rather than as free work. Anything that *has* a config calls
+/// [`gather_priced`] instead.
 pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
+    gather_with(tasks, since_days, None)
+}
+
+/// The same, priced at `prices` (gh#182).
+pub fn gather_priced(tasks: &[Task], since_days: Option<i64>, prices: &Prices) -> Stats {
+    gather_with(tasks, since_days, Some(prices))
+}
+
+fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>) -> Stats {
     let attempts: Vec<(&Task, &Attempt)> = tasks
         .iter()
         .flat_map(|t| t.attempts.iter().map(move |a| (t, a)))
@@ -134,6 +158,12 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
     let mut attempts_with_tokens = 0usize;
     let mut tokens_by_model: BTreeMap<String, TokenUsage> = BTreeMap::new();
     let mut tokens_by_runtime: BTreeMap<String, TokenUsage> = BTreeMap::new();
+    let mut tokens_by_account: BTreeMap<String, TokenUsage> = BTreeMap::new();
+    // Tokens per (payer, model), which is what makes the per-account price
+    // exact (gh#182): an account's spend is priced with the rates of the models
+    // it actually ran, never at a board-wide average. Not on `Stats` itself —
+    // it is arithmetic on the way to a figure, not a fact a page renders.
+    let mut tokens_by_account_model: BTreeMap<(String, String), TokenUsage> = BTreeMap::new();
 
     for (task, a) in &attempts {
         match a.outcome {
@@ -148,11 +178,8 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         // Whose subscription it spent (gh#101). A dispatch that named no slot
         // ran on the box's own login, and saying so is the point of the row —
         // "unattributed" would hide exactly the case the guard exists for.
-        let payer = a
-            .billed_to
-            .clone()
-            .unwrap_or_else(|| "the box's own login".to_string());
-        *by_account.entry(payer).or_default() += 1;
+        let payer = a.billed_to.clone().unwrap_or_else(|| THE_BOX.to_string());
+        *by_account.entry(payer.clone()).or_default() += 1;
         // An agent, by either name it can be known under. Counting only
         // `dispatched_by` counted only agents the board itself dispatched,
         // which is the one kind that almost never does the dispatching — so
@@ -177,9 +204,19 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
             tokens.add(usage);
             attempts_with_tokens += 1;
             let model = a.model.clone().unwrap_or_else(|| "unnamed model".into());
-            tokens_by_model.entry(model).or_default().add(usage);
+            tokens_by_model.entry(model.clone()).or_default().add(usage);
             tokens_by_runtime
                 .entry(a.runtime.clone())
+                .or_default()
+                .add(usage);
+            // And the same split by payer (gh#182) — the counts above say who
+            // ran how many attempts, these say what those attempts spent.
+            tokens_by_account
+                .entry(payer.clone())
+                .or_default()
+                .add(usage);
+            tokens_by_account_model
+                .entry((payer, model))
                 .or_default()
                 .add(usage);
         }
@@ -236,6 +273,17 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
 
     let calendar = day_range(&days, since_days);
 
+    // What it cost (gh#182). `None` when the caller had no rates to price with,
+    // which every surface says out loud rather than drawing as $0.00.
+    let spend = prices.and_then(|p| {
+        p.spend(
+            &tokens_by_model,
+            &by_account,
+            &tokens_by_account_model,
+            since_days,
+        )
+    });
+
     Stats {
         since_days,
         attempts: attempts.len(),
@@ -266,14 +314,23 @@ pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
         by_source,
         by_account,
         agent_dispatched,
+        spend,
         tokens_by_model,
         tokens_by_runtime,
+        tokens_by_account,
     }
 }
 
 pub fn run(paths: &Paths, _log: Arc<Logger>, since_days: Option<i64>) -> Result<Stats> {
     let db = Db::open(&paths.db())?;
-    Ok(gather(&db.load_tasks()?, since_days))
+    // Priced with whatever this box's config says (gh#182). A `routing.toml`
+    // that will not parse is not a reason to refuse the throughput numbers —
+    // it costs the spend half, which then reports itself as unconfigured, and
+    // `doctor` is where a broken config gets named.
+    let prices = RoutingConfig::load_unvalidated(&paths.routing())
+        .map(|cfg| Prices::from_config(&cfg))
+        .unwrap_or_else(|_| Prices::builtin());
+    Ok(gather_priced(&db.load_tasks()?, since_days, &prices))
 }
 
 pub fn print(s: &Stats) {
@@ -335,6 +392,70 @@ pub fn print(s: &Stats) {
     } else {
         println!("  no attempt in this window reported token usage");
     }
+    // What that cost, at list price (gh#182) — and, when the rates could not
+    // price everything, what the figure leaves out. Never a bare total: a
+    // number that silently dropped a model is the one failure this half of the
+    // page is designed against.
+    match &s.spend {
+        None => {
+            println!("  no model rates configured, so nothing is priced (see `[defaults.rates]`)")
+        }
+        Some(spend) if spend.has_price() => {
+            println!(
+                "  {} at list price ({})",
+                human_usd(spend.list_price),
+                spend.rates.provenance()
+            );
+            for row in spend.by_model.iter().take(4) {
+                println!(
+                    "    {} {} on {}",
+                    human_usd(row.cost),
+                    human_tokens(row.usage.total()),
+                    row.label
+                );
+            }
+            if !spend.is_complete() {
+                println!(
+                    "    {} token(s) on {} model(s) with no rate, and so not in that total: {}",
+                    human_tokens(spend.unpriced_tokens),
+                    spend.unpriced.len(),
+                    spend
+                        .unpriced
+                        .iter()
+                        .map(|t| t.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            // The second, separate fact: what the plans behind that work cost.
+            // Never summed with the figure above — one is the board's, the
+            // other is one person's.
+            for account in spend.accounts.iter().filter(|a| a.plan.is_some()) {
+                let plan = account.plan.as_ref().expect("filtered");
+                let name = plan.label.as_deref().unwrap_or("subscription");
+                match (account.plan_in_window, account.subsidy()) {
+                    (Some(window), Some(ratio)) => println!(
+                        "    {}: {} of list price against {} of {} ({name}, {}/month) — {:.0}%",
+                        account.label,
+                        human_usd(account.list_price),
+                        human_usd(window),
+                        s.window_label(),
+                        human_usd(plan.monthly),
+                        ratio * 100.0,
+                    ),
+                    _ => println!(
+                        "    {}: {} of list price, on a {name} at {}/month",
+                        account.label,
+                        human_usd(account.list_price),
+                        human_usd(plan.monthly),
+                    ),
+                }
+            }
+        }
+        // Rates configured, and still no price: every metered model was one
+        // the table has never heard of. `spend_label` is the sentence for it.
+        Some(_) => println!("  {}", s.spend_label()),
+    }
     let line = |label: &str, m: &BTreeMap<String, usize>| {
         if m.len() > 1 {
             let mut v: Vec<_> = m.iter().collect();
@@ -356,6 +477,7 @@ pub fn print(s: &Stats) {
 mod tests {
     use super::*;
     use crate::model::*;
+    use comet_proto::view::rates::Usd;
 
     fn task(id: &str, attempts: Vec<Attempt>) -> Task {
         Task {
@@ -783,6 +905,159 @@ mod tests {
         let t = task("t1", vec![old, recent]);
         assert_eq!(gather(std::slice::from_ref(&t), None).tokens.total(), 10_010);
         assert_eq!(gather(&[t], Some(7)).tokens.total(), 110);
+    }
+
+    // -- spend (gh#182) -----------------------------------------------------
+
+    /// A metered attempt, on a model, billed to somebody.
+    fn spent(minutes_ago: i64, model: &str, billed_to: Option<&str>, usage: TokenUsage) -> Attempt {
+        let mut a = attempt(minutes_ago, 5, Some(Outcome::Done), None);
+        a.model = Some(model.into());
+        a.billed_to = billed_to.map(str::to_string);
+        a.tokens = Some(usage);
+        a
+    }
+
+    #[test]
+    fn a_window_gathered_without_rates_has_no_price_rather_than_a_free_one() {
+        // The unpriced gather is not "everything was free" — it is a caller
+        // that had no rates, and every surface says so in those words.
+        let s = gather(
+            &[task(
+                "t1",
+                vec![spent(30, "claude-opus-5", None, usage(1_000_000, 0, 0, 0))],
+            )],
+            Some(7),
+        );
+        assert_eq!(s.spend, None);
+        assert!(!s.has_spend());
+        assert_eq!(s.spend_label(), "rates not configured");
+    }
+
+    #[test]
+    fn a_priced_window_totals_what_it_can_and_names_what_it_cannot() {
+        let tasks = vec![task(
+            "t1",
+            vec![
+                // Priced by the shipped table, in all four buckets.
+                spent(
+                    60,
+                    "claude-opus-5",
+                    Some("brede@tally.no"),
+                    usage(10_000, 2_000, 1_000_000, 20_000),
+                ),
+                // And a model the table has never heard of.
+                spent(
+                    50,
+                    "gpt-5.6-terra",
+                    Some("brede@tally.no"),
+                    usage(400, 100, 0, 500),
+                ),
+            ],
+        )];
+        let s = gather_priced(&tasks, Some(7), &crate::prices::Prices::builtin());
+        let spend = s.spend.as_ref().expect("rates are configured");
+
+        assert_eq!(spend.list_price, Usd::from_dollars(0.725));
+        assert_eq!(spend.by_model.len(), 1);
+        assert_eq!(spend.unpriced.len(), 1);
+        assert_eq!(spend.unpriced[0].label, "gpt-5.6-terra");
+        assert_eq!(spend.unpriced_tokens, 1_000);
+        assert!(!spend.is_complete());
+        assert!(s.has_spend());
+        // The headline never stands alone while something is missing from it.
+        assert!(s.spend_label().contains("unpriced"), "{}", s.spend_label());
+    }
+
+    #[test]
+    fn tokens_are_split_by_payer_so_a_price_can_be_put_on_each() {
+        let tasks = vec![task(
+            "t1",
+            vec![
+                spent(
+                    60,
+                    "claude-opus-5",
+                    Some("brede@tally.no"),
+                    usage(1_000_000, 0, 0, 0),
+                ),
+                spent(
+                    50,
+                    "claude-haiku-4-5",
+                    Some("ana@example.com"),
+                    usage(1_000_000, 0, 0, 0),
+                ),
+                // A dispatch that named no slot ran on the box's own login,
+                // which is a payer with a name rather than a blank.
+                spent(40, "claude-opus-5", None, usage(200_000, 0, 0, 0)),
+            ],
+        )];
+        let s = gather_priced(&tasks, Some(30), &crate::prices::Prices::builtin());
+
+        assert_eq!(s.tokens_by_account["brede@tally.no"].total(), 1_000_000);
+        assert_eq!(s.tokens_by_account[THE_BOX].total(), 200_000);
+        assert_eq!(
+            s.tokens_by_account.values().map(|u| u.total()).sum::<u64>(),
+            s.tokens.total(),
+            "the split accounts for the headline"
+        );
+
+        let spend = s.spend.as_ref().expect("rates are configured");
+        let by = |who: &str| {
+            spend
+                .accounts
+                .iter()
+                .find(|a| a.label == who)
+                .unwrap_or_else(|| panic!("{who}"))
+                .list_price
+        };
+        // Each account is priced at the rates of the models IT ran — the whole
+        // reason the split is kept by (payer, model) rather than by payer.
+        assert_eq!(by("brede@tally.no"), Usd::from_dollars(5.0));
+        assert_eq!(by("ana@example.com"), Usd::from_dollars(1.0));
+        assert_eq!(by(THE_BOX), Usd::from_dollars(1.0));
+        assert_eq!(
+            spend.accounts.iter().map(|a| a.list_price).sum::<Usd>(),
+            spend.list_price,
+            "the account rows add up to the headline"
+        );
+    }
+
+    /// The two facts stay two facts: what the board ran, and what somebody
+    /// pays for the plan it ran on.
+    #[test]
+    fn a_configured_plan_is_reported_beside_the_price_and_never_inside_it() {
+        let cfg: crate::config::RoutingConfig = toml::from_str(
+            r#"
+[account."8f2c1d0a7b6e4539"]
+email = "brede@tally.no"
+plan = "Claude Max 20x"
+monthly_usd = 200
+"#,
+        )
+        .expect("parses");
+        let prices = crate::prices::Prices::from_config(&cfg);
+        let tasks = vec![task(
+            "t1",
+            vec![spent(
+                30,
+                "claude-opus-5",
+                Some("brede@tally.no"),
+                usage(4_000_000, 0, 0, 0),
+            )],
+        )];
+        let s = gather_priced(&tasks, Some(30), &prices);
+        let spend = s.spend.as_ref().expect("rates are configured");
+        let row = &spend.accounts[0];
+
+        assert_eq!(row.list_price, Usd::from_dollars(20.0));
+        assert_eq!(
+            row.plan.as_ref().and_then(|p| p.label.clone()).as_deref(),
+            Some("Claude Max 20x")
+        );
+        assert_eq!(row.plan_in_window, Some(Usd::from_dollars(200.0)));
+        assert_eq!(row.subsidy(), Some(0.1), "a tenth of what the plan cost");
+        // And the plan is nowhere in the board's own figure.
+        assert_eq!(spend.list_price, Usd::from_dollars(20.0));
     }
 
     #[test]

@@ -31,10 +31,12 @@
       "expect": {
         "completionPercent": null,
         "coveragePercent": null,
+        "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
         "peakDispatches": 0,
         "peakTokens": 0,
+        "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 7 days"
       },
@@ -94,6 +96,7 @@
         "outcomes": {},
         "p90Minutes": null,
         "sinceDays": 7,
+        "spend": null,
         "tasksTouched": 0,
         "tokenCoverage": null,
         "tokens": {
@@ -102,6 +105,7 @@
           "inputTokens": 0,
           "outputTokens": 0
         },
+        "tokensByAccount": {},
         "tokensByModel": {},
         "tokensByRuntime": {},
         "totalMinutes": 0
@@ -111,10 +115,12 @@
       "expect": {
         "completionPercent": null,
         "coveragePercent": null,
+        "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
         "peakDispatches": 0,
         "peakTokens": 0,
+        "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "all time"
       },
@@ -174,6 +180,7 @@
         "outcomes": {},
         "p90Minutes": null,
         "sinceDays": null,
+        "spend": null,
         "tasksTouched": 0,
         "tokenCoverage": null,
         "tokens": {
@@ -182,6 +189,7 @@
           "inputTokens": 0,
           "outputTokens": 0
         },
+        "tokensByAccount": {},
         "tokensByModel": {},
         "tokensByRuntime": {},
         "totalMinutes": 0
@@ -191,10 +199,12 @@
       "expect": {
         "completionPercent": null,
         "coveragePercent": null,
+        "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
         "peakDispatches": 0,
         "peakTokens": 0,
+        "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 24 hours"
       },
@@ -254,6 +264,7 @@
         "outcomes": {},
         "p90Minutes": null,
         "sinceDays": 1,
+        "spend": null,
         "tasksTouched": 0,
         "tokenCoverage": null,
         "tokens": {
@@ -262,6 +273,7 @@
           "inputTokens": 0,
           "outputTokens": 0
         },
+        "tokensByAccount": {},
         "tokensByModel": {},
         "tokensByRuntime": {},
         "totalMinutes": 0
@@ -271,10 +283,12 @@
       "expect": {
         "completionPercent": null,
         "coveragePercent": "0%",
+        "hasSpend": false,
         "hasTokens": false,
         "isEmpty": false,
         "peakDispatches": 0,
         "peakTokens": 0,
+        "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 30 days"
       },
@@ -334,6 +348,7 @@
         "outcomes": {},
         "p90Minutes": null,
         "sinceDays": 30,
+        "spend": null,
         "tasksTouched": 0,
         "tokenCoverage": 0.0,
         "tokens": {
@@ -342,6 +357,7 @@
           "inputTokens": 0,
           "outputTokens": 0
         },
+        "tokensByAccount": {},
         "tokensByModel": {},
         "tokensByRuntime": {},
         "totalMinutes": 0
@@ -351,10 +367,12 @@
       "expect": {
         "completionPercent": "82%",
         "coveragePercent": "62%",
+        "hasSpend": false,
         "hasTokens": true,
         "isEmpty": false,
         "peakDispatches": 8,
         "peakTokens": 440,
+        "spendLabel": "rates not configured",
         "tokenTotal": 185000,
         "windowLabel": "last 7 days"
       },
@@ -478,6 +496,7 @@
         "outcomes": {},
         "p90Minutes": 74,
         "sinceDays": 7,
+        "spend": null,
         "tasksTouched": 11,
         "tokenCoverage": 0.6153846153846154,
         "tokens": {
@@ -485,6 +504,341 @@
           "cacheReadTokens": 148000,
           "inputTokens": 9400,
           "outputTokens": 6100
+        },
+        "tokensByAccount": {},
+        "tokensByModel": {
+          "claude-opus-5": {
+            "cacheCreationTokens": 21000,
+            "cacheReadTokens": 148000,
+            "inputTokens": 9000,
+            "outputTokens": 6000
+          },
+          "gpt-5.6-terra": {
+            "cacheCreationTokens": 500,
+            "cacheReadTokens": 0,
+            "inputTokens": 400,
+            "outputTokens": 100
+          }
+        },
+        "tokensByRuntime": {},
+        "totalMinutes": 351
+      }
+    },
+    {
+      "expect": {
+        "completionPercent": "82%",
+        "coveragePercent": "62%",
+        "hasSpend": true,
+        "hasTokens": true,
+        "isEmpty": false,
+        "peakDispatches": 8,
+        "peakTokens": 440,
+        "spendLabel": "$0.40 at list price, plus 1.0k unpriced token(s) across 1 model(s)",
+        "tokenTotal": 185000,
+        "windowLabel": "last 7 days"
+      },
+      "name": "a busy week, priced",
+      "stats": {
+        "agentDispatched": 5,
+        "attempts": 13,
+        "attemptsWithTokens": 8,
+        "byAccount": {
+          "ana@example.com": 2,
+          "brede@tally.no": 11
+        },
+        "byRuntime": {
+          "claude-code": 10,
+          "codex": 3
+        },
+        "bySource": {},
+        "byWorkspace": {
+          "comet-native": 9,
+          "edge": 4
+        },
+        "completionRate": 0.8181818181818182,
+        "daily": [
+          {
+            "date": "2026-08-03",
+            "dispatches": 2,
+            "done": 2
+          },
+          {
+            "date": "2026-08-04",
+            "dispatches": 0,
+            "done": 0
+          },
+          {
+            "date": "2026-08-05",
+            "dispatches": 8,
+            "done": 5
+          },
+          {
+            "date": "2026-08-06",
+            "dispatches": 3,
+            "done": 3
+          }
+        ],
+        "dailyTokens": [
+          {
+            "date": "2026-08-03",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 100,
+              "outputTokens": 10
+            }
+          },
+          {
+            "date": "2026-08-04",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 0,
+              "outputTokens": 0
+            }
+          },
+          {
+            "date": "2026-08-05",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 400,
+              "outputTokens": 40
+            }
+          },
+          {
+            "date": "2026-08-06",
+            "usage": {
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "inputTokens": 50,
+              "outputTokens": 5
+            }
+          }
+        ],
+        "friction": {
+          "blockedEntries": 4,
+          "earlySettles": 1,
+          "overruns": 1,
+          "retriedTasks": 3
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 1,
+          "merged": 7,
+          "noPr": 1,
+          "open": 2
+        },
+        "live": 2,
+        "longestMinutes": null,
+        "medianMinutes": 18,
+        "outcomes": {},
+        "p90Minutes": 74,
+        "sinceDays": 7,
+        "spend": {
+          "accounts": [
+            {
+              "attempts": 11,
+              "label": "brede@tally.no",
+              "listPrice": 0.40025,
+              "plan": {
+                "label": "Claude Max 20x",
+                "monthly": 200.0
+              },
+              "planInWindow": 46.666667,
+              "unpricedTokens": 0,
+              "usage": {
+                "cacheCreationTokens": 21000,
+                "cacheReadTokens": 148000,
+                "inputTokens": 9000,
+                "outputTokens": 6000
+              }
+            },
+            {
+              "attempts": 2,
+              "label": "ana@example.com",
+              "listPrice": 0.0,
+              "plan": null,
+              "planInWindow": null,
+              "unpricedTokens": 1000,
+              "usage": {
+                "cacheCreationTokens": 500,
+                "cacheReadTokens": 0,
+                "inputTokens": 400,
+                "outputTokens": 100
+              }
+            }
+          ],
+          "byModel": [
+            {
+              "cost": 0.40025,
+              "label": "claude-opus-5",
+              "rate": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "rateKey": "claude-opus-5",
+              "source": "builtin",
+              "usage": {
+                "cacheCreationTokens": 21000,
+                "cacheReadTokens": 148000,
+                "inputTokens": 9000,
+                "outputTokens": 6000
+              }
+            }
+          ],
+          "listPrice": 0.40025,
+          "rates": {
+            "asOf": "2026-06-24",
+            "entries": {
+              "claude-fable-5": {
+                "cacheRead": 1.0,
+                "cacheWrite": 12.5,
+                "input": 10.0,
+                "output": 50.0
+              },
+              "claude-haiku-4-5": {
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25,
+                "input": 1.0,
+                "output": 5.0
+              },
+              "claude-mythos-5": {
+                "cacheRead": 1.0,
+                "cacheWrite": 12.5,
+                "input": 10.0,
+                "output": 50.0
+              },
+              "claude-opus-4-0": {
+                "cacheRead": 1.5,
+                "cacheWrite": 18.75,
+                "input": 15.0,
+                "output": 75.0
+              },
+              "claude-opus-4-1": {
+                "cacheRead": 1.5,
+                "cacheWrite": 18.75,
+                "input": 15.0,
+                "output": 75.0
+              },
+              "claude-opus-4-5": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-6": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-7": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-8": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-5": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-sonnet-4-0": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-4-5": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-4-6": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-5": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              }
+            },
+            "overridden": []
+          },
+          "unpriced": [
+            {
+              "label": "gpt-5.6-terra",
+              "usage": {
+                "cacheCreationTokens": 500,
+                "cacheReadTokens": 0,
+                "inputTokens": 400,
+                "outputTokens": 100
+              }
+            }
+          ],
+          "unpricedTokens": 1000
+        },
+        "tasksTouched": 11,
+        "tokenCoverage": 0.6153846153846154,
+        "tokens": {
+          "cacheCreationTokens": 21500,
+          "cacheReadTokens": 148000,
+          "inputTokens": 9400,
+          "outputTokens": 6100
+        },
+        "tokensByAccount": {
+          "ana@example.com": {
+            "cacheCreationTokens": 500,
+            "cacheReadTokens": 0,
+            "inputTokens": 400,
+            "outputTokens": 100
+          },
+          "brede@tally.no": {
+            "cacheCreationTokens": 21000,
+            "cacheReadTokens": 148000,
+            "inputTokens": 9000,
+            "outputTokens": 6000
+          }
         },
         "tokensByModel": {
           "claude-opus-5": {
@@ -502,6 +856,203 @@
         },
         "tokensByRuntime": {},
         "totalMinutes": 351
+      }
+    },
+    {
+      "expect": {
+        "completionPercent": null,
+        "coveragePercent": "100%",
+        "hasSpend": false,
+        "hasTokens": true,
+        "isEmpty": false,
+        "peakDispatches": 0,
+        "peakTokens": 0,
+        "spendLabel": "no rate for any model in this window (1.0k unpriced token(s))",
+        "tokenTotal": 1000,
+        "windowLabel": "last 7 days"
+      },
+      "name": "rates configured, nothing priceable",
+      "stats": {
+        "agentDispatched": 0,
+        "attempts": 2,
+        "attemptsWithTokens": 2,
+        "byAccount": {},
+        "byRuntime": {},
+        "bySource": {},
+        "byWorkspace": {},
+        "completionRate": null,
+        "daily": [],
+        "dailyTokens": [],
+        "friction": {
+          "blockedEntries": 0,
+          "earlySettles": 0,
+          "overruns": 0,
+          "retriedTasks": 0
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "landing": {
+          "closedUnmerged": 0,
+          "merged": 0,
+          "noPr": 0,
+          "open": 0
+        },
+        "live": 0,
+        "longestMinutes": null,
+        "medianMinutes": null,
+        "outcomes": {},
+        "p90Minutes": null,
+        "sinceDays": 7,
+        "spend": {
+          "accounts": [],
+          "byModel": [],
+          "listPrice": 0.0,
+          "rates": {
+            "asOf": "2026-06-24",
+            "entries": {
+              "claude-fable-5": {
+                "cacheRead": 1.0,
+                "cacheWrite": 12.5,
+                "input": 10.0,
+                "output": 50.0
+              },
+              "claude-haiku-4-5": {
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25,
+                "input": 1.0,
+                "output": 5.0
+              },
+              "claude-mythos-5": {
+                "cacheRead": 1.0,
+                "cacheWrite": 12.5,
+                "input": 10.0,
+                "output": 50.0
+              },
+              "claude-opus-4-0": {
+                "cacheRead": 1.5,
+                "cacheWrite": 18.75,
+                "input": 15.0,
+                "output": 75.0
+              },
+              "claude-opus-4-1": {
+                "cacheRead": 1.5,
+                "cacheWrite": 18.75,
+                "input": 15.0,
+                "output": 75.0
+              },
+              "claude-opus-4-5": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-6": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-7": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-8": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-5": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-sonnet-4-0": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-4-5": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-4-6": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-5": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              }
+            },
+            "overridden": []
+          },
+          "unpriced": [
+            {
+              "label": "gpt-5.6-terra",
+              "usage": {
+                "cacheCreationTokens": 500,
+                "cacheReadTokens": 0,
+                "inputTokens": 400,
+                "outputTokens": 100
+              }
+            }
+          ],
+          "unpricedTokens": 1000
+        },
+        "tasksTouched": 0,
+        "tokenCoverage": 1.0,
+        "tokens": {
+          "cacheCreationTokens": 500,
+          "cacheReadTokens": 0,
+          "inputTokens": 400,
+          "outputTokens": 100
+        },
+        "tokensByAccount": {},
+        "tokensByModel": {
+          "gpt-5.6-terra": {
+            "cacheCreationTokens": 500,
+            "cacheReadTokens": 0,
+            "inputTokens": 400,
+            "outputTokens": 100
+          }
+        },
+        "tokensByRuntime": {},
+        "totalMinutes": 0
       }
     }
   ],
@@ -575,6 +1126,36 @@
     {
       "expect": "2.50B",
       "tokens": 2500000000
+    }
+  ],
+  "humanUsd": [
+    {
+      "dollars": 0.0,
+      "expect": "$0.00"
+    },
+    {
+      "dollars": 0.0042,
+      "expect": "$0.0042"
+    },
+    {
+      "dollars": 0.14,
+      "expect": "$0.14"
+    },
+    {
+      "dollars": 1.316,
+      "expect": "$1.32"
+    },
+    {
+      "dollars": 12.4,
+      "expect": "$12.40"
+    },
+    {
+      "dollars": 248.4,
+      "expect": "$248"
+    },
+    {
+      "dollars": 1234.4,
+      "expect": "$1234"
     }
   ],
   "note": "Generated by crates/proto/src/view/stats.rs (mod spec). Do not hand-edit — run `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`.",

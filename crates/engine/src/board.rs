@@ -446,10 +446,16 @@ fn run_loop(
             // A read like `Detail`: publishes nothing, logs nothing. Opening
             // the stats page is not an event on the board.
             Ok(Msg::Stats { since_days, reply }) => {
+                // Priced with the config the loop is currently running on
+                // (gh#182), so an edited `[defaults.rates]` reaches the page on
+                // the same cycle the rest of a config change does — and a
+                // window is never priced against rates the board has stopped
+                // using.
+                let prices = comet_board::prices::Prices::from_config(&engine.cfg);
                 let result = engine
                     .db
                     .load_tasks()
-                    .map(|tasks| comet_board::stats::gather(&tasks, since_days));
+                    .map(|tasks| comet_board::stats::gather_priced(&tasks, since_days, &prices));
                 let _ = reply.send(result);
             }
             Ok(Msg::Detail { task_id, reply }) => {

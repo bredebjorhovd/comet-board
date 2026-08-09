@@ -305,6 +305,46 @@ pub struct RoutingConfig {
     /// Empty is the single-operator default: every dispatch commits as the box.
     #[serde(default)]
     pub users: BTreeMap<String, String>,
+    /// What each agent-account slot's subscription costs its owner (gh#182),
+    /// keyed by the slot id `doctor` lists — or by the email on it, when that
+    /// is the spelling at hand:
+    ///
+    /// ```toml
+    /// [account."8f2c1d0a7b6e4539"]
+    /// email = "brede@tally.no"
+    /// plan = "Claude Max 20x"
+    /// monthly_usd = 200
+    /// ```
+    ///
+    /// Beside the slot it describes rather than in `[defaults]`, because it is
+    /// not the board's fact: rates are what the board knows about the meter,
+    /// and this is what one person pays for one plan. On a box carrying several
+    /// teammates' slots (gh#59) a single board-wide "subscription cost" would
+    /// be adding up other people's bills and calling the sum the board's spend.
+    ///
+    /// Nothing here is discoverable — comet never sees anybody's invoice — so
+    /// an unconfigured slot is reported as *unknown*, never as free.
+    #[serde(default, rename = "account")]
+    pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+/// One agent account's plan, as its operator wrote it down (gh#182).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AccountConfig {
+    /// The login's email, when the key above is a slot id. What the board
+    /// actually matches against: an attempt records whose subscription it
+    /// spent, and that is an address, never a slot id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// What the plan is called, in the operator's words (`Claude Max 20x`,
+    /// `Team seat`). Free text: comet has no list of plans, and inventing one
+    /// would put words in somebody's mouth about their own bill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// What it costs per month, in US dollars. Pro-rated across the stats
+    /// window it is read against — see [`crate::prices`].
+    #[serde(default)]
+    pub monthly_usd: comet_proto::view::rates::Usd,
 }
 
 /// What the board offers to adopt, and what it has been told to stop offering.
@@ -676,6 +716,91 @@ pub struct Defaults {
     /// See [`crate::billing`].
     #[serde(default = "default_billing_guard")]
     pub billing_guard: String,
+    /// Per-model rate overrides for the spend figures (gh#182), in US dollars
+    /// per million tokens:
+    ///
+    /// ```toml
+    /// [defaults.rates."claude-opus-5"]
+    /// input = 5.0
+    /// output = 25.0
+    /// # cache_read and cache_write are derived from `input` at the published
+    /// # multipliers (0.1x and 1.25x) unless written out here.
+    /// ```
+    ///
+    /// The board ships a dated table of published list prices
+    /// ([`comet_proto::view::rates::builtin`]) and this overrides it, per
+    /// model. Two things need that: a rate the table is missing or wrong about
+    /// — the table is a snapshot and says so — and a negotiated rate, which no
+    /// lookup anywhere would ever know.
+    ///
+    /// Keys are model ids as the *harness* reports them, matched the way the
+    /// table matches: exactly, else by the longest family prefix, so one entry
+    /// covers every dated snapshot of a model.
+    ///
+    /// **Last resort, not first.** A model with no rate is reported unpriced
+    /// rather than free, so an empty table here is an honest board and not a
+    /// broken one.
+    #[serde(default)]
+    pub rates: BTreeMap<String, RateOverride>,
+}
+
+/// One model's rate, as `routing.toml` writes it: dollars per million tokens.
+///
+/// The two cache rates are optional because they are *derivable* — a cache read
+/// is a tenth of fresh input and a five-minute write a quarter more than it,
+/// which is how the shipped table computes its own rows. Writing all four is
+/// for the case where a provider prices them differently; writing two is the
+/// common case, and it cannot be got wrong by fat-fingering a multiplier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateOverride {
+    /// Fresh input, $/million tokens.
+    pub input: comet_proto::view::rates::Usd,
+    /// Output, $/million tokens.
+    pub output: comet_proto::view::rates::Usd,
+    /// Cached input. Omitted = 0.1× `input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<comet_proto::view::rates::Usd>,
+    /// Cache writes. Omitted = 1.25× `input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<comet_proto::view::rates::Usd>,
+}
+
+impl RateOverride {
+    /// This override as a rate, with the cache halves derived where they were
+    /// left out.
+    pub fn rate(&self) -> comet_proto::view::rates::ModelRate {
+        let derived = comet_proto::view::rates::ModelRate::published(
+            self.input.dollars(),
+            self.output.dollars(),
+        );
+        comet_proto::view::rates::ModelRate {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read.unwrap_or(derived.cache_read),
+            cache_write: self.cache_write.unwrap_or(derived.cache_write),
+        }
+    }
+
+    /// What is wrong with this rate, said the way `validate` says everything
+    /// else: a negative price is a typo, and a typo that priced a window at
+    /// minus four dollars would be discovered by somebody reading the page.
+    fn check(&self) -> Result<(), String> {
+        for (field, amount) in [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache_read", self.cache_read.unwrap_or_default()),
+            ("cache_write", self.cache_write.unwrap_or_default()),
+        ] {
+            if amount.micros < 0 {
+                return Err(format!(
+                    "`{field}` is {}, and a rate cannot be negative; write it as dollars per \
+                     million tokens, like `{field} = 5.0`",
+                    amount.dollars()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_billing_guard() -> String {
@@ -749,6 +874,7 @@ impl Default for Defaults {
             retain_build_output: default_retain_build_output(),
             archive_chats: default_archive_chats(),
             billing_guard: default_billing_guard(),
+            rates: BTreeMap::new(),
         }
     }
 }
@@ -1180,6 +1306,33 @@ impl RoutingConfig {
         if let Err(e) = parse_build_retention(&self.defaults.retain_build_output) {
             out.push(format!("[defaults] retain_build_output {e}"));
         }
+        // A rate is money on a page somebody makes decisions on (gh#182), and a
+        // negative or misspelled one would be *believed* — priced totals have
+        // no plausibility check of their own.
+        for (model, rate) in &self.defaults.rates {
+            if model.trim().is_empty() {
+                out.push(
+                    "[defaults.rates] has an entry with an empty model name; the key is the \
+                     model id a run reports, like `[defaults.rates.\"claude-opus-5\"]`"
+                        .to_string(),
+                );
+            }
+            if let Err(e) = rate.check() {
+                out.push(format!("[defaults.rates.\"{model}\"] {e}"));
+            }
+        }
+        // And the same for the other half: a plan cost is what the subsidy
+        // figure is divided by.
+        for (slot, account) in &self.accounts {
+            if account.monthly_usd.micros < 0 {
+                out.push(format!(
+                    "[account.\"{slot}\"] monthly_usd is {}, and a subscription cannot cost \
+                     less than nothing; write what the plan costs per month, like \
+                     `monthly_usd = 200`",
+                    account.monthly_usd.dollars()
+                ));
+            }
+        }
         // `[github] repos` stays the one list of what is polled, so a
         // `[[github.repo]]` naming anything else is settings that apply to
         // nothing — silently, which is the failure this table exists to fix.
@@ -1459,6 +1612,7 @@ pub fn slugify(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use comet_proto::view::rates::Usd;
 
     const SAMPLE: &str = r#"
 [sync]
@@ -1940,6 +2094,116 @@ runtime = "claude"
         .unwrap();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("billing_guard"), "{err}");
+    }
+
+    // ---- what a token costs, and what a plan does (gh#182) ---------------
+
+    #[test]
+    fn a_rate_override_writes_two_numbers_and_derives_the_cache_pair() {
+        let c: RoutingConfig = toml::from_str(
+            r#"
+[defaults.rates."claude-opus-5"]
+input = 4.0
+output = 20.0
+
+[defaults.rates."gpt-5.6-terra"]
+input = 1.25
+output = 10.0
+cache_read = 0.125
+cache_write = 1.25
+"#,
+        )
+        .expect("parses");
+        assert!(c.validate().is_ok());
+
+        // Two numbers, and the cache halves at the published multipliers —
+        // which is how the shipped table computes its own rows, and cannot be
+        // got wrong by fat-fingering a 0.1.
+        let opus = c.defaults.rates["claude-opus-5"].rate();
+        assert_eq!(opus.input, Usd::from_dollars(4.0));
+        assert_eq!(opus.cache_read, Usd::from_dollars(0.4));
+        assert_eq!(opus.cache_write, Usd::from_dollars(5.0));
+        // Four when a provider prices them differently.
+        let gpt = c.defaults.rates["gpt-5.6-terra"].rate();
+        assert_eq!(gpt.cache_read, Usd::from_dollars(0.125));
+        assert_eq!(gpt.cache_write, Usd::from_dollars(1.25));
+
+        // And the board prices with them: the override wins over the shipped
+        // row, and the model the table never heard of is now priceable.
+        let prices = crate::prices::Prices::from_config(&c);
+        assert_eq!(
+            prices.table.rate_for("claude-opus-5").unwrap().rate.input,
+            Usd::from_dollars(4.0)
+        );
+        assert!(prices.table.rate_for("gpt-5.6-terra").is_some());
+    }
+
+    /// Money is believed. A priced page has no plausibility check of its own,
+    /// so a negative rate has to be refused where every other typo is.
+    #[test]
+    fn a_negative_rate_or_plan_is_refused_by_name() {
+        let c: RoutingConfig =
+            toml::from_str("[defaults.rates.\"claude-opus-5\"]\ninput = -5.0\noutput = 25.0\n")
+                .expect("parses");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[defaults.rates.\"claude-opus-5\"]"), "{err}");
+        assert!(err.contains("cannot be negative"), "{err}");
+
+        let c: RoutingConfig =
+            toml::from_str("[account.\"brede@tally.no\"]\nmonthly_usd = -200\n").expect("parses");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[account.\"brede@tally.no\"]"), "{err}");
+    }
+
+    #[test]
+    fn a_plan_is_written_beside_the_slot_it_describes() {
+        let c: RoutingConfig = toml::from_str(
+            r#"
+[account."8f2c1d0a7b6e4539"]
+email = "brede@tally.no"
+plan = "Claude Max 20x"
+monthly_usd = 200
+
+[account."ana@example.com"]
+monthly_usd = 19.99
+"#,
+        )
+        .expect("parses");
+        assert!(c.validate().is_ok());
+        // Written as an integer or with cents — both are amounts a person
+        // types, and refusing one would be a papercut with no upside.
+        assert_eq!(
+            c.accounts["8f2c1d0a7b6e4539"].monthly_usd,
+            Usd::from_dollars(200.0)
+        );
+        assert_eq!(
+            c.accounts["ana@example.com"].monthly_usd,
+            Usd::from_dollars(19.99)
+        );
+        assert_eq!(
+            c.accounts["8f2c1d0a7b6e4539"].email.as_deref(),
+            Some("brede@tally.no")
+        );
+        // A board told nothing knows nothing: unconfigured is not zero.
+        assert!(RoutingConfig::default().accounts.is_empty());
+    }
+
+    /// The board loop rebuilds itself by comparing the config it is running
+    /// against the one on disk (gh#189), so a rate change has to be visible to
+    /// that comparison — a table nobody noticed changing would price the page
+    /// at yesterday's rates until the next restart.
+    #[test]
+    fn a_changed_rate_is_a_changed_config() {
+        let before: RoutingConfig =
+            toml::from_str("[defaults.rates.\"claude-opus-5\"]\ninput = 5.0\noutput = 25.0\n")
+                .unwrap();
+        let after: RoutingConfig =
+            toml::from_str("[defaults.rates.\"claude-opus-5\"]\ninput = 4.0\noutput = 25.0\n")
+                .unwrap();
+        assert_ne!(before, after);
+        let plan: RoutingConfig =
+            toml::from_str("[account.\"brede@tally.no\"]\nmonthly_usd = 200\n").unwrap();
+        assert_ne!(plan, RoutingConfig::default());
     }
 
     // ---- the wall-clock cap (gh#70) --------------------------------------
