@@ -1,6 +1,6 @@
 # 32px single-line rows, right-aligned metadata, one visible verb — **done** (gh#176)
 
-Step 5 of §gh#171, and the only step in it that touches layout rather than
+Step 5 of gh#171, and the only step in it that touches layout rather than
 tokens. Two faults, one row.
 
 - **A third of every ready row was reserved blank.** §gh#132 froze the row at
@@ -42,7 +42,7 @@ its own, so each surface picked for itself — the desktop's `enter` arm, the
 TUI's key table, the phone's single chip. For a blocked row those disagree with
 the action list itself: it leads with `Retry`, but `enter` opens the chat,
 because a blocked agent is alive and waiting for you rather than needing
-replacing (§gh#49).
+replacing (gh#49).
 
 `primary_action` puts the designation beside the set it selects from, and its
 answer is always a member of that set. `secondary_actions` is the remainder, so
