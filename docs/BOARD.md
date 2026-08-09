@@ -1858,7 +1858,13 @@ Three things the other surfaces had and the phone did not: the stats screen
   `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`); the phone's
   `SpecRunner` asserts its own functions against the same file, 79 checks, run
   by `scripts/ios-stats-spec.sh`. Whichever side moves is the side that fails —
-  verified by breaking a rule in each language in turn. The struct cases carry
+  verified by breaking a rule in each language in turn. **A prompt, not an
+  enforcement**, and said out loud in the README, the script and the failing
+  test's own message: the cargo half runs in CI and the simulator half cannot,
+  so regenerating the fixture without running the script turns the build green
+  while leaving the phone wrong — the one failure mode a fixture like this is
+  supposed to make impossible. Closing it needs a macOS runner with a
+  simulator, not a different test framework. The struct cases carry
   a real serialized `BoardStats`, so the decode is checked with them. A launch
   arg rather than XCTest because this project has one target and one shared
   scheme, and a test target means editing `project.pbxproj` and

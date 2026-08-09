@@ -685,12 +685,17 @@ mod tests {
 /// `SpecRunner` asserts its own functions against the same file. One spec, two
 /// consumers: whichever side moves is the side that fails.
 ///
-/// Regenerate after changing a rule (and re-run `scripts/ios-stats-spec.sh`,
-/// which is where the Swift half will disagree):
+/// Regenerate after changing a rule:
 ///
 /// ```sh
 /// UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats
 /// ```
+///
+/// **Then run `scripts/ios-stats-spec.sh`.** This half runs in CI and the
+/// Swift half does not — it needs a simulator — so regenerating alone turns
+/// the build green while leaving the phone wrong about the rule that just
+/// changed. The guard below is a prompt, not an enforcement: what it tells you
+/// is that a second implementation exists and now disagrees.
 #[cfg(test)]
 mod spec {
     use super::*;
@@ -962,8 +967,10 @@ mod spec {
             "the checked-in stats fixture no longer matches this module — a rule changed here, \
              so the phone's copy in apps/ios/Comet/Board/StatsModels.swift is now wrong too.\n\n\
              {}\n\n\
-             Regenerate with `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`, then run \
-             `scripts/ios-stats-spec.sh` and fix whatever the Swift side reports.",
+             Regenerate with `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats` — and then \
+             run `scripts/ios-stats-spec.sh` and fix what it reports. Regenerating alone makes \
+             THIS test pass and leaves the phone wrong: the Swift half needs a simulator and \
+             does not run in CI, so nothing else will tell you.",
             moved.join("\n")
         );
     }

@@ -14,11 +14,19 @@
 // fails — the Rust test on a rule change here, this runner on a rule change
 // there.
 //
+// **This half is not in CI, and that asymmetry is the thing to know.** The Rust
+// test runs on every push; this needs a simulator and runs when somebody runs
+// it. So a rule changed in Rust fails the fixture guard, gets regenerated, and
+// CI goes green with the phone still wrong — the guard is a prompt, not an
+// enforcement. Whoever regenerates the fixture owes this run in the same
+// change; the Rust panic message says so at the moment it matters.
+//
 // Why a launch-arg runner and not XCTest: this project has one target and one
 // shared scheme, and a test target means editing `project.pbxproj` and
 // `Comet.xcscheme` — the two files the operator keeps uncommitted local changes
 // in. `-bench` and `-e2e` already established the headless-runner idiom here,
-// and it runs in one `simctl` command.
+// and it runs in one `simctl` command. A test target would not close the CI gap
+// either: what is missing is a macOS runner with a simulator.
 
 import Foundation
 

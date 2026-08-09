@@ -60,9 +60,20 @@ moves is the side that fails. After changing a rule in Rust:
 UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats && scripts/ios-stats-spec.sh
 ```
 
+**Run the second command. The fixture is a prompt, not an enforcement.** Only
+the Rust half runs in CI — the Swift half needs a simulator, and no CI here has
+one. So the failure mode is quiet and it looks like success: change a rule in
+Rust, the guard goes red, you regenerate, CI goes green, and the phone is now
+wrong about that rule until somebody runs the script. Regenerating the fixture
+is not the end of the job; it is the *notice* that the other half of the job
+exists. Treat a `UPDATE_STATS_SPEC=1` run without an `ios-stats-spec.sh` run in
+the same change as an unfinished change.
+
 A launch-arg runner rather than XCTest: this project has one target and one
 shared scheme, and a test target means editing `project.pbxproj` and
-`Comet.xcscheme`. `-bench` and `-e2e` already work this way.
+`Comet.xcscheme`. `-bench` and `-e2e` already work this way. (A test target
+would not close the gap either — what is missing is a macOS runner with a
+simulator, not a test framework.)
 
 ### Verifying the board against a real box
 

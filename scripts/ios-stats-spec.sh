@@ -15,6 +15,10 @@
 # Rust, regenerate with `UPDATE_STATS_SPEC=1 cargo test -p comet-proto stats`
 # and run this to find out what the Swift now disagrees about.
 #
+# Only the cargo half runs in CI — this one needs a simulator — so regenerating
+# the fixture without running this turns the build green while leaving the phone
+# wrong about the rule that just changed. Nothing will catch that but a person.
+#
 # Usage: scripts/ios-stats-spec.sh [simulator name]
 # Env:   COMET_SPEC_SIM (default "iPhone 17 Pro")
 
