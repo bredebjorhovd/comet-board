@@ -576,9 +576,15 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
     }
 
+    /// This device's board, or the refusal that means "I host none".
+    ///
+    /// [`RpcError::Refused`] rather than `Failed` on purpose (gh#155): every
+    /// board-addressed method funnels through here, and a sweeping caller has
+    /// to be able to tell this device's honest "not me" from a call that never
+    /// arrived. Same message, tagged so the answer survives the relay.
     fn board(&self) -> Result<&crate::board::BoardService, RpcError> {
         self.board.as_deref().ok_or_else(|| {
-            RpcError::Failed(
+            RpcError::Refused(
                 "board unavailable (COMET_BOARD=0, or the service failed to start — \
                  see the engine log)"
                     .into(),
@@ -1430,7 +1436,14 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(watch_stream(merged)))
             }
             methods::LOCAL_DEVICE => {
-                RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+                // The version travels with the identity because the two are
+                // asked together and answered by the same process: `comet-board
+                // doctor` compares it against its own build to catch a CLI that
+                // stopped being upgraded alongside the engine (gh#156).
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": self.doc_host.device_id(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                }))
             }
             methods::EDGE_HEALTH => {
                 // Absent only in bare-core test assemblies; an engine that

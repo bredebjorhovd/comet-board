@@ -12,7 +12,10 @@
 //! - **Managed** (`~/.comet-native/app/<ver>` + `current` symlink — the curl|sh
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
-//!   natively.
+//!   natively. The tarball carries `comet-board` beside `comet` (gh#156), and
+//!   `~/.local/bin` links point at `current` rather than at a version, so the
+//!   symlink flip moves both binaries at once — nothing here needs to know
+//!   there are two.
 //! - **MacApp** (running out of `Comet.app`): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.

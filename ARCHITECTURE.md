@@ -171,6 +171,8 @@ comet-native/
   apps/
     comet/                       # the binary (headed default, `headless` subcommand)
     tui/                         # the `comet-tui` binary
+    board-cli/                   # the `comet-board` binary — ships in the same release
+                                 # payload as `comet` and must not drift from it (gh#156)
   edge/                          # TypeScript Worker + DOs (ported from comet/apps/edge,
                                  # + auth-exchange routes absorbed from apps/server)
   docs/                          # this file + research reports

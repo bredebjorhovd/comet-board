@@ -109,6 +109,9 @@ async fn handle_request(
         Err(err) => {
             let _ = send(ServerFrame {
                 id,
+                // The kind rides along with the message: a refusal has to stay
+                // a refusal across the hop (gh#155).
+                code: err.code().map(str::to_string),
                 err: Some(err.to_string()),
                 ..Default::default()
             })

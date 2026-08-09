@@ -1830,7 +1830,138 @@ pinned by tests:
   Claude Max seat did not cost a per-token figure, so whatever is shown must be
   labelled a list-price estimate of the same usage on the API, not a bill.
 
-### H36 — The phone catches up with 0.3.4 — **done** (gh#157)
+### H36 — "Hosts no board" and "could not be asked" are different answers — **done** (gh#155)
+
+"if i click add space and try to search for repos I cant find it." Nothing was
+misconfigured. §H25's sweep asks every device `ListRepoSpaces` and skips the
+ones that fail, on a contract that is sound as far as it goes: a device hosting
+no board refuses before it does any git or GitHub work, so being refused rules
+it out for free. What the contract could not survive was a host that *would*
+have answered and could not — during §H26's free-tier Durable Object outage
+every relayed call to the box returned 500, so the box was skipped exactly like
+a laptop that hosts nothing, and the picker showed the Mac's repos with no
+error, no spinner and no hint that a second device had been asked. The shorter
+list read as the whole truth. §H26's lesson, on a surface that never learned it.
+
+- **The two answers were the same `Err`, and that is the real fix.** Every
+  board-addressed method funnels through `EngineRpc::board()`, which returned
+  `RpcError::Failed` — indistinguishable at the call site from a dead relay.
+  There is now `RpcError::Refused`, and it survives the hop: `ServerFrame`
+  carries an optional `code` beside `err`, `RpcError::code`/`from_wire` are the
+  two ends of it, and an untagged frame (an older peer) still reads as
+  `Failed`. Nothing else changes on the wire, and the `Display` text is
+  unchanged, so no existing message moves.
+- **Silence is now a fact the picker holds.** `hosts_no_board` is the whole
+  rule, one predicate with a test: `Refused` and `UnknownMethod` are *answers*
+  and rule a device out silently; transport, `Closed` and everything else mean
+  nobody was asked. The unasked devices land in `AddSpaceFlow::unreachable`,
+  named — with the transport's own words underneath — and the list keeps every
+  repo that did answer, because the ones that answered still work.
+- **The warning sits above the list, with Retry.** `view::repos::unreachable_note`
+  is the pure sentence ("Could not reach box — any repos hosted there are
+  missing from this list."), named devices rather than a count, because the
+  operator's next move is device-shaped. A footnote under a plausible list is
+  how this was missed the first time. The rail stops claiming "no device here
+  hosts a board" when the sweep never got to make that claim, and an onboard
+  with nowhere to go says which of the two is true.
+- **Absent is not unreachable, or the strip is on every time.** The sweep asks
+  every registered device, and this fleet is Mac + box + iPhone: a phone is
+  asleep essentially always, hosts no board and never will, so its relayed call
+  fails as transport like any other. Warning about it on every open is how a
+  strip stops being read before the day it has something real to say — silent-
+  when-it-should-speak was the bug, and loud-every-time is how the fix gets
+  reverted. So the report is gated on §H26's presence verdict, gathered per
+  device *before* the call (silence carries no facts): `Offline` — a lapsed
+  heartbeat seen by a viewer whose own sync is up — is absence, and gets one
+  muted line and no Retry, or nothing at all when the device holds no spaces
+  here and its silence therefore costs the list nothing. `SyncDown` is
+  deliberately not absence: a viewer that cannot hear does not get to call
+  anything away, and that is precisely the state the outage put the box in, so
+  the case this issue is about still gets the full treatment. `Candidate::silence`
+  is the rule, with the fleet's own shape as its test.
+- **The sidebar's copy of the sweep had the same disease.** `refresh_space_slugs`
+  replaced the `space → owner/repo` map wholesale from every sweep, so one
+  unreachable box quietly renamed every one of its spaces back to a folder
+  basename. A sweep every device answered still replaces; one that lost a device
+  merges (`AppState::merge_space_slugs`) — it can add and update, never delete.
+- **Not done: the phone.** `BoardStore.repoHosts()` swallows the same way
+  (`guard let … try? await` — one `continue` for both answers), and the phone is
+  the surface where the repo list is the *only* door. The wire now carries what
+  it needs (`code` on the frame); porting it is `RelayError.refused` plus the
+  banner, and it is a separate change with a separate build to verify.
+
+### H37 — The release ships the board CLI too — **done** (gh#156)
+Found while upgrading the box to v0.3.4: `~/.comet-native/app/0.3.4/` held
+`comet`, two icons and a desktop entry, and `~/.local/bin/comet-board` was a
+symlink into a source checkout, made by hand on 6 August and untouched since.
+The release payload had never carried the board CLI, so `install.sh` upgraded
+the engine on every release and stepped over the binary that drives the board.
+By then the box was running 17 routes over 8 repos with a CLI three weeks
+behind them: `onboard` (§H17) and `skill` (§H29) did not exist on the machine
+whose agents were supposed to use them.
+
+- **Both binaries, one payload.** They come off the same `cargo build`;
+  shipping one was the entire bug. `scripts/package-linux.sh` stages
+  `comet-board` beside `comet`, `scripts/package-macos.sh` puts it in
+  `Comet.app/Contents/MacOS` — signed *before* the bundle, since nested code
+  is not covered by signing the wrapper and notarization rejects the
+  submission over one unsigned helper. `release.yml` needed no change: it
+  uploads whatever the packaging scripts produce.
+- **Both packaging scripts now prove it.** Each fails the build if its output
+  is missing either binary — the tarball listing is grepped, the bundle's
+  `Contents/MacOS` is stat'd. An omission that ships is exactly what happened
+  the first time, and it cost nothing to make it impossible to repeat quietly.
+- **One lookup was already written for this layout.** `resolve_board_exe`
+  (§H11's askpass helper) tries `COMET_BOARD_EXECUTABLE`, then *beside the
+  running binary* — "how it is installed next to the engine" — then PATH. The
+  middle step could never hit, because nothing ever put the two side by side; a
+  dispatched agent's `GIT_ASKPASS` resolved through PATH to whatever stale
+  binary was there. The comment described the intended layout and the release
+  did not ship it. Now it does, and the fallback is a fallback again.
+- **Links point at `current`, not at a version.** `~/.local/bin/comet-board →
+  ~/.comet-native/app/current/comet-board`, so a later `comet update` flips one
+  symlink and both binaries follow it. That is also precisely why an unmanaged
+  binary in the way matters: it is the one thing the flip cannot move.
+- **A hand-placed binary is not silently replaced.** Both installers take over
+  `~/.local/bin/<name>` only when it is missing or already theirs — a symlink
+  into the app root for the curl|sh installer, a regular file for the copying
+  tarball one. Anything else is a decision a human made, sitting ahead of the
+  installer on PATH; overwriting it would destroy a build tree nobody chose to
+  throw away. So they name what is there, name the `rm -f` that hands it over,
+  and leave it standing. Refusing loudly is a fix; the failure was never the
+  stale binary, it was that nothing said so.
+- **`doctor` compares the two versions.** The engine reports its own
+  `CARGO_PKG_VERSION` in the `LocalDevice` reply, and the `cli version` check
+  fails when the CLI's disagrees, naming the path of the binary that answered —
+  which copy is talking is most of what you need. An unreachable engine falls
+  back to the installed payload's directory name, because a box whose engine is
+  down is exactly when someone runs doctor; neither available is "not checked"
+  rather than a failure. Against a payload that predates this fix it says so
+  instead of offering an installer that would relink nothing. Every other check
+  in that report asks about the environment the CLI can see. This one asks
+  about the CLI, which is how the whole class of bug stayed invisible.
+- **But doctor cannot be the only teller, because it ships inside the stale
+  thing.** A CLI old enough to have drifted is old enough not to carry the
+  check — so on the one box with the problem, `comet-board doctor` goes on
+  reporting a clean board. The check has to also live where the *current* code
+  runs, and on that box the current code is the engine. `board_cli::probe`
+  inverts it: find the binary (`resolve_board_exe`), run `--version`, compare
+  against the engine's own. `comet status` prints a `Board CLI:` line from it,
+  and `comet headless` logs one WARN at boot when they disagree — the only
+  report in this whole section that fires without somebody first going to look,
+  and it fires on the restart the install itself performs. Off the boot path on
+  its own thread: the probe executes a binary nobody vouches for, and one that
+  hangs instead of answering must not be able to hold the engine down.
+- **`comet-board --version`, for everything outside the binary.** doctor never
+  needed it — a process knows its own `CARGO_PKG_VERSION` — which is why it
+  did not exist, and why `install.sh` could see a binary in its way and not say
+  which one. Now the warning names it: `~/.local/bin/comet-board (v0.2.9) ->
+  ~/comet-board/target/release/comet-board`. A copy too old to know the flag
+  dates itself by failing, since the flag lands with the first release that
+  ships this binary at all — reported as "too old to answer `--version`", which
+  is a fact and not a guess.
+
+### H38 — The phone catches up with 0.3.4 — **done** (gh#157)
 Three things the other surfaces had and the phone did not: the stats screen
 §H34/§H35 built the derivations for, and two fixes §H33 made everywhere else.
 

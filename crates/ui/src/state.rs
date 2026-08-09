@@ -490,6 +490,18 @@ impl AppState {
             .collect();
     }
 
+    /// Fold in a sweep that lost a device to a transport failure (gh#155).
+    ///
+    /// Only the hosts that answered are represented, so this can add and update
+    /// but never remove: a box that could not be reached has not renamed
+    /// anything, and dropping its spaces' slugs would rename every one of its
+    /// sidebar rows back to a folder basename on a relay hiccup.
+    pub fn merge_space_slugs(&mut self, links: Vec<comet_proto::view::repos::SpaceSlug>) {
+        for link in links {
+            self.space_slugs.insert(link.space_id, link.slug);
+        }
+    }
+
     /// The `owner/repo` slug a host reported for this space, if any.
     pub fn space_slug(&self, space_id: &str) -> Option<&str> {
         self.space_slugs.get(space_id).map(String::as_str)
@@ -1877,5 +1889,29 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    /// gh#155: a complete sweep is authoritative and a partial one is not.
+    /// Merging is what keeps the box's spaces named `owner/repo` through a
+    /// relay outage instead of reverting them all to folder basenames.
+    #[test]
+    fn a_partial_slug_sweep_adds_without_deleting() {
+        let slug = |space: &str, slug: &str| comet_proto::view::repos::SpaceSlug {
+            space_id: space.into(),
+            slug: slug.into(),
+        };
+        let mut state = AppState::new();
+        state.apply_space_slugs(vec![slug("s-box", "o/box"), slug("s-mac", "o/mac")]);
+
+        // The box could not be reached: its spaces keep the name it gave last
+        // time, and the Mac's answer still lands.
+        state.merge_space_slugs(vec![slug("s-mac", "o/mac-renamed")]);
+        assert_eq!(state.space_slug("s-box"), Some("o/box"));
+        assert_eq!(state.space_slug("s-mac"), Some("o/mac-renamed"));
+
+        // A whole sweep IS the truth, including about what is no longer a
+        // checkout of anything.
+        state.apply_space_slugs(vec![slug("s-mac", "o/mac-renamed")]);
+        assert_eq!(state.space_slug("s-box"), None);
     }
 }

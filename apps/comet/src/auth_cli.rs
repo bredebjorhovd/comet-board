@@ -176,6 +176,18 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
             Err(err) => println!("Rooms:    could not ask the engine ({err:#})"),
         }
     }
+    // The gh#156 line, and it has to be printed from here rather than from
+    // `comet-board doctor`: a CLI old enough to have drifted is old enough not
+    // to carry the check that would say so, which is exactly how the box ran
+    // three weeks behind in silence. This binary is the one the release
+    // upgrades, so this is the one that can tell.
+    //
+    // Not an exit code, unlike the auth gate above: the engine is fine, and a
+    // service health check must not start failing over a CLI that is merely
+    // stale. Saying it plainly, where somebody is already looking, is the fix.
+    let (_, cli_line) = comet_board::board_cli::probe().line(comet_update::current_version());
+    println!("Board CLI: {cli_line}");
+
     if !signed_in {
         std::process::exit(1);
     }

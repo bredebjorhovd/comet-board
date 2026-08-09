@@ -114,6 +114,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Tui(args)) => comet_tui::cli::run(args),
         Some(Command::Headless) => {
+            warn_on_stale_board_cli();
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
                 let engine = comet_engine::Engine::new(engine_config_from_env());
@@ -172,6 +173,34 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Say once, at boot, when the `comet-board` on this box is not the one this
+/// engine shipped with (gh#156).
+///
+/// The one place the drift can be reported without anybody having gone looking
+/// for it. `comet-board doctor` reports it too, but only from a CLI new enough
+/// to carry the check — which the drifted ones are not, by definition. The
+/// service restarts on every install, so this fires exactly when the gap opens,
+/// into the journal somebody reads when the box misbehaves.
+///
+/// A warn and nothing more: a stale CLI does not stop the engine hosting the
+/// board, and refusing to boot over it would turn a reporting bug into an
+/// outage.
+///
+/// On its own thread for the same reason. The probe shells out to
+/// `comet-board --version`, and the whole point is that the binary it runs is
+/// one nobody vouches for — a copy that hangs instead of answering must not be
+/// able to hold the engine's boot. Nothing waits on the result; it lands in the
+/// log a few milliseconds after the engine is already up.
+fn warn_on_stale_board_cli() {
+    std::thread::spawn(|| {
+        let engine = comet_update::current_version();
+        let cli = comet_board::board_cli::probe();
+        if cli.drifted(engine) {
+            tracing::warn!("board CLI: {}", cli.line(engine).1);
+        }
+    });
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,
