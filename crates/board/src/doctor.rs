@@ -76,14 +76,16 @@ pub fn doctor(
         },
     });
 
-    // What the attempts have left on the disk (gh#72). Beside the database
-    // check because it is the same question — what is this box holding — and
-    // the answer is read partly out of that database.
-    checks.push(worktrees_check(
-        paths,
-        &crate::config::worktrees_root(),
-        db_ok.as_ref().ok(),
-    ));
+    // What the attempts have left on the disk (gh#72), in the two halves gh#186
+    // separated: the checkouts, and the build output inside them. Beside the
+    // database check because it is the same question — what is this box holding
+    // — and the answer is read partly out of that database. One walk feeds both
+    // lines: it is time-boxed, and paying that budget twice would only make the
+    // second half of one measurement disagree with the first.
+    let root = crate::config::worktrees_root();
+    let usage = gc::usage(&root);
+    checks.push(worktrees_check(paths, &usage, &root, db_ok.as_ref().ok()));
+    checks.push(build_output_check(paths, &usage, db_ok.as_ref().ok()));
 
     // The other half of what an attempt leaves behind (gh#139). Beside the
     // checkouts because it is the same question asked of the shelf instead of
@@ -798,19 +800,33 @@ fn dispatch_authorship_check(cfg: &RoutingConfig, accounts: Option<&[AgentAccoun
 /// holding open (a live attempt, a pull request in review, an issue still
 /// owed).
 ///
-/// `ok` is false only when the root is genuinely large ([`gc::WARN_BYTES`] /
+/// `ok` is false only when the *checkouts* are genuinely large
+/// ([`gc::WARN_BYTES`] against [`gc::Usage::checkout_bytes`], or
 /// [`gc::WARN_CHECKOUTS`]); a board holding a week of checkouts on purpose is
 /// working exactly as configured and must not fail the report for it. The
 /// retention window is named either way, because `off` is a choice whose cost
-/// is this line.
-fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Check {
-    let usage = gc::usage(root);
+/// is this line. Build output is [`build_output_check`]'s — it is the bulk of
+/// the bytes and it answers to a different key, so it gets its own verdict
+/// rather than turning this one red on a box that is merely busy (gh#186).
+fn worktrees_check(
+    paths: &Paths,
+    usage: &gc::Usage,
+    root: &std::path::Path,
+    db: Option<&Db>,
+) -> Check {
+    let floor = if usage.truncated { "≥ " } else { "" };
+    // The split gh#186 asked for. `109.5 GiB in worktrees` was true and useless:
+    // it hid that 99.96% of the number was regenerable, and it named
+    // `retain_worktrees` — which governs the other 0.04% — as the thing to
+    // change. The total stays, because the disk is the total.
     let about = format!(
-        "{} checkout(s), {}{} in {}",
+        "{} checkout(s), {floor}{} in {} ({floor}{} of checkout, {floor}{} of build \
+         output — see below)",
         usage.checkouts,
-        if usage.truncated { "≥ " } else { "" },
         gc::human_bytes(usage.bytes),
         root.display(),
+        gc::human_bytes(usage.checkout_bytes()),
+        gc::human_bytes(usage.cache_bytes),
     );
     // What the board still has a claim on. Not the same as "on disk": a
     // checkout cut by comet itself, or one left by an attempt whose row has
@@ -843,6 +859,72 @@ fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Ch
         name: "worktrees".into(),
         ok: !usage.alarming(),
         detail,
+    }
+}
+
+/// What the build output inside those checkouts weighs, and what will sweep it
+/// (gh#186).
+///
+/// Its own line because it is its own thing on its own clock: a checkout is 14 MB
+/// of evidence and its `target/` is 20–36 GB of cache, and the one number the box
+/// reported before this ("109.5 GiB in worktrees") named neither. The share is
+/// what makes the sentence useful — 99.96% regenerable is a different problem
+/// from 109 GiB of source.
+///
+/// Red in exactly one state: a lot of build output and nothing that will ever
+/// sweep it. A busy box mid-build has tens of gibibytes of `target/` and is
+/// working correctly, so size alone must not fail the report — that is how the
+/// line this replaces stopped meaning anything. `retain_build_output = off` with
+/// 20 GiB behind it is the gh#186 failure itself, and it is worth an exit code.
+fn build_output_check(paths: &Paths, usage: &gc::Usage, db: Option<&Db>) -> Check {
+    let floor = if usage.truncated { "≥ " } else { "" };
+    let about = format!(
+        "{floor}{} in {} build-output director{} ({})",
+        gc::human_bytes(usage.cache_bytes),
+        usage.cache_dirs,
+        if usage.cache_dirs == 1 { "y" } else { "ies" },
+        gc::BUILD_OUTPUT_DIRS.join(", "),
+    );
+    // Of the checkouts the board still tracks, how many could it sweep — and how
+    // many has it already. A swept row still holds its checkout (that is the
+    // point of the split), so this is not the same census the line above reports.
+    let held = db.and_then(|db| db.collectable_attempts().ok()).map(|a| {
+        let swept = a.iter().filter(|a| a.cache_swept_at.is_some()).count();
+        format!(
+            "{} checkout(s) tracked by the board, {swept} already swept",
+            a.len()
+        )
+    });
+    let window = match RoutingConfig::load_unvalidated(&paths.routing()) {
+        Ok(cfg) => cfg.retain_build_output_secs(),
+        Err(_) => return unparsed_retention_check("build output"),
+    };
+    let retention = match window {
+        // No window is its own sentence, as it is for chats: "swept 0 seconds
+        // after" is a number where the operator wants the rule.
+        Some(0) => "swept as each attempt ends".to_string(),
+        Some(secs) => format!("swept {} after each attempt ends", gc::human_window(secs)),
+        None => "retain_build_output = off — kept for as long as the checkout is".to_string(),
+    };
+    Check {
+        name: "build output".into(),
+        ok: window.is_some() || usage.cache_bytes < gc::WARN_BYTES,
+        detail: [Some(about), held, Some(retention)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · "),
+    }
+}
+
+/// The one thing a retention line can say when `routing.toml` will not parse:
+/// the window is unquotable. Not a failure of its own — the `routing.toml` check
+/// above is already red, and failing twice for one mistake reads as two.
+fn unparsed_retention_check(name: &str) -> Check {
+    Check {
+        name: name.into(),
+        ok: true,
+        detail: "retention unknown — routing.toml did not parse".into(),
     }
 }
 
@@ -2764,7 +2846,7 @@ mod tests {
         }
         std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
 
-        let check = worktrees_check(&p, &root, None);
+        let check = worktrees_check(&p, &gc::usage(&root), &root, None);
         assert!(check.ok, "two checkouts is not a problem: {}", check.detail);
         assert!(check.detail.contains("2 checkout(s)"), "{}", check.detail);
         assert!(check.detail.contains("4.0 KiB"), "{}", check.detail);
@@ -2776,10 +2858,123 @@ mod tests {
     fn retention_off_is_said_out_loud() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"off\"\n").unwrap();
-        let check = worktrees_check(&p, &_d.path().join("nothing-here"), None);
+        let root = _d.path().join("nothing-here");
+        let check = worktrees_check(&p, &gc::usage(&root), &root, None);
         assert!(check.detail.contains("ever collected"), "{}", check.detail);
         // An empty root is still not a failure — nothing has been dispatched.
         assert!(check.ok);
+    }
+
+    /// The line gh#186 is about. The box read `8 checkout(s), 109.5 GiB` and
+    /// could not tell from it that 99.96% was regenerable — so both halves are
+    /// named, and the cache's own window is quoted beside its own number.
+    #[test]
+    fn the_two_reports_separate_the_checkout_from_its_build_output() {
+        let (_d, p) = tmp();
+        let root = _d.path().join("worktrees");
+        let checkout = root.join("widget").join("board-gh-7-widget");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("src").join("main.rs"), vec![b'x'; 1024]).unwrap();
+        std::fs::create_dir_all(checkout.join("target").join("debug")).unwrap();
+        std::fs::write(
+            checkout.join("target").join("debug").join("bin"),
+            vec![b'x'; 8192],
+        )
+        .unwrap();
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
+
+        let usage = gc::usage(&root);
+        let worktrees = worktrees_check(&p, &usage, &root, None);
+        // The total is still there — the disk is the total — but the split is on
+        // the same line, so nobody reaches for `retain_worktrees` over 8 KiB of
+        // `target/` again.
+        assert!(worktrees.detail.contains("9.0 KiB"), "{}", worktrees.detail);
+        assert!(
+            worktrees.detail.contains("1.0 KiB of checkout"),
+            "{}",
+            worktrees.detail
+        );
+
+        let build = build_output_check(&p, &usage, None);
+        assert!(build.ok);
+        assert!(build.detail.contains("8.0 KiB"), "{}", build.detail);
+        assert!(
+            build.detail.contains("1 build-output directory"),
+            "{}",
+            build.detail
+        );
+        assert!(build.detail.contains("target"), "{}", build.detail);
+        // The default window, spelled as the rule and not as `0s`.
+        assert!(
+            build.detail.contains("swept as each attempt ends"),
+            "{}",
+            build.detail
+        );
+    }
+
+    /// `retain_build_output = off` is what the board did before gh#186, and the
+    /// only state where the build-output line is a failure rather than a number:
+    /// a box mid-build has tens of gibibytes of `target/` and is working.
+    #[test]
+    fn build_output_kept_forever_is_a_failure_only_once_it_is_large() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\nretain_build_output = \"off\"\n").unwrap();
+
+        let small = gc::Usage {
+            checkouts: 1,
+            bytes: 1024,
+            cache_bytes: 512,
+            cache_dirs: 1,
+            truncated: false,
+        };
+        let check = build_output_check(&p, &small, None);
+        assert!(check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("retain_build_output = off"),
+            "{}",
+            check.detail
+        );
+
+        let full = gc::Usage {
+            cache_bytes: gc::WARN_BYTES,
+            bytes: gc::WARN_BYTES,
+            ..small
+        };
+        assert!(!build_output_check(&p, &full, None).ok);
+        // …and the same weight with a sweep behind it is not a fault at all.
+        std::fs::write(p.routing(), "[defaults]\nretain_build_output = \"2h\"\n").unwrap();
+        let check = build_output_check(&p, &full, None);
+        assert!(check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("2h after each attempt ends"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A worktree root that is mostly `target/` must not fail the *checkout*
+    /// line: that verdict is `retain_worktrees`'s, the bytes it names are 14 MB
+    /// per checkout, and a red line over a running build is a red line nobody
+    /// reads twice.
+    #[test]
+    fn a_heavy_cache_does_not_fail_the_checkout_line() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
+        let root = _d.path().join("worktrees");
+        let mostly_cache = gc::Usage {
+            checkouts: 3,
+            bytes: gc::WARN_BYTES * 5,
+            cache_bytes: gc::WARN_BYTES * 5 - 1024,
+            cache_dirs: 3,
+            truncated: false,
+        };
+        assert!(worktrees_check(&p, &mostly_cache, &root, None).ok);
+        // The checkouts themselves crossing the line still fails it.
+        let heavy = gc::Usage {
+            cache_bytes: 0,
+            ..mostly_cache
+        };
+        assert!(!worktrees_check(&p, &heavy, &root, None).ok);
     }
 
     /// The shelf's half of the same report (gh#139): the window, and the fact

@@ -575,6 +575,8 @@ mod tests {
             collected_at: None,
             chat_archivable_at: None,
             chat_archived_at: None,
+            cache_sweepable_at: None,
+            cache_swept_at: None,
             tokens: None,
             model: None,
             dispatched_by_device: None,
