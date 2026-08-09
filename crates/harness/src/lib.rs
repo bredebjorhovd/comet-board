@@ -169,6 +169,9 @@ pub trait Harness: Send + Sync {
 
 pub mod claude;
 pub mod codex;
+/// Shared JSON-RPC-over-stdio client: the codex app-server speaks it today,
+/// and the Agent Client Protocol is the same wire shape (docs/research/acp.md).
+pub mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 
