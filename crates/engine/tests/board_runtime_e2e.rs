@@ -307,6 +307,52 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     assert!(!archived(core.workspace.doc()), "and back on it");
     assert!(runtime.chat_alive(&handle.chat_id).unwrap());
 
+    // ── build output (gh#186): the cache goes, the checkout stays ───────────
+    //
+    // Against a real worktree, because that is the whole claim: the sweep must
+    // leave a directory git still recognises, on its branch, with the agent's
+    // work in it — the checkout is 14 MB of evidence and only the 36 GB of
+    // `target/` inside it is a cache.
+    let checkout = std::path::Path::new(&handle.cwd);
+    std::fs::write(checkout.join("kept.rs"), "the agent's work").unwrap();
+    for cache in ["target/debug", "web/node_modules/react"] {
+        std::fs::create_dir_all(checkout.join(cache)).unwrap();
+        std::fs::write(checkout.join(cache).join("blob"), vec![b'x'; 4096]).unwrap();
+    }
+    let swept = runtime
+        .reclaim_build_output(&handle.cwd)
+        .expect("the sweep runs");
+    assert_eq!(swept.dirs, 2, "target/ and the nested node_modules");
+    assert_eq!(swept.bytes, 8192);
+    assert!(swept.failed.is_empty());
+    assert!(!checkout.join("target").exists());
+    assert!(!checkout.join("web").join("node_modules").exists());
+    // Everything the attempt is retained *for*:
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("kept.rs")).unwrap(),
+        "the agent's work"
+    );
+    let head = Command::new("git")
+        .args(["-C", &handle.cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "board/gh-1-widget",
+        "a swept checkout is still a checkout on its branch"
+    );
+    // And the worktree is still registered with its repo — the sweep is not a
+    // half-done `reclaim_worktree`.
+    let listed = Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "worktree", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("board/gh-1-widget"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
     // ── cancel (interrupt + archive) ────────────────────────────────────────
     runtime.cancel(&handle.chat_id).expect("cancel");
     let chat = core

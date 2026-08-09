@@ -272,7 +272,13 @@ impl SyncEngine {
         // retention clock this cycle; on the interval only, like every other
         // clocked decision (gh#72).
         self.collect_worktrees(runtime);
-        // Beside it, on the same clock and the same rule: the two are one
+        // Then the cache *inside* the checkouts, on its own much shorter clock
+        // (gh#186): a checkout is 14 MB of evidence and its `target/` is 36 GB
+        // of regenerable, and one window for both keeps the expensive thing for
+        // as long as the cheap one. After `collect_worktrees` so a checkout
+        // reclaimed whole this cycle is not walked for a cache that went with it.
+        self.sweep_build_output(runtime);
+        // Beside them, on the same clock and the same rule: the three are one
         // attempt's leavings, and a box that reclaimed the checkout while
         // keeping the chat forever would have tidied half the mess (gh#139).
         self.archive_chats(runtime);
@@ -1342,6 +1348,150 @@ impl SyncEngine {
         Ok(())
     }
 
+    // ---- sweeping build output (gh#186) ----------------------------------
+
+    /// Delete the build output inside every finished attempt's checkout, on
+    /// `[defaults] retain_build_output` — a much shorter clock than the checkout's
+    /// own.
+    ///
+    /// The measurement this exists for, from the box on 2026-08-09: eight
+    /// checkouts, 109.5 GiB, of which 44 MiB was checkouts. One of them was 36 GB
+    /// with 298 MB outside `target/`. `retain_worktrees` governed both, so the
+    /// cheap thing and the expensive thing were kept for the same week, and a week
+    /// of Rust checkouts does not fit on a 150 GB disk. Clearing `target/` from
+    /// the three whose pull requests had already merged took the box from 36 GB
+    /// free to 123 GB.
+    ///
+    /// What is different from [`SyncEngine::collect_worktrees`], and it is all
+    /// one difference — a cache has no reason to be kept:
+    ///
+    /// - **The clock starts when the attempt ends**, not when the task leaves the
+    ///   board. An open pull request holds the *checkout* (review delivery
+    ///   resumes an agent in that directory) and holds nothing here: the agent it
+    ///   resumes rebuilds. [`gc::cache_standing`] consults one fact — whether
+    ///   anybody is building in there — and a live retry on the task counts,
+    ///   because retries reuse the branch and therefore the directory.
+    /// - **A sweep is not a collection.** `cache_swept_at` says a cache inside a
+    ///   checkout that is still there is gone; `collected_at` would say the
+    ///   checkout itself is, which would be false and would stop the board ever
+    ///   reclaiming it.
+    /// - **It can happen twice.** Unlike a deleted worktree or an archived chat,
+    ///   a cache comes back: an attempt re-opened to answer review comments
+    ///   builds again, so the re-open clears both stamps
+    ///   ([`Db::clear_attempt_cache_swept`]) and the next end sweeps the new one.
+    ///
+    /// Failure is never fatal to the cycle, and never stamps: an error leaves the
+    /// attempt unswept so the next sweep tries again over what is left.
+    fn sweep_build_output(&self, runtime: Option<&dyn Runtime>) {
+        let Some(retain) = self.cfg.retain_build_output_secs() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let tasks = match self.db.load_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .error(format!("build output sweep: reading the board: {e}"));
+                return;
+            }
+        };
+        for task in &tasks {
+            for attempt in &task.attempts {
+                // Nothing to sweep: no checkout recorded, the checkout already
+                // reclaimed whole, or this cache already swept. The last is what
+                // keeps a box that has been up for months from re-walking every
+                // source tree it has ever cut, every cycle.
+                if attempt.worktree.is_none()
+                    || attempt.collected_at.is_some()
+                    || attempt.cache_swept_at.is_some()
+                {
+                    continue;
+                }
+                let spent = attempt
+                    .cache_sweepable_at
+                    .as_deref()
+                    .map(|t| secs_since(t, now).unwrap_or(0));
+                let standing = gc::cache_standing(task, attempt);
+                if let Err(e) = match gc::decide(standing, spent, retain) {
+                    gc::Verdict::Keep => Ok(()),
+                    gc::Verdict::Mark => self.mark_cache_sweepable(task, attempt, retain),
+                    gc::Verdict::Unmark => self.db.set_attempt_cache_sweepable(attempt.id, false),
+                    gc::Verdict::Collect => self.sweep_one_cache(runtime, task, attempt),
+                } {
+                    self.log.warn(format!(
+                        "{}: build output sweep on attempt {}: {e:#}",
+                        task.identifier, attempt.id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Start the sweep clock on one checkout's build output.
+    ///
+    /// Silent under `on-settle`, unlike [`SyncEngine::mark_collectable`]: with no
+    /// window the mark and the sweep are the same event a cycle apart, and
+    /// announcing a deletion thirty seconds before announcing it again is noise
+    /// where the checkout's week-long clock genuinely needs a warning. A real
+    /// window gets the notice, naming what it is about to remove and when.
+    fn mark_cache_sweepable(&self, task: &Task, attempt: &Attempt, retain: u64) -> Result<()> {
+        self.db.set_attempt_cache_sweepable(attempt.id, true)?;
+        if retain > 0 {
+            self.log.info(format!(
+                "{}: nothing is building in {} any more — its build output goes in {}",
+                task.identifier,
+                attempt.worktree.as_deref().unwrap_or("(none)"),
+                gc::human_window(retain),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The window ran out: hand the cache to the runtime that owns the checkout,
+    /// and record that it is gone — as a sweep, never as a collection.
+    ///
+    /// A cycle run without a runtime marks and unmarks but deletes nothing, the
+    /// same split [`SyncEngine::collect_one`] and
+    /// [`SyncEngine::archive_one_chat`] make.
+    ///
+    /// Silent when there was nothing to sweep, which is most attempts: a checkout
+    /// nobody built in, or one whose agent only edited docs, has no cache and its
+    /// stamp is bookkeeping rather than news. A sweep that freed something says
+    /// what and how much, because that number is the whole argument for this
+    /// feature.
+    fn sweep_one_cache(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+    ) -> Result<()> {
+        let Some(worktree) = attempt.worktree.as_deref() else {
+            return Ok(());
+        };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+        let swept = runtime.reclaim_build_output(worktree)?;
+        if swept.dirs > 0 {
+            self.log.info(format!(
+                "{}: swept {} of build output from {} ({} director{}) — the next build \
+                 in there writes it again",
+                task.identifier,
+                gc::human_bytes(swept.bytes),
+                worktree,
+                swept.dirs,
+                if swept.dirs == 1 { "y" } else { "ies" },
+            ));
+        }
+        // Unstamped on a partial failure, so the next cycle retries what is
+        // left. The bytes that did go are already reported above.
+        if !swept.failed.is_empty() {
+            anyhow::bail!("{}", swept.failed.join("; "));
+        }
+        self.db.set_attempt_cache_swept(attempt.id)?;
+        Ok(())
+    }
+
     // ---- clearing the shelf (gh#139) -------------------------------------
 
     /// Archive the chat of every attempt nobody is coming back to, once it has
@@ -2116,6 +2266,11 @@ impl SyncEngine {
             // with it, so the next time this attempt finishes it is owed a
             // whole window.
             self.unarchive_chat(runtime, &task, &attempt)?;
+            // And the build output it is about to write again is a fresh cache,
+            // not the one this attempt was already swept for (gh#186): the stamp
+            // has to go, or the 36 GB the resumed agent builds would sit behind a
+            // row the sweep skips forever.
+            self.db.clear_attempt_cache_swept(attempt.id)?;
             self.log.warn(format!(
                 "{} was closed as {} but chat {chat_id} is working again — \
                  attempt re-opened ({} time(s) now)",
@@ -6519,6 +6674,300 @@ max_duration = "{max_duration}"
         e.collect_worktrees(None);
         assert!(attempt_row(&e, a).collectable_at.is_some());
         assert!(attempt_row(&e, a).collected_at.is_none());
+    }
+
+    // ---- sweeping build output (gh#186) ----------------------------------
+
+    /// A runtime that records which checkouts the sweep asked it to clear, and
+    /// can be told to report a directory it could not delete.
+    #[derive(Default)]
+    struct Builder {
+        swept: std::cell::RefCell<Vec<String>>,
+        /// Bytes each sweep reports having freed. Zero is "nothing was built in
+        /// there", which is the quiet majority of attempts.
+        bytes: u64,
+        stuck: bool,
+    }
+
+    impl Runtime for Builder {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("the sweep never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!("the sweep never talks to a chat")
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("the sweep never cancels")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+        fn reclaim_worktree(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+        ) -> anyhow::Result<()> {
+            unreachable!("a cache sweep never removes a worktree — that is the point")
+        }
+        fn reclaim_build_output(&self, worktree: &str) -> anyhow::Result<gc::Swept> {
+            self.swept.borrow_mut().push(worktree.to_string());
+            Ok(gc::Swept {
+                dirs: if self.bytes > 0 { 1 } else { 0 },
+                bytes: self.bytes,
+                failed: if self.stuck {
+                    vec![format!("{worktree}/target: permission denied")]
+                } else {
+                    Vec::new()
+                },
+            })
+        }
+    }
+
+    /// A closed attempt with a checkout, on a task still very much on the board:
+    /// its issue is open and its pull request is in review. Everything gh#72 does
+    /// holds this checkout — and nothing holds the build output inside it.
+    fn built_attempt(e: &SyncEngine) -> i64 {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET pr_open = 1 WHERE id = 'linear:LIN-142'",
+                [],
+            )
+            .unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        a
+    }
+
+    /// Move the sweep clock back, as wall time would have.
+    fn age_sweep_mark(e: &SyncEngine, attempt_id: i64, secs: i64) {
+        let stamp = crate::db::rfc3339(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET cache_sweepable_at = ?2 WHERE id = ?1",
+                rusqlite::params![attempt_id, stamp],
+            )
+            .unwrap();
+    }
+
+    /// gh#186 in one test. The same attempt, on the same cycle: its checkout is
+    /// held for review (14 MB, and review delivery resumes an agent in it) and
+    /// its build output is swept (36 GB, and nothing reads it).
+    #[test]
+    fn build_output_goes_when_the_attempt_ends_and_the_checkout_stays() {
+        let e = engine(None);
+        let a = built_attempt(&e);
+        let build = Builder {
+            bytes: 36 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let checkouts = Collector::default();
+
+        // The first sweep marks — the same one-cycle mark the shelf takes under
+        // `on-settle`, and what `Unmark` reverses if a build starts again.
+        e.sweep_build_output(Some(&build));
+        assert!(attempt_row(&e, a).cache_sweepable_at.is_some());
+        assert!(build.swept.borrow().is_empty());
+
+        // The next takes it, with no window to wait out.
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().as_slice(), ["/wt/board-lin-142"]);
+
+        let row = attempt_row(&e, a);
+        assert!(row.cache_swept_at.is_some());
+        // The three columns that must not have moved. A sweep is not a
+        // collection: the checkout is still there, still on its branch, still
+        // the directory review delivery would resume an agent in — and the
+        // board must still be able to reclaim it when its own week is up.
+        assert!(row.collected_at.is_none(), "the worktree is still there");
+        assert!(
+            row.collectable_at.is_none(),
+            "its own clock has not started"
+        );
+        assert_eq!(row.worktree.as_deref(), Some("/wt/board-lin-142"));
+
+        // The checkout sweep agrees: review holds it, whatever happened inside.
+        e.collect_worktrees(Some(&checkouts));
+        assert!(checkouts.reclaimed.borrow().is_empty());
+
+        // And the cache is not offered twice — a box up for months does not
+        // re-walk every source tree it ever cut, every cycle.
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().len(), 1);
+    }
+
+    /// The checkout's own clock still runs, and still ends in a collection: the
+    /// sweep must not have made the row look already reclaimed.
+    #[test]
+    fn a_swept_checkout_is_still_collected_when_its_own_window_runs_out() {
+        let e = engine(None);
+        let a = built_attempt(&e);
+        let build = Builder {
+            bytes: 1024,
+            ..Default::default()
+        };
+        e.sweep_build_output(Some(&build));
+        e.sweep_build_output(Some(&build));
+        assert!(attempt_row(&e, a).cache_swept_at.is_some());
+
+        // The pull request lands and the issue closes: now the checkout is
+        // nobody's either, and a week later it goes as it always did.
+        e.db.conn
+            .execute(
+                "UPDATE tasks SET pr_open = 0, upstream = 'terminal' \
+                 WHERE id = 'linear:LIN-142'",
+                [],
+            )
+            .unwrap();
+        let checkouts = Collector::default();
+        e.collect_worktrees(Some(&checkouts));
+        age_mark(&e, a, 7 * 86_400);
+        e.collect_worktrees(Some(&checkouts));
+        assert_eq!(checkouts.reclaimed.borrow().len(), 1);
+        assert!(attempt_row(&e, a).collected_at.is_some());
+    }
+
+    /// The one guard. Sweeping a live attempt's checkout would delete a running
+    /// `cargo build`'s output from under it — and a retry reuses the branch, so
+    /// the closed attempt's directory is very often the live one's.
+    #[test]
+    fn nothing_is_swept_while_anybody_is_building() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
+        let build = Builder::default();
+        for _ in 0..3 {
+            // However old a mark left from before, a build in progress stops the
+            // clock rather than running it out.
+            age_sweep_mark(&e, a, 30 * 86_400);
+            e.sweep_build_output(Some(&build));
+            assert!(attempt_row(&e, a).cache_sweepable_at.is_none());
+        }
+        assert!(build.swept.borrow().is_empty());
+
+        // Closed, then a retry dispatched into the same directory: the mark it
+        // had taken is cleared, so the retry's own build gets a whole window.
+        e.db.close_attempt(a, Outcome::Failed).unwrap();
+        e.sweep_build_output(Some(&build));
+        assert!(attempt_row(&e, a).cache_sweepable_at.is_some());
+        dispatch(&e, "linear:LIN-142", "chat-10");
+        e.sweep_build_output(Some(&build));
+        assert!(build.swept.borrow().is_empty(), "a live retry holds it");
+        assert!(attempt_row(&e, a).cache_sweepable_at.is_none());
+    }
+
+    /// A cache is the one thing here that comes back. An attempt re-opened to
+    /// answer review comments builds again, so the stamp has to go with the
+    /// re-open — or the 36 GB that build writes sits behind a row the sweep
+    /// skips forever.
+    #[test]
+    fn a_reopened_attempt_has_its_next_build_swept_too() {
+        let e = engine(None);
+        let a = built_attempt(&e);
+        let build = Builder {
+            bytes: 1024,
+            ..Default::default()
+        };
+        e.sweep_build_output(Some(&build));
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().len(), 1);
+
+        // The chat starts working again — the settle was wrong, and the agent is
+        // building in there right now.
+        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+            .unwrap();
+        let row = attempt_row(&e, a);
+        assert!(row.outcome.is_none(), "back to work");
+        assert!(row.cache_swept_at.is_none(), "and its cache is a live one");
+        assert!(row.cache_sweepable_at.is_none());
+
+        // Nothing while it runs; swept again once it ends.
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().len(), 1, "it is building");
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        e.sweep_build_output(Some(&build));
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().len(), 2);
+    }
+
+    /// A box with disk to spare can buy the rebuild back. Only the default is
+    /// `on-settle`; the window is a setting like every other one here.
+    #[test]
+    fn a_window_on_the_cache_is_waited_out() {
+        let mut e = engine(None);
+        e.cfg.defaults.retain_build_output = "2h".into();
+        let a = built_attempt(&e);
+        let build = Builder::default();
+
+        e.sweep_build_output(Some(&build));
+        e.sweep_build_output(Some(&build));
+        assert!(build.swept.borrow().is_empty(), "two hours is two hours");
+
+        age_sweep_mark(&e, a, 2 * 3_600);
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().len(), 1);
+    }
+
+    #[test]
+    fn sweeping_off_keeps_every_cache() {
+        let mut e = engine(None);
+        e.cfg.defaults.retain_build_output = "off".into();
+        let a = built_attempt(&e);
+        let build = Builder::default();
+        e.sweep_build_output(Some(&build));
+        assert!(
+            attempt_row(&e, a).cache_sweepable_at.is_none(),
+            "the clock never starts"
+        );
+        // Not even one marked before the operator turned it off.
+        age_sweep_mark(&e, a, 365 * 86_400);
+        e.sweep_build_output(Some(&build));
+        assert!(build.swept.borrow().is_empty());
+    }
+
+    /// The stamp is what says the disk space is back. A directory that would not
+    /// delete leaves the row unstamped, so the next cycle tries again over what
+    /// is left — reporting space it never reclaimed is the failure gh#186 is
+    /// about, from the other end.
+    #[test]
+    fn a_cache_that_will_not_delete_is_tried_again_next_cycle() {
+        let e = engine(None);
+        let a = built_attempt(&e);
+        let build = Builder {
+            stuck: true,
+            bytes: 1024,
+            ..Default::default()
+        };
+        e.sweep_build_output(Some(&build));
+        e.sweep_build_output(Some(&build));
+        assert!(attempt_row(&e, a).cache_swept_at.is_none());
+        e.sweep_build_output(Some(&build));
+        assert_eq!(build.swept.borrow().len(), 2, "and again the cycle after");
+    }
+
+    #[test]
+    fn a_cycle_without_a_runtime_marks_but_sweeps_nothing() {
+        // Only the process that cut the worktrees may delete inside them;
+        // anything else running the cycle keeps the clock.
+        let e = engine(None);
+        let a = built_attempt(&e);
+        e.sweep_build_output(None);
+        e.sweep_build_output(None);
+        let row = attempt_row(&e, a);
+        assert!(row.cache_sweepable_at.is_some());
+        assert!(row.cache_swept_at.is_none());
     }
 
     // ---- clearing the shelf (gh#139) -------------------------------------

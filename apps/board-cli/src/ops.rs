@@ -561,15 +561,21 @@ async fn check_overrides(
 
 /// The canonical runtime name for an override, or an error naming what the
 /// engine does offer.
+///
+/// Refuses a runtime the host cannot start as firmly as one it has never heard
+/// of (gh#187), and for a sharper reason: an unknown name fails at `build_spec`
+/// having cost nothing, while a known-but-absent one used to fail at the
+/// harness spawn — after a worktree, a chat and a queued brief. The engine
+/// refuses it too; this is the same refusal one round trip earlier, in the
+/// same words, listing what the box *can* run.
 fn resolve_runtime(options: &[RuntimeOption], want: &str) -> Result<String> {
     // The catalog offers one canonical name per harness; `routing.toml`'s alias
     // spellings are valid input the picker has no reason to list twice, so an
     // alias resolves to the canonical entry rather than being refused.
     let canonical = harness_for_runtime(want).map(runtime_name);
-    options
+    let option = options
         .iter()
         .find(|o| o.name.eq_ignore_ascii_case(want) || Some(o.name.as_str()) == canonical)
-        .map(|o| o.name.clone())
         .ok_or_else(|| {
             anyhow!(
                 "unknown runtime `{want}`; the engine offers: {}",
@@ -579,7 +585,24 @@ fn resolve_runtime(options: &[RuntimeOption], want: &str) -> Result<String> {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        })
+        })?;
+    if let Some(reason) = option.unavailable {
+        let ready: Vec<&str> = options
+            .iter()
+            .filter(|o| o.available())
+            .map(|o| o.name.as_str())
+            .collect();
+        bail!(
+            "{}. This box can run: {}",
+            reason.refusal(&option.name),
+            if ready.is_empty() {
+                "nothing".to_string()
+            } else {
+                ready.join(", ")
+            }
+        );
+    }
+    Ok(option.name.clone())
 }
 
 fn check_model(models: &[ModelChoice], want: &str, runtime: &str) -> Result<()> {
@@ -1465,6 +1488,35 @@ mod tests {
         assert!(err.contains("unknown runtime `claude-cod`"), "{err}");
         // The error has to carry the answer; there is no picker to fall back on.
         assert!(err.contains("claude-code"), "{err}");
+    }
+
+    /// A runtime the host lists but cannot start is refused here, before the
+    /// dispatch that would have cut a worktree to find out (gh#187) — and the
+    /// error says which of the two is wrong, plus what the box *can* run.
+    #[test]
+    fn a_runtime_the_host_cannot_start_is_refused_with_the_reason() {
+        use comet_proto::view::board::RuntimeUnavailable;
+        let mut options = runtimes();
+        for option in &mut options {
+            option.unavailable = match option.name.as_str() {
+                "opencode" => Some(RuntimeUnavailable::NotInstalled),
+                "codex" => Some(RuntimeUnavailable::SignedOut),
+                _ => None,
+            };
+        }
+
+        let err = resolve_runtime(&options, "opencode").unwrap_err().to_string();
+        assert!(err.contains("not installed"), "{err}");
+        assert!(err.contains("claude-code"), "names what does work: {err}");
+
+        // The other axis, named apart: this one is a login, not an install.
+        let err = resolve_runtime(&options, "openai-codex")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("signed out"), "{err}");
+
+        // And an available one still resolves, alias and all.
+        assert_eq!(resolve_runtime(&options, "claude").unwrap(), "claude-code");
     }
 
     #[test]

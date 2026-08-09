@@ -341,11 +341,20 @@ fn account_label(account: &AgentAccount) -> String {
 }
 
 /// The picker's starting row: the route's runtime when the list offers it by
-/// its canonical name, else the first option. A route configured with an alias
-/// (`claude`, `openai-codex`) lands on its harness's canonical entry.
+/// its canonical name, else the first option the host can actually start. A
+/// route configured with an alias (`claude`, `openai-codex`) lands on its
+/// harness's canonical entry.
+///
+/// The route's own runtime wins even when the host cannot start it (gh#187).
+/// That is not an oversight: the picker's job is to say what a dispatch would
+/// do, and "the route sends this to OpenCode, which is not installed on the
+/// box" is precisely the sentence an operator needs to read. Only the
+/// *fallback* prefers an available option — landing on an unavailable one
+/// nobody chose would be the picker inventing a dead end.
 fn default_runtime_index(options: &[BoardRuntime], route_runtime: Option<&str>) -> usize {
     route_runtime
         .and_then(|route| options.iter().position(|o| o.name == route))
+        .or_else(|| options.iter().position(|o| o.available()))
         .unwrap_or(0)
 }
 
@@ -3030,10 +3039,32 @@ impl BoardPanel {
 
         // Row 1: the runtime. Highlight = the route's runtime; the label shows
         // which row the keyboard is on. Runtimes are few — chips stay.
+        //
+        // When the highlighted runtime cannot start on the host, the label says
+        // so instead of saying "Runtime" (gh#187). The host refuses that
+        // dispatch before it cuts anything, so this is the one place the
+        // operator can learn why without pressing enter first — and it is the
+        // *highlighted* one, because that is the one enter would send.
+        let blocked = draft
+            .runtimes
+            .get(draft.active_runtime)
+            .and_then(|r| Some(r.unavailable?.refusal(&r.name)));
         let runtime_label: SharedString = match (&draft.runtime_error, draft.runtimes.is_empty()) {
             (Some(err), _) => format!("{err} — enter dispatches with the route's runtime").into(),
             (None, true) => "Loading runtimes…".into(),
-            (None, false) => "Runtime".into(),
+            // The host's own refusal, verbatim: pressing enter here would print
+            // this sentence back, so the picker may as well say it first.
+            (None, false) => match &blocked {
+                Some(refusal) => SharedString::from(refusal.clone()),
+                None => "Runtime".into(),
+            },
+        };
+        let label_color = if blocked.is_some() {
+            theme.danger
+        } else if runtime_focused {
+            theme.accent
+        } else {
+            theme.text_subtle
         };
         let mut runtime_row = div()
             .flex_none()
@@ -3048,18 +3079,23 @@ impl BoardPanel {
                     .flex_none()
                     .text_size(px(10.5))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(if runtime_focused {
-                        theme.accent
-                    } else {
-                        theme.text_subtle
-                    })
+                    .text_color(label_color)
                     .child(runtime_label),
             );
 
         for (ix, runtime) in draft.runtimes.iter().enumerate() {
             let active = ix == draft.active_runtime;
             let name = runtime.name.clone();
-            let label = runtime.label.clone();
+            // An unavailable runtime is still offered, dimmed and marked
+            // (gh#187): filtering it away would leave an operator who expects
+            // OpenCode on the box wondering whether they misremembered which
+            // box it was, and it is still selectable so the label above can
+            // tell them what to do about it.
+            let unavailable = runtime.unavailable;
+            let label = match unavailable {
+                Some(why) => format!("{} · {}", runtime.label, why.reason()),
+                None => runtime.label.clone(),
+            };
             let key = format!("board-runtime-{}-{}", draft.task_id, name);
             runtime_row = runtime_row.child(
                 div()
@@ -3085,8 +3121,19 @@ impl BoardPanel {
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(if active && runtime_focused {
-                                theme.accent
+                            .text_color(if unavailable.is_some() {
+                                // Dimmed whether or not it is the highlight:
+                                // this one is a fact about the host, not about
+                                // where the cursor happens to be.
+                                theme.text_faint
+                            } else if active {
+                                if runtime_focused {
+                                    theme.accent
+                                } else {
+                                    // gh#172: a selected row is `text`, not a
+                                    // ninth of a tone off muted.
+                                    theme.text
+                                }
                             } else {
                                 theme.text_muted
                             })
@@ -4249,6 +4296,7 @@ mod tests {
             name: name.into(),
             label: label.into(),
             harness,
+            unavailable: None,
         })
         .collect()
     }
@@ -4277,6 +4325,30 @@ mod tests {
     fn an_unknown_route_runtime_falls_back_to_the_first_option() {
         let options = runtimes();
         assert_eq!(default_runtime_index(&options, Some("nonesuch")), 0);
+    }
+
+    /// The route's runtime is where the cursor starts even when the host cannot
+    /// run it (gh#187) — that sentence is the thing worth reading. But a
+    /// *fallback* never lands on a dead end.
+    #[test]
+    fn the_cursor_reports_the_routes_runtime_and_falls_back_to_a_live_one() {
+        use comet_proto::view::board::RuntimeUnavailable;
+        let mut options = runtimes();
+        options[0].unavailable = Some(RuntimeUnavailable::SignedOut);
+        options[1].unavailable = Some(RuntimeUnavailable::NotInstalled);
+
+        assert_eq!(
+            default_runtime_index(&options, Some("opencode")),
+            1,
+            "the route sends work there; saying so is the point"
+        );
+        assert_eq!(
+            default_runtime_index(&options, None),
+            2,
+            "with nothing chosen, start on one that could actually run"
+        );
+        assert_eq!(default_runtime_index(&options, Some("nonesuch")), 2);
+        assert!(!options[0].available() && options[2].available());
     }
 
     fn models() -> Vec<BoardModelInfo> {

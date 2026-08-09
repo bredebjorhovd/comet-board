@@ -408,6 +408,21 @@ pub struct Attempt {
     /// When the checkout and its local branch were reclaimed (gh#72). Non-`None`
     /// means `worktree` names a path that is no longer on disk.
     pub collected_at: Option<String>,
+    /// When the build output inside this attempt's checkout became nobody's
+    /// (gh#186) — the attempt closed, with no live attempt on the task. A much
+    /// earlier moment than [`collectable_at`](Self::collectable_at), and on
+    /// purpose: it does not wait for the task to leave the board, because
+    /// nothing reads `target/` after the run ends.
+    pub cache_sweepable_at: Option<String>,
+    /// When the board last deleted the build output inside this checkout
+    /// (gh#186).
+    ///
+    /// **Not [`collected_at`](Self::collected_at), and never written as it**: the
+    /// checkout is still there, still on its branch, still the directory review
+    /// delivery would resume an agent in. All that is gone is a cache the next
+    /// build rewrites. Cleared when a re-opened attempt starts building again, so
+    /// the output of that build is swept too.
+    pub cache_swept_at: Option<String>,
     /// The device the dispatch was issued from, as its frontend reported it
     /// (gh#74). `None` where nobody said — a `comet-board` run on the box, and
     /// every attempt from before the frontends sent it.

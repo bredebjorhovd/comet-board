@@ -71,6 +71,10 @@ nearly verbatim — it never depended on herdr:
   `collect_worktrees`, on the same interval clock. `chat_standing` (H30,
   gh#139) asks the same question about the attempt's *chat*, and
   `sync.rs`'s `archive_chats` sweeps it beside the checkouts.
+  `cache_standing` + `sweep_build_output` (H41, gh#186) ask it of the build
+  output *inside* the checkout — the one leaving that is a cache rather than
+  evidence, and the only one whose clock does not wait for the task to leave
+  the board.
 - `crates/board/src/settled.rs` — **new** (H4): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
@@ -153,11 +157,13 @@ deliberately: `WatchBoard` republishes all hundred-odd rows on every sync cycle,
 and a hundred issue bodies riding along would make each frame two orders of
 magnitude larger — relayed to a phone — to draw one truncated line. It is read
 when somebody opens a row, and only that row's.
-`ListBoardRuntimes` → `[{name, label, harness}]` lists the runtimes a dispatch
-can be pointed at (the canonical set `build_spec` validates an override against)
-for pickers in the desktop panel, the TUI and the CLI; `harness` is what the
-name resolves to, so a picker can tell which agent accounts a runtime could
-spend without re-implementing `harness_for_runtime`. `runtime`/`model`/`account`
+`ListBoardRuntimes` → `[{name, label, harness, unavailable?}]` lists the runtimes
+a dispatch can be pointed at (the canonical set `build_spec` validates an
+override against) for pickers in the desktop panel, the TUI and the CLI;
+`harness` is what the name resolves to, so a picker can tell which agent
+accounts a runtime could spend without re-implementing `harness_for_runtime`.
+`unavailable` is why that runtime could not start **on the device the call was
+answered by** — see §H41. `runtime`/`model`/`account`
 override the route's configured runtime, the harness's default model, and the
 route's `account` for that one dispatch; the attempt row records whatever the
 agent actually ran under. `bill` is the acknowledgement that a run spends
@@ -2283,6 +2289,157 @@ only re-pinned by ssh-ing to the box.
   the operator asked for. The board republishes the pin on the watch stream as
   the write lands, so the slot *appearing* is the box agreeing, exactly as the
   slot disappearing already was.
+
+### H43 — The agents could not run the board — **done** (gh#184)
+Read off a live agent on the box, not inferred: `PATH=/usr/local/bin:…:/snap/bin`,
+and `comet-board` nowhere in it. `install.sh` links the CLI into `~/.local/bin`,
+which a systemd **user** service does not inherit and a non-interactive ssh
+shell never sources — so on the one machine that runs dispatched agents, every
+verb §H29's skill hands them was `command not found`.
+
+- **The failure had no symptom.** An agent that cannot reach the board does not
+  crash. It stops checking `dispatchable`, stops releasing sub-work through the
+  board, stops `wait`ing, and gets on with the ticket — and the provenance the
+  board exists to guarantee quietly does not happen. Nothing logs a shell's
+  failed lookup.
+- **The engine already had the seam.** `PushCredentials::apply` prepends the
+  `gh` shim's directory to the harness child's PATH (§H11), carefully reading
+  the adapter's PATH back rather than the process's. That is now one of two
+  layers over a shared `prepend_dirs_to_path`: `RunControls::bin_dirs` goes on
+  first, the shim on top, so a `gh` beside either still loses to the one
+  carrying the credential.
+- **The directory is the one §H37 made real.** `agent_bin_dir()` is
+  `resolve_board_exe()`'s parent, which buys two things a configured path would
+  not: it cannot name a directory with no `comet-board` in it, and it is the
+  same copy `GIT_ASKPASS` runs as. On a managed box that is `app/<version>/`,
+  the payload the engine itself shipped in — so an agent gets the CLI that
+  shipped with the engine running it, by construction. §H37's drift check asks
+  whether the two are in step; this makes them in step for the caller that
+  matters.
+- **Every run, not only dispatched ones.** The skill is installed for the whole
+  box, so an orchestrator the board never dispatched reads the same page of
+  verbs; gating the PATH entry on a push credential would have left it
+  `command not found` there. Resolved once at engine assembly — it is a property
+  of the install, not of the run — and empty resolves to no change at all,
+  never an empty PATH entry.
+- **`doctor` asks it now.** The **agent PATH** check fails when the payload
+  holds no `comet-board` for the engine to point at, which is the one way the
+  guarantee comes apart and is exactly the state §H37 was about. It answers for
+  the payload on this disk, not for the running process, and says so.
+- **The skill no longer promises what the box may not keep.** It says the engine
+  puts `comet-board` on the agent's PATH, and tells an agent that cannot find it
+  to say so and stop rather than work on without the board — the silent
+  degradation above is worse than a refusal anybody can read.
+
+### H44 — The picker tells the truth about what a box can run — **done** (gh#187)
+Half of "every harness reachable in every project" already worked: a dispatch
+can name any runtime (`--runtime codex`, the desktop and phone pickers), it is
+validated against the engine's catalog, and an unknown name is refused rather
+than guessed at. The other half was a lie the pickers told.
+
+`runtime::runtime_options()` was a **static list** — Claude Code, OpenCode,
+Codex, Cursor, Mock — with no reference to the device the work would land on.
+Measured on the box: `claude` and `codex` installed, `opencode` and
+`cursor-agent` not. So the picker offered OpenCode, the dispatch was accepted,
+a worktree was cut, a chat was created — and only then did the harness spawn
+fail. **The board spent the expensive part before checking the cheap fact.**
+
+- **Availability is a fact about a device, not a constant.**
+  `ListBoardRuntimes` was already relay-forwardable; it now answers for the
+  *target* device. Two probes, both cheap, both offline:
+  `comet_harness::locate_cli` (the same resolution the adapter does at spawn,
+  minus the spawn) and `AgentAccounts::signed_in` (the same files the accounts
+  page reads, minus the network). `comet_engine::runtimes` is the one place
+  they are combined, so the picker, the dispatch guard and `doctor` cannot
+  disagree.
+- **Installed and signed-in are named apart**, because they are two different
+  jobs for whoever reads them. Codex sat installed-but-signed-out on the box
+  for twenty minutes, and a dispatch in that window looked identical from the
+  picker to one that would have worked. `RuntimeUnavailable` carries
+  `notInstalled` / `signedOut` / `unsupported` — the last for `cursor`, which
+  is in the runtime table and has never had an adapter, so "not installed"
+  would send an operator off to install something that would not help.
+- **Refused at dispatch, beside the cap and the billing guard** (§H18's
+  position, for §H18's reason): before the attempt row, so a refusal costs no
+  cleanup. `board_runtime.rs` had already established the discipline for the
+  account — resolved before the chat exists, because "an attempt whose chat
+  exists but whose login does not is a row somebody has to clean up" — and an
+  unavailable runtime gets the same treatment. The `comet-board` CLI refuses it
+  one round trip earlier, in the same words.
+- **A named account answers for itself.** A run pointed at a slot reads that
+  slot's materialized config dir and never the CLI's own, so the box's login
+  being absent says nothing about it — the signed-out half is skipped, and the
+  slot is checked for real when the executor materializes it.
+- **Shown, never filtered.** An unavailable runtime stays in the picker,
+  dimmed, saying why: an operator who expects OpenCode on a box needs to read
+  "not installed", not find the row absent and wonder which box it was. The
+  route's own runtime is still where the cursor starts even when the host
+  cannot run it — that sentence is the point — while the *fallback* prefers an
+  available option, so the picker never invents a dead end nobody chose.
+- **`doctor` says it from the shell.** A `harnesses` line naming what is ready
+  and why the rest is not. It fails only when *nothing* can start, which is a
+  board that can poll and derive and never dispatch; one missing runtime out of
+  four is a choice. `mock` is left out of the census — always available, so
+  counting it would let an empty box report "1 ready" and pass.
+- **Routes keep naming a default runtime.** Most work has an obvious harness,
+  and the per-dispatch override stays the way to reach for a different one.
+  What changed is that both now fail loudly and early when the box cannot
+  honour them.
+
+### H45 — Build output is a cache, not evidence — **done** (gh#186)
+The box hit 76% of a 150 GB disk on 2026-08-09 with eight checkouts, and
+`doctor` failed on it: `8 checkout(s), 109.5 GiB in ~/.comet-native/worktrees`.
+Measured per worktree, `board-gh-161-comet-board` was 36 GB — and 298 MB of that
+was the checkout. **A checkout is 14 MB; its build output is 20–36 GB.**
+`retain_worktrees` governed both, so the cheap thing and the expensive thing
+were kept for the same week. Clearing `target/` out of the three whose pull
+requests had already merged took the box from 36 GB free to 123 GB.
+
+- **The two are kept for different reasons, so they get different clocks.**
+  §H14 is right about the checkout: an attempt in review must keep its working
+  directory, because review delivery resumes an agent *in that directory*, and
+  after the merge it stays a while so a human can see what the agent actually
+  did. At 14 MB a week of that is free. The build output has no such reason —
+  nothing reads `target/` once the run ends. `[defaults] retain_build_output`
+  (**`on-settle`**, `off` honored) is swept by `SyncEngine::sweep_build_output`
+  beside the other two, and `gc::cache_standing` consults exactly one fact:
+  whether anybody is building in there. An open pull request, an issue still
+  owed, a task that has not left the board — all hold the checkout and none of
+  them hold the cache. A review comment that restarts the agent rebuilds,
+  slower; the alternative is paying 36 GB per attempt for the chance of saving
+  one `cargo build`.
+- **A per-language list, because guessing by size is not honest.**
+  `gc::BUILD_OUTPUT_DIRS` is `target`, `node_modules`, `.next`, `.turbo` —
+  `target/` is the Rust case, and `node_modules/` is the same shape for the JS
+  repos this box also routes. "Delete the biggest directory" would be right
+  about `target/` and wrong, silently, about the repo that keeps a dataset in
+  the tree. `dist`/`build` are deliberately out (some repos commit them), and
+  so is `.venv` (an environment somebody may be *in*). The walk never enters
+  `.git`, never follows a symlink — `node_modules` is full of them, and
+  `remove_dir_all` on a link would take the target's tree — and stops at a
+  depth bound `doctor`'s measurement shares, so what the report calls
+  regenerable is exactly what the sweep would take.
+- **A sweep is not a collection**, and the columns say so:
+  `attempts.cache_sweepable_at` / `cache_swept_at`, never `collected_at`. The
+  checkout is still there, still on its branch, still the directory delivery
+  would resume an agent in; recording a sweep as a collection would have the
+  board reporting space it had not reclaimed and then never reclaiming it. It
+  is also the one leaving that comes *back* — a re-opened attempt builds again,
+  so `rewatch_settled_attempts` clears both stamps and the next end sweeps the
+  new cache.
+- **`doctor` reports the split.** The `worktrees` line names the total and both
+  halves (`9.0 KiB in … (1.0 KiB of checkout, 8.0 KiB of build output)`), and a
+  new `build output` line carries the cache's own weight, how many directories,
+  how many tracked checkouts have been swept, and its own window. The checkout
+  verdict is now measured on `Usage::checkout_bytes`, so a box mid-build does
+  not fail a report for working; the build-output line is red in exactly one
+  state — a lot of it with `retain_build_output = off`, which is the gh#186
+  failure itself. `109.5 GiB in worktrees` was true and useless: it hid that
+  99.96% of the number was regenerable, and it named the key that governs the
+  other 0.04%.
+- **The agents are told**, in `docs/agent-conventions.md`: your checkout keeps
+  everything you wrote, your build output does not survive the end of your run,
+  so a resumed attempt's first build is a cold one.
 
 ### Cross-cutting notes
 - **Trackers stay authoritative.** State is derived on every read from

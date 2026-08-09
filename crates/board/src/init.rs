@@ -200,6 +200,18 @@ base = "origin/HEAD"
 # until somebody notices the disk; `comet-board doctor` reports the running cost
 # either way.
 retain_worktrees = "7d"
+# And how long the build output *inside* that checkout is kept — `target/`,
+# `node_modules/`, `.next/`, `.turbo/`. A much shorter clock, because the two are
+# kept for different reasons: a checkout is 14 MB of evidence somebody may go
+# back for, and its `target/` is 20–36 GB of cache nothing reads once the run has
+# ended. `on-settle` sweeps it as the attempt ends — it does not wait for the
+# task to leave the board or for a pull request to close, and the only guard is
+# that nobody is building in there. A review comment that restarts the agent
+# rebuilds, slower; the alternative is paying tens of gigabytes per attempt for
+# the chance of saving one build. Write a duration (`2h`, `1d`) to buy that
+# rebuild back on a box with disk to spare. `off` keeps every cache for as long
+# as its checkout lives, which is how eight checkouts became 109 GiB.
+retain_build_output = "on-settle"
 # And when its *chat* leaves the space's shelf. `on-settle` is no window at all:
 # the same guards hold it — never while an attempt is live or blocked, never
 # while a pull request is in review, never the pinned orchestrator, never a chat

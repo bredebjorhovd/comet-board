@@ -90,29 +90,16 @@ pub struct PushCredentials {
 }
 
 impl PushCredentials {
-    /// Stamp the child's env. Called after the adapter's own PATH handling, so
-    /// the shim lands in front of whatever that put there — a `gh` beside the
-    /// harness CLI must not win over the one that carries the credential.
+    /// Stamp the child's env. Called last of everything that shapes PATH, so
+    /// the shim lands in front of whatever the rest put there — neither a `gh`
+    /// beside the harness CLI nor one beside the engine may win over the one
+    /// that carries the credential.
     pub(crate) fn apply(&self, cmd: &mut tokio::process::Command) {
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
         let Some(dir) = &self.bin_dir else { return };
-        // The adapters set PATH on the command; read theirs back rather than
-        // the process's, or prepending here would discard it.
-        let current = cmd
-            .as_std()
-            .get_envs()
-            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
-            .and_then(|(_, v)| v.map(|v| v.to_os_string()))
-            .or_else(|| std::env::var_os("PATH"));
-        let mut paths = vec![dir.clone()];
-        if let Some(path) = current {
-            paths.extend(std::env::split_paths(&path));
-        }
-        if let Ok(joined) = std::env::join_paths(paths) {
-            cmd.env("PATH", joined);
-        }
+        prepend_dirs_to_path(cmd, std::slice::from_ref(dir));
     }
 }
 
@@ -142,6 +129,26 @@ pub struct RunControls {
     /// What this run pushes with. `None` = the box user's git credentials,
     /// which is every chat the board did not dispatch (gh#68).
     pub push: Option<PushCredentials>,
+    /// Directories prepended to the child's PATH so the agent can run the
+    /// tools the engine shipped with — `comet-board` above all (gh#184).
+    ///
+    /// The engine's own app directory, in practice. On the box that is
+    /// `~/.comet-native/app/<version>/`, which since gh#156 holds both
+    /// binaries; nothing else puts it on an agent's PATH. `install.sh` links
+    /// the CLI into `~/.local/bin`, which a systemd **user** service does not
+    /// inherit and a non-interactive ssh shell never sources — so every
+    /// `comet-board` an agent typed on the box was `command not found`, and an
+    /// agent that cannot reach the board does not fail, it just quietly stops
+    /// checking `dispatchable`, releasing sub-work, and waiting.
+    ///
+    /// Set on every run, not only board-dispatched ones: the skill is
+    /// installed for the whole box, so an orchestrator the board never
+    /// dispatched reads the same page of verbs. Empty when the engine cannot
+    /// find a `comet-board` beside itself, which leaves PATH exactly as it was.
+    ///
+    /// Applied *before* [`PushCredentials`], whose `gh` shim has to stay in
+    /// front of everything.
+    pub bin_dirs: Vec<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -164,6 +171,45 @@ pub mod claude;
 pub mod codex;
 pub mod mock;
 pub mod opencode;
+
+/// Where this device's CLI for a harness is, asked *without* spawning it
+/// (gh#187).
+///
+/// Every adapter already resolves its binary the same way — env override,
+/// PATH, then the install locations a GUI launch cannot see — and then fails
+/// the run with [`HarnessError::NotInstalled`] when it finds nothing. That is
+/// the right answer at the wrong time: by then a board dispatch has cut a
+/// worktree and made a chat. This is the same lookup, one step earlier, for
+/// anything that wants to know before it spends something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessCli {
+    /// Found, at this path.
+    Found(std::path::PathBuf),
+    /// A CLI this harness needs, nowhere the resolver looks.
+    Missing,
+    /// The harness needs no CLI at all — the mock runs in-process.
+    NotNeeded,
+    /// This build has no adapter for the harness, so there is nothing to look
+    /// for. `Cursor` is the whole of it today: it is in the id enum and in the
+    /// board's runtime table, and no adapter has ever been written.
+    Unsupported,
+}
+
+/// Locate the CLI a harness spawns. Cheap (stat calls), so callers answering a
+/// picker may do it per option rather than caching.
+pub fn locate_cli(harness: HarnessId) -> HarnessCli {
+    let found = match harness {
+        HarnessId::ClaudeCode => claude::resolve_claude_executable(),
+        HarnessId::Codex => codex::resolve_codex_executable(),
+        HarnessId::Opencode => opencode::resolve_opencode_executable(),
+        HarnessId::Mock => return HarnessCli::NotNeeded,
+        HarnessId::Cursor => return HarnessCli::Unsupported,
+    };
+    match found {
+        Some(path) => HarnessCli::Found(path),
+        None => HarnessCli::Missing,
+    }
+}
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
@@ -213,8 +259,31 @@ pub(crate) fn prepend_exe_dir_to_path(cmd: &mut tokio::process::Command, exe: &s
     let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) else {
         return;
     };
-    let mut paths = vec![dir.to_path_buf()];
-    if let Some(path) = std::env::var_os("PATH") {
+    prepend_dirs_to_path(cmd, std::slice::from_ref(&dir.to_path_buf()));
+}
+
+/// Put `dirs` at the front of the PATH the child will be spawned with, in the
+/// order given.
+///
+/// Everything that shapes a child's PATH goes through here, because the order
+/// they run in is the order the entries end up in and each layer has to keep
+/// the ones before it. The command's own `PATH` is read back first and only
+/// then the process's: an earlier layer has already set one on the command,
+/// and starting from the process's would silently discard it.
+///
+/// No dirs is not "an empty entry at the front" — it leaves PATH untouched.
+pub(crate) fn prepend_dirs_to_path(cmd: &mut tokio::process::Command, dirs: &[std::path::PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
+    let current = cmd
+        .as_std()
+        .get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+        .and_then(|(_, v)| v.map(|v| v.to_os_string()))
+        .or_else(|| std::env::var_os("PATH"));
+    let mut paths = dirs.to_vec();
+    if let Some(path) = current {
         paths.extend(std::env::split_paths(&path));
     }
     if let Ok(joined) = std::env::join_paths(paths) {
@@ -382,6 +451,46 @@ mod tests {
         .apply(&mut cmd);
         let after: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
         let before: std::collections::BTreeMap<_, _> = before.into_iter().collect();
+        assert_eq!(after.get("PATH"), before.get("PATH"));
+    }
+
+    /// gh#184: the engine's own app directory reaches the child, so an agent
+    /// can type `comet-board` — and the `gh` shim still wins, because the two
+    /// are applied in the order the adapters apply them.
+    #[test]
+    fn the_engines_app_dir_reaches_the_child_behind_the_push_shim() {
+        let mut cmd = tokio::process::Command::new("claude");
+        prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
+        prepend_dirs_to_path(
+            &mut cmd,
+            &[std::path::PathBuf::from(
+                "/home/comet/.comet-native/app/0.3.5",
+            )],
+        );
+        PushCredentials {
+            env: Vec::new(),
+            bin_dir: Some(std::path::PathBuf::from("/data/board/state/bin")),
+        }
+        .apply(&mut cmd);
+
+        let env: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        let path = env.get("PATH").expect("PATH");
+        let dirs: Vec<&str> = path.split(':').collect();
+        assert_eq!(dirs[0], "/data/board/state/bin");
+        assert_eq!(dirs[1], "/home/comet/.comet-native/app/0.3.5");
+        assert_eq!(dirs[2], "/opt/node/bin");
+    }
+
+    /// An engine with no `comet-board` beside it hands over an empty list, and
+    /// that must not put an empty entry — `:` — at the front of PATH, which
+    /// every shell reads as the current directory.
+    #[test]
+    fn no_bin_dirs_means_no_path_change() {
+        let mut cmd = tokio::process::Command::new("claude");
+        prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
+        let before: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        prepend_dirs_to_path(&mut cmd, &[]);
+        let after: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
         assert_eq!(after.get("PATH"), before.get("PATH"));
     }
 

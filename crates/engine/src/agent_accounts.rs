@@ -1151,6 +1151,55 @@ impl AgentAccounts {
         email.filter(|e| !e.is_empty())
     }
 
+    /// Does this device's CLI for `harness` have a credential a run could
+    /// spend (gh#187)? `None` = the harness has no login concept, so there is
+    /// nothing to be signed out of.
+    ///
+    /// Sync and file-only, for [`AgentAccounts::billed_email`]'s reasons and
+    /// one more: this answers a picker, and a picker must not make the operator
+    /// wait — nor pop a Keychain prompt for a question nobody asked out loud.
+    /// So the Claude arm reads the *identity* file rather than the secret,
+    /// which is the same fact [`AgentAccounts::detect_claude`] gates the whole
+    /// accounts page on, and it is the one that survives the credentials
+    /// living in the macOS Keychain.
+    ///
+    /// Deliberately lenient: every arm also accepts the CLI's own API-key
+    /// environment variable, because a false "signed out" would refuse a
+    /// dispatch that would have worked, and this is a *refusal*. Absence of
+    /// evidence is only reported where the evidence is the thing the CLI
+    /// itself reads.
+    pub fn signed_in(&self, harness: HarnessId) -> Option<bool> {
+        let env_key = |name: &str| {
+            std::env::var_os(name)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        };
+        match harness {
+            HarnessId::ClaudeCode => Some(
+                read_json(&self.inner.config.claude_config_file)
+                    .as_ref()
+                    .and_then(|c| c.get("oauthAccount"))
+                    .is_some()
+                    || self.inner.config.claude_creds_file().exists()
+                    || env_key("ANTHROPIC_API_KEY"),
+            ),
+            HarnessId::Codex => Some(self.detect_codex().is_some() || env_key("OPENAI_API_KEY")),
+            // opencode's logins are provider keys rather than an account, and
+            // it reads the same provider variables directly — so a box with an
+            // Anthropic or OpenAI key in the environment and an empty auth
+            // store is signed in as far as a run is concerned.
+            HarnessId::Opencode => Some(
+                self.detect_opencode().is_some()
+                    || env_key("ANTHROPIC_API_KEY")
+                    || env_key("OPENAI_API_KEY")
+                    || env_key("OPENROUTER_API_KEY"),
+            ),
+            // No login concept in comet: the mock harness has none at all, and
+            // cursor has no adapter to have one.
+            HarnessId::Mock | HarnessId::Cursor => None,
+        }
+    }
+
     // ── detection ───────────────────────────────────────────────────────────
 
     async fn detect_claude(&self) -> (Option<Detected>, Option<String>) {

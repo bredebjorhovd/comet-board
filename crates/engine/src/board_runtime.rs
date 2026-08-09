@@ -17,7 +17,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use comet_board::runtime::{DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime};
+use comet_board::runtime::{
+    DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
+};
 use comet_doc::SessionCommandPayload;
 use comet_proto::{
     AgentEvent, ChatConfig, DoneStatus, RunRequest, SandboxLevel, Session, SessionStatus,
@@ -283,6 +285,21 @@ impl Runtime for CometRuntime {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    /// Sweep the build output out of a finished attempt's checkout (gh#186),
+    /// leaving the checkout and its branch exactly where they are.
+    ///
+    /// No git and no `Repos`: a `target/` is not a worktree registration, and
+    /// removing one is a directory delete the board's own
+    /// [`comet_board::gc::sweep_build_output`] does — which is where the walk's
+    /// refusals (never `.git`, never a symlink, never below the depth bound) are
+    /// stated and tested. This is here for the ownership rule rather than for the
+    /// mechanism: the process that cut the worktrees is the one allowed to delete
+    /// inside them, so a read-only board process keeps the clock and sweeps
+    /// nothing.
+    fn reclaim_build_output(&self, worktree: &str) -> anyhow::Result<comet_board::gc::Swept> {
+        Ok(comet_board::gc::sweep_build_output(Path::new(worktree)))
+    }
+
     /// Whose subscription a dispatch would spend (gh#101) — the slot's login,
     /// or this device's own when the dispatch names no slot.
     ///
@@ -296,6 +313,21 @@ impl Runtime for CometRuntime {
         account: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         Ok(self.accounts.billed_email(harness, account))
+    }
+
+    /// What this box can actually run (gh#187) — the same answer
+    /// `ListBoardRuntimes` gives its pickers, so what a dispatch refuses and
+    /// what a picker warned about cannot drift apart.
+    fn harness_availability(
+        &self,
+        harness: comet_proto::HarnessId,
+        account: Option<&str>,
+    ) -> anyhow::Result<Option<RuntimeUnavailable>> {
+        Ok(crate::runtimes::availability(
+            &self.accounts,
+            harness,
+            account,
+        ))
     }
 
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>> {

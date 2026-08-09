@@ -17,6 +17,7 @@ use crate::runtime::harness_for_runtime;
 use crate::skill;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
+use comet_proto::view::board::RuntimeOption;
 use comet_proto::{AgentAccount, EdgeHealth, Space};
 use std::path::{Path, PathBuf};
 
@@ -49,7 +50,8 @@ pub struct EngineStatus {
 /// the same engine's live edge-connection census (gh#116), and `members` how
 /// many people are in the workspace (gh#161) — the fact that turns "a dispatch
 /// that names no account spends the box's login" from a tautology into a
-/// warning.
+/// warning. `runtimes` is the same engine's `ListBoardRuntimes` answer, which
+/// since gh#187 says which harnesses could actually start here.
 pub fn doctor(
     paths: &Paths,
     engine: &EngineStatus,
@@ -57,6 +59,7 @@ pub fn doctor(
     accounts: Option<&[AgentAccount]>,
     edge: Option<&EdgeHealth>,
     members: Option<usize>,
+    runtimes: Option<&[RuntimeOption]>,
 ) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
@@ -76,14 +79,16 @@ pub fn doctor(
         },
     });
 
-    // What the attempts have left on the disk (gh#72). Beside the database
-    // check because it is the same question — what is this box holding — and
-    // the answer is read partly out of that database.
-    checks.push(worktrees_check(
-        paths,
-        &crate::config::worktrees_root(),
-        db_ok.as_ref().ok(),
-    ));
+    // What the attempts have left on the disk (gh#72), in the two halves gh#186
+    // separated: the checkouts, and the build output inside them. Beside the
+    // database check because it is the same question — what is this box holding
+    // — and the answer is read partly out of that database. One walk feeds both
+    // lines: it is time-boxed, and paying that budget twice would only make the
+    // second half of one measurement disagree with the first.
+    let root = crate::config::worktrees_root();
+    let usage = gc::usage(&root);
+    checks.push(worktrees_check(paths, &usage, &root, db_ok.as_ref().ok()));
+    checks.push(build_output_check(paths, &usage, db_ok.as_ref().ok()));
 
     // The other half of what an attempt leaves behind (gh#139). Beside the
     // checkouts because it is the same question asked of the shelf instead of
@@ -143,6 +148,14 @@ pub fn doctor(
     // the exact state the box was in for 25 minutes after an edge redeploy,
     // dispatching happily and invisible to every remote viewer.
     checks.push(edge_connections_check(edge));
+
+    // Which harnesses could actually start on this box (gh#187). Beside the
+    // engine that answered it, because it is a fact about the box in the same
+    // way the routes and the credentials below are — and because it used to be
+    // invisible: `runtime_options()` was a constant, so every picker offered
+    // every harness on every device and a dispatch to a missing CLI failed
+    // after the worktree was cut.
+    checks.push(harnesses_check(runtimes));
 
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
@@ -418,6 +431,10 @@ pub fn doctor(
     }
 
     checks.push(dispatched_push_check(paths));
+    checks.push(agent_path_check(
+        &crate::config::data_dir().join("app"),
+        git_credentials::agent_bin_dir().as_deref(),
+    ));
     checks.push(git_identity_check(&git_identity::box_identity(
         &paths.config_dir,
     )));
@@ -631,6 +648,69 @@ fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
     }
 }
 
+/// Which harnesses can actually start on this box, and why the rest cannot
+/// (gh#187).
+///
+/// `doctor` already reports the routes, the credentials and the skill; "which
+/// agents could I even spin up here" is the same kind of fact and was the one
+/// nothing said out loud. It is the shell's copy of what the pickers now show,
+/// read from the same `ListBoardRuntimes` answer so the two cannot disagree.
+///
+/// Failing rather than warning when *nothing* can run: a box with no harness is
+/// a board that can poll, derive, and never dispatch — and that is the state
+/// this check exists to catch before an operator releases a task into it. One
+/// missing runtime out of four is a choice, not a fault, so it prints and
+/// passes.
+///
+/// `mock` is left out of the census entirely. It is dispatchable on purpose and
+/// always available, so counting it would let a box with no real harness report
+/// "1 ready" and pass.
+fn harnesses_check(runtimes: Option<&[RuntimeOption]>) -> Check {
+    let name = "harnesses".to_string();
+    let Some(runtimes) = runtimes else {
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine did not answer".into(),
+        };
+    };
+    let real: Vec<&RuntimeOption> = runtimes
+        .iter()
+        .filter(|r| r.harness != comet_proto::HarnessId::Mock)
+        .collect();
+    if real.is_empty() {
+        // An engine old enough to answer without the availability field, or one
+        // whose catalog is empty. Either way there is nothing to report on.
+        return Check {
+            name,
+            ok: true,
+            detail: "not checked — the engine listed no runtimes".into(),
+        };
+    }
+    let ready: Vec<&str> = real
+        .iter()
+        .filter(|r| r.available())
+        .map(|r| r.name.as_str())
+        .collect();
+    let blocked: Vec<String> = real
+        .iter()
+        .filter_map(|r| Some(format!("{} ({})", r.name, r.unavailable?.reason())))
+        .collect();
+    let detail = match (ready.is_empty(), blocked.is_empty()) {
+        (true, _) => format!(
+            "none can start here — {}. Nothing this board dispatches will run",
+            blocked.join(", ")
+        ),
+        (false, true) => format!("{} ready", ready.join(", ")),
+        (false, false) => format!("{} ready · {}", ready.join(", "), blocked.join(", ")),
+    };
+    Check {
+        name,
+        ok: !ready.is_empty(),
+        detail,
+    }
+}
+
 /// Does this box have a git identity, and will GitHub attribute what it signs
 /// (gh#107)?
 ///
@@ -798,19 +878,33 @@ fn dispatch_authorship_check(cfg: &RoutingConfig, accounts: Option<&[AgentAccoun
 /// holding open (a live attempt, a pull request in review, an issue still
 /// owed).
 ///
-/// `ok` is false only when the root is genuinely large ([`gc::WARN_BYTES`] /
+/// `ok` is false only when the *checkouts* are genuinely large
+/// ([`gc::WARN_BYTES`] against [`gc::Usage::checkout_bytes`], or
 /// [`gc::WARN_CHECKOUTS`]); a board holding a week of checkouts on purpose is
 /// working exactly as configured and must not fail the report for it. The
 /// retention window is named either way, because `off` is a choice whose cost
-/// is this line.
-fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Check {
-    let usage = gc::usage(root);
+/// is this line. Build output is [`build_output_check`]'s — it is the bulk of
+/// the bytes and it answers to a different key, so it gets its own verdict
+/// rather than turning this one red on a box that is merely busy (gh#186).
+fn worktrees_check(
+    paths: &Paths,
+    usage: &gc::Usage,
+    root: &std::path::Path,
+    db: Option<&Db>,
+) -> Check {
+    let floor = if usage.truncated { "≥ " } else { "" };
+    // The split gh#186 asked for. `109.5 GiB in worktrees` was true and useless:
+    // it hid that 99.96% of the number was regenerable, and it named
+    // `retain_worktrees` — which governs the other 0.04% — as the thing to
+    // change. The total stays, because the disk is the total.
     let about = format!(
-        "{} checkout(s), {}{} in {}",
+        "{} checkout(s), {floor}{} in {} ({floor}{} of checkout, {floor}{} of build \
+         output — see below)",
         usage.checkouts,
-        if usage.truncated { "≥ " } else { "" },
         gc::human_bytes(usage.bytes),
         root.display(),
+        gc::human_bytes(usage.checkout_bytes()),
+        gc::human_bytes(usage.cache_bytes),
     );
     // What the board still has a claim on. Not the same as "on disk": a
     // checkout cut by comet itself, or one left by an attempt whose row has
@@ -843,6 +937,72 @@ fn worktrees_check(paths: &Paths, root: &std::path::Path, db: Option<&Db>) -> Ch
         name: "worktrees".into(),
         ok: !usage.alarming(),
         detail,
+    }
+}
+
+/// What the build output inside those checkouts weighs, and what will sweep it
+/// (gh#186).
+///
+/// Its own line because it is its own thing on its own clock: a checkout is 14 MB
+/// of evidence and its `target/` is 20–36 GB of cache, and the one number the box
+/// reported before this ("109.5 GiB in worktrees") named neither. The share is
+/// what makes the sentence useful — 99.96% regenerable is a different problem
+/// from 109 GiB of source.
+///
+/// Red in exactly one state: a lot of build output and nothing that will ever
+/// sweep it. A busy box mid-build has tens of gibibytes of `target/` and is
+/// working correctly, so size alone must not fail the report — that is how the
+/// line this replaces stopped meaning anything. `retain_build_output = off` with
+/// 20 GiB behind it is the gh#186 failure itself, and it is worth an exit code.
+fn build_output_check(paths: &Paths, usage: &gc::Usage, db: Option<&Db>) -> Check {
+    let floor = if usage.truncated { "≥ " } else { "" };
+    let about = format!(
+        "{floor}{} in {} build-output director{} ({})",
+        gc::human_bytes(usage.cache_bytes),
+        usage.cache_dirs,
+        if usage.cache_dirs == 1 { "y" } else { "ies" },
+        gc::BUILD_OUTPUT_DIRS.join(", "),
+    );
+    // Of the checkouts the board still tracks, how many could it sweep — and how
+    // many has it already. A swept row still holds its checkout (that is the
+    // point of the split), so this is not the same census the line above reports.
+    let held = db.and_then(|db| db.collectable_attempts().ok()).map(|a| {
+        let swept = a.iter().filter(|a| a.cache_swept_at.is_some()).count();
+        format!(
+            "{} checkout(s) tracked by the board, {swept} already swept",
+            a.len()
+        )
+    });
+    let window = match RoutingConfig::load_unvalidated(&paths.routing()) {
+        Ok(cfg) => cfg.retain_build_output_secs(),
+        Err(_) => return unparsed_retention_check("build output"),
+    };
+    let retention = match window {
+        // No window is its own sentence, as it is for chats: "swept 0 seconds
+        // after" is a number where the operator wants the rule.
+        Some(0) => "swept as each attempt ends".to_string(),
+        Some(secs) => format!("swept {} after each attempt ends", gc::human_window(secs)),
+        None => "retain_build_output = off — kept for as long as the checkout is".to_string(),
+    };
+    Check {
+        name: "build output".into(),
+        ok: window.is_some() || usage.cache_bytes < gc::WARN_BYTES,
+        detail: [Some(about), held, Some(retention)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · "),
+    }
+}
+
+/// The one thing a retention line can say when `routing.toml` will not parse:
+/// the window is unquotable. Not a failure of its own — the `routing.toml` check
+/// above is already red, and failing twice for one mistake reads as two.
+fn unparsed_retention_check(name: &str) -> Check {
+    Check {
+        name: name.into(),
+        ok: true,
+        detail: "retention unknown — routing.toml did not parse".into(),
     }
 }
 
@@ -948,6 +1108,73 @@ fn dispatched_push_check(paths: &Paths) -> Check {
         ok: exe.is_some() && credential,
         detail,
     }
+}
+
+/// Can a dispatched agent on this box run `comet-board` at all (gh#184)?
+///
+/// The question nobody had asked, because the answer looked obvious from a
+/// login shell. A dispatched agent's PATH is not a login shell's: the engine
+/// runs as a systemd **user** service, which inherits `/usr/local/bin:…:/bin`
+/// and nothing else, and `install.sh` links the CLI into `~/.local/bin` —
+/// which appears nowhere in it. Every board verb the skill hands an agent was
+/// `command not found` on the one machine that runs dispatched agents, and
+/// nothing said so: an agent that cannot reach the board does not crash, it
+/// simply stops checking `dispatchable`, stops releasing sub-work through the
+/// board, stops waiting, and gets on with the ticket alone.
+///
+/// The fix is that the engine prepends its own app directory (`app/<version>/`,
+/// which since gh#156 holds both binaries) to every harness child's PATH. So
+/// what this checks is that the directory has a `comet-board` in it — the one
+/// way the guarantee can come back apart is a payload that ships the engine
+/// alone, which is exactly the state gh#156 was about.
+///
+/// `resolved` is where *this* CLI resolves from, used when there is no managed
+/// install to read. Both answers are about the payload on this disk rather than
+/// about the process: an engine somebody started from a build tree prepends
+/// that tree instead, and no check here can see it.
+fn agent_path_check(app_root: &Path, resolved: Option<&Path>) -> Check {
+    let name = "agent PATH".to_string();
+    let current = app_root.join("current");
+    let (ok, detail) = if current.exists() {
+        if current.join("comet-board").exists() {
+            (
+                true,
+                format!(
+                    "agents get {} on PATH — the comet-board the engine shipped with",
+                    crate::config::shorten_home(&current)
+                ),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "the release at {} ships the engine alone, so the directory an agent \
+                     gets on PATH holds no comet-board and every board verb it types is \
+                     `command not found` — upgrade to a release that carries both",
+                    crate::config::shorten_home(&current)
+                ),
+            )
+        }
+    } else {
+        match resolved {
+            Some(dir) => (
+                true,
+                format!(
+                    "no managed install — agents get {}, where this CLI resolves from",
+                    crate::config::shorten_home(dir)
+                ),
+            ),
+            None => (
+                false,
+                format!(
+                    "no comet-board found beside the engine or on PATH — an agent on this \
+                     box can run no board verb at all (set {})",
+                    git_credentials::BOARD_EXE_ENV
+                ),
+            ),
+        }
+    };
+    Check { name, ok, detail }
 }
 
 /// Which GitHub credential is live, and what it can reach (gh#58).
@@ -1810,7 +2037,7 @@ mod tests {
     #[test]
     fn doctor_reports_a_missing_routing_file_without_panicking() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
@@ -1924,6 +2151,55 @@ mod tests {
         assert_eq!(installed_payload_version(&app_root), None);
     }
 
+    // --- agent PATH (gh#184) -------------------------------------------------
+
+    /// The box after the fix: the payload holds both binaries, so the directory
+    /// the engine prepends to every agent's PATH has a `comet-board` in it.
+    #[test]
+    fn a_payload_with_both_binaries_lets_an_agent_run_the_board() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.5", &["comet", "comet-board"]);
+        let c = agent_path_check(&app_root, None);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("on PATH"), "{}", c.detail);
+    }
+
+    /// The one way the guarantee comes apart: a release that ships the engine
+    /// alone. The PATH entry is still there and still useless, which is
+    /// precisely the silence this check exists to end.
+    #[test]
+    fn a_payload_without_the_cli_is_a_path_with_no_board_in_it() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.5", &["comet"]);
+        let c = agent_path_check(&app_root, None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("command not found"), "{}", c.detail);
+    }
+
+    /// A laptop with no managed install: the answer is where this CLI resolves
+    /// from, and it is not a failure.
+    #[test]
+    fn no_managed_install_answers_from_where_the_cli_resolves() {
+        let d = tempfile::tempdir().unwrap();
+        let c = agent_path_check(&d.path().join("app"), Some(&d.path().join("target/debug")));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no managed install"), "{}", c.detail);
+    }
+
+    /// Nothing anywhere: no board verb an agent types can work, and saying so
+    /// is the whole job.
+    #[test]
+    fn no_comet_board_anywhere_fails_loudly() {
+        let d = tempfile::tempdir().unwrap();
+        let c = agent_path_check(&d.path().join("app"), None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains(git_credentials::BOARD_EXE_ENV),
+            "{}",
+            c.detail
+        );
+    }
+
     fn edge_check_in(checks: &[Check]) -> &Check {
         checks
             .iter()
@@ -1946,7 +2222,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("0 of 4 live"), "{}", check.detail);
@@ -1971,7 +2247,7 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok, "{}", check.detail);
         assert!(
@@ -1986,7 +2262,7 @@ mod tests {
     #[test]
     fn an_unaskable_engine_leaves_the_edge_check_unchecked() {
         let (_d, p) = tmp();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok);
         assert!(check.detail.contains("not checked"), "{}", check.detail);
@@ -2006,7 +2282,7 @@ mod tests {
             detail: "connection refused".into(),
             version: None,
         };
-        let checks = doctor(&p, &down, None, Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
         // The route's space is "not checked", not failed: one dead engine must
         // not fail every route and bury its own report.
@@ -2054,14 +2330,14 @@ mod tests {
 
         routing("origin/HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
         assert!(!ok, "{detail}");
         assert!(detail.contains("origin"), "{detail}");
         assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
 
         routing("HEAD");
         let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap());
+            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
         assert!(ok, "{detail}");
     }
 
@@ -2111,14 +2387,14 @@ mod tests {
             comet_proto::HarnessId::ClaudeCode,
         )];
 
-        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let ok = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&ok);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("sam@example.com"), "{}", c.detail);
 
         // An id this device has never saved: named, along with what it does have.
         routing_with_account(&p, "claude-code", "ffffffffffffffff");
-        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let bad = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&bad);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("ffffffffffffffff"), "{}", c.detail);
@@ -2136,7 +2412,7 @@ mod tests {
             "sam@example.com",
             comet_proto::HarnessId::ClaudeCode,
         )];
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("claude-code"), "{}", c.detail);
@@ -2154,11 +2430,11 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(!checks.iter().any(|c| c.name == "route w: account"));
 
         routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
-        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), None, None, None, None).unwrap();
         let c = account_check_in(&checks);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("not checked"), "{}", c.detail);
@@ -2174,7 +2450,7 @@ mod tests {
         )
         .unwrap();
         let spaces = [space("Tally")];
-        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&spaces), Some(&[]), None, None, None).unwrap();
         // Case-insensitive, like every other name match on the board.
         let c = checks
             .iter()
@@ -2182,13 +2458,88 @@ mod tests {
             .unwrap();
         assert!(c.ok, "{}", c.detail);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "route tally: space")
             .unwrap();
         assert!(!c.ok);
         assert!(c.detail.contains("no comet space named"), "{}", c.detail);
+    }
+
+    /// `doctor` says which harnesses this box can start, and why the rest
+    /// cannot (gh#187) — the shell's copy of what the pickers show.
+    #[test]
+    fn the_harness_census_names_the_ready_and_the_reason_for_the_rest() {
+        use comet_proto::HarnessId;
+        use comet_proto::view::board::RuntimeUnavailable;
+        let (_d, p) = tmp();
+
+        let option = |name: &str, harness, unavailable| RuntimeOption {
+            name: name.into(),
+            label: name.into(),
+            harness,
+            unavailable,
+        };
+        let runtimes = vec![
+            option("claude-code", HarnessId::ClaudeCode, None),
+            option(
+                "opencode",
+                HarnessId::Opencode,
+                Some(RuntimeUnavailable::NotInstalled),
+            ),
+            option("codex", HarnessId::Codex, Some(RuntimeUnavailable::SignedOut)),
+            // Always available, and deliberately not part of the census.
+            option("mock", HarnessId::Mock, None),
+        ];
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            Some(&runtimes),
+        )
+        .unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(c.ok, "one harness ready is not a fault: {}", c.detail);
+        assert!(c.detail.contains("claude-code ready"), "{}", c.detail);
+        // Both axes named apart — one is an install, the other a login.
+        assert!(c.detail.contains("opencode (not installed)"), "{}", c.detail);
+        assert!(c.detail.contains("codex (signed out)"), "{}", c.detail);
+        assert!(!c.detail.contains("mock"), "{}", c.detail);
+
+        // A box that can start nothing is a board that can only ever poll.
+        let none: Vec<RuntimeOption> = runtimes
+            .iter()
+            .cloned()
+            .map(|mut o| {
+                if o.harness != HarnessId::Mock {
+                    o.unavailable = Some(RuntimeUnavailable::NotInstalled);
+                }
+                o
+            })
+            .collect();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            None,
+            None,
+            Some(&none),
+        )
+        .unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("none can start here"), "{}", c.detail);
+
+        // An engine that could not be asked says so rather than condemning the
+        // box on the strength of a failed lookup.
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
+        let c = checks.iter().find(|c| c.name == "harnesses").unwrap();
+        assert!(c.ok && c.detail.contains("not checked"), "{}", c.detail);
     }
 
     #[test]
@@ -2204,7 +2555,7 @@ mod tests {
              runtime = \"gpt-piloted-typewriter\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let alias = checks
             .iter()
             .find(|c| c.name == "route w: runtime" && c.ok)
@@ -2234,7 +2585,7 @@ mod tests {
              runtime = \"claude\"\nmax_duration = \"off\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let detail = |name: &str| {
             checks
                 .iter()
@@ -2462,7 +2813,7 @@ mod tests {
     fn doctor_emits_the_default_account_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2)).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, Some(2), None).unwrap();
         assert!(
             checks.iter().any(|c| c.name == "default account"),
             "doctor is silent about what an unnamed account spends"
@@ -2494,7 +2845,7 @@ mod tests {
     fn doctor_emits_the_billing_guard_check() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "billing guard")
@@ -2510,7 +2861,7 @@ mod tests {
             "[defaults]\nnotify_dispatcher = true\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "settle notice")
@@ -2525,7 +2876,7 @@ mod tests {
     fn doctor_says_when_no_agent_is_running_the_board() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
             .find(|c| c.name == "orchestrator")
@@ -2543,7 +2894,7 @@ mod tests {
             "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
@@ -2565,7 +2916,7 @@ mod tests {
              [github]\nrepos = []\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("gets the whole board"), "{}", c.detail);
@@ -2621,7 +2972,7 @@ mod tests {
         db.set_attempt_pane(a, "chat-9").unwrap();
         drop(db);
 
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
@@ -2775,7 +3126,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(
             !checks.iter().any(|c| c.name == "linear review state"),
             "a board with no Linear anywhere must not be handed a Linear setting"
@@ -2794,7 +3145,7 @@ mod tests {
              repo = \"/tmp\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "linear review state"));
     }
 
@@ -2842,7 +3193,7 @@ mod tests {
         }
         std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
 
-        let check = worktrees_check(&p, &root, None);
+        let check = worktrees_check(&p, &gc::usage(&root), &root, None);
         assert!(check.ok, "two checkouts is not a problem: {}", check.detail);
         assert!(check.detail.contains("2 checkout(s)"), "{}", check.detail);
         assert!(check.detail.contains("4.0 KiB"), "{}", check.detail);
@@ -2854,10 +3205,123 @@ mod tests {
     fn retention_off_is_said_out_loud() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"off\"\n").unwrap();
-        let check = worktrees_check(&p, &_d.path().join("nothing-here"), None);
+        let root = _d.path().join("nothing-here");
+        let check = worktrees_check(&p, &gc::usage(&root), &root, None);
         assert!(check.detail.contains("ever collected"), "{}", check.detail);
         // An empty root is still not a failure — nothing has been dispatched.
         assert!(check.ok);
+    }
+
+    /// The line gh#186 is about. The box read `8 checkout(s), 109.5 GiB` and
+    /// could not tell from it that 99.96% was regenerable — so both halves are
+    /// named, and the cache's own window is quoted beside its own number.
+    #[test]
+    fn the_two_reports_separate_the_checkout_from_its_build_output() {
+        let (_d, p) = tmp();
+        let root = _d.path().join("worktrees");
+        let checkout = root.join("widget").join("board-gh-7-widget");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("src").join("main.rs"), vec![b'x'; 1024]).unwrap();
+        std::fs::create_dir_all(checkout.join("target").join("debug")).unwrap();
+        std::fs::write(
+            checkout.join("target").join("debug").join("bin"),
+            vec![b'x'; 8192],
+        )
+        .unwrap();
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
+
+        let usage = gc::usage(&root);
+        let worktrees = worktrees_check(&p, &usage, &root, None);
+        // The total is still there — the disk is the total — but the split is on
+        // the same line, so nobody reaches for `retain_worktrees` over 8 KiB of
+        // `target/` again.
+        assert!(worktrees.detail.contains("9.0 KiB"), "{}", worktrees.detail);
+        assert!(
+            worktrees.detail.contains("1.0 KiB of checkout"),
+            "{}",
+            worktrees.detail
+        );
+
+        let build = build_output_check(&p, &usage, None);
+        assert!(build.ok);
+        assert!(build.detail.contains("8.0 KiB"), "{}", build.detail);
+        assert!(
+            build.detail.contains("1 build-output directory"),
+            "{}",
+            build.detail
+        );
+        assert!(build.detail.contains("target"), "{}", build.detail);
+        // The default window, spelled as the rule and not as `0s`.
+        assert!(
+            build.detail.contains("swept as each attempt ends"),
+            "{}",
+            build.detail
+        );
+    }
+
+    /// `retain_build_output = off` is what the board did before gh#186, and the
+    /// only state where the build-output line is a failure rather than a number:
+    /// a box mid-build has tens of gibibytes of `target/` and is working.
+    #[test]
+    fn build_output_kept_forever_is_a_failure_only_once_it_is_large() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\nretain_build_output = \"off\"\n").unwrap();
+
+        let small = gc::Usage {
+            checkouts: 1,
+            bytes: 1024,
+            cache_bytes: 512,
+            cache_dirs: 1,
+            truncated: false,
+        };
+        let check = build_output_check(&p, &small, None);
+        assert!(check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("retain_build_output = off"),
+            "{}",
+            check.detail
+        );
+
+        let full = gc::Usage {
+            cache_bytes: gc::WARN_BYTES,
+            bytes: gc::WARN_BYTES,
+            ..small
+        };
+        assert!(!build_output_check(&p, &full, None).ok);
+        // …and the same weight with a sweep behind it is not a fault at all.
+        std::fs::write(p.routing(), "[defaults]\nretain_build_output = \"2h\"\n").unwrap();
+        let check = build_output_check(&p, &full, None);
+        assert!(check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("2h after each attempt ends"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A worktree root that is mostly `target/` must not fail the *checkout*
+    /// line: that verdict is `retain_worktrees`'s, the bytes it names are 14 MB
+    /// per checkout, and a red line over a running build is a red line nobody
+    /// reads twice.
+    #[test]
+    fn a_heavy_cache_does_not_fail_the_checkout_line() {
+        let (_d, p) = tmp();
+        std::fs::write(p.routing(), "[defaults]\nretain_worktrees = \"7d\"\n").unwrap();
+        let root = _d.path().join("worktrees");
+        let mostly_cache = gc::Usage {
+            checkouts: 3,
+            bytes: gc::WARN_BYTES * 5,
+            cache_bytes: gc::WARN_BYTES * 5 - 1024,
+            cache_dirs: 3,
+            truncated: false,
+        };
+        assert!(worktrees_check(&p, &mostly_cache, &root, None).ok);
+        // The checkouts themselves crossing the line still fails it.
+        let heavy = gc::Usage {
+            cache_bytes: 0,
+            ..mostly_cache
+        };
+        assert!(!worktrees_check(&p, &heavy, &root, None).ok);
     }
 
     /// The shelf's half of the same report (gh#139): the window, and the fact

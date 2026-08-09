@@ -614,6 +614,30 @@ fn handle_dispatch(
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
 
+    // Can that harness start on the device the work is going to (gh#187)?
+    //
+    // Here, with the cap and the billing guard, and for their reason: this is a
+    // refusal, and a refusal that had already inserted an attempt row — let
+    // alone cut a worktree and made a chat, which is where the missing CLI used
+    // to surface — leaves the operator cleaning up after a dispatch that never
+    // happened. The board offered `opencode` on a box that had never installed
+    // it and found out at the harness spawn; the fact was free to check the
+    // whole time.
+    if let Some(reason) = runtime
+        .harness_availability(spec.harness, spec.account.as_deref())
+        .unwrap_or_else(|e| {
+            // A device that cannot say what it has knows less, not worse —
+            // the same silence `account_email` keeps. The harness still fails
+            // the run loudly if the CLI really is absent.
+            engine
+                .log
+                .warn(format!("checking runtime availability: {e:#}"));
+            None
+        })
+    {
+        anyhow::bail!("{}", reason.refusal(runtime_name));
+    }
+
     // Provenance: a `via` chat with a live attempt names its task as the
     // parent; one without is still an agent if the chat is alive. The
     // `chat_alive` lookup runs only when it is the deciding fact.
@@ -844,6 +868,15 @@ mod tests {
         /// the loop — the regression the `dispatch_from_a_plain_thread...` test
         /// pins.
         spawn_in_dispatch: std::sync::atomic::AtomicBool,
+        /// What this device can start (gh#187): harness → why it cannot. Empty
+        /// is a box with everything installed and signed in, which is what the
+        /// rest of these tests assume.
+        unavailable: std::sync::Mutex<
+            std::collections::HashMap<
+                comet_proto::HarnessId,
+                comet_board::runtime::RuntimeUnavailable,
+            >,
+        >,
     }
 
     impl Default for FakeRuntime {
@@ -854,6 +887,7 @@ mod tests {
                 alive: std::sync::atomic::AtomicBool::new(true),
                 logins: Default::default(),
                 spawn_in_dispatch: std::sync::atomic::AtomicBool::new(false),
+                unavailable: Default::default(),
             }
         }
     }
@@ -899,6 +933,18 @@ mod tests {
                 .unwrap()
                 .get(account.unwrap_or(""))
                 .cloned())
+        }
+        fn harness_availability(
+            &self,
+            harness: comet_proto::HarnessId,
+            account: Option<&str>,
+        ) -> anyhow::Result<Option<comet_board::runtime::RuntimeUnavailable>> {
+            // Same rule as the real one: a run pointed at a slot reads that
+            // slot's login, so the box's own being absent says nothing.
+            if account.is_some_and(|a| !a.is_empty()) {
+                return Ok(None);
+            }
+            Ok(self.unavailable.lock().unwrap().get(&harness).copied())
         }
         fn last_run_end(
             &self,
@@ -1468,6 +1514,94 @@ billing_guard = "{mode}"
             "no suffix on a run that bills its own releaser: {}",
             dispatch.payload
         );
+
+        service.shutdown();
+    }
+
+    /// A dispatch to a harness the box cannot start is refused before anything
+    /// is cut (gh#187), and the refusal says which of the two is wrong.
+    ///
+    /// The failure this replaces: the picker offered OpenCode on a box that had
+    /// never installed it, the dispatch was accepted, a worktree was cut and a
+    /// chat created, and only the harness spawn found the missing CLI — leaving
+    /// a checkout, a chat and an attempt row for somebody to clean up over a
+    /// fact that was free to check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runtime_the_box_cannot_start_is_refused_before_a_worktree_is_cut() {
+        use comet_board::runtime::RuntimeUnavailable;
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#187", "gh#187");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        runtime
+            .unavailable
+            .lock()
+            .unwrap()
+            .insert(comet_proto::HarnessId::Mock, RuntimeUnavailable::NotInstalled);
+
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#187",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        // Named by the *runtime* spelling the operator typed (or the route
+        // said), and told which half is wrong.
+        assert!(err.contains("`mock`"), "{err}");
+        assert!(err.contains("not installed"), "{err}");
+        assert!(err.contains("install its CLI"), "{err}");
+
+        // Nothing was created — no chat, no checkout, no attempt row.
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let db = Db::open(&paths.db()).unwrap();
+        assert!(
+            db.get_task("gh:owner/widget#187")
+                .unwrap()
+                .unwrap()
+                .live_attempt()
+                .is_none(),
+            "a refusal must cost no cleanup"
+        );
+        drop(db);
+
+        // Signed out is the other axis, and reads as a login rather than an
+        // install.
+        runtime
+            .unavailable
+            .lock()
+            .unwrap()
+            .insert(comet_proto::HarnessId::Mock, RuntimeUnavailable::SignedOut);
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#187",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("signed out"), "{err}");
+        assert!(err.contains("sign it in"), "{err}");
+
+        // A dispatch naming a slot reads that slot's login, not the box's — so
+        // the signed-out box must not refuse it.
+        service
+            .dispatch_task(
+                "gh:owner/widget#187",
+                DispatchOrigin::default(),
+                DispatchOverrides {
+                    account: Some("slot-ana".into()),
+                    ..DispatchOverrides::default()
+                },
+            )
+            .await
+            .expect("a named account answers for itself");
+        assert_eq!(runtime.dispatched.lock().unwrap().len(), 1);
 
         service.shutdown();
     }

@@ -11,8 +11,13 @@ Nothing below is runtime-specific.
 ## The comet-board task board
 
 One global queue across every space: Linear issues and GitHub issues in, comet
-chats running coding agents out. `comet-board` is on PATH, and `gh` is
-authenticated once per user — neither is specific to the agent you are.
+chats running coding agents out. The engine puts `comet-board` on the PATH of
+every agent it runs — the copy it shipped with — and `gh` is authenticated once
+per user; neither is specific to the agent you are. If `comet-board` is
+nevertheless not found, say so and stop rather than working on without it: an
+agent that quietly skips the board leaves its work with no row, no provenance
+and no one able to see it (`comet-board doctor` names the fault as **agent
+PATH**).
 
 **Read it before acting. Never read `board.db` directly** — the schema changes,
 the CLI shape does not.
@@ -124,7 +129,10 @@ is this board's `review`.
    the route's runtime and that harness's default model for the one dispatch;
    both are checked against the engine's catalogs first, and an unknown value
    is refused naming the valid set, so a typo costs an error rather than an
-   attempt. The row's default runtime is on the row (`runtime`).
+   attempt. The row's default runtime is on the row (`runtime`). A runtime the
+   box lists but cannot start — its CLI is not installed, or it is signed out —
+   is refused the same way, saying which of the two is wrong;
+   `comet-board doctor` names the harnesses that box can actually run.
 3. **Accounts are the operator's choice, not yours.** `routing.toml` decides
    which teammate's Claude/Codex subscription a route's work is billed to.
    `dispatch --account <id>` overrides it; do not pass it unless you were told
@@ -265,11 +273,21 @@ so in the PR description rather than spending the remaining minutes on another
 lap. Finishing inside the grace settles the attempt `done` on your artifacts as
 normal — the cap only takes what nothing else has closed.
 
+**Your build output goes as soon as your run ends.** `target/`, `node_modules/`,
+`.next/` and `.turbo/` inside your checkout are swept once your attempt closes —
+not when the task leaves the board, and not when your pull request merges
+(`retain_build_output`, `on-settle` by default). The checkout itself stays, on
+its branch, with everything you wrote in it; only the cache goes. So if you are
+resumed to answer review comments, expect the first build to be a cold one, and
+do not keep anything you care about inside those directories. The reason is
+arithmetic: a checkout is about 14 MB and its `target/` is 20–36 GB, and a box
+keeping a week of the second one runs out of disk mid-run — yours.
+
 **Your chat is filed away once the work is over, not deleted.** As soon as the
 task leaves the board — merged, closed upstream, or marked done — the board
 archives the chat it dispatched you into; the checkout you worked in is
-reclaimed on its own, week-long clock (`archive_chats` / `retain_worktrees`,
-both per route). Never while
+reclaimed on its own, week-long clock (`archive_chats`, per route;
+`retain_worktrees`, board-wide). Never while
 your attempt is live or blocked, and never while a pull request is still in
 review: a chat in review is how the board delivers comments back to you, so it
 outlives everything else. The transcript survives archiving, Settings →
