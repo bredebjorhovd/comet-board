@@ -297,6 +297,32 @@ pub fn resolve_board_exe() -> Option<PathBuf> {
 /// Naming the helper binary outright, for a layout neither lookup above finds.
 pub const BOARD_EXE_ENV: &str = "COMET_BOARD_EXECUTABLE";
 
+/// The directory a dispatched agent needs on its PATH to type `comet-board`
+/// (gh#184).
+///
+/// Resolved through [`resolve_board_exe`] and then taken as its parent, which
+/// buys two things a fixed path would not. It cannot name a directory with no
+/// `comet-board` in it — the lookup found the binary there. And it is the same
+/// binary `GIT_ASKPASS` is pointed at, so the CLI an agent runs and the helper
+/// its pushes run are one copy: on a managed box, `app/<version>/`, the payload
+/// the engine itself shipped in.
+///
+/// The failure this exists for is a PATH nobody looks at. `install.sh` links the
+/// CLI into `~/.local/bin`, which the systemd **user** service does not inherit
+/// and a non-interactive ssh shell never sources — so a dispatched agent on the
+/// box got `command not found` for every board verb the skill told it to run,
+/// and simply went on without the board.
+pub fn agent_bin_dir() -> Option<PathBuf> {
+    bin_dir_of(resolve_board_exe())
+}
+
+/// The testable half: the lookup is injected, because "no binary anywhere" is a
+/// state the machine running the tests is not reliably in either way.
+fn bin_dir_of(exe: Option<PathBuf>) -> Option<PathBuf> {
+    exe.and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .filter(|dir| !dir.as_os_str().is_empty())
+}
+
 /// Find the real `gh`, skipping `skip` — the shim directory, which holds a
 /// `gh` of our own and would otherwise wrap itself forever.
 pub fn resolve_gh(skip: Option<&Path>) -> Option<PathBuf> {
@@ -341,6 +367,23 @@ pub fn repo_for_checkout(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::sources::github_app::test_app;
+
+    /// gh#184: the directory an agent gets on PATH is the one the resolved
+    /// binary sits in — so it always holds a `comet-board`, and it is the same
+    /// copy the askpass helper runs as.
+    #[test]
+    fn the_agents_bin_dir_is_the_resolved_binarys_own() {
+        assert_eq!(
+            bin_dir_of(Some(PathBuf::from(
+                "/home/comet/.comet-native/app/0.3.5/comet-board"
+            ))),
+            Some(PathBuf::from("/home/comet/.comet-native/app/0.3.5"))
+        );
+        // No binary is no directory — never a bare "." that would put the
+        // agent's own cwd on the front of its PATH.
+        assert_eq!(bin_dir_of(None), None);
+        assert_eq!(bin_dir_of(Some(PathBuf::from("comet-board"))), None);
+    }
 
     #[test]
     fn the_push_url_carries_the_username_and_never_the_token() {

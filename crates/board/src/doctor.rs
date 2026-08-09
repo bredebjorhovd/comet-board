@@ -418,6 +418,10 @@ pub fn doctor(
     }
 
     checks.push(dispatched_push_check(paths));
+    checks.push(agent_path_check(
+        &crate::config::data_dir().join("app"),
+        git_credentials::agent_bin_dir().as_deref(),
+    ));
     checks.push(git_identity_check(&git_identity::box_identity(
         &paths.config_dir,
     )));
@@ -948,6 +952,73 @@ fn dispatched_push_check(paths: &Paths) -> Check {
         ok: exe.is_some() && credential,
         detail,
     }
+}
+
+/// Can a dispatched agent on this box run `comet-board` at all (gh#184)?
+///
+/// The question nobody had asked, because the answer looked obvious from a
+/// login shell. A dispatched agent's PATH is not a login shell's: the engine
+/// runs as a systemd **user** service, which inherits `/usr/local/bin:…:/bin`
+/// and nothing else, and `install.sh` links the CLI into `~/.local/bin` —
+/// which appears nowhere in it. Every board verb the skill hands an agent was
+/// `command not found` on the one machine that runs dispatched agents, and
+/// nothing said so: an agent that cannot reach the board does not crash, it
+/// simply stops checking `dispatchable`, stops releasing sub-work through the
+/// board, stops waiting, and gets on with the ticket alone.
+///
+/// The fix is that the engine prepends its own app directory (`app/<version>/`,
+/// which since gh#156 holds both binaries) to every harness child's PATH. So
+/// what this checks is that the directory has a `comet-board` in it — the one
+/// way the guarantee can come back apart is a payload that ships the engine
+/// alone, which is exactly the state gh#156 was about.
+///
+/// `resolved` is where *this* CLI resolves from, used when there is no managed
+/// install to read. Both answers are about the payload on this disk rather than
+/// about the process: an engine somebody started from a build tree prepends
+/// that tree instead, and no check here can see it.
+fn agent_path_check(app_root: &Path, resolved: Option<&Path>) -> Check {
+    let name = "agent PATH".to_string();
+    let current = app_root.join("current");
+    let (ok, detail) = if current.exists() {
+        if current.join("comet-board").exists() {
+            (
+                true,
+                format!(
+                    "agents get {} on PATH — the comet-board the engine shipped with",
+                    crate::config::shorten_home(&current)
+                ),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "the release at {} ships the engine alone, so the directory an agent \
+                     gets on PATH holds no comet-board and every board verb it types is \
+                     `command not found` — upgrade to a release that carries both",
+                    crate::config::shorten_home(&current)
+                ),
+            )
+        }
+    } else {
+        match resolved {
+            Some(dir) => (
+                true,
+                format!(
+                    "no managed install — agents get {}, where this CLI resolves from",
+                    crate::config::shorten_home(dir)
+                ),
+            ),
+            None => (
+                false,
+                format!(
+                    "no comet-board found beside the engine or on PATH — an agent on this \
+                     box can run no board verb at all (set {})",
+                    git_credentials::BOARD_EXE_ENV
+                ),
+            ),
+        }
+    };
+    Check { name, ok, detail }
 }
 
 /// Which GitHub credential is live, and what it can reach (gh#58).
@@ -1922,6 +1993,55 @@ mod tests {
         std::fs::create_dir_all(&app_root).unwrap();
         std::os::unix::fs::symlink(&elsewhere, app_root.join("current")).unwrap();
         assert_eq!(installed_payload_version(&app_root), None);
+    }
+
+    // --- agent PATH (gh#184) -------------------------------------------------
+
+    /// The box after the fix: the payload holds both binaries, so the directory
+    /// the engine prepends to every agent's PATH has a `comet-board` in it.
+    #[test]
+    fn a_payload_with_both_binaries_lets_an_agent_run_the_board() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.5", &["comet", "comet-board"]);
+        let c = agent_path_check(&app_root, None);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("on PATH"), "{}", c.detail);
+    }
+
+    /// The one way the guarantee comes apart: a release that ships the engine
+    /// alone. The PATH entry is still there and still useless, which is
+    /// precisely the silence this check exists to end.
+    #[test]
+    fn a_payload_without_the_cli_is_a_path_with_no_board_in_it() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.5", &["comet"]);
+        let c = agent_path_check(&app_root, None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("command not found"), "{}", c.detail);
+    }
+
+    /// A laptop with no managed install: the answer is where this CLI resolves
+    /// from, and it is not a failure.
+    #[test]
+    fn no_managed_install_answers_from_where_the_cli_resolves() {
+        let d = tempfile::tempdir().unwrap();
+        let c = agent_path_check(&d.path().join("app"), Some(&d.path().join("target/debug")));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no managed install"), "{}", c.detail);
+    }
+
+    /// Nothing anywhere: no board verb an agent types can work, and saying so
+    /// is the whole job.
+    #[test]
+    fn no_comet_board_anywhere_fails_loudly() {
+        let d = tempfile::tempdir().unwrap();
+        let c = agent_path_check(&d.path().join("app"), None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains(git_credentials::BOARD_EXE_ENV),
+            "{}",
+            c.detail
+        );
     }
 
     fn edge_check_in(checks: &[Check]) -> &Check {

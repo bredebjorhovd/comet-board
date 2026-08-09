@@ -115,6 +115,13 @@ struct Inner {
     /// pointed at `comet-board`'s askpass helper for it instead of at the box
     /// user's git credentials — gh#68.
     push: OnceLock<Arc<crate::push_credentials::PushCredentials>>,
+    /// The directory holding the `comet-board` this engine shipped with, put on
+    /// every harness child's PATH so an agent can actually run the verbs its
+    /// skill hands it — gh#184. Resolved once here rather than per run: it is a
+    /// property of how this process was installed, and it cannot change while
+    /// the process lives. Empty when there is no `comet-board` beside the
+    /// engine, which leaves the child's PATH untouched.
+    agent_bin_dirs: Vec<std::path::PathBuf>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -148,6 +155,9 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 accounts: OnceLock::new(),
                 push: OnceLock::new(),
+                agent_bin_dirs: comet_board::git_credentials::agent_bin_dir()
+                    .into_iter()
+                    .collect(),
             }),
         }
     }
@@ -364,6 +374,7 @@ impl SessionsEngine {
             chat_id: Some(chat_id.to_string()),
             account,
             push: self.inner.push_for(chat_id),
+            bin_dirs: self.inner.agent_bin_dirs.clone(),
         };
 
         lock(&self.inner.runs).insert(

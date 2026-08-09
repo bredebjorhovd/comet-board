@@ -141,7 +141,8 @@ a human, what you are still waiting on. That summary is the product.
 
 ## What it does not need
 
-Nothing new. `comet-board` is on PATH and `COMET_BOARD_CHAT_ID` is already in
+Nothing new. The engine prepends its own app directory to every harness child's
+PATH, so `comet-board` is there (gh#184), and `COMET_BOARD_CHAT_ID` is already in
 the environment of any chat on the box, so provenance is recorded without
 anybody passing ids by hand — the board knows which chat released what. Pinning
 grants no authority the chat did not already have; it only decides who is told.
