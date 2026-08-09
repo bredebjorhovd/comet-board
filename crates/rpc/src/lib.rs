@@ -168,6 +168,24 @@ pub mod methods {
     /// larger, relayed to a phone, to draw one truncated line. This is read
     /// when somebody opens a row, and only that row's.
     pub const READ_BOARD_TASK: &str = "ReadBoardTask";
+    /// Record what a dispatched agent says its attempt did, file-anchored
+    /// (§gh#183). Params: `{taskId, text}` → the same `AttemptReview`
+    /// [`READ_ATTEMPT_REVIEW`] answers.
+    ///
+    /// `text` is the raw block, parsed on the board's host and not by the
+    /// caller: the refusal — a claim with no file anchor is prose, not a claim
+    /// — is the contract, and a contract enforced in the client is a contract
+    /// the next client does not have. The reply carries the remainder so the
+    /// agent learns what it did not account for while it can still act on it.
+    pub const SUBMIT_CLAIMS: &str = "SubmitClaims";
+    /// One attempt's review (§gh#183): the brief, the agent's claims, the
+    /// evidence the board observed for itself, and the changes no claim
+    /// accounts for. Params: `{taskId, attempt?}` — omit `attempt` for the
+    /// task's latest.
+    ///
+    /// A call and not a stream, like [`READ_BOARD_TASK`]: it reads a diff out
+    /// of a checkout, and it is read when somebody opens a review.
+    pub const READ_ATTEMPT_REVIEW: &str = "ReadAttemptReview";
     /// The board's `routing.toml` as it stands on its host: the text, its
     /// parse, and everything wrong with it — plus the repos that have a space
     /// on that device but nothing on the board watching them (gh#75). Params:

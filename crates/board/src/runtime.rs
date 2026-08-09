@@ -499,6 +499,29 @@ pub trait Runtime {
         let _ = chat_id;
         Ok(None)
     }
+
+    /// Every shell command this chat's runs executed, and whether it exited
+    /// non-zero — off the same journal as [`Runtime::run_tokens`] (§gh#183).
+    ///
+    /// The evidence half of the review contract, and the reason it is a runtime
+    /// method at all: a claim written by the agent is worth reading only beside
+    /// something the agent did not author, and the journal is already the
+    /// durable record of what the run actually did.
+    ///
+    /// `None` is "no journal for this chat" — nothing ever ran, or it has been
+    /// compacted away. `Some(empty)` is a run that executed no commands, which
+    /// is a different and much more interesting answer.
+    ///
+    /// Default `Ok(None)` rather than a refusal, like [`Runtime::run_tokens`]'s:
+    /// a runtime that cannot read a journal costs a review some evidence, and
+    /// [`crate::evidence`] renders the absence honestly.
+    fn run_commands(
+        &self,
+        chat_id: &str,
+    ) -> anyhow::Result<Option<Vec<crate::evidence::RanCommand>>> {
+        let _ = chat_id;
+        Ok(None)
+    }
 }
 
 /// What one chat's run journal says it spent, and what spent it (gh#151).

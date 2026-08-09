@@ -22,7 +22,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      dispatched_by_device, dispatched_by_user, dispatched_by_verified, billed_to, \
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
-     cache_sweepable_at, cache_swept_at";
+     cache_sweepable_at, cache_swept_at, claims, claims_at";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -81,6 +81,14 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         model: r.get(38)?,
         cache_sweepable_at: r.get(39)?,
         cache_swept_at: r.get(40)?,
+        // Unreadable JSON reads as no claims, never as an error: a column one
+        // bad write corrupted must not take `load_tasks` — and with it the
+        // whole board pane — down over a review field (§gh#183).
+        claims: r
+            .get::<_, Option<String>>(41)?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default(),
+        claims_at: r.get(42)?,
     })
 }
 
@@ -256,7 +264,25 @@ impl Db {
               -- sweep as a collection would have the board reporting checkouts
               -- reclaimed that are still on the disk, still on their branches.
               cache_sweepable_at TEXT,
-              cache_swept_at TEXT
+              cache_swept_at TEXT,
+              -- What the agent said it did, file-anchored, and when it said it
+              -- (§gh#183). On the attempt beside the outcome because a retry
+              -- makes new claims and because the review happens after the chat
+              -- is archived — the conversation is gone, the row is not. NULL
+              -- and `[]` are different answers: nothing submitted at all, and
+              -- an agent that submitted an empty set. `claims_at` is the
+              -- witness for the first.
+              claims TEXT,
+              claims_at TEXT,
+              -- The branch diff and the run's own commands, snapshotted off
+              -- the live attempt (§gh#183). Kept out of the columns every
+              -- board read selects: the board loads every attempt of every
+              -- task on every cycle, and these two are read when somebody
+              -- opens a review. Snapshotted rather than looked up because gc
+              -- reclaims the checkout (gh#72) and the run journal can be
+              -- compacted, while the review outlives both.
+              changed_files TEXT,
+              run_evidence TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -416,6 +442,15 @@ impl Db {
                 // its attempt closed. That backlog is what this is about.
                 ("cache_sweepable_at", "TEXT"),
                 ("cache_swept_at", "TEXT"),
+                // The review contract (§gh#183). Existing rows keep NULL on
+                // all four, which is exactly what they are: they ran before
+                // anything asked for claims, so they claimed nothing and were
+                // never asked to — and their diffs and journals are long gone.
+                // Backfilling any of it would be inventing a record.
+                ("claims", "TEXT"),
+                ("claims_at", "TEXT"),
+                ("changed_files", "TEXT"),
+                ("run_evidence", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -976,6 +1011,111 @@ impl Db {
         Ok(())
     }
 
+    // ---- the review contract (§gh#183) -----------------------------------
+
+    /// Record what an agent says this attempt did.
+    ///
+    /// Replaces the set rather than appending to it: claims are an attempt's
+    /// answer to one question, an agent that submits twice is correcting
+    /// itself, and appending would leave a review reading a superseded claim
+    /// beside the one that replaced it. `claims_at` moves with them, so the
+    /// stamp always says when the *current* set was written.
+    pub fn set_attempt_claims(
+        &self,
+        attempt_id: i64,
+        claims: &[crate::claims::Claim],
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET claims = ?2, claims_at = ?3 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(claims)?, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The branch diff the board snapshotted off this attempt while it was
+    /// still live (§gh#183). Empty for an attempt that never had one taken —
+    /// every row from before this existed, and any attempt whose checkout the
+    /// board could not read.
+    ///
+    /// Its own query rather than a column on [`Attempt`]: the board loads every
+    /// attempt of every task on every sync cycle, and a diff per row parsed
+    /// each time would be work nobody asked for. This is read when somebody
+    /// opens a review.
+    pub fn attempt_changes(&self, attempt_id: i64) -> Result<Vec<crate::claims::ChangedFile>> {
+        Ok(self
+            .attempt_json("changed_files", attempt_id)?
+            .unwrap_or_default())
+    }
+
+    /// Snapshot the branch diff onto the attempt, so the remainder survives the
+    /// checkout being reclaimed (gh#72).
+    pub fn set_attempt_changes(
+        &self,
+        attempt_id: i64,
+        changed: &[crate::claims::ChangedFile],
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET changed_files = ?2 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(changed)?],
+        )?;
+        Ok(())
+    }
+
+    /// What the run's own journal says it did (§gh#183). `None` is "never
+    /// recorded", which is not the same as a run that executed nothing —
+    /// [`crate::evidence::RunEvidence::default`] is that one.
+    pub fn attempt_evidence(
+        &self,
+        attempt_id: i64,
+    ) -> Result<Option<crate::evidence::RunEvidence>> {
+        self.attempt_json("run_evidence", attempt_id)
+    }
+
+    pub fn set_attempt_evidence(
+        &self,
+        attempt_id: i64,
+        evidence: &crate::evidence::RunEvidence,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET run_evidence = ?2 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(evidence)?],
+        )?;
+        Ok(())
+    }
+
+    /// One JSON column off one attempt. Unparseable JSON reads as absent for
+    /// [`read_attempt`]'s reason: a review field must never be what stops a
+    /// row being read.
+    fn attempt_json<T: serde::de::DeserializeOwned>(
+        &self,
+        column: &str,
+        attempt_id: i64,
+    ) -> Result<Option<T>> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                &format!("SELECT {column} FROM attempts WHERE id = ?1"),
+                params![attempt_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(stored.and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    /// One attempt by id, whatever task it belongs to — what a review is
+    /// addressed to.
+    pub fn get_attempt(&self, attempt_id: i64) -> Result<Option<Attempt>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE id = ?1"),
+                params![attempt_id],
+                read_attempt,
+            )
+            .optional()?)
+    }
+
     pub fn set_attempt_status(&self, attempt_id: i64, status: AgentStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE attempts SET agent_status = ?2 WHERE id = ?1",
@@ -1450,7 +1590,10 @@ mod tests {
         .unwrap();
         let stored = db.attempts_for("linear:LIN-142").unwrap().remove(0);
         assert_eq!(stored.dispatched_by_device.as_deref(), Some("laptop-ana"));
-        assert_eq!(stored.dispatched_by_user.as_deref(), Some("ana@example.com"));
+        assert_eq!(
+            stored.dispatched_by_user.as_deref(),
+            Some("ana@example.com")
+        );
     }
 
     #[test]

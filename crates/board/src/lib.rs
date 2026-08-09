@@ -16,10 +16,12 @@
 pub mod adopt;
 pub mod billing;
 pub mod board_cli;
+pub mod claims;
 pub mod config;
 pub mod db;
 pub mod dispatch;
 pub mod doctor;
+pub mod evidence;
 pub mod gc;
 pub mod git_credentials;
 pub mod git_identity;

@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use comet_board::claims::AttemptReview;
 use comet_board::config::Paths;
 use comet_board::db::NewAttempt;
 use comet_board::dispatch::{
@@ -83,6 +84,22 @@ enum Msg {
     Stats {
         since_days: Option<i64>,
         reply: oneshot::Sender<anyhow::Result<BoardStats>>,
+    },
+    /// An agent's file-anchored claims about what its attempt did (§gh#183).
+    /// A write, so it could only ever have been on this thread; it answers with
+    /// the review the claims land in, remainder included.
+    Claims {
+        task_id: String,
+        text: String,
+        reply: oneshot::Sender<anyhow::Result<AttemptReview>>,
+    },
+    /// One attempt's review (§gh#183) — brief, claims, evidence, remainder.
+    /// A read like `Detail`, and on this thread for the same reason: it walks
+    /// `board.db` and shells out to git in the attempt's checkout.
+    Review {
+        task_id: String,
+        attempt: Option<i64>,
+        reply: oneshot::Sender<anyhow::Result<AttemptReview>>,
     },
     Shutdown,
 }
@@ -314,6 +331,45 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
     }
 
+    /// Record what an agent says its attempt did, and answer with the review
+    /// those claims land in (§gh#183).
+    ///
+    /// The reply carries the remainder on purpose: the agent is told, at the
+    /// moment it submits, which of its own changes nothing it wrote accounts
+    /// for. It is the only moment at which the party that can still do
+    /// something about it is listening.
+    pub async fn submit_claims(&self, task_id: &str, text: &str) -> anyhow::Result<AttemptReview> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Claims {
+                task_id: task_id.to_string(),
+                text: text.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-claim"))?
+    }
+
+    /// One attempt's review (§gh#183). `None` is the task's latest attempt,
+    /// which is what a reviewer opening a row means.
+    pub async fn attempt_review(
+        &self,
+        task_id: &str,
+        attempt: Option<i64>,
+    ) -> anyhow::Result<AttemptReview> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Review {
+                task_id: task_id.to_string(),
+                attempt,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
+    }
+
     /// Stop the loop and wait for the in-flight cycle to finish, so shutdown
     /// never truncates a SQLite write mid-transaction.
     pub fn shutdown(&self) {
@@ -467,6 +523,26 @@ fn run_loop(
                     })
                     .map(|task| task_detail(&task));
                 let _ = reply.send(result);
+            }
+            // The claim contract (§gh#183). The runtime rides along because
+            // submitting takes a fresh snapshot of the run's evidence before it
+            // answers — the agent has just finished committing, and a remainder
+            // computed against the last reconcile's diff would report files it
+            // has since accounted for.
+            Ok(Msg::Claims {
+                task_id,
+                text,
+                reply,
+            }) => {
+                let result = engine.submit_claims(Some(runtime.as_ref()), &task_id, &text);
+                let _ = reply.send(result);
+            }
+            Ok(Msg::Review {
+                task_id,
+                attempt,
+                reply,
+            }) => {
+                let _ = reply.send(engine.review(&task_id, attempt));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Ok(Msg::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1596,11 +1672,10 @@ billing_guard = "{mode}"
 
         let (_tx, rx) = watch::channel(Vec::<Session>::new());
         let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
-        runtime
-            .unavailable
-            .lock()
-            .unwrap()
-            .insert(comet_proto::HarnessId::Mock, RuntimeUnavailable::NotInstalled);
+        runtime.unavailable.lock().unwrap().insert(
+            comet_proto::HarnessId::Mock,
+            RuntimeUnavailable::NotInstalled,
+        );
 
         let err = service
             .dispatch_task(
@@ -2239,6 +2314,92 @@ max_concurrent_per_workspace = 1
         );
 
         service.shutdown();
+    }
+
+    /// The review contract through the service (§gh#183) — the path
+    /// `SubmitClaims` and `ReadAttemptReview` take. Both run on the loop
+    /// thread, because that thread owns `board.db` and shells out to git in the
+    /// attempt's own checkout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claims_are_recorded_and_the_board_answers_with_the_remainder() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#183", "gh#183");
+        seed_attempt(&paths, "gh:owner/widget#183", "chat-183");
+        let checkout = claims_checkout(&paths, "gh:owner/widget#183");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![]);
+
+        // Prose is refused where it is submitted; the contract is the board's,
+        // not the agent's to remember.
+        let refused = service
+            .submit_claims("gh:owner/widget#183", "I improved the storage layer.")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("no `::`"), "{refused}");
+
+        let review = service
+            .submit_claims("gh:owner/widget#183", "Storage :: src/db.rs")
+            .await
+            .unwrap();
+        assert!(review.claimed());
+        assert_eq!(
+            review
+                .remainder
+                .unclaimed
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["Cargo.lock"]
+        );
+
+        // And reading it back answers the same thing, with the brief attached.
+        let read = service
+            .attempt_review("gh:owner/widget#183", None)
+            .await
+            .unwrap();
+        assert_eq!(read.brief.identifier, "gh#183");
+        assert_eq!(read.remainder.unclaimed.len(), 1);
+        assert_eq!(read.remainder.claims[0].matched, ["src/db.rs"]);
+
+        service.shutdown();
+        std::fs::remove_dir_all(&checkout).ok();
+    }
+
+    /// A checkout with a base commit and two changed files on top, wired onto
+    /// the task's attempt exactly as a dispatch would wire it.
+    fn claims_checkout(paths: &Paths, task_id: &str) -> std::path::PathBuf {
+        let dir = paths.state_dir.join("claims-checkout");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(dir.join("src/db.rs"), "// base\n").unwrap();
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("src/db.rs"), "// base\n// claims\n").unwrap();
+        std::fs::write(dir.join("Cargo.lock"), "# nobody mentions this\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "the work"]);
+
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt = db.get_task(task_id).unwrap().unwrap().attempts[0].id;
+        db.set_attempt_worktree(attempt, &dir.to_string_lossy())
+            .unwrap();
+        db.set_attempt_base_sha(attempt, &base).unwrap();
+        dir
     }
 
     #[tokio::test(flavor = "multi_thread")]

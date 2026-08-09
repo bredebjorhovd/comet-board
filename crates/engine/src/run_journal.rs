@@ -18,7 +18,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{AgentEvent, TokenUsage};
+use comet_board::evidence::RanCommand;
+use comet_proto::{AgentEvent, TokenUsage, ToolCall};
 
 /// What [`RunJournal::tokens`] found in a chat's journal: everything it spent,
 /// and the model the harness said was spending it.
@@ -216,6 +217,66 @@ impl RunJournal {
         Ok(reported.then_some(out))
     }
 
+    /// Every shell command this chat's runs executed, paired with how it
+    /// exited (§gh#183).
+    ///
+    /// The board's evidence half: a claim written by the agent is worth reading
+    /// only beside something the agent did not author, and the journal already
+    /// records every `ToolCall`/`ToolResult` pair. Nothing new is instrumented
+    /// here — this is a read of a file that was being written anyway.
+    ///
+    /// A call whose result never landed (the run died mid-command) comes back
+    /// `failed: false`: the journal does not say how it ended, and a guess
+    /// would be invented evidence in exactly the direction this exists to
+    /// avoid. Same reason the tokens scan filters by tag first: a long run's
+    /// journal is mostly text deltas, and this is read on every reconcile of a
+    /// live attempt.
+    ///
+    /// `None` is "no journal for this chat"; `Some(empty)` is a run that
+    /// executed no commands at all, which is a much more interesting answer.
+    pub fn commands(&self, chat_id: &str) -> Result<Option<Vec<RanCommand>>, JournalError> {
+        const CALL_TAG: &str = r#""type":"toolCall""#;
+        const RESULT_TAG: &str = r#""type":"toolResult""#;
+        let path = self.path_for(chat_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // Tool-call ids are unique within a run, so the index is where a result
+        // finds the command it belongs to.
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        let mut out: Vec<RanCommand> = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.contains(CALL_TAG) && !line.contains(RESULT_TAG) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<JournalLine>(&line) else {
+                continue;
+            };
+            match parsed.event {
+                AgentEvent::ToolCall {
+                    id,
+                    call: ToolCall::Exec { command },
+                } => {
+                    by_id.insert(id, out.len());
+                    out.push(RanCommand {
+                        command,
+                        failed: false,
+                    });
+                }
+                AgentEvent::ToolResult { id, is_error } => {
+                    if let Some(ix) = by_id.get(&id) {
+                        out[*ix].failed = is_error;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// The last event in a chat's journal, if any (ignores a torn tail line).
     pub fn last_event(&self, chat_id: &str) -> Result<Option<(u64, AgentEvent)>, JournalError> {
         let path = self.path_for(chat_id);
@@ -410,7 +471,9 @@ mod tests {
     fn the_model_recorded_is_the_one_the_last_run_named() {
         let dir = tempfile::tempdir().unwrap();
         let journal = RunJournal::open(dir.path()).unwrap();
-        journal.append("chat-1", &started("claude-sonnet-5")).unwrap();
+        journal
+            .append("chat-1", &started("claude-sonnet-5"))
+            .unwrap();
         journal.append("chat-1", &usage(1, 1)).unwrap();
         journal.append("chat-1", &started("claude-opus-5")).unwrap();
         journal.append("chat-1", &usage(1, 1)).unwrap();

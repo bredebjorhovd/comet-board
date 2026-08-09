@@ -602,6 +602,27 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
             updated_at: "2026-08-04T09:00:00Z".into(),
         })
         .expect("seed task");
+        // …and an attempt to hang a review on (§gh#183): claims belong to a
+        // run, and the review verbs forward for the reason every other board
+        // verb does — the attempt row is on the box.
+        db.insert_attempt(&comet_board::db::NewAttempt {
+            task_id: "task-on-the-box".into(),
+            pane_id: Some("chat-55".into()),
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: Some("board/gh-55".into()),
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: None,
+            repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
+            dispatched_by_verified: false,
+            billed_to: None,
+        })
+        .expect("seed attempt");
     }
 
     let core_b = assemble(&dirs.path().join("b"), "device-b");
@@ -768,6 +789,57 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     assert!(
         missing.to_string().contains("nothing-here"),
         "the refusal must name the row B looked for: {missing}"
+    );
+
+    // §gh#183: and so do the review verbs. The claim contract is enforced on
+    // the board's host — the parse, the refusal and the diff all happen where
+    // the attempt and its checkout are — so an agent submitting from anywhere
+    // else gets the same answer it would get on the box.
+    let refused = client
+        .call(
+            methods::SUBMIT_CLAIMS,
+            serde_json::json!({
+                "taskId": "task-on-the-box",
+                "text": "I improved the thing.",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect_err("prose has no file anchor and is refused");
+    assert!(
+        refused.to_string().contains("::"),
+        "the refusal has to name the format, from B: {refused}"
+    );
+    let review = client
+        .call(
+            methods::SUBMIT_CLAIMS,
+            serde_json::json!({
+                "taskId": "task-on-the-box",
+                "text": "Forwarded the board RPCs :: crates/engine/src/rpc.rs",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("remote SubmitClaims");
+    assert_eq!(
+        review["claims"][0]["text"].as_str(),
+        Some("Forwarded the board RPCs")
+    );
+    // No checkout on this attempt, so the diff cannot be read — and the review
+    // says so rather than answering with an empty one.
+    assert_eq!(review["diff"]["source"].as_str(), Some("unavailable"));
+
+    let read = client
+        .call(
+            methods::READ_ATTEMPT_REVIEW,
+            serde_json::json!({ "taskId": "task-on-the-box", "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote ReadAttemptReview");
+    assert_eq!(read["brief"]["identifier"].as_str(), Some("gh#55"));
+    assert!(
+        read["claimed_at"].is_string(),
+        "the claims are stored on B's attempt row: {read}"
     );
 
     // gh#75: so does the config. `routing.toml` is a file on B's disk, and A

@@ -32,6 +32,34 @@ you and your agents invisible to every surface.
 **Close the issue from the work**: `Closes #N` in a commit on the branch. A
 merged PR settles the row itself.
 
+## Finishing: claim what you did
+
+Before you say you are done, tell the board what you changed — in **claims**,
+one per line, each anchored to the files it is about:
+
+```bash
+comet-board claim --task gh:owner/repo#183 <<'EOF'
+Claims are stored against the attempt :: crates/board/src/db.rs crates/board/src/model.rs
+The remainder is computed from the branch diff :: crates/board/src/claims.rs
+EOF
+```
+
+`<sentence> :: <path> [<path>…]`. Paths are repo-relative; a directory
+(`crates/board/src/`) accounts for everything under it. A line with no `::`,
+or nothing after it, is **refused** — without file anchors a claim cannot be
+checked, and an unanchored summary is the thing this replaces.
+
+The reply is the part worth reading: the board diffs your branch and prints
+**every changed file no claim accounts for**. That set is computed from git, not
+from what you wrote, so it is where the dependency you bumped and the function
+you edited in passing turn up. Read it and either claim those changes or go and
+look at them — they are the ones a reviewer would have caught.
+
+Claims live on the attempt, so they outlive this chat; a retry makes its own.
+Submitting again replaces the set. `comet-board review --task <id> [--json]`
+prints the whole thing back: brief, claims, the commands the run ran, and the
+remainder.
+
 **Releasing and waiting:**
 
 ```bash
@@ -87,6 +115,8 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
+| `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
+| `review` | `--task`, `--attempt`, `--json` | What an attempt was asked to do, what it says it did, and what it did not account for |
 | `new <title>` | `--body`, `--team`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
 | `stats` | `--since-days`, `--json` | What the board knows about its own throughput |
 | `doctor` | — | Check the environment: keys, engine, routes, repos. Exits non-zero on any failing check |
