@@ -84,6 +84,29 @@ enum Sent {
     Dropped(String),
 }
 
+/// What became of one agent-facing notice — see [`SyncEngine::announce`],
+/// which routes on it.
+///
+/// Not a bool, because the hop to the next addressee and the log line for an
+/// event nobody heard both need to know *why* a channel came up empty
+/// (gh#165) — an unpinned board and an unreachable pin are different things to
+/// go and fix. Only [`Told::Yes`] stops the hop: a dispatcher that cannot be
+/// told is not a dispatcher that was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Told {
+    /// Prompted into that chat. Nobody after it in the chain hears this event.
+    Yes,
+    /// There is no chat in this role: nothing agent-released the work, or no
+    /// orchestrator is pinned. Not a failure — an empty address.
+    NoOne,
+    /// There is a chat and it could not be prompted — archived, gone, or the
+    /// runtime refused. The reason is already in the log where it happened.
+    Unreachable,
+    /// The channel is switched off in config. Only `notify_dispatcher` has a
+    /// switch; the pin's absence is [`Told::NoOne`].
+    Off,
+}
+
 /// Agent statuses for this cycle, keyed by chat id (the id stored in
 /// `Attempt::pane_id`). Built by the engine's board service from the session
 /// watch through [`crate::runtime::agent_status`]. A chat absent from the map
@@ -1120,9 +1143,12 @@ impl SyncEngine {
         // The orchestrator hears about the cap before the attempt is gone
         // (gh#104) — the one notice it gets about a run that is still going,
         // and the only window in which reading the chat can still change the
-        // outcome. Outside the `runtime`/`chat_id` guard below on purpose: an
-        // attempt whose chat vanished is exactly the kind the orchestrator has
-        // no other way to learn about.
+        // outcome. Straight here with no dispatcher hop (gh#165): this is not
+        // an event about work that has ended, so there is nothing for a
+        // dispatcher waiting on the step to do about it, and the party who can
+        // still act is one that goes and looks. Outside the `runtime`/`chat_id`
+        // guard below on purpose: an attempt whose chat vanished is exactly the
+        // kind the orchestrator has no other way to learn about.
         self.wake_orchestrator(
             runtime,
             task,
@@ -1132,7 +1158,6 @@ impl SyncEngine {
                 cap_secs: cap,
                 grace_secs: grace,
             },
-            None,
         );
         let (Some(runtime), Some(chat_id)) = (runtime, attempt.pane_id.as_deref()) else {
             return Ok(());
@@ -1680,13 +1705,18 @@ impl SyncEngine {
     /// Tell whoever is not watching the board that something happened to a
     /// dispatched attempt.
     ///
-    /// Three channels, three switches, and they are independent because they
-    /// are different audiences (see [`crate::notify`]): the chat of the agent
-    /// that released the work (`notify_dispatcher`, off by default), the
-    /// pinned orchestrator (`orchestrator_chat`, unset by default) and the
-    /// operator's webhook (`notify` + `notify_webhook`). The fourth channel —
-    /// the comment upstream — is not here: outcome comments are queued by
-    /// [`SyncEngine::enqueue_outcome`] and the blocked comment by
+    /// The two agent-facing channels are **one channel with a fallback hop**,
+    /// not two switches (gh#165). The dispatcher is tried first because it is
+    /// the precise addressee — it prompts the one agent whose plan that task
+    /// was a step in — and the orchestrator gets what the dispatcher could not
+    /// be given: work no agent released, and work whose dispatcher did not
+    /// survive it. Told once or not at all; see [`crate::notify`] for why a
+    /// pinned orchestrator only survives a busy board on that rule.
+    ///
+    /// The operator's webhook (`notify` + `notify_webhook`) is beside both and
+    /// unconditional on either: it is not addressed to an agent. The fourth
+    /// channel — the comment upstream — is not here at all: outcome comments
+    /// are queued by [`SyncEngine::enqueue_outcome`] and the blocked comment by
     /// [`SyncEngine::note_blocked`], because those are retryable writebacks
     /// rather than best-effort notices.
     ///
@@ -1700,34 +1730,65 @@ impl SyncEngine {
         attempt: &Attempt,
         signal: Signal,
     ) {
-        let mut told: Option<&str> = None;
-        if let Signal::Settled {
-            outcome,
-            evidence,
-            pr_url,
-        } = &signal
-        {
-            told = self.wake_dispatcher(
-                runtime,
-                task,
-                attempt,
-                *outcome,
-                *evidence,
-                pr_url.as_deref(),
-            );
+        match runtime {
+            // The hop, in the order the addresses get more general.
+            Some(rt) => {
+                let dispatcher = self.wake_dispatcher(rt, task, attempt, &signal);
+                if dispatcher != Told::Yes {
+                    let orchestrator = self.wake_orchestrator(
+                        Some(rt),
+                        task,
+                        attempt,
+                        &notify::Event::Signal(&signal),
+                    );
+                    if orchestrator != Told::Yes {
+                        self.note_unheard(task, &signal, dispatcher, orchestrator);
+                    }
+                }
+            }
+            // A cycle run without a runtime can settle rows but cannot prompt
+            // anybody. One line rather than one per channel: the reason is the
+            // same for both, and it is not about who was addressed.
+            None => self.log.warn(format!(
+                "{}: {} reached no agent — this cycle has no runtime to prompt a chat with",
+                task.identifier,
+                signal.event(),
+            )),
         }
-        self.wake_orchestrator(
-            runtime,
-            task,
-            attempt,
-            &notify::Event::Signal(&signal),
-            told,
-        );
         self.post_webhook(task, attempt, &signal);
     }
 
-    /// Queue a settle notice into the chat of the agent that released this
-    /// work (herdr-board's AGE-25).
+    /// The line that keeps a dropped notice from being a silence.
+    ///
+    /// Both agent-facing addresses came up empty, so this event is now the row
+    /// colour, the webhook and the comment on the issue — which is a legitimate
+    /// board (an operator at the panel with nothing pinned is exactly it) and an
+    /// invisible one when it is not. Before gh#165 the undeliverable case said
+    /// nothing at all, and "the orchestrator never told me" was indistinguishable
+    /// from "the orchestrator has nothing to say".
+    fn note_unheard(&self, task: &Task, signal: &Signal, dispatcher: Told, orchestrator: Told) {
+        let first = match dispatcher {
+            Told::Yes => return,
+            Told::NoOne => "no chat released it",
+            Told::Unreachable => "the chat that released it is gone",
+            Told::Off => "`notify_dispatcher` is off",
+        };
+        let second = match orchestrator {
+            Told::Yes => return,
+            // The pin has no switch: unset *is* nobody to tell.
+            Told::NoOne | Told::Off => "no orchestrator is pinned",
+            Told::Unreachable => "the pinned orchestrator could not be told",
+        };
+        self.log.warn(format!(
+            "{}: {} reached no agent — {first}, and {second}; the board row and the comment \
+             on the issue are the whole trail",
+            task.identifier,
+            signal.event(),
+        ));
+    }
+
+    /// Queue a settle or block notice into the chat of the agent that released
+    /// this work (herdr-board's AGE-25, made the first hop by gh#165).
     ///
     /// The provenance is already on the attempt row — `dispatched_by_pane` is
     /// the chat the dispatch ran from, recorded for every agent-issued
@@ -1735,78 +1796,75 @@ impl SyncEngine {
     /// the same [`Runtime::prompt`] a review uses: a steer into a live run, a
     /// send otherwise, durable either way.
     ///
-    /// Silent for an operator-released task by construction — there is no chat
-    /// to prompt — which is why this switch is separate from the operator's.
-    ///
-    /// Returns the chat it prompted, so [`SyncEngine::announce`] can keep the
-    /// orchestrator from being told the same settle twice when it is also the
-    /// chat that released the work.
-    fn wake_dispatcher<'a>(
+    /// The three answers are all meaningful to [`SyncEngine::announce`], which
+    /// is why this returns [`Told`] and not a bool: [`Told::NoOne`] is an
+    /// operator's dispatch and [`Told::Unreachable`] is a dispatcher that did
+    /// not survive its child, and both of those are the orchestrator's to hear.
+    fn wake_dispatcher(
         &self,
-        runtime: Option<&dyn Runtime>,
+        runtime: &dyn Runtime,
         task: &Task,
-        attempt: &'a Attempt,
-        outcome: Outcome,
-        evidence: Option<Evidence>,
-        pr_url: Option<&str>,
-    ) -> Option<&'a str> {
+        attempt: &Attempt,
+        signal: &Signal,
+    ) -> Told {
         if !self.cfg.defaults.notify_dispatcher {
-            return None;
+            return Told::Off;
         }
-        let chat = attempt.dispatched_by_pane.as_deref()?;
+        let Some(chat) = attempt.dispatched_by_pane.as_deref() else {
+            return Told::NoOne;
+        };
         // A chat that dispatched into itself would be prompted about its own
         // settle. Not reachable through `comet-board dispatch` (a dispatch
         // makes a fresh chat), but a hand-set `--via` can say anything.
         if Some(chat) == attempt.pane_id.as_deref() {
-            return None;
+            return Told::NoOne;
         }
-        let Some(runtime) = runtime else {
-            self.log.warn(format!(
-                "{}: settled, but no runtime to notify chat {chat} with",
-                task.identifier
-            ));
-            return None;
-        };
         // The dispatcher is usually a long-lived orchestrator that outlives
-        // many children, but it can have been archived since. Not an error:
-        // there is simply nobody to tell.
+        // many children, but attempts cap at two hours and chats archive as
+        // their task settles (§H31), so a dispatcher that did not survive its
+        // own child is ordinary rather than exceptional. Not an error — just a
+        // notice that now needs a different addressee.
         if !self.chat_can_be_told(runtime, task, chat) {
-            return None;
+            return Told::Unreachable;
         }
-        let text = notify::dispatcher_message(task, attempt, outcome, evidence, pr_url);
+        let text = notify::dispatcher_message(task, attempt, signal);
         match runtime.prompt(chat, &text) {
             Ok(()) => {
                 self.log.info(format!(
-                    "{}: settle notice queued into chat {chat}",
-                    task.identifier
+                    "{}: {} queued into the chat that released it ({chat})",
+                    task.identifier,
+                    signal.event(),
                 ));
-                Some(chat)
+                Told::Yes
             }
             // Best effort by design: the attempt is closed and the tracker has
             // the trail. Retrying a notice about a thing that already happened
-            // is how a dispatcher gets told twice.
+            // is how a dispatcher gets told twice — but a hop to the
+            // orchestrator is not a retry, it is a different reader.
             Err(e) => {
                 self.log.warn(format!(
                     "{}: could not notify chat {chat}: {e}",
                     task.identifier
                 ));
-                None
+                Told::Unreachable
             }
         }
     }
 
     /// Queue an event into the pinned orchestrator's chat (gh#104).
     ///
-    /// The superset channel. `wake_dispatcher` answers "the agent that released
-    /// this is waiting on it"; this one answers "one agent is running the
-    /// board", so it fires for work an operator released from the panel and
-    /// work a sibling released, which is most of what a board carries.
+    /// The addressee of last resort. `wake_dispatcher` answers "the agent that
+    /// released this is waiting on it"; this one answers "somebody has to hear
+    /// it and there is nobody else" — work an operator released from the panel
+    /// or the phone, work whose dispatcher did not survive it, and the cap
+    /// warning, which belongs to no dispatcher at all because the attempt it is
+    /// about is still running.
     ///
-    /// `already_told` is the chat `wake_dispatcher` just prompted, if any: when
-    /// the orchestrator is *also* the chat that released the work it has
-    /// already been told, and a second prompt would be the same settle twice in
-    /// the same turn. The dispatcher's wording wins that tie — it is the more
-    /// specific truth.
+    /// It is only reached when the dispatcher was not told, which is
+    /// [`SyncEngine::announce`]'s rule rather than this function's: an
+    /// orchestrator whose context fills with a copy of every child's settle is
+    /// one that cannot hold a train of thought, and that was the real content
+    /// of the warning gh#71 attached to the *dispatcher* wake.
     ///
     /// Three more things it will not do, each because the alternative is an
     /// agent talking to itself:
@@ -1825,37 +1883,39 @@ impl SyncEngine {
         task: &Task,
         attempt: &Attempt,
         event: &notify::Event,
-        already_told: Option<&str>,
-    ) {
+    ) -> Told {
         let Some(chat) = self.cfg.defaults.orchestrator() else {
-            return;
+            return Told::NoOne;
         };
-        if Some(chat) == already_told {
-            return;
-        }
         if Some(chat) == attempt.pane_id.as_deref() {
-            return;
+            return Told::NoOne;
         }
         let Some(runtime) = runtime else {
             self.log.warn(format!(
                 "{}: no runtime to reach the orchestrator ({chat}) with",
                 task.identifier
             ));
-            return;
+            return Told::Unreachable;
         };
         if !self.chat_can_be_told(runtime, task, chat) {
-            return;
+            return Told::Unreachable;
         }
         let text = notify::orchestrator_message(task, attempt, event);
         match runtime.prompt(chat, &text) {
-            Ok(()) => self.log.info(format!(
-                "{}: queued into the orchestrator's chat {chat}",
-                task.identifier
-            )),
-            Err(e) => self.log.warn(format!(
-                "{}: could not reach the orchestrator ({chat}): {e}",
-                task.identifier
-            )),
+            Ok(()) => {
+                self.log.info(format!(
+                    "{}: queued into the orchestrator's chat {chat}",
+                    task.identifier
+                ));
+                Told::Yes
+            }
+            Err(e) => {
+                self.log.warn(format!(
+                    "{}: could not reach the orchestrator ({chat}): {e}",
+                    task.identifier
+                ));
+                Told::Unreachable
+            }
         }
     }
 
@@ -3322,15 +3382,32 @@ mod tests {
     /// A runtime that answers the journal question and records the prompts the
     /// settle path sends — the two things reachable from settling (gh#71).
     #[derive(Default)]
-    struct JournalFact(Option<RunEnd>, std::sync::Mutex<Vec<(String, String)>>);
+    struct JournalFact {
+        end: Option<RunEnd>,
+        queued: std::sync::Mutex<Vec<(String, String)>>,
+        /// Chats that have been archived since — the ordinary shape of a
+        /// dispatcher that did not survive its child (gh#165).
+        gone: Vec<String>,
+    }
 
     impl JournalFact {
         fn ending(end: Option<RunEnd>) -> JournalFact {
-            JournalFact(end, Default::default())
+            JournalFact {
+                end,
+                queued: Default::default(),
+                gone: Vec::new(),
+            }
+        }
+        /// The same, with some chats already archived.
+        fn ending_without(end: Option<RunEnd>, gone: &[&str]) -> JournalFact {
+            JournalFact {
+                gone: gone.iter().map(|c| c.to_string()).collect(),
+                ..JournalFact::ending(end)
+            }
         }
         /// (chat id, text) for every prompt the board queued.
         fn prompts(&self) -> Vec<(String, String)> {
-            self.1.lock().unwrap().clone()
+            self.queued.lock().unwrap().clone()
         }
     }
 
@@ -3339,7 +3416,7 @@ mod tests {
             unreachable!("settling never dispatches")
         }
         fn prompt(&self, chat: &str, text: &str) -> anyhow::Result<()> {
-            self.1
+            self.queued
                 .lock()
                 .unwrap()
                 .push((chat.to_string(), text.to_string()));
@@ -3351,15 +3428,26 @@ mod tests {
         fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
             Ok(None)
         }
-        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
-            Ok(true)
+        fn chat_alive(&self, chat: &str) -> anyhow::Result<bool> {
+            Ok(!self.gone.iter().any(|c| c == chat))
         }
         fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
             unreachable!("settling never reads the chat cwd")
         }
         fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
-            Ok(self.0)
+            Ok(self.end)
         }
+    }
+
+    /// Point an engine's log at a file the test can read back.
+    ///
+    /// The only way to assert on a silence: the board's answer to "nobody could
+    /// be told" is a line in the log, and a line nobody checks is exactly the
+    /// silence gh#165 is about.
+    fn logging(e: &mut SyncEngine) -> std::path::PathBuf {
+        let path = e.paths.state_dir.join("board.log");
+        e.log = Arc::new(Logger::new(path.clone(), false));
+        path
     }
 
     fn git_in(dir: &std::path::Path, args: &[&str]) {
@@ -3918,8 +4006,8 @@ mod tests {
     /// hear.
     #[test]
     fn a_settle_wakes_the_chat_that_released_the_work() {
-        let mut e = engine(None);
-        e.cfg.defaults.notify_dispatcher = true;
+        let e = engine(None);
+        assert!(e.cfg.defaults.notify_dispatcher, "on by default (gh#165)");
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
         e.db.set_pr(
@@ -3941,12 +4029,34 @@ mod tests {
         assert!(prompts[0].1.contains("https://github.com/o/r/pull/18"));
     }
 
-    /// Off by default, and the default is the design: an orchestrator woken by
-    /// every child it released cannot hold a train of thought.
+    /// A block is the state where nothing happens until somebody acts, and the
+    /// agent whose plan that task was a step in is the one who can act soonest.
+    /// Before gh#165 the dispatcher wake fired on settles only.
     #[test]
-    fn the_dispatcher_is_not_woken_unless_asked_for() {
+    fn a_block_wakes_the_chat_that_released_the_work_too() {
         let e = engine(None);
-        assert!(!e.cfg.defaults.notify_dispatcher, "off by default");
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        let rt = JournalFact::ending(None);
+
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        let prompts = rt.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0].0, "chat-parent");
+        assert!(prompts[0].1.contains("work you released is blocked"));
+        assert!(prompts[0].1.contains("chat: chat-9"), "where to answer it");
+        assert!(live(&e).outcome.is_none(), "and it still settles nothing");
+    }
+
+    /// Turning it off is a routing choice, not a mute: with a pin behind it the
+    /// event goes to the orchestrator instead, and with nothing pinned it goes
+    /// nowhere — which the log has to say (gh#165).
+    #[test]
+    fn the_dispatcher_wake_can_still_be_turned_off() {
+        let mut e = engine(None);
+        e.cfg.defaults.notify_dispatcher = false;
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -3966,10 +4076,11 @@ mod tests {
 
     // ---- the pinned orchestrator (gh#104) --------------------------------
 
-    /// The case `notify_dispatcher` cannot cover and the pin exists for: a
-    /// human released this from the board panel, so there is no dispatcher
-    /// chat at all — and the agent running the board still has to hear about
-    /// it, because reviewing what lands is its job.
+    /// The first of the three cases the pin exists for, and most of a solo
+    /// operator's dispatches: released from the panel, the phone, or a bare
+    /// `comet-board dispatch`, so there is no dispatching chat at all — and the
+    /// agent running the board still has to hear, because reviewing what lands
+    /// is its job.
     #[test]
     fn the_orchestrator_hears_about_work_nobody_else_released() {
         let mut e = engine(None);
@@ -4028,7 +4139,6 @@ mod tests {
     #[test]
     fn the_orchestrator_is_not_told_twice_about_its_own_dispatch() {
         let mut e = engine(None);
-        e.cfg.defaults.notify_dispatcher = true;
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-boss");
@@ -4042,6 +4152,102 @@ mod tests {
         let prompts = rt.prompts();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(prompts[0].1.contains("work you released"));
+    }
+
+    /// The rule that makes a pin survivable on a busy board (gh#165): a settle
+    /// its dispatcher was told about is not copied to the orchestrator. Before
+    /// this, an orchestrator pinned beside dispatching siblings received every
+    /// child's settle twice over — once as a sibling's business and once as its
+    /// own — and filled with work nobody needed it for.
+    #[test]
+    fn a_settle_a_live_dispatcher_handled_does_not_reach_the_orchestrator() {
+        let mut e = engine(None);
+        e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-sibling");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let prompts = rt.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0].0, "chat-sibling", "the precise addressee");
+    }
+
+    /// The second case the pin exists for, and the one that used to be a
+    /// dropped notice: attempts cap at two hours and chats archive as their
+    /// task settles (§H31), so a dispatcher that did not survive its own child
+    /// is ordinary. The event still matters — it just needs another addressee.
+    #[test]
+    fn a_settle_whose_dispatcher_is_gone_hops_to_the_orchestrator() {
+        let mut e = engine(None);
+        e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending_without(None, &["chat-parent"]);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let prompts = rt.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0].0, "chat-boss");
+        assert!(prompts[0].1.contains("LIN-142"));
+        // And it names the chat that never heard, which is the fact the
+        // orchestrator acts on: this is a step in somebody's abandoned plan.
+        assert!(
+            prompts[0].1.contains("released by: chat chat-parent"),
+            "{}",
+            prompts[0].1
+        );
+    }
+
+    /// The exit condition's last clause: an event that reaches neither agent is
+    /// not dropped without a line saying so. Both halves of the address are
+    /// named, because "no orchestrator is pinned" and "the orchestrator could
+    /// not be told" are different things to go and fix.
+    #[test]
+    fn an_event_that_reaches_nobody_says_so_in_the_log() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending_without(None, &["chat-parent"]);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert!(rt.prompts().is_empty(), "nobody to tell");
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log.contains("on_settled reached no agent"), "{log}");
+        assert!(log.contains("the chat that released it is gone"), "{log}");
+        assert!(log.contains("no orchestrator is pinned"), "{log}");
+    }
+
+    /// The same line for the commonest board of all: a solo operator's
+    /// dispatch, with nothing pinned. Silence here is a setting, and it should
+    /// read as one in the log rather than as nothing having happened.
+    #[test]
+    fn a_panel_dispatch_on_an_unpinned_board_says_so_too() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log.contains("on_blocked reached no agent"), "{log}");
+        assert!(log.contains("no chat released it"), "{log}");
     }
 
     /// The kill switch, and the whole of it: no pin, no notices. The chat that
@@ -4075,11 +4281,11 @@ mod tests {
 
     /// Operator-released work has no dispatcher chat, so the switch being on
     /// changes nothing about it. That is why it is a separate switch from the
-    /// operator's own notice.
+    /// operator's own notice — and why an unpinned board hears nothing at all
+    /// about the dispatches a solo operator makes most of.
     #[test]
     fn operator_released_work_has_nobody_to_wake() {
-        let mut e = engine(None);
-        e.cfg.defaults.notify_dispatcher = true;
+        let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -4162,8 +4368,7 @@ mod tests {
     /// vanished, so there is no agent left to ask and no run journal to read.
     #[test]
     fn an_orphaned_attempt_is_announced_like_a_settle() {
-        let (mut e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
-        e.cfg.defaults.notify_dispatcher = true;
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
         let rt = JournalFact::ending(None);

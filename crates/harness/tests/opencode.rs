@@ -6,7 +6,7 @@
 //! - Against the real `opencode` CLI, skipped (not failed) when the binary
 //!   isn't on this device — the harness contract's end-to-end smoke.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -18,6 +18,26 @@ use comet_harness::{
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
 };
+
+mod common;
+
+/// Ceiling on a fake-serve run, before [`common::scaled`]. Generous because it
+/// covers a child spawn, an HTTP connect and a teardown on top of the ~2s the
+/// scenarios actually need.
+#[cfg(unix)]
+const RUN_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Ceiling on the reap wait, before [`common::scaled`].
+#[cfg(unix)]
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Ceiling on a run against the real CLI, before [`common::scaled`] — a live
+/// model turn, so an order of magnitude above the fake.
+const REAL_RUN_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Where the fake serve records its pid, relative to the request's cwd.
+#[cfg(unix)]
+const PID_FILE: &str = "fake-opencode.pid";
 
 fn fake_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_opencode"))
@@ -74,13 +94,57 @@ async fn run_to_end(
     req: RunRequest,
     controls: RunControls,
 ) -> Vec<AgentEvent> {
-    let stream = harness.run(req, controls).await.expect("run starts");
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        stream.map(|r| r.expect("stream event")).collect::<Vec<_>>(),
+    let pid_file = PathBuf::from(&req.cwd).join(PID_FILE);
+    let mut stream = harness.run(req, controls).await.expect("run starts");
+
+    // Collected outside the timeout on purpose: what the stream managed to
+    // emit before the deadline is the diagnosis, and `collect()` inside the
+    // timeout throws it away.
+    let mut events = Vec::new();
+    let drain = async {
+        while let Some(ev) = stream.next().await {
+            events.push(ev.expect("stream event"));
+        }
+    };
+    let finished = tokio::time::timeout(common::scaled(RUN_DEADLINE), drain).await;
+    assert!(finished.is_ok(), "{}", timeout_report(&events, &pid_file));
+    events
+}
+
+/// What the run had and had not done when the deadline fired.
+///
+/// The one bug class this suite exists to catch — a harness that hangs instead
+/// of ending its stream — is indistinguishable from a slow runner unless the
+/// failure separates the three cases: the child never started, the child ran
+/// but the stream never ended, or the child is gone and the harness outlived
+/// it. `expect("run finished in time")` said none of that, which is why gh#162
+/// was merged past this rather than investigated.
+#[cfg(unix)]
+fn timeout_report(events: &[AgentEvent], pid_file: &Path) -> String {
+    let serve = match std::fs::read_to_string(pid_file) {
+        Err(err) => format!(
+            "no pid file at {} ({err}) — the fake serve never got far enough to write one, \
+             so this is a spawn/connect failure, not a hang in the harness",
+            pid_file.display()
+        ),
+        Ok(raw) => match raw.trim().parse::<i32>() {
+            Err(_) => format!("pid file holds {:?}, which is not a pid", raw.trim()),
+            Ok(pid) if process_alive(pid) => format!(
+                "fake serve pid {pid} is STILL ALIVE — the harness neither ended its stream \
+                 nor reaped the child"
+            ),
+            Ok(pid) => format!(
+                "fake serve pid {pid} is gone, but the stream never ended — the harness \
+                 outlived the child it was reading from"
+            ),
+        },
+    };
+    format!(
+        "run did not finish within {}\n  serve: {serve}\n  events before the deadline ({}):\n{}",
+        common::deadline_note(RUN_DEADLINE),
+        events.len(),
+        common::events_so_far(events),
     )
-    .await
-    .expect("run finished in time")
 }
 
 /// True while the pid exists (a zombie counts — the harness must reap it).
@@ -100,19 +164,22 @@ fn process_alive(pid: i32) -> bool {
 /// under us (the PPID-1-orphan failure mode this suite guards against).
 #[cfg(unix)]
 async fn assert_serve_reaped(dir: &tempfile::TempDir) {
-    let pid: i32 = std::fs::read_to_string(dir.path().join("fake-opencode.pid"))
+    let pid: i32 = std::fs::read_to_string(dir.path().join(PID_FILE))
         .expect("fake serve wrote its pid")
         .trim()
         .parse()
         .expect("pid is numeric");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + common::scaled(REAP_DEADLINE);
     while std::time::Instant::now() < deadline {
         if !process_alive(pid) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("fake serve pid {pid} was not reaped");
+    panic!(
+        "fake serve pid {pid} was still alive {} after the run ended — not reaped",
+        common::deadline_note(REAP_DEADLINE)
+    );
 }
 
 /// Regression for gh#23: opencode closes its SSE feed for reasons that are NOT
@@ -317,6 +384,10 @@ async fn sse_stream_survives_past_the_total_request_deadline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (controls, steer, _token) = fake_controls();
     drop(steer); // close the mailbox so the run settles after its turn
+    // Deliberately NOT scaled: this 300ms is the thing under test, not a
+    // margin. It has to expire while the fake still has 2s of heartbeats left
+    // to send, so stretching it with the runner would quietly stop the test
+    // from reproducing gh#46 at all.
     let harness = harness().with_request_timeout(Duration::from_millis(300));
     let events = run_to_end(
         &harness,
@@ -400,11 +471,16 @@ async fn real_opencode_streams_a_run_end_to_end() {
         Err(err) => panic!("opencode run failed to start: {err}"),
     };
     let events: Vec<AgentEvent> = tokio::time::timeout(
-        Duration::from_secs(120),
+        common::scaled(REAL_RUN_DEADLINE),
         stream.map(|r| r.expect("stream event")).collect(),
     )
     .await
-    .expect("run finished in time");
+    .unwrap_or_else(|_| {
+        panic!(
+            "real opencode run did not finish within {}",
+            common::deadline_note(REAL_RUN_DEADLINE)
+        )
+    });
 
     let starts: Vec<_> = events
         .iter()

@@ -199,7 +199,7 @@ pub fn doctor(
             checks.push(Check {
                 name: "settle notice".into(),
                 ok: true,
-                detail: settle_notice_detail(cfg.defaults.notify_dispatcher),
+                detail: settle_notice_detail(&cfg.defaults),
             });
 
             // The counterpart to the settle notice, and the one gh#71 existed
@@ -1312,27 +1312,43 @@ fn account_check(
     }
 }
 
-/// Whether a dispatching agent is told its released work settled.
+/// Which agent hears that a settle or a block happened.
 ///
 /// The one setting whose failure is invisible: writeback failing leaves a ticket
 /// open, an unresolvable review state is reported by name, but a notice that
 /// never fires produces nothing at all — no error, no log line, no changed row.
 /// It reads as "nobody told me" rather than "the board is misconfigured", which
 /// is why it belongs in `doctor` next to the other two.
-fn settle_notice_detail(notify_dispatcher: bool) -> String {
-    if notify_dispatcher {
-        "on — an agent that released work is prompted in its own chat \
-         when that work settles"
-            .into()
-    } else {
+///
+/// Since gh#165 the two agent channels are one chain, so this line answers
+/// "who takes this event" rather than reporting a switch. It reads the pin as
+/// well as the switch for exactly that reason: `notify_dispatcher = false` on a
+/// board with an orchestrator is a routing choice, and on a board without one
+/// it is silence — two facts one boolean cannot tell apart.
+fn settle_notice_detail(defaults: &crate::config::Defaults) -> String {
+    match (defaults.notify_dispatcher, defaults.orchestrator()) {
+        (true, Some(chat)) => format!(
+            "on — a settle or a block goes to the chat that released the work; when nothing \
+             did, or that chat is gone, the orchestrator ({chat}) takes it instead"
+        ),
+        (true, None) => "on — a settle or a block goes to the chat that released the work. \
+                         Work released from the panel or the phone released it from no chat, \
+                         and with nothing pinned that reaches no agent at all (see \
+                         `orchestrator`)"
+            .into(),
+        (false, Some(chat)) => format!(
+            "off — the chat that released work is never told; every settle and block goes to \
+             the orchestrator ({chat}), including a copy of every child it released itself \
+             (`[defaults] notify_dispatcher = true` routes them to the dispatcher first)"
+        ),
         // Deliberately not "only you are notified": until gh#71 that was what
         // this line said, and there was no channel that notified you either.
         // A `doctor` line describing a notice nobody sends is worse than no
         // line, because it is the answer somebody stops investigating at.
-        "off — the agent that released work is not told when it settles; the \
-         board row and the comment on the issue are the whole trail \
-         (`[defaults] notify_dispatcher = true` to enable)"
-            .into()
+        (false, None) => "off — no agent is told when work settles or blocks; the board row \
+                          and the comment on the issue are the whole trail (`[defaults] \
+                          notify_dispatcher = true` to enable)"
+            .into(),
     }
 }
 
@@ -1342,8 +1358,8 @@ fn settle_notice_detail(notify_dispatcher: bool) -> String {
 /// Unpinned is a preference, not a fault: a board driven by a human at the panel
 /// wants no orchestrator, and a `doctor` that exited non-zero over that would
 /// stop meaning anything. What the line has to do is say what an unpinned board
-/// costs — work released from the panel reaches no agent at all — so that
-/// "nobody picked this up" is legible as a setting rather than as a bug.
+/// costs — the three cases that reach nobody — so that "nobody picked this up"
+/// is legible as a setting rather than as a bug.
 ///
 /// The fault it does catch is the one misconfiguration the pin allows: pinning
 /// a chat the board itself dispatched. That chat is an attempt — it holds a
@@ -1357,10 +1373,12 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
         return Check {
             name,
             ok: true,
-            detail: "not pinned — no chat is told about the board as a whole. Work you \
-                     release from the panel reaches no agent, and a settle is a row \
-                     colour and a comment on the issue (pin a session in the app, or \
-                     `[defaults] orchestrator_chat = \"<chat-id>\"`)"
+            detail: "not pinned — nothing takes what no dispatcher can be told. Work you \
+                     release from the panel or the phone, a settle whose dispatching chat \
+                     has been archived, and every cap warning reach no agent: they are a row \
+                     colour and a comment on the issue, and the log says so once per event \
+                     (pin a session in the app, or `[defaults] orchestrator_chat = \
+                     \"<chat-id>\"`)"
                 .into(),
         };
     };
@@ -1390,8 +1408,16 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
             name,
             ok: true,
             detail: format!(
-                "chat {chat} — every settle, block, orphan and cap warning on this board \
-                 is prompted into it, one message per event. Unpin to stop them"
+                "chat {chat} — {}, one message per event. Unpin to stop them",
+                if defaults.notify_dispatcher {
+                    "the addressee of last resort: work no chat released, work whose \
+                     dispatching chat is gone, and every cap warning. A settle its \
+                     dispatcher was told about is not repeated here"
+                } else {
+                    "every settle, block, orphan and cap warning on this board is prompted \
+                     into it — `notify_dispatcher` is off, so nothing goes to a dispatcher \
+                     first and this chat gets the whole board"
+                }
             ),
         },
     }
@@ -2355,17 +2381,47 @@ mod tests {
     /// gh#27's shape, inherited: a notice that never fires is the one failure
     /// that produces nothing to look at, so the line saying whether it is on
     /// has to be there in both states — and has to name the key.
+    ///
+    /// gh#165: it also has to say which of the two agent channels *takes* the
+    /// event, because they became one chain with a fallback hop. Reporting two
+    /// independent switches was the thing that made "which chat gets this?"
+    /// unanswerable from the report.
     #[test]
-    fn doctor_says_whether_the_dispatcher_is_told() {
-        let on = settle_notice_detail(true);
-        assert!(on.starts_with("on —"), "{on}");
-        assert!(on.contains("released work is prompted"), "{on}");
+    fn doctor_says_which_channel_takes_a_settle() {
+        let mut d = crate::config::Defaults::default();
+        assert!(d.notify_dispatcher, "the default state since gh#165");
 
-        let off = settle_notice_detail(false);
-        assert!(off.starts_with("off —"), "{off}");
+        // Dispatcher-first, and nothing behind it.
+        let bare = settle_notice_detail(&d);
+        assert!(bare.starts_with("on —"), "{bare}");
+        assert!(bare.contains("the chat that released the work"), "{bare}");
         assert!(
-            off.contains("notify_dispatcher"),
-            "off has to name the key to turn it on: {off}"
+            bare.contains("reaches no agent at all"),
+            "an unpinned board has to be told what it drops: {bare}"
+        );
+
+        // Dispatcher-first with the fallback behind it: the whole chain, in
+        // order, in one line.
+        d.orchestrator_chat = Some("chat-boss".into());
+        let chained = settle_notice_detail(&d);
+        assert!(chained.contains("that chat is gone"), "{chained}");
+        assert!(chained.contains("chat-boss"), "{chained}");
+
+        // Off with a pin is a routing choice, and the line says what it costs
+        // the pinned chat rather than reporting a switch.
+        d.notify_dispatcher = false;
+        let routed = settle_notice_detail(&d);
+        assert!(routed.starts_with("off —"), "{routed}");
+        assert!(routed.contains("chat-boss"), "{routed}");
+        assert!(routed.contains("notify_dispatcher"), "{routed}");
+
+        // Off with nothing pinned is the one silent state.
+        d.orchestrator_chat = None;
+        let silent = settle_notice_detail(&d);
+        assert!(silent.contains("no agent is told"), "{silent}");
+        assert!(
+            silent.contains("notify_dispatcher"),
+            "off has to name the key to turn it on: {silent}"
         );
     }
 
@@ -2611,6 +2667,28 @@ mod tests {
         let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
+        // gh#165: what it receives is the question, and on a default board the
+        // answer is "what nobody else could be told" — not the whole board.
+        assert!(c.detail.contains("last resort"), "{}", c.detail);
+        assert!(c.detail.contains("is not repeated here"), "{}", c.detail);
+    }
+
+    /// With the dispatcher wake off, the pin really is the whole board again —
+    /// and an operator who turned it off should read that here rather than
+    /// discover it as volume in the pinned chat.
+    #[test]
+    fn the_pin_says_when_it_is_taking_the_whole_board() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[defaults]\norchestrator_chat = \"chat-boss\"\nnotify_dispatcher = false\n\n\
+             [github]\nrepos = []\n",
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None).unwrap();
+        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        assert!(c.ok);
+        assert!(c.detail.contains("gets the whole board"), "{}", c.detail);
     }
 
     /// The one misconfiguration the pin allows, and it is a quiet one: a
