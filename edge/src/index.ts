@@ -22,6 +22,8 @@
  *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
  *   GET  /workspace/:orgId/presence   — devices the room sees now (gh#145)
+ *   GET  /workspace/:orgId/snapshot   — repair: read the workspace doc snapshot
+ *   POST /workspace/:orgId/append     — repair: merge-import into the workspace doc
  *   GET  /org/:orgId/devices/ws       — org device registry `orgdev1/{orgId}`
  *   GET  /org/:orgId/devices/tail     — org device registry tail JSON
  *   GET  /org/:orgId/devices/presence — devices the registry sees now
@@ -228,11 +230,25 @@ export default {
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth, "/stats", "", "workspace");
       }
+      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
+      // behind the shallow-locked rebuild converges by replacing its local
+      // workspace doc with this — see the incident repair recipe).
+      if (parts[2] === "snapshot" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/snapshot", "", "workspace");
+      }
       // Operator wedge-break: clear a workspace room whose update log grew big
       // enough to CPU-reset the DO on every cold start (org-membership already
       // checked; state re-uploads from each device's local doc on rejoin).
       if (parts[2] === "reset-log" && request.method === "POST") {
         return forward(env.SESSION_ROOMS, room, request, auth, "/reset-log", "", "workspace");
+      }
+      // Merge-safe repair write (the chat rooms' /append, for the workspace
+      // doc): lets an operator seed a reset room with ONE compact
+      // locally-exported history blob instead of waiting for every device to
+      // re-upload its whole doc — the N-way redundant re-seed is what kept
+      // ballooning the update log after the 2026-08-05 wedge breaks.
+      if (parts[2] === "append" && request.method === "POST") {
+        return forward(env.SESSION_ROOMS, room, request, auth, "/append", "", "workspace");
       }
     }
 
