@@ -2621,16 +2621,94 @@ these is declined by default, and the decline belongs in the ledger below.
 
 ### The SHA ledger — what we have taken
 
-Empty by design until the first deliberate sync lands. gh#146 (the edge
-wasm-poisoning / doc-freeing / history-trim cluster) will produce the first
-rows; its exit condition is a note here recording which upstream SHAs we carry,
-*so the next sync knows where it started*. Record declines too — a commit
-considered and refused is a decision, and without the row the next person
-rediscovers it from scratch.
+Record declines too — a commit considered and refused is a decision, and
+without the row the next person rediscovers it from scratch.
+
+#### Sync 1 — gh#146, 2026-08-09: the edge stability cluster
+
+Upstream spent 2026-08-04/05 hardening the *same edge code we run* and we had
+none of it. 24 commits, applied in upstream order onto `board/gh-146-comet-board`.
+22 taken, 1 empty upstream, 1 declined; one commit taken in part.
+
+Why us and not just them: we had already chased the client-side shadow of these
+bugs twice. gh#116 (a dropped room connection never re-established, box dark for
+remote viewers) and gh#126 (presence lying about a box that was up) are what a
+room whose joins die silently *looks like* from our side. These are the server
+half.
 
 | Upstream SHA | Date | Subject | Taken as | Verdict |
 |---|---|---|---|---|
-| — | — | *(none yet; gh#146 fills this)* | — | — |
+| `013a087` | 08-04 | Edge join-wedge root cause: wasm-heap poisoning made joins die in silence | `53ad687` | **part** — edge + `crates/doc` RETAIN_DAYS 30→3; client log-flock half declined (see below) |
+| `13704c7` | 08-04 | Trim history on log fold, not just the daily alarm | `955964a` | taken |
+| `0fdea0f` | 08-04 | Trim history on cold materialization too — idle rooms never trimmed | `2319a22` | taken |
+| `4ff80ae` | 08-04 | Free loro-wasm objects explicitly — GC finalizers never fire under wasm pressure | `0994232` | taken |
+| `5f26832` | 08-04 | Make history trims durable before the join continues | `c93beaa` | taken |
+| `c202e91` | 08-04 | Free idle docs — wasm memory outlives DO instances and never shrinks | `75c30cc` | taken |
+| `c4a2e46` | 08-04 | Force-trim oversized rooms that have no aged checkpoint | `b5b95bc` | taken |
+| `9176b51` | 08-04 | Reset the wasm-poison strike counter on a clean join answer | `96ea5f7` | taken (conflict: kept gh#145 `publishPresence`) |
+| `1f2333d` | 08-04 | Relay accepted updates via per-socket fragmentation, not one raw frame | `e993853` | taken |
+| `81ebf25` | 08-04 | Gate cutoff trims on lastTrimAt alone — isShallow re-fired them forever | `c201283` | taken |
+| `d2a4b57` | 08-04 | Force-trim gate counts log bytes, not just the snapshot | `732aa87` | taken |
+| `82ce441` | 08-04 | Automated wedge break boots attached sockets, like /reset-log always did | `1b6d8c9` | taken |
+| `1f2152a` | 08-04 | Never serve a freed doc wrapper; count wasm use-after-free as poison | `f5e7858` | taken |
+| `b019439` | 08-04 | Workspace rooms force-trim only at aged checkpoints, never the live frontier | `f764a4b` | taken — extended to our registry in `d864d36`, below |
+| `c1243c5` | 08-04 | Penalty-box devices whose imports keep failing — stop the doomed-push DOS | `a52091f` | taken |
+| `79c8e22` | 08-04 | Expose GET /workspace/:orgId/snapshot for doc repair reads | `d53feaa` | taken (adapted: our `forward` takes the whole `Verified`) |
+| `fb6492c` | 08-04 | Retire ws3 workspace rooms — ws4 allocates virgin DO storage | — | **declined** — live-data migration, not a code fix; separate ticket |
+| `3a89e68` | 08-04 | Recycle DOs: clear stale in-memory import penalties after fleet doc flatten | — | **empty upstream** — zero file changes; its subject describes `fb6492c`'s fallout. Nothing to carry |
+| `02002cf` | 08-05 | Salvage importable updates before striking; small-payload penalty probe; attributed /stats | `7533818` | taken (conflict: gh#66 read gate inside their new try/catch) |
+| `469d18a` | 08-05 | Fold the update log when it dwarfs the folded state, not only at fixed budgets | `ee75b07` | taken — then largely reverted by `6f19b76`; kept in order so we land where upstream did |
+| `4aacc6d` | 08-05 | Workspace live-frontier-trim guard: match any ws generation, not the literal ws3/ | `3809996` | taken |
+| `bf16add` | 08-05 | foldLog: recycle the isolate when the fold export dies on a pressed heap | `1b40962` | taken |
+| `6f19b76` | 08-05 | Revert the aggressive fold triggers; route workspace /append for operator repair | `b66fcb2` | taken (adapted: route placement — see below) |
+| `6cee4af` | 08-05 | Whale-session sync fix: chunked update-log rows + shallow-aware join backfill | `3f4cd0c` | taken; brought `edge/src/update-log.ts` + its 6 tests |
+
+Plus one commit of ours that is not a cherry-pick: `d864d36`, extending the
+live-frontier trim guard to `orgdev1/{orgId}`.
+
+**What did not apply cleanly, and why — the shape to expect next time.**
+
+- **`013a087`, partial.** Its client half patches `open_log_file` in
+  `apps/comet/src/main.rs`, a function our tree does not have — it arrived
+  upstream in commits outside this cluster. Applying it would have imported
+  `sync_cli` and `sweep_stale_pid_logs` wholesale as unreferenced code. It is a
+  log-rotation fix, unrelated to edge stability. Its `crates/doc/src/constants.rs`
+  half **was** taken: RETAIN_DAYS is a constant the edge and the Rust client both
+  read, and letting it drift is how the incident started.
+- **Our auth gate conflicts on every read route.** gh#66 replaced upstream's
+  inline `if (!workspace) { owner checks }` with `mayRead`/`refuse()` so a shared
+  chat admits teammates. Upstream then wrapped several of those same routes in
+  try/catch. Every such conflict resolves the same way: **our gate, their body.**
+- **Two routes landed in the wrong block.** Upstream's `index.ts` has one
+  `parts[2]`-indexed room block; we have two, because gh#66 added the org device
+  registry at `parts[3]`. `6f19b76`'s `/append` matched the wrong one and applied
+  *without a conflict* — it typechecked as a dead comparison against a `string`
+  literal union. `79c8e22`'s `/snapshot` landed right but passed `auth.userId`
+  where our `forward` wants the whole `Verified`. **Run `npm run typecheck` in
+  `edge/` after every pick**; both of these surfaced there and nowhere else.
+- **The guard that only half-covered us.** `b019439` refuses to force-trim at the
+  live frontier on docs every device writes at once; `4aacc6d` then made its room
+  pattern generation-agnostic, because matching the literal `ws3/` silently
+  stopped protecting anything when the room became `ws4`. Upstream has one such
+  room. We have two — `orgdev1/{orgId}` is ours (gh#66) and has exactly the
+  hazardous shape. Ported verbatim, the guard would have left the registry
+  force-trimming at the live frontier. `d864d36` extracts the rule as
+  `isConcurrentWriteRoom` next to `livePresence` and `chatRoomAccess`, covers both
+  prefixes, and pins it with tests. **This is the general lesson: an upstream
+  guard scoped by room name does not know about the rooms only we have.**
+
+Verified at the branch tip: `edge/` typecheck clean, 57 tests green across 7
+files (was 46/5 — `update-log.test.ts` came from `6cee4af`,
+`session-trim-rooms.test.ts` is ours), `cargo check -p comet-doc` clean.
+
+Not verified: none of this has run against live Durable Objects. The cluster is
+upstream's own incident response, so it is load-bearing on their fleet, not on
+ours. `edge/scripts/whale-check.mjs` arrived with `6cee4af` and is the tool for
+checking a real room.
+
+**Where the next sync starts:** everything through `6cee4af` (2026-08-05) in
+`edge/` is now ours. `upstream/main` at `433ff68` (v0.1.26) is still ahead by the
+registry-sidebar, iOS, ACP-harness and terminal work — none of it edge.
 
 ### What we owe upstream
 
