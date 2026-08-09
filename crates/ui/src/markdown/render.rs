@@ -28,11 +28,13 @@ use super::veil::{RowVeil, apply_veil, slice_spans};
 
 /// Gap between markdown blocks inside one message (comet mdBlockGap).
 pub const MD_BLOCK_GAP: f32 = 12.0;
-/// Body text size / line height (comet: 14px / 22px).
-pub const MD_TEXT_SIZE: f32 = 14.0;
-pub const MD_LINE_HEIGHT: f32 = 22.0;
+/// Body text size / line height — the reserved prose pair (gh#174), aliased
+/// here because the block metrics below are arithmetic on it.
+pub const MD_TEXT_SIZE: f32 = Theme::TEXT_PROSE;
+pub const MD_LINE_HEIGHT: f32 = Theme::PROSE_LINE_HEIGHT;
 /// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
-pub const CODE_TEXT_SIZE: f32 = 12.5;
+/// Code inside prose reads at the dense-row size: it is a listing, not prose.
+pub const CODE_TEXT_SIZE: f32 = Theme::TEXT_DENSE;
 pub const CODE_LINE_HEIGHT: f32 = 18.0;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
@@ -214,8 +216,8 @@ pub fn render_block(
             .border_l_2()
             .border_color(theme.accent.opacity(0.6))
             .bg(theme.accent.opacity(0.05))
-            .rounded_tr(px(6.0))
-            .rounded_br(px(6.0))
+            .rounded_tr(px(Theme::RADIUS_CHIP))
+            .rounded_br(px(Theme::RADIUS_CHIP))
             .pl(px(12.0))
             .pr(px(10.0))
             .py(px(6.0))
@@ -259,6 +261,7 @@ pub fn render_block(
                                 .ml(px(1.0))
                                 .w(px(5.0))
                                 .h(px(5.0))
+                                // round-ok: list bullet
                                 .rounded_full()
                                 .bg(theme.accent.opacity(0.85)),
                         )
@@ -298,14 +301,15 @@ pub fn render_block(
     }
 }
 
-/// Tight monochrome heading scale (comet: h2 ≈ 16px semibold; headings step
-/// down quickly toward body size).
+/// Tight monochrome heading scale: ONE step above prose, then prose itself
+/// (gh#174). Headings used to walk 19 / 16 / 15 / 14 — four more sizes, in a
+/// transcript where an h1 and an h2 sit three lines apart and the difference
+/// read as noise. `render_block` already sets every heading bold, so h3 and
+/// below separate from the paragraph they title by weight alone.
 fn heading_metrics(level: u8) -> (f32, f32) {
     match level {
-        1 => (19.0, 27.0),
-        2 => (16.0, 24.0),
-        3 => (15.0, 22.0),
-        _ => (14.0, 22.0),
+        1 | 2 => (Theme::TEXT_TITLE, Theme::PROSE_LINE_HEIGHT),
+        _ => (Theme::TEXT_PROSE, Theme::PROSE_LINE_HEIGHT),
     }
 }
 
@@ -1020,7 +1024,7 @@ fn render_code_block(
             .right(px(5.0))
             .h(px(20.0))
             .px(px(6.0))
-            .rounded(px(5.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .flex()
             .flex_row()
             .items_center()
@@ -1034,7 +1038,7 @@ fn render_code_block(
                 theme.white_alpha(0.08),
             ))
             .on_hover(crate::motion::hover_listener(fade_key))
-            .text_size(px(10.5))
+            .text_size(px(Theme::TEXT_CAPTION))
             .text_color(theme.text_muted)
             .on_click(move |_, window, cx| handler(ix, code_text.clone(), window, cx))
             .child(
@@ -1049,7 +1053,7 @@ fn render_code_block(
             .when(copied, |el| el.child(SharedString::from("Copied")))
     });
     div()
-        .rounded(px(10.0))
+        .rounded(px(Theme::RADIUS_ROW))
         // Faint white wash over the near-black panel ≈ #101010 (comet's code
         // surface), with the hairline border.
         .bg(theme.white_alpha(0.035))
@@ -1066,7 +1070,7 @@ fn render_code_block(
                     .border_color(theme.border)
                     // A whisper of tone separation between header and body.
                     .bg(theme.white_alpha(0.02))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(lang.to_string())),
             )

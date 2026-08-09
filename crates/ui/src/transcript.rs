@@ -1527,7 +1527,7 @@ impl Transcript {
                 .flex_none()
                 .w(px(ATT_THUMB_W))
                 .h(px(ATT_THUMB_H))
-                .rounded(px(8.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .overflow_hidden();
             let thumb: AnyElement = match state {
                 AttachmentSnapshot::Loaded(image) => {
@@ -1619,11 +1619,13 @@ impl Transcript {
                                 .min_w_0()
                                 .max_w(px(MAX_CONTENT_WIDTH * 0.8))
                                 .bg(theme.surface_raised)
-                                .rounded(px(Theme::BUBBLE_RADIUS))
+                                .rounded(px(Theme::RADIUS_CARD))
                                 .px(px(16.0))
                                 .py(px(10.0))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
+                                // A user bubble is prose, not chrome — the size
+                                // it is read back at is the size it was typed.
+                                .text_size(px(Theme::TEXT_PROSE))
+                                .line_height(px(Theme::PROSE_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
                                 .child(text),
@@ -1772,7 +1774,7 @@ impl Transcript {
                     el.child(motion::fade_quick(
                         SharedString::from(format!("ts-{}", row.id)),
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(theme.text_subtle)
                             .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
                     ))
@@ -1913,7 +1915,7 @@ impl Transcript {
             .px(px(4.0))
             .h(px(26.0))
             .cursor_pointer()
-            .text_size(px(12.0))
+            .text_size(px(Theme::TEXT_DENSE))
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
@@ -1929,12 +1931,12 @@ impl Transcript {
                 div()
                     .size(px(18.0))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .bg(theme.white_alpha(0.06))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(10.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(if open { "▾" } else { "▸" })),
             )
@@ -2012,17 +2014,17 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                 .items_center()
                 .gap(px(8.0))
                 .overflow_hidden()
-                .rounded(px(10.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .border_1()
                 .border_color(danger.opacity(0.16))
                 .bg(danger.opacity(0.05))
                 .px(px(8.0))
-                .text_size(px(12.0))
+                .text_size(px(Theme::TEXT_DENSE))
                 .child(
                     div()
                         .flex_none()
                         .size(px(20.0))
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(danger.opacity(0.12))
                         .flex()
                         .items_center()
@@ -2076,17 +2078,17 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                 .items_center()
                 .gap(px(8.0))
                 .overflow_hidden()
-                .rounded(px(10.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .border_1()
                 .border_color(theme.white_alpha(0.08))
                 .bg(theme.white_alpha(0.045))
                 .px(px(8.0))
-                .text_size(px(12.0))
+                .text_size(px(Theme::TEXT_DENSE))
                 .child(
                     div()
                         .flex_none()
                         .size(px(20.0))
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.white_alpha(0.09))
                         .flex()
                         .items_center()
@@ -2142,7 +2144,7 @@ fn skill_chip(
                 .items_center()
                 .gap(px(9.0))
                 .overflow_hidden()
-                .rounded(px(12.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .border_1()
                 .border_color(tint.opacity(0.22))
                 .bg(tint.opacity(0.06))
@@ -2152,7 +2154,7 @@ fn skill_chip(
                     div()
                         .flex_none()
                         .size(px(22.0))
-                        .rounded(px(7.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(tint.opacity(0.14))
                         .flex()
                         .items_center()
@@ -2168,7 +2170,7 @@ fn skill_chip(
                     // what both the operator and the agent call it.
                     div()
                         .flex_none()
-                        .text_size(px(13.0))
+                        .text_size(px(Theme::TEXT_BODY))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(if is_error { theme.danger } else { theme.text })
                         .child(SharedString::from(format!("/{name}"))),
@@ -2179,7 +2181,7 @@ fn skill_chip(
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(args),
                     )
@@ -2194,7 +2196,7 @@ fn skill_chip(
                         div()
                             .flex_none()
                             .ml_auto()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(theme.text_subtle)
                             .child(SharedString::from("running…")),
                     )
@@ -2260,19 +2262,19 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .items_center()
                 .gap(px(8.0))
                 .overflow_hidden()
-                .rounded(px(9.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .border_1()
                 .border_color(theme.white_alpha(0.07))
                 .bg(theme.white_alpha(0.03))
                 .px(px(8.0))
-                .text_size(px(12.0))
+                .text_size(px(Theme::TEXT_DENSE))
                 .child(
                     // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
                     // icon size-3).
                     div()
                         .size(px(18.0))
                         .flex_none()
-                        .rounded(px(5.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.white_alpha(0.08))
                         .flex()
                         .items_center()

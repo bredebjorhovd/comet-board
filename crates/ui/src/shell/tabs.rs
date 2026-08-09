@@ -62,11 +62,11 @@ impl Render for TabGhost {
             .flex()
             .items_center()
             .gap(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
+            .rounded(px(Theme::RADIUS_CHIP))
             .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border_strong)
-            .text_size(px(12.0))
+            .text_size(px(Theme::TEXT_DENSE))
             .text_color(theme.text)
             .opacity(0.85)
             .when_some(self.brand, |el, (path, tint)| {
@@ -278,7 +278,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .hover(|s| s.bg(theme.wash(0.14)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -309,6 +309,7 @@ impl Shell {
                         })
                         .when(
                             !matches!(status, ChatIndicator::Idle | ChatIndicator::Working),
+                            // round-ok: status dot
                             |el| el.child(div().size(px(6.0)).rounded_full().bg(dot)),
                         )
                         .into_any_element()
@@ -324,8 +325,8 @@ impl Shell {
                     .gap(px(6.0))
                     .pl(px(8.0))
                     .pr(px(4.0))
-                    .rounded(px(8.0))
-                    .text_size(px(12.0))
+                    .rounded(px(Theme::RADIUS_ROW))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(text_color)
                     .bg(bg)
                     .when(is_selected, |el| el.shadow(theme.glass_selected_shadows()))
@@ -427,16 +428,12 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .cursor_pointer()
             .bg(if on_canvas && has_space {
                 theme.glass_selected_bg()
             } else {
-                motion::hover_blend(
-                    "session-tab-new",
-                    theme.wash(0.0),
-                    theme.wash(0.12),
-                )
+                motion::hover_blend("session-tab-new", theme.wash(0.0), theme.wash(0.12))
             })
             .when(on_canvas && has_space, |el| {
                 el.shadow(theme.glass_selected_shadows())
@@ -569,7 +566,7 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .cursor_pointer()
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())

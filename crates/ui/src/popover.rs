@@ -140,15 +140,20 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 /// gpui has no backdrop blur at the pinned rev, so the glass is approximated
 /// with the tone it composites to over the frosted backdrop
 /// ([`Theme::float_card`]) plus the same hairline + baked-in shadow.
+///
+/// A popover is a row-scale surface ([`Theme::RADIUS_ROW`]), and its `p-1`
+/// inset is [`Theme::NEST_GUTTER`] — so the [`menu_row`]s inside it land at
+/// [`Theme::RADIUS_CHIP`] and the two curves are concentric (gh#174). The
+/// gutter was already 4px; the scale was fitted to it.
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     div()
         .border_1()
         .border_color(theme.white_alpha(0.10))
-        .rounded(px(12.0))
+        .rounded(px(Theme::RADIUS_ROW))
         .shadow_lg()
-        .p(px(4.0))
+        .p(px(Theme::NEST_GUTTER))
         .overflow_hidden()
-        .text_size(px(13.0))
+        .text_size(px(Theme::TEXT_BODY))
         .text_color(theme.text)
         .bg(theme.float_card())
 }
@@ -296,8 +301,8 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .gap(px(10.0))
         .px(px(8.0))
         .py(px(6.0))
-        .rounded(px(8.0))
-        .text_size(px(13.0))
+        .rounded(px(Theme::RADIUS_CHIP))
+        .text_size(px(Theme::TEXT_BODY))
         .cursor_pointer();
     if active {
         row.bg(theme.wash(0.14)).text_color(theme.text)
@@ -344,7 +349,7 @@ pub fn menu_heading(theme: &Theme, label: &str) -> gpui::Div {
         .px(px(8.0))
         .pb(px(4.0))
         .pt(px(6.0))
-        .text_size(px(10.0))
+        .text_size(px(Theme::TEXT_CAPTION))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.text_subtle)
         .child(SharedString::from(tracked_upper(label)))
@@ -404,7 +409,7 @@ pub fn key_cap(theme: &Theme) -> gpui::Div {
     div()
         .h(px(22.0))
         .px(px(5.0))
-        .rounded(px(5.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .flex()
         .flex_row()
         .items_center()
@@ -416,7 +421,7 @@ pub fn key_cap(theme: &Theme) -> gpui::Div {
 /// The tiny verb after a key-cap.
 fn key_hint_label(theme: &Theme, label: &'static str) -> gpui::Div {
     div()
-        .text_size(px(10.5))
+        .text_size(px(Theme::TEXT_CAPTION))
         .text_color(theme.text_subtle)
         .child(SharedString::from(label))
 }
@@ -475,9 +480,9 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .flex_none()
         .px(px(5.0))
         .py(px(1.0))
-        .rounded(px(5.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .bg(theme.white_alpha(0.05))
-        .text_size(px(10.0))
+        .text_size(px(Theme::TEXT_CAPTION))
         .font_family(theme.font_mono.clone())
         .text_color(theme.text_subtle)
         .child(SharedString::from(label.to_string()))
@@ -492,9 +497,9 @@ pub fn search_input_frame(theme: &Theme, input: AnyElement) -> gpui::Div {
         .mb(px(4.0))
         .px(px(10.0))
         .py(px(6.0))
-        .rounded(px(8.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .bg(theme.white_alpha(0.04))
-        .text_size(px(13.0))
+        .text_size(px(Theme::TEXT_BODY))
         .child(input)
 }
 
@@ -523,7 +528,7 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
     div()
         .w(px(360.0))
         .p(px(20.0))
-        .rounded(px(16.0))
+        .rounded(px(Theme::RADIUS_CARD))
         .bg(theme.float_card())
         .border_1()
         .border_color(theme.white_alpha(0.10))
@@ -536,7 +541,7 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
 /// Dialog title: `text-[15px] font-semibold tracking-tight`.
 pub fn dialog_title(theme: &Theme, title: &str) -> gpui::Div {
     div()
-        .text_size(px(15.0))
+        .text_size(px(Theme::TEXT_TITLE))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.text)
         .child(SharedString::from(title.to_string()))
@@ -545,7 +550,7 @@ pub fn dialog_title(theme: &Theme, title: &str) -> gpui::Div {
 /// Dialog body copy: `text-[13px] leading-relaxed text-muted-foreground`.
 pub fn dialog_body(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
     div()
-        .text_size(px(13.0))
+        .text_size(px(Theme::TEXT_BODY))
         .line_height(px(19.0))
         .text_color(theme.text_muted)
         .child(copy.into())
@@ -558,11 +563,11 @@ pub fn dialog_field(theme: &Theme, input: AnyElement) -> gpui::Div {
         .w_full()
         .px(px(12.0))
         .py(px(8.0))
-        .rounded(px(8.0))
+        .rounded(px(Theme::RADIUS_ROW))
         .border_1()
         .border_color(theme.white_alpha(0.08))
         .bg(theme.white_alpha(0.04))
-        .text_size(px(14.0))
+        .text_size(px(Theme::TEXT_BODY))
         .child(input)
 }
 
@@ -574,8 +579,8 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
     let mut btn = div()
         .px(px(12.0))
         .py(px(6.0))
-        .rounded(px(8.0))
-        .text_size(px(13.0))
+        .rounded(px(Theme::RADIUS_CHIP))
+        .text_size(px(Theme::TEXT_BODY))
         .text_color(motion::hover_blend(&fade_key, theme.text_muted, theme.text))
         .bg(motion::hover_blend(
             &fade_key,
@@ -593,9 +598,9 @@ pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
     div()
         .px(px(12.0))
         .py(px(6.0))
-        .rounded(px(8.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .bg(theme.text)
-        .text_size(px(13.0))
+        .text_size(px(Theme::TEXT_BODY))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.bg)
         .cursor_pointer()
@@ -608,9 +613,9 @@ pub fn btn_danger(_theme: &Theme, label: &str) -> gpui::Div {
     div()
         .px(px(12.0))
         .py(px(6.0))
-        .rounded(px(8.0))
+        .rounded(px(Theme::RADIUS_CHIP))
         .bg(crate::theme::oklch(0.58, 0.16, 25.0))
-        .text_size(px(13.0))
+        .text_size(px(Theme::TEXT_BODY))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(gpui::white())
         .cursor_pointer()
@@ -630,7 +635,7 @@ pub fn skeleton_rows(id: &'static str, theme: &Theme, count: usize) -> AnyElemen
         .children((0..count).map(move |i| {
             div()
                 .h(px(28.0))
-                .rounded(px(Theme::CONTROL_RADIUS))
+                .rounded(px(Theme::RADIUS_CHIP))
                 .bg(wash)
                 .with_animation((id, i), COMET_PULSE.repeating(), move |el, delta| {
                     let phase = motion::staggered_phase(delta, i, 0.08);
@@ -648,7 +653,7 @@ pub fn error_row(theme: &Theme, message: &str) -> gpui::Div {
         .flex_col()
         .gap(px(6.0))
         .p(px(Theme::SPACE_SM))
-        .text_size(px(12.0))
+        .text_size(px(Theme::TEXT_DENSE))
         .text_color(theme.danger)
         .child(gpui::SharedString::from(message.to_string()))
 }

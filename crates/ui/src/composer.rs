@@ -63,9 +63,10 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// Below this pill input width the composer always expands.
 pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
-/// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
+/// Input text metrics: `leading-relaxed` = 14 × 1.625 = 22.75. The composer is
+/// prose — what you type is set at the size it is read back at (gh#174).
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
-pub const INPUT_TEXT_SIZE: f32 = 14.0;
+pub const INPUT_TEXT_SIZE: f32 = Theme::TEXT_PROSE;
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
 
@@ -1911,7 +1912,7 @@ impl Composer {
                         div()
                             .id(("composer-att-thumb", ix))
                             .size(px(STRIP_THUMB))
-                            .rounded(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .overflow_hidden()
                             .border_1()
                             .border_color(theme.white_alpha(0.10))
@@ -1933,7 +1934,7 @@ impl Composer {
                             .top(px(-6.0))
                             .right(px(-6.0))
                             .size(px(18.0))
-                            .rounded_full()
+                            .rounded(px(Theme::RADIUS_CHIP))
                             .bg(theme.bg)
                             .flex()
                             .items_center()
@@ -2815,7 +2816,7 @@ impl Composer {
                 .gap(px(12.0))
                 .px(px(14.0))
                 .py(px(10.0))
-                .rounded(px(12.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .border_1()
                 .border_color(if picked {
                     theme.white_alpha(0.16)
@@ -2839,7 +2840,7 @@ impl Composer {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.5))
+                        .text_size(px(Theme::TEXT_BODY))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(if picked { theme.text } else { theme.text_muted })
                         .child(SharedString::from(label.clone())),
@@ -2853,13 +2854,13 @@ impl Composer {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
                             .bg(if picked {
                                 theme.white_alpha(0.16)
                             } else {
                                 theme.white_alpha(0.05)
                             })
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(if picked {
                                 theme.text
                             } else {
@@ -2876,7 +2877,7 @@ impl Composer {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
-            .rounded(px(26.0))
+            .rounded(px(Theme::RADIUS_CARD))
             .border_1()
             .border_color(theme.border)
             .bg(if theme.light {
@@ -2903,7 +2904,7 @@ impl Composer {
                             .gap(px(10.0))
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from(crate::popover::tracked_upper(
@@ -2917,9 +2918,9 @@ impl Composer {
                                         .px(px(6.0))
                                         .flex()
                                         .items_center()
-                                        .rounded(px(6.0))
+                                        .rounded(px(Theme::RADIUS_CHIP))
                                         .bg(theme.white_alpha(0.06))
-                                        .text_size(px(10.0))
+                                        .text_size(px(Theme::TEXT_CAPTION))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text_subtle)
                                         .child(SharedString::from(counter)),
@@ -2929,7 +2930,7 @@ impl Composer {
                     .child(
                         div()
                             .mt(px(6.0))
-                            .text_size(px(15.0))
+                            .text_size(px(Theme::TEXT_TITLE))
                             .line_height(px(20.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
@@ -2939,7 +2940,7 @@ impl Composer {
                         el.child(
                             div()
                                 .mt(px(4.0))
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .text_color(theme.text_subtle)
                                 .child(SharedString::from("Select one or more options.")),
                         )
@@ -3016,7 +3017,9 @@ impl Composer {
         let list = div()
             .flex()
             .flex_col()
-            .p(px(4.0))
+            // The nesting rule (gh#174): rows at RADIUS_ROW one gutter inside
+            // the RADIUS_CARD popup, so the list reads as part of the card.
+            .p(px(Theme::NEST_GUTTER))
             .children(
                 rows.iter()
                     .enumerate()
@@ -3031,7 +3034,7 @@ impl Composer {
                             .flex_row()
                             .items_center()
                             .gap(px(8.0))
-                            .rounded(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             .px(px(8.0))
                             .py(px(6.0))
                             .cursor_pointer()
@@ -3043,7 +3046,7 @@ impl Composer {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(13.0))
+                                    .text_size(px(Theme::TEXT_BODY))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(if active { theme.text } else { theme.text_muted })
                                     .child(name),
@@ -3054,7 +3057,7 @@ impl Composer {
                                         .min_w_0()
                                         .flex_1()
                                         .truncate()
-                                        .text_size(px(12.0))
+                                        .text_size(px(Theme::TEXT_DENSE))
                                         .text_color(theme.text_muted)
                                         .child(SharedString::from(description)),
                                 )
@@ -3063,7 +3066,7 @@ impl Composer {
                                 div()
                                     .flex_none()
                                     .ml_auto()
-                                    .text_size(px(10.0))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from(skill.source.label())),
                             )
@@ -3076,7 +3079,7 @@ impl Composer {
                     div()
                         .px(px(8.0))
                         .py(px(4.0))
-                        .text_size(px(10.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(format!("{hidden} more — keep typing"))),
                 )
@@ -3085,7 +3088,7 @@ impl Composer {
         Some(
             div()
                 .mx(px(4.0))
-                .rounded(px(14.0))
+                .rounded(px(Theme::RADIUS_CARD))
                 .border_1()
                 .border_color(theme.white_alpha(0.08))
                 .bg(theme.surface_raised)
@@ -3108,6 +3111,7 @@ impl Composer {
                 .id("composer-stop")
                 .size(px(28.0))
                 .flex_none()
+                // round-ok: the stop button — the send button, mid-run
                 .rounded_full()
                 .bg(theme.text)
                 .flex()
@@ -3116,12 +3120,15 @@ impl Composer {
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
+                // scale-ok: the stop square is a drawn glyph inside the button,
+                // not a box on the surface — it has no corner to relate to.
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Steer => div()
                 .id("composer-send")
                 .size(px(28.0))
                 .flex_none()
+                // round-ok: the send button. The one round thing you press
                 .rounded_full()
                 .bg(theme.text)
                 .flex()
@@ -3295,13 +3302,13 @@ impl Render for Composer {
                         .flex()
                         .items_start()
                         .gap(px(8.0))
-                        .rounded(px(12.0))
+                        .rounded(px(Theme::RADIUS_CARD))
                         .border_1()
                         .border_color(border_c)
                         .bg(wash)
                         .px(px(12.0))
                         .py(px(8.0))
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .line_height(px(16.0))
                         .text_color(text_c)
                         .cursor_pointer()
@@ -3370,7 +3377,7 @@ impl Render for Composer {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_full()
+            .rounded(px(Theme::RADIUS_CHIP))
             .cursor_pointer()
             // comet composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
@@ -3404,7 +3411,7 @@ impl Render for Composer {
             theme.white_alpha(0.03)
         };
         let pill = div()
-            .rounded(px(26.0))
+            .rounded(px(Theme::RADIUS_CARD))
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
