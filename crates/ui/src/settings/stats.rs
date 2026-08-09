@@ -14,7 +14,15 @@
 //!    bar height is tokens, the dispatch count rides in the caption (gh#226).
 //! 3. **Tokens** — what the price above was computed from, per model.
 //! 4. **When and where** — one grid crossing the hour against the space.
-//! 5. **Who ran it** — the runtime, the tracker, the subscription.
+//! 5. **Breakdown** — the same window cut by model, runtime, space, tracker or
+//!    account, with tokens and money on every row (gh#227).
+//!
+//! **Block five is one card and a toggle, not three columns.** It shipped as
+//! three fixed tallies of dispatch counts, which answered the wrong question
+//! twice: a count per runtime says nothing about what the runtime cost, and the
+//! axis that matters most — which model is the bill — was not on the page at
+//! all. The axis a reader wants changes between visits, so it is a control; and
+//! since the rows are about money, they are ordered and drawn against it.
 //!
 //! **The crossing is the point of block four.** "When do I release work" and
 //! "which spaces" were two cards, and the interesting fact — that the evening
@@ -49,9 +57,9 @@ use comet_proto::TokenUsage;
 use comet_proto::view::board;
 use comet_proto::view::rates::{Usd, human_usd};
 use comet_proto::view::stats::{
-    BoardSpend, BoardStats, HOURS, Tally, TokenTally, WINDOWS, bar_fraction, day_captions_fit,
-    day_columns, hour_grid, human_minutes, human_multiple, human_tokens, peak_tokens, percent,
-    ranked_tokens, ranked_top,
+    BoardSpend, BoardStats, Breakdown, BreakdownRow, Dimension, HOURS, TokenTally, WINDOWS,
+    bar_fraction, day_captions_fit, day_columns, hour_grid, human_minutes, human_multiple,
+    human_tokens, peak_tokens, percent, ranked_tokens,
 };
 use comet_rpc::methods;
 
@@ -59,7 +67,10 @@ use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::{Bed, ListRow as _, Theme};
 
-/// How many rows a tally shows before folding the rest into `n others`.
+/// How many rows the per-model table shows before folding the rest into
+/// `n others`. The breakdown's own cap is the board's
+/// ([`comet_proto::view::stats::BREAKDOWN_ROWS`]), because it folds before it
+/// sends.
 const TALLY_ROWS: usize = 6;
 
 /// How many spaces the crossed grid shows before folding. Fewer than a tally:
@@ -84,7 +95,7 @@ const HAIRLINE: f32 = 1.0;
 /// the page, which is the same rule one level down.
 const MARK_RADIUS: f32 = 3.0;
 
-/// The label gutter shared by the crossed grid and the tallies, so the two
+/// The label gutter shared by the crossed grid and the breakdown, so the two
 /// blocks start their bars on the same vertical.
 const LABEL_WIDTH: f32 = 132.0;
 
@@ -109,6 +120,10 @@ pub struct StatsPage {
     /// The window in days; `None` is all time. Mirrors the CLI's
     /// `--since-days`, so the two surfaces are asking one question.
     since_days: Option<i64>,
+    /// Which axis the breakdown is cut along (gh#227). A view state, not a
+    /// query: every cut arrives in the one reply, so the toggle costs nothing
+    /// but a redraw.
+    dimension: Dimension,
     stats: Option<BoardStats>,
     /// The device that answered. `None` before the first reply, and on a board
     /// hosted right here.
@@ -125,6 +140,9 @@ impl StatsPage {
             // A week: long enough to have a shape, short enough that today is
             // still visible in it.
             since_days: Some(7),
+            // The axis where the answer is usually one row, and the one the
+            // page could not ask about at all before gh#227.
+            dimension: Dimension::Model,
             stats: None,
             host: None,
             loaded: false,
@@ -204,6 +222,16 @@ impl StatsPage {
         cx.notify();
     }
 
+    /// Switch the axis the breakdown is cut along. A redraw, never a reload —
+    /// all five cuts came down in the same reply.
+    fn set_dimension(&mut self, dimension: Dimension, cx: &mut Context<Self>) {
+        if self.dimension == dimension {
+            return;
+        }
+        self.dimension = dimension;
+        cx.notify();
+    }
+
     /// The host's display name, for the subtitle.
     fn host_label(&self, cx: &gpui::App) -> SharedString {
         let Some(host) = self.host.as_deref() else {
@@ -218,12 +246,17 @@ impl StatsPage {
             .unwrap_or_else(|| SharedString::from(host.to_string()))
     }
 
-    /// The window picker: a segmented row, current one filled.
-    fn render_windows(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div()
+    /// The track a segmented control's choices sit in.
+    ///
+    /// One recipe, used by the window picker and by the breakdown's dimension
+    /// toggle (gh#227): two segmented controls on one page that were built
+    /// twice would be two segmented controls that drift apart.
+    fn track(theme: &Theme) -> gpui::Div {
+        div()
             .flex()
             .flex_row()
             .items_center()
+            .flex_none()
             .gap(px(2.0))
             // The nesting rule (gh#174): segments at RADIUS_CHIP inside a track
             // at RADIUS_ROW want exactly one gutter between them, and then the
@@ -232,29 +265,59 @@ impl StatsPage {
             .rounded(px(Theme::RADIUS_ROW))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.white_alpha(0.02));
+            .bg(theme.white_alpha(0.02))
+    }
+
+    /// One choice in that track.
+    ///
+    /// The padding follows the type size rather than being a second knob: the
+    /// design gives 8×3 around an 11px segment and 10×4 around a 12px one,
+    /// which is one rule stated twice.
+    fn segment(
+        theme: &Theme,
+        id: String,
+        label: &str,
+        size: f32,
+        selected: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (pad_x, pad_y) = match size <= Theme::TEXT_CAPTION {
+            true => (8.0, 3.0),
+            false => (10.0, 4.0),
+        };
+        div()
+            .id(SharedString::from(id.clone()))
+            .px(px(pad_x))
+            .py(px(pad_y))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .text_size(px(size))
+            .font_weight(if selected {
+                gpui::FontWeight::MEDIUM
+            } else {
+                gpui::FontWeight::NORMAL
+            })
+            .when(!selected, |el| el.cursor_pointer())
+            // A segmented control inside a settings card: in light mode the
+            // card is white, so the chosen segment steps DOWN into it rather
+            // than trying to lift off it (gh#175).
+            .list_row(theme, Bed::Card, selected, id)
+            .child(SharedString::from(label.to_string()))
+    }
+
+    /// The window picker: a segmented row, current one filled.
+    fn render_windows(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = Self::track(theme);
         for (days, label) in WINDOWS {
             let selected = self.since_days == *days;
             let days = *days;
             row = row.child(
-                div()
-                    .id(SharedString::from(format!("stats-window-{label}")))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .rounded(px(Theme::RADIUS_CHIP))
-                    .text_size(px(Theme::TEXT_DENSE))
-                    .font_weight(if selected {
-                        gpui::FontWeight::MEDIUM
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .when(!selected, |el| el.cursor_pointer())
-                    // A segmented control inside a settings card: in light
-                    // mode the card is white, so the chosen window steps DOWN
-                    // into it rather than trying to lift off it (gh#175).
-                    .list_row(theme, Bed::Card, selected, format!("stats-window-{label}"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_window(days, cx)))
-                    .child(SharedString::from(*label)),
+                Self::segment(
+                    theme,
+                    format!("stats-window-{label}"),
+                    label,
+                    Theme::TEXT_DENSE,
+                    selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_window(days, cx))),
             );
         }
         row.into_any_element()
@@ -264,6 +327,25 @@ impl StatsPage {
 
     /// A block: heading, an optional aside, and a body.
     fn block(theme: &Theme, title: &str, aside: Option<String>, body: AnyElement) -> AnyElement {
+        Self::block_with(theme, title, aside, None, body)
+    }
+
+    /// The same block with a control in its header (gh#227).
+    ///
+    /// The aside moves to the left, under the title's baseline, when there is
+    /// one: a caption and a segmented control both pinned to the right edge
+    /// would read as one crowded object rather than as a label and a switch.
+    fn block_with(
+        theme: &Theme,
+        title: &str,
+        aside: Option<String>,
+        control: Option<AnyElement>,
+        body: AnyElement,
+    ) -> AnyElement {
+        let (beside_title, at_the_edge) = match control.is_some() {
+            true => (aside, None),
+            false => (None, aside),
+        };
         widgets::section_card(theme)
             // `section_card` carries the settings stack's own `mt(24)`, which
             // in this column double-spaces on top of `dashboard_column`'s gap.
@@ -280,23 +362,40 @@ impl StatsPage {
                     .gap(px(10.0))
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(title.to_string())),
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap(px(8.0))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(title.to_string())),
+                            )
+                            .when_some(beside_title, |el, aside| {
+                                el.child(Self::caption(theme, aside))
+                            }),
                     )
-                    .when_some(aside, |el, aside| {
-                        el.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .text_color(theme.text_subtle)
-                                .child(SharedString::from(aside)),
-                        )
-                    }),
+                    .when_some(at_the_edge, |el, aside| {
+                        el.child(Self::caption(theme, aside))
+                    })
+                    .when_some(control, |el, control| el.child(control)),
             )
             .child(body)
+            .into_any_element()
+    }
+
+    /// The small subdued line a block heads or ends with.
+    fn caption(theme: &Theme, copy: String) -> AnyElement {
+        div()
+            .min_w_0()
+            .truncate()
+            .text_size(px(Theme::TEXT_CAPTION))
+            .text_color(theme.text_subtle)
+            .child(SharedString::from(copy))
             .into_any_element()
     }
 
@@ -1396,96 +1495,178 @@ impl StatsPage {
             .into_any_element()
     }
 
-    // -- block 5: who ran it -------------------------------------------------
+    // -- block 5: the breakdown ----------------------------------------------
 
-    /// The three remaining single-axis tallies, side by side in one block:
-    /// which harness, which tracker, whose subscription.
-    fn render_who(stats: &BoardStats, theme: &Theme) -> Option<AnyElement> {
-        let columns: Vec<AnyElement> = [
-            ("Runtime", &stats.by_runtime),
-            ("Tracker", &stats.by_source),
-            ("Subscription", &stats.by_account),
-        ]
-        .into_iter()
-        .filter(|(_, tally)| !tally.is_empty())
-        .map(|(heading, tally)| Self::tally_column(theme, heading, ranked_top(tally, TALLY_ROWS)))
-        .collect();
-        if columns.is_empty() {
-            return None;
+    /// The same window cut five ways, one axis at a time (gh#227).
+    ///
+    /// This was three fixed columns of dispatch counts, which answered the
+    /// wrong question twice: a count per runtime says nothing about what the
+    /// runtime cost, and the axis that matters most — the model — was not on
+    /// the page at all. So the axis is a toggle, and every row carries the two
+    /// numbers a reader is here for: what it spent and what that cost.
+    ///
+    /// The toggle is built from the cuts the board actually sent, so a
+    /// dimension this window has nothing under is absent rather than a segment
+    /// that opens onto an empty card.
+    fn render_breakdown(
+        &self,
+        stats: &BoardStats,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        // A window that dropped the chosen axis falls back to the first one it
+        // does have, WITHOUT moving the selection: switching to 24 hours and
+        // back should return to the axis the reader picked, not to whatever
+        // the quiet window happened to offer.
+        let cut = stats
+            .cut(self.dimension)
+            .or_else(|| stats.breakdown.first())?;
+        let priced = cut.is_priced();
+        let unpriced: u64 = cut.rows.iter().map(|r| r.unpriced_tokens).sum();
+        let rows: Vec<AnyElement> = cut
+            .rows
+            .iter()
+            .map(|row| Self::breakdown_row(theme, cut, row, priced))
+            .collect();
+        let mut body = Self::body(14.0).child(
+            div()
+                .flex()
+                .flex_col()
+                // Tighter than a block's own gap: these are rows of one table,
+                // not stacked facts.
+                .gap(px(9.0))
+                .children(rows),
+        );
+        if priced && unpriced > 0 {
+            body = body.child(Self::caption(
+                theme,
+                format!(
+                    "{} token(s) here ran on a model with no rate, and so are in no price above.",
+                    human_tokens(unpriced)
+                ),
+            ));
         }
-        Some(Self::block(
+        Some(Self::block_with(
             theme,
-            "Who ran it",
-            None,
-            Self::body(14.0)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_start()
-                        .gap(px(24.0))
-                        .children(columns),
-                )
-                .into_any_element(),
+            "Breakdown",
+            // What the rows are ordered by, said out loud: the bar is drawn
+            // against the same quantity, and on an unpriced window that is
+            // tokens rather than money.
+            Some(cut.ranking.caption().to_string()),
+            Some(Self::render_dimensions(stats, self.dimension, theme, cx)),
+            body.into_any_element(),
         ))
     }
 
-    /// One tally as a headed column of label + bar + count.
-    fn tally_column(theme: &Theme, heading: &str, rows: Vec<Tally>) -> AnyElement {
-        let peak = rows.iter().map(|t| t.count).max().unwrap_or(0);
-        let children: Vec<AnyElement> = rows
-            .into_iter()
-            .map(|row| {
-                let fraction = bar_fraction(row.count, peak);
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(Theme::TEXT_DENSE))
-                            .text_color(theme.text)
-                            .child(SharedString::from(row.label)),
-                    )
-                    .child(
-                        div()
-                            .w(px(64.0))
-                            .flex_none()
-                            .h(px(6.0))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(theme.white_alpha(0.05))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(fraction))
-                                    .rounded(px(MARK_RADIUS))
-                                    .bg(theme.accent.opacity(0.6)),
-                            ),
-                    )
-                    .child(Self::cell(theme, format!("{}", row.count), 28.0, false))
-                    .into_any_element()
-            })
-            .collect();
+    /// The axis toggle: one segment per cut the board sent.
+    fn render_dimensions(
+        stats: &BoardStats,
+        current: Dimension,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let offered: Vec<Dimension> = stats.breakdown.iter().map(|b| b.dimension).collect();
+        // The fallback above chooses a cut; the toggle has to agree with it, or
+        // a window without the chosen axis would fill one card and highlight a
+        // different segment.
+        let shown = offered
+            .iter()
+            .copied()
+            .find(|d| *d == current)
+            .or_else(|| offered.first().copied());
+        let mut row = Self::track(theme);
+        for dimension in offered {
+            row = row.child(
+                Self::segment(
+                    theme,
+                    format!("stats-dimension-{}", dimension.label()),
+                    dimension.label(),
+                    Theme::TEXT_CAPTION,
+                    Some(dimension) == shown,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_dimension(dimension, cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// One row: what it is, how big a share of the window it is, what it spent,
+    /// and what that cost.
+    fn breakdown_row(
+        theme: &Theme,
+        cut: &Breakdown,
+        row: &BreakdownRow,
+        priced: bool,
+    ) -> AnyElement {
+        let fraction = cut.share(row);
         div()
-            .flex_grow(1.0)
-            .flex_basis(px(0.0))
-            .min_w(px(240.0))
             .flex()
-            .flex_col()
-            .gap(px(8.0))
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(heading)),
+                    // The gutter the crossed grid uses, so the two blocks start
+                    // their bars on the same vertical.
+                    .w(px(LABEL_WIDTH))
+                    .flex_none()
+                    .truncate()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(row.label.clone())),
             )
-            .children(children)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(40.0))
+                    .h(px(6.0))
+                    .rounded(px(MARK_RADIUS))
+                    .bg(theme.white_alpha(0.05))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(fraction))
+                            .rounded(px(MARK_RADIUS))
+                            .bg(theme.accent.opacity(0.6)),
+                    ),
+            )
+            .child(Self::cell(theme, Self::row_tokens(row), 52.0, false))
+            .when(priced, |el| {
+                el.child(
+                    div()
+                        .w(px(44.0))
+                        .flex_none()
+                        .text_right()
+                        .truncate()
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        // The loudest thing on the row, because it is the one
+                        // the card is opened for.
+                        .text_color(theme.text)
+                        .child(SharedString::from(Self::row_price(row))),
+                )
+            })
             .into_any_element()
+    }
+
+    /// A row's tokens — a dash where it reported none, never a zero that would
+    /// read as work that was free.
+    fn row_tokens(row: &BreakdownRow) -> String {
+        match row.usage.is_zero() {
+            true => "—".into(),
+            false => human_tokens(row.usage.total()),
+        }
+    }
+
+    /// A row's money, with the two ways there is none said as a dash: nothing
+    /// metered here, and nothing here the rate table could price.
+    fn row_price(row: &BreakdownRow) -> String {
+        match row.cost {
+            Some(cost) if !row.usage.is_zero() && (!cost.is_zero() || row.unpriced_tokens == 0) => {
+                human_usd(cost)
+            }
+            _ => "—".into(),
+        }
     }
 }
 
@@ -1570,14 +1751,15 @@ impl Render for StatsPage {
         }
 
         // Five blocks, and the order is the argument: what it cost, what it
-        // ran, what it spent that on, when and where, and who.
+        // ran, what it spent that on, when and where, and the same window cut
+        // whichever way the reader wants it.
         column = column
             .child(Self::render_spend(&stats, &theme))
             .child(Self::render_delivery(&stats, &theme))
             .child(Self::render_tokens(&stats, &theme))
             .child(Self::render_when_and_where(&stats, &theme));
-        if let Some(who) = Self::render_who(&stats, &theme) {
-            column = column.child(who);
+        if let Some(breakdown) = self.render_breakdown(&stats, &theme, cx) {
+            column = column.child(breakdown);
         }
 
         scroll_page(column)
