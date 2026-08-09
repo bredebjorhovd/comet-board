@@ -1,0 +1,18 @@
+// Signing for the Comet app target.
+//
+// Committed, and deliberately team-less. A simulator build needs no team; a
+// device build does, and a personal team id does not belong in a public repo —
+// it would only make every other contributor's build fail differently.
+//
+// So the team lives in Signing.local.xcconfig, which is gitignored. The include
+// at the bottom is optional (`#include?`), so a clean checkout still builds for
+// the simulator with no file-not-found warning. See apps/ios/README.md.
+//
+// This is an .xcconfig rather than settings in the .pbxproj on purpose: the
+// .pbxproj is tracked, so a local team id sits there as a permanent dirty diff
+// and gets swept into an unrelated `git stash`. An ignored file cannot be.
+
+PRODUCT_BUNDLE_IDENTIFIER = dev.cometnative.Comet
+CODE_SIGN_STYLE = Automatic
+
+#include? "Signing.local.xcconfig"
