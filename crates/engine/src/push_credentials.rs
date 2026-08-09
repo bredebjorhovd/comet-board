@@ -138,19 +138,16 @@ mod tests {
     use super::*;
 
     fn paths_in(dir: &Path) -> Paths {
-        // Scratch dirs, not the device's board: `Paths::under` honours the
-        // COMET_BOARD_* overrides, which tests must not depend on.
-        Paths {
-            config_dir: dir.join("config"),
-            state_dir: dir.join("state"),
-        }
+        // Scratch dirs, not the device's board. `Paths::under` used to honour
+        // the COMET_BOARD_* overrides, which tests must not depend on; since
+        // gh#190 it cannot, so this is the plain derivation again.
+        Paths::under(dir).expect("board dirs")
     }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("comet-push-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("config")).unwrap();
-        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
@@ -213,7 +210,7 @@ mod tests {
         );
         assert_eq!(
             env.get("COMET_BOARD_CONFIG_DIR").map(String::as_str),
-            Some(dir.join("config").display().to_string().as_str())
+            Some(dir.join("board").display().to_string().as_str())
         );
         assert!(
             !env.values()

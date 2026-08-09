@@ -24,21 +24,13 @@ use comet_harness::mock::MockHarness;
 use comet_proto::HarnessId;
 use comet_rpc::methods;
 
-/// Board paths under `dir`, built by hand rather than with [`Paths::under`].
-///
-/// `Paths::under` honours `COMET_BOARD_CONFIG_DIR` / `COMET_BOARD_STATE_DIR`,
-/// which is right for the engine — an operator pointing the board somewhere
-/// else means it — and wrong for a test: those variables are set in the
-/// environment of every board-dispatched agent, so a test run there would take
-/// its tempdir argument, ignore it, and write the *box's live* `routing.toml`.
-/// This is a config file people hand-edit; a test suite is not allowed near it.
+/// Board paths under `dir` — the same derivation the engine makes from its own
+/// data dir, and since gh#190 a pure one: the board's two directory variables
+/// are set in the environment of every board-dispatched agent, and
+/// [`Paths::under`] no longer lets them overrule the directory it was handed.
+/// `board_env_isolation.rs` is the test that keeps it that way.
 fn board_paths(dir: &std::path::Path) -> Paths {
-    let paths = Paths {
-        config_dir: dir.join("board"),
-        state_dir: dir.join("board").join("state"),
-    };
-    std::fs::create_dir_all(&paths.state_dir).expect("board dirs");
-    paths
+    Paths::under(dir).expect("board dirs")
 }
 
 /// An engine with a board service of its own, on a tempdir nobody else shares.

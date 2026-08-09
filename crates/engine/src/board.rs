@@ -104,7 +104,8 @@ pub struct BoardService {
     /// Where this board's `routing.toml`, `.env` and store live. Kept here so
     /// the config RPCs (gh#75) resolve them off the running service rather than
     /// re-deriving them from the data dir — two answers to "which routing.toml"
-    /// is one too many, and `COMET_BOARD_CONFIG_DIR` makes it a real risk.
+    /// is one too many, and [`BoardService::spawn_at`] means the loop's own
+    /// answer is not always the one a data dir would give.
     paths: Paths,
 }
 
@@ -837,6 +838,9 @@ mod tests {
     use comet_board::runtime::{DispatchHandle, DispatchSpec};
     use comet_proto::SessionStatus;
 
+    /// A board of this test's own. `Paths::under` is pure since gh#190, so the
+    /// directory named here is the one the loop opens — under a dispatched
+    /// agent's environment it used to be the box's live board.
     fn scratch_paths() -> Paths {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
@@ -844,12 +848,7 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        let paths = Paths {
-            config_dir: base.clone(),
-            state_dir: base.join("state"),
-        };
-        std::fs::create_dir_all(&paths.state_dir).unwrap();
-        paths
+        Paths::under(&base).unwrap()
     }
 
     /// Records what the board asked of comet; answers like a healthy engine.
