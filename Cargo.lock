@@ -1225,6 +1225,7 @@ name = "comet-board-bin"
 version = "0.3.6"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "comet-board",
  "comet-proto",

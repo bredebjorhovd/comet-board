@@ -250,7 +250,9 @@ ticket numbers carry what order there was.
   delivery. Already ported; just needs the loop.
 - **Multi-device.** One engine hosts the board; every other device drives it
   over the relay (§gh#55). Moving board rows into the workspace doc stays
-  deferred — one host device is correct while one box hosts the board.
+  deferred — one host device is correct while one box hosts the board. Nothing
+  *enforces* one, though, and two boards polling one repo race the same issue,
+  so `doctor` sweeps the account and says who else is hosting one (§gh#195).
 - **Upstream tracking**: cherry-pick, never merge. The additive-diff advice this
   line used to carry stopped being true in August 2026 — see **Upstream**
   below for the merge base, the standing divergences, and the SHA ledger.
