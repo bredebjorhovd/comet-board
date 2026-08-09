@@ -500,7 +500,7 @@ impl Render for RoutingPage {
 
         if let Some(error) = self.error.clone() {
             column = column.child(
-                widgets::error_strip(error)
+                widgets::error_strip(&theme, error)
                     .id("routing-error")
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -519,8 +519,9 @@ impl Render for RoutingPage {
             // config the board is NOT running on, and the routes below it are
             // then a description of a file rather than of the board.
             for (ix, problem) in config.routing.problems.iter().enumerate() {
-                column = column
-                    .child(widgets::warning_strip(problem.clone()).id(("routing-problem", ix)));
+                column = column.child(
+                    widgets::warning_strip(&theme, problem.clone()).id(("routing-problem", ix)),
+                );
             }
 
             if let Some(parsed) = &config.routing.config {

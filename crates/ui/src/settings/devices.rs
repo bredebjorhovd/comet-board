@@ -388,7 +388,7 @@ impl Render for DevicesPage {
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
-                            widgets::error_strip(message)
+                            widgets::error_strip(&theme, message)
                                 .id("devices-error")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {

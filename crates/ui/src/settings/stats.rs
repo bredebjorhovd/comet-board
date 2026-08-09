@@ -983,27 +983,6 @@ impl StatsPage {
     }
 }
 
-
-/// The page's own column, wider than [`widgets::page_column`]'s 768px.
-///
-/// That width is the settings *form* rhythm — right for Devices and Accounts,
-/// wrong here: a dashboard read as a 768px ribbon in a 1400px window is the
-/// whole of "hard to get an overview without scrolling" (operator, 2026-08-08).
-/// Still capped, because a chart stretched across an ultrawide is not a better
-/// chart.
-fn dashboard_column() -> gpui::Div {
-    div()
-        .w_full()
-        .max_w(px(1160.0))
-        .mx_auto()
-        .px(px(24.0))
-        .pt(px(32.0))
-        .pb(px(64.0))
-        .flex()
-        .flex_col()
-        .gap(px(14.0))
-}
-
 /// Two panels side by side, weighted, that stack when the window is too narrow
 /// to hold them — gpui has no media queries, so `flex_wrap` plus a min width
 /// per panel is the responsive rule.
@@ -1047,7 +1026,10 @@ impl Render for StatsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let host = self.host_label(cx);
-        let mut column = dashboard_column().child(
+        // The wide column the shared layer declares (gh#178) — this page is a
+        // dashboard, and picking the width is now a choice between two named
+        // ones rather than a private copy of the column with a note attached.
+        let mut column = widgets::dashboard_column().child(
             div()
                 .flex()
                 .flex_row()
@@ -1068,7 +1050,7 @@ impl Render for StatsPage {
         );
 
         if let Some(error) = self.error.clone() {
-            column = column.child(div().mt(px(20.0)).child(widgets::error_strip(error)));
+            column = column.child(div().mt(px(20.0)).child(widgets::error_strip(&theme, error)));
         }
 
         let Some(stats) = self.stats.clone() else {

@@ -323,7 +323,10 @@ pub struct RoutingConfig {
     /// be adding up other people's bills and calling the sum the board's spend.
     ///
     /// Nothing here is discoverable — comet never sees anybody's invoice — so
-    /// an unconfigured slot is reported as *unknown*, never as free.
+    /// an unconfigured slot is reported as *unknown*, never as free. Which is
+    /// why the Accounts settings page asks for it beside the login it belongs
+    /// to and writes it here ([`crate::routes::Edit::Account`], gh#178): it is
+    /// the one line of this file no amount of probing could fill in.
     #[serde(default, rename = "account")]
     pub accounts: BTreeMap<String, AccountConfig>,
 }
