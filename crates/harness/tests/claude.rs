@@ -71,6 +71,7 @@ fn controls(
         chat_id: None,
         account: None,
         push: None,
+        bin_dirs: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -220,6 +221,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         chat_id: None,
         account: None,
         push: None,
+        bin_dirs: Vec::new(),
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;
 

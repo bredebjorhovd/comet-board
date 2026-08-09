@@ -201,7 +201,7 @@ impl Harness for OpencodeHarness {
             return Ok(models.clone());
         }
         let exe = self.resolve_executable()?;
-        let (mut child, base, _stderr) = spawn_server(&exe, None, None, None).await?;
+        let (mut child, base, _stderr) = spawn_server(&exe, None, None, None, &[]).await?;
         let models = {
             let client = Client::new(base);
             client
@@ -229,8 +229,14 @@ impl Harness for OpencodeHarness {
         } else {
             Some(request.cwd.as_str())
         };
-        let (mut child, base, stderr_tail) =
-            spawn_server(&exe, cwd, controls.chat_id.as_deref(), controls.push.as_ref()).await?;
+        let (mut child, base, stderr_tail) = spawn_server(
+            &exe,
+            cwd,
+            controls.chat_id.as_deref(),
+            controls.push.as_ref(),
+            &controls.bin_dirs,
+        )
+        .await?;
         let client = Client::with_timeouts(base, self.request_timeout, client::STREAM_READ_TIMEOUT);
 
         let session_id = if let Some(resume) = &request.resume {
@@ -305,6 +311,7 @@ async fn spawn_server(
     cwd: Option<&str>,
     chat_id: Option<&str>,
     push: Option<&crate::PushCredentials>,
+    bin_dirs: &[std::path::PathBuf],
 ) -> Result<(Child, String, crate::StderrTail), HarnessError> {
     let mut cmd = Command::new(exe);
     cmd.arg("serve").arg("--port").arg("0").arg("--hostname").arg("127.0.0.1");
@@ -312,8 +319,10 @@ async fn spawn_server(
     if let Some(chat_id) = chat_id {
         cmd.env("COMET_BOARD_CHAT_ID", chat_id);
     }
-    // The server is what runs the agent's tools, so the credentials belong on
-    // it — opencode's own process never pushes anything.
+    // The server is what runs the agent's tools, so the credentials — and the
+    // directories the tools themselves live in — belong on it; opencode's own
+    // process never pushes anything and never types `comet-board`.
+    crate::prepend_dirs_to_path(&mut cmd, bin_dirs);
     if let Some(push) = push {
         push.apply(&mut cmd);
     }
@@ -583,9 +592,10 @@ async fn run_session(session: Session) {
         interrupt,
         chat_id: _,
         account: _,
-        // Both are spent at spawn: the account picked the config dir, the
-        // credentials are already on the child.
+        // All three are spent at spawn: the account picked the config dir, the
+        // credentials and the tool directories are already on the child.
         push: _,
+        bin_dirs: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

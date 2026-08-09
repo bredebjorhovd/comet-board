@@ -11,8 +11,13 @@ Nothing below is runtime-specific.
 ## The comet-board task board
 
 One global queue across every space: Linear issues and GitHub issues in, comet
-chats running coding agents out. `comet-board` is on PATH, and `gh` is
-authenticated once per user — neither is specific to the agent you are.
+chats running coding agents out. The engine puts `comet-board` on the PATH of
+every agent it runs — the copy it shipped with — and `gh` is authenticated once
+per user; neither is specific to the agent you are. If `comet-board` is
+nevertheless not found, say so and stop rather than working on without it: an
+agent that quietly skips the board leaves its work with no row, no provenance
+and no one able to see it (`comet-board doctor` names the fault as **agent
+PATH**).
 
 **Read it before acting. Never read `board.db` directly** — the schema changes,
 the CLI shape does not.

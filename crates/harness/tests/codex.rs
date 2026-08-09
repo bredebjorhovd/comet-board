@@ -71,6 +71,7 @@ fn controls(
         chat_id: None,
         account: None,
         push: None,
+        bin_dirs: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -384,6 +385,7 @@ async fn approvals_round_trip_as_input_requests() {
         chat_id: None,
         account: None,
         push: None,
+        bin_dirs: Vec::new(),
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;

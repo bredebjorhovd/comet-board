@@ -253,6 +253,8 @@ impl Harness for ClaudeHarness {
         if let Some(account) = &controls.account {
             account.apply(&mut cmd, HarnessId::ClaudeCode);
         }
+        // Before the push credentials, whose `gh` shim has to stay in front.
+        crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
         if let Some(push) = &controls.push {
             push.apply(&mut cmd);
         }
@@ -457,9 +459,10 @@ async fn run_session(session: Session) {
         interrupt,
         chat_id: _,
         account: _,
-        // Both are spent at spawn: the account picked the config dir, the
-        // credentials are already on the child.
+        // All three are spent at spawn: the account picked the config dir, the
+        // credentials and the tool directories are already on the child.
         push: _,
+        bin_dirs: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
