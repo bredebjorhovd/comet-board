@@ -226,7 +226,16 @@ pub fn github_auth(paths: &Paths) -> GithubAuth {
     Credentials::load(paths).github_auth()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// `routing.toml`, parsed.
+///
+/// `PartialEq` is load-bearing, here and on every type below it: the board loop
+/// decides whether to rebuild itself by comparing the config it is running
+/// against the config on disk ([`crate::sync::SyncEngine::reload_if_configuration_changed`]).
+/// A derived comparison cannot fall behind the struct it is derived from, which
+/// a hand-picked list of fields did — for two releases every `[defaults]` key
+/// was invisible to the loop (gh#189). Adding a field here needs nothing; taking
+/// the derive away would silently restore the bug.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub sync: SyncConfig,
@@ -270,7 +279,7 @@ pub struct RoutingConfig {
 /// `[github] repos` entries, because those are the config that already exists.
 /// Ignoring has nowhere else to live — "I am only reading this repo" is not a
 /// fact any other key can carry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AdoptConfig {
     /// `owner/repo` entries the board will never offer again. Delete a line to
     /// be offered it once more.
@@ -284,7 +293,7 @@ impl AdoptConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncConfig {
     /// Poll interval, e.g. `"30s"`.
     #[serde(default = "default_interval")]
@@ -447,7 +456,7 @@ pub fn parse_build_retention(s: &str) -> std::result::Result<Option<u64>, String
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_per_workspace: usize,
@@ -710,7 +719,7 @@ impl Default for Defaults {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubConfig {
     /// `owner/repo` entries to poll for issues and PRs.
     #[serde(default)]
@@ -790,7 +799,7 @@ impl Default for GithubConfig {
 /// labels = ["release-a"]
 /// writeback = false
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// `owner/repo`. Must also appear in `[github] repos` — see
     /// [`RoutingConfig::validate`].
@@ -867,7 +876,7 @@ impl GithubConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LinearConfig {
     /// Name of the workflow state a task moves to when the board derives
     /// `review` — typically `"In Review"`.
@@ -888,7 +897,7 @@ pub struct LinearConfig {
     pub review_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route {
     /// Name shown in the picker and the prompt view. Defaults to the workspace.
     #[serde(default)]
@@ -962,7 +971,7 @@ impl Route {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RouteMatch {
     pub linear_team: Option<String>,
     pub linear_project: Option<String>,
