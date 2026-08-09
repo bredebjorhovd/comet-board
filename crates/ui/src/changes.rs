@@ -835,7 +835,7 @@ impl Changes {
         let chevron = div().flex_none().size(px(14.0)).child(
             crate::icons::icon(chevron_icon)
                 .size(px(13.0))
-                .text_color(theme.text_muted.opacity(0.7)),
+                .text_color(theme.text_subtle),
         );
         let chevron: AnyElement = if fold.animating() {
             chevron
@@ -875,7 +875,7 @@ impl Changes {
                     .truncate()
                     .font_family(theme.font_mono.clone())
                     .text_size(px(12.0))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(file.path.clone())),
             )
             .when(file.binary, |el| {
@@ -883,7 +883,7 @@ impl Changes {
                     div()
                         .flex_none()
                         .text_size(px(10.0))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from("BIN")),
                 )
             })
@@ -953,7 +953,7 @@ impl Changes {
                             .py(px(2.0))
                             .rounded(px(4.0))
                             .bg(theme.warning.opacity(0.08))
-                            .text_color(theme.warning.opacity(0.75))
+                            .text_color(theme.warning_text())
                             .child(SharedString::from("Partial snapshot")),
                     )
                 })
@@ -999,7 +999,7 @@ fn render_file_body(
                 .items_center()
                 .px(px(Theme::SPACE_LG))
                 .text_size(px(11.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(notice))
                 .into_any_element(),
         );
@@ -1024,7 +1024,7 @@ fn render_file_body(
                 .bg(hunk_bg)
                 .font_family(theme.font_mono.clone())
                 .text_size(px(11.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(hunk.header.clone()))
                 .into_any_element(),
         );
@@ -1045,7 +1045,7 @@ fn render_file_body(
                         .items_center()
                         .pl(px(ACCENT_BAR_WIDTH + 2.0 * GUTTER_WIDTH + MARKER_WIDTH + 12.0))
                         .text_size(px(10.5))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_subtle)
                         .italic()
                         .child(SharedString::from(line.text.clone()))
                         .into_any_element(),
@@ -1068,13 +1068,7 @@ fn render_file_body(
                     Some(del_color().opacity(0.55)),
                     del_color().opacity(0.9),
                 ),
-                _ => (
-                    "·",
-                    theme.text_faint.opacity(0.5),
-                    None,
-                    None,
-                    theme.text_faint.opacity(0.8),
-                ),
+                _ => ("·", theme.text_faint, None, None, theme.text_subtle),
             };
             let gutter = |no: Option<u32>, color: gpui::Hsla| {
                 div()
@@ -1090,13 +1084,9 @@ fn render_file_body(
                         no.map(|n| n.to_string()).unwrap_or_default(),
                     ))
             };
-            let runs = render::runs_with_palette(
-                &line.text,
-                tokens,
-                &mono,
-                theme.text.opacity(0.92),
-                |class| diff_token_color(class, theme),
-            );
+            let runs = render::runs_with_palette(&line.text, tokens, &mono, theme.text, |class| {
+                diff_token_color(class, theme)
+            });
             children.push(
                 div()
                     .h(px(DIFF_LINE_HEIGHT))
@@ -1119,7 +1109,7 @@ fn render_file_body(
                         if line.kind == LineKind::Del {
                             number_color
                         } else {
-                            theme.text_faint.opacity(0.8)
+                            theme.text_subtle
                         },
                     ))
                     .child(gutter(
@@ -1127,7 +1117,7 @@ fn render_file_body(
                         if line.kind == LineKind::Add {
                             number_color
                         } else {
-                            theme.text_faint.opacity(0.8)
+                            theme.text_subtle
                         },
                     ))
                     .child(
@@ -1194,7 +1184,7 @@ impl Render for Changes {
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from("Preparing diff…")),
                 )
                 .into_any_element(),
@@ -1204,7 +1194,7 @@ impl Render for Changes {
                 .items_center()
                 .justify_center()
                 .text_size(px(12.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("No uncommitted changes"))
                 .into_any_element(),
             DiffPhase::List => {

@@ -304,7 +304,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
     } else {
         let fade_key = fade_key.into();
         let mut row = row
-            .text_color(motion::hover_blend(&fade_key, theme.text.opacity(0.9), theme.text))
+            .text_color(motion::hover_blend(&fade_key, theme.text_muted, theme.text))
             .bg(motion::hover_blend(
                 &fade_key,
                 theme.wash(0.0),
@@ -337,8 +337,8 @@ pub fn menu_row_nav(
 
 /// Small uppercase section heading inside a floating menu (comet
 /// `MenuHeading`): `px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase
-/// tracking-[0.1em] text-muted-foreground/60`. gpui has no letter-spacing at
-/// the pinned rev; the tracking is approximated with hair spaces.
+/// tracking-[0.1em]`, at the label tone. gpui has no letter-spacing at the
+/// pinned rev; the tracking is approximated with hair spaces.
 pub fn menu_heading(theme: &Theme, label: &str) -> gpui::Div {
     div()
         .px(px(8.0))
@@ -346,7 +346,7 @@ pub fn menu_heading(theme: &Theme, label: &str) -> gpui::Div {
         .pt(px(6.0))
         .text_size(px(10.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.text_muted.opacity(0.6))
+        .text_color(theme.text_subtle)
         .child(SharedString::from(tracked_upper(label)))
 }
 
@@ -377,12 +377,12 @@ pub fn menu_separator(theme: &Theme) -> gpui::Div {
         .bg(theme.white_alpha(0.07))
 }
 
-/// The trailing check on the selected row (comet `MenuCheck`): 14px,
-/// `text-foreground/70`, pushed to the row end by the caller's flex.
+/// The trailing check on the selected row (comet `MenuCheck`): 14px, a step
+/// under the row's own tone, pushed to the row end by the caller's flex.
 pub fn menu_check(theme: &Theme) -> impl IntoElement {
     crate::icons::icon(crate::icons::CHECK)
         .size(px(14.0))
-        .text_color(theme.text.opacity(0.7))
+        .text_color(theme.text_muted)
 }
 
 /// The recessed band tone for a palette/picker header or footer strip — a
@@ -417,7 +417,7 @@ pub fn key_cap(theme: &Theme) -> gpui::Div {
 fn key_hint_label(theme: &Theme, label: &'static str) -> gpui::Div {
     div()
         .text_size(px(10.5))
-        .text_color(theme.text_muted.opacity(0.45))
+        .text_color(theme.text_subtle)
         .child(SharedString::from(label))
 }
 
@@ -433,7 +433,7 @@ pub fn key_hint(theme: &Theme, icon_path: &'static str, label: &'static str) -> 
             key_cap(theme).child(
                 crate::icons::icon(icon_path)
                     .size(px(12.5))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                    .text_color(theme.text_subtle),
             ),
         )
         .child(key_hint_label(theme, label))
@@ -457,13 +457,13 @@ pub fn key_hint_pair(
                 .child(
                     crate::icons::icon(first)
                         .size(px(12.5))
-                        .text_color(theme.text_muted.opacity(0.7)),
+                        .text_color(theme.text_subtle),
                 )
                 .child(div().w(px(1.0)).h(px(11.0)).bg(theme.white_alpha(0.10)))
                 .child(
                     crate::icons::icon(second)
                         .size(px(12.5))
-                        .text_color(theme.text_muted.opacity(0.7)),
+                        .text_color(theme.text_subtle),
                 ),
         )
         .child(key_hint_label(theme, label))
@@ -479,7 +479,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .bg(theme.white_alpha(0.05))
         .text_size(px(10.0))
         .font_family(theme.font_mono.clone())
-        .text_color(theme.text_muted.opacity(0.6))
+        .text_color(theme.text_subtle)
         .child(SharedString::from(label.to_string()))
 }
 

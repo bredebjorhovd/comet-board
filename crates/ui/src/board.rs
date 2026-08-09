@@ -2250,7 +2250,7 @@ impl BoardPanel {
             .child(
                 icon(icons::CHECKLIST)
                     .size(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.8)),
+                    .text_color(theme.text_muted),
             )
             .child(
                 div()
@@ -2276,7 +2276,7 @@ impl BoardPanel {
                 .rounded_full()
                 .bg(theme.wash(0.08))
                 .text_size(px(10.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(shown.to_string())),
         );
 
@@ -2365,7 +2365,7 @@ impl BoardPanel {
             let label_color = if filter_active {
                 theme.text
             } else {
-                theme.text_muted.opacity(0.7)
+                theme.text_subtle
             };
             filter_chip = filter_chip
                 .child(icon(icons::TUNING).size(px(13.0)).text_color(label_color))
@@ -2398,7 +2398,7 @@ impl BoardPanel {
                         .child(
                             icon(icons::CLOSE_CIRCLE)
                                 .size(px(14.0))
-                                .text_color(theme.text_muted.opacity(0.8)),
+                                .text_color(theme.text_muted),
                         ),
                 );
             }
@@ -2418,7 +2418,7 @@ impl BoardPanel {
                     .child(
                         icon(icons::MAGNIFER)
                             .size(px(14.0))
-                            .text_color(theme.text_muted.opacity(0.8)),
+                            .text_color(theme.text_muted),
                     ),
             );
             // Close the dock.
@@ -2439,7 +2439,7 @@ impl BoardPanel {
                     .child(
                         icon(icons::CLOSE)
                             .size(px(13.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
+                            .text_color(theme.text_muted),
                     ),
             );
         }
@@ -2496,7 +2496,7 @@ impl BoardPanel {
             .text_size(px(12.0))
             .child(
                 div()
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from("on")),
             )
             .child(
@@ -2507,7 +2507,7 @@ impl BoardPanel {
                     .text_color(if confirmed {
                         theme.text_muted
                     } else {
-                        theme.text_muted.opacity(0.6)
+                        theme.text_subtle
                     })
                     .child(label),
             )
@@ -2564,7 +2564,7 @@ impl BoardPanel {
                                 div()
                                     .flex_none()
                                     .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
+                                    .text_color(theme.text_subtle)
                                     .child(SharedString::from("You")),
                             )
                         })
@@ -2594,7 +2594,7 @@ impl BoardPanel {
             .justify_center()
             .px(px(Theme::SPACE_LG))
             .text_size(px(12.0))
-            .text_color(theme.text_faint)
+            .text_color(theme.text_subtle)
             .child(text)
             .into_any_element()
     }
@@ -2672,7 +2672,7 @@ impl BoardPanel {
                     .rounded_full()
                     .bg(theme.wash(0.08))
                     .text_size(px(10.0))
-                    .text_color(if folded { theme.text_muted } else { theme.text_faint })
+                    .text_color(if folded { theme.text_muted } else { theme.text_subtle })
                     .child(SharedString::from(len.to_string())),
             )
             .child(div().flex_1())
@@ -2683,7 +2683,7 @@ impl BoardPanel {
                     icons::ALT_ARROW_DOWN
                 })
                 .size(px(13.0))
-                .text_color(theme.text_muted.opacity(0.7)),
+                .text_color(theme.text_subtle),
             );
 
         el.into_any_element()
@@ -2750,7 +2750,7 @@ impl BoardPanel {
                     icons::ALT_ARROW_DOWN
                 })
                 .size(px(12.0))
-                .text_color(theme.text_muted.opacity(0.6)),
+                .text_color(theme.text_subtle),
             )
             .child(
                 div()
@@ -2773,7 +2773,7 @@ impl BoardPanel {
             .child(
                 div()
                     .text_size(px(10.0))
-                    .text_color(theme.text_faint.opacity(0.85))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(format!("· {len}"))),
             )
             .into_any_element()
@@ -2904,7 +2904,7 @@ impl BoardPanel {
                             } else if selected {
                                 theme.text
                             } else {
-                                theme.text_muted.opacity(0.9)
+                                theme.text_muted
                             })
                             .child(SharedString::from(title.clone())),
                     )
@@ -2922,7 +2922,7 @@ impl BoardPanel {
                     .flex_row()
                     .items_center()
                     .text_size(px(10.5))
-                    .text_color(theme.text_faint.opacity(0.85))
+                    .text_color(theme.text_subtle)
                     .truncate()
                     .child(SharedString::from(meta)),
             )
@@ -3051,7 +3051,7 @@ impl BoardPanel {
                     .text_color(if runtime_focused {
                         theme.accent
                     } else {
-                        theme.text_faint
+                        theme.text_subtle
                     })
                     .child(runtime_label),
             );
@@ -3085,12 +3085,8 @@ impl BoardPanel {
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(if active {
-                                if runtime_focused {
-                                    theme.accent
-                                } else {
-                                    theme.text_muted.opacity(0.9)
-                                }
+                            .text_color(if active && runtime_focused {
+                                theme.accent
                             } else {
                                 theme.text_muted
                             })
@@ -3128,7 +3124,7 @@ impl BoardPanel {
                     .text_color(if model_focused {
                         theme.accent
                     } else {
-                        theme.text_faint
+                        theme.text_subtle
                     })
                     .child(SharedString::from("Model")),
             )
@@ -3157,8 +3153,12 @@ impl BoardPanel {
                 div()
                     .flex_none()
                     .text_size(px(10.0))
-                    .text_color(theme.text_faint.opacity(0.7))
-                    .child(SharedString::from(format!("{}/{}", filtered.len(), total_models))),
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(format!(
+                        "{}/{}",
+                        filtered.len(),
+                        total_models
+                    ))),
             );
         }
 
@@ -3181,7 +3181,7 @@ impl BoardPanel {
                 .px(px(Theme::SPACE_LG))
                 .py(px(8.0))
                 .text_size(px(11.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from(format!("No models match “{query}”")))
                 .into_any_element(),
             Some(ModelCatalog::Ready(models)) => {
@@ -3218,7 +3218,7 @@ impl BoardPanel {
                 .px(px(Theme::SPACE_LG))
                 .py(px(6.0))
                 .text_size(px(10.5))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("Loading models…"))
                 .into_any_element(),
         };
@@ -3233,7 +3233,7 @@ impl BoardPanel {
             .child(
                 div()
                     .text_size(px(10.0))
-                    .text_color(theme.text_faint.opacity(0.7))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(
                         "type to filter · ↑↓ switch · ←→ pick · enter dispatch · esc cancel",
                     )),
@@ -3317,7 +3317,7 @@ impl BoardPanel {
                     .text_color(if focused {
                         theme.accent
                     } else {
-                        theme.text_faint
+                        theme.text_subtle
                     })
                     .child(label),
             );
@@ -3362,12 +3362,8 @@ impl BoardPanel {
                             .text_size(px(10.5))
                             .text_color(if bills_somebody_else {
                                 warned
-                            } else if active {
-                                if focused {
-                                    theme.accent
-                                } else {
-                                    theme.text_muted.opacity(0.9)
-                                }
+                            } else if active && focused {
+                                theme.accent
                             } else {
                                 theme.text_muted
                             })
@@ -3439,12 +3435,10 @@ impl BoardPanel {
                             .w_full()
                             .truncate()
                             .text_size(px(11.5))
-                            .text_color(if active {
-                                if focused {
-                                    theme.accent
-                                } else {
-                                    theme.text_muted.opacity(0.9)
-                                }
+                            .text_color(if active && focused {
+                                theme.accent
+                            } else if active {
+                                theme.text_muted
                             } else {
                                 theme.text
                             })
@@ -3455,7 +3449,7 @@ impl BoardPanel {
                             .w_full()
                             .truncate()
                             .text_size(px(9.5))
-                            .text_color(theme.text_muted.opacity(0.55))
+                            .text_color(theme.text_subtle)
                             .child(id),
                     ),
             )
@@ -3464,7 +3458,7 @@ impl BoardPanel {
                     div()
                         .flex_none()
                         .text_size(px(9.5))
-                        .text_color(theme.text_muted.opacity(0.5))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from("default")),
                 )
             })
@@ -3529,7 +3523,7 @@ impl BoardPanel {
                     .items_center()
                     .rounded(px(5.0))
                     .text_size(px(10.5))
-                    .text_color(theme.text_faint)
+                    .text_color(theme.text_subtle)
                     .hover(|s| s.bg(theme.wash(0.12)))
                     .child(SharedString::from("esc"))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3554,7 +3548,7 @@ impl BoardPanel {
                 div()
                     .flex_none()
                     .text_size(px(10.5))
-                    .text_color(theme.text_faint.opacity(0.9))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(line))
                     .into_any_element()
             })
@@ -3596,7 +3590,7 @@ impl BoardPanel {
         } else if loading {
             div()
                 .text_size(px(11.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("Reading the issue…"))
                 .into_any_element()
         } else if let Some(text) = body {
@@ -3749,7 +3743,7 @@ impl BoardPanel {
             .text_color(if has_notice {
                 theme.warning
             } else {
-                theme.text_faint.opacity(0.8)
+                theme.text_subtle
             })
             .child(content)
             .into_any_element()

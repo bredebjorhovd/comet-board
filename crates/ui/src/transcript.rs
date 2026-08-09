@@ -1773,7 +1773,7 @@ impl Transcript {
                         SharedString::from(format!("ts-{}", row.id)),
                         div()
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.55))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
                     ))
                 })
@@ -1935,7 +1935,7 @@ impl Transcript {
                     .items_center()
                     .justify_center()
                     .text_size(px(10.0))
-                    .text_color(theme.text_muted.opacity(0.7))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(if open { "▾" } else { "▸" })),
             )
             .child(
@@ -2030,14 +2030,14 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .child(
                             crate::icons::icon(crate::icons::DANGER_TRIANGLE)
                                 .size(px(12.0))
-                                .text_color(red_text.opacity(0.8)),
+                                .text_color(red_text),
                         ),
                 )
                 .child(
                     div()
                         .flex_none()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(red_text.opacity(0.8))
+                        .text_color(red_text)
                         .child(SharedString::from("Error")),
                 )
                 .child(
@@ -2045,7 +2045,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_color(theme.text.opacity(0.8))
+                        .text_color(theme.text_muted)
                         .child(message),
                 ),
         )
@@ -2109,7 +2109,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_color(theme.text.opacity(0.9))
+                        .text_color(theme.text)
                         .child(value),
                 ),
         )
@@ -2195,7 +2195,7 @@ fn skill_chip(
                             .flex_none()
                             .ml_auto()
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.8))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from("running…")),
                     )
                 }),
@@ -2298,7 +2298,7 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                         .text_color(if tool.is_error {
                             theme.danger
                         } else {
-                            theme.text.opacity(0.85)
+                            theme.text_muted
                         })
                         .child(SharedString::from(detail)),
                 ),

@@ -1468,11 +1468,7 @@ impl Pickers {
             // and text brighten fade over 150ms.
             .text_color(motion::hover_blend(
                 id,
-                if set {
-                    theme.text.opacity(0.9)
-                } else {
-                    theme.text_muted
-                },
+                if set { theme.text } else { theme.text_muted },
                 theme.text,
             ))
             .bg(if open {
@@ -1497,7 +1493,7 @@ impl Pickers {
                 el.child(
                     div()
                         .flex_none()
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(theme.text_subtle)
                         .child(suffix),
                 )
             })
@@ -1528,11 +1524,7 @@ impl Pickers {
             .rounded(px(6.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
-                id,
-                theme.text_muted.opacity(0.7),
-                theme.text.opacity(0.8),
-            ))
+            .text_color(motion::hover_blend(id, theme.text_subtle, theme.text_muted))
             .bg(if open {
                 theme.element_hover
             } else {
@@ -1544,13 +1536,13 @@ impl Pickers {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                    .text_color(theme.text_subtle),
             )
             .child(div().min_w_0().truncate().child(label))
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.5)),
+                    .text_color(theme.text_subtle),
             )
     }
 
@@ -1571,11 +1563,11 @@ impl Pickers {
             .px(px(8.0))
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_muted.opacity(0.6))
+            .text_color(theme.text_subtle)
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.6)),
+                    .text_color(theme.text_subtle),
             )
             .child(div().min_w_0().truncate().child(label))
     }
@@ -1777,7 +1769,7 @@ impl Pickers {
             return div()
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("No space selected"))
                 .into_any_element();
         }
@@ -1804,7 +1796,7 @@ impl Pickers {
             Loadable::Ready(_) if rows.is_empty() => div()
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("No refs found."))
                 .into_any_element(),
             Loadable::Ready(_) => {
@@ -1848,7 +1840,7 @@ impl Pickers {
                                     div()
                                         .flex_none()
                                         .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .text_color(theme.text_subtle)
                                         .child(SharedString::from("switching…")),
                                 )
                             })
@@ -1857,7 +1849,7 @@ impl Pickers {
                                     div()
                                         .flex_none()
                                         .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.45))
+                                        .text_color(theme.text_subtle)
                                         .child(SharedString::from(tag)),
                                 )
                             })
@@ -1875,14 +1867,16 @@ impl Pickers {
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
-            popover = popover.child(popover::menu_section(&theme).child(
-                div()
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.danger.opacity(0.9))
-                    .child(SharedString::from(error.clone())),
-            ));
+            popover = popover.child(
+                popover::menu_section(&theme).child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.danger_text())
+                        .child(SharedString::from(error.clone())),
+                ),
+            );
         }
         if total > shown {
             popover = popover.child(
@@ -1891,7 +1885,7 @@ impl Pickers {
                         .px(px(Theme::SPACE_SM))
                         .py(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(format!(
                             "Showing {shown} of {total} refs"
                         ))),
@@ -2073,7 +2067,7 @@ impl Pickers {
                         .px(px(8.0))
                         .py(px(24.0))
                         .text_size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(theme.text_subtle)
                         .text_center()
                         .child(SharedString::from(format!("No models match “{query}”")))
                         .into_any_element();
@@ -2116,7 +2110,7 @@ impl Pickers {
                                             .w_full()
                                             .truncate()
                                             .text_size(px(11.0))
-                                            .text_color(theme.text_muted.opacity(0.7))
+                                            .text_color(theme.text_subtle)
                                             .child(description),
                                     )
                                 }),
@@ -2141,7 +2135,7 @@ impl Pickers {
                     .px(px(8.0))
                     .py(px(24.0))
                     .text_size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_color(theme.text_subtle)
                     .text_center()
                     .child(SharedString::from("Loading models…"))
                     .into_any_element(),
@@ -2198,7 +2192,7 @@ impl Pickers {
                                         div()
                                             .px(px(8.0))
                                             .text_size(px(10.0))
-                                            .text_color(theme.text_faint)
+                                            .text_color(theme.text_subtle)
                                             .child(SharedString::from(format!(
                                                 "{}/{}",
                                                 self.model_rows_len(cx),
@@ -2418,7 +2412,7 @@ fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
         })
         .when(!active, |el| {
             el.bg(theme.white_alpha(0.04))
-                .text_color(theme.text_muted.opacity(0.7))
+                .text_color(theme.text_subtle)
                 .hover(|s| s.bg(theme.element_hover))
         })
         .when(active || highlighted, |el| {

@@ -726,7 +726,7 @@ impl RoutingPage {
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .text_color(theme.text_muted.opacity(0.65))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(
                             "The repos the board's GitHub App can see. Onboarding clones on \
                              the board's device with the board's own credential — this \
@@ -885,7 +885,7 @@ impl RoutingPage {
             row = row.child(
                 div()
                     .text_size(px(11.5))
-                    .text_color(theme.text_muted.opacity(0.65))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(line)),
             );
         }
@@ -967,7 +967,7 @@ impl RoutingPage {
                     .child(
                         div()
                             .text_size(px(11.5))
-                            .text_color(theme.text_muted.opacity(0.65))
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(dialog.field.empty_hint())),
                     )
                     .child(div().w_full().child(dialog.input.clone()))

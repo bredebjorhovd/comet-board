@@ -899,10 +899,10 @@ impl TerminalPanel {
                         let ghost_title = title.clone();
                         // Comet tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
                         // terminal glyph + label + close; active = white/8 wash.
-                        let (text_color, bg, glyph_alpha) = if selected {
-                            (theme.text, theme.white_alpha(0.08), 0.8)
+                        let (text_color, bg) = if selected {
+                            (theme.text, theme.white_alpha(0.08))
                         } else {
-                            (theme.text_muted.opacity(0.6), gpui::transparent_black(), 0.6)
+                            (theme.text_subtle, gpui::transparent_black())
                         };
                         let close_btn = div()
                             .id(("terminal-tab-close", key))
@@ -922,7 +922,7 @@ impl TerminalPanel {
                             .child(
                                 crate::icons::icon(crate::icons::CLOSE)
                                     .size(px(12.0))
-                                    .text_color(theme.text_muted.opacity(0.8)),
+                                    .text_color(theme.text_muted),
                             );
                         let tab_el = div()
                             .id(("terminal-tab", key))
@@ -972,7 +972,7 @@ impl TerminalPanel {
                             .child(
                                 crate::icons::icon(crate::icons::TERMINAL)
                                     .size(px(16.0))
-                                    .text_color(text_color.opacity(glyph_alpha)),
+                                    .text_color(text_color),
                             )
                             .child(div().flex_1().min_w_0().truncate().child(title))
                             .child(close_btn);
@@ -1029,7 +1029,7 @@ impl TerminalPanel {
                     .child(
                         crate::icons::icon(crate::icons::PLUS)
                             .size(px(16.0))
-                            .text_color(theme.text_muted.opacity(0.6)),
+                            .text_color(theme.text_muted),
                     ),
             )
             // Collapse chevron pinned right (comet "Hide terminal" ⌘J).
@@ -1056,7 +1056,7 @@ impl TerminalPanel {
                     .child(
                         crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                             .size(px(13.0))
-                            .text_color(theme.text_muted.opacity(0.55)),
+                            .text_color(theme.text_muted),
                     ),
             )
     }
@@ -1082,7 +1082,7 @@ impl Render for TerminalPanel {
                 .items_center()
                 .justify_center()
                 .text_size(px(12.0))
-                .text_color(theme.text_faint)
+                .text_color(theme.text_subtle)
                 .child(SharedString::from("Select a chat to open a terminal"))
                 .into_any_element();
         };

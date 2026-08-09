@@ -12,8 +12,24 @@
 //! live from the Appearance settings page; read with [`Theme::of`]. Hairlines and
 //! interactive washes are white at low alpha in dark and black at low alpha in
 //! light — see [`Theme::white_alpha`] / [`Theme::wash`].
+//!
+//! # Four text tones, and no multipliers (gh#172)
+//!
+//! Text paints in exactly four greys — [`Theme::text`], [`Theme::text_muted`],
+//! [`Theme::text_subtle`], [`Theme::text_faint`] — and **a text tone is never
+//! multiplied by an alpha at the call site**. Before this rule the three tones
+//! that existed were multiplied by eleven different factors across the crate,
+//! shipping roughly a dozen unnamed greys: section headers landed at 3.4:1, key
+//! hints at 2.4:1, the "You" label at 1.9:1. The eleven arrived one reasonable
+//! call site at a time, so review discipline is not the fix — the fix is that
+//! `.opacity()` on a text colour fails a test (`tests/text_tones.rs`), and a
+//! tone that is genuinely needed becomes a fifth token here instead.
+//!
+//! Non-text opacity — washes, scrims, fills, hairlines, animation fades — is
+//! untouched by the rule; those are what [`Theme::wash`] and
+//! [`Theme::white_alpha`] are for.
 
-use gpui::{App, Global, Hsla, SharedString, hsla};
+use gpui::{App, Global, Hsla, Rgba, SharedString, hsla};
 use serde::{Deserialize, Serialize};
 
 /// Which theme variant the app paints with. Persisted in [`crate::settings::UiSettings`]
@@ -90,12 +106,15 @@ pub struct Theme {
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
 
-    // ---- paint: text ----
-    /// Primary text.
+    // ---- paint: text (four tones, never multiplied — see the module docs) ----
+    /// Headings, titles, the selected row. ~16.9:1 on [`Self::bg`].
     pub text: Hsla,
-    /// Muted text: timestamps, secondary labels.
+    /// Body copy and unselected rows — the default reading tone. ~8.4:1.
     pub text_muted: Hsla,
-    /// Faint text: placeholders, disabled.
+    /// Labels, metadata, captions, key hints. ~5.1:1 — still AA body text.
+    pub text_subtle: Hsla,
+    /// Disabled controls and placeholders, and nothing else. ~3.5:1 — the
+    /// floor, so anything a user is meant to READ sits at `text_subtle` or up.
     pub text_faint: Hsla,
 
     // ---- paint: accents ----
@@ -184,13 +203,14 @@ impl Theme {
             element_active: wash(0.16),
             border: white_alpha(0.08),
             border_strong: white_alpha(0.14),
-            text: neutral(0.922),                        // ~neutral-200
-            text_muted: neutral(0.708),                  // ~neutral-400
-            text_faint: neutral(0.556),                  // ~neutral-500
-            accent: oklch(0.673, 0.182, 276.935),        // indigo-400
+            text: neutral(0.938),                 // #ebebeb — 16.9:1 on bg
+            text_muted: neutral(0.728),           // #a7a7a7 —  8.4:1
+            text_subtle: neutral(0.598),          // #7f7f7f —  5.1:1
+            text_faint: neutral(0.508),           // #656565 —  3.5:1
+            accent: oklch(0.673, 0.182, 276.935), // indigo-400
             accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
-            danger: oklch(0.704, 0.191, 22.216),         // red-400
-            warning: oklch(0.828, 0.189, 84.429),        // amber-400
+            danger: oklch(0.704, 0.191, 22.216),  // red-400
+            warning: oklch(0.828, 0.189, 84.429), // amber-400
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -212,9 +232,12 @@ impl Theme {
             element_active: black_wash(0.10),
             border: black_wash(0.10),
             border_strong: black_wash(0.16),
-            text: neutral(0.22),      // ~neutral-900
-            text_muted: neutral(0.48), // ~neutral-600
-            text_faint: neutral(0.66), // ~neutral-400
+            // The same four contrast steps, walked the other way: 16.9 / 8.4 /
+            // 5.1 / 3.5 against the near-white `bg`.
+            text: neutral(0.212),                 // #191919
+            text_muted: neutral(0.412),           // #4b4b4b
+            text_subtle: neutral(0.528),          // #6b6b6b
+            text_faint: neutral(0.619),           // #868686
             accent: oklch(0.511, 0.262, 276.966), // indigo, darkened for white
             accent_strong: oklch(0.457, 0.24, 277.023),
             danger: oklch(0.60, 0.22, 26.0),
@@ -325,6 +348,17 @@ impl Theme {
         } else {
             grey(0x16)
         }
+    }
+
+    /// The four text tones, brightest first — for callers that walk the ramp
+    /// rather than naming one step of it (the contrast tests).
+    pub fn text_tones(&self) -> [Hsla; 4] {
+        [
+            self.text,
+            self.text_muted,
+            self.text_subtle,
+            self.text_faint,
+        ]
     }
 
     /// Read the theme global.
@@ -483,6 +517,29 @@ pub(crate) fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (h, s, l)
 }
 
+/// WCAG relative luminance of an OPAQUE color (alpha is ignored — a translucent
+/// tone has no luminance of its own until it composites onto something).
+pub fn relative_luminance(color: Hsla) -> f32 {
+    let rgb = Rgba::from(color);
+    let lin = |c: f32| {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+}
+
+/// WCAG 2.1 contrast ratio between two opaque colors, 1.0 (identical) to 21.0
+/// (black on white). The text tones are chosen by this number and pinned by
+/// this module's tests — see the module docs on why they are never
+/// multiplied.
+pub fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 /// Linear per-component mix of two colors (paint helper for the gradient spinner).
 pub fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let t = t.clamp(0.0, 1.0);
@@ -536,20 +593,70 @@ mod tests {
         assert!(t.bg.l < t.surface.l);
         assert!(t.surface.l < t.surface_raised.l);
         assert!(t.surface_raised.l < t.text_faint.l);
-        assert!(t.text_faint.l < t.text_muted.l);
+        assert!(t.text_faint.l < t.text_subtle.l);
+        assert!(t.text_subtle.l < t.text_muted.l);
         assert!(t.text_muted.l < t.text.l);
         // Monochrome: neutrals carry no saturation.
-        for c in [
-            t.bg,
-            t.surface,
-            t.surface_raised,
-            t.text,
-            t.text_muted,
-            t.text_faint,
-        ] {
+        for c in [t.bg, t.surface, t.surface_raised]
+            .into_iter()
+            .chain(t.text_tones())
+        {
             assert_eq!(c.s, 0.0);
             assert_eq!(c.a, 1.0);
         }
+    }
+
+    /// The four tones, measured rather than eyeballed. Every tone clears its
+    /// tier's floor against BOTH surface tones — `bg` (#060606, the main panel)
+    /// and `surface` (#0d0d0d, the shell) — so no screen can put readable copy
+    /// below AA. The predecessor of this test was a hand-measured table in an
+    /// issue, which is how eleven call-site multipliers landed two of the app's
+    /// most common tones under 3:1.
+    #[test]
+    fn text_tones_clear_their_contrast_floors() {
+        // (name, target on `bg`, floor that BOTH surfaces must clear)
+        const TIERS: [(&str, f32, f32); 4] = [
+            ("text", 16.9, 15.0), // headings, titles, selected rows
+            ("muted", 8.4, 7.5),  // body, unselected rows
+            ("subtle", 5.1, 4.5), // labels, metadata, captions — AA body text
+            ("faint", 3.5, 3.0),  // disabled and placeholders only
+        ];
+        for t in [Theme::dark(), Theme::light()] {
+            let tones = t.text_tones();
+            for (tone, (name, target, floor)) in tones.into_iter().zip(TIERS) {
+                let on_bg = contrast_ratio(tone, t.bg);
+                let on_surface = contrast_ratio(tone, t.surface);
+                assert!(
+                    (on_bg - target).abs() < 0.35,
+                    "{name} is {on_bg:.2}:1 on bg, designed for {target}:1 (light={})",
+                    t.light
+                );
+                assert!(
+                    on_surface >= floor,
+                    "{name} is {on_surface:.2}:1 on surface, floor {floor} (light={})",
+                    t.light
+                );
+            }
+            // The tones must read as LEVELS, not noise: each is at least 1.4x
+            // the contrast of the one below it. Two greys landing two percent
+            // apart is the failure this whole token set replaces.
+            for pair in tones.windows(2) {
+                let (hi, lo) = (contrast_ratio(pair[0], t.bg), contrast_ratio(pair[1], t.bg));
+                assert!(hi / lo >= 1.4, "{hi:.2}:1 vs {lo:.2}:1 is not a step");
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_ratio_matches_wcag_anchors() {
+        let white = hsla(0.0, 0.0, 1.0, 1.0);
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert!((contrast_ratio(white, black) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(white, white) - 1.0).abs() < 0.01);
+        // Symmetric — the brighter color may be either argument.
+        assert_eq!(contrast_ratio(white, black), contrast_ratio(black, white));
+        // #767676 on white is the canonical 4.5:1 AA boundary.
+        assert!((contrast_ratio(grey(0x76), white) - 4.54).abs() < 0.05);
     }
 
     #[test]
@@ -623,17 +730,14 @@ mod tests {
         assert!(t.bg.l > t.surface.l);
         assert!(t.surface.l > t.surface_raised.l);
         assert!(t.surface_raised.l > t.text_faint.l);
-        assert!(t.text_faint.l > t.text_muted.l);
+        assert!(t.text_faint.l > t.text_subtle.l);
+        assert!(t.text_subtle.l > t.text_muted.l);
         assert!(t.text_muted.l > t.text.l);
         // Monochrome: neutrals carry no saturation, same as dark.
-        for c in [
-            t.bg,
-            t.surface,
-            t.surface_raised,
-            t.text,
-            t.text_muted,
-            t.text_faint,
-        ] {
+        for c in [t.bg, t.surface, t.surface_raised]
+            .into_iter()
+            .chain(t.text_tones())
+        {
             assert_eq!(c.s, 0.0);
             assert_eq!(c.a, 1.0);
         }
@@ -732,6 +836,7 @@ mod tests {
             (t.text, t.surface),
             (t.text, t.surface_raised),
             (t.text_muted, t.bg),
+            (t.text_subtle, t.surface),
             (t.text_faint, t.surface),
         ] {
             assert!(fg.l < bg.l - 0.15, "fg {} vs bg {}", fg.l, bg.l);

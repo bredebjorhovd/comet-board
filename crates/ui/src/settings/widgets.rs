@@ -39,7 +39,7 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
             el.child(
                 div()
                     .text_size(px(13.0))
-                    .text_color(theme.text_muted.opacity(0.7))
+                    .text_color(theme.text_subtle)
                     .child(SharedString::from(format!("{count}"))),
             )
         })
@@ -113,8 +113,8 @@ pub fn row_title(theme: &Theme, title: impl Into<SharedString>) -> gpui::Div {
         .child(title.into())
 }
 
-/// The quiet meta line under a row title: `text-[11.5px]
-/// text-muted-foreground/65` fragments joined by dots.
+/// The quiet meta line under a row title: `text-[11.5px]` fragments joined by
+/// dots — metadata, so `text_subtle`, with the dots themselves a step below.
 pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
     let mut line = div()
         .mt(px(4.0))
@@ -125,13 +125,13 @@ pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
         .gap_x(px(8.0))
         .gap_y(px(2.0))
         .text_size(px(11.5))
-        .text_color(theme.text_muted.opacity(0.65));
+        .text_color(theme.text_subtle);
     let mut first = true;
     for fragment in fragments {
         if !first {
             line = line.child(
                 div()
-                    .text_color(theme.text_muted.opacity(0.3))
+                    .text_color(theme.text_faint)
                     .child(SharedString::from("·")),
             );
         }
@@ -167,7 +167,7 @@ pub fn badge_active(label: impl Into<SharedString>) -> gpui::Div {
         .rounded_full()
         .bg(emerald.opacity(0.12))
         .text_size(px(10.5))
-        .text_color(emerald_text.opacity(0.9))
+        .text_color(emerald_text)
         .child(label.into())
 }
 
@@ -211,7 +211,7 @@ pub fn error_strip(message: impl Into<SharedString>) -> gpui::Div {
         .border_color(red.opacity(0.2))
         .bg(red.opacity(0.06))
         .text_size(px(12.5))
-        .text_color(red_text.opacity(0.9))
+        .text_color(red_text)
         .flex()
         .flex_row()
         .items_start()
@@ -220,7 +220,7 @@ pub fn error_strip(message: impl Into<SharedString>) -> gpui::Div {
             div().flex_none().mt(px(2.0)).child(
                 crate::icons::icon(crate::icons::DANGER_TRIANGLE)
                     .size(px(16.0))
-                    .text_color(red_text.opacity(0.9)),
+                    .text_color(red_text),
             ),
         )
         .child(div().min_w_0().child(message.into()))
@@ -241,7 +241,7 @@ pub fn warning_strip(message: impl Into<SharedString>) -> gpui::Div {
         .border_color(amber.opacity(0.2))
         .bg(amber.opacity(0.06))
         .text_size(px(12.0))
-        .text_color(amber_text.opacity(0.9))
+        .text_color(amber_text)
         .flex()
         .flex_row()
         .items_start()
@@ -250,7 +250,7 @@ pub fn warning_strip(message: impl Into<SharedString>) -> gpui::Div {
             div().flex_none().mt(px(2.0)).child(
                 crate::icons::icon(crate::icons::DANGER_TRIANGLE)
                     .size(px(14.0))
-                    .text_color(amber_text.opacity(0.9)),
+                    .text_color(amber_text),
             ),
         )
         .child(div().min_w_0().child(message.into()))

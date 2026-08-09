@@ -184,7 +184,7 @@ impl Render for ShortcutsPage {
                         div()
                             .id(("shortcut-reset", ix))
                             .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.7))
+                            .text_color(theme.text_subtle)
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme.text))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -210,7 +210,9 @@ impl Render for ShortcutsPage {
                         .cursor_pointer()
                         .map(|el| {
                             if is_recording {
-                                el.border_color(theme.text.opacity(0.3))
+                                // Border and fill are the same tone: the
+                                // recording chip reads as one solid slab.
+                                el.border_color(theme.text)
                                     .bg(theme.text)
                                     .text_color(theme.bg)
                             } else {
@@ -218,9 +220,10 @@ impl Render for ShortcutsPage {
                                     .bg(theme.bg)
                                     .text_color(theme.text)
                                     .hover(|s| {
-                                        // `hover:border-foreground/20` — the
-                                        // neutral foreground, not pure white.
-                                        s.border_color(theme.text.opacity(0.2))
+                                        // `hover:border-foreground/20` — a
+                                        // hairline wash, not a text tone
+                                        // (text tones are never multiplied).
+                                        s.border_color(theme.white_alpha(0.2))
                                             .bg(theme.white_alpha(0.03))
                                     })
                             }

@@ -244,7 +244,7 @@ pub fn render_block(
                         .min_w(px(18.0))
                         .text_size(px(MD_TEXT_SIZE))
                         .line_height(px(MD_LINE_HEIGHT))
-                        .text_color(theme.accent.opacity(0.85))
+                        .text_color(theme.accent)
                         .child(SharedString::from(format!("{}.", start + item_ix as u64)))
                         .into_any_element(),
                     None => div()
