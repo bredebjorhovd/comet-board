@@ -16,11 +16,64 @@ xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
-Or open `Comet.xcodeproj` in Xcode and run. Dependencies (SPM, resolved
+Or open `Comet.xcodeproj` in Xcode and run. That is the **simulator**: it needs
+no signing and works from a clean checkout. A **device** does not — it needs one
+local file that is not in the repo, and the section below is how to write it.
+
+Dependencies (SPM, resolved
 automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (matches the engine's loro 1.13), [swift-markdown](https://github.com/swiftlang/swift-markdown)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
+
+### Building for a device (gh#196)
+
+**A clean checkout cannot build for a device until you write one local file.**
+This is deliberate — the repo is public and an Apple team id is personal — but
+the failure is not self-explaining, so here is the whole of it.
+
+```sh
+cd apps/ios
+cp Signing.local.xcconfig.example Signing.local.xcconfig
+$EDITOR Signing.local.xcconfig     # your DEVELOPMENT_TEAM and a bundle id
+xcodebuild -project Comet.xcodeproj -scheme Comet \
+  -destination 'generic/platform=iOS' build
+```
+
+`Signing.local.xcconfig` is gitignored. `Signing.xcconfig` — committed, and the
+target's base configuration — pulls it in with `#include?`, an *optional*
+include, so a checkout without it still builds for the simulator with no
+warning. Once the file exists, Xcode and `xcodebuild` both pick it up with no
+extra arguments; there is nothing to remember on the command line.
+
+Set **both** keys. Two different errors are waiting:
+
+| What you left out | What Xcode says |
+| --- | --- |
+| No file, or no `DEVELOPMENT_TEAM` | `Signing for "Comet" requires a development team.` |
+| Team set, bundle id left at the default | `No profiles for 'dev.cometnative.Comet' were found` |
+
+The second one is the trap, because it does not sound like a bundle-id problem.
+`dev.cometnative.Comet` is the project's default and **no personal team can sign
+it** — a free team issues profiles on demand only for ids nobody else has
+claimed. Pick your own (`dev.comet.native.<yourname>`) and Xcode mints the
+profile the first time you build.
+
+One consequence worth knowing: the override applies to **every** destination,
+so once you set it your simulator builds carry your bundle id too. Anything
+driving the app through `simctl` — `get_app_container`, `launch`, `terminate` —
+must therefore read the id rather than assume it:
+
+```sh
+plutil -extract CFBundleIdentifier raw "$APP/Info.plist"
+```
+
+`scripts/ios-stats-spec.sh` does exactly that. Copy it, do not hardcode.
+
+An ignored file rather than settings in `Comet.xcodeproj/project.pbxproj`: put a
+team id in the tracked `.pbxproj` and it is a permanent dirty diff, one that has
+already been swept into an unrelated `git stash` and nearly lost. It cannot
+happen to a file git never looks at.
 
 ### Connecting
 
@@ -90,8 +143,14 @@ all.
 ### Distribution
 
 Personal-device sideload via Xcode free provisioning works and re-signs every
-7 days. TestFlight needs the $99 Apple Developer account — the same one gh#100's
-signing tier wants, so it is one purchase for both.
+7 days. That is the free personal team's whole profile lifetime — the app on the
+phone stops launching after a week and has to be rebuilt and reinstalled, which
+is a recurring chore, not a one-off. The $99/yr Apple Developer Program issues
+twelve-month profiles and ends it.
+
+TestFlight needs that same paid account — and so does gh#100's signing tier, so
+it is one purchase for three things. Buying it is a spending decision, not a
+code one; until it is made, expect the weekly reinstall.
 
 ## Architecture
 

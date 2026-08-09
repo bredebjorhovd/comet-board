@@ -26,7 +26,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIM="${1:-${COMET_SPEC_SIM:-iPhone 17 Pro}}"
-APP_ID="dev.cometnative.Comet"
 DERIVED="$(mktemp -d /tmp/comet-ios-spec.XXXXXX)"
 
 cleanup() { rm -rf "$DERIVED"; }
@@ -41,11 +40,21 @@ xcodebuild -project "$ROOT/apps/ios/Comet.xcodeproj" -scheme Comet \
     exit 1
   }
 
-echo "spec: booting $SIM"
+APP="$DERIVED/Build/Products/Debug-iphonesimulator/Comet.app"
+
+# Read the bundle id off the app that was just built rather than hardcoding it.
+# apps/ios/Signing.local.xcconfig (gh#196) overrides PRODUCT_BUNDLE_IDENTIFIER
+# so device builds can be signed by a personal team — and it applies to the
+# simulator too. A hardcoded id would make every simctl call below miss on any
+# machine set up for device builds, and "spec runner produced no log" does not
+# sound like a signing override.
+APP_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")"
+
+echo "spec: booting $SIM ($APP_ID)"
 xcrun simctl boot "$SIM" >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$SIM" -b >/dev/null 2>&1 || true
 
-xcrun simctl install "$SIM" "$DERIVED/Build/Products/Debug-iphonesimulator/Comet.app"
+xcrun simctl install "$SIM" "$APP"
 xcrun simctl terminate "$SIM" "$APP_ID" >/dev/null 2>&1 || true
 
 # Remove the previous run's log BEFORE launching, not after: the container

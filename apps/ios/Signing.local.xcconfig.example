@@ -1,0 +1,20 @@
+// Copy to Signing.local.xcconfig — that name is gitignored — and fill both in.
+// Signing.xcconfig includes it last, so these two win over the defaults.
+//
+// DEVELOPMENT_TEAM — your Apple team id. Xcode → Settings → Accounts → your
+// account → the Team ID column. Or read it off a profile you already have:
+//
+//   security cms -D -i ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/<uuid>.mobileprovision \
+//     | plutil -extract Entitlements.application-identifier raw -
+//
+// which prints TEAMID.bundle.id — both halves of what this file needs.
+//
+// PRODUCT_BUNDLE_IDENTIFIER — must be a bundle id your team has a profile for.
+// A free personal team will issue one on demand for any id nobody else has
+// claimed, so make it yours: dev.comet.native.<yourname>. Do NOT leave this
+// line out; the default dev.cometnative.Comet belongs to no personal team, and
+// the failure reads as "No profiles for 'dev.cometnative.Comet' were found",
+// which does not sound like a bundle-id problem.
+
+DEVELOPMENT_TEAM = ABCDE12345
+PRODUCT_BUNDLE_IDENTIFIER = dev.comet.native.yourname
