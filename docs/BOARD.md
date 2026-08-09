@@ -2498,9 +2498,118 @@ hand.
 - **Multi-device.** One engine hosts the board; every other device drives it
   over the relay (H9 above). Moving board rows into the workspace doc stays
   deferred — one host device is correct while one box hosts the board.
-- **Upstream tracking**: `git fetch upstream && git merge upstream/main`
-  (upstream = zeronsh/comet). Keep board changes additive — new crate, new
-  files, short diffs in `rpc/lib.rs` + `engine/rpc.rs` — so merges stay cheap.
+- **Upstream tracking**: cherry-pick, never merge. The additive-diff advice this
+  line used to carry stopped being true in August 2026 — see **Upstream**
+  below for the merge base, the standing divergences, and the SHA ledger.
+
+## Upstream: cherry-pick, not merge
+
+`upstream` is [zeronsh/comet](https://github.com/zeronsh/comet). Until August
+2026 the note here read *"`git fetch upstream && git merge upstream/main`; keep
+board changes additive so merges stay cheap"*, and at the merge base that was
+true — the board was a new crate plus short diffs in `rpc/lib.rs` and
+`engine/rpc.rs`, and upstream had not yet touched anything we had an opinion
+about. Following it today would quietly undo work. This section is what
+replaces it.
+
+**The merge base is `fb22e26`** — upstream v0.1.6, 2026-08-01. As of 2026-08-09
+`upstream/main` is `433ff68` (v0.1.26), **89 commits ahead** of that base. Every
+one of those commits is a candidate; none of them is automatically ours.
+
+### Why a merge is the wrong verb now
+
+Three upstream commits are not conflicts. Each one compiles on both sides, so
+git resolves it silently — and each resolution is git picking a side of a
+product argument nobody asked it to arbitrate.
+
+- **Upstream deleted the TUI.** `7b52ce1` (2026-08-04) — *"Remove the TUI:
+  crates/tui, apps/tui, comet tui subcommand, scripts, docs"*. A merge deletes
+  it here. We depend on it three ways: `ARCHITECTURE.md` calls it *"a peer of
+  the gpui app rather than a subset of it"*, which is the whole reason
+  `comet_proto::view` exists as pure derivations two viewports share (see the
+  module docs in `crates/proto/src/view/spaces.rs` — "so both viewports agree");
+  it carries 87 render tests in `crates/tui/tests/render.rs` (226 in the crate),
+  which is the only place the derivations are asserted against rendered frames;
+  and it is the attach surface for the fork's **primary deployment** — the
+  edge-less single-box mode README.md documents as `COMET_EDGE_URL=off comet
+  headless` + `comet tui`. `docs/orchestrator.md` and `docs/teammate.md` both
+  give operator steps in terms of it.
+- **Upstream reversed gh#124 on the session row.** `ff124f4` (2026-08-03) —
+  *"Show owning device in session rows: space@device"* — restores exactly the
+  string gh#124 removed as information said twice with different truncation.
+  Our side of that argument is written down where the code is
+  (`crates/tui/src/app.rs:211`, `:271`, `crates/tui/src/render.rs:737`) and the
+  derivation that replaced it is `view::spaces::device_groups` — the device name
+  once, as a group header, instead of riding along on every row.
+- **Light mode was built twice, independently.** `b6fb19e` (2026-08-03) upstream;
+  ours is `efa52ea` (H12), now Settings → Appearance
+  (`crates/ui/src/settings/appearance.rs`) and `crates/tui/src/theme.rs`. Two
+  implementations of one feature, and a merge keeps whichever one it wins.
+
+The first is a deletion, the second a reversal, the third a duplicate. Nothing
+about them shows up as a conflict marker, which is the point: the failure mode
+is a green build and a quiet regression.
+
+### Standing divergences
+
+What we hold against upstream, and why. A cherry-pick that would touch one of
+these is declined by default, and the decline belongs in the ledger below.
+
+| Divergence | Ours | Upstream | Why we hold it |
+|---|---|---|---|
+| The TUI | kept: `crates/tui`, `apps/tui`, `comet tui` | deleted (`7b52ce1`) | peer frontend, 87 render tests, the edge-less box's only viewport |
+| Session rows | space and device said once, device as a group header (gh#124, gh#138) | `space@device` on every row (`ff124f4`) | the old row spent its loudest pixels on its least differentiating fact |
+| Light mode | ours (`efa52ea`, Settings → Appearance) | theirs (`b6fb19e`) | same feature, two implementations; ours is the one the TUI shares |
+| The board | `crates/board`, `apps/board-cli`, the board RPCs | none | the fork's reason to exist |
+
+### The SHA ledger — what we have taken
+
+Empty by design until the first deliberate sync lands. gh#146 (the edge
+wasm-poisoning / doc-freeing / history-trim cluster) will produce the first
+rows; its exit condition is a note here recording which upstream SHAs we carry,
+*so the next sync knows where it started*. Record declines too — a commit
+considered and refused is a decision, and without the row the next person
+rediscovers it from scratch.
+
+| Upstream SHA | Date | Subject | Taken as | Verdict |
+|---|---|---|---|---|
+| — | — | *(none yet; gh#146 fills this)* | — | — |
+
+### What we owe upstream
+
+`upstream/main:crates/engine/src/workspace_host.rs:45` still reads
+`PRESENCE_INTERVAL_MS = 15_000`, with `presence_tick` beating a `%EPH` frame
+into the workspace-doc room on that interval. That is gh#145: a `%EPH` frame is
+a real message, not a text ping, so a room woken every 15s never hibernates —
+one idle user burned 83% of the Durable Objects free tier before an agent ran.
+We deleted the beat in `51241bc` (2026-08-08) and derive liveness from the
+socket the way `DeviceRoom` always did (`crates/engine/src/presence.rs`).
+Upstream carries the bug into one room; we carried it into two, because the
+org device registry (gh#66) is ours. When the fix has proven out on the box it
+is worth sending back.
+
+There is **no PR path**. `bredebjorhovd/comet-board` is not a GitHub fork of
+`zeronsh/comet` — `isFork: false`, `parent: null` — so the GitHub UI offers no
+compare-across-forks and no upstream PR button. Contributing back means a
+branch on a real fork, or a patch. Reading from them means the same thing it
+means today: a plain `upstream` remote and `git cherry-pick`.
+
+### The mechanics
+
+```bash
+git fetch upstream
+git log --oneline fb22e26..upstream/main -- edge/     # scope to what you mean to take
+git cherry-pick -x <sha>                              # -x records the origin in the message
+```
+
+`-x` is not optional: it stamps *"cherry picked from commit …"* into the commit
+message, which makes the ledger above recoverable from git even when somebody
+forgets to write the row. Scope the `git log` to a path — the 89-commit range is
+mostly `edge/`, and the commits that touch `crates/` are the ones most likely to
+land on a standing divergence.
+
+Keeping board changes additive is still good practice, for the plain reason that
+short diffs cherry-pick cleanly in both directions. It is no longer a strategy.
 
 ## Reference
 
