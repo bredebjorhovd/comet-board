@@ -775,6 +775,7 @@ fn main() -> Result<()> {
                                 info.spaces.len()
                             ),
                             version: info.version,
+                            update: info.update,
                         },
                         Some(info.spaces),
                         Some(info.accounts),
@@ -790,6 +791,7 @@ fn main() -> Result<()> {
                                  `comet headless`"
                             ),
                             version: None,
+                            update: None,
                         },
                         None,
                         None,
@@ -1378,6 +1380,9 @@ struct EngineInfo {
     /// engine too old to answer, which doctor reports as "not checked" rather
     /// than as a box that can run nothing.
     runtimes: Vec<comet_proto::view::board::RuntimeOption>,
+    /// What the engine's release checker last saw at the edge (gh#197). `None`
+    /// from an engine that has no updater attached or predates the verb.
+    update: Option<comet_update::UpdateStatus>,
 }
 
 /// This device's spaces, from the engine: `LocalDevice` for the device id (and
@@ -1453,6 +1458,22 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             .ok()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        // What the edge is handing out (gh#197), taken from the engine's own
+        // release checker rather than fetched here: it is the process that
+        // performs updates, and a second opinion could only disagree with it.
+        // A stream because that is how the engine publishes it — the first
+        // frame is the current status. An engine with no updater attached (or
+        // one too old for the verb) ends the stream instead, which is `None`.
+        let update: Option<comet_update::UpdateStatus> = match client
+            .subscribe(methods::UPDATE_STATUS, serde_json::json!({}))
+            .await
+        {
+            Ok(mut stream) => stream
+                .recv()
+                .await
+                .and_then(|v| serde_json::from_value(v).ok()),
+            Err(_) => None,
+        };
         Ok::<_, anyhow::Error>(EngineInfo {
             device,
             version,
@@ -1461,6 +1482,7 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             edge,
             members,
             runtimes,
+            update,
         })
     };
     tokio::time::timeout(FETCH_TIMEOUT, fetch)
