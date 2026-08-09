@@ -1189,6 +1189,7 @@ version = "0.3.4"
 dependencies = [
  "anyhow",
  "clap",
+ "comet-board",
  "comet-engine",
  "comet-proto",
  "comet-rpc",

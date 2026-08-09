@@ -15,6 +15,7 @@
 
 pub mod adopt;
 pub mod billing;
+pub mod board_cli;
 pub mod config;
 pub mod db;
 pub mod dispatch;

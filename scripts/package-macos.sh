@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# macOS packaging: build the release binary for the host arch and produce
+# macOS packaging: build the release binaries for the host arch and produce
 #   target/package/comet-<version>-macos-<arch>.dmg          (user download)
 #   target/package/comet-<version>-macos-<arch>-app.tar.gz   (auto-updater)
 # containing Comet.app.
+#
+# The bundle carries `comet-board` beside `comet` in Contents/MacOS (gh#156):
+# they are the same release and must not be able to drift apart. Nothing on
+# macOS puts either on PATH — there is no installer here, only a dmg — so this
+# ships the CLI where `comet` can find it (crates/tui's sibling-then-PATH
+# lookup) rather than pretending it is installed.
 #
 # Two signing outcomes, and they are very different for whoever downloads it:
 #
@@ -45,12 +51,21 @@ APP_TARBALL="$OUT_DIR/comet-$VERSION-macos-$ARCH-app.tar.gz"
 DMG_ROOT="$OUT_DIR/dmg-root"
 
 cd "$ROOT"
-cargo build --release -p comet
+cargo build --release -p comet -p comet-board-bin
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL" "$DMG_ROOT"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/comet" "$APP/Contents/MacOS/comet"
+install -m 755 "$ROOT/target/release/comet-board" "$APP/Contents/MacOS/comet-board"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+
+# Asked to prove it, because the Linux payload shipped the engine alone from the
+# first release to v0.3.4 and nothing noticed (gh#156). A missing binary is a
+# failed build.
+for required in comet comet-board; do
+  [[ -x "$APP/Contents/MacOS/$required" ]] \
+    || { echo "packaging bug: $required is missing from the bundle" >&2; exit 1; }
+done
 
 # Icon: iconset from dist/comet.png — the comet mark from the original app
 # (apps/desktop/resources/icon.png in the comet repo; source dist/comet.svg).
@@ -71,9 +86,14 @@ NOTARIZED=0
 NOTARY_ARGS=()
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  # No --deep: the bundle has no nested code, and Apple discourages --deep for
-  # anything destined for notarization. --timestamp and the hardened runtime
-  # are both notarization prerequisites.
+  # Inside-out, and it has to be in that order: since gh#156 the bundle carries
+  # a second Mach-O (Contents/MacOS/comet-board), and nested code is not covered
+  # by signing the bundle around it — notarization rejects the whole submission
+  # over one unsigned helper. Signing the helper first, then the bundle, is what
+  # seals it; still no --deep, which Apple discourages for anything destined for
+  # notarization. --timestamp and the hardened runtime are both prerequisites.
+  codesign --force --options runtime --timestamp \
+    --sign "$CODESIGN_IDENTITY" "$APP/Contents/MacOS/comet-board"
   codesign --force --options runtime --timestamp \
     --sign "$CODESIGN_IDENTITY" "$APP"
 

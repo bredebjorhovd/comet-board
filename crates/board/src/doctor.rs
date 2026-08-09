@@ -34,6 +34,10 @@ pub struct EngineStatus {
     pub reachable: bool,
     /// `listening on 127.0.0.1:27654 (device d-…)`, or why the dial failed.
     pub detail: String,
+    /// The running engine's own `CARGO_PKG_VERSION`, from `LocalDevice`
+    /// (gh#156). `None` when the engine could not be asked, or is old enough
+    /// not to say — both leave the version check reading off the disk instead.
+    pub version: Option<String>,
 }
 
 /// Check the environment. Plain stdout — the report is the output.
@@ -116,6 +120,18 @@ pub fn doctor(
         ok: engine.reachable,
         detail: engine.detail.clone(),
     });
+
+    // Whether the binary printing this report is the one that engine shipped
+    // with (gh#156). Directly under the engine check because it is a fact about
+    // the pair, and the pair is what was allowed to drift: every release
+    // upgraded the engine and left the board CLI wherever it was, so the first
+    // symptom was an agent typing a verb that did not exist.
+    checks.push(cli_version_check(
+        env!("CARGO_PKG_VERSION"),
+        engine.version.as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        &crate::config::data_dir().join("app"),
+    ));
 
     // Reachable from this shell is not the same as reachable from anywhere
     // else (gh#116). Every other check on this box runs over the loopback IPC
@@ -409,6 +425,111 @@ pub fn doctor(
     ));
 
     Ok(checks)
+}
+
+/// Is the board CLI the one the engine beside it shipped with (gh#156)?
+///
+/// The bug this exists for was invisible by construction. The release payload
+/// carried the engine alone, so `install.sh` upgraded `comet` on every release
+/// and never touched `comet-board`; the team box ran a source build symlinked by
+/// hand in August, three weeks of verbs behind the board it was driving, and
+/// nothing said so until an agent typed `onboard` and got "unknown subcommand".
+/// Every other check here asks about the environment the CLI can see. This one
+/// asks about the CLI.
+///
+/// Two candidate answers for "the engine's version", in order: the version the
+/// engine reported over IPC — authoritative, it is the process actually running
+/// the board — and, when it could not be asked, the version of the payload
+/// installed on this disk. Neither available is "not checked": a laptop with no
+/// managed install and no engine up has nothing to be wrong about.
+///
+/// `cli` is this crate's `CARGO_PKG_VERSION`, which is the CLI's: one workspace
+/// version, and the binary links this crate.
+fn cli_version_check(
+    cli: &str,
+    running: Option<&str>,
+    exe: Option<&Path>,
+    app_root: &Path,
+) -> Check {
+    let name = "cli version".to_string();
+    // Which copy on this box answered. Stated whether or not there is drift:
+    // when there is, it is most of what to do about it; when there is not, it is
+    // the only line in the report that says which binary is talking.
+    let here = exe
+        .map(|p| format!(" · {}", crate::config::shorten_home(p)))
+        .unwrap_or_default();
+
+    let installed = installed_payload_version(app_root);
+    let (engine, source) = match (running, installed.as_deref()) {
+        (Some(v), _) => (v, "the engine running here"),
+        (None, Some(v)) => (v, "the release installed here"),
+        (None, None) => {
+            return Check {
+                name,
+                ok: true,
+                detail: format!("v{cli}{here} — no engine to compare against"),
+            };
+        }
+    };
+
+    if engine == cli {
+        return Check {
+            name,
+            ok: true,
+            detail: format!("v{cli}, same as {source}{here}"),
+        };
+    }
+
+    // Deliberately not "this is not from a release": a copy installed from an
+    // older tarball is from a release, just not this one. What is provable from
+    // the version mismatch alone is that whatever installed the engine did not
+    // put this binary down, and that is what gets said.
+    let answering = match exe {
+        Some(p) => format!(
+            " The binary answering is {}, which is not what that release installed.",
+            crate::config::shorten_home(p)
+        ),
+        None => String::new(),
+    };
+    // A payload with no `comet-board` in it predates this fix, and re-running
+    // the installer against it would relink nothing. Say that rather than
+    // handing over a command that cannot work yet.
+    let fix = if app_root.join("current").exists() && !app_root.join("current/comet-board").exists()
+    {
+        format!(
+            "the release at {} ships the engine alone, so there is no matching \
+             comet-board to link yet — upgrade to one that carries both",
+            crate::config::shorten_home(&app_root.join("current"))
+        )
+    } else {
+        "re-run the installer to put them back in step: \
+         curl -fsSL https://edge.comet.offhand.dev/install.sh | sh"
+            .to_string()
+    };
+    // The fix goes last so the line ends on something copy-pasteable.
+    Check {
+        name,
+        ok: false,
+        detail: format!(
+            "v{cli}, but {source} is v{engine} — a verb this CLI does not have does \
+             not exist on this box.{answering} {fix}"
+        ),
+    }
+}
+
+/// The version of the managed payload installed on this box, read off the
+/// `app/current` symlink (`~/.comet-native/app/<version>`).
+///
+/// The link target's name, not a file inside it: that name *is* the version the
+/// installer staged, and reading it costs no process spawn. Anything that does
+/// not start with a digit is not one of our versioned dirs — a `current` a human
+/// pointed somewhere else is no answer at all, and a wrong answer here would
+/// invent drift that is not there.
+fn installed_payload_version(app_root: &Path) -> Option<String> {
+    let target = std::fs::read_link(app_root.join("current")).ok()?;
+    let name = target.file_name()?.to_str()?;
+    name.starts_with(|c: char| c.is_ascii_digit())
+        .then(|| name.to_string())
 }
 
 /// Does the skill the agents read match the binary whose flags it documents
@@ -1530,6 +1651,9 @@ mod tests {
         EngineStatus {
             reachable: true,
             detail: "listening on 127.0.0.1:27654".into(),
+            // The version this crate was built at, so the `cli version` check
+            // stays quiet in every test that is about something else.
+            version: Some(env!("CARGO_PKG_VERSION").into()),
         }
     }
 
@@ -1553,6 +1677,114 @@ mod tests {
         assert!(checks.iter().any(|c| c.name == "routing.toml" && !c.ok));
         // The database check must still pass — doctor creates it.
         assert!(checks.iter().any(|c| c.name == "database" && c.ok));
+    }
+
+    // --- cli version (gh#156) ------------------------------------------------
+
+    /// A managed install: `app/<version>` with a `current` symlink onto it, and
+    /// `payload` deciding whether that release carries a `comet-board` at all.
+    fn app_root_at(dir: &Path, version: &str, payload: &[&str]) -> PathBuf {
+        let app_root = dir.join("app");
+        let versioned = app_root.join(version);
+        std::fs::create_dir_all(&versioned).unwrap();
+        for bin in payload {
+            std::fs::write(versioned.join(bin), b"#!/bin/sh\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&versioned, app_root.join("current")).unwrap();
+        app_root
+    }
+
+    /// The gh#156 box, exactly: engine upgraded to a new release, `comet-board`
+    /// still the hand-built binary somebody symlinked weeks ago. Nothing on that
+    /// machine said so until an agent typed a verb that did not exist.
+    #[test]
+    fn a_board_cli_older_than_its_engine_fails() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.4", &["comet", "comet-board"]);
+        let exe = d.path().join("src/target/release/comet-board");
+        let c = cli_version_check("0.2.9", Some("0.3.4"), Some(&exe), &app_root);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("v0.2.9"), "{}", c.detail);
+        assert!(c.detail.contains("v0.3.4"), "{}", c.detail);
+        // The path is the actionable half: which of the copies on this box is
+        // the one that answered.
+        assert!(
+            c.detail.contains("src/target/release/comet-board"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("not what that release installed"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// The same drift, against a release that predates shipping the CLI. Telling
+    /// this box to re-run the installer would relink nothing, so it must not.
+    #[test]
+    fn drift_against_an_engine_only_payload_says_so_instead_of_offering_the_installer() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.4", &["comet"]);
+        let c = cli_version_check("0.2.9", Some("0.3.4"), None, &app_root);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("ships the engine alone"), "{}", c.detail);
+        assert!(!c.detail.contains("install.sh"), "{}", c.detail);
+    }
+
+    /// Matching versions are a passing line, not a silent one — it is the only
+    /// place the report says which binary is talking.
+    #[test]
+    fn a_cli_shipped_with_its_engine_passes() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.4", &["comet", "comet-board"]);
+        let exe = app_root.join("0.3.4/comet-board");
+        let c = cli_version_check("0.3.4", Some("0.3.4"), Some(&exe), &app_root);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("v0.3.4"), "{}", c.detail);
+        // Says which binary answered, and accuses it of nothing.
+        assert!(c.detail.contains("comet-board"), "{}", c.detail);
+        assert!(!c.detail.contains("not what that release"), "{}", c.detail);
+    }
+
+    /// Engine unreachable, or too old to report a version: the installed
+    /// payload's own directory name answers instead. This is what makes the
+    /// check work on a box whose engine is down — which is exactly when someone
+    /// is running doctor.
+    #[test]
+    fn an_unreachable_engine_falls_back_to_the_installed_payload() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = app_root_at(d.path(), "0.3.4", &["comet", "comet-board"]);
+        let c = cli_version_check("0.2.9", None, None, &app_root);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("the release installed here is v0.3.4"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// A laptop with no managed install and no engine up has nothing to be
+    /// wrong about, and must not be failed for it.
+    #[test]
+    fn nothing_to_compare_against_is_not_a_failure() {
+        let d = tempfile::tempdir().unwrap();
+        let c = cli_version_check("0.3.4", None, None, &d.path().join("app"));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no engine to compare"), "{}", c.detail);
+    }
+
+    /// `current` pointed at something that is not a versioned dir is not a
+    /// version. Reading one out of it would invent drift that is not there.
+    #[test]
+    fn a_current_symlink_outside_the_versioned_layout_yields_no_version() {
+        let d = tempfile::tempdir().unwrap();
+        let app_root = d.path().join("app");
+        let elsewhere = d.path().join("checkout/target/release");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&app_root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, app_root.join("current")).unwrap();
+        assert_eq!(installed_payload_version(&app_root), None);
     }
 
     fn edge_check_in(checks: &[Check]) -> &Check {
@@ -1635,6 +1867,7 @@ mod tests {
         let down = EngineStatus {
             reachable: false,
             detail: "connection refused".into(),
+            version: None,
         };
         let checks = doctor(&p, &down, None, Some(&[]), None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
