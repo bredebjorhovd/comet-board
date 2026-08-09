@@ -84,6 +84,7 @@
           0,
           0
         ],
+        "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
           "merged": 0,
@@ -168,6 +169,7 @@
           0,
           0
         ],
+        "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
           "merged": 0,
@@ -252,6 +254,7 @@
           0,
           0
         ],
+        "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
           "merged": 0,
@@ -336,6 +339,7 @@
           0,
           0
         ],
+        "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
           "merged": 0,
@@ -484,6 +488,60 @@
           0,
           0
         ],
+        "hoursByWorkspace": {
+          "comet-native": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            4,
+            0
+          ],
+          "edge": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
         "landing": {
           "closedUnmerged": 1,
           "merged": 7,
@@ -648,6 +706,60 @@
           0,
           0
         ],
+        "hoursByWorkspace": {
+          "comet-native": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            4,
+            0
+          ],
+          "edge": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
         "landing": {
           "closedUnmerged": 1,
           "merged": 7,
@@ -915,6 +1027,7 @@
           0,
           0
         ],
+        "hoursByWorkspace": {},
         "landing": {
           "closedUnmerged": 0,
           "merged": 0,

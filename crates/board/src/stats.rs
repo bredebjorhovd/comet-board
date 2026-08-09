@@ -23,7 +23,7 @@ use std::sync::Arc;
 pub use comet_proto::TokenUsage;
 pub use comet_proto::view::rates::human_usd;
 pub use comet_proto::view::stats::{
-    BoardStats as Stats, DayBucket, Friction, Landing, TokenDay, human_tokens,
+    BoardStats as Stats, DayBucket, Friction, HOURS, Landing, TokenDay, human_tokens,
 };
 
 /// Whose subscription a dispatch that named no slot spent (gh#101).
@@ -147,7 +147,12 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
     let mut durations: Vec<i64> = Vec::new();
     let mut days: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut token_days: BTreeMap<String, TokenUsage> = BTreeMap::new();
-    let mut hour_of_day = vec![0usize; 24];
+    let mut hour_of_day = vec![0usize; HOURS];
+    // When crossed with where (gh#179). Not a second sweep of the rows and not
+    // a new thing recorded — the same attempt already carries both its start
+    // and its workspace, and keeping them apart is what made the page hide the
+    // one fact worth having.
+    let mut hours_by_workspace: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut live = 0;
     let mut agent_dispatched = 0;
     let mut friction = Friction::default();
@@ -222,7 +227,11 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         }
         if let Some(start) = started_local(a) {
             use chrono::Timelike as _;
-            hour_of_day[start.hour() as usize] += 1;
+            let hour = start.hour() as usize;
+            hour_of_day[hour] += 1;
+            hours_by_workspace
+                .entry(a.workspace.clone())
+                .or_insert_with(|| vec![0usize; HOURS])[hour] += 1;
             let key = start.date_naive().format("%Y-%m-%d").to_string();
             let entry = days.entry(key.clone()).or_default();
             entry.0 += 1;
@@ -309,6 +318,7 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         daily: day_series(&calendar, &days),
         daily_tokens: token_day_series(&calendar, &token_days),
         hour_of_day,
+        hours_by_workspace,
         by_workspace,
         by_runtime,
         by_source,
@@ -721,7 +731,12 @@ mod tests {
         // present and empty.
         let done_day = bucket_of(10);
         let cancelled_day = bucket_of(20);
-        let bar = |date: &str| s.daily.iter().find(|d| d.date == date).unwrap_or_else(|| panic!("{date} is in the window"));
+        let bar = |date: &str| {
+            s.daily
+                .iter()
+                .find(|d| d.date == date)
+                .unwrap_or_else(|| panic!("{date} is in the window"))
+        };
         assert_eq!(bar(&done_day).done, 1, "only the one that ended done");
         assert!(bar(&done_day).dispatches >= 1);
         assert!(bar(&cancelled_day).dispatches >= 1);
@@ -742,6 +757,40 @@ mod tests {
         let s = gather(&tasks, None);
         assert_eq!(s.hour_of_day.len(), 24);
         assert_eq!(s.hour_of_day.iter().sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn when_the_work_ran_is_crossed_with_where_it_went() {
+        // Two spaces, two dispatches an hour apart (gh#179). The hour margin
+        // and the workspace margin each hold half the story; the crossing is
+        // what says WHICH space was the late one.
+        let mut early = attempt(120, 5, Some(Outcome::Done), None);
+        early.workspace = "comet".into();
+        let mut late = attempt(30, 5, Some(Outcome::Done), None);
+        late.workspace = "edge".into();
+        let early_hour = started_local(&early).map(|t| {
+            use chrono::Timelike as _;
+            t.hour() as usize
+        });
+        let late_hour = started_local(&late).map(|t| {
+            use chrono::Timelike as _;
+            t.hour() as usize
+        });
+        let (Some(early_hour), Some(late_hour)) = (early_hour, late_hour) else {
+            panic!("both attempts parse");
+        };
+
+        let s = gather(&[task("t1", vec![early, late])], None);
+        let comet = s.hours_by_workspace.get("comet").expect("a row per space");
+        let edge = s.hours_by_workspace.get("edge").expect("a row per space");
+        assert_eq!(comet.len(), 24, "a slot for every hour, like the margin");
+        assert_eq!(comet[early_hour], 1);
+        assert_eq!(edge[late_hour], 1);
+        // The crossing sums back to both margins it replaced — a grid that
+        // disagreed with the histogram beside it would be two answers.
+        assert_eq!(comet.iter().sum::<usize>(), s.by_workspace["comet"]);
+        let crossed: usize = s.hours_by_workspace.values().flatten().sum();
+        assert_eq!(crossed, s.hour_of_day.iter().sum::<usize>());
     }
 
     #[test]
@@ -888,10 +937,17 @@ mod tests {
         let token_dates: Vec<&str> = s.daily_tokens.iter().map(|d| d.date.as_str()).collect();
         assert_eq!(dates, token_dates);
         let day = bucket_of(10);
-        let spent = s.daily_tokens.iter().find(|d| d.date == day).expect("the day is in the window");
+        let spent = s
+            .daily_tokens
+            .iter()
+            .find(|d| d.date == day)
+            .expect("the day is in the window");
         assert_eq!(spent.usage.total(), 1_100);
         assert!(
-            s.daily_tokens.iter().filter(|d| d.date != day).all(|d| d.usage.is_zero()),
+            s.daily_tokens
+                .iter()
+                .filter(|d| d.date != day)
+                .all(|d| d.usage.is_zero()),
             "quiet days are present with zeroes, like the bars above them"
         );
     }
@@ -903,7 +959,10 @@ mod tests {
         let mut recent = attempt(30, 5, Some(Outcome::Done), None);
         recent.tokens = Some(usage(100, 10, 0, 0));
         let t = task("t1", vec![old, recent]);
-        assert_eq!(gather(std::slice::from_ref(&t), None).tokens.total(), 10_010);
+        assert_eq!(
+            gather(std::slice::from_ref(&t), None).tokens.total(),
+            10_010
+        );
         assert_eq!(gather(&[t], Some(7)).tokens.total(), 110);
     }
 
