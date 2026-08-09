@@ -743,9 +743,10 @@ mod tests {
         let dark_bg = terminal_bg(&Theme::dark());
         assert_eq!(dark_bg.s, 0.0);
         assert!((dark_bg.l - 9.0 / 255.0).abs() < 1e-4);
-        // Light inverts to a bright well (the theme surface).
+        // Light is a bright well (the theme surface) — neutral, save for the
+        // trace of blue every light neutral carries (gh#177).
         let light_bg = terminal_bg(&Theme::light());
-        assert_eq!(light_bg.s, 0.0);
+        assert!(!crate::theme::spends_colour(light_bg));
         assert!(light_bg.l > 0.9, "light terminal bg {}, expected bright", light_bg.l);
         assert!(light_bg.l > dark_bg.l);
     }

@@ -1618,10 +1618,15 @@ impl Transcript {
                             div()
                                 .min_w_0()
                                 .max_w(px(MAX_CONTENT_WIDTH * 0.8))
-                                .bg(theme.surface_raised)
+                                // "Mine" is a distinction, not an elevation —
+                                // painting the raised surface here inverted to
+                                // a mid-grey slab on a white page (gh#177).
+                                .bg(theme.bubble)
+                                .border_1()
+                                .border_color(theme.bubble_border)
                                 .rounded(px(Theme::RADIUS_CARD))
-                                .px(px(16.0))
-                                .py(px(10.0))
+                                .px(px(15.0))
+                                .py(px(9.0))
                                 // A user bubble is prose, not chrome — the size
                                 // it is read back at is the size it was typed.
                                 .text_size(px(Theme::TEXT_PROSE))

@@ -6,12 +6,47 @@
 //! numbers and never depend on which color is painted.
 //!
 //! Two variants, [`Theme::dark`] (the default — comet is always-dark by design)
-//! and [`Theme::light`] (the same ramp inverted: text goes dark, surfaces light,
-//! accents re-tuned for contrast on white). The chosen variant is installed as a
-//! gpui [`Global`] at boot (`cx.set_global(Theme::dark())`) and can be flipped
-//! live from the Appearance settings page; read with [`Theme::of`]. Hairlines and
-//! interactive washes are white at low alpha in dark and black at low alpha in
-//! light — see [`Theme::white_alpha`] / [`Theme::wash`].
+//! and [`Theme::light`], which declares its OWN values rather than inverting
+//! dark's (see below). The chosen variant is installed as a gpui [`Global`] at
+//! boot (`cx.set_global(Theme::dark())`) and can be flipped live from the
+//! Appearance settings page; read with [`Theme::of`]. Hairlines and interactive
+//! washes are white at low alpha in dark and cool ink at low alpha in light —
+//! see [`Theme::white_alpha`] / [`Theme::wash`].
+//!
+//! # Light is a design, not an inversion (gh#177)
+//!
+//! Light mode used to be dark's ramp read backwards, and four things do not
+//! survive that trip:
+//!
+//! 1. **Elevation.** Dark walks `#060606 → #0d0d0d → #1e1e1e`, brighter as it
+//!    rises. Inverted, light walked `#fafafa → #f3f3f3 → #e4e4e4` — a popover
+//!    DARKER than the page behind it, which reads as a hole. Light elevates
+//!    toward white and lets shadow do the lifting: the shell is the ground
+//!    ([`Theme::surface`]), the main panel is paper ([`Theme::bg`]), and a
+//!    float is white ([`Theme::surface_raised`] / [`Theme::float_card`]) under
+//!    [`Theme::float_shadow`].
+//! 2. **Your own message.** The user bubble painted `surface_raised`, which
+//!    inverted to a mid-grey slab in the middle of a white page. It has its own
+//!    token now — [`Theme::bubble`], the shallowest step the paper can take
+//!    plus a hairline — because "mine" is a distinction, not an elevation.
+//! 3. **Washes are not perceptually symmetric.** White at 14% over near-black
+//!    is a lift; ink at 14% over near-white is a scrim. Light washes run at
+//!    [`Theme::LIGHT_WASH_SCALE`] of the alpha a call site names, and they are
+//!    made of cool [`ink`] rather than black so they tint instead of dirtying.
+//!    (The selection washes are the exception and keep their full alpha: they
+//!    were tuned against the light bed in the first place — see [`Theme::row`],
+//!    which answers hover-versus-selected for every list.)
+//! 4. **Contrast.** The four text tones are measured against every light
+//!    surface, not just the page — see `text_tones_clear_their_contrast_floors`.
+//!
+//! And one macOS-only: light frost used to be plain white at 80% over the
+//! blurred desktop, so the wallpaper tinted the sidebar. [`Theme::glass`] is a
+//! tinted scrim now, at dark's neutralising alpha.
+//!
+//! Every light neutral carries a trace of blue ([`Theme::LIGHT_NEUTRAL_HUE`]) —
+//! a pure grey beside white makes the white read yellow. The one exception is
+//! `surface_raised`, which IS white: it is the thing the trace exists to keep
+//! looking white.
 //!
 //! # Four text tones, and no multipliers (gh#172)
 //!
@@ -308,7 +343,7 @@ impl ThemeChoice {
             ),
             ThemeChoice::Light => (
                 "Light",
-                "The same ramp inverted for bright environments — light surfaces, dark text.",
+                "Its own palette for bright rooms — paper-white panels, cool neutrals, shadow for lift.",
             ),
         }
     }
@@ -331,18 +366,43 @@ pub struct Theme {
     /// everywhere paint is generated from a primitive ([`Self::wash`],
     /// [`Self::white_alpha`], [`Self::glass`]).
     pub light: bool,
-    // ---- paint: neutral surfaces (oklch chroma 0) ----
-    /// App background — oklch(0.145 0 0) ≡ `#0a0a0a` (dark).
+    // ---- paint: neutral surfaces ----
+    // Dark's are achromatic; light's carry [`Self::LIGHT_NEUTRAL_HUE`]'s trace
+    // of blue (see the module docs).
+    /// The main panel. Dark's darkest tone (`#060606`, the inset well); light's
+    /// paper, one step ABOVE the shell it floats on.
     pub bg: Hsla,
-    /// Panel / sidebar surface — one scale step up.
+    /// Panel / sidebar surface — the shell the main panel is inset into. Dark
+    /// walks UP from `bg` to reach it, light walks DOWN: it is the ground.
     pub surface: Hsla,
-    /// Raised surface: popovers, dialogs, cards.
+    /// A card raised off the main panel: the settings sections, the login and
+    /// workspace cards. Distinct from [`Self::surface`] because that token is
+    /// doing two jobs that only coincide in dark — the shell is one step ABOVE
+    /// `bg` there, so "the shell tone" and "a card tone" are the same number.
+    /// In light the shell is BELOW the paper and a card is above it, and using
+    /// one for the other is how a settings card ends up darker than the page
+    /// it sits on (gh#177).
+    pub card: Hsla,
+    /// Raised surface: popovers, dialogs, floats, the composer well. The top of
+    /// the elevation ramp in BOTH variants — white in light, where the lift
+    /// comes from [`Self::float_shadow`] rather than from more tone.
     pub surface_raised: Hsla,
+    /// Hover tone for an OPAQUE raised surface — the one case a translucent
+    /// wash cannot serve, because the surface it would sit on is already the
+    /// top of the ramp. Brighter than `surface_raised` in dark, dimmer in light.
+    pub surface_raised_hover: Hsla,
+    /// Your own message. Not an elevation — a distinction, so it is a tint
+    /// rather than a step on the surface ramp (gh#177: inverted, the old
+    /// `surface_raised` bubble was a mid-grey slab on a white page).
+    pub bubble: Hsla,
+    /// The hairline around [`Self::bubble`]. Transparent in dark, where the
+    /// tone carries the shape on its own.
+    pub bubble_border: Hsla,
     /// The hover wash, and the ONLY hover wash: a flat, weak, neutral tone for
     /// rows and buttons alike. Selection is not a heavier version of this —
     /// it is a different channel entirely ([`Theme::row`], gh#175).
     pub element_hover: Hsla,
-    /// Hairline border — white at low alpha.
+    /// Hairline border — white at low alpha in dark, cool ink in light.
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
@@ -496,6 +556,21 @@ impl Theme {
     const SELECT_EDGE: f32 = 0.18;
     const SELECT_EDGE_LIGHT: f32 = 0.22;
 
+    // ---- light is its own design (gh#177) ----
+    /// The hue every light neutral carries a trace of. A pure grey beside white
+    /// makes the white read yellow, so the light surfaces, hairlines, washes
+    /// and text tones are all mixed at this hue with a chroma small enough that
+    /// nobody would call them blue — and `surface_raised` stays pure white,
+    /// which is the point.
+    pub const LIGHT_NEUTRAL_HUE: f32 = 255.0;
+    /// The fraction of a call site's named alpha a light wash actually paints.
+    /// The alphas across the crate were chosen for soft-white over near-black,
+    /// and ink over near-white is not their mirror: white at 14% over `#060606`
+    /// is a gentle lift, black at 14% over `#f9fafc` is a grey scrim on the
+    /// row. One scale here beats retuning sixty call sites — and the tone is
+    /// [`ink`], not black, so what lands is a tint rather than a smudge.
+    pub const LIGHT_WASH_SCALE: f32 = 0.65;
+
     /// Base spacing steps.
     pub const SPACE_XS: f32 = 4.0;
     pub const SPACE_SM: f32 = 8.0;
@@ -505,18 +580,49 @@ impl Theme {
     /// The frost tint painted over the blurred window background (macOS
     /// glass). Darker than `surface` — matched to the reference dark
     /// vibrancy scrim: `hsl(0 0% 3%)` (#080808) at [`Self::GLASS_ALPHA`].
-    /// On light the scrim inverts: white at a lighter alpha, so the blur
-    /// reads as a bright frosted panel rather than a dark plate. On opaque
-    /// platforms this IS the surface tone (no tint swap).
+    ///
+    /// Light gets a TINTED scrim at the same neutralising strength, not a
+    /// transparent one (gh#177): plain white at 80% let whatever wallpaper sat
+    /// behind the window tint the sidebar, because white has no colour of its
+    /// own to win with — dark's near-black neutralises by being far from
+    /// everything, and the light scrim has to earn that with its own tone.
+    /// On opaque platforms this IS the surface tone (no tint swap).
     pub fn glass(&self) -> Hsla {
         if Self::GLASS_ALPHA < 1.0 {
             if self.light {
-                white_alpha(0.80)
+                cool(0.960, 0.006).opacity(0.93)
             } else {
                 grey(8).opacity(Self::GLASS_ALPHA)
             }
         } else {
             self.surface
+        }
+    }
+
+    /// The lift under a floating card — popovers, dialogs, palettes, the
+    /// suggestion list. Dark keeps Tailwind's `shadow-lg` (a black shadow on a
+    /// near-black ground barely registers; the card's own tone does the work).
+    /// Light is where a shadow is the whole mechanism, so it gets a real one:
+    /// a tight contact shadow under a wide soft cast, both in cool [`ink`]
+    /// rather than black so they read as shade and not as grime (gh#177).
+    pub fn float_shadow(&self) -> Vec<gpui::BoxShadow> {
+        let shadow = |y: f32, blur: f32, spread: f32, color: Hsla| gpui::BoxShadow {
+            color,
+            offset: gpui::point(gpui::px(0.0), gpui::px(y)),
+            blur_radius: gpui::px(blur),
+            spread_radius: gpui::px(spread),
+            inset: false,
+        };
+        if self.light {
+            vec![
+                shadow(1.0, 2.0, 0.0, ink(0.08)),
+                shadow(10.0, 24.0, -6.0, ink(0.16)),
+            ]
+        } else {
+            vec![
+                shadow(10.0, 15.0, -3.0, hsla(0.0, 0.0, 0.0, 0.1)),
+                shadow(4.0, 6.0, -4.0, hsla(0.0, 0.0, 0.0, 0.1)),
+            ]
         }
     }
 
@@ -528,7 +634,11 @@ impl Theme {
             light: false,
             bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
+            card: grey(13),    // a card and the shell coincide in dark
             surface_raised: neutral(0.235),
+            surface_raised_hover: neutral(0.29),
+            bubble: neutral(0.235),
+            bubble_border: gpui::transparent_black(),
             // Half the 0.14 it replaces: hover no longer has to carry
             // "selected" too, so it can go back to being a hint (gh#175).
             element_hover: wash(0.07),
@@ -551,26 +661,53 @@ impl Theme {
         }
     }
 
-    /// Build the light theme — the same ramp inverted: surfaces walk DOWN from
-    /// a near-white app background, text walks up to near-black, and the
-    /// accents move from the 400-shades to the 600-shades so they keep contrast
-    /// on white. The default remains dark; this is the opt-in variant.
+    /// Build the light theme — its OWN declared values, not dark's ramp read
+    /// backwards (gh#177; the module docs say which four things do not survive
+    /// the inversion). The shape of it:
+    ///
+    /// - **Elevation runs toward white.** The shell is the ground
+    ///   (`#edf0f4`), the main panel is paper on it (`#f9fafc`), and a float
+    ///   is white — with [`Self::float_shadow`], not more tone, doing the
+    ///   lifting.
+    /// - **Neutrals lean blue.** Every tone here is [`cool`] at
+    ///   [`Self::LIGHT_NEUTRAL_HUE`]; only `surface_raised` is pure white, so
+    ///   the white it puts on screen stays white instead of reading yellow.
+    /// - **Ink, not black.** Washes and hairlines are [`ink`] — a cool
+    ///   near-black — at [`Self::LIGHT_WASH_SCALE`] of the named alpha.
+    /// - **Accents drop an anchor** so the four hues keep contrast on paper.
+    ///
+    /// The default remains dark; this is the opt-in variant.
     pub fn light() -> Self {
         Self {
             light: true,
-            bg: neutral(0.985),      // main panel — near-white
-            surface: neutral(0.965), // shell / sidebar — one step down
-            surface_raised: neutral(0.92),
-            element_hover: black_wash(0.06),
-            border: black_wash(0.10),
-            border_strong: black_wash(0.16),
-            // The same four contrast steps, walked the other way: 16.9 / 8.4 /
-            // 5.1 / 3.5 against the near-white `bg`.
-            text: neutral(0.212),        // #191919
-            text_muted: neutral(0.412),  // #4b4b4b
-            text_subtle: neutral(0.528), // #6b6b6b
-            text_faint: neutral(0.619),  // #868686
-            // The same ramp, one anchor lower so the hues hold on white.
+            bg: cool(0.986, 0.003), // #f9fafc — the paper, ABOVE the shell
+            surface: cool(0.955, 0.006), // #edf0f4 — shell / sidebar, the ground
+            // A card is above the paper, where the shell is below it — the one
+            // place the two jobs `surface` was doing come apart.
+            card: cool(1.0, 0.0),           // #ffffff, carried by its hairline
+            surface_raised: cool(1.0, 0.0), // #ffffff — the top of the ramp
+            surface_raised_hover: cool(0.965, 0.004), // white has to hover DOWN
+            // "Mine" is a WELL in the paper, drawn by its edge — the shallowest
+            // step that still reads, because the tone that carries it is the
+            // hairline. Monochrome, like every other non-state surface: the
+            // hues mean state (gh#173) and "who said this" is not one.
+            bubble: cool(0.965, 0.005), // #f1f3f7
+            bubble_border: ink(0.14),
+            // gh#175's weight, in this theme's ink rather than in black.
+            element_hover: ink(0.06),
+            // Hairlines keep a full alpha where washes are scaled: a wash that
+            // floods can afford to be quieter, a line that has to be SEEN
+            // cannot.
+            border: ink(0.13),
+            border_strong: ink(0.20),
+            // The same four contrast steps, measured against the light
+            // surfaces: 16.9 / 8.4 / 5.1 / 3.5 on `bg`, and every one of them
+            // still clears its floor on the ground and in the bubble.
+            text: cool(0.213, 0.008),        // #17191d
+            text_muted: cool(0.412, 0.008),  // #484b4f
+            text_subtle: cool(0.529, 0.008), // #686c70
+            text_faint: cool(0.620, 0.008),  // #83868b
+            // The status ramp, one anchor lower so the hues hold on paper.
             accent: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_REVIEW),
             accent_strong: oklch(0.47, 0.19, Self::HUE_REVIEW),
             danger: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_BLOCKED),
@@ -617,22 +754,26 @@ impl Theme {
     }
 
     /// Interactive-state wash for THIS theme's surface tone: soft-white over
-    /// dark, soft-black over light. Hover fades must rest on `wash(0.0)`,
-    /// never transparent black, so the interpolation stays theme-toned.
+    /// dark, cool [`ink`] over light — at [`Self::LIGHT_WASH_SCALE`] of the
+    /// named alpha, because the two directions are not each other's mirror
+    /// (gh#177). Hover fades must rest on `wash(0.0)`, never transparent black,
+    /// so the interpolation stays theme-toned — and the scale keeps 0 at 0.
     pub fn wash(&self, alpha: f32) -> Hsla {
         if self.light {
-            black_wash(alpha)
+            ink(alpha * Self::LIGHT_WASH_SCALE)
         } else {
             wash(alpha)
         }
     }
 
-    /// The hairline/wash primitive for this theme: white at low alpha over dark
-    /// surfaces, black at low alpha over light ones (a white hairline on white
-    /// would vanish).
+    /// The hairline primitive for this theme: white at low alpha over dark
+    /// surfaces, cool [`ink`] at low alpha over light ones (a white hairline on
+    /// white would vanish). Unlike [`Self::wash`] this does NOT scale: a wash
+    /// that floods a whole row can afford to be quieter on light, a line whose
+    /// entire job is to be seen cannot.
     pub fn white_alpha(&self, alpha: f32) -> Hsla {
         if self.light {
-            black_wash(alpha)
+            ink(alpha)
         } else {
             white_alpha(alpha)
         }
@@ -655,6 +796,12 @@ impl Theme {
     /// lifts toward light. A light shell lifts to white. A light settings card
     /// has nowhere left to lift — it IS the raised white object on the page —
     /// so the row steps down into it and the hairline draws the well.
+    ///
+    /// The light washes here are [`ink`] rather than black (gh#177): a sink
+    /// and an edge made of black over a near-white bed read as grime, and this
+    /// theme's neutrals lean cool. The alphas are gh#175's, unchanged — a
+    /// selection is one of the few washes that was tuned against the light bed
+    /// in the first place, so [`Self::LIGHT_WASH_SCALE`] does not apply.
     pub fn row(&self, bed: Bed, selected: bool) -> RowPaint {
         if !selected {
             return RowPaint {
@@ -670,14 +817,14 @@ impl Theme {
         }
         let (rest, hovered, edge) = match (bed, self.light) {
             (Bed::Card, true) => (
-                black_wash(Self::SELECT_SINK),
-                black_wash(Self::SELECT_SINK + Self::SELECT_HOVER_STEP),
-                black_wash(Self::SELECT_EDGE_LIGHT),
+                ink(Self::SELECT_SINK),
+                ink(Self::SELECT_SINK + Self::SELECT_HOVER_STEP),
+                ink(Self::SELECT_EDGE_LIGHT),
             ),
             (Bed::Shell, true) => (
                 white_alpha(Self::SELECT_WHITE),
                 white_alpha(Self::SELECT_WHITE + Self::SELECT_HOVER_STEP),
-                black_wash(Self::SELECT_EDGE_LIGHT),
+                ink(Self::SELECT_EDGE_LIGHT),
             ),
             (_, false) => (
                 wash(Self::SELECT_LIFT),
@@ -732,11 +879,17 @@ impl Theme {
     /// The floating card tone (popovers, dialogs, palettes): over the frosted
     /// backdrop blur on macOS the card is a translucent tint the vibrancy reads
     /// through; elsewhere it is the opaque tone it composites to. Dark uses the
-    /// near-black `#161616` plate; light inverts to a bright translucent white.
+    /// near-black `#161616` plate.
+    ///
+    /// Light is WHITE, and near-opaque (gh#177). A float has to sit above the
+    /// page it covers, and the old translucent white did the opposite twice
+    /// over: it sat below (the inverted ramp made it darker than the page) and
+    /// it took its colour from whatever wallpaper the blur happened to catch.
+    /// The lift comes from [`Self::float_shadow`] instead.
     pub fn float_card(&self) -> Hsla {
         if Self::GLASS_ALPHA < 1.0 {
             if self.light {
-                white_alpha(0.72)
+                cool(0.995, 0.002).opacity(0.95)
             } else {
                 grey(0x16).opacity(0.65)
             }
@@ -811,10 +964,26 @@ pub fn wash(alpha: f32) -> Hsla {
     hsla(0.0, 0.0, 0.92, alpha)
 }
 
-/// The light-theme inverse of [`wash`]: soft-black, so hover/selected washes
-/// darken a near-white surface instead of vanishing.
-fn black_wash(alpha: f32) -> Hsla {
-    hsla(0.0, 0.0, 0.0, alpha)
+/// A light-mode neutral: an oklch tone carrying [`Theme::LIGHT_NEUTRAL_HUE`]'s
+/// trace of blue. `cool(l, 0.0)` is exactly [`neutral`] — which is how
+/// `surface_raised` gets to be pure white while everything around it leans
+/// cool, so the white reads as white.
+pub fn cool(lightness: f32, chroma: f32) -> Hsla {
+    oklch(lightness, chroma, Theme::LIGHT_NEUTRAL_HUE)
+}
+
+/// The light theme's ink — what a hairline, a wash or a shadow is MADE of.
+/// Not black: a cool near-black, so a 9% wash over a cool surface stays on the
+/// same side of neutral instead of going flat grey. Black over near-white is
+/// the tone the whole of gh#177 is arguing with. The light-theme counterpart of
+/// [`wash`]/[`white_alpha`] — callers that serve both themes go through
+/// [`Theme::wash`] / [`Theme::white_alpha`], which apply
+/// [`Theme::LIGHT_WASH_SCALE`] where it belongs.
+pub fn ink(alpha: f32) -> Hsla {
+    // The chroma is the same trace the surfaces carry, not more: ink is what a
+    // NEUTRAL is made of here, and an idle dot or a normal meter paints it
+    // straight — see [`spends_colour`], which those call sites assert against.
+    cool(0.30, 0.012).opacity(alpha)
 }
 
 /// White at the given alpha — the dark-theme hairline/wash primitive (light
@@ -916,6 +1085,23 @@ pub fn composite(over: Hsla, under: Hsla) -> Hsla {
     let lerp = |x: f32, y: f32| y + (x - y) * t;
     let (h, s, l) = rgb_to_hsl(lerp(a.r, b.r), lerp(a.g, b.g), lerp(a.b, b.b));
     hsla(h, s, l, 1.0)
+}
+
+/// Does this tone spend COLOUR, or is it one of the theme's neutrals?
+///
+/// This is the question a dozen tests ask — of a quiet board state, of an idle
+/// dot, of a normal meter, of a selected row (gh#173, gh#175). HSL saturation
+/// stopped answering it when the light neutrals took on their trace of blue
+/// (gh#177): `#f9fafc` is three points of channel spread and a saturation of
+/// 0.33, because saturation is a ratio whose denominator collapses near white.
+/// The spread is the honest measure, and the gap it straddles is not close —
+/// no neutral in either theme spreads past 4% of the range, and the palest
+/// thing that MEANS something is a status hue at ten times that.
+pub fn spends_colour(color: Hsla) -> bool {
+    let rgb = Rgba::from(color);
+    let hi = rgb.r.max(rgb.g).max(rgb.b);
+    let lo = rgb.r.min(rgb.g).min(rgb.b);
+    hi - lo > 0.05
 }
 
 /// WCAG relative luminance of an OPAQUE color (alpha is ignored — a translucent
@@ -1067,14 +1253,21 @@ mod tests {
     }
 
     /// The four tones, measured rather than eyeballed. Every tone clears its
-    /// tier's floor against BOTH surface tones — `bg` (#060606, the main panel)
-    /// and `surface` (#0d0d0d, the shell) — so no screen can put readable copy
-    /// below AA. The predecessor of this test was a hand-measured table in an
-    /// issue, which is how eleven call-site multipliers landed two of the app's
-    /// most common tones under 3:1.
+    /// tier's floor against BOTH reading panels — `bg` (the main panel) and
+    /// `surface` (the shell) — so no screen can put readable copy below AA. The
+    /// predecessor of this test was a hand-measured table in an issue, which is
+    /// how eleven call-site multipliers landed two of the app's most common
+    /// tones under 3:1.
+    ///
+    /// The raised surfaces are checked separately and against WCAG's own
+    /// numbers, because only the top two tones are ever painted on them — see
+    /// the second half. Measuring BOTH variants against BOTH is the gh#177
+    /// half: the multipliers are gone, but the same token on a different
+    /// surface is still a different number, and light's surfaces are no longer
+    /// dark's read backwards.
     #[test]
     fn text_tones_clear_their_contrast_floors() {
-        // (name, target on `bg`, floor that BOTH surfaces must clear)
+        // (name, target on `bg`, floor that BOTH reading panels must clear)
         const TIERS: [(&str, f32, f32); 4] = [
             ("text", 16.9, 15.0), // headings, titles, selected rows
             ("muted", 8.4, 7.5),  // body, unselected rows
@@ -1096,6 +1289,24 @@ mod tests {
                     "{name} is {on_surface:.2}:1 on surface, floor {floor} (light={})",
                     t.light
                 );
+            }
+            // The raised surfaces — a float, a ghost chip, your own message —
+            // carry only the top two tones (a placeholder or a disabled control
+            // never lands on one). Those two clear WCAG's own bars there:
+            // AAA body for `text`, AA body for `text_muted`.
+            for (surface, paint) in [
+                ("card", t.card),
+                ("surface_raised", t.surface_raised),
+                ("bubble", t.bubble),
+            ] {
+                for (name, tone, floor) in [("text", t.text, 7.0), ("muted", t.text_muted, 4.5)] {
+                    let ratio = contrast_ratio(tone, paint);
+                    assert!(
+                        ratio >= floor,
+                        "{name} is {ratio:.2}:1 on {surface}, floor {floor} (light={})",
+                        t.light
+                    );
+                }
             }
             // The tones must read as LEVELS, not noise: each is at least 1.4x
             // the contrast of the one below it. Two greys landing two percent
@@ -1205,23 +1416,29 @@ mod tests {
                 );
 
                 // No colour is spent on "this one" — the status hues mean
-                // state, and selection is not a state.
+                // state, and selection is not a state. (Measured as channel
+                // spread rather than saturation: light's neutrals carry a
+                // trace of blue and its washes are cool ink, so `s` reads a
+                // third of full chroma on tones nobody would call blue —
+                // gh#177, [`spends_colour`].)
                 for c in [idle.rest, idle.hovered, picked.rest, picked.hovered] {
-                    assert_eq!(c.s, 0.0, "selection must spend no colour");
+                    assert!(!spends_colour(c), "selection must spend no colour");
                 }
-                assert_eq!(picked.ring[0].color.s, 0.0);
+                assert!(!spends_colour(picked.ring[0].color));
             }
         }
     }
 
     #[test]
     fn a_selected_row_inside_a_white_card_is_unmistakable() {
-        // The subtle case (gh#175): the settings cards are near-white in
-        // light mode, so the row steps DOWN and its hairline draws the well.
+        // The subtle case (gh#175): the settings cards are white in light
+        // mode, so the row steps DOWN and its hairline draws the well. The
+        // bed is [`Theme::card`] — gh#177 split that off `surface`, which in
+        // light is the shell BELOW the page rather than a card above it.
         let t = Theme::light();
         let picked = t.row(Bed::Card, true);
         let hovered = t.row(Bed::Card, false).hovered;
-        let card = t.surface;
+        let card = t.card;
         let (sel, hov) = (composite(picked.rest, card), composite(hovered, card));
         assert!(relative_luminance(sel) < relative_luminance(card));
         // Told apart from the merely-hovered row by the fill alone...
@@ -1349,57 +1566,180 @@ mod tests {
 
     // ---- light variant ----
 
+    /// gh#177's first failure: elevation does not survive inversion. Dark
+    /// elevates toward white and so does light — the ramp is not mirrored, it
+    /// is re-declared, and a popover is never darker than the page it covers.
     #[test]
-    fn light_neutral_scale_is_inverted_ordered() {
+    fn light_elevation_runs_toward_white() {
         let t = Theme::light();
-        // The light ramp walks the OTHER way: backgrounds are the lightest
-        // tones, text the darkest.
-        assert!(t.bg.l > t.surface.l);
-        assert!(t.surface.l > t.surface_raised.l);
+        // The ground is the shell, the paper is the main panel, and a float is
+        // white. Inverted, this order ran backwards and a popover read as a
+        // hole punched in the page.
+        assert!(t.surface.l < t.bg.l, "the shell is the ground");
+        assert!(t.bg.l < t.card.l, "a settings card is above the paper");
+        assert!(t.bg.l < t.surface_raised.l, "and so is a float");
+        assert!(t.surface_raised.l > 0.999, "the top of the ramp is white");
+        // `surface` and `card` are the token gh#177 split: one number in dark,
+        // where the shell IS the card tone, and two in light, where the shell
+        // is below the page and a card is above it. A settings card painting
+        // `surface` was the elevation defect wearing a different hat.
+        let d = Theme::dark();
+        assert_eq!(d.surface, d.card, "in dark the two coincide");
+        assert_ne!(t.surface, t.card, "in light they cannot");
+        // Text still walks the other way from the surfaces.
         assert!(t.surface_raised.l > t.text_faint.l);
         assert!(t.text_faint.l > t.text_subtle.l);
         assert!(t.text_subtle.l > t.text_muted.l);
         assert!(t.text_muted.l > t.text.l);
-        // Monochrome: neutrals carry no saturation, same as dark.
-        for c in [t.bg, t.surface, t.surface_raised]
+        // BOTH variants elevate toward their own bright end — that is the
+        // structure the two share, rather than one being the other reversed.
+        assert!(d.surface.l < d.surface_raised.l);
+        assert!(t.surface.l < t.surface_raised.l);
+        // Only white is achromatic. Every other light neutral leans blue, so
+        // the white beside it does not read yellow — and it leans by a TRACE:
+        // measured as channel spread (HSL saturation is meaningless this close
+        // to white), no tone is more than 3% off achromatic.
+        for c in [t.bg, t.surface].into_iter().chain(t.text_tones()) {
+            let rgb = Rgba::from(c);
+            assert!(!spends_colour(c), "a trace only, not a hue: {rgb:?}");
+            assert!(rgb.b > rgb.r, "and the trace is BLUE: {rgb:?}");
+            assert!(
+                (0.55..0.75).contains(&c.h),
+                "which puts the hue in the blues: h={}",
+                c.h
+            );
+            assert_eq!(c.a, 1.0);
+        }
+        assert_eq!(t.surface_raised.s, 0.0, "white is white");
+        // Dark stays monochrome — its greys were sampled off the original app.
+        for c in [d.bg, d.surface, d.card, d.surface_raised]
             .into_iter()
-            .chain(t.text_tones())
+            .chain(d.text_tones())
         {
             assert_eq!(c.s, 0.0);
             assert_eq!(c.a, 1.0);
         }
-        // And the two variants share their ramp structure — a surface that is
-        // raised in dark is raised in light, text that is prominent in dark is
-        // prominent in light.
-        let d = Theme::dark();
-        assert_eq!(d.bg.l < d.surface.l, t.bg.l > t.surface.l);
     }
 
+    /// gh#177's third failure: a wash is not perceptually symmetric. Light's
+    /// hairlines and washes are cool INK rather than black, and the washes run
+    /// at a fraction of the alpha the call sites name.
     #[test]
-    fn light_hairlines_are_black_and_washes_are_soft_black() {
+    fn light_hairlines_and_washes_are_cool_ink() {
         let t = Theme::light();
-        // Hairlines flip to black — a white hairline would vanish on white.
+        let is_ink = |c: Hsla| c.l > 0.1 && c.l < 0.4 && (0.55..0.75).contains(&c.h);
         for c in [t.border, t.border_strong] {
-            assert_eq!(c.l, 0.0, "hairlines are black");
+            assert!(is_ink(c), "hairlines are cool ink, got {c:?}");
             assert!(c.a > 0.0 && c.a < 0.25, "low alpha, got {}", c.a);
         }
-        // The hover wash is a translucent soft-black that darkens a near-white
-        // surface.
-        assert_eq!(t.element_hover.l, 0.0, "washes are soft-black");
+        assert!(is_ink(t.element_hover), "the hover wash is cool ink");
         assert!(
             t.element_hover.a >= 0.05 && t.element_hover.a < 0.35,
             "alpha in band, got {}",
             t.element_hover.a
         );
         assert!(t.border.a < t.border_strong.a);
-        // The theme primitives mirror the fields.
-        assert_eq!(t.wash(0.14).l, 0.0);
-        assert_eq!(t.white_alpha(0.09).l, 0.0);
+        // The primitives mirror the fields — and the wash scales while the
+        // hairline does not: a wash floods a row, a hairline has to be seen.
+        assert!(is_ink(t.wash(0.14)) && is_ink(t.white_alpha(0.09)));
+        assert_eq!(t.white_alpha(0.09).a, 0.09);
+        assert!(
+            t.wash(0.14).a < 0.14,
+            "black at the dark alphas is the scrim gh#177 is about"
+        );
+        // A fade must still rest on the theme's own zero, never on transparent
+        // black, or the interpolation goes grey mid-way.
+        assert_eq!(t.wash(0.0).a, 0.0);
+        // Dark is untouched: white at exactly the named alpha.
+        let d = Theme::dark();
+        assert_eq!(d.wash(0.14), wash(0.14));
+        assert_eq!(d.white_alpha(0.09), white_alpha(0.09));
         // A selected row on the light shell is the one wash that runs the
-        // other way: it lifts to WHITE, edged in black so the lift reads.
+        // other way: it lifts to WHITE (gh#175), edged in ink so the lift
+        // reads against the paper.
         let picked = t.row(Bed::Shell, true);
         assert_eq!(picked.rest.l, 1.0);
-        assert_eq!(picked.ring[0].color.l, 0.0);
+        assert!(is_ink(picked.ring[0].color), "and the edge is ink, not black");
+    }
+
+    /// gh#177's second failure: your own message. Inverted, the bubble painted
+    /// `surface_raised` and landed a mid-grey slab in the middle of a white
+    /// page — "mine" is a distinction, not an elevation.
+    #[test]
+    fn the_user_bubble_is_a_well_in_light_and_a_step_in_dark() {
+        let t = Theme::light();
+        // Not the raised surface, and not a slab: the shallowest step the paper
+        // can take, carried by its hairline. The inverted #e4e4e4 sat at 0.89.
+        assert_ne!(t.bubble, t.surface_raised);
+        assert!(t.bubble.l < t.bg.l, "distinct from the page");
+        assert!(t.bubble.l > 0.94, "and barely — the edge does the work");
+        assert!(t.bubble_border.a > 0.0, "so there has to BE an edge");
+        // Monochrome, like every other non-state surface: the hues mean state
+        // (gh#173), and who said something is not a state.
+        assert!(!spends_colour(t.bubble) && !spends_colour(t.bubble_border));
+        // Dark keeps the tone it always had, and needs no hairline — the step
+        // in tone carries the shape there.
+        let d = Theme::dark();
+        assert_eq!(d.bubble, neutral(0.235));
+        assert_eq!(d.bubble_border.a, 0.0);
+    }
+
+    /// The macOS failure: light frost was plain white at 80% over the blurred
+    /// desktop, so the wallpaper tinted the sidebar.
+    #[test]
+    fn the_light_frost_does_not_take_the_wallpapers_colour() {
+        let t = Theme::light();
+        let frost = t.glass();
+        if Theme::GLASS_ALPHA < 1.0 {
+            assert!(frost.s > 0.0, "the scrim has a tone of its own");
+            assert!(
+                frost.a >= Theme::GLASS_ALPHA,
+                "and neutralises at least as hard as dark's: {} vs {}",
+                frost.a,
+                Theme::GLASS_ALPHA
+            );
+            // A float is white and near-opaque — it covers the page rather
+            // than borrowing from whatever is behind the window.
+            let card = t.float_card();
+            assert!(card.l > 0.97 && card.a > 0.9, "float card {card:?}");
+        }
+    }
+
+    /// A light float lifts with shadow, because it has nowhere brighter to go.
+    #[test]
+    fn light_floats_lift_with_shadow() {
+        let (light, dark) = (Theme::light(), Theme::dark());
+        // Dark keeps Tailwind's `shadow-lg` verbatim — its cards lift by tone.
+        assert_eq!(dark.float_shadow().len(), 2);
+        for s in dark.float_shadow() {
+            assert_eq!(s.color, hsla(0.0, 0.0, 0.0, 0.1));
+        }
+        // Light's is stronger, cooler, and cast further: with `surface_raised`
+        // at white there is no brighter tone left to elevate with.
+        let cast = light.float_shadow();
+        assert_eq!(cast.len(), 2);
+        assert!(
+            cast.iter().any(|s| s.color.a > 0.1),
+            "light needs a shadow you can see"
+        );
+        for s in &cast {
+            assert!(!s.inset, "a float casts outward");
+            assert!(
+                (0.55..0.75).contains(&s.color.h),
+                "shade, not grime: h={}",
+                s.color.h
+            );
+        }
+        let widest = |shadows: Vec<gpui::BoxShadow>| {
+            shadows
+                .iter()
+                .map(|s| f32::from(s.blur_radius))
+                .fold(0.0, f32::max)
+        };
+        assert!(
+            widest(cast) > widest(dark.float_shadow()),
+            "and it casts further than dark's"
+        );
     }
 
     #[test]

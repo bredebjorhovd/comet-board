@@ -3092,7 +3092,7 @@ impl Composer {
                 .border_1()
                 .border_color(theme.white_alpha(0.08))
                 .bg(theme.surface_raised)
-                .shadow_lg()
+                .shadow(theme.float_shadow())
                 .child(list)
                 .into_any_element(),
         )

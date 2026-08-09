@@ -150,7 +150,7 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.white_alpha(0.10))
         .rounded(px(Theme::RADIUS_ROW))
-        .shadow_lg()
+        .shadow(theme.float_shadow())
         .p(px(Theme::NEST_GUTTER))
         .overflow_hidden()
         .text_size(px(Theme::TEXT_BODY))
@@ -383,7 +383,8 @@ pub fn menu_check(theme: &Theme) -> impl IntoElement {
 /// The recessed band tone for a palette/picker header or footer strip — a
 /// translucent black so the glass still reads through (the add-space palette
 /// converged on this; measured subtler tones vanish against the dim scrim).
-/// Inverts to a translucent white over light glass.
+/// Light recesses the same way — with cool ink over the white card, not a
+/// brighter tone: a band is a step DOWN from the surface in both variants.
 pub fn band(theme: &Theme) -> gpui::Hsla {
     if theme.light {
         theme.white_alpha(0.10)
@@ -522,7 +523,7 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
         .bg(theme.float_card())
         .border_1()
         .border_color(theme.white_alpha(0.10))
-        .shadow_lg()
+        .shadow(theme.float_shadow())
         .flex()
         .flex_col()
         .text_color(theme.text)
