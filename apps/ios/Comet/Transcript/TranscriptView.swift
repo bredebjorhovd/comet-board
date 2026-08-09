@@ -157,7 +157,7 @@ struct TranscriptView: View {
                         .foregroundStyle(Theme.text)
                         .frame(width: 36, height: 36)
                 }
-                .glassEffect(.regular.interactive(), in: Circle())
+                .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                 .padding(.trailing, 16)
                 .padding(.bottom, 12)
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
@@ -291,7 +291,7 @@ struct UserBubble: View {
                 .foregroundStyle(Theme.text)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
-                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
                 .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
                 .opacity(pending ? 0.65 : 1)
                 .contextMenu {
@@ -375,9 +375,9 @@ struct ToolGroupView: View {
                         .foregroundStyle(Theme.textMuted)
                         .rotationEffect(.degrees(open ? 90 : 0))
                         .frame(width: 18, height: 18)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 5))
+                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                     Text(toolGroupSummary(tools))
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textMuted)
                         .lineLimit(1)
                     Spacer(minLength: 0)
@@ -385,7 +385,7 @@ struct ToolGroupView: View {
                 .frame(height: 26)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PressWashButtonStyle(cornerRadius: 6))
+            .buttonStyle(PressWashButtonStyle(cornerRadius: Theme.radiusRow))
 
             if open {
                 VStack(alignment: .leading, spacing: 0) {
@@ -410,21 +410,21 @@ struct ToolChipRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.textMuted)
                     .frame(width: 18, height: 18)
-                    .background(whiteAlpha(0.08), in: RoundedRectangle(cornerRadius: 5))
+                    .background(whiteAlpha(0.08), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 Text(tool.call.chipLabel)
-                    .font(Theme.sans(12, weight: .medium))
+                    .font(Theme.sans(Theme.textDense, weight: .medium))
                     .foregroundStyle(tool.isError ? Theme.danger : Theme.textMuted)
                 Text(tool.call.chipDetail)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(tool.isError ? Theme.danger : Theme.text.opacity(0.85))
+                    .font(Theme.sans(Theme.textDense))
+                    .foregroundStyle(tool.isError ? Theme.danger : Theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 8)
             .frame(height: 30)
-            .background(whiteAlpha(0.03), in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+            .background(whiteAlpha(0.03), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
             .padding(.leading, 12)
         }
         .frame(height: 38)
@@ -440,22 +440,22 @@ struct ErrorChipView: View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 10))
-                .foregroundStyle(Theme.dangerSoft.opacity(0.8))
+                .foregroundStyle(Theme.dangerText)
                 .frame(width: 20, height: 20)
-                .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             Text("Error")
-                .font(Theme.sans(12, weight: .medium))
+                .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.text)
             Text(message)
-                .font(Theme.sans(12))
-                .foregroundStyle(Theme.text.opacity(0.8))
+                .font(Theme.sans(Theme.textDense))
+                .foregroundStyle(Theme.text)
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
         .frame(height: 34)
-        .background(Theme.danger.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.danger.opacity(0.16), lineWidth: 1))
+        .background(Theme.danger.opacity(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(Theme.danger.opacity(0.16), lineWidth: 1))
     }
 }
 
@@ -480,15 +480,15 @@ struct SkillChipView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(tint)
                 .frame(width: 22, height: 22)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             // The name leads with its slash: `/comet-board` is what both the
             // operator and the agent call it.
             Text("/" + name)
-                .font(Theme.sans(13, weight: .medium))
+                .font(Theme.sans(Theme.textBody, weight: .medium))
                 .foregroundStyle(isError ? Theme.danger : Theme.text)
             if let args, !args.isEmpty {
                 Text(args)
-                    .font(Theme.sans(12))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textMuted)
                     .lineLimit(1)
             }
@@ -498,14 +498,14 @@ struct SkillChipView: View {
             // status, which it is not.
             if !resolved && !isError {
                 Text("running…")
-                    .font(Theme.sans(11))
-                    .foregroundStyle(Theme.textMuted.opacity(0.8))
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textMuted)
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(tint.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(tint.opacity(0.22), lineWidth: 1))
+        .background(tint.opacity(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(tint.opacity(0.22), lineWidth: 1))
     }
 }
 
@@ -520,19 +520,19 @@ struct InputChipView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 20, height: 20)
-                .background(whiteAlpha(0.09), in: RoundedRectangle(cornerRadius: 6))
+                .background(whiteAlpha(0.09), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             Text("Question")
-                .font(Theme.sans(12, weight: .medium))
+                .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.text)
             Text(resolved ? header : "Awaiting your answer…")
-                .font(Theme.sans(12))
+                .font(Theme.sans(Theme.textDense))
                 .foregroundStyle(Theme.textMuted)
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
         .frame(height: 34)
-        .background(whiteAlpha(0.045), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+        .background(whiteAlpha(0.045), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(whiteAlpha(0.08), lineWidth: 1))
     }
 }

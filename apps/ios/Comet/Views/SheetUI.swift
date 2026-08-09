@@ -6,7 +6,7 @@
 import SwiftUI
 
 enum SheetStyle {
-    static let cardRadius: CGFloat = 20
+    static let cardRadius: CGFloat = Theme.radiusCard
     static let cardFill = whiteAlpha(0.045)
     static let rowSeparator = whiteAlpha(0.06)
     static let panel = grey(0x14)
@@ -55,11 +55,11 @@ struct SheetSelectRow: View {
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(Theme.sans(15))
+                        .font(Theme.sans(Theme.textTitle))
                         .foregroundStyle(Theme.text)
                     if let subtitle, !subtitle.isEmpty {
                         Text(subtitle)
-                            .font(Theme.sans(12.5))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.textMuted)
                             .lineLimit(2)
                     }
@@ -67,7 +67,8 @@ struct SheetSelectRow: View {
                 Spacer(minLength: 8)
                 Image(systemName: "checkmark")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.text)                    .opacity(selected ? 1 : 0)
+                    .foregroundStyle(Theme.text)
+                    .opacity(selected ? 1 : 0)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
@@ -94,12 +95,12 @@ struct SheetLinkRow: View {
                         .frame(width: 22)
                 }
                 Text(title)
-                    .font(Theme.sans(15))
+                    .font(Theme.sans(Theme.textTitle))
                     .foregroundStyle(Theme.text)
                 Spacer(minLength: 8)
                 if let detail {
                     Text(detail)
-                        .font(Theme.sans(14))
+                        .font(Theme.sans(Theme.textBody))
                         .foregroundStyle(Theme.textMuted)
                         .lineLimit(1)
                 }
@@ -125,9 +126,9 @@ struct SheetLabel: View {
 
     var body: some View {
         Text(text.uppercased())
-            .font(Theme.sans(11, weight: .medium))
+            .font(Theme.sans(Theme.textCaption, weight: .medium))
             .kerning(1)
-            .foregroundStyle(Theme.textMuted.opacity(0.6))
+            .foregroundStyle(Theme.textSubtle)
             .padding(.horizontal, 4)
     }
 }
@@ -149,12 +150,12 @@ struct SheetPrimaryButton: View {
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(Theme.sans(15, weight: .semibold))
+                .font(Theme.sans(Theme.textTitle, weight: .semibold))
                 .foregroundStyle(enabled ? Theme.bg : Theme.textFaint)
                 .frame(maxWidth: .infinity)
                 .frame(height: 50)
                 .background(enabled ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.08)),
-                            in: Capsule())
+                            in: RoundedRectangle(cornerRadius: Theme.radiusRow))
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
@@ -164,7 +165,7 @@ struct SheetPrimaryButton: View {
 /// Pressed-state wash for tappable rows and chips — the desktop's
 /// `element_hover` (white 6%) translated to touch. Fades out on release.
 struct PressWashButtonStyle: ButtonStyle {
-    var cornerRadius: CGFloat = 8
+    var cornerRadius: CGFloat = Theme.radiusRow
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -178,7 +179,8 @@ struct PressWashButtonStyle: ButtonStyle {
 struct ChipPressButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .overlay(Capsule().fill(configuration.isPressed ? whiteAlpha(0.06) : .clear))
+            .overlay(RoundedRectangle(cornerRadius: Theme.radiusChip)
+                .fill(configuration.isPressed ? whiteAlpha(0.06) : .clear))
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

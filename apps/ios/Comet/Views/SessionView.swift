@@ -41,7 +41,7 @@ struct SessionView: View {
                 VStack(spacing: 12) {
                     CometPulse()
                     Text("Opening session…")
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textFaint)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -66,7 +66,7 @@ struct SessionView: View {
                                 // title gives way, so a long name truncates
                                 // instead of pushing the chevron off-screen.
                                 Text(chat.displayTitle)
-                                    .font(Theme.sans(13, weight: .medium))
+                                    .font(Theme.sans(Theme.textBody, weight: .medium))
                                     .foregroundStyle(Theme.text)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
@@ -80,8 +80,8 @@ struct SessionView: View {
                                 // Middle-truncated: the tail (device) identifies
                                 // the session as much as the leading repo does.
                                 Text(subtitle)
-                                    .font(Theme.sans(10.5))
-                                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                                    .font(Theme.sans(Theme.textCaption))
+                                    .foregroundStyle(Theme.textSubtle)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
@@ -253,15 +253,15 @@ struct SessionView: View {
                     let startedAt = sessionStartedAt(chat: chat)
                     let elapsed = (nowMs() - startedAt) / 1000
                     Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
-                        .font(Theme.sans(12))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textMuted)
                     Text(Motion.formatElapsed(elapsed))
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(Theme.textFaint)
                         .monospacedDigit()
                 case .errored:
                     Text("Run failed")
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(Theme.danger)
                 default:
                     EmptyView()

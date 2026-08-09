@@ -46,11 +46,11 @@ struct SignInView: View {
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
                         Text("Comet")
-                            .font(Theme.sans(28, weight: .semibold))
+                            .font(Theme.sans(Theme.textFigure, weight: .semibold))
                             .kerning(-0.5)
                             .foregroundStyle(Theme.text)
                         Text("Your coding agents, from anywhere")
-                            .font(Theme.sans(15))
+                            .font(Theme.sans(Theme.textTitle))
                             .foregroundStyle(Theme.textMuted)
                     }
                 }
@@ -65,13 +65,13 @@ struct SignInView: View {
                                     .tint(Theme.bg)
                             } else {
                                 Text("Log in to Comet")
-                                    .font(Theme.sans(15, weight: .semibold))
+                                    .font(Theme.sans(Theme.textTitle, weight: .semibold))
                                     .foregroundStyle(Theme.bg)
                             }
                         }
                         .frame(maxWidth: .infinity)
                         .frame(height: 50)
-                        .background(Theme.text, in: RoundedRectangle(cornerRadius: 16))
+                        .background(Theme.text, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                     }
                     .buttonStyle(.plain)
                     .disabled(busy)
@@ -79,7 +79,7 @@ struct SignInView: View {
 
                     if let error {
                         Text(error)
-                            .font(Theme.sans(13))
+                            .font(Theme.sans(Theme.textBody))
                             .foregroundStyle(Theme.danger)
                             .multilineTextAlignment(.center)
                     }
@@ -181,7 +181,7 @@ struct OrgPickerView: View {
             Theme.bg.ignoresSafeArea()
             VStack(spacing: 20) {
                 Text("Choose an organization")
-                    .font(Theme.sans(16, weight: .semibold))
+                    .font(Theme.sans(Theme.textTitle, weight: .semibold))
                     .foregroundStyle(Theme.text)
                 VStack(spacing: 8) {
                     ForEach(orgs) { org in
@@ -190,7 +190,7 @@ struct OrgPickerView: View {
                         } label: {
                             HStack {
                                 Text(org.name)
-                                    .font(Theme.sans(14, weight: .medium))
+                                    .font(Theme.sans(Theme.textBody, weight: .medium))
                                     .foregroundStyle(Theme.text)
                                 Spacer()
                                 Image(systemName: "chevron.right")
@@ -199,16 +199,16 @@ struct OrgPickerView: View {
                             }
                             .padding(.horizontal, 16)
                             .frame(height: 48)
-                            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 14))
+                            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                         }
                         .disabled(busy)
                     }
                 }
                 if let error {
-                    Text(error).font(Theme.sans(12)).foregroundStyle(Theme.danger)
+                    Text(error).font(Theme.sans(Theme.textDense)).foregroundStyle(Theme.danger)
                 }
                 Button("Back") { model.signOut() }
-                    .font(Theme.sans(13))
+                    .font(Theme.sans(Theme.textBody))
                     .foregroundStyle(Theme.textMuted)
             }
             .padding(24)

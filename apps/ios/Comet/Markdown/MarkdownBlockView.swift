@@ -1,28 +1,39 @@
 // Markdown block rendering — metrics ported from crates/ui/src/markdown/render.rs.
 //
 // Every constant here mirrors the desktop values so the two apps read the same:
-// body 14/22, headings (19/27, 16/24, 15/22, 14/22), code 12.5/18, block gap 12.
-// Code blocks render one fixed-height row per line, so their height is analytic
+// body 14/22 (the reserved prose pair), headings one step above prose and then
+// prose, code at the dense-row size on an 18pt line, block gap 12. Code blocks
+// render one fixed-height row per line, so their height is analytic
 // (lines × 18 + padding) and syntax highlighting is a pure recolor.
 
 import SwiftUI
 
 enum MD {
-    static let textSize: CGFloat = 14
-    static let lineHeight: CGFloat = 22
+    /// The reserved prose pair (gh#174) — a transcript is reading, not chrome.
+    static let textSize: CGFloat = Theme.textProse
+    static let lineHeight: CGFloat = Theme.proseLineHeight
     static let blockGap: CGFloat = 12
-    static let codeTextSize: CGFloat = 12.5
+    /// Code inside prose reads at the dense-row size: it is a listing, not
+    /// prose.
+    static let codeTextSize: CGFloat = Theme.textDense
     static let codeLineHeight: CGFloat = 18
     static let codePaddingX: CGFloat = 12
     static let codePaddingY: CGFloat = 10
+    /// Paint-only geometry: the wash is a small rounded rect drawn around the
+    /// glyphs themselves, so its corner relates to its own few points of height
+    /// and not to any box it sits in.
+    // scale-ok: a drawn wash around glyphs, not a box
     static let inlineCodeRadius: CGFloat = 4.5
 
+    /// Tight monochrome heading scale: ONE step above prose, then prose itself
+    /// (gh#174). Headings used to walk 19 / 16 / 15 / 14 — four more sizes, in
+    /// a transcript where an h1 and an h2 sit three lines apart and the
+    /// difference read as noise. Every heading is already set bold, so h3 and
+    /// below separate from the paragraph they title by weight alone.
     static func headingMetrics(_ level: Int) -> (size: CGFloat, line: CGFloat) {
         switch level {
-        case 1: return (19, 27)
-        case 2: return (16, 24)
-        case 3: return (15, 22)
-        default: return (14, 22)
+        case 1, 2: return (Theme.textTitle, Theme.proseLineHeight)
+        default: return (Theme.textProse, Theme.proseLineHeight)
         }
     }
 }
@@ -39,7 +50,7 @@ extension [InlineRun] {
         for run in self {
             var piece = AttributedString(run.text)
             if run.style.code {
-                piece.font = Theme.mono(size - 1.5)
+                piece.font = Theme.mono(size)
                 piece.foregroundColor = Theme.inlineCodeText
                 piece.backgroundColor = Theme.inlineCodeWash
             } else {
@@ -78,7 +89,7 @@ extension [InlineRun] {
         for run in self {
             if run.style.code {
                 var piece = AttributedString(run.text)
-                piece.font = Theme.mono(size - 1.5)
+                piece.font = Theme.mono(size)
                 piece.foregroundColor = Theme.inlineCodeText
                 result = result + Text(piece).customAttribute(InlineCodeAttribute())
             } else {
@@ -111,7 +122,8 @@ extension [InlineRun] {
                 let slice = String(chars[(lower - offset)..<(upper - offset)])
                 if run.style.code {
                     var piece = AttributedString(slice)
-                    piece.font = Theme.mono(size - 1.5)
+                    piece.font = Theme.mono(size)
+                    // theme-opacity-ok: the streaming fade (see Veil.swift)
                     piece.foregroundColor = Theme.inlineCodeText.opacity(segment.alpha)
                     result = result + Text(piece).customAttribute(InlineCodeAttribute())
                 } else {
@@ -121,6 +133,7 @@ extension [InlineRun] {
                     if segment.alpha < 1 {
                         for r in attr.runs {
                             let base: Color = attr[r.range].foregroundColor ?? baseColor
+                            // theme-opacity-ok: the streaming fade
                             attr[r.range].foregroundColor = base.opacity(segment.alpha)
                         }
                     }
@@ -193,7 +206,7 @@ struct CodeBlockView: View {
         VStack(alignment: .leading, spacing: 0) {
             if let language, !language.isEmpty {
                 Text(language)
-                    .font(Theme.sans(11))
+                    .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(Theme.textMuted)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 5)
@@ -217,9 +230,9 @@ struct CodeBlockView: View {
             }
         }
         .background(whiteAlpha(0.035))
-        .clipShape(RoundedRectangle(cornerRadius: Theme.panelRadius))
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
         .overlay(
-            RoundedRectangle(cornerRadius: Theme.panelRadius)
+            RoundedRectangle(cornerRadius: Theme.radiusRow)
                 .strokeBorder(whiteAlpha(0.06), lineWidth: 1)
         )
         .contextMenu {
@@ -242,7 +255,7 @@ struct CodeBlockView: View {
     /// Recolor a line by its token spans — same string, same font, paint only.
     private func attributedLine(_ line: String, spans: [TokenSpan]) -> AttributedString {
         var attr = AttributedString(line)
-        attr.foregroundColor = Theme.text.opacity(0.9)
+        attr.foregroundColor = Theme.text
         guard !spans.isEmpty else { return attr }
         let chars = Array(line)
         for span in spans {
@@ -329,14 +342,15 @@ struct ListBlockView: View {
         if let checked = item.checked {
             Image(systemName: checked ? "checkmark.square.fill" : "square")
                 .font(.system(size: 12))
-                .foregroundStyle(checked ? Theme.accent.opacity(0.85) : Theme.textMuted)
+                .foregroundStyle(checked ? Theme.accent : Theme.textMuted)
                 .frame(height: MD.lineHeight)
         } else if let start = orderedStart {
             Text("\(start + ix).")
                 .font(Theme.sans(MD.textSize))
-                .foregroundStyle(Theme.accent.opacity(0.85))
+                .foregroundStyle(Theme.accent)
                 .frame(height: MD.lineHeight)
         } else {
+            // round-ok: a list bullet — a drawn mark, not a box
             Circle()
                 .fill(Theme.accent.opacity(0.85))
                 .frame(width: 5, height: 5)

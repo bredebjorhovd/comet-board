@@ -138,6 +138,17 @@
 //! for the transcript, and [`Theme::TEXT_FIGURE`] is the single display size
 //! for a number shown as a number. Hierarchy past that comes from weight and
 //! the four greys above — not from half-pixels.
+//!
+//! # The phone reads from here too (gh#181)
+//!
+//! `apps/ios/Comet/Theme/Theme.swift` restates the four greys, the four hues,
+//! the three radii and the four sizes, because no Rust runs on that device.
+//! `tests/ios_theme.rs` asserts the restatement still matches this file, and
+//! runs the same three scans over the Swift that `tests/text_tones.rs` and
+//! `tests/scale.rs` run over this crate. **Changing a number here changes it
+//! there** — the test will say so, and the fix is the Swift constant, never a
+//! second opinion. What is deliberately NOT ported: [`Theme::light`] (that app
+//! is always-dark) and [`Theme::row`] (a phone has no pointer).
 
 use comet_proto::ChatIndicator;
 use comet_proto::view::board::{AgentState, BoardState};
