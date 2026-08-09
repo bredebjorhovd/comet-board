@@ -120,11 +120,11 @@ impl Render for SpaceGhost {
             .flex()
             .items_center()
             .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border_strong)
-            .text_size(px(13.0))
+            .text_size(px(Theme::TEXT_BODY))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text)
             .opacity(0.85)
@@ -576,7 +576,7 @@ impl Shell {
             .pb(px(4.0))
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from("Spaces")),
@@ -588,7 +588,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(5.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     .bg(motion::hover_blend(
                         "add-space",
@@ -615,10 +615,10 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
                     .px(px(Theme::SPACE_SM))
                     .py(px(6.0))
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .text_color(motion::hover_blend(
                         "add-space-ghost",
                         theme.text_muted,
@@ -812,7 +812,7 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .pt(px(6.0))
             .pb(px(2.0))
-            .text_size(px(11.0))
+            .text_size(px(Theme::TEXT_CAPTION))
             .child(
                 div()
                     .min_w_0()
@@ -960,7 +960,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
@@ -996,6 +996,7 @@ impl Shell {
             // stable — appearing/disappearing at the right edge made the row
             // jitter (user request). Faint at rest, colored under attention.
             .child(
+                // round-ok: status dot
                 div().size(px(6.0)).rounded_full().flex_none().bg(attention
                     .map(|status| status_dot_color(status, theme))
                     .unwrap_or_else(|| theme.white_alpha(0.14))),
@@ -1018,7 +1019,7 @@ impl Shell {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .line_height(px(17.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(base),
@@ -1035,7 +1036,7 @@ impl Shell {
                         .flex_none()
                         .max_w(px(SPACE_QUALIFIER_MAX))
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .line_height(px(17.0))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(format!("· {tail}"))),
@@ -1048,7 +1049,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .line_height(px(17.0))
                         .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(theme.text_subtle)
@@ -1067,7 +1068,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(5.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     .bg(motion::hover_blend(
                         &chevron_key,
@@ -1143,7 +1144,7 @@ impl Shell {
             div()
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
-                .text_size(px(12.0))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(note))
                 .into_any_element()
@@ -1212,6 +1213,7 @@ impl Shell {
         } else {
             div()
                 .size(px(6.0))
+                // round-ok: status dot
                 .rounded_full()
                 .flex_none()
                 .bg(status_dot_color(status, theme))
@@ -1235,7 +1237,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
@@ -1267,7 +1269,7 @@ impl Shell {
                         el.child(
                             div()
                                 .flex_none()
-                                .text_size(px(10.0))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .line_height(px(14.0))
                                 .text_color(theme.accent)
                                 .child(SharedString::from(
@@ -1280,14 +1282,14 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .line_height(px(17.0))
                             .child(title),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(subline)
                             .child(time_ago),
                     ),
@@ -1323,7 +1325,7 @@ impl Shell {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.0))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .line_height(px(14.0))
                                 .text_color(subline)
                                 .child(branch),
@@ -1357,7 +1359,7 @@ impl Shell {
             .pb(px(4.0))
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(needs_view::NEEDS_YOU_TITLE)),
@@ -1368,9 +1370,9 @@ impl Shell {
                     div()
                         .px(px(5.0))
                         .py(px(1.0))
-                        .rounded(px(5.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.accent.opacity(0.16))
-                        .text_size(px(10.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.accent)
                         .child(SharedString::from(format!("{}", needs.len()))),
@@ -1388,13 +1390,13 @@ impl Shell {
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(10.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(status_dot_color(ChatIndicator::Completed, theme))
                         .child(SharedString::from("✓")),
                 )
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(needs_view::ALL_CLEAR)),
                 )
@@ -1457,7 +1459,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
@@ -1479,9 +1481,9 @@ impl Shell {
                     .gap(px(6.0))
                     .child(
                         div()
-                            .w(px(8.0))
+                            .w(px(12.0))
                             .flex_none()
-                            .text_size(px(9.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(accent)
                             .child(SharedString::from(need.kind.glyph())),
                     )
@@ -1490,7 +1492,7 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .line_height(px(17.0))
                             .child(SharedString::from(transcript::single_line(&need.who))),
                     ),
@@ -1502,7 +1504,7 @@ impl Shell {
                     .pl(px(14.0))
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .line_height(px(14.0))
                     .text_color(subline)
                     .child(SharedString::from(need.what.clone())),
@@ -1544,7 +1546,7 @@ impl Shell {
         // turn running now.
         let lead: AnyElement = if slot.indicator == ChatIndicator::Working {
             div()
-                .w(px(8.0))
+                .w(px(12.0))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -1556,9 +1558,9 @@ impl Shell {
                 .into_any_element()
         } else {
             div()
-                .w(px(8.0))
+                .w(px(12.0))
                 .flex_none()
-                .text_size(px(9.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.accent)
                 .child(SharedString::from(
                     comet_proto::view::board::ORCHESTRATOR_GLYPH,
@@ -1572,9 +1574,9 @@ impl Shell {
                 .flex_none()
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded(px(5.0))
+                .rounded(px(Theme::RADIUS_CHIP))
                 .bg(status_dot_color(ChatIndicator::Completed, theme).opacity(0.16))
-                .text_size(px(10.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(status_dot_color(ChatIndicator::Completed, theme))
                 .child(SharedString::from("new"))
@@ -1582,7 +1584,7 @@ impl Shell {
         } else {
             div()
                 .flex_none()
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(subline)
                 .child(SharedString::from(
                     slot.last_at
@@ -1609,7 +1611,7 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .rounded(px(8.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .px(px(Theme::SPACE_SM))
                 .py(px(6.0))
                 .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
@@ -1649,7 +1651,7 @@ impl Shell {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(13.0))
+                                .text_size(px(Theme::TEXT_BODY))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .line_height(px(17.0))
                                 .child(SharedString::from(needs_view::ORCHESTRATOR_NAME)),
@@ -1662,7 +1664,7 @@ impl Shell {
                         .pl(px(14.0))
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .line_height(px(14.0))
                         .text_color(preview_color)
                         .child(SharedString::from(preview)),
@@ -1743,7 +1745,7 @@ impl Shell {
             .pb(px(4.0))
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from("Active")),
@@ -1755,9 +1757,9 @@ impl Shell {
                     div()
                         .px(px(5.0))
                         .py(px(1.0))
-                        .rounded(px(5.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.danger.opacity(0.16))
-                        .text_size(px(10.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.danger)
                         .child(SharedString::from(format!("{blocked} blocked"))),
@@ -1778,7 +1780,7 @@ impl Shell {
         use comet_proto::view::board::AgentState;
         if state == AgentState::Working {
             div()
-                .w(px(8.0))
+                .w(px(12.0))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -1787,9 +1789,9 @@ impl Shell {
                 .into_any_element()
         } else {
             div()
-                .w(px(8.0))
+                .w(px(12.0))
                 .flex_none()
-                .text_size(px(9.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(accent)
                 .child(SharedString::from(state.glyph()))
                 .into_any_element()
@@ -1836,7 +1838,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
@@ -1857,7 +1859,7 @@ impl Shell {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .line_height(px(17.0))
                     .child(SharedString::from(transcript::single_line(&row.title))),
             )
@@ -1867,7 +1869,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(accent)
                         .child(SharedString::from(row.state.label())),
                 )
@@ -1876,7 +1878,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(subline)
                         .child(SharedString::from(label)),
                 )
@@ -1924,7 +1926,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(8.0))
+            .rounded(px(Theme::RADIUS_ROW))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
@@ -1955,9 +1957,9 @@ impl Shell {
                                 .max_w_full()
                                 .truncate()
                                 .px(px(5.0))
-                                .rounded(px(5.0))
+                                .rounded(px(Theme::RADIUS_CHIP))
                                 .bg(theme.wash(0.11))
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .line_height(px(17.0))
                                 .child(SharedString::from(agent.identifier.clone())),
                         ),
@@ -1966,7 +1968,7 @@ impl Shell {
                         el.child(
                             div()
                                 .flex_none()
-                                .text_size(px(11.0))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .text_color(elapsed_color)
                                 .child(SharedString::from(label)),
                         )
@@ -1993,7 +1995,7 @@ impl Shell {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.0))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .line_height(px(14.0))
                                 .text_color(subline)
                                 .child(SharedString::from(branch)),
@@ -2002,7 +2004,7 @@ impl Shell {
                     .when(agent.branch.is_none(), |el| {
                         el.child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .line_height(px(14.0))
                                 .text_color(accent)
                                 .child(SharedString::from(agent.state.label())),
@@ -2762,14 +2764,14 @@ impl Shell {
             div()
                 .h(px(22.0))
                 .px(px(6.0))
-                .rounded(px(5.0))
+                .rounded(px(Theme::RADIUS_CHIP))
                 .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(2.0))
                 .bg(theme.white_alpha(0.05))
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text_subtle)
         };
@@ -2807,15 +2809,17 @@ impl Shell {
             .h(px(22.0))
             .px(px(8.0))
             .py(px(0.0))
-            // Match the key-cap chips beside it (rounded-5) — btn_primary's
-            // rounded-8 at this size read as a different component.
-            .rounded(px(5.0))
+            // Redundant since the scale landed — `btn_primary` is already a
+            // chip — but stated, because the bug it fixes (a button reading as
+            // a different component from the caps beside it) is the whole
+            // reason the radii are three numbers now.
+            .rounded(px(Theme::RADIUS_CHIP))
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .text_size(px(12.0))
+            .text_size(px(Theme::TEXT_DENSE))
             .when(!primary_enabled, |el| el.opacity(0.6))
             .on_click(cx.listener(move |this, _, _, cx| {
                 let mode = this.add_space.as_ref().map(|f| f.mode);
@@ -2869,7 +2873,7 @@ impl Shell {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(14.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .child(search.clone().into_any_element()),
             )
             .child(submit_chip)
@@ -2936,7 +2940,7 @@ impl Shell {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.danger)
                         .child(message),
                 )
@@ -2946,7 +2950,7 @@ impl Shell {
             div()
                 .id("add-space-palette")
                 .w(px(680.0))
-                .rounded(px(14.0))
+                .rounded(px(Theme::RADIUS_CARD))
                 .border_1()
                 .border_color(theme.white_alpha(0.10))
                 // The popover_card glass recipe: a translucent tint over the
@@ -3036,7 +3040,7 @@ impl Shell {
                 div()
                     .px(px(14.0))
                     .py(px(16.0))
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(if !query_empty {
                         "No repos match"
@@ -3129,7 +3133,7 @@ impl Shell {
                     .flex_none()
                     .mx(px(14.0))
                     .mt(px(10.0))
-                    .text_size(px(11.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .line_height(px(15.0))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(note))
@@ -3160,7 +3164,7 @@ impl Shell {
                 .mt(px(8.0))
                 .px(px(10.0))
                 .py(px(8.0))
-                .rounded(px(8.0))
+                .rounded(px(Theme::RADIUS_ROW))
                 .bg(theme.warning.opacity(0.10))
                 .border_1()
                 .border_color(theme.warning.opacity(0.28))
@@ -3184,7 +3188,7 @@ impl Shell {
                         .gap(px(2.0))
                         .child(
                             div()
-                                .text_size(px(12.0))
+                                .text_size(px(Theme::TEXT_DENSE))
                                 .line_height(px(16.0))
                                 .text_color(theme.text)
                                 .child(SharedString::from(headline)),
@@ -3193,7 +3197,7 @@ impl Shell {
                             el.child(
                                 div()
                                     .truncate()
-                                    .text_size(px(11.0))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .line_height(px(15.0))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from(detail)),
@@ -3204,7 +3208,7 @@ impl Shell {
                         .when_some(absent, |el, note| {
                             el.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .line_height(px(15.0))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from(note)),
@@ -3218,8 +3222,8 @@ impl Shell {
                         .h(px(22.0))
                         .px(px(8.0))
                         .py(px(0.0))
-                        .rounded(px(5.0))
-                        .text_size(px(11.5))
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.load_repo_hosts(cx);
                             cx.notify();
@@ -3303,7 +3307,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(note)),
                 )
@@ -3312,7 +3316,7 @@ impl Shell {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(11.5))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(if device_offline {
                             theme.warning_text()
                         } else {
@@ -3390,7 +3394,7 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(if asking {
@@ -3412,12 +3416,12 @@ impl Shell {
                     .id(("add-space-host", ix))
                     .h(px(28.0))
                     .px(px(8.0))
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .when(selected, |el| {
                         el.bg(theme.glass_selected_bg())
                             .shadow(theme.glass_selected_shadows())
@@ -3444,6 +3448,7 @@ impl Shell {
                     .child(
                         div()
                             .size(px(5.0))
+                            // round-ok: presence dot
                             .rounded_full()
                             .flex_none()
                             .when(online, |el| el.bg(theme.settled.opacity(0.9)))
@@ -3486,7 +3491,7 @@ impl Shell {
                     .flex_row()
                     .items_start()
                     .gap(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .line_height(px(15.0))
                     .text_color(theme.text_subtle)
                     .child(
@@ -3506,7 +3511,7 @@ impl Shell {
                 div()
                     .px(px(8.0))
                     .pt(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .line_height(px(15.0))
                     .text_color(theme.text_subtle)
                     .child(note),
@@ -3519,7 +3524,7 @@ impl Shell {
                 div()
                     .px(px(8.0))
                     .pb(px(4.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from("This device")),
@@ -3531,12 +3536,12 @@ impl Shell {
                     .id("add-space-browse")
                     .h(px(28.0))
                     .px(px(8.0))
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(theme.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.element_hover))
@@ -3605,7 +3610,7 @@ impl Shell {
         let back_crumb = div()
             .id("add-space-crumb-repos")
             .px(px(3.0))
-            .rounded(px(4.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .text_color(theme.text_subtle)
             .cursor_pointer()
             .hover(|s| s.text_color(theme.text))
@@ -3638,7 +3643,7 @@ impl Shell {
                     .px(px(13.0))
                     .pt(px(10.0))
                     .pb(px(2.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_family(theme.font_mono.clone())
                     .child(back_crumb)
                     .child(separator(theme))
@@ -3646,7 +3651,7 @@ impl Shell {
                         let crumb = div()
                             .id("add-space-crumb-device")
                             .px(px(3.0))
-                            .rounded(px(4.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
                             .child(device_name.clone());
                         if at_home {
                             // Standing at home — the device crumb IS the
@@ -3678,7 +3683,7 @@ impl Shell {
                                     let crumb = div()
                                         .id(("add-space-crumb", ix))
                                         .px(px(3.0))
-                                        .rounded(px(4.0))
+                                        .rounded(px(Theme::RADIUS_CHIP))
                                         .text_color(if is_last {
                                             theme.text
                                         } else {
@@ -3711,7 +3716,7 @@ impl Shell {
                 .px(px(13.0))
                 .pt(px(10.0))
                 .pb(px(2.0))
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .font_family(theme.font_mono.clone())
                 .child(back_crumb)
                 .into_any_element(),
@@ -3738,7 +3743,7 @@ impl Shell {
                         .id("add-space-retry")
                         .px(px(Theme::SPACE_SM))
                         .py(px(3.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .border_1()
                         .border_color(theme.border)
                         .text_color(theme.text)
@@ -3755,7 +3760,7 @@ impl Shell {
             div()
                 .px(px(14.0))
                 .py(px(16.0))
-                .text_size(px(12.5))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(if query_empty {
                     "No folders here"
@@ -3870,7 +3875,7 @@ impl Shell {
                     .px(px(8.0))
                     .pt(px(2.0))
                     .pb(px(4.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from("Devices")),
@@ -3891,12 +3896,12 @@ impl Shell {
                     .id(("add-space-device", ix))
                     .h(px(28.0))
                     .px(px(8.0))
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .cursor_pointer()
                     .when(is_active, |el| {
                         // The sidebar's selection language: glass wash +
@@ -3922,6 +3927,7 @@ impl Shell {
                     .child(
                         div()
                             .size(px(5.0))
+                            // round-ok: presence dot
                             .rounded_full()
                             .flex_none()
                             .when(online, |el| {
@@ -3947,7 +3953,7 @@ impl Shell {
                     .flex_row()
                     .items_start()
                     .gap(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .line_height(px(15.0))
                     .text_color(theme.text_subtle)
                     .child(
@@ -3967,12 +3973,12 @@ impl Shell {
                     .id("add-space-back-to-repos")
                     .h(px(28.0))
                     .px(px(8.0))
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(theme.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.element_hover))

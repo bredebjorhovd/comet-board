@@ -24,7 +24,7 @@ use gpui::{
 };
 
 use crate::state::EngineHandle;
-use crate::theme::white_alpha;
+use crate::theme::{Theme, white_alpha};
 use comet_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
@@ -574,14 +574,14 @@ pub fn lightbox(
                             .object_fit(ObjectFit::Contain)
                             .max_h(max_h)
                             .max_w(max_w)
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_CARD))
                             .shadow_2xl(),
                     )
                     .child(
                         div()
                             .max_w(max_w)
                             .overflow_hidden()
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(white_alpha(0.45))
                             .child(preview.name.clone()),
                     ),

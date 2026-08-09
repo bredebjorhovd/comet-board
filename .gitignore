@@ -12,3 +12,9 @@ edge/dist/
 # wizard collected, and this repo is public — one `git add -A` is all it takes.
 # Globbed rather than listed: the next wizard should not have to remember this.
 .*-setup.env
+# The iOS signing override: a personal Apple team id and the bundle id its
+# profile covers. Ignored rather than tracked so it cannot be committed to a
+# public repo, and — the reason it is a separate file at all — so it cannot be
+# swept into an unrelated `git stash` the way the same edits in the .pbxproj
+# were. apps/ios/Signing.local.xcconfig.example is the tracked template.
+apps/ios/Signing.local.xcconfig

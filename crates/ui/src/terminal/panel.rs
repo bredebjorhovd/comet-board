@@ -222,11 +222,11 @@ impl Render for TabGhost {
             .px(px(Theme::SPACE_SM))
             .flex()
             .items_center()
-            .rounded(px(Theme::CONTROL_RADIUS))
+            .rounded(px(Theme::RADIUS_CHIP))
             .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border_strong)
-            .text_size(px(12.0))
+            .text_size(px(Theme::TEXT_DENSE))
             .text_color(theme.text)
             .opacity(0.85)
             .child(div().truncate().child(self.title.clone()))
@@ -911,7 +911,7 @@ impl TerminalPanel {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
                             .when(!selected, |el| el.invisible())
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.white_alpha(0.09)))
@@ -935,7 +935,7 @@ impl TerminalPanel {
                             .gap(px(6.0))
                             .pl(px(8.0))
                             .pr(px(4.0))
-                            .rounded(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
                             // comet terminal-panel.tsx tab: `transition-colors`.
                             .bg(motion::hover_blend(
                                 &format!("term-tab-{key}"),
@@ -943,7 +943,7 @@ impl TerminalPanel {
                                 theme.element_hover,
                             ))
                             .on_hover(motion::hover_listener(format!("term-tab-{key}")))
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(text_color)
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1012,7 +1012,7 @@ impl TerminalPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     // comet terminal-panel.tsx icon buttons: `transition-colors`.
                     .bg(motion::hover_blend(
@@ -1042,7 +1042,7 @@ impl TerminalPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     .bg(motion::hover_blend(
                         "term-collapse",
@@ -1081,7 +1081,7 @@ impl Render for TerminalPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.0))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from("Select a chat to open a terminal"))
                 .into_any_element();

@@ -52,6 +52,14 @@ const TALLY_ROWS: usize = 6;
 /// the tiles.
 const CHART_HEIGHT: f32 = 96.0;
 
+/// The corner on a drawn mark — a chart column, a meter fill, a heat cell.
+///
+/// scale-ok: a mark is data, not a box on a surface. Its corner relates to its
+/// own 4–6px width, not to the card it sits in, so the three-radius scale
+/// (gh#174) does not reach it — but it is still ONE number for every mark on
+/// the page, which is the same rule one level down.
+const MARK_RADIUS: f32 = 3.0;
+
 pub struct StatsPage {
     state: Entity<AppState>,
     /// The window in days; `None` is all time. Mirrors the CLI's
@@ -173,8 +181,11 @@ impl StatsPage {
             .flex_row()
             .items_center()
             .gap(px(2.0))
-            .p(px(2.0))
-            .rounded(px(9.0))
+            // The nesting rule (gh#174): segments at RADIUS_CHIP inside a track
+            // at RADIUS_ROW want exactly one gutter between them, and then the
+            // two curves are concentric instead of merely both round.
+            .p(px(Theme::NEST_GUTTER))
+            .rounded(px(Theme::RADIUS_ROW))
             .border_1()
             .border_color(theme.border)
             .bg(theme.white_alpha(0.02));
@@ -186,8 +197,8 @@ impl StatsPage {
                     .id(SharedString::from(format!("stats-window-{label}")))
                     .px(px(10.0))
                     .py(px(4.0))
-                    .rounded(px(7.0))
-                    .text_size(px(12.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(if selected {
                         gpui::FontWeight::MEDIUM
                     } else {
@@ -217,7 +228,7 @@ impl StatsPage {
             .min_w_0()
             .px(px(14.0))
             .py(px(12.0))
-            .rounded(px(11.0))
+            .rounded(px(Theme::RADIUS_CARD))
             .border_1()
             .border_color(theme.border)
             .bg(theme.surface)
@@ -226,7 +237,7 @@ impl StatsPage {
             .gap(px(3.0))
             .child(
                 div()
-                    .text_size(px(21.0))
+                    .text_size(px(Theme::TEXT_FIGURE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .truncate()
@@ -234,7 +245,7 @@ impl StatsPage {
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .truncate()
                     .child(SharedString::from(label.to_string())),
@@ -253,7 +264,7 @@ impl StatsPage {
             return div()
                 .px(px(20.0))
                 .py(px(18.0))
-                .text_size(px(12.5))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from("Nothing was dispatched in this window."))
                 .into_any_element();
@@ -277,7 +288,7 @@ impl StatsPage {
                         div()
                             .w_full()
                             .h(px(total_h.max(if day.dispatches > 0 { 2.0 } else { 0.0 })))
-                            .rounded(px(3.0))
+                            .rounded(px(MARK_RADIUS))
                             .bg(theme.accent.opacity(0.22))
                             .flex()
                             .flex_col()
@@ -287,7 +298,7 @@ impl StatsPage {
                                 div()
                                     .w_full()
                                     .h(px(done_h))
-                                    .rounded(px(3.0))
+                                    .rounded(px(MARK_RADIUS))
                                     .bg(theme.accent.opacity(0.85)),
                             ),
                     )
@@ -326,7 +337,7 @@ impl StatsPage {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(first))
                     .child(SharedString::from(format!("peak {peak}/day")))
@@ -348,7 +359,7 @@ impl StatsPage {
             return div()
                 .px(px(20.0))
                 .py(px(18.0))
-                .text_size(px(12.5))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(
                     "No day in this window has usage to show.",
@@ -377,9 +388,10 @@ impl StatsPage {
                     .child(
                         div()
                             .w_full()
-                            .h(px(CHART_HEIGHT * fraction
-                                + if total > 0 { 2.0 } else { 0.0 }))
-                            .rounded(px(3.0))
+                            .h(px(
+                                CHART_HEIGHT * fraction + if total > 0 { 2.0 } else { 0.0 }
+                            ))
+                            .rounded(px(MARK_RADIUS))
                             .bg(theme.accent.opacity(0.7)),
                     )
                     .into_any_element()
@@ -416,7 +428,7 @@ impl StatsPage {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(first))
                     .child(SharedString::from(format!(
@@ -451,7 +463,7 @@ impl StatsPage {
                             .w(px(150.0))
                             .flex_none()
                             .truncate()
-                            .text_size(px(12.5))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text)
                             .child(SharedString::from(row.label)),
                     )
@@ -460,13 +472,13 @@ impl StatsPage {
                             .flex_1()
                             .min_w_0()
                             .h(px(6.0))
-                            .rounded(px(3.0))
+                            .rounded(px(MARK_RADIUS))
                             .bg(theme.white_alpha(0.05))
                             .child(
                                 div()
                                     .h_full()
                                     .w(gpui::relative(fraction))
-                                    .rounded(px(3.0))
+                                    .rounded(px(MARK_RADIUS))
                                     .bg(theme.accent.opacity(0.6)),
                             ),
                     )
@@ -474,7 +486,7 @@ impl StatsPage {
                         div()
                             .w(px(58.0))
                             .flex_none()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(human_tokens(total))),
                     )
@@ -502,7 +514,7 @@ impl StatsPage {
             let base = div()
                 .when(lead, |el| el.flex_1().min_w_0().truncate())
                 .when(!lead, |el| el.w(px(72.0)).flex_none().text_right())
-                .text_size(px(12.0));
+                .text_size(px(Theme::TEXT_DENSE));
             if head {
                 base.text_color(theme.text_subtle)
                     .child(SharedString::from(text))
@@ -535,7 +547,7 @@ impl StatsPage {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.5))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text)
                             .child(SharedString::from(row.label)),
                     )
@@ -568,7 +580,7 @@ impl StatsPage {
                             .w(px(72.0))
                             .flex_none()
                             .text_right()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(SharedString::from(human_tokens(row.usage.total()))),
@@ -620,7 +632,7 @@ impl StatsPage {
                             .w(px(150.0))
                             .flex_none()
                             .truncate()
-                            .text_size(px(12.5))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text)
                             .child(SharedString::from(row.label)),
                     )
@@ -629,13 +641,13 @@ impl StatsPage {
                             .flex_1()
                             .min_w_0()
                             .h(px(6.0))
-                            .rounded(px(3.0))
+                            .rounded(px(MARK_RADIUS))
                             .bg(theme.white_alpha(0.05))
                             .child(
                                 div()
                                     .h_full()
                                     .w(gpui::relative(fraction))
-                                    .rounded(px(3.0))
+                                    .rounded(px(MARK_RADIUS))
                                     .bg(theme.accent.opacity(0.6)),
                             ),
                     )
@@ -643,7 +655,7 @@ impl StatsPage {
                         div()
                             .w(px(34.0))
                             .flex_none()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(format!("{}", row.count))),
                     )
@@ -664,41 +676,41 @@ impl StatsPage {
     /// them, so the quiet hours are as legible as the busy ones.
     fn render_hours(stats: &BoardStats, theme: &Theme) -> AnyElement {
         let peak = stats.hour_of_day.iter().copied().max().unwrap_or(0);
-        let cells: Vec<AnyElement> = stats
-            .hour_of_day
-            .iter()
-            .enumerate()
-            .map(|(hour, count)| {
-                let heat = bar_fraction(*count, peak);
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(26.0))
-                            .rounded(px(4.0))
-                            .bg(if *count == 0 {
+        let cells: Vec<AnyElement> =
+            stats
+                .hour_of_day
+                .iter()
+                .enumerate()
+                .map(|(hour, count)| {
+                    let heat = bar_fraction(*count, peak);
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(div().w_full().h(px(26.0)).rounded(px(MARK_RADIUS)).bg(
+                            if *count == 0 {
                                 theme.white_alpha(0.03)
                             } else {
                                 theme.accent.opacity(0.15 + 0.7 * f32::from(heat))
-                            }),
-                    )
-                    // Every third hour is labelled: 24 numbers at this width
-                    // is a smear, and the reader is looking for a shape.
-                    .child(div().text_size(px(9.0)).text_color(theme.text_subtle).child(
-                        SharedString::from(if hour % 3 == 0 {
-                            format!("{hour:02}")
-                        } else {
-                            String::new()
-                        }),
-                    ))
-                    .into_any_element()
-            })
-            .collect();
+                            },
+                        ))
+                        // Every third hour is labelled: 24 numbers at this width
+                        // is a smear, and the reader is looking for a shape.
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child(SharedString::from(if hour % 3 == 0 {
+                                    format!("{hour:02}")
+                                } else {
+                                    String::new()
+                                })),
+                        )
+                        .into_any_element()
+                })
+                .collect();
         div()
             .px(px(20.0))
             .py(px(14.0))
@@ -719,13 +731,13 @@ impl StatsPage {
             .gap(px(12.0))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(label.to_string())),
             )
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text)
                     .child(value.into()),
@@ -765,7 +777,7 @@ impl StatsPage {
                     .gap(px(10.0))
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(Theme::TEXT_BODY))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(SharedString::from(title.to_string())),
@@ -773,7 +785,7 @@ impl StatsPage {
                     .when_some(aside, |el, aside| {
                         el.child(
                             div()
-                                .text_size(px(11.5))
+                                .text_size(px(Theme::TEXT_CAPTION))
                                 .text_color(theme.text_subtle)
                                 .child(SharedString::from(aside)),
                         )
@@ -825,7 +837,7 @@ impl StatsPage {
                             .w(px(120.0))
                             .flex_none()
                             .truncate()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(row.label)),
                     )
@@ -834,13 +846,13 @@ impl StatsPage {
                             .flex_1()
                             .min_w_0()
                             .h(px(5.0))
-                            .rounded(px(3.0))
+                            .rounded(px(MARK_RADIUS))
                             .bg(theme.white_alpha(0.05))
                             .child(
                                 div()
                                     .h_full()
                                     .w(gpui::relative(fraction))
-                                    .rounded(px(3.0))
+                                    .rounded(px(MARK_RADIUS))
                                     .bg(theme.accent.opacity(0.55)),
                             ),
                     )
@@ -848,7 +860,7 @@ impl StatsPage {
                         div()
                             .w(px(28.0))
                             .flex_none()
-                            .text_size(px(11.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(format!("{}", row.count))),
                     )
@@ -869,7 +881,7 @@ impl StatsPage {
                     .gap(px(4.0))
                     .child(
                         div()
-                            .text_size(px(30.0))
+                            .text_size(px(Theme::TEXT_FIGURE))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
                             .child(SharedString::from(format!(
@@ -880,7 +892,7 @@ impl StatsPage {
                     )
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(if facts.is_empty() {
                                 format!("across {} task(s)", stats.tasks_touched)
@@ -1065,26 +1077,30 @@ impl Render for StatsPage {
             } else {
                 "Reading the board…"
             };
-            return scroll_page(column.child(
-                div()
-                    .mt(px(24.0))
-                    .text_size(px(13.0))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(note)),
-            ));
+            return scroll_page(
+                column.child(
+                    div()
+                        .mt(px(24.0))
+                        .text_size(px(Theme::TEXT_BODY))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(note)),
+                ),
+            );
         };
 
         if stats.is_empty() {
-            return scroll_page(column.child(
-                div()
-                    .mt(px(24.0))
-                    .text_size(px(13.0))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(format!(
-                        "No dispatches in the {}. Release a task and this fills in.",
-                        stats.window_label()
-                    ))),
-            ));
+            return scroll_page(
+                column.child(
+                    div()
+                        .mt(px(24.0))
+                        .text_size(px(Theme::TEXT_BODY))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(format!(
+                            "No dispatches in the {}. Release a task and this fills in.",
+                            stats.window_label()
+                        ))),
+                ),
+            );
         }
 
         // ── row 1: the answer, and the shape of it ──────────────────────────
@@ -1115,7 +1131,7 @@ impl Render for StatsPage {
                 div()
                     .px(px(20.0))
                     .py(px(18.0))
-                    .text_size(px(12.5))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(
                         "No attempt in this window reported token usage. \

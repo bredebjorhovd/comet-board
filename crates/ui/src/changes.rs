@@ -48,7 +48,8 @@ pub const GUTTER_WIDTH: f32 = 36.0;
 pub const MARKER_WIDTH: f32 = 28.0;
 /// Width of the coloured accent bar on the left edge of +/− rows.
 pub const ACCENT_BAR_WIDTH: f32 = 3.0;
-const DIFF_TEXT_SIZE: f32 = 12.0;
+/// A diff is the densest listing in the app — the dense-row size (gh#174).
+const DIFF_TEXT_SIZE: f32 = Theme::TEXT_DENSE;
 
 // ---------------------------------------------------------------------------
 // Patch model + parser (pure)
@@ -874,7 +875,7 @@ impl Changes {
                     .min_w_0()
                     .truncate()
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(12.0))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(file.path.clone())),
             )
@@ -882,7 +883,7 @@ impl Changes {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(10.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from("BIN")),
                 )
@@ -892,7 +893,7 @@ impl Changes {
                     div()
                         .flex_none()
                         .font_family(theme.font_mono.clone())
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(add_color())
                         .child(SharedString::from(format!("+{adds}"))),
                 )
@@ -902,7 +903,7 @@ impl Changes {
                     div()
                         .flex_none()
                         .font_family(theme.font_mono.clone())
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(del_color())
                         .child(SharedString::from(format!("−{dels}"))),
                 )
@@ -925,21 +926,21 @@ impl Changes {
                 .border_color(theme.white_alpha(0.06))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(uncommitted_label(parsed.file_count))),
                 )
                 .child(
                     div()
                         .font_family(theme.font_mono.clone())
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(add_color())
                         .child(SharedString::from(format!("+{}", parsed.additions))),
                 )
                 .child(
                     div()
                         .font_family(theme.font_mono.clone())
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(del_color())
                         .child(SharedString::from(format!("−{}", parsed.deletions))),
                 )
@@ -948,10 +949,10 @@ impl Changes {
                     el.child(
                         div()
                             .flex_none()
-                            .text_size(px(10.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .px(px(6.0))
                             .py(px(2.0))
-                            .rounded(px(4.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
                             .bg(theme.warning.opacity(0.08))
                             .text_color(theme.warning_text())
                             .child(SharedString::from("Partial snapshot")),
@@ -998,7 +999,7 @@ fn render_file_body(
                 .flex()
                 .items_center()
                 .px(px(Theme::SPACE_LG))
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(notice))
                 .into_any_element(),
@@ -1023,7 +1024,7 @@ fn render_file_body(
                 .px(px(Theme::SPACE_LG))
                 .bg(hunk_bg)
                 .font_family(theme.font_mono.clone())
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(hunk.header.clone()))
                 .into_any_element(),
@@ -1043,8 +1044,11 @@ fn render_file_body(
                         .flex_none()
                         .flex()
                         .items_center()
-                        .pl(px(ACCENT_BAR_WIDTH + 2.0 * GUTTER_WIDTH + MARKER_WIDTH + 12.0))
-                        .text_size(px(10.5))
+                        .pl(px(ACCENT_BAR_WIDTH
+                            + 2.0 * GUTTER_WIDTH
+                            + MARKER_WIDTH
+                            + 12.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .italic()
                         .child(SharedString::from(line.text.clone()))
@@ -1075,7 +1079,7 @@ fn render_file_body(
                     .w(px(GUTTER_WIDTH))
                     .flex_none()
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(color)
                     .flex()
                     .justify_end()
@@ -1183,7 +1187,7 @@ impl Render for Changes {
                 ))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from("Preparing diff…")),
                 )
@@ -1193,7 +1197,7 @@ impl Render for Changes {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.0))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from("No uncommitted changes"))
                 .into_any_element(),
@@ -1240,7 +1244,7 @@ impl Render for Changes {
                         .py(px(4.0))
                         .border_b_1()
                         .border_color(theme.border)
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.warning)
                         .child(message),
                 )

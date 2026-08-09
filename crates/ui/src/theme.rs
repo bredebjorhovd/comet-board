@@ -47,6 +47,33 @@
 //! one, pink in the other, one keystroke apart on screen). States that mean
 //! "nothing is happening" — ready, done, idle — map to `None` and spend no
 //! colour at all: the absence of a hue is a state too.
+//!
+//! # Three radii and four type sizes (gh#174)
+//!
+//! Ten radii were in use — 4.5, 5, 6, 8, 10, 12, 16, 26 and full-round — which
+//! is an inventory, not a scale, and the roundness never related to the box a
+//! thing sat inside: a 5px action chip in a row inside a 12px card, a 26px
+//! composer pill under a 16px bubble. Softness everywhere and structure
+//! nowhere. Three steps replace it — [`Theme::RADIUS_CHIP`] 6,
+//! [`Theme::RADIUS_ROW`] 10, [`Theme::RADIUS_CARD`] 14 — chosen four apart so
+//! the **nesting rule** falls out of the scale: `inner = outer − padding`, with
+//! the padding being [`Theme::NEST_GUTTER`], which is the gutter the cards
+//! already used. A row at 10 inside a card at 14 reads as one object.
+//!
+//! `rounded_full()` survives in exactly one job — a dot, and the send button.
+//! One round thing on screen, and it is the one you press. `tests/scale.rs`
+//! holds the line: every remaining full-round needs a `round-ok:` marker
+//! saying which of those it is.
+//!
+//! Type had ten sizes — 9, 9.5, 10, 10.5, 11, 11.5, 12, 12.5, 13, 13.5, 14, 15,
+//! 16, 18, 21, 22, 30 — six of them inside the 520px board pane alone. A 0.5px
+//! step is not a level of hierarchy, it is a different decision made on a
+//! different day. Four sizes carry the UI ([`Theme::TEXT_CAPTION`] 11,
+//! [`Theme::TEXT_DENSE`] 12, [`Theme::TEXT_BODY`] 13, [`Theme::TEXT_TITLE`]
+//! 15), [`Theme::TEXT_PROSE`] 14/[`Theme::PROSE_LINE_HEIGHT`] 22 is reserved
+//! for the transcript, and [`Theme::TEXT_FIGURE`] is the single display size
+//! for a number shown as a number. Hierarchy past that comes from weight and
+//! the four greys above — not from half-pixels.
 
 use comet_proto::ChatIndicator;
 use comet_proto::view::board::{AgentState, BoardState};
@@ -252,12 +279,48 @@ impl Theme {
     /// Reserved status strip under the content outlet (comet `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
-    /// Message bubble corner radius.
-    pub const BUBBLE_RADIUS: f32 = 16.0;
-    /// Panel / card corner radius.
-    pub const PANEL_RADIUS: f32 = 10.0;
-    /// Small control radius (buttons, chips).
-    pub const CONTROL_RADIUS: f32 = 6.0;
+
+    // ---- three radii, and one full-round exception (gh#174) ----
+    /// The innermost step: chips, badges, key caps, small icon buttons,
+    /// avatars, swatches — anything that sits INSIDE a [`Self::RADIUS_ROW`] row.
+    pub const RADIUS_CHIP: f32 = 6.0;
+    /// The middle step: rows, menu items, inputs, tabs, popovers, tiles — the
+    /// things that sit inside a [`Self::RADIUS_CARD`] card.
+    pub const RADIUS_ROW: f32 = 10.0;
+    /// The outermost step: cards, dialogs, sheets, message bubbles, the
+    /// composer. Nothing is rounder than this except the send button.
+    pub const RADIUS_CARD: f32 = 14.0;
+    /// The gutter that makes the nesting rule true. `inner = outer − padding`:
+    /// a [`Self::RADIUS_ROW`] row inset by this much inside a
+    /// [`Self::RADIUS_CARD`] card keeps the two curves concentric, and the same
+    /// step takes a chip out of a row. It is [`Self::SPACE_XS`] — the scale was
+    /// chosen so the gutter the cards already used is the one the rule wants.
+    pub const NEST_GUTTER: f32 = Self::RADIUS_CARD - Self::RADIUS_ROW;
+
+    // ---- four type sizes, plus prose and one figure (gh#174) ----
+    /// Captions: labels, metadata, key hints, timestamps, badge text — the
+    /// smallest type that ships.
+    pub const TEXT_CAPTION: f32 = 11.0;
+    /// Dense rows: the board pane, the sidebar lists, tables, diff gutters —
+    /// where many lines stack and every pixel of height is spent twice.
+    pub const TEXT_DENSE: f32 = 12.0;
+    /// UI body — the default. Buttons, menu items, form fields, section copy.
+    pub const TEXT_BODY: f32 = 13.0;
+    /// Titles: page headers, dialog titles, empty-state headings. The top of
+    /// the UI ramp; anything louder is a matter of weight, not size.
+    pub const TEXT_TITLE: f32 = 15.0;
+    /// Prose, and only prose: rendered markdown, the message bubbles, and the
+    /// composer you type them into. Reserved — a transcript is reading, not
+    /// chrome, and it does not share the UI ramp.
+    pub const TEXT_PROSE: f32 = 14.0;
+    /// The line height [`Self::TEXT_PROSE`] is set on.
+    pub const PROSE_LINE_HEIGHT: f32 = 22.0;
+    /// A number shown AS a number: the stats tiles, the headline dispatch
+    /// count, a login code read aloud. The one size off the UI ramp, because a
+    /// figure at title size stops being a figure — and it is ONE size, not the
+    /// 21 / 22 / 30 it replaces.
+    pub const TEXT_FIGURE: f32 = 21.0;
+
     // ---- the status ramp (gh#173) ----
     // Defined in `comet-proto` (`view::status`), not here: the terminal app
     // paints the same meanings and must land on the same hues.
@@ -918,7 +981,68 @@ mod tests {
     fn layout_numbers_match_comet() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
-        assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
+    }
+
+    #[test]
+    fn the_radius_scale_makes_the_nesting_rule_true() {
+        // gh#174: three steps, each one gutter apart, so `inner = outer −
+        // padding` is arithmetic rather than a thing to remember. The ten-radius
+        // inventory that preceded this had no such relation: a 5px chip in a
+        // 12px card left the two curves fighting.
+        assert_eq!(
+            Theme::RADIUS_CARD - Theme::RADIUS_ROW,
+            Theme::RADIUS_ROW - Theme::RADIUS_CHIP,
+            "the scale must be evenly stepped or the rule only works one level deep"
+        );
+        assert_eq!(Theme::NEST_GUTTER, Theme::RADIUS_ROW - Theme::RADIUS_CHIP);
+        // And the gutter is the one the cards already used — the scale was
+        // fitted to the layout, not the other way round.
+        assert_eq!(Theme::NEST_GUTTER, Theme::SPACE_XS);
+        assert_eq!(
+            [
+                Theme::RADIUS_CHIP,
+                Theme::RADIUS_ROW,
+                Theme::RADIUS_CARD,
+                Theme::NEST_GUTTER
+            ],
+            [6.0, 10.0, 14.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn the_type_scale_is_four_sizes_and_two_reservations() {
+        // Four UI sizes, ordered and never closer than a whole pixel — a 0.5px
+        // step is not a level of hierarchy (gh#174).
+        let ui = [
+            Theme::TEXT_CAPTION,
+            Theme::TEXT_DENSE,
+            Theme::TEXT_BODY,
+            Theme::TEXT_TITLE,
+        ];
+        assert_eq!(ui, [11.0, 12.0, 13.0, 15.0]);
+        for pair in ui.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= 1.0,
+                "{} and {} are the same decision made twice",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Prose is reserved: it sits between the dense rows and the titles on
+        // purpose, and carries its own line height.
+        assert_eq!((Theme::TEXT_PROSE, Theme::PROSE_LINE_HEIGHT), (14.0, 22.0));
+        // Prose reads a step above UI body and a step below a title, and the
+        // one display size sits above the whole UI ramp.
+        let full = [
+            Theme::TEXT_BODY,
+            Theme::TEXT_PROSE,
+            Theme::TEXT_TITLE,
+            Theme::TEXT_FIGURE,
+        ];
+        assert!(
+            full.windows(2).all(|p| p[0] < p[1]),
+            "the scale is not ordered: {full:?}"
+        );
     }
 
     // ---- light variant ----

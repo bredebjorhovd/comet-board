@@ -2255,7 +2255,7 @@ impl BoardPanel {
             )
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from("Board")),
@@ -2274,9 +2274,9 @@ impl BoardPanel {
                 .h(px(18.0))
                 .flex()
                 .items_center()
-                .rounded_full()
+                .rounded(px(Theme::RADIUS_CHIP))
                 .bg(theme.wash(0.08))
-                .text_size(px(10.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(shown.to_string())),
         );
@@ -2303,7 +2303,7 @@ impl BoardPanel {
                     .max_w(px(240.0))
                     .h(px(26.0))
                     .px(px(8.0))
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .border_1()
                     .border_color(theme.border_strong)
                     .bg(theme.wash(0.05))
@@ -2319,7 +2319,7 @@ impl BoardPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.wash(0.1)))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -2344,7 +2344,7 @@ impl BoardPanel {
                 .items_center()
                 .gap(px(5.0))
                 .px(px(8.0))
-                .rounded(px(6.0))
+                .rounded(px(Theme::RADIUS_CHIP))
                 .cursor_pointer()
                 .bg(motion::hover_blend(
                     "board-filter",
@@ -2358,7 +2358,7 @@ impl BoardPanel {
                     }
                     cx.notify();
                 }))
-                .text_size(px(11.0));
+                .text_size(px(Theme::TEXT_CAPTION));
             let label: SharedString = filter_label
                 .clone()
                 .map(Into::into)
@@ -2388,7 +2388,7 @@ impl BoardPanel {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.wash(0.1)))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2412,7 +2412,7 @@ impl BoardPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.wash(0.1)))
                     .on_click(cx.listener(|this, _, _, cx| this.open_find_field(cx)))
@@ -2431,7 +2431,7 @@ impl BoardPanel {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.wash(0.1)))
                     .on_click(|_, window, cx| {
@@ -2479,7 +2479,7 @@ impl BoardPanel {
             .items_center()
             .gap(px(5.0))
             .px(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .cursor_pointer()
             .bg(if open {
                 theme.wash(0.14)
@@ -2495,7 +2495,7 @@ impl BoardPanel {
                 this.host_menu_dismissed_at = None;
                 cx.notify();
             }))
-            .text_size(px(12.0))
+            .text_size(px(Theme::TEXT_DENSE))
             .child(
                 div()
                     .text_color(theme.text_subtle)
@@ -2517,6 +2517,7 @@ impl BoardPanel {
                 div()
                     .size(px(6.0))
                     .flex_none()
+                    // round-ok: status dot
                     .rounded_full()
                     .bg(if confirmed {
                         emerald
@@ -2565,7 +2566,7 @@ impl BoardPanel {
                             el.child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(10.5))
+                                    .text_size(px(Theme::TEXT_CAPTION))
                                     .text_color(theme.text_subtle)
                                     .child(SharedString::from("You")),
                             )
@@ -2595,7 +2596,7 @@ impl BoardPanel {
             .items_center()
             .justify_center()
             .px(px(Theme::SPACE_LG))
-            .text_size(px(12.0))
+            .text_size(px(Theme::TEXT_DENSE))
             .text_color(theme.text_subtle)
             .child(text)
             .into_any_element()
@@ -2646,7 +2647,7 @@ impl BoardPanel {
             }))
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(Theme::TEXT_BODY))
                     .text_color(color)
                     .child(SharedString::from(state.glyph())),
             )
@@ -2656,9 +2657,13 @@ impl BoardPanel {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(12.0))
+                    .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(if selected { theme.text } else { theme.text_muted })
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
                     .child(SharedString::from(if state == BoardState::Done {
                         "DONE TODAY".to_string()
                     } else {
@@ -2671,10 +2676,14 @@ impl BoardPanel {
                     .h(px(18.0))
                     .flex()
                     .items_center()
-                    .rounded_full()
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .bg(theme.wash(0.08))
-                    .text_size(px(10.0))
-                    .text_color(if folded { theme.text_muted } else { theme.text_subtle })
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if folded {
+                        theme.text_muted
+                    } else {
+                        theme.text_subtle
+                    })
                     .child(SharedString::from(len.to_string())),
             )
             .child(div().flex_1())
@@ -2759,7 +2768,7 @@ impl BoardPanel {
                     .flex_none()
                     .max_w(px(180.0))
                     .truncate()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     // The no-route group's headline uses the rows' own words,
                     // in the quiet tone of something you cannot dispatch.
@@ -2774,7 +2783,7 @@ impl BoardPanel {
             )
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(format!("· {len}"))),
             )
@@ -2877,7 +2886,7 @@ impl BoardPanel {
                         div()
                             .flex_none()
                             .w(px(12.0))
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(color)
                             .child(SharedString::from(state.glyph())),
                     )
@@ -2885,7 +2894,7 @@ impl BoardPanel {
                         div()
                             .flex_none()
                             .font_family(theme.font_mono.clone())
-                            .text_size(px(11.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(if state == BoardState::Done {
                                 theme.text_faint
                             } else {
@@ -2900,7 +2909,7 @@ impl BoardPanel {
                             // One line, on every row, in every state (gh#132).
                             // The whole title is in the peek panel.
                             .truncate()
-                            .text_size(px(12.0))
+                            .text_size(px(Theme::TEXT_DENSE))
                             .text_color(if state == BoardState::Done {
                                 theme.text_faint
                             } else if selected {
@@ -2923,7 +2932,7 @@ impl BoardPanel {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .truncate()
                     .child(SharedString::from(meta)),
@@ -2965,11 +2974,11 @@ impl BoardPanel {
                     .flex_none()
                     .h(px(ROW_LINE_H))
                     .px(px(8.0))
-                    .rounded(px(5.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .bg(theme.wash(0.12))
                     .flex()
                     .items_center()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(action_color(action, &theme))
                     .hover(|s| s.bg(theme.wash(0.18)))
                     .child(SharedString::from(action.short_label()))
@@ -3070,7 +3079,7 @@ impl BoardPanel {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(label_color)
                     .child(runtime_label),
@@ -3096,7 +3105,7 @@ impl BoardPanel {
                     .flex_none()
                     .h(px(22.0))
                     .px(px(9.0))
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -3113,7 +3122,7 @@ impl BoardPanel {
                     }))
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(if unavailable.is_some() {
                                 // Dimmed whether or not it is the highlight:
                                 // this one is a fact about the host, not about
@@ -3159,7 +3168,7 @@ impl BoardPanel {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(if model_focused {
                         theme.accent
@@ -3176,7 +3185,7 @@ impl BoardPanel {
                     .min_w_0()
                     .h(px(24.0))
                     .px(px(8.0))
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .border_1()
                     .border_color(if model_focused {
                         theme.border_strong
@@ -3192,7 +3201,7 @@ impl BoardPanel {
             model_row = model_row.child(
                 div()
                     .flex_none()
-                    .text_size(px(10.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(format!(
                         "{}/{}",
@@ -3210,7 +3219,7 @@ impl BoardPanel {
                 .flex_none()
                 .px(px(Theme::SPACE_LG))
                 .py(px(6.0))
-                .text_size(px(10.5))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.warning)
                 .child(SharedString::from(format!(
                     "{err} — enter dispatches with the harness default"
@@ -3220,7 +3229,7 @@ impl BoardPanel {
                 .flex_none()
                 .px(px(Theme::SPACE_LG))
                 .py(px(8.0))
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from(format!("No models match “{query}”")))
                 .into_any_element(),
@@ -3257,7 +3266,7 @@ impl BoardPanel {
                 .flex_none()
                 .px(px(Theme::SPACE_LG))
                 .py(px(6.0))
-                .text_size(px(10.5))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from("Loading models…"))
                 .into_any_element(),
@@ -3272,7 +3281,7 @@ impl BoardPanel {
             .border_color(theme.white_alpha(0.06))
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(
                         "type to filter · ↑↓ switch · ←→ pick · enter dispatch · esc cancel",
@@ -3352,7 +3361,7 @@ impl BoardPanel {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(if focused {
                         theme.accent
@@ -3375,7 +3384,7 @@ impl BoardPanel {
                     .flex_none()
                     .h(px(22.0))
                     .px(px(9.0))
-                    .rounded(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -3399,7 +3408,7 @@ impl BoardPanel {
                     }))
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(if bills_somebody_else {
                                 warned
                             } else if active && focused {
@@ -3439,7 +3448,7 @@ impl BoardPanel {
             .flex_none()
             .px(px(9.0))
             .py(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(Theme::RADIUS_CHIP))
             .flex()
             .flex_row()
             .items_center()
@@ -3474,7 +3483,7 @@ impl BoardPanel {
                         div()
                             .w_full()
                             .truncate()
-                            .text_size(px(11.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(if active && focused {
                                 theme.accent
                             } else if active {
@@ -3488,7 +3497,7 @@ impl BoardPanel {
                         div()
                             .w_full()
                             .truncate()
-                            .text_size(px(9.5))
+                            .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(theme.text_subtle)
                             .child(id),
                     ),
@@ -3497,7 +3506,7 @@ impl BoardPanel {
                 el.child(
                     div()
                         .flex_none()
-                        .text_size(px(9.5))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from("default")),
                 )
@@ -3540,7 +3549,7 @@ impl BoardPanel {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(state_color(state, &theme))
                     .child(SharedString::from(state.glyph())),
             )
@@ -3548,7 +3557,7 @@ impl BoardPanel {
                 div()
                     .flex_none()
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(row.display_identifier())),
             )
@@ -3561,8 +3570,8 @@ impl BoardPanel {
                     .h(px(18.0))
                     .flex()
                     .items_center()
-                    .rounded(px(5.0))
-                    .text_size(px(10.5))
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .hover(|s| s.bg(theme.wash(0.12)))
                     .child(SharedString::from("esc"))
@@ -3576,7 +3585,7 @@ impl BoardPanel {
         // of a list that then reflowed under the pointer.
         let title = div()
             .flex_none()
-            .text_size(px(13.0))
+            .text_size(px(Theme::TEXT_BODY))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text)
             .child(SharedString::from(row.title.clone()));
@@ -3587,7 +3596,7 @@ impl BoardPanel {
             .map(|line| {
                 div()
                     .flex_none()
-                    .text_size(px(10.5))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(line))
                     .into_any_element()
@@ -3610,9 +3619,9 @@ impl BoardPanel {
                         .h(px(16.0))
                         .flex()
                         .items_center()
-                        .rounded_full()
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.wash(0.08))
-                        .text_size(px(10.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(label.clone()))
                 }))
@@ -3623,13 +3632,13 @@ impl BoardPanel {
         // issue reads here the way an agent's reply reads there.
         let body_element: AnyElement = if let Some(message) = error {
             div()
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.warning)
                 .child(message)
                 .into_any_element()
         } else if loading {
             div()
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_subtle)
                 .child(SharedString::from("Reading the issue…"))
                 .into_any_element()
@@ -3646,7 +3655,7 @@ impl BoardPanel {
             )
         } else {
             div()
-                .text_size(px(11.0))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(theme.text_faint)
                 .child(SharedString::from(board::NO_BODY))
                 .into_any_element()
@@ -3671,11 +3680,11 @@ impl BoardPanel {
                         .flex_none()
                         .h(px(22.0))
                         .px(px(9.0))
-                        .rounded(px(6.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.wash(0.12))
                         .flex()
                         .items_center()
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(action_color(action, &theme))
                         .hover(|s| s.bg(theme.wash(0.18)))
                         // The full spelling here: a panel has room, and a
@@ -3779,7 +3788,7 @@ impl BoardPanel {
             .px(px(Theme::SPACE_LG))
             .border_t_1()
             .border_color(theme.white_alpha(0.06))
-            .text_size(px(10.5))
+            .text_size(px(Theme::TEXT_CAPTION))
             .text_color(if has_notice {
                 theme.warning
             } else {
@@ -3897,7 +3906,7 @@ impl Render for BoardPanel {
                         .py(px(4.0))
                         .border_b_1()
                         .border_color(theme.border)
-                        .text_size(px(11.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.warning)
                         .child(message),
                 )
