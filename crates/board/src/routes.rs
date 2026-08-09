@@ -198,6 +198,24 @@ pub enum Edit {
         #[serde(default)]
         value: Option<String>,
     },
+    /// Set (or, with `value: null`, remove) one key under `[account."<slot>"]`
+    /// — what one agent-account slot's subscription costs its owner (gh#182).
+    ///
+    /// Its own op for the same reason [`Edit::User`] is: the key is data, not a
+    /// name off a fixed list. It is an account — the email a login signs in as,
+    /// or the slot id `doctor` prints — and a typo there produces an entry no
+    /// stats row will ever match rather than a refusal.
+    ///
+    /// This is the write behind the Accounts page's plan field (gh#178): the
+    /// cost of a subscription is the one number in this file that comet cannot
+    /// discover, and the page that lists the logins is where a person is
+    /// already looking when they think about what they pay for one.
+    Account {
+        slot: String,
+        key: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
 }
 
 /// The keys [`Edit::Route`] may set, and the TOML each writes.
@@ -243,11 +261,24 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("billing_guard", Kind::Str),
 ];
 
+/// The keys [`Edit::Account`] may set on one `[account."<slot>"]` table.
+const ACCOUNT_KEYS: &[(&str, Kind)] = &[
+    ("email", Kind::Str),
+    ("plan", Kind::Str),
+    ("monthly_usd", Kind::Money),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Str,
     Int,
     Bool,
+    /// An amount in US dollars. Its own kind because money is neither an
+    /// integer (`monthly_usd = 17.50` is a real plan) nor free text, and
+    /// because a negative subscription is the one value the config validator
+    /// would refuse *after* the write — better to name it here, beside the
+    /// number somebody typed.
+    Money,
 }
 
 impl Kind {
@@ -268,7 +299,40 @@ impl Kind {
                 "false" | "no" | "off" | "0" => Ok("false".into()),
                 _ => bail!("`{value}` is not true or false"),
             },
+            // `$200`, `200`, `17.50`, `1,200` — what a person writes when asked
+            // what a plan costs. The currency is dollars because the rate table
+            // is; a board on another currency writes the converted figure, and
+            // saying so is a job for the `plan` label beside it.
+            Kind::Money => {
+                let cleaned: String = v
+                    .trim_start_matches(['$', '\u{a0}'])
+                    .chars()
+                    .filter(|c| *c != ',' && !c.is_whitespace())
+                    .collect();
+                match cleaned.parse::<f64>() {
+                    Ok(n) if n.is_finite() && n >= 0.0 => Ok(trim_zeros(n)),
+                    Ok(_) => bail!(
+                        "`{value}` is not what a subscription costs — an amount per month, \
+                         and never below zero"
+                    ),
+                    Err(_) => bail!("`{value}` is not an amount in dollars"),
+                }
+            }
         }
+    }
+}
+
+/// An amount as TOML: `200`, not `200.00000000000001`.
+///
+/// Rounded to the cent first — a plan is billed in cents, and a float that came
+/// out of a text field should not put four more digits in a file somebody
+/// reads.
+fn trim_zeros(amount: f64) -> String {
+    let cents = (amount * 100.0).round() / 100.0;
+    if cents.fract() == 0.0 {
+        format!("{}", cents as i64)
+    } else {
+        format!("{cents:.2}")
     }
 }
 
@@ -368,6 +432,21 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
                 value.as_deref().map(adopt::toml_string),
             )
         }
+        Edit::Account { slot, key, value } => {
+            let slot = slot.trim();
+            // The key is an account, and the two spellings it comes in — an
+            // email or a slot id — share the only shape worth checking: one
+            // word, no quoting to get wrong.
+            if slot.is_empty() || slot.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                bail!(
+                    "`{slot}` is not an account. `[account.\"…\"]` is keyed by the email a \
+                     login signs in as, or by the slot id `comet-board doctor` lists."
+                );
+            }
+            let kind = kind_of(ACCOUNT_KEYS, key, "[account]")?;
+            let header = account_header(&before, slot);
+            set_in_table(&before, &header, key, rendered(kind, value.as_deref())?)
+        }
     };
     adopt::apply(&path, &before, &after)?;
     read(paths)
@@ -438,6 +517,32 @@ fn user_key(text: &str, user: &str) -> String {
         }
     }
     adopt::toml_string(user)
+}
+
+/// The `[account."…"]` header already in the file for this slot, or a freshly
+/// quoted one.
+///
+/// Same rule as [`user_key`] and for the same reason: the slot is matched
+/// case-insensitively wherever it is *read* ([`crate::prices`]), so writing
+/// `[account."Brede@tally.no"]` beside an existing `[account."brede@tally.no"]`
+/// would be two plans for one subscription and the board would add them both up.
+fn account_header(text: &str, slot: &str) -> String {
+    for (_, name) in adopt::header_lines(text) {
+        let Some(rest) = name.strip_prefix("[account.") else {
+            continue;
+        };
+        let Some(key) = rest.strip_suffix(']') else {
+            continue;
+        };
+        if key
+            .trim()
+            .trim_matches(['"', '\''])
+            .eq_ignore_ascii_case(slot)
+        {
+            return name;
+        }
+    }
+    format!("[account.{}]", adopt::toml_string(slot))
 }
 
 /// Set (or remove) `key` in a named top-level table, creating the table when it
@@ -922,6 +1027,13 @@ max_duration = "banana"
         }))
         .unwrap();
         assert!(matches!(user, Edit::User { .. }));
+        // And the plan field on the Accounts page (gh#178), which is the same
+        // shape a key away.
+        let plan: Edit = serde_json::from_value(serde_json::json!({
+            "op": "account", "slot": "brede@tally.no", "key": "monthly_usd", "value": "200"
+        }))
+        .unwrap();
+        assert!(matches!(plan, Edit::Account { .. }));
     }
 
     // ── the `[users]` map (gh#162) ──────────────────────────────────────────
@@ -1076,5 +1188,109 @@ max_duration = "banana"
             view.text
         );
         assert_eq!(view.config.as_ref().unwrap().users.len(), 1);
+    }
+
+    // ── what a plan costs (gh#182), entered from Accounts (gh#178) ──────────
+
+    fn plan_edit(paths: &Paths, slot: &str, key: &str, value: Option<&str>) -> Result<RoutingView> {
+        edit(
+            paths,
+            &Edit::Account {
+                slot: slot.into(),
+                key: key.into(),
+                value: value.map(str::to_string),
+            },
+        )
+    }
+
+    #[test]
+    fn a_plan_cost_lands_in_its_own_account_table_and_reads_back() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = plan_edit(&paths, "brede@tally.no", "monthly_usd", Some("$200")).unwrap();
+        assert!(
+            view.text.contains("[account.\"brede@tally.no\"]"),
+            "{}",
+            view.text
+        );
+        assert!(view.text.contains("monthly_usd = 200"), "{}", view.text);
+        let cfg = view.config.as_ref().unwrap();
+        assert_eq!(
+            cfg.accounts["brede@tally.no"].monthly_usd,
+            comet_proto::view::rates::Usd::from_dollars(200.0)
+        );
+
+        // A second key joins the table that is now there rather than opening a
+        // second one — two `[account."…"]` headers for one slot do not parse.
+        let view = plan_edit(&paths, "brede@tally.no", "plan", Some("Claude Max 20x")).unwrap();
+        assert_eq!(view.text.matches("[account.").count(), 1, "{}", view.text);
+        let cfg = view.config.as_ref().unwrap();
+        assert_eq!(
+            cfg.accounts["brede@tally.no"].plan.as_deref(),
+            Some("Claude Max 20x")
+        );
+        assert_eq!(
+            cfg.accounts["brede@tally.no"].monthly_usd,
+            comet_proto::view::rates::Usd::from_dollars(200.0)
+        );
+
+        // And clearing it takes the line out — an unknown plan is not a $0 one.
+        let view = plan_edit(&paths, "brede@tally.no", "monthly_usd", None).unwrap();
+        assert!(!view.text.contains("monthly_usd"), "{}", view.text);
+    }
+
+    /// The slot is matched however it was written down — the same rule
+    /// `[users]` follows, and for the same reason: two tables for one
+    /// subscription would be counted twice.
+    #[test]
+    fn an_existing_account_table_keeps_its_spelling() {
+        let (_dir, paths) =
+            paths_with("[account.\"Brede@Tally.no\"]\nmonthly_usd = 100\n\n[defaults]\n");
+        let view = plan_edit(&paths, "brede@tally.no", "monthly_usd", Some("200")).unwrap();
+        assert_eq!(view.text.matches("[account.").count(), 1, "{}", view.text);
+        assert!(
+            view.text.contains("[account.\"Brede@Tally.no\"]"),
+            "{}",
+            view.text
+        );
+        assert_eq!(view.config.as_ref().unwrap().accounts.len(), 1);
+    }
+
+    #[test]
+    fn an_amount_is_read_the_way_a_person_writes_one() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        for (typed, written) in [
+            ("200", "monthly_usd = 200"),
+            ("$1,200", "monthly_usd = 1200"),
+            ("17.50", "monthly_usd = 17.5"),
+            (" 20 ", "monthly_usd = 20"),
+        ] {
+            let view = plan_edit(&paths, "slot@example.com", "monthly_usd", Some(typed)).unwrap();
+            assert!(view.text.contains(written), "{typed}:\n{}", view.text);
+        }
+        // What is not an amount is refused by name, before anything is written.
+        let before = read(&paths).unwrap().text;
+        for bad in ["free", "-200", "two hundred"] {
+            let err = plan_edit(&paths, "slot@example.com", "monthly_usd", Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(bad), "{err}");
+        }
+        assert_eq!(read(&paths).unwrap().text, before, "the file moved");
+    }
+
+    #[test]
+    fn an_account_edit_refuses_a_key_it_cannot_set_and_a_slot_that_is_not_one() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let err = plan_edit(&paths, "brede@tally.no", "montly_usd", Some("200"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`montly_usd` is not a [account] key"), "{err}");
+        assert!(err.contains("monthly_usd"), "it names the set: {err}");
+
+        let err = plan_edit(&paths, "  ", "monthly_usd", Some("200"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not an account"), "{err}");
+        assert_eq!(read(&paths).unwrap().text, SAMPLE, "the file moved");
     }
 }

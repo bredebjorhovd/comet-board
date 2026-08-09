@@ -609,7 +609,7 @@ impl Render for MembersPage {
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
-                            widgets::error_strip(message)
+                            widgets::error_strip(&theme, message)
                                 .id("members-error")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {

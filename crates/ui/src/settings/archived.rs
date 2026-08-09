@@ -297,7 +297,7 @@ impl Render for ArchivedPage {
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
-                            widgets::error_strip(message)
+                            widgets::error_strip(&theme, message)
                                 .id("archived-error")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
