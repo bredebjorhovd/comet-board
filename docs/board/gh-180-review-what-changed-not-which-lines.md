@@ -34,7 +34,7 @@ the session went instead of drawing an empty transcript.
 
 ### One hue means "look here", and only the remainder gets it
 
-The screen paints in the status ramp (§gh#173): the alarm tone is the ramp's
+The screen paints in the status ramp (gh#173): the alarm tone is the ramp's
 blocked hue, the same red a blocked or failed row wears on the board. An
 unclaimed change is not a new kind of bad news needing a new colour; it is the
 board's existing "something is wrong here", said about a diff.
@@ -42,7 +42,7 @@ board's existing "something is wrong here", said about a diff.
 Three things wear it and nothing else does — the verdict strip under the header,
 the remainder block, and the inline `!` marks that flag a contradiction. The
 remainder is the only *bordered, tinted* block on the page and carries the only
-figure-size number (§gh#174's one off-ramp size), because it is the number the
+figure-size number (gh#174's one off-ramp size), because it is the number the
 screen exists to produce. A screen where three things shout has nothing left to
 shout with.
 
