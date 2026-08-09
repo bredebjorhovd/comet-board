@@ -690,11 +690,11 @@ not the same person:
   ported: `notify_dispatcher = true` prompts the dispatching chat when its
   released work settles (or orphans), over the same `Runtime::prompt` review
   delivery uses. The provenance was already on the attempt row
-  (`dispatched_by_pane`). Still off by default, and that is the design rather
-  than caution — an orchestrator woken by every child it released cannot hold
-  a train of thought. Operator-released work has no dispatcher chat, so the
-  switch is silent for it by construction, which is why it stays separate from
-  the operator's own.
+  (`dispatched_by_pane`). Off by default here, on the grounds that an
+  orchestrator woken by every child it released cannot hold a train of thought
+  — §H41 inverts that and says why the sentence was about the other channel.
+  Operator-released work has no dispatcher chat, so the switch is silent for it
+  by construction, which is why it stays separate from the operator's own.
 - **The operator, out of band.** `notify` is now real: it switches one webhook
   URL (`notify_webhook`), POSTed `{"event": "on_blocked" | "on_settled", …}`
   with a `text` line for endpoints that render nothing else. One URL, no
@@ -1060,6 +1060,8 @@ not a second switch on the same channel — every settle, block, orphan and cap
 warning is prompted into it, over the same `Runtime::prompt` review delivery
 and the dispatcher wake already use. When the orchestrator *is* the dispatcher
 it is told once, in the dispatcher's words: the more specific truth wins.
+(Superset until §H41, which cut it back to the events no dispatcher could be
+told about — the tie-break above generalised into the whole rule.)
 
 Wording is shared with the settle notice (`notify::settled_block`) rather than
 written twice, so the one description in `docs/agent-conventions.md` stays the
@@ -2182,7 +2184,109 @@ one usually when a commit landed under the wrong name.
   revocations, and one verb doing all three would make the reversible one look
   as final as the other two.
 
-### H41 — The picker tells the truth about what a box can run — **done** (gh#187)
+### H41 — Dispatcher-first, and the orchestrator hears only what nobody else can — **done** (gh#165)
+`notify.rs` had four audiences and wired the two that are agents as independent
+switches: the chat that released the work (`notify_dispatcher`, off) and the
+pinned orchestrator (`orchestrator_chat`, unset). Both fired when both were set,
+and the orchestrator heard about *everything* — including every settle a live
+dispatcher had already handled. That is backwards, and it is why the dispatcher
+wake shipped off: §H13's config comment said "an orchestrator woken by every
+child it released cannot hold a train of thought", which is true and is a
+description of the **other** channel. The orchestrator channel delivers the
+whole board into one chat. The dispatcher channel prompts the one agent whose
+plan that task was a step in. The caution belonged to the second one and was
+attached to the first.
+
+So the two are now **one channel with a fallback hop** (`SyncEngine::announce`),
+and the switches were the wrong shape rather than wrongly set:
+
+- **Dispatcher-first, on by default.** A settle *or a block* goes to
+  `attempt.dispatched_by_pane` when there is one and it can still be told.
+  Blocks are new here: a block settles nothing and closes nothing, so nothing at
+  all happens until somebody acts, and the party who was waiting on that step is
+  the one who can act soonest. `dispatcher_message` takes a `Signal` now and
+  shares `blocked_block` + `unsticks` with the orchestrator's copy, for
+  `settled_block`'s reason — two audiences describing one state two ways is two
+  contracts for it.
+- **The orchestrator is the addressee of last resort**, and those three cases
+  are the whole of its job. Work no agent released — the panel, the phone, a
+  bare `comet-board dispatch` — which is most of a solo operator's dispatches
+  and reached nobody at all before. Work whose dispatcher did not survive it:
+  attempts cap at 2h and chats archive as their task settles (§H31), so
+  `chat_can_be_told` saying no is ordinary rather than exceptional, and the
+  notice was *dropped* there, silently, documented as best-effort. It is a hop
+  now, not a drop — the event still matters, it just needs a different reader.
+  And the events that belong to no attempt, which is the duration cap's warning:
+  the attempt is still running, so no dispatcher is waiting on a step that
+  finished, and it goes straight to the pin as it always did.
+- **No double delivery.** When a dispatcher was told, the orchestrator is not.
+  That is what makes a pinned orchestrator survivable on a board with
+  dispatching siblings on it: its context fills with the things that would
+  otherwise vanish, not with a copy of every child's settle. §H21's tie-break —
+  "when the orchestrator *is* the dispatcher it is told once" — was this rule
+  seen through a keyhole.
+- **Nothing is dropped in silence.** An event that reaches neither agent now
+  logs which half of the address was empty ("no chat released it, and no
+  orchestrator is pinned" / "the chat that released it is gone, and …"), because
+  "the orchestrator never told me" and "the orchestrator had nothing to say"
+  were indistinguishable. That is what `Told` exists for: three answers rather
+  than a bool, since both the hop and the log line need to know *why* a channel
+  came up empty.
+- **`doctor` says which channel takes an event**, rather than reporting two
+  switches. `settle notice` reads the pin as well as the switch — off with a pin
+  is a routing choice and off without one is silence, and one boolean cannot
+  tell those apart — and the `orchestrator` line says "addressee of last resort"
+  or, with the wake off, that it is taking the whole board again.
+
+Unchanged, and said out loud: the operator webhook (audience 4) and the upstream
+comment (audience 1). Neither is addressed to an agent, and the comment is the
+durable trail either way. Whether a *human* dispatcher gets anything is still
+out of scope — they get the webhook and the row.
+
+### H42 — The phone could unpin an orchestrator and never pin one — **done** (gh#166)
+`BoardStore.setOrchestrator(chatId:)` has taken a chat id since §H33 wrote it,
+written the same `[defaults] orchestrator_chat` key through the same validated
+`WriteBoardConfig`, and applied nothing optimistically. Its only caller passed
+`nil`. The kill switch shipped; the affirmative half was never given a surface,
+so a board pinned from the desktop could be unpinned from the phone and then
+only re-pinned by ssh-ing to the box.
+
+- **Saying it does not do it, and the chat cannot do it itself.** Telling a
+  session "you are now the orchestrator" hands it the brief and moves no
+  address: the pin is one chat id in `routing.toml` that `announce` queues
+  prompts into, and the two are separable — only the address was missing on
+  iOS. Nor could the chat close the gap from inside: an agent learns its own id
+  from `COMET_BOARD_CHAT_ID`, which only a *dispatched* run carries, and an
+  orchestrator is by definition a chat somebody opened.
+- **Three surfaces, one item, one voice.** `OrchestratorPin.swift` holds the
+  words (`Pin as orchestrator` / `Unpin as orchestrator`, the desktop's and the
+  TUI's), the confirmation, and both refusals; the surfaces hold only where the
+  menu hangs. The chat screen's ⋯ menu — because an idle orchestrator has no
+  Active row and, before it is pinned, no slot either — plus a long-press on
+  the Active or Needs-you row of a chat that is running, and on the pinned slot,
+  where §H33's unpin already lived. Same modifier there now: that row is the
+  pinned case of the same item, not a second one.
+- **Pinning asks; unpinning does not.** The cost of the pin is that chat's
+  attention — every settle, block, orphan and cap warning arrives in it as a
+  prompt — so the dialog says so, and says the way back is a long-press on the
+  ◆ slot it is about to gain. It also names the chat it displaces, because
+  `orchestrator_chat` is one key: a second pin *moves* it, and a menu that let
+  you read it as "add" would be lying about the config it writes. Unpinning
+  stays immediate: a kill switch that asks a question is not one.
+- **Not offered on a chat the board dispatched.** That is the one thing
+  `comet-board doctor` says can be wrong with a pin — an attempt holds a
+  workspace slot and pinning it exempts it from its own time cap. The phone
+  declines to offer the mistake rather than reporting it afterwards; the *unpin*
+  is never withheld, since whatever is pinned has to be removable here however
+  it got pinned.
+- **Still nothing optimistic, and the same refusals.** Both halves call the one
+  `setOrchestrator`, so "No board host" and a write the box refused come back in
+  the words they always did — only the verb in the alert's title follows what
+  the operator asked for. The board republishes the pin on the watch stream as
+  the write lands, so the slot *appearing* is the box agreeing, exactly as the
+  slot disappearing already was.
+
+### H43 — The picker tells the truth about what a box can run — **done** (gh#187)
 Half of "every harness reachable in every project" already worked: a dispatch
 can name any runtime (`--runtime codex`, the desktop and phone pickers), it is
 validated against the engine's catalog, and an unknown name is refused rather

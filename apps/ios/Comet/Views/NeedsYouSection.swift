@@ -7,6 +7,11 @@
 // ports of `comet_proto::view::needs`). A tap opens the chat, which is where
 // answering, retrying and reading all happen — and what marks the thread seen,
 // the synced marker that clears the badge on every device.
+//
+// The one thing a row here writes is the orchestrator pin, on long-press
+// (`OrchestratorPin.swift`, gh#166): both halves of it, in the words the
+// desktop and the TUI use, since the slot below is only the pinned case of the
+// same item.
 
 import SwiftUI
 
@@ -40,6 +45,11 @@ struct NeedsYouSection: View {
                     NeedRowView(need: need)
                 }
                 .buttonStyle(PressWashButtonStyle())
+                // A chat asking you something is a chat you are looking at, so
+                // the pin is offered here too (gh#166) — an orchestrator is
+                // usually pinned in the middle of the work that made you want
+                // one, not from a settings page afterwards.
+                .orchestratorPinMenu(chatId: need.chatId)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -116,10 +126,6 @@ struct OrchestratorSlotSection: View {
     @Environment(AppModel.self) private var model
     @Binding var path: [Route]
 
-    /// Why the unpin did not happen, when it did not. Nothing is said on
-    /// success — the slot disappearing IS the board agreeing.
-    @State private var failure: String?
-
     var body: some View {
         if let slot = model.orchestratorSlotRow {
             Section {
@@ -137,35 +143,14 @@ struct OrchestratorSlotSection: View {
                 // desktop and the TUI grew this menu for exactly that; the
                 // phone has no `comet-board routes defaults orchestrator_chat
                 // --unset` to fall back to.
-                .contextMenu {
-                    Button("Unpin orchestrator", systemImage: "pin.slash",
-                           role: .destructive) {
-                        unpin()
-                    }
-                }
+                //
+                // The item, its words and its refusal are the same ones every
+                // other chat's menu carries (gh#166) — this row is only the
+                // pinned case of them.
+                .orchestratorPinMenu(chatId: slot.chatId)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 1, trailing: 12))
-                .alert("Couldn't unpin the orchestrator",
-                       isPresented: Binding(get: { failure != nil },
-                                            set: { if !$0 { failure = nil } })) {
-                    Button("OK", role: .cancel) { failure = nil }
-                } message: {
-                    Text(failure ?? "")
-                }
-            }
-        }
-    }
-
-    /// Clear `[defaults] orchestrator_chat` on the board's routing.toml.
-    ///
-    /// Nothing is applied optimistically: the board republishes the pin on the
-    /// watch stream as the write lands, so a refusal must not leave the slot
-    /// gone on a phone the box disagrees with.
-    private func unpin() {
-        Task {
-            if let error = await model.setOrchestrator(chatId: nil) {
-                failure = error
             }
         }
     }

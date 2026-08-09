@@ -355,6 +355,27 @@ final class AppModel {
         demo != nil ? demo?.orchestratorChatId : board?.orchestratorChatId
     }
 
+    /// What to call the pinned chat when a *different* chat is about to take
+    /// the pin from it (gh#166) — the pin is one key, so saying yes moves it.
+    ///
+    /// A pin whose chat has not synced to this phone still has to be nameable:
+    /// the operator is being told what they are about to displace, and "nothing
+    /// is pinned" would be the one wrong answer.
+    var pinnedOrchestratorName: String? {
+        guard let pin = orchestratorChatId else { return nil }
+        return chat(id: pin)?.displayTitle ?? orchestratorName
+    }
+
+    /// Whether the board dispatched this chat — an attempt of its own.
+    ///
+    /// The one thing `comet-board doctor` says can be wrong with a pin: an
+    /// attempt holds a workspace slot and is exempted from its own time cap by
+    /// being pinned. Rows the board never released answer false, which includes
+    /// every chat on a phone attached to no board at all.
+    func boardDispatched(chatId: String) -> Bool {
+        boardRows.contains { $0.chatId == chatId }
+    }
+
     /// The "Needs you" inbox (gh#122): everything waiting on a human, most
     /// owed first, joined from the four streams the app already holds.
     var needsYouRows: [NeedRow] {
