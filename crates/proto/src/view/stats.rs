@@ -68,6 +68,46 @@ pub struct TokenTally {
     pub usage: TokenUsage,
 }
 
+/// Hours in the box's local day — the width of every hour series here.
+pub const HOURS: usize = 24;
+
+/// One row of the crossed grid (gh#179): a workspace, and its dispatches by
+/// hour of the local day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourRow {
+    pub label: String,
+    /// [`HOURS`] slots, always all of them.
+    pub hours: Vec<usize>,
+    pub total: usize,
+}
+
+/// *When* the work is released crossed with *where* it goes (gh#179).
+///
+/// These were two cards — an hour histogram and a workspace tally — and the
+/// fact worth having was in neither of them: that the evening releases all go
+/// to one space, or that a space is only ever touched inside working hours. A
+/// reader cannot recover a crossing from two margins, so the page draws the
+/// crossing and keeps the margins on its edges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HourGrid {
+    /// Busiest space first, ties alphabetical, tail folded into `n others`.
+    pub rows: Vec<HourRow>,
+    /// The bottom margin: dispatches per hour across every row, folded ones
+    /// included — the old hour histogram, in its place.
+    pub columns: Vec<usize>,
+    /// The busiest single cell, which is what the heat is scaled against.
+    pub peak: usize,
+    pub total: usize,
+}
+
+impl HourGrid {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 /// Where the work ended up, which is the question a completion rate only
 /// half-answers: an attempt can end `done` and leave a pull request nobody
 /// merged.
@@ -263,6 +303,40 @@ impl BoardSpend {
             .filter_map(|a| a.plan.as_ref().map(|p| p.monthly))
             .sum()
     }
+
+    /// The same, pro-rated onto *this window* — the only form in which the two
+    /// halves are comparable at all, and the denominator of
+    /// [`subsidy`](Self::subsidy).
+    ///
+    /// `None` when not one account has a plan to pro-rate, which is a state the
+    /// page says out loud: a missing plan is unentered, never free. Summing
+    /// plans across accounts is the same arithmetic
+    /// [`monthly_subscriptions`](Self::monthly_subscriptions) does, and just as
+    /// carefully NOT added to the list price — the pair is a ratio, never a
+    /// total.
+    pub fn subscriptions_in_window(&self) -> Option<Usd> {
+        let mut found = false;
+        let mut total = Usd::ZERO;
+        for account in &self.accounts {
+            if let Some(share) = account.plan_in_window {
+                found = true;
+                total += share;
+            }
+        }
+        found.then_some(total)
+    }
+
+    /// How far the subscriptions carried the window: list price as a multiple
+    /// of what the plans behind it cost over the same days. The board-wide
+    /// answer to [`AccountSpend::subsidy`]'s per-account one, and the headline
+    /// the spend block exists for.
+    ///
+    /// `None` when there is nothing to divide by — no plan entered, or plans
+    /// that are free. A ratio against zero is not a number.
+    pub fn subsidy(&self) -> Option<f64> {
+        let plan = self.subscriptions_in_window()?;
+        (!plan.is_zero()).then(|| self.list_price.dollars() / plan.dollars())
+    }
 }
 
 /// Everything the board can say about its own throughput over a window.
@@ -321,6 +395,15 @@ pub struct BoardStats {
     pub daily_tokens: Vec<TokenDay>,
     /// Dispatches by hour of the box's local day, `[0..24)`.
     pub hour_of_day: Vec<usize>,
+    /// The same hours, split by the workspace they went to (gh#179) — the
+    /// crossing [`hour_grid`] draws, and the reason "when" and "where" are one
+    /// block rather than two cards that each hide what the other knows.
+    ///
+    /// Every value is [`HOURS`] long. Defaulted on the wire: a board that
+    /// predates this field answers without it, and an absent crossing is a page
+    /// that falls back to the margins rather than one that fails to decode.
+    #[serde(default)]
+    pub hours_by_workspace: BTreeMap<String, Vec<usize>>,
 
     pub by_workspace: BTreeMap<String, usize>,
     pub by_runtime: BTreeMap<String, usize>,
@@ -375,7 +458,8 @@ impl BoardStats {
             friction: Friction::default(),
             daily: Vec::new(),
             daily_tokens: Vec::new(),
-            hour_of_day: vec![0; 24],
+            hour_of_day: vec![0; HOURS],
+            hours_by_workspace: BTreeMap::new(),
             by_workspace: BTreeMap::new(),
             by_runtime: BTreeMap::new(),
             by_source: BTreeMap::new(),
@@ -525,6 +609,93 @@ pub fn human_tokens(tokens: u64) -> String {
     tokens.to_string()
 }
 
+/// The crossing of *when* against *where*, ready to draw (gh#179).
+///
+/// The same ranking rule as every tally here — biggest first, ties
+/// alphabetical, the tail folded into one honest `n others` row that carries
+/// the hours it stands for — applied to a row of 24 numbers instead of one.
+/// The column margin is summed after the fold, over every row, so the bottom
+/// of the grid is the hour histogram it replaced and not just the rows that
+/// survived the cap.
+///
+/// Rows arrive from the wire ([`BoardStats::hours_by_workspace`]) and are
+/// normalised to [`HOURS`] on the way in: a board that answered with a shorter
+/// vector is a board this one does not have to trust to index safely.
+///
+/// Unlike the rules beside it this one has no Swift counterpart yet — the
+/// phone's stats screen (`apps/ios/Comet/Views/StatsView.swift`) draws no grid,
+/// so there is nothing there to disagree with it. When it does, this is the
+/// arithmetic it adopts, and the cross-language fixture is where the case goes.
+pub fn hour_grid(hours_by_workspace: &BTreeMap<String, Vec<usize>>, max_rows: usize) -> HourGrid {
+    let mut rows: Vec<HourRow> = hours_by_workspace
+        .iter()
+        .map(|(label, hours)| {
+            let mut slots = vec![0usize; HOURS];
+            for (slot, count) in slots.iter_mut().zip(hours.iter()) {
+                *slot = *count;
+            }
+            HourRow {
+                label: label.clone(),
+                total: slots.iter().sum(),
+                hours: slots,
+            }
+        })
+        // A space with nothing in the window is noise in a grid about when
+        // work happens — the same rule `ranked_tokens` applies to a model that
+        // spent nothing.
+        .filter(|row| row.total > 0)
+        .collect();
+    rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.label.cmp(&b.label)));
+
+    if max_rows > 0 && rows.len() > max_rows {
+        let tail = rows.split_off(max_rows);
+        let mut folded = vec![0usize; HOURS];
+        for row in &tail {
+            for (slot, count) in folded.iter_mut().zip(row.hours.iter()) {
+                *slot += count;
+            }
+        }
+        rows.push(HourRow {
+            label: format!("{} others", tail.len()),
+            total: folded.iter().sum(),
+            hours: folded,
+        });
+    }
+
+    let mut columns = vec![0usize; HOURS];
+    for row in &rows {
+        for (slot, count) in columns.iter_mut().zip(row.hours.iter()) {
+            *slot += count;
+        }
+    }
+    HourGrid {
+        peak: rows
+            .iter()
+            .flat_map(|r| r.hours.iter().copied())
+            .max()
+            .unwrap_or(0),
+        total: rows.iter().map(|r| r.total).sum(),
+        rows,
+        columns,
+    }
+}
+
+/// A ratio said the way a person compares two prices: `12×`, `5.3×`, `0.42×`.
+///
+/// Precision grows as the number shrinks, because that is where it starts to
+/// matter: nobody acts on the difference between 12.3× and 12× of subsidy, and
+/// everybody acts on the difference between 0.9× and 0.4×.
+pub fn human_multiple(ratio: f64) -> String {
+    let r = ratio.max(0.0);
+    if r >= 10.0 {
+        format!("{r:.0}×")
+    } else if r >= 1.0 {
+        format!("{r:.1}×")
+    } else {
+        format!("{r:.2}×")
+    }
+}
+
 /// A bar's share of its chart, `0.0..=1.0`, scaled against the largest bucket.
 ///
 /// Against the largest and not against the total: these charts answer "which
@@ -671,6 +842,98 @@ mod tests {
         assert_eq!(s.hour_of_day.len(), 24);
     }
 
+    // -- the crossing (gh#179) -----------------------------------------------
+
+    /// A workspace's day, from `(hour, count)` pairs.
+    fn hours(pairs: &[(usize, usize)]) -> Vec<usize> {
+        let mut out = vec![0usize; HOURS];
+        for (hour, count) in pairs {
+            out[*hour] = *count;
+        }
+        out
+    }
+
+    #[test]
+    fn the_crossing_keeps_both_margins_the_two_cards_used_to_be() {
+        let crossed: BTreeMap<String, Vec<usize>> = [
+            ("comet".to_string(), hours(&[(9, 3), (22, 5)])),
+            ("edge".to_string(), hours(&[(9, 2)])),
+        ]
+        .into_iter()
+        .collect();
+        let grid = hour_grid(&crossed, 6);
+        // The workspace tally, as row totals: biggest first.
+        assert_eq!(grid.rows[0].label, "comet");
+        assert_eq!(grid.rows[0].total, 8);
+        assert_eq!(grid.rows[1].total, 2);
+        // The hour histogram, as the column margin.
+        assert_eq!(grid.columns[9], 5);
+        assert_eq!(grid.columns[22], 5);
+        assert_eq!(grid.columns.iter().sum::<usize>(), 10);
+        assert_eq!(grid.total, 10);
+        // And the fact neither margin holds: the 22:00 releases are all one
+        // space, the 09:00 ones are split.
+        assert_eq!(grid.rows[0].hours[22], 5);
+        assert_eq!(grid.rows[1].hours[22], 0);
+        // Heat scales against the busiest CELL, not the busiest row.
+        assert_eq!(grid.peak, 5);
+    }
+
+    #[test]
+    fn a_capped_crossing_folds_the_tail_hour_by_hour() {
+        let crossed: BTreeMap<String, Vec<usize>> = [
+            ("a".to_string(), hours(&[(1, 9)])),
+            ("b".to_string(), hours(&[(2, 4)])),
+            ("c".to_string(), hours(&[(2, 3)])),
+            ("d".to_string(), hours(&[(3, 2)])),
+        ]
+        .into_iter()
+        .collect();
+        let grid = hour_grid(&crossed, 2);
+        assert_eq!(grid.rows.len(), 3);
+        assert_eq!(grid.rows[2].label, "2 others");
+        // Folded element-wise: the tail's two spaces both released in hour 2
+        // and 3, and the fold keeps the hours rather than only the count.
+        assert_eq!(grid.rows[2].hours[2], 3);
+        assert_eq!(grid.rows[2].hours[3], 2);
+        assert_eq!(grid.rows[2].total, 5);
+        // The margin still totals every dispatch, folded ones included.
+        assert_eq!(grid.columns.iter().sum::<usize>(), 18);
+    }
+
+    #[test]
+    fn a_crossing_with_nothing_in_it_is_empty_rather_than_a_grid_of_zeroes() {
+        assert!(hour_grid(&BTreeMap::new(), 6).is_empty());
+        let quiet: BTreeMap<String, Vec<usize>> = [("comet".to_string(), vec![0; HOURS])]
+            .into_iter()
+            .collect();
+        let grid = hour_grid(&quiet, 6);
+        assert!(grid.is_empty());
+        assert_eq!(grid.peak, 0);
+    }
+
+    #[test]
+    fn a_short_row_off_the_wire_still_has_a_slot_for_every_hour() {
+        // An older board, or one that answered with a truncated series: the
+        // grid indexes 24 slots either way rather than trusting the sender.
+        let ragged: BTreeMap<String, Vec<usize>> =
+            [("comet".to_string(), vec![1, 2, 3])].into_iter().collect();
+        let grid = hour_grid(&ragged, 6);
+        assert_eq!(grid.rows[0].hours.len(), HOURS);
+        assert_eq!(grid.rows[0].total, 6);
+        assert_eq!(grid.columns.len(), HOURS);
+    }
+
+    #[test]
+    fn a_multiple_gets_precise_where_precision_starts_to_matter() {
+        assert_eq!(human_multiple(12.34), "12×");
+        assert_eq!(human_multiple(5.28), "5.3×");
+        assert_eq!(human_multiple(1.0), "1.0×");
+        // Under one: the plan cost more than the work would have.
+        assert_eq!(human_multiple(0.4231), "0.42×");
+        assert_eq!(human_multiple(0.0), "0.00×");
+    }
+
     #[test]
     fn a_percentage_is_whole_and_bounded() {
         assert_eq!(percent(Some(0.914)), Some("91%".into()));
@@ -791,6 +1054,73 @@ mod tests {
         assert_eq!(peak_tokens(&[]), 0);
     }
 
+    // -- the spend headline (gh#182 rendered by gh#179) -----------------------
+
+    fn account(
+        label: &str,
+        list: f64,
+        monthly: Option<f64>,
+        in_window: Option<f64>,
+    ) -> AccountSpend {
+        AccountSpend {
+            label: label.to_string(),
+            attempts: 1,
+            usage: usage(1, 1, 0, 0),
+            list_price: Usd::from_dollars(list),
+            unpriced_tokens: 0,
+            plan: monthly.map(|m| AccountPlan {
+                label: None,
+                monthly: Usd::from_dollars(m),
+            }),
+            plan_in_window: in_window.map(Usd::from_dollars),
+        }
+    }
+
+    fn priced(list: f64, accounts: Vec<AccountSpend>) -> BoardSpend {
+        BoardSpend {
+            rates: crate::view::rates::RateTable::empty("2026-06-24"),
+            list_price: Usd::from_dollars(list),
+            by_model: Vec::new(),
+            unpriced: Vec::new(),
+            unpriced_tokens: 0,
+            accounts,
+        }
+    }
+
+    #[test]
+    fn the_subsidy_is_a_ratio_of_the_window_and_never_a_sum() {
+        let spend = priced(
+            240.0,
+            vec![
+                account("brede@tally.no", 200.0, Some(200.0), Some(46.666_667)),
+                account("ana@example.com", 40.0, Some(20.0), Some(4.666_667)),
+            ],
+        );
+        // The two plans are pro-rated onto the same window and compared with
+        // the list price — never added to it.
+        let plans = spend.subscriptions_in_window().expect("both have plans");
+        assert_eq!(plans, Usd::from_dollars(51.333_334));
+        assert_eq!(human_multiple(spend.subsidy().expect("a ratio")), "4.7×");
+        // The monthly figure is a different question and stays whole.
+        assert_eq!(spend.monthly_subscriptions(), Usd::from_dollars(220.0));
+    }
+
+    #[test]
+    fn a_window_with_no_plan_entered_has_no_multiple_rather_than_an_infinite_one() {
+        // Unentered is not free: with nothing to divide by there is no answer,
+        // and the page says so instead of drawing a subsidy of ∞.
+        let spend = priced(12.4, vec![account("brede@tally.no", 12.4, None, None)]);
+        assert_eq!(spend.subscriptions_in_window(), None);
+        assert_eq!(spend.subsidy(), None);
+        // A plan that costs nothing is the same non-answer.
+        let free = priced(
+            12.4,
+            vec![account("ci@example.com", 12.4, Some(0.0), Some(0.0))],
+        );
+        assert_eq!(free.subscriptions_in_window(), Some(Usd::ZERO));
+        assert_eq!(free.subsidy(), None);
+    }
+
     #[test]
     fn the_wire_shape_round_trips_camel_case() {
         // The board gathers this on the box and a viewport deserializes it
@@ -821,6 +1151,8 @@ mod tests {
             done: 3,
         }];
         s.by_workspace.insert("attn".into(), 4);
+        s.hours_by_workspace
+            .insert("attn".into(), hours(&[(9, 3), (22, 1)]));
         s.tokens = usage(1_000, 200, 40_000, 3_000);
         s.attempts_with_tokens = 3;
         s.token_coverage = Some(0.75);
@@ -840,6 +1172,7 @@ mod tests {
         assert!(json.get("p90Minutes").is_some());
         assert!(json.get("totalMinutes").is_some());
         assert!(json.get("hourOfDay").is_some());
+        assert!(json.get("hoursByWorkspace").is_some());
         assert!(json.get("byWorkspace").is_some());
         assert!(json.get("agentDispatched").is_some());
         assert!(json["landing"].get("closedUnmerged").is_some());
@@ -852,10 +1185,25 @@ mod tests {
         assert!(json.get("tokensByModel").is_some());
         assert!(json.get("tokensByRuntime").is_some());
         assert_eq!(json["tokens"]["cacheReadTokens"], 40_000);
-        assert_eq!(json["dailyTokens"][0]["usage"]["cacheCreationTokens"], 3_000);
+        assert_eq!(
+            json["dailyTokens"][0]["usage"]["cacheCreationTokens"],
+            3_000
+        );
 
-        let back: BoardStats = serde_json::from_value(json).expect("deserializes");
+        let back: BoardStats = serde_json::from_value(json.clone()).expect("deserializes");
         assert_eq!(back, s);
+
+        // A board that predates the crossing (gh#179) answers without the key,
+        // and its throughput numbers still arrive: an older box is a page with
+        // no grid, not a page that failed to decode.
+        let mut older = json;
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("hoursByWorkspace");
+        let back: BoardStats = serde_json::from_value(older).expect("deserializes without it");
+        assert!(back.hours_by_workspace.is_empty());
+        assert_eq!(back.attempts, 4);
     }
 }
 
@@ -1047,6 +1395,24 @@ mod spec {
             },
         ];
         busy.by_workspace = tally(&[("comet-native", 9), ("edge", 4)]);
+        // The crossing (gh#179), summing to the tally above it hour by hour:
+        // one space worked on all evening, one only in the afternoon. The
+        // phone does not draw this yet and ignores the key — what the fixture
+        // pins here is that it still decodes the rest of the reply when a
+        // newer board sends it.
+        busy.hours_by_workspace = [
+            ("comet-native", &[(14, 2), (21, 3), (22, 4)][..]),
+            ("edge", &[(14, 3), (15, 1)][..]),
+        ]
+        .into_iter()
+        .map(|(label, pairs)| {
+            let mut slots = vec![0usize; HOURS];
+            for (hour, count) in pairs {
+                slots[*hour] = *count;
+            }
+            (label.to_string(), slots)
+        })
+        .collect();
         busy.by_runtime = tally(&[("claude-code", 10), ("codex", 3)]);
         busy.agent_dispatched = 5;
         busy.tokens_by_model = token_tally(&[

@@ -301,6 +301,16 @@ struct BoardStats: Decodable, Hashable {
     var dailyTokens: [TokenDay]
     /// Dispatches by hour of the box's local day, 24 slots.
     var hourOfDay: [Int]
+    /// The same hours, split by the workspace they went to (gh#179) — the
+    /// crossing the desktop's stats page draws instead of an hour card and a
+    /// space card that each hide what the other knows.
+    ///
+    /// Optional because it is optional on the wire: a board older than the
+    /// field answers without it, and this screen does not draw the grid yet
+    /// either. Decoded rather than ignored so the phone's copy of the shape
+    /// stays the whole shape — `comet_proto::view::stats::hour_grid` is the
+    /// arithmetic to mirror on the day it does.
+    var hoursByWorkspace: [String: [Int]]?
 
     var byWorkspace: [String: Int]
     var byRuntime: [String: Int]
