@@ -1,5 +1,9 @@
 # Rust harness integration: Claude Code + Codex (2026-07)
 
+> Still the shipping design. Whether the bespoke adapters below should give way
+> to one Agent Client Protocol harness is evaluated in [acp.md](acp.md) (gh#147)
+> — outcome: adopt additively, convert these two only behind a real dispatch.
+
 ## Decision
 - Claude Code: spawn installed `claude` CLI, speak stream-json directly. NO crates.io SDK dep
   (crate "claude-agent-sdk" is name-squatted w/ fake anthropics repo; `claude-codes` 2.1.x is a

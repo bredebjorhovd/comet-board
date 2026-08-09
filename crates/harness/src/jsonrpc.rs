@@ -1,5 +1,12 @@
-//! Minimal JSON-RPC 2.0 client over the app server's stdio (newline-delimited
-//! frames, id-multiplexed), ported from codex.ts's `startAppServer`.
+//! Minimal JSON-RPC 2.0 client over a child's stdio (newline-delimited frames,
+//! id-multiplexed), ported from codex.ts's `startAppServer`.
+//!
+//! Shared, not codex's: the codex app-server and the Agent Client Protocol are
+//! the same wire shape, so an ACP adapter would speak through this client
+//! unchanged. Promoted out of `codex/rpc.rs` for that reason — upstream made
+//! the identical move before converting its harnesses (docs/research/acp.md),
+//! and matching the file's name and place is most of what a later port of
+//! their `acp/` module would otherwise have to reconcile.
 //!
 //! - Responses are matched to callers by numeric id (a shared pending map the
 //!   reader task resolves directly, so requests can be awaited from anywhere —
@@ -22,7 +29,7 @@ use crate::HarnessError;
 
 /// A non-response line from the app server, in stdout order.
 #[derive(Debug)]
-pub(crate) enum Incoming {
+pub enum Incoming {
     Notification {
         method: String,
         params: Value,
@@ -41,7 +48,7 @@ pub(crate) enum Incoming {
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 
 #[derive(Clone)]
-pub(crate) struct RpcClient {
+pub struct RpcClient {
     next_id: Arc<AtomicI64>,
     pending: Pending,
     writer: mpsc::UnboundedSender<String>,
@@ -124,7 +131,7 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
             stdin.flush().await
         };
         if let Err(e) = write.await {
-            tracing::debug!(target: "comet_harness::codex", "stdin write failed (tolerated): {e}");
+            tracing::debug!(target: "comet_harness::jsonrpc", "stdin write failed (tolerated): {e}");
             return;
         }
     }
@@ -143,7 +150,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            tracing::debug!(target: "comet_harness::codex", "non-JSON stdout line (skipped)");
+            tracing::debug!(target: "comet_harness::jsonrpc", "non-JSON stdout line (skipped)");
             continue;
         };
         let method = msg.get("method").and_then(Value::as_str);
