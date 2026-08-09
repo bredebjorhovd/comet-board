@@ -11,6 +11,12 @@ struct SessionView: View {
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
 
+    /// The orchestrator pin, asked for and refused (gh#166) — the chat's own
+    /// menu is where a person is standing when they decide this chat is the one
+    /// the board should talk to.
+    @State private var pinRequest: OrchestratorPinRequest?
+    @State private var pinFailure: OrchestratorPinFailure?
+
     /// Width the nav bar's own controls need either side of the title — the
     /// back button leading, breathing room trailing.
     private static let headerChromeInset: CGFloat = 132
@@ -93,8 +99,27 @@ struct SessionView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                // The chat's own menu. It holds one item today — the pin — and
+                // exists because that item has nowhere else to be for a chat
+                // that is not running: an idle orchestrator has no Active row,
+                // and before it is pinned it has no slot either. Absent when the
+                // board dispatched this chat, which is the one chat that must
+                // not be pinned.
+                if orchestratorPinOffered(chatId: chatId, model: model) {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            orchestratorPinItem(chatId: chatId, model: model,
+                                                request: $pinRequest,
+                                                failure: $pinFailure)
+                        } label: {
+                            Image(systemName: "ellipsis")
+                        }
+                        .accessibilityLabel("Session menu")
+                    }
+                }
             }
         }
+        .orchestratorPinPrompts(request: $pinRequest, failure: $pinFailure)
         .sheet(isPresented: $showConfig) {
             if let chat {
                 let harness = chat.config?.harness ?? "claude-code"
