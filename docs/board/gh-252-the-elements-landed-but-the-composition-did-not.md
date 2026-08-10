@@ -10,14 +10,14 @@ This one was built from the design file itself — fetched over `DesignSync`
 not described. Every number in the constant block at the top of
 `crates/ui/src/settings/stats.rs` comes off that file.
 
-## Before and after, same board, same window
+### Before and after, same board, same window
 
 The screenshots below are the same seeded week rendered by the commit before
 this branch and by its head, so the difference is the code and nothing else.
 Reproduce either with `crates/board/examples/seed_stats.rs` — see
 [Reproducing](#reproducing).
 
-### Before — two screens for one window
+#### Before — two screens for one window
 
 | | |
 |---|---|
@@ -29,19 +29,19 @@ released` is one card holding both the day chart *and* `Where the work landed`;
 the outcomes bar sits in card two instead of last; the page ends in a stack; and
 the bars are painted in the review hue, which on this page means a state.
 
-### After — dark
+#### After — dark
 
 | | |
 |---|---|
 | ![After, dark, top](../screenshots/stats-dark-top.png) | ![After, dark, bottom](../screenshots/stats-dark-bottom.png) |
 
-### After — light
+#### After — light
 
 | | |
 |---|---|
 | ![After, light, top](../screenshots/stats-light-top.png) | ![After, light, bottom](../screenshots/stats-light-bottom.png) |
 
-### An empty chart collapses rather than reserves
+#### An empty chart collapses rather than reserves
 
 ![Empty chart collapses](../screenshots/stats-dark-empty-chart.png)
 
@@ -50,7 +50,7 @@ all** — its aside says why and the captions still carry the dispatch counts �
 and the whole page fits one 880px window. Before, this state was ~400px of
 nothing holding seven em dashes.
 
-## What changed
+### What changed
 
 **Five cards in four rows, in the design's order.**
 
@@ -82,7 +82,7 @@ headers are unchanged (`Board stats`, `Board routing`, `Archived sessions`) —
 `SettingsSection::label` was only ever the sidebar's string, so the section name
 no longer repeats the page title inside a 256px rail.
 
-## What was removed, and where it went
+### What was removed, and where it went
 
 The design has no room for a question answered twice, and three things on this
 page were answered twice. None of the underlying numbers are gone — the board
@@ -100,7 +100,7 @@ counts or the per-account multiple should keep a card of their own, say so and
 they come back — but they come back as a sixth card, and the page stops fitting
 the window again.
 
-## Reproducing
+### Reproducing
 
 An empty board draws the empty state, which is the one state that cannot show
 whether the layout is right. `crates/board/examples/seed_stats.rs` invents a
@@ -127,7 +127,7 @@ that already holds a board. `COMET_IPC_PORT` matters too: without a distinct
 port the app attaches to whatever engine is already running and reads *its*
 board, which looks exactly like success.
 
-## Notes
+### Notes
 
 - Everything in the fixture is invented and marked as such — the accounts are
   `@example.invalid`, the tasks are `Seeded task N`. It is dispatch metadata and
