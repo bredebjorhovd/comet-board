@@ -207,7 +207,7 @@ struct NewSpaceSheet: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
+        .cometAppearance()
         .task {
             hosts = await model.repoHosts()
             sweeping = false

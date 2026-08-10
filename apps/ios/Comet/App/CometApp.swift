@@ -13,7 +13,9 @@ struct CometApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
-                .preferredColorScheme(.dark)
+                // The scheme is a preference, not a constant (gh#257): System
+                // by default, so the theme's dynamic tokens resolve from iOS.
+                .cometAppearance()
                 // Monochrome controls: glass buttons, toolbar icons, and
                 // toggles render white like the desktop — accent stays paint
                 // for status/markdown, never chrome.

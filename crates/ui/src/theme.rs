@@ -183,8 +183,14 @@
 //! runs the same three scans over the Swift that `tests/text_tones.rs` and
 //! `tests/scale.rs` run over this crate. **Changing a number here changes it
 //! there** — the test will say so, and the fix is the Swift constant, never a
-//! second opinion. What is deliberately NOT ported: [`Theme::light`] (that app
-//! is always-dark) and [`Theme::row`] (a phone has no pointer).
+//! second opinion.
+//!
+//! Light crossed in gh#257, but its paint does NOT come from [`Theme::light`]:
+//! the supplied `Comet iOS.dc.html` declares a distinct neutral/status palette
+//! for the phone. The phone declares each colour as `themed(dark:light:)`, and
+//! `tests/ios_theme.rs` holds the dark halves plus shared scales to this file
+//! while holding the light halves to that iOS reference. Still not ported:
+//! [`Theme::row`] (a phone has no pointer).
 
 use comet_proto::ChatIndicator;
 use comet_proto::view::board::{AgentState, BoardState};

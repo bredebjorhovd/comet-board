@@ -92,6 +92,10 @@ struct HomeView: View {
                         if model.demo != nil {
                             Text("Demo mode")
                         }
+                        // The desktop's Appearance settings page, at the size a
+                        // phone needs it (gh#257): the theme has two variants
+                        // now, and this is the only place that says so.
+                        AppearanceMenuSection()
                         Button("Sign out", role: .destructive) { model.signOut() }
                     } label: {
                         Image(systemName: "person.circle")

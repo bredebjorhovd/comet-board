@@ -7,9 +7,12 @@ import SwiftUI
 
 enum SheetStyle {
     static let cardRadius: CGFloat = Theme.radiusCard
-    static let cardFill = whiteAlpha(0.045)
-    static let rowSeparator = whiteAlpha(0.06)
-    static let panel = grey(0x14)
+    /// A translucent lift off the panel in dark; the white object on it in
+    /// light, where a card that got DARKER than its page would read as a hole
+    /// (gh#257 / gh#177's first finding).
+    static let cardFill = Theme.card
+    static let rowSeparator = Theme.separator
+    static let panel = Theme.sheetPanel
 }
 
 /// Grouped card: rows separated by inset hairlines.

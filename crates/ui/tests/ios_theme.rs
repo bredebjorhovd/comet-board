@@ -7,17 +7,35 @@
 //! `boardStateColor` said amber and `ChatIndicator.dotColor` said pink, one
 //! screen apart, months after the desktop had settled that argument.
 //!
-//! So this file reads the Swift as text and holds it to the Rust. Four checks,
+//! So this file reads the Swift as text and holds dark plus the shared scales to
+//! Rust, while holding light to the supplied iOS reference. Eight checks,
 //! mirroring `text_tones.rs` and `scale.rs` for the other viewport:
 //!
-//! 1. **Parity.** The status ramp, the three radii, the type scale and the four
-//!    text greys are the same NUMBERS the desktop paints (`ios_theme_declares_the_same_system`).
-//! 2. **No text tone is multiplied by an alpha** (gh#172), hatch
+//! 1. **Parity, in both variants.** Shared dark paint and the radii/type scale
+//!    stay equal to [`Theme::dark`]; phone-specific dark values remain pinned
+//!    to the supplied iOS design. Light paint stays equal to the exact
+//!    neutral, status and Claude variables in `Comet iOS.dc.html`, which
+//!    deliberately differ from [`Theme::light`]
+//!    (`ios_theme_declares_the_shared_system_and_ios_reference`).
+//! 2. **Every paint token declares both variants**
+//!    (`every_paint_token_answers_for_both_variants`), hatch `one-tone-ok:`.
+//!    A token that resolves to one colour in both schemes is the crack a
+//!    scattered `if colorScheme == .light` grows out of.
+//! 3. **No Swift view pins a scheme**
+//!    (`no_swift_view_pins_a_colour_scheme`). Before gh#257 four call sites
+//!    pinned `.dark` — the scene and three sheets. The separate, ring-fenced
+//!    `UIUserInterfaceStyle = Dark` bundle key is still present and is checked
+//!    explicitly rather than hidden by this claim.
+//! 4. **No text tone is multiplied by an alpha** (gh#172), hatch
 //!    `theme-opacity-ok:`.
-//! 3. **No literal radius or font size outside `Theme.swift`** (gh#174), hatch
+//! 5. **No literal radius or font size outside `Theme.swift`** (gh#174), hatch
 //!    `scale-ok:`.
-//! 4. **`Capsule()` / `Circle()` is a dot, a drawn cap or the send button**
+//! 6. **`Capsule()` / `Circle()` is a dot, a drawn cap or the send button**
 //!    (gh#174), hatch `round-ok:`.
+//! 7. **The ring-fenced bundle override is handled honestly**
+//!    (`bundle_style_dependency_is_explicit`).
+//! 8. **The activation observer has a bounded lifetime**
+//!    (`window_scheme_observer_has_a_bounded_lifetime`).
 //!
 //! Why here and not in the phone's own harness: `SpecRunner` needs a simulator,
 //! so it runs when somebody remembers to run it and never in CI (see
@@ -27,10 +45,11 @@
 //!
 //! It lives in `comet-ui` rather than `comet-proto` because it needs both ends:
 //! the status ramp from `comet_proto::view::status`, and `Theme::RADIUS_*` /
-//! `Theme::TEXT_*` / `Theme::dark()` from here.
+//! `Theme::TEXT_*` / shared parts of `Theme::dark()` from here.
 
 use comet_proto::view::status;
-use comet_ui::theme::{Theme, neutral};
+use comet_ui::theme::{Theme, grey, ink, neutral, oklch, wash, white_alpha};
+use gpui::{Hsla, Rgba};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -46,13 +65,26 @@ fn theme_swift() -> String {
     std::fs::read_to_string(ios_root().join("Theme/Theme.swift")).expect("read Theme.swift")
 }
 
+fn appearance_swift() -> String {
+    std::fs::read_to_string(ios_root().join("Theme/Appearance.swift"))
+        .expect("read Appearance.swift")
+}
+
+fn info_plist() -> String {
+    std::fs::read_to_string(ios_root().join("Info.plist")).expect("read Info.plist")
+}
+
 // ---------------------------------------------------------------------------
 // 1. Parity
 // ---------------------------------------------------------------------------
 
-/// The value of `static let <name> = …` / `static let <name>: T = …`, trimmed.
-fn declaration<'a>(src: &'a str, name: &str) -> &'a str {
-    for line in src.lines() {
+/// The value of `static let <name> = …` / `static let <name>: T = …`, with
+/// trailing `//` comments stripped and continuation lines joined — a `themed()`
+/// pair with a note against each half spans two lines, and a declaration that
+/// stops at the newline reads as an unbalanced expression.
+fn declaration(src: &str, name: &str) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    for (ix, line) in lines.iter().enumerate() {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("static let ") else {
             continue;
@@ -61,12 +93,30 @@ fn declaration<'a>(src: &'a str, name: &str) -> &'a str {
             continue;
         };
         // `name` or `name: CGFloat`
-        let declared = lhs.split(':').next().unwrap_or("").trim();
-        if declared == name {
-            return rhs.split("//").next().unwrap_or(rhs).trim();
+        if lhs.split(':').next().unwrap_or("").trim() != name {
+            continue;
         }
+        let mut out = code(rhs);
+        let mut at = ix;
+        while unclosed(&out) && at + 1 < lines.len() {
+            at += 1;
+            out.push(' ');
+            out.push_str(&code(lines[at]));
+        }
+        return out.trim().to_string();
     }
     panic!("Theme.swift declares no `{name}` — the phone dropped a token the desktop still has");
+}
+
+/// One source line's code half — everything left of a trailing `//`.
+fn code(line: &str) -> String {
+    line.split("//").next().unwrap_or(line).trim().to_string()
+}
+
+/// Whether an expression is still waiting on a `)` — the only reason to read
+/// the next line. A declaration with no parens at all (a number) is finished.
+fn unclosed(expr: &str) -> bool {
+    expr.chars().filter(|c| *c == '(').count() > expr.chars().filter(|c| *c == ')').count()
 }
 
 /// A bare number declaration (`static let radiusChip: CGFloat = 6`).
@@ -77,22 +127,179 @@ fn number(src: &str, name: &str) -> f32 {
     })
 }
 
-/// The argument of a one-argument call (`neutral(0.938)` -> `0.938`).
-fn call_arg(src: &str, name: &str, func: &str) -> f32 {
-    let raw = declaration(src, name);
-    let inner = raw
-        .strip_prefix(func)
-        .and_then(|r| r.strip_prefix('('))
-        .and_then(|r| r.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("Theme.swift's `{name}` is `{raw}`, expected `{func}(…)`"));
-    inner
+// ---------------------------------------------------------------------------
+// Reading a Swift paint token as paint (gh#257)
+// ---------------------------------------------------------------------------
+
+/// The `dark:` and `light:` halves of a paint token, as source expressions.
+///
+/// Every colour in `Theme.swift` is `themed(dark: …, light: …)` or one of the
+/// two shorthands that expand to it — `ramp(hue)` (the same hue at the two
+/// status anchors) and `whiteAlpha(a)` (white over dark, black over light).
+/// Anything else is a token that paints one colour in both schemes, which
+/// `every_paint_token_answers_for_both_variants` is the test for.
+fn variants(src: &str, name: &str) -> Option<(String, String)> {
+    split_variants(&declaration(src, name))
+}
+
+fn split_variants(raw: &str) -> Option<(String, String)> {
+    if let Some(hue) = call_body(raw, "ramp") {
+        return Some((
+            format!("oklch(statusL, statusC, {hue})"),
+            format!("oklch(statusLLight, statusCLight, {hue})"),
+        ));
+    }
+    if let Some(alpha) = call_body(raw, "whiteAlpha") {
+        return Some((
+            format!("Color.white.opacity({alpha})"),
+            format!("Color.black.opacity({alpha} * lightInkScale)"),
+        ));
+    }
+    let body = call_body(raw, "themed")?;
+    let dark = body.strip_prefix("dark:")?;
+    let cut = top_level_comma(dark)?;
+    let light = dark[cut + 1..].trim().strip_prefix("light:")?.trim();
+    Some((dark[..cut].trim().to_string(), light.to_string()))
+}
+
+/// The arguments of `name(…)`, when the whole expression IS that call.
+fn call_body(expr: &str, name: &str) -> Option<String> {
+    let inner = expr
         .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("`{name}`'s argument `{inner}` is not a plain number"))
+        .strip_prefix(name)?
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    // `oklch(…).opacity(…)` also starts with `oklch(` and ends with `)`; what
+    // tells the two apart is whether the parens in between still nest.
+    well_nested(inner).then(|| inner.trim().to_string())
+}
+
+fn well_nested(expr: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in expr.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// The index of the comma separating a two-argument call's arguments.
+fn top_level_comma(args: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (ix, ch) in args.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some(ix),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One Swift paint expression, evaluated with this crate's own primitives — so
+/// what is compared is the COLOUR that lands on the phone's screen, not the
+/// spelling of it. The four constructors are the ones `Theme.swift` declares;
+/// bare identifiers resolve against the numbers it declares above them.
+fn paint(src: &str, expr: &str) -> Hsla {
+    let expr = expr.trim();
+    // A trailing `.opacity(a)` applies to whatever it is hung off — but only
+    // when it is the OUTERMOST call, not an alpha inside an argument.
+    if let Some(at) = expr.rfind(".opacity(")
+        && matching_paren(expr, at + ".opacity(".len() - 1) == Some(expr.len() - 1)
+    {
+        let base = &expr[..at];
+        let alpha = &expr[at + ".opacity(".len()..expr.len() - 1];
+        if base == "Color.white" {
+            return white_alpha(scalar(src, alpha));
+        }
+        if base == "Color.black" {
+            return black_alpha(scalar(src, alpha));
+        }
+        return paint(src, base).opacity(scalar(src, alpha));
+    }
+    let args = |name: &str| -> Option<Vec<f32>> {
+        Some(
+            split_args(&call_body(expr, name)?)
+                .iter()
+                .map(|a| scalar(src, a))
+                .collect(),
+        )
+    };
+    if let Some(a) = args("grey") {
+        return grey(a[0] as u8);
+    }
+    if let Some(a) = args("hex") {
+        return hex(a[0] as u32);
+    }
+    if let Some(a) = args("neutral") {
+        return neutral(a[0]);
+    }
+    if let Some(a) = args("ink") {
+        return ink(a[0]);
+    }
+    if let Some(a) = args("wash") {
+        return wash(a[0]);
+    }
+    if let Some(a) = args("oklch") {
+        return oklch(a[0], a[1], a[2]);
+    }
+    panic!(
+        "Theme.swift paints `{expr}`, which this test cannot evaluate — teach it the constructor or use one it knows"
+    );
+}
+
+fn hex(rgb: u32) -> Hsla {
+    Hsla::from(Rgba {
+        r: ((rgb >> 16) & 0xff) as f32 / 255.0,
+        g: ((rgb >> 8) & 0xff) as f32 / 255.0,
+        b: (rgb & 0xff) as f32 / 255.0,
+        a: 1.0,
+    })
+}
+
+fn black_alpha(alpha: f32) -> Hsla {
+    Hsla::from(Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: alpha,
+    })
+}
+
+fn split_args(body: &str) -> Vec<String> {
+    match top_level_comma(body) {
+        Some(cut) => {
+            let mut out = vec![body[..cut].trim().to_string()];
+            out.extend(split_args(body[cut + 1..].trim()));
+            out
+        }
+        None => vec![body.trim().to_string()],
+    }
+}
+
+/// A number, a `Theme` constant by name, or a product of the two.
+fn scalar(src: &str, expr: &str) -> f32 {
+    let expr = expr.trim();
+    if let Some((a, b)) = expr.split_once('*') {
+        return scalar(src, a) * scalar(src, b);
+    }
+    if let Some(hex) = expr.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).expect("hex literal") as f32;
+    }
+    expr.parse().unwrap_or_else(|_| number(src, expr))
 }
 
 #[test]
-fn ios_theme_declares_the_same_system() {
+fn ios_theme_declares_the_shared_system_and_ios_reference() {
     let src = theme_swift();
     let mut wrong = Vec::new();
     let mut check = |what: &str, phone: f32, desktop: f32| {
@@ -103,7 +310,9 @@ fn ios_theme_declares_the_same_system() {
 
     // The status ramp — one lightness, one chroma, four hues (gh#173).
     check("statusL", number(&src, "statusL"), status::L);
+    check("statusLLight", number(&src, "statusLLight"), 0.52);
     check("statusC", number(&src, "statusC"), status::C);
+    check("statusCLight", number(&src, "statusCLight"), 0.16);
     check("hueBlocked", number(&src, "hueBlocked"), status::BLOCKED);
     check("hueWorking", number(&src, "hueWorking"), status::WORKING);
     check("hueReview", number(&src, "hueReview"), status::REVIEW);
@@ -139,31 +348,224 @@ fn ios_theme_declares_the_same_system() {
     );
     check("textFigure", number(&src, "textFigure"), Theme::TEXT_FIGURE);
 
-    // Four text greys (gh#172). Compared as PAINT, not as lightness: both
-    // languages run the same oklch→sRGB conversion, so the assertion is that
-    // what lands on the phone's screen is the tone that lands on the desktop's.
+    // Paint is compared as COLOUR, not spelling. Shared dark tokens stay on
+    // the desktop system; the four values gh#258 deliberately retuned only for
+    // the desktop stay pinned to the phone's established dark reference.
+    // Light is the supplied iOS reference's own table — not a derivation of
+    // the desktop-light palette.
     let dark = Theme::dark();
-    for (name, desktop) in [
-        ("text", dark.text),
-        ("textMuted", dark.text_muted),
-        ("textSubtle", dark.text_subtle),
-        ("textFaint", dark.text_faint),
+    for (name, want_dark, want_light) in [
+        // --text / --muted / --subtle / --faint
+        ("text", dark.text, hex(0x171717)),
+        ("textMuted", dark.text_muted, hex(0x545454)),
+        ("textSubtle", dark.text_subtle, hex(0x6b6b6b)),
+        ("textFaint", dark.text_faint, hex(0x8a8a8a)),
+        // --card / --raised / --sel / --selcard / --chip
+        ("bg", grey(6), hex(0xffffff)),
+        ("surface", dark.surface, hex(0xffffff)),
+        ("surfaceRaised", neutral(0.235), hex(0xf4f4f7)),
+        ("sheetPanel", grey(0x14), hex(0xf4f4f7)),
+        ("card", white_alpha(0.045), hex(0xffffff)),
+        ("elementHover", wash(0.07), black_alpha(0.05)),
+        ("elementActive", wash(0.10), hex(0xeeeef2)),
+        // --line / --line2
+        ("border", dark.border, hex(0xe4e4e8)),
+        ("borderStrong", white_alpha(0.14), hex(0xd6d6dc)),
+        ("separator", white_alpha(0.06), hex(0xe4e4e8)),
+        // --review / --blocked / --working / --settled
+        ("accent", dark.accent, oklch(0.52, 0.16, status::REVIEW)),
+        ("danger", dark.danger, oklch(0.52, 0.16, status::BLOCKED)),
+        ("warning", dark.warning, oklch(0.52, 0.16, status::WORKING)),
+        ("settled", dark.settled, oklch(0.52, 0.16, status::SETTLED)),
+        // Foregrounds on status washes use that same reference ramp in light.
+        (
+            "dangerText",
+            dark.danger_text(),
+            oklch(0.52, 0.16, status::BLOCKED),
+        ),
+        (
+            "warningText",
+            dark.warning_text(),
+            oklch(0.52, 0.16, status::WORKING),
+        ),
+        (
+            "settledText",
+            dark.settled_text(),
+            oklch(0.52, 0.16, status::SETTLED),
+        ),
+        // --claude
+        ("claudeBrand", hex(0xd97757), hex(0xc15f3c)),
     ] {
-        let phone = neutral(call_arg(&src, name, "neutral"));
-        if phone != desktop {
-            wrong.push(format!("  {name}: phone {phone:?}, desktop {desktop:?}"));
+        let Some((dark_expr, light_expr)) = variants(&src, name) else {
+            wrong.push(format!(
+                "  {name}: not a `themed(dark:light:)` token — it paints one colour in both schemes"
+            ));
+            continue;
+        };
+        for (scheme, expr, want) in [
+            ("dark", dark_expr, want_dark),
+            ("light", light_expr, want_light),
+        ] {
+            let got = paint(&src, &expr);
+            if got != want {
+                wrong.push(format!(
+                    "  {name} ({scheme}): phone {expr} = {got:?}, expected {want:?}"
+                ));
+            }
         }
     }
 
     assert!(
         wrong.is_empty(),
-        "{} value(s) where the phone has drifted off the desktop's system. \
-         The numbers live in crates/ui/src/theme.rs and comet_proto::view::status; \
-         apps/ios/Comet/Theme/Theme.swift restates them because no Rust runs on \
-         that device, and restating them differently is the bug this test \
-         exists for:\n{}",
+        "{} value(s) where the phone has drifted off its shared dark/scales or \
+         supplied iOS references. Shared dark and layout numbers live in \
+         crates/ui/src/theme.rs and comet_proto::view::status; the phone-only \
+         dark values and light paint values are restated explicitly above:\n{}",
         wrong.len(),
         wrong.join("\n")
+    );
+}
+
+/// Every colour token answers for both schemes (gh#257).
+///
+/// The whole design of the phone's light mode is that a token knows its two
+/// values and no view ever asks which scheme it is in. The failure mode this
+/// guards is the cheap one: somebody adds a token, gives it the dark value that
+/// was in front of them, and the light screens grow a `colorScheme ==` check at
+/// the call site to work round it. One `themed(…)` here costs less than that
+/// check, and unlike the check it can be held to the desktop above.
+///
+/// A colour that genuinely IS one colour says so with a `one-tone-ok:` marker.
+#[test]
+fn every_paint_token_answers_for_both_variants() {
+    let src = theme_swift();
+    let lines: Vec<&str> = src.lines().collect();
+    let mut violations = Vec::new();
+    for (ix, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("static let ") else {
+            continue;
+        };
+        let Some((lhs, _)) = rest.split_once('=') else {
+            continue;
+        };
+        let name = lhs.split(':').next().unwrap_or("").trim();
+        // Only the paint: a token whose value is a number is a layout constant,
+        // and layout does not change with the light (see the file header).
+        let raw = declaration(&src, name);
+        let is_paint = [
+            "themed(",
+            "ramp(",
+            "whiteAlpha(",
+            "oklch(",
+            "neutral(",
+            "grey(",
+            "ink(",
+            "wash(",
+            "Color(",
+        ]
+        .iter()
+        .any(|c| raw.starts_with(c));
+        if !is_paint || exempt(&lines, ix, "one-tone-ok:") {
+            continue;
+        }
+        if split_variants(&raw).is_none() {
+            violations.push(Violation {
+                file: PathBuf::from("Theme/Theme.swift"),
+                line: ix + 1,
+                text: format!("static let {name} = {raw}"),
+                why: "one tone".into(),
+            });
+        }
+    }
+
+    report(
+        violations,
+        "paint token(s) that paint the same colour in light and dark. Declare \
+         both — `themed(dark: …, light: …)`, or `ramp(hue)` for a status hue — \
+         with the light half taken from the supplied iOS reference where it \
+         declares that job. If the colour really \
+         is one colour in both (a brand mark is), say so with a \
+         `one-tone-ok: <reason>` comment:",
+    );
+}
+
+/// No Swift view pins a scheme (gh#257).
+///
+/// Four call sites used to: the scene in `CometApp.swift` and three sheets,
+/// each `.preferredColorScheme(.dark)`. That is why the light design in the
+/// reference could not be reached. `cometAppearance()` is now the one modifier
+/// that translates an explicit preference into the window-level override.
+#[test]
+fn no_swift_view_pins_a_colour_scheme() {
+    let mut violations = Vec::new();
+    for file in swift_sources() {
+        let body = std::fs::read_to_string(&file).expect("read source");
+        for (ix, line) in body.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains(".preferredColorScheme(.dark)")
+                || line.contains(".preferredColorScheme(.light)")
+            {
+                violations.push(Violation {
+                    file: rel(&file),
+                    line: ix + 1,
+                    text: line.trim().to_string(),
+                    why: "forced".into(),
+                });
+            }
+        }
+    }
+
+    report(
+        violations,
+        "call site(s) pinning a colour scheme. The scheme is a preference — \
+         `.cometAppearance()`, which reads the explicit preference. This claim \
+         is intentionally limited to Swift views: Info.plist still forces Dark \
+         at the bundle level, and `bundle_style_dependency_is_explicit` holds \
+         that remaining integration dependency visible:",
+    );
+}
+
+/// The ticket forbids editing Info.plist, so this PR cannot honestly claim that
+/// the app follows the device appearance by default. Keep the forced key and
+/// the code that accounts for it visible until a separately-authorized change
+/// removes both together.
+#[test]
+fn bundle_style_dependency_is_explicit() {
+    let plist = info_plist();
+    assert!(
+        plist.contains("<key>UIUserInterfaceStyle</key>")
+            && plist.contains("<string>Dark</string>"),
+        "gh#257 ring-fences Info.plist; update this contract when the bundle-level Dark override is separately removed"
+    );
+
+    let appearance = appearance_swift();
+    for contract in [
+        "object(forInfoDictionaryKey: \"UIUserInterfaceStyle\")",
+        "case .system: return Appearance.forcedByBundle",
+        "forcedByBundle == nil ? allCases : [.light, .dark]",
+    ] {
+        assert!(
+            appearance.contains(contract),
+            "Appearance.swift no longer accounts for the ring-fenced bundle override: missing `{contract}`"
+        );
+    }
+}
+
+/// A block observer retained by NotificationCenter must not strongly retain its
+/// coordinator. That breaks the retain cycle so deinit can stop it.
+#[test]
+fn window_scheme_observer_has_a_bounded_lifetime() {
+    let appearance = appearance_swift();
+    assert!(
+        appearance.contains(") { [weak self] _ in"),
+        "WindowScheme's activation observer must capture its coordinator weakly"
+    );
+    assert!(
+        appearance.contains("deinit { stopObserving() }"),
+        "WindowScheme must remove the weak observer when its coordinator deinitializes"
     );
 }
 
@@ -510,6 +912,80 @@ fn report(violations: Vec<Violation>, headline: &str) {
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    /// The reader that makes the two-variant parity check possible: it has to
+    /// tell a pair from a single tone, survive a note against each half, and
+    /// not mistake a trailing `.opacity()` for the call it hangs off.
+    #[test]
+    fn a_token_is_read_as_its_two_halves() {
+        assert_eq!(
+            split_variants("themed(dark: grey(6), light: cool(0.986, 0.003))"),
+            Some(("grey(6)".into(), "cool(0.986, 0.003)".into()))
+        );
+        // The shorthands expand to the same pair.
+        assert_eq!(
+            split_variants("ramp(hueReview)"),
+            Some((
+                "oklch(statusL, statusC, hueReview)".into(),
+                "oklch(statusLLight, statusCLight, hueReview)".into()
+            ))
+        );
+        assert_eq!(
+            split_variants("whiteAlpha(0.08)"),
+            Some((
+                "Color.white.opacity(0.08)".into(),
+                "Color.black.opacity(0.08 * lightInkScale)".into()
+            ))
+        );
+        // One tone in both schemes — the thing the scan is looking for.
+        assert_eq!(split_variants("oklch(0.62, 0.19, 265)"), None);
+        assert_eq!(split_variants("Color(red: 1, green: 0, blue: 0)"), None);
+        // An alpha hung off the whole expression is not a second argument.
+        assert_eq!(
+            split_variants("themed(dark: oklch(0.7, 0.18, 293).opacity(0.12), light: ink(0.2))"),
+            Some((
+                "oklch(0.7, 0.18, 293).opacity(0.12)".into(),
+                "ink(0.2)".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_declaration_spans_its_continuation_lines() {
+        let src = "\
+enum Theme {
+    static let statusL: Double = 0.74
+    static let dangerText = themed(dark: oklch(0.8, 0.1, 19.5),   // red-300
+                                   light: oklch(0.5, 0.2, 27.5))  // red-700
+    static let nestGutter: CGFloat = radiusCard - radiusRow
+}";
+        assert_eq!(declaration(src, "statusL"), "0.74");
+        assert_eq!(declaration(src, "nestGutter"), "radiusCard - radiusRow");
+        assert_eq!(
+            declaration(src, "dangerText"),
+            "themed(dark: oklch(0.8, 0.1, 19.5), light: oklch(0.5, 0.2, 27.5))"
+        );
+    }
+
+    /// Expressions are compared as PAINT, so the evaluator has to agree with
+    /// this crate's own primitives — including the alpha and the scale.
+    #[test]
+    fn paint_evaluates_to_this_crates_colours() {
+        let src = "static let lightInkScale: Double = 0.714285714\n";
+        assert_eq!(paint(src, "grey(0x14)"), grey(0x14));
+        assert_eq!(paint(src, "hex(0x171717)"), hex(0x171717));
+        assert_eq!(paint(src, "neutral(0.938)"), neutral(0.938));
+        assert_eq!(paint(src, "Color.white.opacity(0.08)"), white_alpha(0.08));
+        assert_eq!(
+            paint(src, "oklch(0.702, 0.183, 293.541).opacity(0.12)"),
+            oklch(0.702, 0.183, 293.541).opacity(0.12)
+        );
+        // A named constant, and arithmetic on one.
+        assert_eq!(
+            paint(src, "Color.black.opacity(0.07 * lightInkScale)"),
+            black_alpha(0.07 * (5.0 / 7.0))
+        );
+    }
 
     #[test]
     fn literals_are_offences_and_tokens_are_not() {
