@@ -425,6 +425,196 @@ final class DemoDataset {
         ]
     }
 
+    // MARK: The review (gh#256)
+
+    /// What `ReadAttemptReview` would answer for one demo row, as the wire
+    /// spells it.
+    ///
+    /// Held as JSON and decoded rather than built with initialisers, which is
+    /// deliberate: the shape this app is most likely to be wrong about is the
+    /// one it never constructs itself, and a key that skewed would otherwise
+    /// reach the screen as a zero. Demo mode decoding it is a standing check
+    /// that `ReviewModels.swift` still reads what the board writes.
+    ///
+    /// Two rows, because the review screen has two halves worth exploring with
+    /// no box: one attempt the board can see straight through, and one that
+    /// never answered the contract at all — which must read as *unknown* and
+    /// never as green.
+    static func review(taskId: String) -> AttemptReview? {
+        guard let json = reviewPayloads[taskId], let data = json.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(AttemptReview.self, from: data)
+    }
+
+    /// Does this demo row have an attempt to review at all? The same question
+    /// `boardReviewable` asks of a live row, answered from the fixture so the
+    /// door and the screen behind it cannot disagree.
+    static func reviewable(taskId: String) -> Bool {
+        reviewPayloads[taskId] != nil
+    }
+
+    /// The receipt a demo verdict comes back with. Delivered into the branch,
+    /// because that is the case worth seeing: the phone said something and an
+    /// agent in a checkout was told.
+    static func receipt(taskId: String, kind: VerdictKind, comment: String) -> VerdictReceipt {
+        let unclaimed = review(taskId: taskId)?.unclaimed.count ?? 0
+        let json = """
+            {"task_id": "\(taskId)", "attempt": 1, "kind": "\(kind.rawValue)",
+             "review_id": 4021, "posted": true, "chat_id": "chat-tabs",
+             "delivered": \(reviewWorthDelivering(kind, comment)),
+             "unclaimed": \(unclaimed), "payload": ""}
+            """
+        // The fixture is this file's own literal, so a decode that fails here
+        // is a bug in the model rather than a thing the demo should invent
+        // around — the fallback says the plain truth and nothing more.
+        return (try? JSONDecoder().decode(VerdictReceipt.self, from: Data(json.utf8)))
+            ?? VerdictReceipt(taskId: taskId, kind: kind.rawValue, posted: true)
+    }
+
+    /// The demo's review row: a codex attempt that claimed three things, and a
+    /// branch with two changes none of them names.
+    private static let reviewPayloads: [String: String] = [
+        "gh:comet#117": """
+            {
+              "task_id": "gh:comet#117",
+              "attempt": 811,
+              "attempt_number": 1,
+              "state": "review",
+              "outcome": "done",
+              "branch": "fix/tool-colors",
+              "worktree": "/Users/dev/worktrees/comet-native-tool-colors",
+              "pr_url": "https://github.com/x/y/pull/117",
+              "brief": {
+                "identifier": "gh#117",
+                "title": "Tool group header colors",
+                "url": "https://github.com/x/y/issues/117",
+                "body": "A failed child turns its whole group red, so a run that recovered reads as a run that broke. The header should carry the group's own state and stay quiet about children that were retried."
+              },
+              "claimed_at": "2026-08-10T07:41:00Z",
+              "claims": [
+                {
+                  "text": "A group's header paints its own state, never a child's.",
+                  "files": ["crates/ui/src/transcript.rs"],
+                  "symbols": [],
+                  "matched": ["crates/ui/src/transcript.rs"],
+                  "unmatched": [],
+                  "call_sites": []
+                },
+                {
+                  "text": "Both surfaces read one derivation per frame.",
+                  "files": [],
+                  "symbols": ["group_tone"],
+                  "matched": ["crates/ui/src/tools.rs"],
+                  "unmatched": [],
+                  "call_sites": [{"symbol": "group_tone", "now": 1, "before": 2}]
+                },
+                {
+                  "text": "A retried child stops recolouring the header it sits under.",
+                  "files": ["crates/ui/src/board.rs"],
+                  "symbols": [],
+                  "matched": ["crates/ui/src/board.rs"],
+                  "unmatched": [],
+                  "call_sites": []
+                }
+              ],
+              "unclaimed": [
+                {"path": "Cargo.toml", "status": "M", "added": 1, "removed": 0,
+                 "binary": false, "symbols": []},
+                {"path": "crates/ui/src/shell.rs", "status": "M", "added": 6,
+                 "removed": 4, "binary": false, "symbols": ["right_target"]}
+              ],
+              "unmatched_anchors": [],
+              "claimed": 3,
+              "changed": [
+                {"path": "crates/ui/src/transcript.rs", "status": "M", "added": 64,
+                 "removed": 12, "binary": false, "symbols": ["group_tone"]},
+                {"path": "crates/ui/src/tools.rs", "status": "M", "added": 21,
+                 "removed": 4, "binary": false, "symbols": ["group_tone"]},
+                {"path": "crates/ui/src/board.rs", "status": "M", "added": 8,
+                 "removed": 3, "binary": false, "symbols": []},
+                {"path": "Cargo.toml", "status": "M", "added": 1, "removed": 0,
+                 "binary": false, "symbols": []},
+                {"path": "crates/ui/src/shell.rs", "status": "M", "added": 6,
+                 "removed": 4, "binary": false, "symbols": ["right_target"]}
+              ],
+              "diff": {"source": "checkout"},
+              "uncommitted": 0,
+              "evidence": {
+                "commands": 84,
+                "failed": 6,
+                "checks": [
+                  {"command": "cargo test -p comet-ui", "runs": 7, "failed": 1},
+                  {"command": "cargo clippy --all-targets", "runs": 3, "failed": 0}
+                ],
+                "truncated": false
+              },
+              "effects": {
+                "read": true,
+                "files": [
+                  {"path": "crates/ui/src/transcript.rs", "kind": "rust",
+                   "tests_added": 4, "tests_removed": 0, "api": 0, "schema": 0,
+                   "config_keys": 0},
+                  {"path": "crates/ui/src/tools.rs", "kind": "rust",
+                   "tests_added": 2, "tests_removed": 0, "api": 0, "schema": 0,
+                   "config_keys": 0},
+                  {"path": "crates/ui/src/board.rs", "kind": "rust",
+                   "tests_added": 0, "tests_removed": 0, "api": 0, "schema": 0,
+                   "config_keys": 0},
+                  {"path": "Cargo.toml", "kind": "manifest", "tests_added": 0,
+                   "tests_removed": 0, "api": 0, "schema": 0, "config_keys": 0},
+                  {"path": "crates/ui/src/shell.rs", "kind": "rust",
+                   "tests_added": 0, "tests_removed": 0, "api": 0, "schema": 0,
+                   "config_keys": 0}
+                ],
+                "tests_after": 47,
+                "tests_before": 41,
+                "deps_added": ["itertools 0.13"],
+                "deps_known": true
+              }
+            }
+            """,
+        // The other half: an attempt that never answered the contract, whose
+        // checkout is gone. Unknown, quiet, and never green.
+        "gh:edge#39": """
+            {
+              "task_id": "gh:edge#39",
+              "attempt": 774,
+              "attempt_number": 2,
+              "state": "failed",
+              "outcome": "failed",
+              "branch": "deploy-hygiene",
+              "brief": {
+                "identifier": "gh#39",
+                "title": "Wrangler deploy hygiene",
+                "url": "https://github.com/x/edge/issues/39",
+                "body": null
+              },
+              "claimed_at": null,
+              "claims": [],
+              "unclaimed": [
+                {"path": "edge/wrangler.toml", "status": "M", "added": 12,
+                 "removed": 9, "binary": false, "symbols": []},
+                {"path": "edge/src/rooms/session.ts", "status": "M", "added": 3,
+                 "removed": 1, "binary": false, "symbols": []}
+              ],
+              "unmatched_anchors": [],
+              "claimed": 0,
+              "changed": [
+                {"path": "edge/wrangler.toml", "status": "M", "added": 12,
+                 "removed": 9, "binary": false, "symbols": []},
+                {"path": "edge/src/rooms/session.ts", "status": "M", "added": 3,
+                 "removed": 1, "binary": false, "symbols": []}
+              ],
+              "diff": {"source": "recorded"},
+              "uncommitted": null,
+              "evidence": {"commands": 19, "failed": 4, "checks": [], "truncated": false},
+              "effects": {"read": false, "files": [], "deps_added": [],
+                          "deps_known": false}
+            }
+            """,
+    ]
+
     // MARK: Fake filesystem (folder browser demo)
 
     static let fileTree: [String: [String]] = [

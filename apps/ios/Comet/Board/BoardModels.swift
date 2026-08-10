@@ -598,6 +598,10 @@ enum TaskBody: Equatable {
 /// holding a copy here would be a second, staler board.
 struct OpenedRow: Identifiable, Hashable {
     var id: String
+    /// Skip the reading and land on the review (gh#256). Only the screenshot
+    /// rig sets it — a tap always opens the row, and the review is a push from
+    /// there.
+    var openReview = false
 }
 
 /// One thing a surface offers to do with a row. Ported from `RowAction`.
@@ -667,6 +671,27 @@ func boardDetailActions(_ row: TaskRow) -> [BoardRowAction] {
     if nonEmpty(row.prUrl) != nil, !out.contains(.openPR) { out.append(.openPR) }
     if !row.url.isEmpty { out.append(.openIssue) }
     return out
+}
+
+/// Is there an attempt on this row worth reviewing (gh#256)?
+///
+/// Not a `BoardRowAction`: the actions are the shared rule `row_actions` owns,
+/// and the review is a *screen* rather than something a row does — the desktop
+/// reaches it through `shell::Route::Review`, not through a chip. This is the
+/// phone's own door rule, and it is deliberately narrow.
+///
+/// An attempt has to have ENDED. A `working` row's agent has not submitted its
+/// claims yet, so a review of it would be the screen's unknown state dressed up
+/// as a finding about work still in progress — and a `ready` row with attempts
+/// behind it has had them cleared away. What is left is exactly the three
+/// states a human is looked at over: the review gate, a question, and a run
+/// that died.
+func boardReviewable(_ row: TaskRow) -> Bool {
+    guard row.attempts > 0 else { return false }
+    switch row.boardState {
+    case .review, .blocked, .failed, .done: return true
+    case .working, .ready: return false
+    }
 }
 
 /// The URL an action opens, or nil for the ones that are not links.

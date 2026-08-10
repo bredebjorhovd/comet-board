@@ -114,7 +114,8 @@ struct BoardView: View {
                              },
                              onOpenChat: { chatId in
                                  afterDetail { path.append(.chat(chatId)) }
-                             })
+                             },
+                             openReview: row.openReview)
         }
         .overlay(alignment: .bottom) {
             if let notice {
@@ -130,6 +131,21 @@ struct BoardView: View {
                     $0.dispatchable && $0.boardState == .ready
                 }) {
                     dispatching = target(for: row)
+                }
+            }
+            // …or on a review (gh#256). The review gate first and any ended
+            // attempt after it: a row parked in `review` is the state the
+            // design file draws, and a rig that took whichever reviewable row
+            // sorted first would photograph the blocked one.
+            if let spec = model.launchSheet, spec == "review" || spec.hasPrefix("review:") {
+                model.launchSheet = nil
+                let wanted = spec.hasPrefix("review:")
+                    ? String(spec.dropFirst("review:".count)) : nil
+                let reviewable = model.boardRows.filter(boardReviewable)
+                if let row = reviewable.first(where: { $0.id == wanted })
+                    ?? (wanted == nil ? reviewable.first { $0.boardState == .review } : nil)
+                    ?? (wanted == nil ? reviewable.first : nil) {
+                    opened = OpenedRow(id: row.id, openReview: true)
                 }
             }
         }

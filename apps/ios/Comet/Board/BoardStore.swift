@@ -365,6 +365,70 @@ final class BoardStore {
         }
     }
 
+    // MARK: The review (gh#256)
+
+    /// What one attempt is worth: the brief, the claims, the effects the board
+    /// derived from the branch, and everything nobody accounted for (§gh#183,
+    /// §gh#236).
+    ///
+    /// Swept the same way the stats page is, and for the same reason: `board.db`
+    /// lives on whichever device hosts the board, so a candidate that refuses
+    /// has said "I host no board" and the sweep moves on. A reply that will not
+    /// decode ends it instead — that host HAS a board and is running a different
+    /// version, and asking the next device would report the wrong problem.
+    enum ReviewOutcome {
+        case read(AttemptReview)
+        case failed(String)
+    }
+
+    func attemptReview(taskId: String) async -> ReviewOutcome {
+        var candidates = boardHostCandidates(devices())
+        if let host = hostDeviceId {
+            candidates.removeAll { $0 == host }
+            candidates.insert(host, at: 0)
+        }
+        guard !candidates.isEmpty else {
+            return .failed("No device in this org is hosting a board")
+        }
+        var last: String?
+        for deviceId in candidates {
+            do {
+                let review: AttemptReview = try await relay(for: deviceId)
+                    .call(method: "ReadAttemptReview", params: ["taskId": taskId])
+                return .read(review)
+            } catch is DecodingError {
+                return .failed("Unreadable review — the board is on another version")
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        return .failed(last ?? "No device in this org is hosting a board")
+    }
+
+    /// Send the verdict (§gh#239): one review on the pull request, one prompt
+    /// into the checkout the agent is still in.
+    ///
+    /// Asked of the host that answered the read, not swept: a verdict is a
+    /// write, and trying the next device after a refusal would be looking for
+    /// somebody willing to accept it.
+    enum VerdictOutcome {
+        case sent(VerdictReceipt)
+        case failed(String)
+    }
+
+    func submitVerdict(taskId: String, kind: VerdictKind,
+                       comment: String) async -> VerdictOutcome {
+        guard let host = hostDeviceId else { return .failed("No board host") }
+        do {
+            let receipt: VerdictReceipt = try await relay(for: host)
+                .call(method: "SubmitVerdict",
+                      params: ["taskId": taskId, "kind": kind.rawValue, "comment": comment])
+            return .sent(receipt)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks.
     func cancel(taskId: String) async -> String? {

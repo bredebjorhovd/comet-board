@@ -85,21 +85,26 @@ happen to a file git never looks at.
 - **Demo mode**: fully offline dataset with a scripted streaming reply and a
   board (rows in every state, two live attempts wired to real demo chats) —
   explore the UI with no infrastructure. Launch args for screenshot rigs:
-  `-demo [-route chat:<id>|space:<id>|board|stats] [-sheet dispatch] [-stream]`.
+  `-demo [-route chat:<id>|space:<id>|board|stats] [-sheet dispatch|review|review:<taskId>] [-stream]`.
   `-route`/`-sheet` work against a live edge too, which is where the rows that
-  matter are.
+  matter are. `-sheet review` lands on the first row parked in `review`;
+  `-sheet review:<taskId>` names one, which is how the states that are not the
+  happy one get photographed.
 
 ### Keeping the ported rules honest (gh#157)
 
 Several files here are second implementations of rules that live in Rust —
-`StatsModels.swift`, `SpaceRows.swift`, `BoardModels.swift` — because no Rust
-runs on this device. Two implementations of one rule is how a phone comes to
-disagree with a laptop about a number somebody is deciding on, so for the stats
-rules the *cases* live outside both languages:
+`StatsModels.swift`, `SpaceRows.swift`, `BoardModels.swift`, `ReviewModels.swift`
+— because no Rust runs on this device. Two implementations of one rule is how a
+phone comes to disagree with a laptop about a number somebody is deciding on, so
+for those rules the *cases* live outside both languages:
 
 ```sh
-cargo test -p comet-proto stats     # the Rust half + the fixture guard
-scripts/ios-stats-spec.sh           # the Swift half, in the simulator
+cargo test -p comet-proto stats               # the Rust half + the fixture guard
+scripts/ios-stats-spec.sh                     # the Swift half, in the simulator
+
+cargo test -p comet-board ios_review_spec     # the same pair for the review
+scripts/ios-review-spec.sh                    # reading (gh#256)
 ```
 
 `crates/proto/src/view/stats.rs` (mod `spec`) generates
@@ -121,6 +126,14 @@ wrong about that rule until somebody runs the script. Regenerating the fixture
 is not the end of the job; it is the *notice* that the other half of the job
 exists. Treat a `UPDATE_STATS_SPEC=1` run without an `ios-stats-spec.sh` run in
 the same change as an unfinished change.
+
+The review fixture (gh#256) is the same shape with different nouns:
+`crates/board/tests/ios_review_spec.rs` generates `Comet/Spec/review-spec.json`
+from `comet_board::claims` and `comet_board::effects` — eight whole reviews with
+every verdict, finding, chip and claim mark they produce — and
+`ReviewSpecRunner` (launch arg `-review-spec`) asserts `ReviewModels.swift`
+against it. Regenerate with `UPDATE_REVIEW_SPEC=1`, and the paragraph above
+applies word for word.
 
 A launch-arg runner rather than XCTest: this project has one target and one
 shared scheme, and a test target means editing `project.pbxproj` and
