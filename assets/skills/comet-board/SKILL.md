@@ -94,8 +94,17 @@ look at them — they are the ones a reviewer would have caught.
 
 Claims live on the attempt, so they outlive this chat; a retry makes its own.
 Submitting again replaces the set. `comet-board review --task <id> [--json]`
-prints the whole thing back: brief, claims, the commands the run ran, and the
-remainder.
+prints the whole thing back: brief, the effects the board derived, claims, the
+commands the run ran, and the remainder.
+
+Those effects are not yours to write and there is nothing to submit for them.
+The board reads them off the branch and the journal itself — tests before and
+after, whether the public surface moved, the schema, config keys, dependencies
+— and it attaches to each claim what it found in the files that claim anchors.
+A claim with a new passing test under it reads as checked; one with nothing
+under it says `no test covers this`. Neither is an instruction to write a test
+you would not otherwise write; it is what a reviewer sees, so it is worth
+knowing it is being read.
 
 **Releasing and waiting:**
 

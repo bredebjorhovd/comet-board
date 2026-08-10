@@ -22,6 +22,7 @@ pub mod credential_ledger;
 pub mod db;
 pub mod dispatch;
 pub mod doctor;
+pub mod effects;
 pub mod evidence;
 pub mod gc;
 pub mod git_credentials;

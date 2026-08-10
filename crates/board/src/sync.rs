@@ -1110,15 +1110,26 @@ impl SyncEngine {
     /// as it was. What that costs is visible in the review itself, as
     /// [`crate::claims::DiffSource::Unavailable`].
     pub fn record_review_facts(&self, runtime: Option<&dyn Runtime>, attempt: &Attempt) {
-        if let Some(changed) = self.branch_changes(attempt) {
+        if let Some((changed, effects)) = self.branch_facts(attempt) {
             // The board reads this every cycle and the diff only moves when the
             // agent commits, so a write per tick is a write nobody needs.
             let stored = self.db.attempt_changes(attempt.id).unwrap_or_default();
-            if stored != changed
-                && let Err(e) = self.db.set_attempt_changes(attempt.id, &changed)
-            {
+            let moved = stored != changed;
+            if moved && let Err(e) = self.db.set_attempt_changes(attempt.id, &changed) {
                 self.log.warn(format!(
                     "recording changes for attempt {}: {e:#}",
+                    attempt.id
+                ));
+            }
+            // The effects are a function of the diff, so a branch that did not
+            // move does not need them derived again — except on a row that has
+            // none at all, which is every attempt that was already running when
+            // §gh#236 landed and whose branch may never move again.
+            if (moved || self.db.attempt_effects(attempt.id).ok().flatten().is_none())
+                && let Err(e) = self.db.set_attempt_effects(attempt.id, &effects)
+            {
+                self.log.warn(format!(
+                    "recording effects for attempt {}: {e:#}",
                     attempt.id
                 ));
             }
@@ -1163,7 +1174,10 @@ impl SyncEngine {
     /// function keeps for pre-`base_sha` rows is a weaker measurement, and a
     /// *remainder* computed against the wrong base would invent unclaimed files
     /// out of somebody else's commits.
-    pub fn branch_changes(&self, attempt: &Attempt) -> Option<Vec<crate::claims::ChangedFile>> {
+    pub fn branch_facts(
+        &self,
+        attempt: &Attempt,
+    ) -> Option<(Vec<crate::claims::ChangedFile>, crate::effects::Effects)> {
         let worktree = attempt.worktree.as_deref()?;
         if !std::path::Path::new(worktree).exists() {
             return None;
@@ -1177,15 +1191,95 @@ impl SyncEngine {
         let name_status = git_out(worktree, &["diff", "--name-status", "--no-renames", &range])
             .unwrap_or_default();
         let mut changed = crate::claims::parse_diff(&numstat, &name_status);
-        // A third read of the same range, for the symbol anchors (§gh#235).
-        // `-U0` because only the lines that actually moved are evidence: a
-        // symbol three lines above the edit is context the agent did not touch,
-        // and letting it anchor a claim would be exactly the generous reading
-        // this module refuses everywhere else.
-        if let Some(diff) = git_out(worktree, &["diff", "-U0", "--no-renames", &range]) {
-            crate::claims::attach_symbols(&mut changed, &diff);
+        // A third read of the same range, for the symbol anchors (§gh#235) and
+        // for the effects (§gh#236). `-U0` because only the lines that actually
+        // moved are evidence: a symbol three lines above the edit is context
+        // the agent did not touch, and letting it anchor a claim — or count as
+        // a public API change — would be exactly the generous reading this
+        // module refuses everywhere else.
+        let unified = git_out(worktree, &["diff", "-U0", "--no-renames", &range]);
+        if let Some(diff) = &unified {
+            crate::claims::attach_symbols(&mut changed, diff);
         }
-        Some(changed)
+        let effects = self.branch_effects(worktree, base, &changed, unified.as_deref());
+        Some((changed, effects))
+    }
+
+    /// What this attempt's branch had as an *effect* (§gh#236): the tests
+    /// either side of it, the public surface, the schema, the config keys and
+    /// the dependencies.
+    ///
+    /// Everything here is read from git, and every failure lands as "unknown"
+    /// rather than as a clean result — a diff the board could not read at all
+    /// returns [`crate::effects::Effects::default`], whose `read` flag is
+    /// `false` and whose chip row says so in one line.
+    fn branch_effects(
+        &self,
+        worktree: &str,
+        base: &str,
+        changed: &[crate::claims::ChangedFile],
+        diff: Option<&str>,
+    ) -> crate::effects::Effects {
+        let Some(diff) = diff else {
+            return crate::effects::Effects::default();
+        };
+        let (deps_added, deps_known) = self.deps_added(worktree, base, changed);
+        crate::effects::Effects {
+            read: true,
+            files: crate::effects::scan(changed, diff),
+            // Both counted the same way in the two trees the diff spans, so the
+            // pair is comparable even where the rule is coarse. `HEAD` rather
+            // than the working tree: the branch is what a reviewer can fetch,
+            // and uncommitted work is reported on its own line.
+            tests_after: test_total(worktree, "HEAD"),
+            tests_before: test_total(worktree, base),
+            deps_added,
+            deps_known,
+        }
+    }
+
+    /// Dependencies this branch added, read out of the manifests on both sides.
+    ///
+    /// Not a diff heuristic: the file as it was and the file as it is, each
+    /// parsed for the names it lists. A manifest that will not parse, or a side
+    /// git will not hand over, returns `false` for "known" — which makes the
+    /// chip say unknown, because "no dependencies added" is the one thing the
+    /// board must not say about a manifest it failed to read.
+    fn deps_added(
+        &self,
+        worktree: &str,
+        base: &str,
+        changed: &[crate::claims::ChangedFile],
+    ) -> (Vec<String>, bool) {
+        let mut added: Vec<String> = Vec::new();
+        let mut known = true;
+        for file in changed
+            .iter()
+            .filter(|f| crate::effects::is_manifest(&f.path))
+        {
+            // An added file had no `before` and a deleted one has no `after`:
+            // git is right to refuse those, and empty is the honest content.
+            let before = match file.status.starts_with('A') {
+                true => Some(String::new()),
+                false => git_out(worktree, &["show", &format!("{base}:{}", file.path)]),
+            };
+            let after = match file.status.starts_with('D') {
+                true => Some(String::new()),
+                false => git_out(worktree, &["show", &format!("HEAD:{}", file.path)]),
+            };
+            match (before, after) {
+                (Some(before), Some(after)) => {
+                    match crate::effects::deps_added(&file.path, &before, &after) {
+                        Some(names) => added.extend(names),
+                        None => known = false,
+                    }
+                }
+                _ => known = false,
+            }
+        }
+        added.sort();
+        added.dedup();
+        (added, known)
     }
 
     /// Read an agent's claims off the attempt it just finished (§gh#235).
@@ -1334,30 +1428,71 @@ impl SyncEngine {
                     anyhow::anyhow!("{} has no attempts to review", task.identifier)
                 })?,
             };
-        let (changed, diff) = match self.branch_changes(&attempt) {
-            Some(changed) => (changed, DiffSource::Checkout),
+        let (changed, effects, diff) = match self.branch_facts(&attempt) {
+            Some((changed, effects)) => (changed, effects, DiffSource::Checkout),
             None => {
                 let recorded = self.db.attempt_changes(attempt.id)?;
+                // The snapshot's effects, which are the ones taken against the
+                // snapshot's diff. Absent is `read = false`, and the chip row
+                // says the board never read this branch rather than saying
+                // nothing moved in it.
+                let effects = self.db.attempt_effects(attempt.id)?.unwrap_or_default();
                 if recorded.is_empty() {
                     (
                         Vec::new(),
+                        effects,
                         DiffSource::Unavailable {
                             reason: unreadable_diff(&attempt),
                         },
                     )
                 } else {
-                    (recorded, DiffSource::Recorded)
+                    (recorded, effects, DiffSource::Recorded)
                 }
             }
         };
-        Ok(crate::claims::review(
+        let mut review = crate::claims::review(
             &task,
             &attempt,
             changed,
             diff,
             self.uncommitted(&attempt),
             self.db.attempt_evidence(attempt.id)?.unwrap_or_default(),
-        ))
+            effects,
+        );
+        self.count_call_sites(&attempt, &mut review);
+        Ok(review)
+    }
+
+    /// Count, for every symbol anchor on every claim, how many lines name it
+    /// now and how many named it before (§gh#236).
+    ///
+    /// Done here rather than in the snapshot because it needs a checkout and
+    /// two greps per symbol: cheap when somebody opens a review, and not
+    /// something to run on every attempt on every reconcile. When the checkout
+    /// is gone the claims simply carry no call-site chips — the absence of a
+    /// count is the honest rendering of a count that was never taken.
+    fn count_call_sites(&self, attempt: &Attempt, review: &mut crate::claims::AttemptReview) {
+        let (Some(worktree), Some(base)) =
+            (attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+        else {
+            return;
+        };
+        if !std::path::Path::new(worktree).exists() {
+            return;
+        }
+        for claim in &mut review.remainder.claims {
+            for symbol in claim.symbols.clone() {
+                let Some(now) = git_grep(worktree, &symbol, "HEAD") else {
+                    continue;
+                };
+                claim.call_sites.push(crate::effects::CallSites {
+                    now: crate::effects::count_call_sites(&symbol, &now),
+                    before: git_grep(worktree, &symbol, base)
+                        .map(|before| crate::effects::count_call_sites(&symbol, &before)),
+                    symbol,
+                });
+            }
+        }
     }
 
     /// How many files are changed in this attempt's checkout but not committed.
@@ -3622,6 +3757,76 @@ fn git_out(worktree: &str, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The regexes that find a test declaration in a whole tree (§gh#236).
+///
+/// The `git grep` half of [`crate::effects::is_test_decl`], and deliberately
+/// the same rules: the two numbers on the tests chip are counted by this, in
+/// both trees, so a rule that misses a language misses it symmetrically and the
+/// *pair* stays honest even where the total is low. Searching every tracked
+/// file rather than a pathspec per language costs the odd markdown code fence,
+/// on both sides, for the same reason.
+const TEST_PATTERNS: &[&str] = &[
+    r"^[[:space:]]*#\[(tokio::|async_std::)?test\]",
+    r"^[[:space:]]*#\[(rstest|test_case)",
+    r"^func Test",
+    r"^[[:space:]]*(async )?def test_",
+    r"^[[:space:]]*(it|test)\(",
+    r"^[[:space:]]*func test",
+];
+
+/// How many test declarations one tree holds, or `None` when git could not say.
+///
+/// `None` is not zero and the chip renders it as neither: a suite the board
+/// could not count is a suite it must not report a count for.
+fn test_total(worktree: &str, rev: &str) -> Option<u32> {
+    let mut args: Vec<&str> = vec!["grep", "-I", "-c", "-E"];
+    for pattern in TEST_PATTERNS {
+        args.push("-e");
+        args.push(pattern);
+    }
+    args.push(rev);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(&args)
+        .output()
+        .ok()?;
+    match out.status.code() {
+        // `git grep -c` prints `rev:path:count` per file.
+        Some(0) => Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.rsplit_once(':'))
+                .filter_map(|(_, count)| count.trim().parse::<u32>().ok())
+                .sum(),
+        ),
+        // Exit 1 is git grep's "nothing matched", which is a count.
+        Some(1) => Some(0),
+        _ => None,
+    }
+}
+
+/// Every line in one tree that names `symbol` as a whole word.
+///
+/// `-F` and `-w`: a fixed string on a word boundary, so `note` cannot answer
+/// for `shelf_note` — the same exactness [`crate::claims::names_symbol`] holds
+/// to, and for the same reason. `-h` drops the `rev:path:` prefix, so what
+/// comes back is the lines themselves and [`crate::effects::count_call_sites`]
+/// can read them.
+fn git_grep(worktree: &str, symbol: &str, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["grep", "-h", "-I", "-w", "-F", "-e", symbol, rev])
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(String::from_utf8_lossy(&out.stdout).to_string()),
+        Some(1) => Some(String::new()),
+        _ => None,
+    }
 }
 
 /// Why an attempt's diff could not be read, in the words a review prints
@@ -8528,6 +8733,149 @@ max_duration = "{max_duration}"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// §gh#236, end to end: every chip on the row comes off the checkout and
+    /// the journal, and the one thing that arrived is the one thing that is not
+    /// neutral.
+    ///
+    /// The claims in here are deliberately *correct* — the point is not that
+    /// the board catches a lie, it is that a true claim reads differently when
+    /// something the agent did not write stands behind it.
+    #[test]
+    fn the_board_derives_the_effects_of_a_branch_without_asking_the_agent() {
+        let (dir, _) = checkout_with_a_base();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn active_placements() -> usize { 0 }\n\
+             fn a() { let _ = active_placements(); }\n\
+             fn b() { let _ = active_placements(); }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("app.toml"), "[sync]\n").unwrap();
+        commit_all(&dir, "a base with a dependency and a symbol");
+        let base = String::from_utf8_lossy(
+            &Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+
+        // The branch: a dependency arrives, the schema moves, a config key is
+        // added, a test is written, and one of the two call sites goes.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1.2\"\ntoml = \"1.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/db.rs"),
+            "// base\nconst UP: &str = \"ALTER TABLE attempts ADD COLUMN effects TEXT\";\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("app.toml"), "[sync]\ninterval = \"5m\"\n").unwrap();
+        std::fs::write(
+            dir.join("src/effects.rs"),
+            "pub fn scan() {}\n#[test]\nfn it_scans() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn active_placements() -> usize { 0 }\n\
+             fn a() { let _ = active_placements(); }\n\
+             fn b() {}\n",
+        )
+        .unwrap();
+        commit_all(&dir, "the work");
+
+        // What the harness recorded while the agent worked — the only source
+        // for "did the tests pass", and not one the agent wrote.
+        e.db.set_attempt_evidence(
+            a,
+            &crate::evidence::gather(&[crate::evidence::RanCommand {
+                command: "cargo test".into(),
+                failed: false,
+            }]),
+        )
+        .unwrap();
+
+        let review = e
+            .submit_claims(
+                None,
+                "linear:LIN-142",
+                "The scan and its test :: src/effects.rs\n\
+                 One call site went :: active_placements\n",
+            )
+            .unwrap();
+
+        let effects = &review.effects;
+        assert!(effects.read);
+        assert_eq!(
+            (effects.tests_before, effects.tests_after),
+            (Some(0), Some(1)),
+            "counted in both trees by the same rule"
+        );
+        assert_eq!(effects.deps_added, vec!["toml".to_string()]);
+        assert!(effects.deps_known);
+        assert!(matches!(
+            effects.public_api(),
+            crate::effects::Surface::Changed { .. }
+        ));
+        assert_eq!(
+            effects.schema(),
+            crate::effects::Surface::Changed { count: 1 },
+            "a migration written in Rust is still a migration"
+        );
+        assert_eq!(
+            effects.config_keys(),
+            crate::effects::Surface::Changed { count: 1 }
+        );
+
+        let chips = review.effect_chips();
+        assert_eq!(chips[0].text, "Tests 0 → 1, all passing");
+        assert_eq!(chips[0].ground, crate::effects::Ground::Neutral);
+        assert_eq!(chips.last().unwrap().text, "1 dependency added");
+        assert_eq!(
+            chips.last().unwrap().ground,
+            crate::effects::Ground::Working,
+            "a new dependency is the one chip on this row that is not neutral"
+        );
+
+        // The claim with a passing new test behind it is corroborated; the one
+        // about a symbol carries the count from both trees.
+        let tested = &review.remainder.claims[0];
+        assert_eq!(review.claim_chips(tested)[0].text, "1 new test passes");
+        assert_eq!(
+            review.claim_mark(tested),
+            crate::claims::ClaimMark::Corroborated
+        );
+        let moved = &review.remainder.claims[1];
+        let chips = review.claim_chips(moved);
+        assert_eq!(chips[0].text, "1 call site, was 2");
+        assert!(
+            chips.iter().any(|c| c.text == "no test covers this"),
+            "\"somebody calls it\" and \"something checks it\" are different news"
+        );
+        // Still a tick: a count taken in both trees is evidence the agent did
+        // not author, which is the whole bar this glyph is set at.
+        assert_eq!(
+            review.claim_mark(moved),
+            crate::claims::ClaimMark::Corroborated
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The one way an empty remainder could mislead: an agent that claims
     /// before it commits has shown the board nothing, and "all accounted for"
     /// would be the friendliest possible lie.
@@ -8625,6 +8973,15 @@ max_duration = "{max_duration}"
         assert!(matches!(review.diff, crate::claims::DiffSource::Recorded));
         assert_eq!(review.remainder.unclaimed.len(), 1);
         assert_eq!(review.remainder.unclaimed[0].path, "Cargo.lock");
+        // The effects were snapshotted with it (§gh#236) — they are read from
+        // the same checkout, so a review that kept the remainder and lost them
+        // would go from "the board looked" to "the board never looked" purely
+        // because gc ran.
+        assert!(review.effects.read, "the snapshot carries what was derived");
+        assert_eq!(review.effects.files.len(), 2);
+        // …and the call-site counts do NOT survive, because they were never
+        // stored: they need a tree to grep. Absent rather than stale.
+        assert!(review.remainder.claims[0].call_sites.is_empty());
     }
 
     /// …and when there is neither a checkout nor a snapshot, the review says
