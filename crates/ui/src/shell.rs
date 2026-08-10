@@ -183,20 +183,25 @@ impl SettingsSection {
         SettingsSection::Archived,
     ];
 
-    /// Sidebar + header label (comet settings-sidebar.tsx SECTIONS / __root.tsx
-    /// `settingsTitle` — the same strings in both places; Appearance is a
-    /// comet-native addition).
+    /// The nav label — **the short form** (gh#252).
+    ///
+    /// This is the sidebar's string and only the sidebar's: every page owns its
+    /// own header (`Board stats`, `Board routing`, `Archived sessions`), which
+    /// is why the nav does not have to repeat it. Four of these used to, and
+    /// the nav is 256px wide: `Archived sessions` and `Board routing` were
+    /// spending a third of the rail saying a word the page under the cursor was
+    /// about to say again. The design's labels are one word each.
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
-            SettingsSection::Agents => "Accounts",
+            SettingsSection::Agents => "Agents",
             // gh#76 — the workspace roster and its invitations.
             SettingsSection::Members => "Members",
-            SettingsSection::Routing => "Board routing",
-            SettingsSection::Stats => "Board stats",
+            SettingsSection::Routing => "Routing",
+            SettingsSection::Stats => "Stats",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
-            SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Archived => "Archived",
         }
     }
 }
