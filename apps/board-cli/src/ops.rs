@@ -403,6 +403,20 @@ pub fn render_claim_result(review: &AttemptReview) -> String {
 
 fn claims_section(review: &AttemptReview, out: &mut String) {
     use std::fmt::Write;
+    // A block that was written and could not be read (§gh#235). Printed whole,
+    // unlike the verdict's one line: this is the section a reviewer scrolls to
+    // when the verdict tells them the claims went missing, and the refusal
+    // names the line that did it.
+    if let Some(err) = &review.claims_error {
+        let _ = writeln!(
+            out,
+            "CLAIMS — a block was written and would not parse; nothing was recorded"
+        );
+        for line in err.lines() {
+            let _ = writeln!(out, "  ! {}", line.trim());
+        }
+        return;
+    }
     if !review.claimed() {
         let _ = writeln!(
             out,
@@ -428,8 +442,18 @@ fn claims_section(review: &AttemptReview, out: &mut String) {
         if !claim.matched.is_empty() {
             let _ = writeln!(out, "      {}", claim.matched.join(", "));
         }
-        for path in &claim.unmatched {
-            let _ = writeln!(out, "      (unchanged: {path})");
+        // A path nothing happened to and a symbol no changed line names are
+        // the same finding said about different anchors, and a reviewer needs
+        // to know which they are looking at before going to check it (§gh#235).
+        for anchor in &claim.unmatched {
+            let _ = match comet_board::claims::anchor_kind(anchor) {
+                comet_board::claims::AnchorKind::Path => {
+                    writeln!(out, "      (unchanged: {anchor})")
+                }
+                comet_board::claims::AnchorKind::Symbol => {
+                    writeln!(out, "      (no changed line names: {anchor})")
+                }
+            };
         }
     }
 }
@@ -1966,6 +1990,7 @@ mod tests {
             added: 12,
             removed: 3,
             binary: false,
+            symbols: Vec::new(),
         }
     }
 
@@ -1986,6 +2011,7 @@ mod tests {
                 body: None,
             },
             claimed_at: Some("2026-08-09T10:00:00Z".into()),
+            claims_error: None,
             remainder,
             changed: changed_files,
             diff: DiffSource::Checkout,
@@ -2003,6 +2029,7 @@ mod tests {
                 claims: vec![ClaimView {
                     text: "Storage".into(),
                     files: vec!["src/db.rs".into()],
+                    symbols: vec![],
                     matched: vec!["src/db.rs".into()],
                     unmatched: vec![],
                 }],
@@ -2064,6 +2091,7 @@ mod tests {
                 claims: vec![ClaimView {
                     text: "Fixed the retry path".into(),
                     files: vec!["src/retry.rs".into()],
+                    symbols: vec![],
                     matched: vec![],
                     unmatched: vec!["src/retry.rs".into()],
                 }],

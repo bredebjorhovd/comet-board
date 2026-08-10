@@ -522,6 +522,30 @@ pub trait Runtime {
         let _ = chat_id;
         Ok(None)
     }
+
+    /// The tail of what the agent *said* in this chat — off the same journal
+    /// again (§gh#235).
+    ///
+    /// Read for exactly one thing: the ```` ```claims ```` block a finished
+    /// attempt wrote instead of running `comet-board claim`. Never rendered,
+    /// never summarised, never shown to anybody — the argument the whole
+    /// review contract rests on is that prose written by the model that wrote
+    /// the code is not evidence, and this method does not get to be the hole
+    /// in it. [`crate::claims::harvest`] is the only caller and it looks for a
+    /// fence.
+    ///
+    /// A tail rather than the whole transcript because a long run's journal is
+    /// mostly text deltas, and the block is at the end by construction: it is
+    /// written when the work is done.
+    ///
+    /// Default `Ok(None)` rather than a refusal, like [`Runtime::run_tokens`]'s.
+    /// A runtime that cannot read a journal costs an attempt the harvest, and
+    /// an attempt with no claims settles exactly as it did before any of this
+    /// existed.
+    fn run_message(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
+        let _ = chat_id;
+        Ok(None)
+    }
 }
 
 /// What one chat's run journal says it spent, and what spent it (gh#151).

@@ -274,12 +274,27 @@ pub fn dispatcher_for(
     Dispatcher::agent(live.map(|a| a.task_id), is_agent.then(|| chat.to_string()))
 }
 
-/// The short name for a dispatcher: the parent's issue identifier when the
-/// board dispatched it too, its chat id otherwise. `None` is the operator, who
-/// is named by the surrounding copy rather than by this.
-pub fn dispatcher_name(db: &Db, d: &Dispatcher) -> Option<String> {
+/// The short name for a dispatcher, strongest first: the parent's issue
+/// identifier when the board dispatched it too, then the human the board
+/// recorded behind the release, and only then the raw chat id (gh#232).
+///
+/// `user` is [`Attribution::name`] — who released this, as the attempt row
+/// stores it. It sits *above* the chat id rather than below it because a chat
+/// id is legible exactly when it resolves to an issue identifier: when it does
+/// not, it is a UUID, and a UUID is the least useful of the three facts on
+/// hand. The comment used to print one in place of an address the board was
+/// already holding. The id keeps its place as the last resort it was meant to
+/// be — an agent-issued dispatch with nobody signed in still names the chain.
+///
+/// `None` is a dispatch with none of the three, named by the surrounding copy
+/// rather than by this.
+pub fn dispatcher_name(db: &Db, d: &Dispatcher, user: Option<&str>) -> Option<String> {
+    let named = || {
+        user.map(str::to_string)
+            .filter(|u: &String| !u.trim().is_empty())
+    };
     match d {
-        Dispatcher::Operator => None,
+        Dispatcher::Operator => named(),
         Dispatcher::Agent { task, pane } => task
             .as_deref()
             // A reaped parent leaves an id with no row behind it; the id is
@@ -291,6 +306,7 @@ pub fn dispatcher_name(db: &Db, d: &Dispatcher) -> Option<String> {
                     .map(|t| t.identifier)
                     .unwrap_or_else(|| id.to_string())
             })
+            .or_else(named)
             .or_else(|| pane.clone()),
     }
 }
@@ -370,6 +386,21 @@ pub fn build_spec(
         model: overrides.model.clone(),
         account: effective_account(route, overrides).map(str::to_string),
     })
+}
+
+/// What an attempt actually ran under, as against what its route would have run
+/// (gh#232).
+///
+/// One value rather than two parameters because the pair is one answer, and
+/// splitting it is how the runtime got separated from the override in the first
+/// place: the writeback took a `&str` that the route could satisfy, so a
+/// dispatch under `--runtime opencode` typechecked while reading `claude-code`
+/// upstream. `model` is `None` for the harness default, which the board cannot
+/// spell and so does not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RanOn<'a> {
+    pub runtime: &'a str,
+    pub model: Option<&'a str>,
 }
 
 /// Per-dispatch deviations from the route's defaults — what the operator (or an
@@ -990,7 +1021,14 @@ mod tests {
         });
         assert_eq!(d.task(), Some("linear:LIN-138"));
         assert_eq!(d.pane(), Some("chat-p"));
-        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("LIN-138"));
+        assert_eq!(dispatcher_name(&db, &d, None).as_deref(), Some("LIN-138"));
+        // …and it stays the identifier even with a human on hand: the parent
+        // issue is the more useful of the two, and the chain is what a reader
+        // follows.
+        assert_eq!(
+            dispatcher_name(&db, &d, Some("brede@tally.no")).as_deref(),
+            Some("LIN-138")
+        );
     }
 
     /// The usual case (AGE-24): a long-lived orchestrator chat the board never
@@ -1001,7 +1039,32 @@ mod tests {
         let d = dispatcher_for(&db, Some("chat-orch"), |_| true);
         assert_eq!(d.task(), None);
         assert_eq!(d.pane(), Some("chat-orch"));
-        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("chat-orch"));
+        assert_eq!(dispatcher_name(&db, &d, None).as_deref(), Some("chat-orch"));
+    }
+
+    /// gh#232: an orchestrator chat the board never dispatched resolves to no
+    /// identifier, and the chat id is a UUID on a public comment. The human the
+    /// board already recorded beats it; the id survives only when there is
+    /// nobody to name, and a blank claim is nobody.
+    #[test]
+    fn a_person_outranks_a_bare_chat_id() {
+        let db = Db::open_in_memory().unwrap();
+        let d = dispatcher_for(&db, Some("f31135c6-92d2-4efa-a0c1-1c740170f4c7"), |_| true);
+        assert_eq!(
+            dispatcher_name(&db, &d, Some("brede@tally.no")).as_deref(),
+            Some("brede@tally.no")
+        );
+        assert_eq!(
+            dispatcher_name(&db, &d, Some("   ")).as_deref(),
+            Some("f31135c6-92d2-4efa-a0c1-1c740170f4c7")
+        );
+        // The operator's dispatch is named by the same human, and by nothing
+        // when the frontend sent none.
+        assert_eq!(
+            dispatcher_name(&db, &Dispatcher::Operator, Some("brede@tally.no")).as_deref(),
+            Some("brede@tally.no")
+        );
+        assert_eq!(dispatcher_name(&db, &Dispatcher::Operator, None), None);
     }
 
     /// An archived or gone chat is not claimed as an agent — recording it
@@ -1039,8 +1102,11 @@ mod tests {
     fn a_parent_whose_row_is_gone_is_named_by_its_id() {
         let db = Db::open_in_memory().unwrap();
         let d = Dispatcher::agent(Some("linear:LIN-999".into()), None);
-        assert_eq!(dispatcher_name(&db, &d).as_deref(), Some("linear:LIN-999"));
-        assert_eq!(dispatcher_name(&db, &Dispatcher::Operator), None);
+        assert_eq!(
+            dispatcher_name(&db, &d, None).as_deref(),
+            Some("linear:LIN-999")
+        );
+        assert_eq!(dispatcher_name(&db, &Dispatcher::Operator, None), None);
     }
 
     #[test]
