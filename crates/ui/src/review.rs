@@ -1581,6 +1581,9 @@ mod tests {
             symbols: vec![],
         };
         AttemptReview {
+            // gh#236's field, defaulted: read = false, so this fixture claims
+            // nothing about effects it does not exercise.
+            effects: Default::default(),
             task_id: "gh:o/r#138".into(),
             attempt: 7,
             attempt_number: 1,
