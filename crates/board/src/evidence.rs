@@ -210,6 +210,59 @@ fn word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Does this command run a *test suite*, as opposed to checking something else
+/// (§gh#236)?
+///
+/// A narrower question than [`is_check`] and asked for a narrower purpose: the
+/// review's tests chip says whether the tests pass, and a green `cargo build`
+/// or `cargo fmt` is not an answer to that. Same segment-and-prefix machinery,
+/// over [`TESTS`] instead of [`VERIFICATION`], so `cd web && pnpm test` counts
+/// exactly where `cd web && pnpm build` does not.
+pub fn runs_tests(command: &str) -> bool {
+    segments(command).any(|s| {
+        TESTS.iter().any(|v| {
+            s.strip_prefix(v)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| !word_char(c)))
+        })
+    })
+}
+
+/// The subset of [`VERIFICATION`] that runs tests.
+///
+/// A subset rather than a second list: every entry here is spelled exactly as
+/// it is spelled there, so a command cannot be a test runner and not a check —
+/// which would make the evidence block and the tests chip disagree about the
+/// same line of the journal.
+pub const TESTS: &[&str] = &[
+    "cargo test",
+    "cargo nextest",
+    "cargo bench",
+    "npm test",
+    "npm run test",
+    "pnpm test",
+    "pnpm run test",
+    "yarn test",
+    "bun test",
+    "jest",
+    "vitest",
+    "mocha",
+    "playwright test",
+    "pytest",
+    "python -m pytest",
+    "python -m unittest",
+    "tox",
+    "nox",
+    "go test",
+    "make test",
+    "swift test",
+    "gradle test",
+    "./gradlew test",
+    "mvn test",
+    "dotnet test",
+    "rspec",
+    "phpunit",
+];
+
 /// Commands that check something, longest-prefix spellings included.
 ///
 /// Not a taxonomy of build tools — a list of the verbs that mean "I verified
@@ -387,6 +440,22 @@ mod tests {
         let e = gather(&[ran(&long, false)]);
         assert!(e.checks[0].command.chars().count() <= MAX_COMMAND + 1);
         assert!(e.checks[0].command.ends_with('…'));
+    }
+
+    /// The tests chip asks a narrower question than the evidence block, and
+    /// every command that answers it must also be a check — or the two would
+    /// read the same journal and disagree (§gh#236).
+    #[test]
+    fn a_test_runner_is_a_check_and_a_build_is_not_a_test_runner() {
+        for command in TESTS {
+            assert!(is_check(command), "{command} must be a check");
+        }
+        assert!(runs_tests("cd web && pnpm test -- --run"));
+        assert!(runs_tests("RUST_LOG=debug cargo test claims"));
+        assert!(!runs_tests("cargo build"));
+        assert!(!runs_tests("pnpm build"));
+        assert!(!runs_tests("cargo clippy --all-targets"));
+        assert!(!runs_tests("git status"));
     }
 
     #[test]

@@ -222,6 +222,15 @@ pub struct ClaimView {
     /// dropped — a claim that cannot be checked is exactly the thing this
     /// screen exists to say out loud.
     pub unmatched: Vec<String>,
+    /// How far each of this claim's *symbol* anchors reaches, counted in both
+    /// trees (§gh#236). Empty on a path-anchored claim, and empty when there
+    /// was no checkout to count in — which is why the chip built from it says
+    /// nothing rather than saying zero.
+    ///
+    /// Filled after the fact by [`crate::sync::SyncEngine::review`]: counting
+    /// call sites needs a repo, and [`remainder`] is pure on purpose.
+    #[serde(default)]
+    pub call_sites: Vec<crate::effects::CallSites>,
 }
 
 impl ClaimView {
@@ -338,6 +347,15 @@ pub struct AttemptReview {
     /// checkout to ask.
     pub uncommitted: Option<u32>,
     pub evidence: RunEvidence,
+    /// What the board derived from the branch itself (§gh#236): the tests
+    /// either side of it, the public surface, the schema, the config keys and
+    /// the dependencies.
+    ///
+    /// Defaulted for every attempt recorded before it existed, and the default
+    /// is [`crate::effects::Effects::read`]`= false` — which renders as "not
+    /// read" rather than as five clean results.
+    #[serde(default)]
+    pub effects: crate::effects::Effects,
 }
 
 impl AttemptReview {
@@ -664,7 +682,12 @@ pub fn attach_symbols(files: &mut [ChangedFile], diff: &str) {
 
 /// The path out of a `+++ b/crates/board/src/db.rs` header, or `None` for
 /// `/dev/null` and for the `+++` of a diff that carries no path.
-fn header_path(header: &str) -> Option<&str> {
+///
+/// Shared with [`crate::effects`], which walks the same `-U0` diff for a
+/// different question (§gh#236): two readers of one diff format must agree
+/// about which file a hunk belongs to, and the way to guarantee that is one
+/// function.
+pub(crate) fn header_path(header: &str) -> Option<&str> {
     let path = header.split('\t').next()?.trim();
     if path.is_empty() || path == "/dev/null" {
         return None;
@@ -747,6 +770,7 @@ pub fn remainder(claims: &[Claim], changed: &[ChangedFile]) -> Remainder {
             symbols: claim.symbols.clone(),
             matched,
             unmatched,
+            call_sites: Vec::new(),
         });
     }
 
@@ -776,6 +800,7 @@ pub fn review(
     diff: DiffSource,
     uncommitted: Option<u32>,
     evidence: RunEvidence,
+    effects: crate::effects::Effects,
 ) -> AttemptReview {
     let remainder = remainder(&attempt.claims, &changed);
     AttemptReview {
@@ -812,6 +837,7 @@ pub fn review(
         diff,
         uncommitted,
         evidence,
+        effects,
     }
 }
 
@@ -898,6 +924,35 @@ impl FindingKind {
             | FindingKind::MalformedClaims
             | FindingKind::Unchecked => Tone::Alarm,
             FindingKind::NeverClaimed | FindingKind::NoDiff => Tone::Unknown,
+        }
+    }
+}
+
+/// How much a claim is standing on (§gh#236), in one glyph.
+///
+/// Three, because a claim has three genuinely different states and a screen
+/// that drew two of them alike would be doing the flattening this whole design
+/// exists to undo. The middle one is the reason it is not a boolean: a claim
+/// the diff supports but nothing checks is neither contradicted nor verified,
+/// and it must not be allowed to borrow either look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimMark {
+    /// Nothing this claim anchored moved. `!`, in the review's one loud hue.
+    Contradicted,
+    /// Something the agent did not author supports it: a new test that passes,
+    /// a call-site count that moved. `✓`.
+    Corroborated,
+    /// The anchors matched, and nothing corroborates it. `·`, quiet.
+    Bare,
+}
+
+impl ClaimMark {
+    /// The glyph itself, so the CLI and the desktop cannot pick different ones.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            ClaimMark::Contradicted => "!",
+            ClaimMark::Corroborated => "✓",
+            ClaimMark::Bare => "·",
         }
     }
 }
@@ -1032,6 +1087,40 @@ impl AttemptReview {
             });
         }
         out
+    }
+
+    /// The effects row (§gh#236): what the board found in the branch itself,
+    /// beside what the agent said about it.
+    ///
+    /// Deliberately **not** folded into [`Self::findings`]. A new dependency
+    /// and an unrun suite are things to look at, not things nobody accounted
+    /// for, and the verdict bar's one loud voice belongs to the remainder — a
+    /// screen where three blocks shout has nothing left to shout with.
+    pub fn effect_chips(&self) -> Vec<crate::effects::Chip> {
+        self.effects.chips(&self.evidence)
+    }
+
+    /// The evidence chips under one claim: what the board found in the files
+    /// that claim's own anchors reached.
+    pub fn claim_chips(&self, claim: &ClaimView) -> Vec<crate::effects::Chip> {
+        crate::effects::claim_chips(
+            &claim.matched,
+            &claim.call_sites,
+            &self.effects,
+            crate::effects::test_run(&self.evidence),
+        )
+    }
+
+    /// Which glyph one claim is drawn with, in every surface that draws claims.
+    pub fn claim_mark(&self, claim: &ClaimView) -> ClaimMark {
+        if !claim.anchored() {
+            return ClaimMark::Contradicted;
+        }
+        if crate::effects::corroborated(&self.claim_chips(claim)) {
+            ClaimMark::Corroborated
+        } else {
+            ClaimMark::Bare
+        }
     }
 
     /// The one line a surface leads with.
@@ -1427,6 +1516,7 @@ mod tests {
             DiffSource::Checkout,
             Some(0),
             RunEvidence::default(),
+            crate::effects::Effects::default(),
         );
         assert_eq!(r.brief.identifier, "gh#183");
         // An issue whose body is whitespace has no description; a surface must
@@ -1452,6 +1542,7 @@ mod tests {
             DiffSource::Recorded,
             None,
             RunEvidence::default(),
+            crate::effects::Effects::default(),
         );
         assert!(!r.claimed());
         assert_eq!(r.remainder.unclaimed.len(), 1);
@@ -1472,6 +1563,7 @@ mod tests {
             DiffSource::Checkout,
             Some(0),
             RunEvidence::default(),
+            crate::effects::Effects::default(),
         ))
         .unwrap();
 
@@ -1490,6 +1582,18 @@ mod tests {
         assert_eq!(json["claims"][0]["matched"][0], "src/a.rs");
         assert_eq!(json["evidence"]["commands"], 0);
         assert!(json["evidence"]["checks"].as_array().unwrap().is_empty());
+        // The effects ride in the same object (§gh#236), and a review nobody
+        // took them for carries `read: false` rather than dropping the key —
+        // a reader that saw no `effects` at all could not tell "unread" from
+        // "this build of the board does not derive them".
+        assert_eq!(json["effects"]["read"], false);
+        assert!(json["effects"]["files"].as_array().unwrap().is_empty());
+        assert!(
+            json["claims"][0]["call_sites"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A collected checkout with nothing recorded must not render as "nothing
@@ -1507,6 +1611,7 @@ mod tests {
             },
             None,
             RunEvidence::default(),
+            crate::effects::Effects::default(),
         );
         assert!(matches!(r.diff, DiffSource::Unavailable { .. }));
         assert!(
@@ -1538,6 +1643,7 @@ mod tests {
             DiffSource::Checkout,
             uncommitted,
             evidence,
+            crate::effects::Effects::default(),
         )
     }
 
@@ -1712,6 +1818,7 @@ mod tests {
             },
             Some(4),
             crate::evidence::gather(&[ran("cargo test", true)]),
+            crate::effects::Effects::default(),
         );
         let findings = r.findings();
         assert_eq!(findings.len(), 1);
@@ -2024,6 +2131,7 @@ mod tests {
             DiffSource::Checkout,
             Some(0),
             RunEvidence::default(),
+            crate::effects::Effects::default(),
         );
         assert_eq!(loud.findings()[0].kind, FindingKind::MalformedClaims);
         assert_eq!(loud.verdict().tone, Tone::Alarm);
