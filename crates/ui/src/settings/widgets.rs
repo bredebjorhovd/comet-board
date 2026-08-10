@@ -41,6 +41,13 @@ pub const FORM_WIDTH: f32 = 768.0;
 /// a chart stretched across an ultrawide is not a better chart.
 pub const DASHBOARD_WIDTH: f32 = 1160.0;
 
+/// The reference's page frame: the named widths above are CONTENT widths, so
+/// the centered wrapper has to include its two 24px gutters rather than eating
+/// them out of the measure (gh#258).
+const PAGE_GUTTER: f32 = 24.0;
+const PAGE_TOP: f32 = 26.0;
+const SUBTITLE_WIDTH: f32 = 560.0;
+
 /// Centered page column at the form width — the default, and what seven of the
 /// eight pages use.
 pub fn page_column() -> gpui::Div {
@@ -60,10 +67,10 @@ pub fn dashboard_column() -> gpui::Div {
 fn column(max_width: f32) -> gpui::Div {
     div()
         .w_full()
-        .max_w(px(max_width))
+        .max_w(px(max_width + 2.0 * PAGE_GUTTER))
         .mx_auto()
-        .px(px(24.0))
-        .pt(px(32.0))
+        .px(px(PAGE_GUTTER))
+        .pt(px(PAGE_TOP))
         .pb(px(64.0))
         .flex()
         .flex_col()
@@ -97,8 +104,10 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
 /// Subtitle under the headline: `mt-1 text-[13px] text-muted-foreground`.
 pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
     div()
-        .mt(px(4.0))
+        .mt(px(1.0))
+        .max_w(px(SUBTITLE_WIDTH))
         .text_size(px(Theme::TEXT_BODY))
+        .line_height(px(20.0))
         .text_color(theme.text_muted)
         .child(copy.into())
 }
@@ -351,6 +360,9 @@ mod tests {
     fn there_are_exactly_two_page_widths() {
         assert_eq!(FORM_WIDTH, 768.0);
         assert_eq!(DASHBOARD_WIDTH, 1160.0);
+        assert_eq!(PAGE_GUTTER, 24.0);
+        assert_eq!(PAGE_TOP, 26.0);
+        assert_eq!(SUBTITLE_WIDTH, 560.0);
         // A width apiece, and the wide one is the wide one.
         const { assert!(DASHBOARD_WIDTH > FORM_WIDTH) };
     }

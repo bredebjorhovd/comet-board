@@ -10,32 +10,58 @@
 //! dark's (see below). The chosen variant is installed as a gpui [`Global`] at
 //! boot (`cx.set_global(Theme::dark())`) and can be flipped live from the
 //! Appearance settings page; read with [`Theme::of`]. Hairlines and interactive
-//! washes are white at low alpha in dark and cool ink at low alpha in light —
+//! washes are white at low alpha in dark and black at low alpha in light —
 //! see [`Theme::white_alpha`] / [`Theme::wash`].
 //!
-//! # Light is a design, not an inversion (gh#177)
+//! # The surfaces are transcribed, not derived (gh#258)
+//!
+//! Every neutral surface below is a hex lifted out of the supplied design
+//! files (`Comet Window.dc.html`, `Comet Stats Window.dc.html`,
+//! `Comet Settings Window.dc.html`), whose stylesheet declares the whole
+//! system as eight custom properties per variant. The mapping, once, so the
+//! next reader can diff a token against the reference without guessing which
+//! name means which thing:
+//!
+//! | reference | token | dark | light |
+//! |---|---|---|---|
+//! | `--shell` | [`Theme::surface`] | `#0d0d0d` | `#e9e9ec` |
+//! | `--card` | [`Theme::bg`] | `#070707` | `#ffffff` |
+//! | `--raised` | [`Theme::card`] / [`Theme::surface_raised`] / [`Theme::bubble`] | `#161616` | `#f4f4f7` |
+//! | `--sel` | [`Theme::row_selected`] | `#191919` | `#ffffff` |
+//! | `--selcard` | [`Theme::row_selected_card`] | `#191919` | `#eeeef2` |
+//! | `--line` | [`Theme::border`] | white 8% | `#e4e4e8` |
+//! | `--line2` | [`Theme::border_strong`] | white 13% | `#d6d6dc` |
+//! | `--hover` | [`Theme::element_hover`] | white 5% | black 2.5% |
+//!
+//! The names are ours and the numbers are theirs. `--card` is the reference's
+//! word for the MAIN PANEL — the inset content card the transcript and the
+//! board pane live in — which is why it lands on [`Theme::bg`] and not on
+//! [`Theme::card`]; a call site that wants "the tone behind the page" wants
+//! `bg`, and one that wants "an inner panel on the page" wants `card`.
+//! `the_surfaces_are_the_reference_hexes` holds every one of these to the hex.
+//!
+//! # Light is a design, not an inversion (gh#177, retuned by gh#258)
 //!
 //! Light mode used to be dark's ramp read backwards, and four things do not
 //! survive that trip:
 //!
-//! 1. **Elevation.** Dark walks `#060606 → #0d0d0d → #1e1e1e`, brighter as it
+//! 1. **Elevation.** Dark walks `#070707 → #0d0d0d → #161616`, brighter as it
 //!    rises. Inverted, light walked `#fafafa → #f3f3f3 → #e4e4e4` — a popover
-//!    DARKER than the page behind it, which reads as a hole. Light elevates
-//!    toward white and lets shadow do the lifting: the shell is the ground
-//!    ([`Theme::surface`]), the main panel is paper ([`Theme::bg`]), and a
-//!    float is white ([`Theme::surface_raised`] / [`Theme::float_card`]) under
-//!    [`Theme::float_shadow`].
+//!    DARKER than the page behind it, which reads as a hole. Light re-declares
+//!    the ramp instead: the shell is the ground ([`Theme::surface`]), the main
+//!    panel is paper ([`Theme::bg`], and in this variant the paper is WHITE),
+//!    and an inner panel on that paper is the reference's grey
+//!    [`Theme::surface_raised`] under a hairline. A true float — a popover, a
+//!    dialog, a palette — still lifts to near-white ([`Theme::float_card`])
+//!    with [`Theme::float_shadow`] doing the work, because a float covers the
+//!    page rather than sitting on it.
 //! 2. **Your own message.** The user bubble painted `surface_raised`, which
 //!    inverted to a mid-grey slab in the middle of a white page. It has its own
-//!    token now — [`Theme::bubble`], the shallowest step the paper can take
-//!    plus a hairline — because "mine" is a distinction, not an elevation.
+//!    token — [`Theme::bubble`] — which the reference happens to paint with the
+//!    same inner-panel grey as everything else that sits ON the paper.
 //! 3. **Washes are not perceptually symmetric.** White at 14% over near-black
 //!    is a lift; ink at 14% over near-white is a scrim. Light washes run at
-//!    [`Theme::LIGHT_WASH_SCALE`] of the alpha a call site names, and they are
-//!    made of cool [`ink`] rather than black so they tint instead of dirtying.
-//!    (The selection washes are the exception and keep their full alpha: they
-//!    were tuned against the light bed in the first place — see [`Theme::row`],
-//!    which answers hover-versus-selected for every list.)
+//!    [`Theme::LIGHT_WASH_SCALE`] of the alpha a call site names.
 //! 4. **Contrast.** The four text tones are measured against every light
 //!    surface, not just the page — see `text_tones_clear_their_contrast_floors`.
 //!
@@ -43,10 +69,12 @@
 //! blurred desktop, so the wallpaper tinted the sidebar. [`Theme::glass`] is a
 //! tinted scrim now, at dark's neutralising alpha.
 //!
-//! Every light neutral carries a trace of blue ([`Theme::LIGHT_NEUTRAL_HUE`]) —
-//! a pure grey beside white makes the white read yellow. The one exception is
-//! `surface_raised`, which IS white: it is the thing the trace exists to keep
-//! looking white.
+//! The light neutrals carry the reference's own trace of blue — `#e9e9ec`,
+//! `#f4f4f7`, `#e4e4e8` all run their blue channel three points over the other
+//! two. What gh#258 removed is the *cool cast* the generated ramp had on top of
+//! that: `#edf0f4` and `#17191d` moved all three channels, which reads as a
+//! tint rather than as a neutral. Light text is now flat grey (`#171717` …
+//! `#8a8a8a`), exactly as the reference sets it.
 //!
 //! # Four text tones, and no multipliers (gh#172)
 //!
@@ -95,7 +123,7 @@
 //! the padding being [`Theme::NEST_GUTTER`], which is the gutter the cards
 //! already used. A row at 10 inside a card at 14 reads as one object.
 //!
-//! # Hover is tone, selection is elevation (gh#175)
+//! # Hover is tone, selection is a surface with an edge (gh#175, gh#258)
 //!
 //! Hover and selection used to be the same paint one notch apart — a 14% wash
 //! against a 16% wash, with selection's only real telling a 1px inset ring at
@@ -109,20 +137,27 @@
 //!
 //! - **Hover is a flat wash.** [`Theme::element_hover`], the same weak neutral
 //!   tone a button gets. No edge, no structure, nothing but tone.
-//! - **Selection lifts the row onto its own surface**, with a hairline round
-//!   it ([`RowPaint::ring`], an inset shadow — nothing may paint BEHIND a
-//!   glass row).
+//! - **Selection puts the row on a named surface** — [`Theme::row_selected`],
+//!   the reference's `--sel` — with a hairline round it ([`RowPaint::ring`], an
+//!   inset shadow: nothing may paint BEHIND a glass row).
 //!
 //! Two channels, no ambiguity, and no colour is spent on "this one":
 //! monochrome on purpose, because the status hues above mean STATE and
 //! selection is not a state.
 //!
-//! Elevation only means something relative to the surface underneath, so the
-//! row says what it sits on ([`Bed`]). On the shell a selected row lifts —
-//! toward light in dark mode, to white in light mode. Inside a settings card
-//! in light mode there is nowhere left to lift: the card is already the raised
-//! white object on the page, so the row steps DOWN into it and the hairline
-//! draws the edge of the well.
+//! What gh#258 changed is the AMOUNT. Selection used to be a 16% white wash,
+//! which lands a sidebar row on `#303030` — a slab, three times the step the
+//! design draws. The reference paints `#191919`: barely off the shell, and the
+//! hairline is what you actually read. The two channels survive; the shouting
+//! does not. Where the row lands is a surface rather than a wash now, so a
+//! bed-relative wash cannot drift the tone off the reference — a selected row
+//! is the same `#191919` in the sidebar and in the board pane, exactly as the
+//! design files draw it.
+//!
+//! The row still says what it sits on ([`Bed`]), because light draws the two
+//! cases differently: on the shell a selected row goes to white, and on a
+//! panel or card — already white or near it — it steps DOWN to `#eeeef2` and
+//! the hairline draws the edge of the well.
 //!
 //! `rounded_full()` survives in a job or two — a dot, the send button, and the
 //! account avatar (gh#230), where roundness IS the meaning: a face is not a
@@ -231,14 +266,17 @@ impl Status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bed {
     /// The shell and everything over it: the sidebar's space/chat/agent lists,
-    /// the board pane, session and terminal tabs, popovers, pickers, the
-    /// palette. Dim in dark and bright-but-translucent in light, and in both
-    /// there is room above for a selected row to lift into.
+    /// session and terminal tabs, popovers, pickers, the palette. Dim in dark
+    /// and bright-but-translucent in light, and in both there is room above for
+    /// a selected row to lift into — to the reference's `--sel`.
     Shell,
-    /// Inside a settings card ([`crate::settings::widgets::section_card`]).
-    /// In light that card is already the raised white object on the page: a
-    /// row cannot lift out of it without competing with it, so it steps down
-    /// instead. In dark the card is near-black and the row lifts as usual.
+    /// On a panel or inside a card: the board pane's rows (the main panel IS
+    /// the reference's `--card`), and the rows inside a settings card
+    /// ([`crate::settings::widgets::section_card`]). In light those surfaces
+    /// are white or near it, so a row cannot lift out of them without
+    /// competing — it steps DOWN to the reference's `--selcard` instead, and
+    /// the hairline draws the well. In dark both land on the same near-black
+    /// lift the shell uses.
     Card,
 }
 
@@ -381,40 +419,58 @@ pub struct Theme {
     // ---- paint: neutral surfaces ----
     // Dark's are achromatic; light's carry [`Self::LIGHT_NEUTRAL_HUE`]'s trace
     // of blue (see the module docs).
-    /// The main panel. Dark's darkest tone (`#060606`, the inset well); light's
-    /// paper, one step ABOVE the shell it floats on.
+    /// The main panel — the reference's `--card`, the inset content card the
+    /// transcript, the board pane and every settings page live in. Dark's
+    /// darkest tone (`#070707`, the inset well); light's paper, which is white.
     pub bg: Hsla,
-    /// Panel / sidebar surface — the shell the main panel is inset into. Dark
-    /// walks UP from `bg` to reach it, light walks DOWN: it is the ground.
+    /// Panel / sidebar surface — the shell the main panel is inset into (the
+    /// reference's `--shell`). Dark walks UP from `bg` to reach it, light walks
+    /// DOWN: it is the ground.
     pub surface: Hsla,
-    /// A card raised off the main panel: the settings sections, the login and
-    /// workspace cards. Distinct from [`Self::surface`] because that token is
-    /// doing two jobs that only coincide in dark — the shell is one step ABOVE
-    /// `bg` there, so "the shell tone" and "a card tone" are the same number.
-    /// In light the shell is BELOW the paper and a card is above it, and using
-    /// one for the other is how a settings card ends up darker than the page
-    /// it sits on (gh#177).
+    /// An inner panel ON the main panel — the reference's `--raised`: the
+    /// settings sections, the stats cards, the login and workspace cards.
+    /// Distinct from [`Self::surface`] because that token was doing two jobs
+    /// that only coincided in dark — using one for the other is how a settings
+    /// card ends up the same tone as the shell behind the window (gh#177) or
+    /// dissolves into the page it sits on (gh#258).
     pub card: Hsla,
-    /// Raised surface: popovers, dialogs, floats, the composer well. The top of
-    /// the elevation ramp in BOTH variants — white in light, where the lift
-    /// comes from [`Self::float_shadow`] rather than from more tone.
+    /// The same inner-panel tone under the name the composer well, the message
+    /// bubbles and the menu surfaces ask for it by. One number with
+    /// [`Self::card`] in BOTH variants, because the reference has one
+    /// `--raised` — a genuine FLOAT (a popover over the page, not a panel on
+    /// it) is [`Self::float_card`], which lifts with [`Self::float_shadow`].
     pub surface_raised: Hsla,
     /// Hover tone for an OPAQUE raised surface — the one case a translucent
-    /// wash cannot serve, because the surface it would sit on is already the
-    /// top of the ramp. Brighter than `surface_raised` in dark, dimmer in light.
+    /// wash cannot serve, because the caller paints over it rather than under
+    /// it. Brighter than `surface_raised` in dark, dimmer in light.
     pub surface_raised_hover: Hsla,
-    /// Your own message. Not an elevation — a distinction, so it is a tint
-    /// rather than a step on the surface ramp (gh#177: inverted, the old
-    /// `surface_raised` bubble was a mid-grey slab on a white page).
+    /// Your own message. Not an elevation — a distinction; the reference draws
+    /// it with the inner-panel tone and no edge, which is a step the paper can
+    /// take in either variant.
     pub bubble: Hsla,
-    /// The hairline around [`Self::bubble`]. Transparent in dark, where the
-    /// tone carries the shape on its own.
+    /// The hairline around [`Self::bubble`]. Transparent in both variants: the
+    /// reference's bubble is bare `--raised`, and the tone carries the shape.
     pub bubble_border: Hsla,
     /// The hover wash, and the ONLY hover wash: a flat, weak, neutral tone for
-    /// rows and buttons alike. Selection is not a heavier version of this —
-    /// it is a different channel entirely ([`Theme::row`], gh#175).
+    /// rows and buttons alike (the reference's `--hover`). Selection is not a
+    /// heavier version of this — it is a different channel entirely
+    /// ([`Theme::row`], gh#175).
     pub element_hover: Hsla,
-    /// Hairline border — white at low alpha in dark, cool ink in light.
+    /// The surface a selected row lands on over the shell — the reference's
+    /// `--sel`. A named surface rather than a wash, so the tone is the same
+    /// number the design files draw and cannot drift with what is underneath
+    /// (gh#258).
+    pub row_selected: Hsla,
+    /// The same for a row on a panel or inside a card — the reference's
+    /// `--selcard`. Identical to [`Self::row_selected`] in dark; in light it is
+    /// the step DOWN a row takes when the surface it sits on is already white.
+    pub row_selected_card: Hsla,
+    /// The selected row's hairline — the reference's `--sellift`. Half the
+    /// signal, since the tone step is deliberately small; painted as an INSET
+    /// shadow (see [`hairline_ring`]).
+    pub row_edge: Hsla,
+    /// Hairline border — white at low alpha in dark, the reference's opaque
+    /// grey in light.
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
@@ -542,6 +598,10 @@ impl Theme {
     pub const STATUS_L_LIGHT: f32 = status::L_LIGHT;
     /// The chroma every status hue carries.
     pub const STATUS_C: f32 = status::C;
+    /// The same on a light surface, a touch richer: at the lower lightness
+    /// anchor the dark chroma reads washed out, and the reference compensates
+    /// (`oklch(0.52 0.16 …)` against dark's `oklch(0.74 0.14 …)`).
+    pub const STATUS_C_LIGHT: f32 = status::C_LIGHT;
     /// Blocked · failed · errored.
     pub const HUE_BLOCKED: f32 = status::BLOCKED;
     /// Working — an agent is running.
@@ -551,45 +611,63 @@ impl Theme {
     /// Settled · seen · online.
     pub const HUE_SETTLED: f32 = status::SETTLED;
 
-    // ---- hover is tone, selection is elevation (gh#175) ----
-    /// How far a selected row lifts off a DARK bed — the alpha of the
-    /// soft-white plate it becomes. More than twice the hover wash, because
-    /// it is a different surface and not more of the same one; and no more
-    /// than that, because the sublines on a selected row are painted in
-    /// [`Self::text_subtle`] and every point of lift costs them contrast (at
-    /// this step they hold ~3.3:1, where the wash it replaces gave ~3.5:1).
-    const SELECT_LIFT: f32 = 0.16;
-    /// The same lift on a light SHELL: near-white, still translucent enough
-    /// that the window vibrancy reads through the row.
-    const SELECT_WHITE: f32 = 0.85;
-    /// How far a selected row sinks INTO a white card, where lifting would
-    /// only compete with the card's own elevation.
-    const SELECT_SINK: f32 = 0.18;
-    /// What the pointer adds ON TOP of a selected row: the same small step in
-    /// whichever direction that row already moved.
-    const SELECT_HOVER_STEP: f32 = 0.06;
-    /// The selected row's hairline over a dark bed (white) and over a light
-    /// one (black). Twice the 0.09 ring it replaces, because the ring is no
-    /// longer a detail that distinguishes two near-identical washes — it is
-    /// half the signal, and it has to read at a glance across a long list.
-    /// The light ring runs heavier still: a white row on a near-white panel
-    /// is carried almost entirely by its edge.
-    const SELECT_EDGE: f32 = 0.18;
-    const SELECT_EDGE_LIGHT: f32 = 0.22;
+    // ---- the reference surfaces, as the design files declare them (gh#258) ----
+    // The module docs carry the table; these are the numbers themselves, named
+    // so a diff against `Comet Window.dc.html` is a search rather than a hunt.
+    /// Dark `--card`: the main panel.
+    pub const DARK_PANEL: u32 = 0x070707;
+    /// Dark `--shell`: the window ground and the sidebar.
+    pub const DARK_SHELL: u32 = 0x0d0d0d;
+    /// Dark `--raised`: an inner panel on the main panel.
+    pub const DARK_RAISED: u32 = 0x161616;
+    /// Dark `--raised`, hovered — the one step above it the reference does not
+    /// declare (it draws no hover), derived to sit as far above `--raised` as
+    /// `--raised` sits above `--shell`.
+    pub const DARK_RAISED_HOVER: u32 = 0x1f1f1f;
+    /// Dark `--sel` / `--selcard`: a selected row, in either bed.
+    pub const DARK_SELECTED: u32 = 0x191919;
+    /// Light `--card`: the main panel — white, in this variant.
+    pub const LIGHT_PANEL: u32 = 0xffffff;
+    /// Light `--shell`.
+    pub const LIGHT_SHELL: u32 = 0xe9e9ec;
+    /// Light `--raised`.
+    pub const LIGHT_RAISED: u32 = 0xf4f4f7;
+    /// Light `--sel`: a selected row on the shell lifts to white.
+    pub const LIGHT_SELECTED: u32 = 0xffffff;
+    /// Light `--selcard`: on a panel that is already white it steps down.
+    pub const LIGHT_SELECTED_CARD: u32 = 0xeeeef2;
+    /// Light `--line`.
+    pub const LIGHT_LINE: u32 = 0xe4e4e8;
+    /// Light `--line2`.
+    pub const LIGHT_LINE_STRONG: u32 = 0xd6d6dc;
+    /// Light `--sellift`'s ring colour.
+    pub const LIGHT_SELECT_EDGE: u32 = 0xdcdce2;
+    /// Light text, muted, subtle, faint — flat greys, no cast.
+    pub const LIGHT_TEXT: u32 = 0x171717;
+    pub const LIGHT_TEXT_MUTED: u32 = 0x545454;
+    pub const LIGHT_TEXT_SUBTLE: u32 = 0x6b6b6b;
+    pub const LIGHT_TEXT_FAINT: u32 = 0x8a8a8a;
+
+    // ---- hover is tone, selection is a surface with an edge (gh#175/gh#258) ----
+    /// The hover wash's alpha — the reference's `--hover`. Over `--shell` it
+    /// composites to within a point of `--sel`, which is the design's own
+    /// answer to "how much brighter is a touched row": barely. The row you
+    /// PICKED is told apart by its edge, not by more of this.
+    const HOVER_ALPHA: f32 = 0.05;
+    /// The same in light, where the wash darkens instead (`rgba(0,0,0,.025)`).
+    const HOVER_ALPHA_LIGHT: f32 = 0.025;
+    /// The selected row's hairline over a dark bed — the reference's
+    /// `--sellift`, `rgba(255,255,255,.13)`. It carries most of the signal now
+    /// that the tone step is the design's small one, so it has to read at a
+    /// glance across a long list.
+    const SELECT_EDGE: f32 = 0.13;
 
     // ---- light is its own design (gh#177) ----
-    /// The hue every light neutral carries a trace of. A pure grey beside white
-    /// makes the white read yellow, so the light surfaces, hairlines, washes
-    /// and text tones are all mixed at this hue with a chroma small enough that
-    /// nobody would call them blue — and `surface_raised` stays pure white,
-    /// which is the point.
-    pub const LIGHT_NEUTRAL_HUE: f32 = 255.0;
     /// The fraction of a call site's named alpha a light wash actually paints.
     /// The alphas across the crate were chosen for soft-white over near-black,
-    /// and ink over near-white is not their mirror: white at 14% over `#060606`
-    /// is a gentle lift, black at 14% over `#f9fafc` is a grey scrim on the
-    /// row. One scale here beats retuning sixty call sites — and the tone is
-    /// [`ink`], not black, so what lands is a tint rather than a smudge.
+    /// and ink over near-white is not their mirror: white at 14% over `#070707`
+    /// is a gentle lift, black at 14% over white is a grey scrim on the row.
+    /// One scale here beats retuning sixty call sites.
     pub const LIGHT_WASH_SCALE: f32 = 0.65;
 
     /// Base spacing steps.
@@ -611,7 +689,9 @@ impl Theme {
     pub fn glass(&self) -> Hsla {
         if Self::GLASS_ALPHA < 1.0 {
             if self.light {
-                cool(0.960, 0.006).opacity(0.93)
+                // The reference's own `--shell`, which already carries the
+                // trace of blue that keeps a wallpaper from tinting through.
+                hex(Self::LIGHT_SHELL).opacity(0.93)
             } else {
                 grey(8).opacity(Self::GLASS_ALPHA)
             }
@@ -623,9 +703,9 @@ impl Theme {
     /// The lift under a floating card — popovers, dialogs, palettes, the
     /// suggestion list. Dark keeps Tailwind's `shadow-lg` (a black shadow on a
     /// near-black ground barely registers; the card's own tone does the work).
-    /// Light is where a shadow is the whole mechanism, so it gets a real one:
-    /// a tight contact shadow under a wide soft cast, both in cool [`ink`]
-    /// rather than black so they read as shade and not as grime (gh#177).
+    /// Light is where a shadow is the whole mechanism, so it gets the
+    /// reference's own `--cardshadow`: a tight contact shadow under a wide,
+    /// far-cast, heavily-pulled-in one.
     pub fn float_shadow(&self) -> Vec<gpui::BoxShadow> {
         let shadow = |y: f32, blur: f32, spread: f32, color: Hsla| gpui::BoxShadow {
             color,
@@ -635,9 +715,10 @@ impl Theme {
             inset: false,
         };
         if self.light {
+            // `0 1px 2px rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.18)`
             vec![
-                shadow(1.0, 2.0, 0.0, ink(0.08)),
-                shadow(10.0, 24.0, -6.0, ink(0.16)),
+                shadow(1.0, 2.0, 0.0, ink(0.04)),
+                shadow(10.0, 30.0, -18.0, ink(0.18)),
             ]
         } else {
             vec![
@@ -647,24 +728,30 @@ impl Theme {
         }
     }
 
-    /// Build the dark theme — comet's original. The surface tones are sampled
-    /// straight from the reference screenshots of the original app
-    /// (docs/reference): main panel `#060606`, shell/sidebar `#0d0d0d`.
+    /// Build the dark theme — comet's original, transcribed from the supplied
+    /// design files (gh#258; the module docs carry the token table). The three
+    /// neutrals it stands on: main panel `#070707`, shell/sidebar `#0d0d0d`,
+    /// inner panel `#161616`.
     pub fn dark() -> Self {
         Self {
             light: false,
-            bg: grey(6),       // main panel — sampled #060606
-            surface: grey(13), // shell / sidebar — sampled #0d0d0d
-            card: grey(13),    // a card and the shell coincide in dark
-            surface_raised: neutral(0.235),
-            surface_raised_hover: neutral(0.29),
-            bubble: neutral(0.235),
+            bg: hex(Self::DARK_PANEL),
+            surface: hex(Self::DARK_SHELL),
+            // An inner panel is a step ABOVE the shell here, where it used to
+            // be the same number — which made every settings card, stats card
+            // and login card read as a hole in the page rather than a thing on
+            // it (gh#258).
+            card: hex(Self::DARK_RAISED),
+            surface_raised: hex(Self::DARK_RAISED),
+            surface_raised_hover: hex(Self::DARK_RAISED_HOVER),
+            bubble: hex(Self::DARK_RAISED),
             bubble_border: gpui::transparent_black(),
-            // Half the 0.14 it replaces: hover no longer has to carry
-            // "selected" too, so it can go back to being a hint (gh#175).
-            element_hover: wash(0.07),
+            element_hover: wash(Self::HOVER_ALPHA),
+            row_selected: hex(Self::DARK_SELECTED),
+            row_selected_card: hex(Self::DARK_SELECTED),
+            row_edge: white_alpha(Self::SELECT_EDGE),
             border: white_alpha(0.08),
-            border_strong: white_alpha(0.14),
+            border_strong: white_alpha(0.13),
             text: neutral(0.938),        // #ebebeb — 16.9:1 on bg
             text_muted: neutral(0.728),  // #a7a7a7 —  8.4:1
             text_subtle: neutral(0.598), // #7f7f7f —  5.1:1
@@ -683,57 +770,74 @@ impl Theme {
     }
 
     /// Build the light theme — its OWN declared values, not dark's ramp read
-    /// backwards (gh#177; the module docs say which four things do not survive
-    /// the inversion). The shape of it:
+    /// backwards (gh#177), and since gh#258 transcribed from the same design
+    /// files dark is. The shape of it:
     ///
-    /// - **Elevation runs toward white.** The shell is the ground
-    ///   (`#edf0f4`), the main panel is paper on it (`#f9fafc`), and a float
-    ///   is white — with [`Self::float_shadow`], not more tone, doing the
-    ///   lifting.
-    /// - **Neutrals lean blue.** Every tone here is [`cool`] at
-    ///   [`Self::LIGHT_NEUTRAL_HUE`]; only `surface_raised` is pure white, so
-    ///   the white it puts on screen stays white instead of reading yellow.
-    /// - **Ink, not black.** Washes and hairlines are [`ink`] — a cool
-    ///   near-black — at [`Self::LIGHT_WASH_SCALE`] of the named alpha.
+    /// - **The paper is white.** The shell is the ground (`#e9e9ec`), the main
+    ///   panel is white on it, and an inner panel — a settings card, a stats
+    ///   card, the composer well, your own message — is the reference's grey
+    ///   `#f4f4f7` under a hairline. That is a step DOWN off the paper, which
+    ///   is the design: nesting on a white page is drawn by tint and edge, not
+    ///   by yet more white. A true FLOAT still lifts ([`Self::float_card`]),
+    ///   because it covers the page instead of sitting on it.
+    /// - **Neutral greys.** The reference's own tones, blue channel three
+    ///   points over the others on the surfaces and flat grey in the text. The
+    ///   generated `cool()` ramp this replaces moved all three channels, and
+    ///   what landed on screen was a cast.
+    /// - **Black, at low alpha.** Washes and hairlines are [`ink`] at
+    ///   [`Self::LIGHT_WASH_SCALE`] of the named alpha, matching the
+    ///   reference's `rgba(0,0,0,…)`.
     /// - **Accents drop an anchor** so the four hues keep contrast on paper.
     ///
     /// The default remains dark; this is the opt-in variant.
     pub fn light() -> Self {
         Self {
             light: true,
-            bg: cool(0.986, 0.003), // #f9fafc — the paper, ABOVE the shell
-            surface: cool(0.955, 0.006), // #edf0f4 — shell / sidebar, the ground
-            // A card is above the paper, where the shell is below it — the one
-            // place the two jobs `surface` was doing come apart.
-            card: cool(1.0, 0.0),           // #ffffff, carried by its hairline
-            surface_raised: cool(1.0, 0.0), // #ffffff — the top of the ramp
-            surface_raised_hover: cool(0.965, 0.004), // white has to hover DOWN
-            // "Mine" is a WELL in the paper, drawn by its edge — the shallowest
-            // step that still reads, because the tone that carries it is the
-            // hairline. Monochrome, like every other non-state surface: the
-            // hues mean state (gh#173) and "who said this" is not one.
-            bubble: cool(0.965, 0.005), // #f1f3f7
-            bubble_border: ink(0.14),
-            // gh#175's weight, in this theme's ink rather than in black.
-            element_hover: ink(0.06),
-            // Hairlines keep a full alpha where washes are scaled: a wash that
-            // floods can afford to be quieter, a line that has to be SEEN
-            // cannot.
-            border: ink(0.13),
-            border_strong: ink(0.20),
-            // The same four contrast steps, measured against the light
-            // surfaces: 16.9 / 8.4 / 5.1 / 3.5 on `bg`, and every one of them
-            // still clears its floor on the ground and in the bubble.
-            text: cool(0.213, 0.008),        // #17191d
-            text_muted: cool(0.412, 0.008),  // #484b4f
-            text_subtle: cool(0.529, 0.008), // #686c70
-            text_faint: cool(0.620, 0.008),  // #83868b
-            // The status ramp, one anchor lower so the hues hold on paper.
-            accent: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_REVIEW),
+            bg: hex(Self::LIGHT_PANEL),
+            surface: hex(Self::LIGHT_SHELL),
+            card: hex(Self::LIGHT_RAISED),
+            surface_raised: hex(Self::LIGHT_RAISED),
+            surface_raised_hover: hex(Self::LIGHT_SELECTED_CARD),
+            // "Mine" is a tinted panel on the paper — the same `--raised` every
+            // other thing that sits ON the page is drawn with, and bare, like
+            // the reference draws it. Monochrome, like every other non-state
+            // surface: the hues mean state (gh#173) and "who said this" is not
+            // one.
+            bubble: hex(Self::LIGHT_RAISED),
+            bubble_border: gpui::transparent_black(),
+            element_hover: ink(Self::HOVER_ALPHA_LIGHT),
+            row_selected: hex(Self::LIGHT_SELECTED),
+            row_selected_card: hex(Self::LIGHT_SELECTED_CARD),
+            row_edge: hex(Self::LIGHT_SELECT_EDGE),
+            // Hairlines are opaque here: over a white page a line whose whole
+            // job is to be seen cannot also be translucent.
+            border: hex(Self::LIGHT_LINE),
+            border_strong: hex(Self::LIGHT_LINE_STRONG),
+            // Flat greys — 17.9 / 7.6 / 5.3 / 3.5 on the white page, and every
+            // one of them still clears its floor on the ground and in a card.
+            text: hex(Self::LIGHT_TEXT),
+            text_muted: hex(Self::LIGHT_TEXT_MUTED),
+            text_subtle: hex(Self::LIGHT_TEXT_SUBTLE),
+            text_faint: hex(Self::LIGHT_TEXT_FAINT),
+            // The status ramp, one anchor lower and a touch richer so the hues
+            // hold on paper (`oklch(0.52 0.16 …)` in the reference).
+            accent: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C_LIGHT, Self::HUE_REVIEW),
             accent_strong: oklch(0.47, 0.19, Self::HUE_REVIEW),
-            danger: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_BLOCKED),
-            warning: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_WORKING),
-            settled: oklch(Self::STATUS_L_LIGHT, Self::STATUS_C, Self::HUE_SETTLED),
+            danger: oklch(
+                Self::STATUS_L_LIGHT,
+                Self::STATUS_C_LIGHT,
+                Self::HUE_BLOCKED,
+            ),
+            warning: oklch(
+                Self::STATUS_L_LIGHT,
+                Self::STATUS_C_LIGHT,
+                Self::HUE_WORKING,
+            ),
+            settled: oklch(
+                Self::STATUS_L_LIGHT,
+                Self::STATUS_C_LIGHT,
+                Self::HUE_SETTLED,
+            ),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -788,7 +892,7 @@ impl Theme {
     }
 
     /// The hairline primitive for this theme: white at low alpha over dark
-    /// surfaces, cool [`ink`] at low alpha over light ones (a white hairline on
+    /// surfaces, [`ink`] at low alpha over light ones (a white hairline on
     /// white would vanish). Unlike [`Self::wash`] this does NOT scale: a wash
     /// that floods a whole row can afford to be quieter on light, a line whose
     /// entire job is to be seen cannot.
@@ -806,23 +910,22 @@ impl Theme {
     /// settings lists.
     ///
     /// The two states differ by KIND, not by amount. Hover is a flat wash and
-    /// nothing else. Selection puts the row on its own surface and draws a
+    /// nothing else. Selection puts the row on a NAMED SURFACE and draws a
     /// hairline round it — a channel hover never uses, so a pointer resting on
     /// row 4 can never be confused with a keyboard cursor on row 9. No colour
     /// is spent either way: the status hues mean state, and selection is not a
     /// state.
     ///
-    /// Which way the surface moves depends on `bed`, because elevation is
-    /// relative to what the row sits on. Dark beds have headroom, so the row
-    /// lifts toward light. A light shell lifts to white. A light settings card
-    /// has nowhere left to lift — it IS the raised white object on the page —
-    /// so the row steps down into it and the hairline draws the well.
+    /// The surface is [`Self::row_selected`] on the shell and
+    /// [`Self::row_selected_card`] on a panel or in a card — the reference's
+    /// `--sel` and `--selcard`. Naming the surface rather than washing toward
+    /// it is gh#258's correction: a 16% white wash lands a sidebar row on
+    /// `#303030` and the same wash lands a board row on `#252525`, so one
+    /// "selected" was two tones and neither was the design's `#191919`.
     ///
-    /// The light washes here are [`ink`] rather than black (gh#177): a sink
-    /// and an edge made of black over a near-white bed read as grime, and this
-    /// theme's neutrals lean cool. The alphas are gh#175's, unchanged — a
-    /// selection is one of the few washes that was tuned against the light bed
-    /// in the first place, so [`Self::LIGHT_WASH_SCALE`] does not apply.
+    /// Hovering a row that is already selected steps it once more in whichever
+    /// direction this theme's hover goes — brighter in dark, dimmer in light —
+    /// so the pointer still answers on the row you picked.
     pub fn row(&self, bed: Bed, selected: bool) -> RowPaint {
         if !selected {
             return RowPaint {
@@ -836,27 +939,14 @@ impl Theme {
                 text_hovered: self.text,
             };
         }
-        let (rest, hovered, edge) = match (bed, self.light) {
-            (Bed::Card, true) => (
-                ink(Self::SELECT_SINK),
-                ink(Self::SELECT_SINK + Self::SELECT_HOVER_STEP),
-                ink(Self::SELECT_EDGE_LIGHT),
-            ),
-            (Bed::Shell, true) => (
-                white_alpha(Self::SELECT_WHITE),
-                white_alpha(Self::SELECT_WHITE + Self::SELECT_HOVER_STEP),
-                ink(Self::SELECT_EDGE_LIGHT),
-            ),
-            (_, false) => (
-                wash(Self::SELECT_LIFT),
-                wash(Self::SELECT_LIFT + Self::SELECT_HOVER_STEP),
-                white_alpha(Self::SELECT_EDGE),
-            ),
+        let rest = match bed {
+            Bed::Shell => self.row_selected,
+            Bed::Card => self.row_selected_card,
         };
         RowPaint {
             rest,
-            hovered,
-            ring: hairline_ring(edge),
+            hovered: composite(self.element_hover, rest),
+            ring: hairline_ring(self.row_edge),
             text: self.text,
             text_hovered: self.text,
         }
@@ -907,17 +997,21 @@ impl Theme {
     /// over: it sat below (the inverted ramp made it darker than the page) and
     /// it took its colour from whatever wallpaper the blur happened to catch.
     /// The lift comes from [`Self::float_shadow`] instead.
+    ///
+    /// This is the ONE place light parts company with [`Self::surface_raised`]
+    /// (gh#258): a panel ON the page is the reference's tinted `--raised`, but
+    /// a float OVER the page cannot be a tint darker than what it covers.
     pub fn float_card(&self) -> Hsla {
         if Self::GLASS_ALPHA < 1.0 {
             if self.light {
-                cool(0.995, 0.002).opacity(0.95)
+                hex(Self::LIGHT_PANEL).opacity(0.95)
             } else {
-                grey(0x16).opacity(0.65)
+                hex(Self::DARK_RAISED).opacity(0.65)
             }
         } else if self.light {
-            self.surface_raised
+            hex(Self::LIGHT_PANEL)
         } else {
-            grey(0x16)
+            hex(Self::DARK_RAISED)
         }
     }
 
@@ -985,26 +1079,15 @@ pub fn wash(alpha: f32) -> Hsla {
     hsla(0.0, 0.0, 0.92, alpha)
 }
 
-/// A light-mode neutral: an oklch tone carrying [`Theme::LIGHT_NEUTRAL_HUE`]'s
-/// trace of blue. `cool(l, 0.0)` is exactly [`neutral`] — which is how
-/// `surface_raised` gets to be pure white while everything around it leans
-/// cool, so the white reads as white.
-pub fn cool(lightness: f32, chroma: f32) -> Hsla {
-    oklch(lightness, chroma, Theme::LIGHT_NEUTRAL_HUE)
-}
-
-/// The light theme's ink — what a hairline, a wash or a shadow is MADE of.
-/// Not black: a cool near-black, so a 9% wash over a cool surface stays on the
-/// same side of neutral instead of going flat grey. Black over near-white is
-/// the tone the whole of gh#177 is arguing with. The light-theme counterpart of
-/// [`wash`]/[`white_alpha`] — callers that serve both themes go through
-/// [`Theme::wash`] / [`Theme::white_alpha`], which apply
+/// The light theme's ink — what a hairline, a wash or a shadow is MADE of:
+/// black at the given alpha, which is what the reference's `rgba(0,0,0,…)`
+/// washes and its `--cardshadow` are (gh#258; it used to be a cool near-black,
+/// whose tint compounded with the generated cool surfaces into a cast). The
+/// light-theme counterpart of [`wash`]/[`white_alpha`] — callers that serve
+/// both themes go through [`Theme::wash`] / [`Theme::white_alpha`], which apply
 /// [`Theme::LIGHT_WASH_SCALE`] where it belongs.
 pub fn ink(alpha: f32) -> Hsla {
-    // The chroma is the same trace the surfaces carry, not more: ink is what a
-    // NEUTRAL is made of here, and an idle dot or a normal meter paints it
-    // straight — see [`spends_colour`], which those call sites assert against.
-    cool(0.30, 0.012).opacity(alpha)
+    hsla(0.0, 0.0, 0.0, alpha)
 }
 
 /// White at the given alpha — the dark-theme hairline/wash primitive (light
@@ -1033,6 +1116,16 @@ pub fn hairline_ring(color: Hsla) -> Vec<BoxShadow> {
 /// — for surfaces matched against reference-screenshot samples.
 pub fn grey(value: u8) -> Hsla {
     hsla(0.0, 0.0, value as f32 / 255.0, 1.0)
+}
+
+/// An exact opaque tone from a 24-bit `0xRRGGBB` literal — the form the design
+/// files declare their surfaces in, so a token can be read straight off the
+/// reference stylesheet and diffed against it (gh#258).
+pub fn hex(rgb: u32) -> Hsla {
+    let channel = |shift: u32| ((rgb >> shift) & 0xff) as f32 / 255.0;
+    let (r, g, b) = (channel(16), channel(8), channel(0));
+    let (h, s, l) = rgb_to_hsl(r, g, b);
+    hsla(h, s, l, 1.0)
 }
 
 /// Convert an oklch color (CSS notation: L 0..1, C, H in degrees) to gpui Hsla.
@@ -1195,9 +1288,18 @@ mod tests {
     fn the_status_ramp_is_one_lightness_and_one_chroma() {
         // The whole point of gh#173: a state's loudness is decided by the state,
         // not by which hue it happened to be given.
-        for (theme, l) in [
-            (Theme::dark(), Theme::STATUS_L),
-            (Theme::light(), Theme::STATUS_L_LIGHT),
+        for (theme, l, c, spread) in [
+            (Theme::dark(), Theme::STATUS_L, Theme::STATUS_C, 1.25),
+            (
+                Theme::light(),
+                Theme::STATUS_L_LIGHT,
+                Theme::STATUS_C_LIGHT,
+                // The light anchor's richer chroma clips emerald hardest, so
+                // the four sit a third apart rather than a quarter. Still an
+                // order of magnitude tighter than the 1.96x the ramp replaced,
+                // and it is the reference's own `oklch(0.52 0.16 …)`.
+                1.35,
+            ),
         ] {
             for (status, hue) in [
                 (Status::Blocked, Theme::HUE_BLOCKED),
@@ -1207,15 +1309,13 @@ mod tests {
             ] {
                 assert_eq!(
                     theme.status(status),
-                    oklch(l, Theme::STATUS_C, hue),
+                    oklch(l, c, hue),
                     "{status:?} is off the ramp"
                 );
             }
-            // And it lands: the four hues sit within a quarter of one another in
-            // measured luminance (dark 1.14x, light 1.23x — the light anchor
-            // clips emerald a little). The old palette spread 1.96x: amber-400
-            // at 0.56 against indigo-400 at 0.29, the "twice as loud" this ramp
-            // exists to end.
+            // And it lands: the four hues sit close in measured luminance. The
+            // old palette spread 1.96x — amber-400 at 0.56 against indigo-400
+            // at 0.29, the "twice as loud" this ramp exists to end.
             let lums: Vec<f32> = [
                 Status::Blocked,
                 Status::Working,
@@ -1228,7 +1328,11 @@ mod tests {
             let (lo, hi) = lums
                 .iter()
                 .fold((f32::MAX, 0.0f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-            assert!(hi / lo < 1.25, "status hues differ in loudness: {lums:?}");
+            assert!(
+                hi / lo < spread,
+                "status hues differ in loudness: {lums:?} (light={})",
+                theme.light
+            );
         }
     }
 
@@ -1288,16 +1392,23 @@ mod tests {
     /// dark's read backwards.
     #[test]
     fn text_tones_clear_their_contrast_floors() {
-        // (name, target on `bg`, floor that BOTH reading panels must clear)
-        const TIERS: [(&str, f32, f32); 4] = [
-            ("text", 16.9, 15.0), // headings, titles, selected rows
-            ("muted", 8.4, 7.5),  // body, unselected rows
-            ("subtle", 5.1, 4.5), // labels, metadata, captions — AA body text
-            ("faint", 3.5, 3.0),  // disabled and placeholders only
+        // (name, target on `bg`, floor that BOTH reading panels must clear).
+        // The targets are per variant since gh#258, because the two pages are
+        // no longer the same distance from their text: dark's is `#070707` and
+        // light's is WHITE, so the same tier measures a point higher there. The
+        // floors are the shared bar — every tone on every reading panel, which
+        // for light means the `#e9e9ec` shell its sidebar is painted with.
+        const TIERS: [(&str, f32, f32, f32); 4] = [
+            //                     dark   light  floor
+            ("text", 16.9, 17.9, 12.0), // headings, titles, selected rows
+            ("muted", 8.4, 7.6, 6.0),   // body, unselected rows
+            ("subtle", 5.1, 5.3, 4.3),  // labels, metadata, captions
+            ("faint", 3.5, 3.5, 2.8),   // disabled and placeholders only
         ];
         for t in [Theme::dark(), Theme::light()] {
             let tones = t.text_tones();
-            for (tone, (name, target, floor)) in tones.into_iter().zip(TIERS) {
+            for (tone, (name, dark_target, light_target, floor)) in tones.into_iter().zip(TIERS) {
+                let target = if t.light { light_target } else { dark_target };
                 let on_bg = contrast_ratio(tone, t.bg);
                 let on_surface = contrast_ratio(tone, t.surface);
                 assert!(
@@ -1370,10 +1481,11 @@ mod tests {
         assert!(t.border.a < t.border_strong.a);
     }
 
-    /// The gh#175 rule, and the test that replaces the one asserting hover
-    /// EQUALS the active fill: the two states must differ in kind.
+    /// The gh#175 rule as gh#258 retuned it: the two states still differ in
+    /// KIND — a wash against a named surface with an edge — but the amount is
+    /// the design's small one, not a 16% slab.
     #[test]
-    fn hover_is_tone_and_selection_is_elevation() {
+    fn hover_is_tone_and_selection_is_a_surface_with_an_edge() {
         for t in [Theme::dark(), Theme::light()] {
             for bed in [Bed::Shell, Bed::Card] {
                 let idle = t.row(bed, false);
@@ -1392,56 +1504,61 @@ mod tests {
                     "a row's hover is the app's one hover wash"
                 );
 
-                // Selection is the other channel: its own surface, with a
-                // hairline round it that hover never has.
+                // Selection is the other channel: a named, OPAQUE surface,
+                // with a hairline round it that hover never has. Opaque is the
+                // point — a wash lands somewhere different on every bed, and
+                // "selected" is one tone in the design, not three.
                 assert_eq!(picked.ring.len(), 1, "a selected row is edged");
                 assert!(
                     picked.ring[0].inset,
                     "nothing may paint BEHIND a translucent row"
                 );
-
-                // And the surface really is a different one, not a heavier
-                // dose of the hover wash: the step from hover to selected is
-                // bigger than the step from rest to hover.
-                let on = |c: Hsla| composite(c, t.surface);
-                let (rest, hover, sel) = (on(idle.rest), on(idle.hovered), on(picked.rest));
-                assert!(
-                    contrast_ratio(sel, hover) > contrast_ratio(hover, rest),
-                    "selection reads as more-hover, not as elevation \
-                     (light={}, {bed:?}): {:.3} vs {:.3}",
-                    t.light,
-                    contrast_ratio(sel, hover),
-                    contrast_ratio(hover, rest)
+                assert_eq!(
+                    picked.rest.a, 1.0,
+                    "the selected surface is named, not washed"
                 );
 
-                // Elevation is relative to the bed. Everything lifts except a
-                // row inside a light card, where there is nowhere left to go.
-                let down = t.light && bed == Bed::Card;
-                let lifted = relative_luminance(sel) > relative_luminance(hover);
+                // The edge is what carries it, so the edge must READ against
+                // the row's own fill.
+                let edge = composite(picked.ring[0].color, picked.rest);
+                assert!(
+                    contrast_ratio(edge, picked.rest) > 1.15,
+                    "the selected row's hairline is invisible on it \
+                     (light={}, {bed:?}): {:.3}:1",
+                    t.light,
+                    contrast_ratio(edge, picked.rest)
+                );
+
+                // The pointer still answers on a row you already picked, in
+                // whichever direction this theme's hover goes.
+                assert_ne!(
+                    picked.hovered, picked.rest,
+                    "hovering the selected row must do something (light={}, {bed:?})",
+                    t.light
+                );
+                let brighter = relative_luminance(picked.hovered) > relative_luminance(picked.rest);
                 assert_eq!(
-                    lifted, !down,
-                    "wrong direction off the bed (light={}, {bed:?})",
+                    brighter, !t.light,
+                    "hover moved the wrong way off the selected row (light={})",
                     t.light
                 );
 
-                // A row that lifts costs the metadata printed on it some
-                // contrast, so the lift is bounded by what those sublines can
-                // pay. This floor is why selection leans on its hairline
-                // rather than on ever more wash.
+                // The sublines printed on a selected row are `text_subtle`,
+                // and every point of tone costs them contrast. This floor is
+                // half of why the reference's step is as small as it is.
                 assert!(
-                    contrast_ratio(t.text_subtle, sel) >= 3.0,
+                    contrast_ratio(t.text_subtle, picked.rest) >= 3.0,
                     "sublines on the selected row read at only {:.2}:1 \
                      (light={}, {bed:?})",
-                    contrast_ratio(t.text_subtle, sel),
+                    contrast_ratio(t.text_subtle, picked.rest),
                     t.light
                 );
 
                 // No colour is spent on "this one" — the status hues mean
                 // state, and selection is not a state. (Measured as channel
-                // spread rather than saturation: light's neutrals carry a
-                // trace of blue and its washes are cool ink, so `s` reads a
-                // third of full chroma on tones nobody would call blue —
-                // gh#177, [`spends_colour`].)
+                // spread rather than saturation: the light neutrals carry a
+                // trace of blue, so `s` reads a sixth of full chroma on tones
+                // nobody would call blue — [`spends_colour`].)
                 for c in [idle.rest, idle.hovered, picked.rest, picked.hovered] {
                     assert!(!spends_colour(c), "selection must spend no colour");
                 }
@@ -1452,24 +1569,122 @@ mod tests {
 
     #[test]
     fn a_selected_row_inside_a_white_card_is_unmistakable() {
-        // The subtle case (gh#175): the settings cards are white in light
-        // mode, so the row steps DOWN and its hairline draws the well. The
-        // bed is [`Theme::card`] — gh#177 split that off `surface`, which in
-        // light is the shell BELOW the page rather than a card above it.
+        // The subtle case: in light the panels a row sits on are white or
+        // near it, so the row steps DOWN and its hairline draws the well.
         let t = Theme::light();
         let picked = t.row(Bed::Card, true);
         let hovered = t.row(Bed::Card, false).hovered;
         let card = t.card;
         let (sel, hov) = (composite(picked.rest, card), composite(hovered, card));
         assert!(relative_luminance(sel) < relative_luminance(card));
-        // Told apart from the merely-hovered row by the fill alone...
-        assert!(
-            contrast_ratio(sel, hov) > 1.25,
-            "only {:.3}:1 between selected and hovered",
-            contrast_ratio(sel, hov)
-        );
-        // ...and again by the edge, which reads against the row's own fill.
+        // Its fill lands where the reference's `--selcard` does, and the edge
+        // — not the fill — is what tells it from a merely-hovered row: the two
+        // fills are a hair apart on purpose (`#eeeef2` against `#efeff2`), and
+        // a design that leaned on THAT would be asking the reader to compare
+        // two greys across a card.
+        assert_eq!(sel, hex(Theme::LIGHT_SELECTED_CARD));
         assert!(contrast_ratio(composite(picked.ring[0].color, sel), sel) > 1.15);
+        assert!(picked.ring[0].inset && t.row(Bed::Card, false).ring.is_empty());
+        // And the hovered row keeps NO edge, which is the whole distinction.
+        assert!(
+            contrast_ratio(sel, hov) < 1.1,
+            "the fills are close by design"
+        );
+    }
+
+    /// Every neutral is the hex the supplied design files declare (gh#258).
+    /// This is the test the module's token table is written against: change a
+    /// surface here and the reference has to have changed too.
+    #[test]
+    fn the_surfaces_are_the_reference_hexes() {
+        let d = Theme::dark();
+        for (what, got, want) in [
+            ("dark --card (main panel)", d.bg, Theme::DARK_PANEL),
+            ("dark --shell", d.surface, Theme::DARK_SHELL),
+            ("dark --raised (card)", d.card, Theme::DARK_RAISED),
+            (
+                "dark --raised (float)",
+                d.surface_raised,
+                Theme::DARK_RAISED,
+            ),
+            ("dark --raised (bubble)", d.bubble, Theme::DARK_RAISED),
+            ("dark --sel", d.row_selected, Theme::DARK_SELECTED),
+            ("dark --selcard", d.row_selected_card, Theme::DARK_SELECTED),
+        ] {
+            assert_eq!(got, hex(want), "{what} is off the reference");
+        }
+        let l = Theme::light();
+        for (what, got, want) in [
+            ("light --card (main panel)", l.bg, Theme::LIGHT_PANEL),
+            ("light --shell", l.surface, Theme::LIGHT_SHELL),
+            ("light --raised (card)", l.card, Theme::LIGHT_RAISED),
+            (
+                "light --raised (float)",
+                l.surface_raised,
+                Theme::LIGHT_RAISED,
+            ),
+            ("light --raised (bubble)", l.bubble, Theme::LIGHT_RAISED),
+            ("light --sel", l.row_selected, Theme::LIGHT_SELECTED),
+            (
+                "light --selcard",
+                l.row_selected_card,
+                Theme::LIGHT_SELECTED_CARD,
+            ),
+            ("light --line", l.border, Theme::LIGHT_LINE),
+            ("light --line2", l.border_strong, Theme::LIGHT_LINE_STRONG),
+            ("light text", l.text, Theme::LIGHT_TEXT),
+            ("light muted", l.text_muted, Theme::LIGHT_TEXT_MUTED),
+            ("light subtle", l.text_subtle, Theme::LIGHT_TEXT_SUBTLE),
+            ("light faint", l.text_faint, Theme::LIGHT_TEXT_FAINT),
+        ] {
+            assert_eq!(got, hex(want), "{what} is off the reference");
+        }
+        // The two alpha tokens the reference declares rather than paints.
+        assert_eq!((d.border.l, d.border.a), (1.0, 0.08));
+        assert_eq!((d.border_strong.l, d.border_strong.a), (1.0, 0.13));
+        assert_eq!((d.row_edge.l, d.row_edge.a), (1.0, 0.13));
+        assert_eq!(d.element_hover.a, 0.05);
+        assert_eq!(l.element_hover, ink(0.025));
+
+        // And the ONE thing that was actually wrong on screen: a selected
+        // sidebar row used to composite a 16% white wash to `#303030`, three
+        // times the step the design draws.
+        assert_eq!(hex(Theme::DARK_SELECTED), grey(0x19));
+        let old_slab = composite(wash(0.16), d.surface);
+        assert!(
+            relative_luminance(old_slab) > relative_luminance(d.row_selected) * 2.5,
+            "the slab this replaces was not actually brighter"
+        );
+    }
+
+    /// The raised surface is a real step in BOTH directions off the page it
+    /// sits on — the other half of gh#258's surface defect, where a dark
+    /// settings card painted `#0d0d0d` on a `#060606` page and read as a hole.
+    #[test]
+    fn an_inner_panel_never_dissolves_into_the_page() {
+        for t in [Theme::dark(), Theme::light()] {
+            assert_ne!(
+                t.card, t.bg,
+                "a card must not BE the page (light={})",
+                t.light
+            );
+            assert_ne!(
+                t.card, t.surface,
+                "nor the shell behind the window (light={})",
+                t.light
+            );
+            assert_eq!(t.card, t.surface_raised, "one `--raised`, not two");
+            let step = (relative_luminance(t.card) - relative_luminance(t.bg)).abs();
+            assert!(
+                step > 0.005,
+                "a card is {step:.4} off the page it sits on (light={})",
+                t.light
+            );
+        }
+        // Which way it steps is the variant's own answer: dark has headroom
+        // above the page, light does not and tints down instead.
+        assert!(Theme::dark().card.l > Theme::dark().bg.l);
+        assert!(Theme::light().card.l < Theme::light().bg.l);
     }
 
     #[test]
@@ -1587,51 +1802,53 @@ mod tests {
 
     // ---- light variant ----
 
-    /// gh#177's first failure: elevation does not survive inversion. Dark
-    /// elevates toward white and so does light — the ramp is not mirrored, it
-    /// is re-declared, and a popover is never darker than the page it covers.
+    /// gh#177's first failure: elevation does not survive inversion. The ramp
+    /// is re-declared rather than mirrored — and since gh#258 it is the
+    /// reference's own grey hierarchy rather than a generated one.
     #[test]
-    fn light_elevation_runs_toward_white() {
+    fn light_is_the_references_grey_hierarchy() {
         let t = Theme::light();
-        // The ground is the shell, the paper is the main panel, and a float is
-        // white. Inverted, this order ran backwards and a popover read as a
-        // hole punched in the page.
+        // The ground is the shell, the paper is the main panel — and the paper
+        // is WHITE, so an inner panel on it is a tint DOWN under a hairline
+        // rather than yet more white. Inverted, this order ran backwards and a
+        // popover read as a hole punched in the page.
         assert!(t.surface.l < t.bg.l, "the shell is the ground");
-        assert!(t.bg.l < t.card.l, "a settings card is above the paper");
-        assert!(t.bg.l < t.surface_raised.l, "and so is a float");
-        assert!(t.surface_raised.l > 0.999, "the top of the ramp is white");
-        // `surface` and `card` are the token gh#177 split: one number in dark,
-        // where the shell IS the card tone, and two in light, where the shell
-        // is below the page and a card is above it. A settings card painting
-        // `surface` was the elevation defect wearing a different hat.
+        assert!(t.surface.l < t.card.l, "an inner panel is above the shell");
+        assert!(t.card.l < t.bg.l, "…and a tint below the paper it sits on");
+        assert!(t.bg.l > 0.999, "the paper is white");
+        // A genuine FLOAT is the exception, and the only one: it covers the
+        // page rather than sitting on it, so it cannot be darker than what it
+        // covers — the lift comes from `float_shadow`.
+        assert!(t.float_card().l >= t.bg.l, "a float is never a hole");
+        // `surface` and `card` are the token gh#177 split, and they stay split:
+        // a card painting `surface` was the elevation defect wearing a hat.
         let d = Theme::dark();
-        assert_eq!(d.surface, d.card, "in dark the two coincide");
-        assert_ne!(t.surface, t.card, "in light they cannot");
+        assert_ne!(t.surface, t.card);
+        assert_ne!(d.surface, d.card);
         // Text still walks the other way from the surfaces.
-        assert!(t.surface_raised.l > t.text_faint.l);
+        assert!(t.surface.l > t.text_faint.l);
         assert!(t.text_faint.l > t.text_subtle.l);
         assert!(t.text_subtle.l > t.text_muted.l);
         assert!(t.text_muted.l > t.text.l);
-        // BOTH variants elevate toward their own bright end — that is the
-        // structure the two share, rather than one being the other reversed.
-        assert!(d.surface.l < d.surface_raised.l);
-        assert!(t.surface.l < t.surface_raised.l);
-        // Only white is achromatic. Every other light neutral leans blue, so
-        // the white beside it does not read yellow — and it leans by a TRACE:
-        // measured as channel spread (HSL saturation is meaningless this close
-        // to white), no tone is more than 3% off achromatic.
-        for c in [t.bg, t.surface].into_iter().chain(t.text_tones()) {
+        // The light SURFACES carry the reference's trace of blue — the blue
+        // channel three points over the other two, which is what keeps the
+        // white beside them from reading yellow. A trace, measured as channel
+        // spread (HSL saturation is meaningless this close to white).
+        for c in [t.surface, t.card, t.border, t.border_strong] {
             let rgb = Rgba::from(c);
             assert!(!spends_colour(c), "a trace only, not a hue: {rgb:?}");
             assert!(rgb.b > rgb.r, "and the trace is BLUE: {rgb:?}");
-            assert!(
-                (0.55..0.75).contains(&c.h),
-                "which puts the hue in the blues: h={}",
-                c.h
-            );
+            assert_eq!(rgb.r, rgb.g, "on the blue channel alone: {rgb:?}");
             assert_eq!(c.a, 1.0);
         }
-        assert_eq!(t.surface_raised.s, 0.0, "white is white");
+        // The light TEXT does not: the reference sets it flat grey, and the
+        // cool cast this replaces moved all three channels at once.
+        for c in t.text_tones() {
+            let rgb = Rgba::from(c);
+            assert_eq!(c.s, 0.0, "light text is flat grey, got {rgb:?}");
+            assert_eq!(c.a, 1.0);
+        }
+        assert_eq!(t.bg.s, 0.0, "white is white");
         // Dark stays monochrome — its greys were sampled off the original app.
         for c in [d.bg, d.surface, d.card, d.surface_raised]
             .into_iter()
@@ -1642,26 +1859,36 @@ mod tests {
         }
     }
 
-    /// gh#177's third failure: a wash is not perceptually symmetric. Light's
-    /// hairlines and washes are cool INK rather than black, and the washes run
-    /// at a fraction of the alpha the call sites name.
+    /// gh#177's third failure: a wash is not perceptually symmetric. The light
+    /// washes run at a fraction of the alpha the call sites name — and since
+    /// gh#258 they are made of black, which is what the reference's
+    /// `rgba(0,0,0,…)` washes and shadows are.
     #[test]
-    fn light_hairlines_and_washes_are_cool_ink() {
+    fn light_hairlines_are_opaque_and_washes_are_black() {
         let t = Theme::light();
-        let is_ink = |c: Hsla| c.l > 0.1 && c.l < 0.4 && (0.55..0.75).contains(&c.h);
+        let is_ink = |c: Hsla| c.l == 0.0 && c.s == 0.0;
+        // Hairlines are OPAQUE greys here: over a white page a line whose
+        // whole job is to be seen cannot also be translucent, and the
+        // reference names both of them as hexes.
         for c in [t.border, t.border_strong] {
-            assert!(is_ink(c), "hairlines are cool ink, got {c:?}");
-            assert!(c.a > 0.0 && c.a < 0.25, "low alpha, got {}", c.a);
+            assert_eq!(c.a, 1.0, "light hairlines are opaque, got {c:?}");
+            assert!(c.l > 0.8 && c.l < 0.92, "and pale, got {c:?}");
         }
-        assert!(is_ink(t.element_hover), "the hover wash is cool ink");
         assert!(
-            t.element_hover.a >= 0.05 && t.element_hover.a < 0.35,
+            t.border.l > t.border_strong.l,
+            "the strong hairline is the darker one"
+        );
+        assert!(
+            is_ink(t.element_hover),
+            "the hover wash is black at low alpha"
+        );
+        assert!(
+            t.element_hover.a > 0.0 && t.element_hover.a < 0.1,
             "alpha in band, got {}",
             t.element_hover.a
         );
-        assert!(t.border.a < t.border_strong.a);
-        // The primitives mirror the fields — and the wash scales while the
-        // hairline does not: a wash floods a row, a hairline has to be seen.
+        // The primitives are ink — and the wash scales while the hairline does
+        // not: a wash floods a row, a hairline has to be seen.
         assert!(is_ink(t.wash(0.14)) && is_ink(t.white_alpha(0.09)));
         assert_eq!(t.white_alpha(0.09).a, 0.09);
         assert!(
@@ -1675,34 +1902,35 @@ mod tests {
         let d = Theme::dark();
         assert_eq!(d.wash(0.14), wash(0.14));
         assert_eq!(d.white_alpha(0.09), white_alpha(0.09));
-        // A selected row on the light shell is the one wash that runs the
-        // other way: it lifts to WHITE (gh#175), edged in ink so the lift
-        // reads against the paper.
+        // A selected row on the light shell is the one that runs the other
+        // way: it lifts to WHITE, edged in the reference's own grey so the
+        // lift reads against the paper.
         let picked = t.row(Bed::Shell, true);
-        assert_eq!(picked.rest.l, 1.0);
-        assert!(is_ink(picked.ring[0].color), "and the edge is ink, not black");
+        assert_eq!(picked.rest, hex(Theme::LIGHT_SELECTED));
+        assert_eq!(picked.ring[0].color, hex(Theme::LIGHT_SELECT_EDGE));
     }
 
-    /// gh#177's second failure: your own message. Inverted, the bubble painted
-    /// `surface_raised` and landed a mid-grey slab in the middle of a white
-    /// page — "mine" is a distinction, not an elevation.
+    /// gh#177's second failure: your own message. Inverted, the bubble landed
+    /// a mid-grey slab in the middle of a white page — "mine" is a
+    /// distinction, not an elevation. The reference draws it with `--raised`,
+    /// the same tone every other thing that sits ON the page gets, and bare.
     #[test]
-    fn the_user_bubble_is_a_well_in_light_and_a_step_in_dark() {
+    fn the_user_bubble_is_the_inner_panel_tone_and_nothing_else() {
+        for t in [Theme::light(), Theme::dark()] {
+            assert_eq!(t.bubble, t.surface_raised, "one `--raised`, not two");
+            assert_ne!(t.bubble, t.bg, "distinct from the page");
+            assert_eq!(
+                t.bubble_border.a, 0.0,
+                "the reference's bubble is bare — the tone carries the shape"
+            );
+            // Monochrome, like every other non-state surface: the hues mean
+            // state (gh#173), and who said something is not a state.
+            assert!(!spends_colour(t.bubble));
+        }
+        // In light it is a tint DOWN off white paper; the inverted `#e4e4e4`
+        // this replaces sat at 0.89 and read as a slab.
         let t = Theme::light();
-        // Not the raised surface, and not a slab: the shallowest step the paper
-        // can take, carried by its hairline. The inverted #e4e4e4 sat at 0.89.
-        assert_ne!(t.bubble, t.surface_raised);
-        assert!(t.bubble.l < t.bg.l, "distinct from the page");
-        assert!(t.bubble.l > 0.94, "and barely — the edge does the work");
-        assert!(t.bubble_border.a > 0.0, "so there has to BE an edge");
-        // Monochrome, like every other non-state surface: the hues mean state
-        // (gh#173), and who said something is not a state.
-        assert!(!spends_colour(t.bubble) && !spends_colour(t.bubble_border));
-        // Dark keeps the tone it always had, and needs no hairline — the step
-        // in tone carries the shape there.
-        let d = Theme::dark();
-        assert_eq!(d.bubble, neutral(0.235));
-        assert_eq!(d.bubble_border.a, 0.0);
+        assert!(t.bubble.l < t.bg.l && t.bubble.l > 0.94);
     }
 
     /// The macOS failure: light frost was plain white at 80% over the blurred
@@ -1735,8 +1963,9 @@ mod tests {
         for s in dark.float_shadow() {
             assert_eq!(s.color, hsla(0.0, 0.0, 0.0, 0.1));
         }
-        // Light's is stronger, cooler, and cast further: with `surface_raised`
-        // at white there is no brighter tone left to elevate with.
+        // Light's is the reference's own `--cardshadow`: a tight contact
+        // shadow under a wide, far-cast, heavily-pulled-in one. With the paper
+        // already white there is no brighter tone left to elevate with.
         let cast = light.float_shadow();
         assert_eq!(cast.len(), 2);
         assert!(
@@ -1745,12 +1974,16 @@ mod tests {
         );
         for s in &cast {
             assert!(!s.inset, "a float casts outward");
-            assert!(
-                (0.55..0.75).contains(&s.color.h),
-                "shade, not grime: h={}",
-                s.color.h
+            assert_eq!(
+                s.color.s, 0.0,
+                "the reference casts in black, not in a tint"
             );
+            assert_eq!(s.color.l, 0.0);
         }
+        assert!(
+            cast.iter().any(|s| f32::from(s.spread_radius) < 0.0),
+            "the wide cast is pulled in so it reads as height, not as a halo"
+        );
         let widest = |shadows: Vec<gpui::BoxShadow>| {
             shadows
                 .iter()
@@ -1777,8 +2010,13 @@ mod tests {
             "red hue {}",
             deg(t.danger)
         );
+        // The light amber sits lower on the wheel than dark's: at
+        // `oklch(0.52 0.16 75)` the blue channel clips to zero, which swings
+        // the sRGB hue toward orange. It is still the one amber the reference
+        // draws, and the band says so rather than the ramp being retuned to
+        // flatter a measurement.
         assert!(
-            (35.0..60.0).contains(&deg(t.warning)),
+            (28.0..60.0).contains(&deg(t.warning)),
             "amber hue {}",
             deg(t.warning)
         );
@@ -1786,14 +2024,15 @@ mod tests {
 
     #[test]
     fn light_accents_are_the_darker_shades() {
-        // Light mode walks the ramp down one anchor so the hues keep contrast on
-        // white (dark sits at the bright anchor). Pinned to this crate's own
-        // oklch conversion (which differs a hair from CSS Color 4's matrices).
-        let (l, c) = (Theme::STATUS_L_LIGHT, Theme::STATUS_C);
-        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 265.0)), [73, 109, 195]);
-        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 25.0)), [181, 74, 70]);
-        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 75.0)), [160, 98, 0]);
-        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 160.0)), [0, 137, 84]);
+        // Light mode walks the ramp down one anchor and up a touch of chroma,
+        // so the hues keep contrast on white without going grey (dark sits at
+        // the bright anchor). Pinned to this crate's own oklch conversion
+        // (which differs a hair from CSS Color 4's matrices).
+        let (l, c) = (Theme::STATUS_L_LIGHT, Theme::STATUS_C_LIGHT);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 265.0)), [58, 97, 196]);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 25.0)), [179, 55, 54]);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 75.0)), [156, 86, 0]);
+        assert_eq!(srgb_u8(oklch_to_srgb(l, c, 160.0)), [0, 131, 71]);
         // Every hue on the light ramp is visibly darker than the dark theme's,
         // and the strong accent is darker still than the accent it fills for.
         let (t, dark) = (Theme::light(), Theme::dark());

@@ -591,12 +591,16 @@ pub mod status {
     /// The lightness every status hue is anchored to on a dark surface.
     pub const L: f32 = 0.74;
     /// The same anchor on a light surface — walked down so the hues keep
-    /// contrast on near-white (~5:1).
-    pub const L_LIGHT: f32 = 0.55;
+    /// contrast on near-white (~5:1). The supplied design files set it at
+    /// 0.52 (gh#258).
+    pub const L_LIGHT: f32 = 0.52;
     /// The chroma every status hue carries. The old palette already agreed on
     /// ≈0.19; 0.14 is that intent at the new lightness, where 0.19 would push
     /// amber and emerald out of sRGB.
     pub const C: f32 = 0.14;
+    /// The chroma on a light surface. At [`L_LIGHT`] the dark anchor's chroma
+    /// reads washed out, so the reference carries a touch more (gh#258).
+    pub const C_LIGHT: f32 = 0.16;
 
     /// Blocked · failed · errored.
     pub const BLOCKED: f32 = 25.0;
@@ -614,7 +618,7 @@ pub mod status {
 
     /// A hue at the light anchor.
     pub const fn light(hue: f32) -> (f32, f32, f32) {
-        (L_LIGHT, C, hue)
+        (L_LIGHT, C_LIGHT, hue)
     }
 }
 
