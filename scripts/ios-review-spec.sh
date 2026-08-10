@@ -8,14 +8,14 @@
 # screen is the worst place in the app for that: its whole job is to be trusted
 # about what a run did. So the cases live outside both:
 #
-#   cargo test -p comet-board ios_review_spec   the Rust half, and the guard
+#   cargo test -p comet-board --test ios_review_spec   the Rust half, and the guard
 #                                               that the checked-in fixture
 #                                               still matches it
 #   scripts/ios-review-spec.sh                  this: the Swift half against the
 #                                               same file, in the simulator
 #
 # Whichever side moves is the side that fails. After changing a rule in the
-# Rust, regenerate with `UPDATE_REVIEW_SPEC=1 cargo test -p comet-board
+# Rust, regenerate with `UPDATE_REVIEW_SPEC=1 cargo test -p comet-board --test
 # ios_review_spec` and run this to find out what the Swift now disagrees about.
 #
 # Only the cargo half runs in CI — this one needs a simulator — so regenerating

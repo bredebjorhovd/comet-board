@@ -12,7 +12,7 @@ opinion about what a review is.
 
 ### Look at it first
 
-Both at **393×852** (iPhone 16 Pro, iOS 26.4), demo dataset, no box.
+Both at **393×852** (iPhone 15 Pro, iOS 26.4), demo dataset, no box.
 
 | The state the design draws | The state it must not flatter |
 | --- | --- |
@@ -105,8 +105,8 @@ trusted about what a run did, that is the worst possible drift.
 So the cases live outside both, exactly as §gh#157 did it for the stats page:
 
 ```sh
-cargo test -p comet-board ios_review_spec               # the Rust half + the guard
-UPDATE_REVIEW_SPEC=1 cargo test -p comet-board ios_review_spec   # regenerate
+cargo test -p comet-board --test ios_review_spec               # the Rust half + the guard
+UPDATE_REVIEW_SPEC=1 cargo test -p comet-board --test ios_review_spec   # regenerate
 scripts/ios-review-spec.sh                              # the Swift half, in a simulator
 ```
 

@@ -103,7 +103,7 @@ for those rules the *cases* live outside both languages:
 cargo test -p comet-proto stats               # the Rust half + the fixture guard
 scripts/ios-stats-spec.sh                     # the Swift half, in the simulator
 
-cargo test -p comet-board ios_review_spec     # the same pair for the review
+cargo test -p comet-board --test ios_review_spec  # the same pair for the review
 scripts/ios-review-spec.sh                    # reading (gh#256)
 ```
 

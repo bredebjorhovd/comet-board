@@ -578,6 +578,8 @@ final class DemoDataset {
               "state": "failed",
               "outcome": "failed",
               "branch": "deploy-hygiene",
+              "worktree": null,
+              "pr_url": null,
               "brief": {
                 "identifier": "gh#39",
                 "title": "Wrangler deploy hygiene",
