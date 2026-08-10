@@ -561,6 +561,10 @@ mod tests {
             &changed_files,
         );
         AttemptReview {
+            // gh#236 added this after this fixture was written. Default is
+            // `read = false` — "not read" rather than five clean results, so
+            // a fixture that does not exercise effects asserts nothing.
+            effects: Default::default(),
             task_id: "gh:bredebjorhovd/comet-board#138".into(),
             attempt: 7,
             attempt_number: 1,
