@@ -32,6 +32,16 @@ you and your agents invisible to every surface.
 **Close the issue from the work**: `Closes #N` in a commit on the branch. A
 merged PR settles the row itself.
 
+**The credential for your push is the board's, and it is the only one.** A
+dispatched run gets `GIT_ASKPASS` pointed at a helper that mints a short-lived
+token onto git's pipe, and a `gh` wrapper that does the same — so no token is
+ever in argv, in `.git/config`, or in your environment. If a push cannot
+authenticate, **say so and stop**. Do not write your own askpass or credential
+wrapper, do not export a token, do not put one in a remote URL. The board now
+records whether its credential was the one that pushed, and comments on the
+issue when it was not; a push that got through some other way is a finding, not
+a finish.
+
 ## Finishing: claim what you did
 
 Before you say you are done, tell the board what you changed — in **claims**,

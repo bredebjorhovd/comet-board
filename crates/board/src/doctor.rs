@@ -1413,10 +1413,20 @@ fn chats_check(paths: &Paths, db: Option<&Db>) -> Check {
 /// A missing `gh` is not a failure: `git push` still works, and a PR opened by
 /// hand from the branch is a normal way to finish. A missing binary is, because
 /// then nothing was handed to the agent at all.
+///
+/// Since gh#233 the parts are not merely counted, they are **run**. The check
+/// that a `comet-board` exists is the check that failed gh#233: everything was
+/// installed, everything resolved, and no push on the box could authenticate,
+/// because `GIT_ASKPASS` was being handed a string git cannot exec. So this
+/// builds the shim a dispatch would build and asks it the one question that
+/// needs no credential and no network — which username does a GitHub App push
+/// with — in a scratch directory, so a `doctor` run by the wrong user cannot
+/// leave a file the engine then cannot rewrite.
 fn dispatched_push_check(paths: &Paths) -> Check {
     let credential = !matches!(Credentials::load(paths).github_auth(), GithubAuth::None);
     let exe = git_credentials::resolve_board_exe();
     let gh = git_credentials::resolve_gh(None);
+    let mut ok = exe.is_some() && credential;
     let detail = match (&exe, credential) {
         (None, _) => format!(
             "no comet-board binary found beside the engine or on PATH — agents push with \
@@ -1426,20 +1436,48 @@ fn dispatched_push_check(paths: &Paths) -> Check {
         (Some(_), false) => "no GitHub credential — agents push with this box's own git \
              credentials"
             .to_string(),
-        (Some(exe), true) => format!(
-            "{} git-askpass mints per push{}",
-            exe.display(),
-            match &gh {
-                Some(gh) => format!("; `gh` at {} is wrapped to mint per call", gh.display()),
-                None => "; no `gh` installed, so pull requests are opened by hand".into(),
+        (Some(exe), true) => match askpass_answers(exe) {
+            Ok(()) => format!(
+                "the askpass helper answers, and mints per push{}",
+                match &gh {
+                    Some(gh) => format!("; `gh` at {} is wrapped to mint per call", gh.display()),
+                    None => "; no `gh` installed, so pull requests are opened by hand".into(),
+                }
+            ),
+            Err(err) => {
+                ok = false;
+                format!(
+                    "the credential path does not work — no dispatched agent on this box can \
+                     push with the board's App: {err:#}"
+                )
             }
-        ),
+        },
+    };
+    // Whatever the live check says, a failure the path already recorded is the
+    // more useful fact: it happened during somebody's run (gh#233).
+    let detail = match crate::credential_ledger::last_failure(paths) {
+        Some(last) => {
+            ok = false;
+            format!("{detail} · last recorded failure: {}", last.summary())
+        }
+        None => detail,
     };
     Check {
         name: "dispatched pushes".into(),
-        ok: exe.is_some() && credential,
+        ok,
         detail,
     }
+}
+
+/// Build the askpass shim in a scratch directory and ask it git's username
+/// prompt. Removed afterwards: this is a diagnostic, not an install.
+fn askpass_answers(board_exe: &Path) -> anyhow::Result<()> {
+    let dir = std::env::temp_dir().join(format!("comet-doctor-askpass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let result = git_credentials::install_askpass_shim(&dir, board_exe)
+        .and_then(|shim| git_credentials::verify_askpass(&shim));
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 /// Can a dispatched agent on this box run `comet-board` at all (gh#184)?
@@ -2941,7 +2979,16 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&dark), None, None).unwrap();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&dark),
+            None,
+            None,
+        )
+        .unwrap();
         let check = edge_check_in(&checks);
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("0 of 4 live"), "{}", check.detail);
@@ -2966,7 +3013,16 @@ mod tests {
             chat_rooms_live: 0,
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&partial), None, None).unwrap();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&partial),
+            None,
+            None,
+        )
+        .unwrap();
         let check = edge_check_in(&checks);
         assert!(check.ok, "{}", check.detail);
         assert!(
@@ -3050,15 +3106,17 @@ mod tests {
         };
 
         routing("origin/HEAD");
-        let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
+        let (ok, detail) = base_check_in(
+            &doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap(),
+        );
         assert!(!ok, "{detail}");
         assert!(detail.contains("origin"), "{detail}");
         assert!(detail.contains("HEAD"), "the opt-out is named: {detail}");
 
         routing("HEAD");
-        let (ok, detail) =
-            base_check_in(&doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap());
+        let (ok, detail) = base_check_in(
+            &doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap(),
+        );
         assert!(ok, "{detail}");
     }
 
@@ -3209,7 +3267,11 @@ mod tests {
                 HarnessId::Opencode,
                 Some(RuntimeUnavailable::NotInstalled),
             ),
-            option("codex", HarnessId::Codex, Some(RuntimeUnavailable::SignedOut)),
+            option(
+                "codex",
+                HarnessId::Codex,
+                Some(RuntimeUnavailable::SignedOut),
+            ),
             // Always available, and deliberately not part of the census.
             option("mock", HarnessId::Mock, None),
         ];
@@ -3227,7 +3289,11 @@ mod tests {
         assert!(c.ok, "one harness ready is not a fault: {}", c.detail);
         assert!(c.detail.contains("claude-code ready"), "{}", c.detail);
         // Both axes named apart — one is an install, the other a login.
-        assert!(c.detail.contains("opencode (not installed)"), "{}", c.detail);
+        assert!(
+            c.detail.contains("opencode (not installed)"),
+            "{}",
+            c.detail
+        );
         assert!(c.detail.contains("codex (signed out)"), "{}", c.detail);
         assert!(!c.detail.contains("mock"), "{}", c.detail);
 

@@ -830,7 +830,7 @@ impl Inner {
         let mut creds = config
             .push_repo
             .as_deref()
-            .and_then(|repo| self.push.get()?.for_repo(repo));
+            .and_then(|repo| self.push.get()?.for_repo(repo, Some(chat_id)));
         let Some(author) = config.git_author.as_ref() else {
             return creds;
         };

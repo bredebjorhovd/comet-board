@@ -26,6 +26,7 @@
 //!   earns a place here.
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
+use crate::credential_ledger;
 use crate::db::{Db, NewWriteback, Reaped};
 use crate::dispatch::RanOn;
 use crate::gc;
@@ -2232,6 +2233,10 @@ impl SyncEngine {
             task.identifier,
             evidence.as_str()
         ));
+        // Every settle is a settle on work that reached origin — a pull
+        // request, or commits the branch check found on the remote — so this
+        // is the moment to ask what pushed it (gh#233).
+        let credential = self.note_credential_path(task, attempt);
         self.announce(
             runtime,
             task,
@@ -2240,10 +2245,80 @@ impl SyncEngine {
                 outcome: Outcome::Done,
                 evidence: Some(evidence),
                 pr_url: pr_url.map(str::to_string),
-                note: None,
+                note: credential,
             },
         );
         Ok(())
+    }
+
+    /// Did the board's own credential push this? (gh#233.)
+    ///
+    /// The failure this exists for arrived from the inside. The first opencode
+    /// dispatch could not exec the askpass helper, wrote a credential wrapper
+    /// of its own, pushed with it, opened its pull request and finished green —
+    /// and the board recorded a clean attempt, because a board that only
+    /// watches outcomes cannot tell a sanctioned push from an improvised one.
+    /// gh#68 kept the token out of argv, out of `.git/config` and out of the
+    /// environment; none of that survives a wrapper script written under time
+    /// pressure by an agent whose push just failed.
+    ///
+    /// So the ledger is consulted at the one moment there is something to
+    /// compare it against. The board handed this run a credential and was never
+    /// asked for it, or could not hand one over at all — yet here is work on
+    /// origin. That is not proof of wrongdoing and the wording does not claim
+    /// it is: it is the board saying, out loud and on the issue, that it cannot
+    /// account for the credential that pushed.
+    ///
+    /// Returns the clause the settle notice carries, so the agent that released
+    /// the work hears it too — an orchestrator collecting a finished step is
+    /// exactly who needs to know the step's push went around the board.
+    fn note_credential_path(&self, task: &Task, attempt: &Attempt) -> Option<String> {
+        let chat = attempt.pane_id.as_deref()?;
+        let record = credential_ledger::for_chat(&self.paths, chat);
+        // Said whether or not the verdict below fires: a helper that failed and
+        // then worked is a box on its way to gh#233, and the log is where that
+        // is visible before it costs anybody a run.
+        for failure in &record.failures {
+            self.log.error(format!(
+                "{}: the board's credential path failed during this attempt — {}",
+                task.identifier,
+                failure.summary()
+            ));
+        }
+        if !record.unsanctioned() {
+            return None;
+        }
+        let reason = record
+            .last_failure()
+            .map(|f| f.summary())
+            .unwrap_or_else(|| "the helper was never asked".to_string());
+        self.log.error(format!(
+            "{}: this attempt's work is on origin, but the board's credential never pushed it \
+             ({reason}) — the push used a credential the board did not issue",
+            task.identifier
+        ));
+        let queued = self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "credential".into(),
+            payload: json!({
+                "attempt": task.attempt_count(),
+                "branch": attempt.branch,
+                "reason": reason,
+                "log": self.paths.logfile().to_string_lossy(),
+            })
+            .to_string(),
+            // Per attempt: a re-opened attempt that settles twice has one
+            // credential story, and telling it twice on the issue would only
+            // make it easier to scroll past.
+            idem_key: format!("{}:credential:{}", task.id, attempt.id),
+        });
+        if let Err(e) = queued {
+            self.log.error(format!(
+                "{}: queueing the credential notice: {e}",
+                task.identifier
+            ));
+        }
+        Some("the board's credential did not push this — see the issue".to_string())
     }
 
     // ---- notification (gh#71) --------------------------------------------
@@ -3163,6 +3238,11 @@ impl SyncEngine {
                     "blocked" => {
                         linear.comment(&task.source_id, &blocked_comment(&payload))?;
                     }
+                    // The board could not account for the credential that
+                    // pushed this attempt's work (gh#233).
+                    "credential" => {
+                        linear.comment(&task.source_id, &credential_comment(&payload))?;
+                    }
                     // The attempt settled with work waiting on a human. Dispatch
                     // moved this issue to In Progress and, without this, nothing
                     // moved it again until a merge — so Linear read In Progress
@@ -3250,6 +3330,9 @@ impl SyncEngine {
                     }
                     "blocked" => {
                         gh.comment(&repo, number, &blocked_comment(&payload))?;
+                    }
+                    "credential" => {
+                        gh.comment(&repo, number, &credential_comment(&payload))?;
                     }
                     // Close on done. This is what makes "mark done" mean the
                     // same thing on a GitHub row as on a Linear one.
@@ -3397,6 +3480,18 @@ fn blocked_comment(payload: &Value) -> String {
     notify::upstream_comment(
         payload["attempt"].as_u64().unwrap_or(1),
         Stopped::parse(payload["reason"].as_str().unwrap_or("")),
+        payload["log"].as_str().unwrap_or("(none)"),
+    )
+}
+
+/// The gh#233 notice, composed at delivery like every other comment.
+fn credential_comment(payload: &Value) -> String {
+    notify::credential_comment(
+        payload["attempt"].as_u64().unwrap_or(1),
+        payload["branch"].as_str(),
+        payload["reason"]
+            .as_str()
+            .unwrap_or("the helper was never asked"),
         payload["log"].as_str().unwrap_or("(none)"),
     )
 }
@@ -5310,6 +5405,105 @@ mod tests {
 
         assert!(hook.posts.lock().unwrap().is_empty());
         assert_eq!(blocked_writebacks(&e).len(), 1);
+    }
+
+    // ---- the credential that pushed (gh#233) -----------------------------
+
+    fn credential_writebacks(e: &SyncEngine) -> Vec<Value> {
+        e.db.pending_writebacks(50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind == "credential")
+            .map(|w| serde_json::from_str(&w.payload).unwrap())
+            .collect()
+    }
+
+    /// Settle a dispatched attempt on a pull request, having first written
+    /// `ledger` into the board's credential record for its chat.
+    fn settle_with_ledger(ledger: impl FnOnce(&Paths)) -> (SyncEngine, Arc<RecordingWebhook>) {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        ledger(&e.paths);
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done), "the attempt settled");
+        (e, hook)
+    }
+
+    /// gh#233, as it actually happened: the board wired the run to its askpass
+    /// helper, the helper was never asked, and a pull request exists anyway.
+    /// Something pushed that branch and it was not the board's credential.
+    #[test]
+    fn work_on_origin_that_the_boards_credential_never_pushed_is_said_out_loud() {
+        let (e, hook) = settle_with_ledger(|paths| {
+            credential_ledger::handed(paths, "owner/widget", Some("chat-9"));
+        });
+
+        let notices = credential_writebacks(&e);
+        assert_eq!(notices.len(), 1, "one comment upstream: {notices:?}");
+        assert_eq!(notices[0]["branch"], json!("board/lin-142"));
+        let comment = credential_comment(&notices[0]);
+        assert!(comment.contains("never asked"), "{comment}");
+        assert!(comment.contains("comet-board doctor"), "{comment}");
+
+        // And the agent that released the work hears it on the settle itself,
+        // rather than finding out from the issue next week.
+        let posts = hook.posts.lock().unwrap().clone();
+        assert!(
+            posts[0].1["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("did not push this")),
+            "{:?}",
+            posts[0].1
+        );
+    }
+
+    /// The same settle on a box that could not hand the credential over at
+    /// all. The engine refuses a path it cannot exec (that is the gh#233 fix),
+    /// so nothing is `handed` — but the refusal is on the record, and work
+    /// still reached origin.
+    #[test]
+    fn a_credential_path_that_was_refused_still_accuses_the_push_that_happened() {
+        let (e, _) = settle_with_ledger(|paths| {
+            credential_ledger::unusable(
+                paths,
+                "owner/widget",
+                Some("chat-9"),
+                "cannot exec the askpass helper",
+            );
+        });
+
+        let notices = credential_writebacks(&e);
+        assert_eq!(notices.len(), 1);
+        let comment = credential_comment(&notices[0]);
+        assert!(comment.contains("cannot exec"), "{comment}");
+    }
+
+    /// The case that must stay quiet, because it is every normal dispatch: the
+    /// board handed its credential over and the helper answered a push with it.
+    #[test]
+    fn a_push_the_boards_credential_made_is_not_worth_a_word() {
+        let (e, hook) = settle_with_ledger(|paths| {
+            credential_ledger::handed(paths, "owner/widget", Some("chat-9"));
+            credential_ledger::minted(paths, "git-askpass", "owner/widget", Some("chat-9"));
+        });
+
+        assert!(credential_writebacks(&e).is_empty());
+        assert_eq!(hook.posts.lock().unwrap()[0].1["note"], Value::Null);
+    }
+
+    /// And the case that must stay quiet for a different reason: a box with no
+    /// board credential at all never claimed to be the thing that pushes, so
+    /// an empty ledger is not an accusation — it is a device pushing the way
+    /// every device did before gh#68.
+    #[test]
+    fn a_box_that_never_issues_credentials_is_not_accused_of_losing_one() {
+        let (e, _) = settle_with_ledger(|_| {});
+        assert!(credential_writebacks(&e).is_empty());
     }
 
     /// A notification is best effort by construction. An endpoint that is down

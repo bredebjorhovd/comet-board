@@ -16,7 +16,11 @@
 //!
 //! The server writes its own pid to `fake-opencode.pid` in its current
 //! working directory (the harness is pointed at a tempdir cwd by the tests) so
-//! tests can assert the child was reaped after a run.
+//! tests can assert the child was reaped after a run. Beside it goes
+//! `fake-opencode.env` — the credential-shaped variables as this process
+//! actually received them, which is how gh#233's question ("what does the
+//! opencode child get?") is answered by a test rather than by reasoning about
+//! it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,11 +65,20 @@ enum Scenario {
 async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let _ = std::fs::write(
-        std::env::current_dir()
-            .unwrap_or_else(|_| ".".into())
-            .join("fake-opencode.pid"),
+        cwd.join("fake-opencode.pid"),
         std::process::id().to_string(),
+    );
+    // What the process that runs the agent's tools was actually handed. The
+    // server is the parent of every `git push` an opencode agent makes, so
+    // this file is the environment those pushes inherit.
+    let _ = std::fs::write(
+        cwd.join("fake-opencode.env"),
+        std::env::vars()
+            .filter(|(k, _)| k.starts_with("GIT_") || k.starts_with("COMET_BOARD_"))
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect::<String>(),
     );
     println!("opencode server listening on http://127.0.0.1:{port}");
 

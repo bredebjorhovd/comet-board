@@ -128,9 +128,22 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     // directory it puts on every child's PATH from it, and a test that let the
     // lookup fall through to PATH would assert something different on a box
     // with `comet-board` installed than on one without.
+    //
+    // A working stand-in rather than an empty file: since gh#233 the engine
+    // *runs* the credential path before handing it to a run, so a `comet-board`
+    // that cannot answer `git-askpass` is — correctly — no credential at all.
     let board_exe = dir.join("comet-board");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(&board_exe, "").unwrap();
+    std::fs::write(
+        &board_exe,
+        "#!/bin/sh\n[ \"$1\" = git-askpass ] || exit 2\necho x-access-token\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&board_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     // SAFETY: single-test binary, set before the engine that reads it exists.
     unsafe { std::env::set_var("COMET_BOARD_EXECUTABLE", &board_exe) };
 
@@ -256,9 +269,28 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
 
     let push = for_chat("chat-dispatched").expect("the dispatched run has credentials");
     let env: std::collections::BTreeMap<_, _> = push.env.iter().cloned().collect();
+    // gh#233: a path, naming a file git can exec, and nothing else. The
+    // subcommand rides inside that file — it cannot ride in the variable,
+    // because git execs `GIT_ASKPASS` rather than running it through a shell.
+    let askpass = env.get("GIT_ASKPASS").expect("askpass wiring").clone();
     assert_eq!(
-        env.get("GIT_ASKPASS").map(String::as_str),
-        Some(format!("'{}' git-askpass", board_exe.display()).as_str())
+        askpass,
+        paths
+            .state_dir
+            .join("bin")
+            .join(comet_board::git_credentials::ASKPASS_SHIM)
+            .display()
+            .to_string()
+    );
+    assert!(
+        std::path::Path::new(&askpass).is_file(),
+        "GIT_ASKPASS names nothing git could exec: {askpass}"
+    );
+    assert!(
+        std::fs::read_to_string(&askpass)
+            .unwrap()
+            .contains("git-askpass"),
+        "the helper's subcommand went missing"
     );
     assert_eq!(
         env.get("COMET_BOARD_ASKPASS_REPO").map(String::as_str),
