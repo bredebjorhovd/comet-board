@@ -261,10 +261,6 @@ impl Runtime for CometRuntime {
         Ok(chats
             .into_iter()
             .filter_map(|chat| {
-                let branch = chat.branch?.trim().to_string();
-                if branch.is_empty() || branch == "HEAD" {
-                    return None;
-                }
                 // A checkout path belongs to its host device. Keep the remote
                 // chat as provenance, but never run local git against its path.
                 let worktree = (chat.device_id == local_device)
@@ -282,6 +278,12 @@ impl Runtime for CometRuntime {
                 }
                 pull_request_urls.sort();
                 pull_request_urls.dedup();
+                let branch = chat
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                    .map(str::to_string);
                 let created_pull_request = local
                     && self
                         .journal
@@ -289,6 +291,9 @@ impl Runtime for CometRuntime {
                         .ok()
                         .flatten()
                         .is_some_and(|commands| commands.iter().any(ran_gh_pr_create));
+                if branch.is_none() && pull_request_urls.is_empty() {
+                    return None;
+                }
                 let repo = chat
                     .config
                     .as_ref()
@@ -450,12 +455,13 @@ impl Runtime for CometRuntime {
 }
 
 fn ran_gh_pr_create(command: &RanCommand) -> bool {
-    command
-        .command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(3)
-        .any(|words| words == ["gh", "pr", "create"])
+    !command.failed
+        && command
+            .command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .any(|words| words == ["gh", "pr", "create"])
 }
 
 /// Canonical PR URLs mentioned in one message. The workspace row only syncs a
@@ -504,11 +510,17 @@ mod review_candidate_tests {
 
     #[test]
     fn pr_creation_is_a_command_signal_not_arbitrary_prose() {
-        let ran = RanCommand {
+        let successful = RanCommand {
             command: "env CI=1 gh pr create --fill".into(),
             failed: false,
         };
-        assert!(ran_gh_pr_create(&ran));
+        assert!(ran_gh_pr_create(&successful));
+
+        let failed = RanCommand {
+            command: "gh pr create --fill".into(),
+            failed: true,
+        };
+        assert!(!ran_gh_pr_create(&failed));
     }
 }
 

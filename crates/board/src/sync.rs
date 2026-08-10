@@ -688,7 +688,7 @@ impl SyncEngine {
             explicit.sort_by_key(|candidate| candidate.created_at);
             let matching: Vec<_> = candidates
                 .iter()
-                .filter(|candidate| candidate.branch == pr.head_ref)
+                .filter(|candidate| candidate.branch.as_deref() == Some(pr.head_ref.as_str()))
                 .filter(|candidate| {
                     candidate.repo.as_deref().is_some_and(|repo| {
                         repo.eq_ignore_ascii_case(&pr.repo)
@@ -730,7 +730,7 @@ impl SyncEngine {
                         relinked = true;
                     }
                     if attempt.worktree.is_none()
-                        && author.branch == pr.head_ref
+                        && author.branch.as_deref() == Some(pr.head_ref.as_str())
                         && let Some(worktree) = author.worktree.as_deref()
                     {
                         self.db.set_attempt_worktree(attempt.id, worktree)?;
@@ -757,7 +757,7 @@ impl SyncEngine {
             };
             let author_chat_id = author.map(|author| author.chat_id.clone());
             let worktree = author
-                .filter(|author| author.branch == pr.head_ref)
+                .filter(|author| author.branch.as_deref() == Some(pr.head_ref.as_str()))
                 .and_then(|author| author.worktree.clone());
 
             let attempt_id = self.db.insert_adopted_attempt(&NewAttempt {
@@ -6709,7 +6709,7 @@ max_duration = "{max_duration}"
                     runtime: "claude-code".into(),
                     worktree: Some(work.to_string_lossy().into_owned()),
                     repo: Some("o/r".into()),
-                    branch: "direct-pr".into(),
+                    branch: Some("direct-pr".into()),
                     pull_request_urls: vec![pr.url.clone()],
                     created_pull_request: false,
                     account: None,
@@ -6721,7 +6721,7 @@ max_duration = "{max_duration}"
                     runtime: "codex".into(),
                     worktree: Some(work.to_string_lossy().into_owned()),
                     repo: Some("o/r".into()),
-                    branch: "direct-pr".into(),
+                    branch: Some("direct-pr".into()),
                     pull_request_urls: Vec::new(),
                     created_pull_request: false,
                     account: None,
@@ -6835,7 +6835,7 @@ max_duration = "{max_duration}"
                 // as a local checkout. The attempt still carries the chat.
                 worktree: None,
                 repo: None,
-                branch: "comet/remote-pr".into(),
+                branch: None,
                 pull_request_urls: vec![pr.url.clone()],
                 created_pull_request: false,
                 account: None,
@@ -6899,7 +6899,7 @@ max_duration = "{max_duration}"
             runtime: "codex".into(),
             worktree: None,
             repo: Some("person/r".into()),
-            branch: "feature".into(),
+            branch: Some("feature".into()),
             pull_request_urls: Vec::new(),
             created_pull_request: false,
             account: None,

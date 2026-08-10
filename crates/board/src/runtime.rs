@@ -327,7 +327,9 @@ pub struct ReviewCandidate {
     /// GitHub repository derived by the owning device when it can inspect the
     /// checkout. None is still usable when this branch names exactly one PR.
     pub repo: Option<String>,
-    pub branch: String,
+    /// Current branch when the chat still has usable checkout metadata. An
+    /// exact PR URL remains sufficient provenance when this is unavailable.
+    pub branch: Option<String>,
     /// Canonical GitHub PR URLs explicitly mentioned by this conversation.
     /// An exact URL is adoption evidence even when the chat lives elsewhere.
     pub pull_request_urls: Vec<String>,
