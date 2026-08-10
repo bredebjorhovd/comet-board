@@ -166,8 +166,9 @@ pub struct Chat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
     /// The space this chat belongs to. Invariant: `Some` for every UI-created
-    /// chat; rows with a missing/dangling space id are not rendered (the host
-    /// device's repair sweep deletes its own danglers).
+    /// chat. The host device's repair sweep deletes its own danglers; while
+    /// independent Chat and Space watches converge, view placement treats a
+    /// missing/dangling id as unresolved and keeps live work in Active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
     /// Synced LWW seen marker — compared against `last_message_at` to derive

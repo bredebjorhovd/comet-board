@@ -2246,7 +2246,7 @@ impl Shell {
         let active = self.board.read(cx).active(cx, active_now);
         let placements: Vec<(String, Option<String>)> = {
             let state = self.state.read(cx);
-            comet_proto::view::spaces::active_placements(&active, &state.chats)
+            comet_proto::view::spaces::active_placements(&active, &state.chats, &state.spaces)
                 .into_iter()
                 .map(|(chat, space)| (chat.to_string(), space.map(str::to_string)))
                 .collect()
@@ -2256,8 +2256,6 @@ impl Shell {
         // disclosure can hold. Below the tree, not above it.
         let loose_section =
             self.render_loose_active_section(&active, &placements, active_now, theme, cx);
-        // …and the orchestrator, when no expanded space is there to host it.
-        let orchestrator_slot = self.render_orphan_orchestrator_slot(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2287,14 +2285,6 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(needs_section)
-                            .children(orchestrator_slot.map(|slot| {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(slot)
-                                    .child(Self::render_orchestrator_rule(theme))
-                                    .into_any_element()
-                            }))
                             .child(spaces_section)
                             .children(loose_section)
                             .child(div().pb(px(Theme::SPACE_SM))),

@@ -14,15 +14,13 @@
 //! competing with the tab strip, and neither was authoritative. The tab strip
 //! stays as in-space navigation with the titlebar duties.
 //!
-//! ## One full row per chat (gh#138)
+//! ## One full row per chat (gh#138, gh#258)
 //!
-//! Active and the tree still answer different questions, but only one of them
-//! draws a chat at a time: **Active owns it while its session is live, the
-//! space's shelf shows it when idle.** Otherwise a box whose whole load sits
-//! in one space renders that space as a verbatim copy of the list above it.
-//! Two things keep the surfaces tied — the space row's `· 3 running` count,
-//! and the shelf's own note when Active holds every one of its sessions
-//! ([`spaces_view::space_shelf`]).
+//! Spaces is the primary hierarchy: a disclosure draws its Orchestrator first,
+//! then live sessions, then idle sessions. Active is only the fallback for a
+//! live row whose current placement resolves to no known Space. That fallback
+//! matters because Chat and Space watches settle independently; a dangling
+//! `space_id` must stay visible while the Space side catches up.
 //!
 //! A space row is named repo-first: `owner/repo` where a host has supplied the
 //! gh#118 link ([`Shell::refresh_space_slugs`]), the folder basename otherwise.
@@ -86,6 +84,13 @@ const SPACE_QUALIFIER_MAX: f32 = 132.0;
 /// qualifier: a branch name is a location, not an identity, so `board-gh-229-…`
 /// eliding is a shortened fact rather than an ambiguous row.
 const SPACE_BRANCH_MAX: f32 = 96.0;
+
+/// Selection belongs to the hierarchy's parent while a child is disclosed.
+/// In light mode both selected fills are white, so painting both would produce
+/// the nested parent/child plates the reference deliberately avoids.
+fn disclosed_child_selected(parent_selected: bool, child_selected: bool) -> bool {
+    child_selected && !parent_selected
+}
 
 /// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
 /// animation restarts (the session-tab idiom, vertical).
@@ -395,6 +400,17 @@ impl Shell {
     /// The chevron's toggle — collapse if disclosed, disclose if not. Does not
     /// activate the space; that is the row's job.
     fn toggle_space_disclosure(&mut self, space_id: &str, cx: &mut Context<Self>) {
+        let forced_open = {
+            let state = self.state.read(cx);
+            spaces_view::space_disclosure_forced_open(
+                state.selected_space.as_deref() == Some(space_id),
+                state.orchestrator_slot(Utc::now()).is_some(),
+            )
+        };
+        if forced_open {
+            self.expand_space(space_id, cx);
+            return;
+        }
         if let Some(ix) = self
             .settings
             .expanded_spaces
@@ -502,7 +518,16 @@ impl Shell {
             .iter()
             .map(|(chat, space)| (chat.as_str(), space.as_deref()))
             .collect();
-        let (spaces, selected, device_names, device_presence, attention, slugs, local_device) = {
+        let (
+            spaces,
+            selected,
+            device_names,
+            device_presence,
+            attention,
+            slugs,
+            local_device,
+            has_orchestrator,
+        ) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             let spaces = state.spaces.clone();
@@ -562,6 +587,7 @@ impl Shell {
                 attention,
                 state.space_slugs.clone(),
                 state.local_device_id.clone(),
+                state.orchestrator_slot(now).is_some(),
             )
         };
         // Manual (drag) order overrides the synced creation order — device-
@@ -705,7 +731,12 @@ impl Shell {
                     // while collapsed (gh#229) — owner-stamped, so it costs no
                     // RPC and is true on a phone that will never see the disk.
                     let branch = spaces_view::space_branch(&space).map(str::to_string);
-                    let expanded = self.space_expanded(&space.id) && !drag_active;
+                    let expanded = (self.space_expanded(&space.id)
+                        || spaces_view::space_disclosure_forced_open(
+                            is_selected,
+                            has_orchestrator,
+                        ))
+                        && !drag_active;
                     // What Active holds for this space — the count the row
                     // wears, and the rows the shelf therefore skips.
                     let order = self.tab_ids(&id, cx);
@@ -1182,7 +1213,14 @@ impl Shell {
             let selected = self.state.read(cx).selected_chat.clone();
             live.iter()
                 .map(|row| {
-                    let is_selected = selected.as_deref() == Some(row.chat_id());
+                    // The selected Space owns selection for its disclosed
+                    // hierarchy. Painting the selected child too nests two
+                    // white plates in light; the reference leaves children on
+                    // the disclosed bed.
+                    let is_selected = disclosed_child_selected(
+                        orchestrator,
+                        selected.as_deref() == Some(row.chat_id()),
+                    );
                     match row {
                         ActiveRow::Agent(agent) => {
                             self.render_agent_row(agent, is_selected, now, theme, cx)
@@ -1212,7 +1250,10 @@ impl Shell {
                     Some(self.render_space_session_row(
                         &chat,
                         status,
-                        selected.as_deref() == Some(*chat_id),
+                        disclosed_child_selected(
+                            orchestrator,
+                            selected.as_deref() == Some(*chat_id),
+                        ),
                         pinned.as_deref() == Some(*chat_id),
                         now,
                         theme,
@@ -1633,11 +1674,9 @@ impl Shell {
     /// here); a pinned-but-silent orchestrator renders as the empty fixture,
     /// teaching where to look before the first notice arrives.
     ///
-    /// It is the first row inside the selected space's disclosure (gh#258),
-    /// and falls back above Spaces when no expanded space can host it
-    /// ([`Self::render_orphan_orchestrator_slot`]). The row itself carries no
-    /// outer margin, so whichever of the two places it lands in owns its
-    /// spacing.
+    /// It is the first row inside the selected space's disclosure (gh#258).
+    /// That disclosure is forced open while this row exists, so the ownership
+    /// stays visible even if the saved disclosure state says collapsed.
     pub(super) fn render_orchestrator_slot(
         &mut self,
         theme: &Theme,
@@ -1645,8 +1684,6 @@ impl Shell {
     ) -> Option<AnyElement> {
         let now = Utc::now();
         let slot = self.state.read(cx).orchestrator_slot(now)?;
-        let selected = self.state.read(cx).selected_chat.as_deref() == Some(slot.chat_id.as_str());
-
         let subline = theme.text_subtle;
         let fade_key = format!("orch-slot-{}", slot.chat_id);
         let chat_id = slot.chat_id.clone();
@@ -1723,7 +1760,10 @@ impl Shell {
                 .rounded(px(Theme::RADIUS_ROW))
                 .px(px(Theme::SPACE_SM))
                 .py(px(6.0))
-                .list_row(theme, Bed::Shell, selected, fade_key)
+                // The selected Space row owns the hierarchy's selection fill;
+                // its Orchestrator child remains unfilled like every other
+                // disclosed child in the reference.
+                .list_row(theme, Bed::Shell, false, fade_key)
                 .cursor_pointer()
                 // Opening it opens the thread — and marks it seen, the synced
                 // marker that clears the badge on every device.
@@ -1798,8 +1838,8 @@ impl Shell {
     }
 
     /// What is left of the "Active" group (gh#123, cut back by gh#258): the
-    /// live runs no space can hold — a working chat whose `space_id` is unset,
-    /// which no disclosure in the tree above will ever draw.
+    /// live runs no space can hold — a working chat whose placement is unset
+    /// or dangling, which no disclosure in the tree above can draw yet.
     ///
     /// It sits BELOW the tree, not above it, and it is `None` whenever every
     /// run has a home — which is the ordinary case. A live run must always
@@ -1854,34 +1894,6 @@ impl Shell {
                 .flex_col()
                 .child(header)
                 .child(div().flex().flex_col().gap(px(2.0)).children(rows))
-                .into_any_element(),
-        )
-    }
-
-    /// The orchestrator's slot when no expanded space is there to host it —
-    /// nothing selected yet, or the selected space collapsed.
-    ///
-    /// The pinned slot is the only way to reach the orchestrator's thread when
-    /// its chat has no other row on screen, so it cannot simply disappear with
-    /// the disclosure it normally lives in. It reappears above Spaces, where it
-    /// used to live full-time.
-    pub(super) fn render_orphan_orchestrator_slot(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let hosted = {
-            let state = self.state.read(cx);
-            state.selected_space.clone()
-        }
-        .is_some_and(|space| self.space_expanded(&space));
-        if hosted {
-            return None;
-        }
-        Some(
-            div()
-                .mt(px(Theme::SPACE_MD))
-                .child(self.render_orchestrator_slot(theme, cx)?)
                 .into_any_element(),
         )
     }
@@ -4333,6 +4345,13 @@ impl Shell {
 mod tests {
     use super::*;
     use comet_rpc::RpcError;
+
+    #[test]
+    fn a_selected_space_owns_selection_instead_of_its_selected_child() {
+        assert!(!disclosed_child_selected(true, true));
+        assert!(disclosed_child_selected(false, true));
+        assert!(!disclosed_child_selected(false, false));
+    }
 
     /// The line gh#155 turns on: which failures mean "this device is not a
     /// host" (and vanish from the picker), and which mean "this device was

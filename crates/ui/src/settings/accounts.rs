@@ -203,6 +203,17 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
+/// Reference copy for an account usage window. The engine calls Claude's
+/// rolling five-hour allowance "Session"; the supplied Settings design names
+/// the duration instead.
+pub fn usage_window_label(label: &str) -> &str {
+    if label == "Session" {
+        "5 hours"
+    } else {
+        label
+    }
+}
+
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, comet settings.agents.tsx `PROVIDERS`).
 pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
@@ -1040,7 +1051,7 @@ impl AccountsPage {
                     .w(px(48.0))
                     .flex_none()
                     .truncate()
-                    .child(SharedString::from(window.label.clone())),
+                    .child(SharedString::from(usage_window_label(&window.label).to_string())),
             )
             .child(
                 div()
@@ -2138,5 +2149,11 @@ mod tests {
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    #[test]
+    fn the_session_window_uses_the_reference_duration_copy() {
+        assert_eq!(usage_window_label("Session"), "5 hours");
+        assert_eq!(usage_window_label("Week"), "Week");
     }
 }

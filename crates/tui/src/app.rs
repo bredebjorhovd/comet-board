@@ -2248,7 +2248,7 @@ impl App {
             now,
         );
         let placed: Vec<(String, Option<String>)> =
-            spaces_view::active_placements(&active, &self.chats)
+            spaces_view::active_placements(&active, &self.chats, &self.spaces)
                 .into_iter()
                 .map(|(chat, space)| (chat.to_string(), space.map(str::to_string)))
                 .collect();

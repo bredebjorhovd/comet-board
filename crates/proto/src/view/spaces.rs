@@ -256,6 +256,7 @@ pub fn space_branch(space: &Space) -> Option<&str> {
 pub fn active_placements<'a>(
     active: &'a [ActiveRow],
     chats: &'a [Chat],
+    spaces: &[Space],
 ) -> Vec<(&'a str, Option<&'a str>)> {
     active
         .iter()
@@ -264,10 +265,24 @@ pub fn active_placements<'a>(
             let space = chats
                 .iter()
                 .find(|chat| chat.id == chat_id)
-                .and_then(|chat| chat.space_id.as_deref());
+                .and_then(|chat| chat.space_id.as_deref())
+                // Chats and Spaces arrive on independent watches. Until a
+                // referenced Space arrives (or after it has been removed),
+                // the placement is unresolved and must use Active's fallback
+                // rather than disappear between the two renderers.
+                .filter(|space_id| spaces.iter().any(|space| space.id == *space_id));
             (chat_id, space)
         })
         .collect()
+}
+
+/// Whether the selected Space's disclosure is structurally required to stay
+/// open because it owns the visible Orchestrator row.
+///
+/// This is shared by rendering and the chevron action so persisted collapsed
+/// state cannot briefly move the Orchestrator outside its Space or hide it.
+pub fn space_disclosure_forced_open(selected: bool, has_orchestrator: bool) -> bool {
+    selected && has_orchestrator
 }
 
 /// The live chats a space's disclosure draws, in the order Active derived them
@@ -285,8 +300,9 @@ pub fn space_live<'a>(space_id: &str, active: &[(&'a str, Option<&'a str>)]) -> 
         .collect()
 }
 
-/// The live chats no space claims — a run whose chat has no `space_id`, which
-/// no disclosure can draw.
+/// The live chats no current space claims — either the chat has no `space_id`
+/// or [`active_placements`] normalized a dangling reference to `None` while
+/// the independent Space watch catches up.
 ///
 /// These are the only rows that still need a group of their own, and it sits
 /// BELOW the spaces tree: a live run must always have a row somewhere, and the
@@ -614,14 +630,34 @@ mod tests {
     }
 
     #[test]
-    fn placements_find_the_space_an_attempt_never_names() {
+    fn placements_find_only_spaces_the_current_watch_knows() {
         let chats = vec![chat("c1", Some("s1")), chat("c2", None)];
         let active = vec![agent_row("c1"), agent_row("c2"), agent_row("gone")];
-        let placements = active_placements(&active, &chats);
+        let spaces = vec![space("s1", "local", "/s1")];
+        let placements = active_placements(&active, &chats, &spaces);
         assert_eq!(
             placements,
             [("c1", Some("s1")), ("c2", None), ("gone", None)]
         );
+    }
+
+    #[test]
+    fn a_dangling_space_reference_falls_back_to_active() {
+        let chats = vec![chat("dangling", Some("not-in-the-space-watch"))];
+        let active = vec![agent_row("dangling")];
+        let spaces = vec![space("known", "local", "/known")];
+
+        let placements = active_placements(&active, &chats, &spaces);
+
+        assert_eq!(placements, [("dangling", None)]);
+        assert_eq!(homeless_live(&placements), ["dangling"]);
+    }
+
+    #[test]
+    fn a_selected_space_with_an_orchestrator_stays_disclosed() {
+        assert!(space_disclosure_forced_open(true, true));
+        assert!(!space_disclosure_forced_open(true, false));
+        assert!(!space_disclosure_forced_open(false, true));
     }
 
     #[test]
