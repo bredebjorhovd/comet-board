@@ -43,7 +43,28 @@
 //! blocked hue (gh#173) — the verdict strip under the header wears it, the
 //! remainder block wears it, and the inline `!` marks that flag a contradiction
 //! wear it. Nothing else on the page is allowed to; a screen where three things
-//! shout has nothing left to shout with.
+//! shout has nothing left to shout with. The single carve-out is the deletion
+//! count in the diff strip (§gh#238), where the hue belongs to the *minus sign*
+//! rather than to the screen: `−33` is arithmetic, every diff in this app and
+//! every other one paints it red, and a grey minus would be the only one that
+//! is not.
+//!
+//! ## Two ways out, and neither draws a diff
+//!
+//! The screen is not a diff viewer and it will not become one, but the diff has
+//! to be one click away or the refusal is just a missing feature (§gh#238). So
+//! the body closes with a strip that says *how much* moved — `3 files changed`,
+//! `+117`, `−33`, summed off the same `changed` list the remainder is derived
+//! from — beside a `Read the diff` chip that hands the reader to
+//! [`crate::changes`], which is the module that does draw diffs. The chip
+//! leaves by event ([`ReviewEvent`]) rather than reaching for the route: a card
+//! that navigated the shell would be a card that owns the window.
+//!
+//! And the header says whose turn it is. A review that is waiting for a human
+//! and one that has already been answered are otherwise the same screen — same
+//! verdict strip, same claims, same bar — which was survivable while the
+//! verdict had to be written on GitHub and stopped being so the moment it could
+//! be sent from here (§gh#239). The pill is the difference.
 //!
 //! **The reading is not this module's.** Whether a review is alarming, and the
 //! sentence that says so, come from [`comet_board::claims`] —
@@ -72,8 +93,8 @@ use comet_board::claims::{
     AnchorKind, AttemptReview, ChangedFile, ClaimMark, ClaimView, DiffSource, FindingKind, Tone,
     Verdict, anchor_kind,
 };
-use comet_board::verdict::{self, VerdictKind, VerdictReceipt};
 use comet_board::effects::{Chip, Ground};
+use comet_board::verdict::{self, VerdictKind, VerdictReceipt};
 use comet_proto::view::board;
 use comet_rpc::methods;
 
@@ -131,6 +152,34 @@ const CHIP_DOT: f32 = 5.0;
 /// than the verdict would be arguing with it.
 const CHIP_TINT: f32 = 0.12;
 
+/// The turn pill in the header (§gh#238), as the design gives it: `1px 8px` of
+/// padding on a 14% tint of its own hue. Two off the chip row's 12%, because
+/// this one has no dot to carry the colour and the text is all there is.
+const PILL_PX: f32 = 8.0;
+const PILL_PY: f32 = 1.0;
+const PILL_TINT: f32 = 0.14;
+
+/// The diff strip that closes the body (§gh#238): `9px 12px` inside a hairline
+/// row. Tighter vertically than a section, because it is a signpost and not a
+/// section — the reading is over by the time a reader reaches it.
+const STRIP_PX: f32 = 12.0;
+const STRIP_PY: f32 = 9.0;
+
+/// What the review card asks the shell to do, because it cannot do it itself.
+///
+/// The same shape [`crate::board::BoardEvent`] has, and for the same reason: a
+/// panel that reached over and set the route would be a dock that owns the
+/// window.
+#[derive(Debug, Clone)]
+pub enum ReviewEvent {
+    /// The `Read the diff` chip (§gh#238). The card does not draw a diff and
+    /// will not learn to; this is the hand-off to [`crate::changes`], which
+    /// reads the live checkout of whichever chat is selected — so the chat to
+    /// select travels with the request rather than being guessed at the far
+    /// end.
+    ReadTheDiff { chat_id: String },
+}
+
 /// One attempt's review, fetched and drawn.
 pub struct ReviewPanel {
     state: Entity<AppState>,
@@ -138,6 +187,11 @@ pub struct ReviewPanel {
     /// different panel (the shell replaces it rather than re-pointing it, so a
     /// stale reply can never land on the wrong review).
     task_id: String,
+    /// The chat that authored this attempt, where there still is one. Held for
+    /// one purpose: [`ReviewEvent::ReadTheDiff`] needs a session to select, and
+    /// a review outlives its chat — so a review with none has no diff to open
+    /// and says so by drawing the counts without the chip.
+    chat_id: Option<String>,
     /// Which attempt, or the task's latest. Held so a later "previous attempt"
     /// affordance has somewhere to write.
     attempt: Option<i64>,
@@ -175,6 +229,7 @@ impl ReviewPanel {
     pub fn new(
         state: Entity<AppState>,
         task_id: String,
+        chat_id: Option<String>,
         attempt: Option<i64>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -197,6 +252,7 @@ impl ReviewPanel {
         let mut panel = Self {
             state,
             task_id,
+            chat_id,
             attempt,
             review: None,
             host: None,
@@ -1076,7 +1132,52 @@ impl ReviewPanel {
             .into_any_element()
     }
 
-    /// The card's own header: which attempt this is, and the links out.
+    /// Whose turn it is, as the header pill says it (§gh#238).
+    ///
+    /// Two readings and an absence. A task the board has parked in `review` is
+    /// waiting for a human, and one `blocked` on a question is waiting for the
+    /// same human about something else — both are your turn, so both wear the
+    /// review hue and the label says which. An attempt still running, or one
+    /// long since done, gets no pill: the facts line beside it already says
+    /// which, and a badge on every review is not a signal.
+    ///
+    /// `answered` is this session's receipt rather than anything durable, and
+    /// it wins over the board's state because it is newer — the state moves
+    /// when the sync loop next reads the pull request, which is some seconds
+    /// after the button was pressed and not before.
+    ///
+    /// Never [`Theme::danger`], including for `blocked`: that hue is the
+    /// unclaimed set's, and a pill in the header wearing it would be the
+    /// loudest thing on the screen saying something the remainder block is
+    /// there to say.
+    fn turn_pill(state: &str, answered: bool, theme: &Theme) -> Option<(&'static str, gpui::Hsla)> {
+        let review_hue = crate::board::state_color(board::BoardState::Review, theme);
+        if answered {
+            return Some(("Answered", theme.settled));
+        }
+        match board::BoardState::parse(state) {
+            Some(board::BoardState::Review) => Some(("Waiting on you", review_hue)),
+            Some(board::BoardState::Blocked) => Some(("Blocked on you", review_hue)),
+            _ => None,
+        }
+    }
+
+    /// The pill itself: the design's `1px 8px` on a 14% tint of its own hue.
+    fn render_pill(label: &'static str, color: gpui::Hsla) -> AnyElement {
+        div()
+            .flex_none()
+            .px(px(PILL_PX))
+            .py(px(PILL_PY))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .bg(color.opacity(PILL_TINT))
+            .text_size(px(Theme::TEXT_CAPTION))
+            .text_color(color)
+            .child(SharedString::from(label))
+            .into_any_element()
+    }
+
+    /// The card's own header: which attempt this is, whose turn it is, and the
+    /// links out.
     fn render_header(
         &self,
         review: &AttemptReview,
@@ -1099,6 +1200,10 @@ impl ReviewPanel {
         .flatten()
         .map(|(label, url)| (SharedString::from(label), url))
         .collect();
+        // Beside the identifier rather than out by the links: whose turn it is
+        // is a fact about this review, not an action you can take on it.
+        let pill = Self::turn_pill(&review.state, self.receipt.is_some(), theme)
+            .map(|(label, color)| Self::render_pill(label, color));
         div()
             .flex_none()
             .flex()
@@ -1118,6 +1223,7 @@ impl ReviewPanel {
                             .text_color(theme.text_muted)
                             .child(SharedString::from(review.brief.identifier.clone())),
                     )
+                    .children(pill)
                     .child(
                         div()
                             .flex_1()
@@ -1151,6 +1257,116 @@ impl ReviewPanel {
                     .child(SharedString::from(review.brief.title.clone())),
             )
             .into_any_element()
+    }
+
+    /// What the diff strip says on its left: how many files moved, and by how
+    /// much (§gh#238).
+    ///
+    /// Summed off `changed` — the same list the remainder is computed against
+    /// — so the strip is a restatement of the denominator and not a second
+    /// reading of the branch. A binary file counts as a file and contributes no
+    /// lines, which is what git says about it and what
+    /// [`ChangedFile::counts`] already spells one row at a time.
+    fn diff_totals(changed: &[ChangedFile]) -> (String, u32, u32) {
+        let added: u32 = changed.iter().map(|file| file.added).sum();
+        let removed: u32 = changed.iter().map(|file| file.removed).sum();
+        let label = match changed.len() {
+            1 => "1 file changed".to_string(),
+            n => format!("{n} files changed"),
+        };
+        (label, added, removed)
+    }
+
+    /// Whether the `Read the diff` chip has anywhere to hand the reader.
+    ///
+    /// It needs both halves, because [`crate::changes`] reads the **live**
+    /// checkout of the selected chat: a session to select, and a checkout still
+    /// on disk. A [`DiffSource::Recorded`] review is a snapshot of a worktree
+    /// `gc` has since reclaimed (gh#72) — its counts are true and there is
+    /// nothing left to open — and a review whose chat is gone has nothing to
+    /// select. Either way the counts are still drawn: the numbers are the fact,
+    /// and the chip is only the route to the rest of it.
+    fn diff_openable(review: &AttemptReview, chat_id: Option<&str>) -> bool {
+        chat_id.is_some() && matches!(review.diff, DiffSource::Checkout)
+    }
+
+    /// The strip that closes the body (§gh#238): what moved, and the way out.
+    ///
+    /// This is the whole of the screen's answer to "but where is the diff". It
+    /// draws none: the chip emits [`ReviewEvent::ReadTheDiff`] and the shell
+    /// takes the reader to [`crate::changes`], which is the module whose job
+    /// that is. Absent entirely when nothing changed — there is no diff to
+    /// point at, and `0 files changed` beside a dead chip would be a signpost
+    /// to an empty room.
+    fn render_diff_strip(
+        &self,
+        review: &AttemptReview,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if review.changed.is_empty() {
+            return None;
+        }
+        let (label, added, removed) = Self::diff_totals(&review.changed);
+        let chat = Self::diff_openable(review, self.chat_id.as_deref())
+            .then(|| self.chat_id.clone())
+            .flatten();
+        let counts = |text: String, color: gpui::Hsla| {
+            div()
+                .flex_none()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(color)
+                .child(SharedString::from(text))
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
+                .px(px(STRIP_PX))
+                .py(px(STRIP_PY))
+                .rounded(px(Theme::RADIUS_ROW))
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(label)),
+                )
+                .child(counts(format!("+{added}"), theme.settled))
+                // The one place on this screen the blocked hue is not an alarm:
+                // it belongs to the minus sign, as it does in every diff ever
+                // printed, and a grey `−33` would be the only one that is not.
+                .child(counts(format!("−{removed}"), theme.danger))
+                .child(div().flex_1())
+                .children(chat.map(|chat_id| {
+                    div()
+                        .id("review-read-the-diff")
+                        .flex_none()
+                        .h(px(CHIP_H))
+                        .px(px(CHIP_PAD))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .bg(theme.wash(0.08))
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.wash(0.14)))
+                        .child(SharedString::from("Read the diff"))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ReviewEvent::ReadTheDiff {
+                                chat_id: chat_id.clone(),
+                            })
+                        }))
+                }))
+                .into_any_element(),
+        )
     }
 
     /// What the submission did, in one line. Not an error even when nothing
@@ -1416,6 +1632,8 @@ impl ReviewPanel {
     }
 }
 
+impl gpui::EventEmitter<ReviewEvent> for ReviewPanel {}
+
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -1460,6 +1678,7 @@ impl Render for ReviewPanel {
         let claims = Self::render_claims(&review, &theme);
         let evidence = Self::render_evidence(&review, &theme);
         let remainder = Self::render_remainder(&review, &theme);
+        let strip = self.render_diff_strip(&review, &theme, cx);
         let host = self.render_host(&theme, cx);
         let bar = self.render_verdict_bar(&review, &theme, cx);
 
@@ -1482,6 +1701,10 @@ impl Render for ReviewPanel {
             .child(claims)
             .child(evidence)
             .child(remainder)
+            // Last, and after the remainder on purpose: "here is how much moved"
+            // is the question a reader has once they have been told what nobody
+            // accounted for, and never before.
+            .children(strip)
             .child(host);
 
         // The verdict bar is pinned under the scroll for the same reason the
@@ -1628,6 +1851,108 @@ mod tests {
         // And the card fades where the design says it does, at 72% of its own
         // height — the band is the remainder of it.
         assert!((PREVIEW_MAX_H * (1.0 - PREVIEW_FADE_AT) - 168.0 * 0.28).abs() < 0.01);
+    }
+
+    /// The strip restates the denominator, and the denominator is the same
+    /// `changed` list the remainder is subtracted from (§gh#238). A strip that
+    /// counted the branch for itself could disagree with the block above it
+    /// about how many files there are, on one screen.
+    #[test]
+    fn the_strip_counts_the_same_files_the_remainder_does() {
+        let mut review = reviewed();
+        let (label, added, removed) = ReviewPanel::diff_totals(&review.changed);
+        assert_eq!((label.as_str(), added, removed), ("1 file changed", 1, 0));
+        // A second file, a binary one, and the plural: binary contributes a
+        // file and no lines, because that is all git says about it.
+        review.changed.push(ChangedFile {
+            path: "docs/a.png".into(),
+            status: "A".into(),
+            added: 0,
+            removed: 0,
+            binary: true,
+            symbols: vec![],
+        });
+        review.changed.push(ChangedFile {
+            path: "src/lib.rs".into(),
+            status: "M".into(),
+            added: 116,
+            removed: 33,
+            binary: false,
+            symbols: vec![],
+        });
+        let (label, added, removed) = ReviewPanel::diff_totals(&review.changed);
+        assert_eq!(
+            (label.as_str(), added, removed),
+            ("3 files changed", 117, 33)
+        );
+    }
+
+    /// The chip is a route, so it needs somewhere to route to: a chat to
+    /// select, and a checkout still on disk for [`crate::changes`] to read. A
+    /// chip that opened an empty diff pane would be worse than no chip — the
+    /// counts beside it are true either way, which is why only the chip goes.
+    #[test]
+    fn the_chip_is_only_drawn_when_there_is_a_diff_to_open() {
+        let review = reviewed();
+        assert!(ReviewPanel::diff_openable(&review, Some("chat-1")));
+        // A review outlives its chat (gh#183), and the pane resolves its diff
+        // from the selected one.
+        assert!(!ReviewPanel::diff_openable(&review, None));
+        // The snapshot the board kept after `gc` reclaimed the worktree
+        // (gh#72): the numbers survive, the checkout does not.
+        let recorded = AttemptReview {
+            diff: DiffSource::Recorded,
+            ..reviewed()
+        };
+        assert!(!ReviewPanel::diff_openable(&recorded, Some("chat-1")));
+        let gone = AttemptReview {
+            diff: DiffSource::Unavailable {
+                reason: "no checkout".into(),
+            },
+            ..reviewed()
+        };
+        assert!(!ReviewPanel::diff_openable(&gone, Some("chat-1")));
+    }
+
+    /// The pill separates a review that wants a human from one already
+    /// answered (§gh#238) — which, since the verdict can be sent from this
+    /// screen (§gh#239), are otherwise the same screen exactly.
+    #[test]
+    fn the_pill_says_whose_turn_it_is() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let waiting = ReviewPanel::turn_pill("review", false, &theme);
+            assert_eq!(waiting.map(|(label, _)| label), Some("Waiting on you"));
+            // Answered wins over the state, because it is newer: the board's
+            // state moves when the sync loop next reads the pull request.
+            let answered = ReviewPanel::turn_pill("review", true, &theme);
+            assert_eq!(answered.map(|(label, _)| label), Some("Answered"));
+            assert_ne!(waiting, answered, "the two must not paint alike");
+            // A question is your turn too, and says which kind.
+            assert_eq!(
+                ReviewPanel::turn_pill("blocked", false, &theme).map(|(label, _)| label),
+                Some("Blocked on you")
+            );
+            // Nobody is waiting on you while it runs, and nobody is once it is
+            // over: no pill, rather than a badge on every review.
+            for state in ["working", "ready", "done", "failed", "nonsense"] {
+                assert!(
+                    ReviewPanel::turn_pill(state, false, &theme).is_none(),
+                    "{state}"
+                );
+            }
+            // …and none of them borrows the screen's one loud hue, `blocked`
+            // included: that hue belongs to the unclaimed set.
+            for (state, answered) in [("review", false), ("blocked", false), ("review", true)] {
+                let (_, color) = ReviewPanel::turn_pill(state, answered, &theme).unwrap();
+                assert_ne!(color, theme.danger, "{state}");
+            }
+            // The waiting pill is the board's own review hue — the colour the
+            // row it was opened from is painted in.
+            assert_eq!(
+                waiting.map(|(_, color)| color),
+                Some(state_color(BoardState::Review, &theme))
+            );
+        }
     }
 
     /// The tone the surface paints is the reading's, never the renderer's —
