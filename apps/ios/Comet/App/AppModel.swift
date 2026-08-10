@@ -77,6 +77,12 @@ final class AppModel {
             SpecRunner.run()
             return
         }
+        // The ported review reading against the fixture Rust generated
+        // (gh#256). Same shape, same reason, its own file.
+        if args.contains("-review-spec") {
+            ReviewSpecRunner.run()
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return
@@ -442,6 +448,43 @@ final class AppModel {
         }
         guard let board else { return .failed("Not connected to a board") }
         return await board.taskDetail(taskId: taskId)
+    }
+
+    /// What one attempt is worth, for the review screen (gh#256).
+    ///
+    /// A row with nothing to review is not an error the board reports — the
+    /// call refuses with "has no attempts to review" — so the screen's own
+    /// unavailable state is where that lands, and it says so in words rather
+    /// than drawing an empty review.
+    func attemptReview(taskId: String) async -> ReviewLoad {
+        if let demo {
+            // Feel like a read, so the screen's loading state is explorable.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard let review = DemoDataset.review(taskId: taskId) else {
+                return .failed("This row has no attempt to review.")
+            }
+            let host = demo.devices.first { $0.platform != "ios" }?.id ?? "demo-board"
+            return .read(LoadedAttemptReview(review: review, host: host))
+        }
+        guard let board else { return .failed("Not connected to a board") }
+        switch await board.attemptReview(taskId: taskId) {
+        case .read(let review, let host):
+            return .read(LoadedAttemptReview(review: review, host: host))
+        case .failed(let message): return .failed(message)
+        }
+    }
+
+    /// Deliver the verdict (§gh#239). Demo mode answers with a receipt rather
+    /// than pretending to post: the bar's after-state is the half of this
+    /// screen a screenshot cannot otherwise reach.
+    func submitVerdict(target: ReviewTarget, kind: VerdictKind,
+                       comment: String) async -> BoardStore.VerdictOutcome {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            return .sent(DemoDataset.receipt(target: target, kind: kind, comment: comment))
+        }
+        guard let board else { return .failed("Not connected to a board") }
+        return await board.submitVerdict(target: target, kind: kind, comment: comment)
     }
 
     /// What the board did with the work it was given, over a window (gh#143).
