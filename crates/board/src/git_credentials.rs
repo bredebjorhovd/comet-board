@@ -17,9 +17,23 @@
 //! What is left is git's askpass protocol: the URL carries the *username*
 //! (`x-access-token`, GitHub's fixed name for this), git runs `$GIT_ASKPASS`
 //! when it needs the password, and the helper writes the token to its own
-//! stdout — read by git, seen by nobody else. The helper is this same binary
-//! (`comet-board git-askpass`), which mints at push time, so the token is
-//! never older than the push.
+//! stdout — read by git, seen by nobody else. The helper mints at push time, so
+//! the token is never older than the push.
+//!
+//! **`GIT_ASKPASS` names one executable and git execs it directly** — no shell,
+//! no arguments. `#58` was built on the opposite belief (that git ran anything
+//! with a space in it through `sh -c '<cmd> "$@"'`, which is what
+//! `credential.helper` does) and so put `'<path>' git-askpass` in the variable.
+//! git took the whole string as a filename, found no such file, and every
+//! dispatched push that reached this code failed with `cannot exec`. gh#233 is
+//! the ticket; `tests/askpass_git.rs` is the proof, and it runs a real `git`
+//! against a real 401 rather than asserting the shape of a string.
+//!
+//! So the subcommand cannot ride in the variable, and it rides in a one-line
+//! shell script instead — [`install_askpass_shim`], beside the `gh` shim below
+//! and for the same kind of reason. A path is all `GIT_ASKPASS` can carry, so a
+//! path is all it is given: spaces in it are fine (git execs it, it does not
+//! parse it), and there is nothing left for a quoting rule to get wrong.
 //!
 //! The caller is a **dispatched agent** (gh#68): [`agent_env`] is stamped onto
 //! the harness child by the engine, so the agent's `git push` authenticates as
@@ -67,12 +81,13 @@ pub fn push_url(repo: &str) -> String {
 
 /// The environment a `git push` needs to authenticate as the board's credential.
 ///
-/// `exe` is this binary. Together with [`push_url`] this is the whole contract:
-/// no persisted remote, no secret in argv, and nothing left behind in the
-/// checkout when the token expires an hour later.
-pub fn push_env(exe: &Path, repo: &str) -> Vec<(String, String)> {
+/// `askpass` is the shim [`install_askpass_shim`] wrote — a path, because a
+/// path is the only thing `GIT_ASKPASS` can hold. Together with [`push_url`]
+/// this is the whole contract: no persisted remote, no secret in argv, and
+/// nothing left behind in the checkout when the token expires an hour later.
+pub fn push_env(askpass: &Path, repo: &str) -> Vec<(String, String)> {
     vec![
-        ("GIT_ASKPASS".into(), askpass_command(exe)),
+        ("GIT_ASKPASS".into(), askpass.display().to_string()),
         (ASKPASS_REPO_ENV.into(), repo.to_string()),
         // Fail rather than block. Without this, a helper that cannot mint
         // leaves git waiting on a terminal that a dispatched push does not have.
@@ -101,8 +116,8 @@ pub fn push_env(exe: &Path, repo: &str) -> Vec<(String, String)> {
 /// This pair is also why no other resolution may read them (gh#190): every
 /// process a dispatched agent starts inherits it, including `cargo test`.
 /// [`Paths::discover`] is the one reader, and a helper is what it is for.
-pub fn agent_env(exe: &Path, repo: &str, paths: &Paths) -> Vec<(String, String)> {
-    let mut env = push_env(exe, repo);
+pub fn agent_env(askpass: &Path, repo: &str, paths: &Paths) -> Vec<(String, String)> {
+    let mut env = push_env(askpass, repo);
     env.push((
         crate::config::CONFIG_DIR_ENV.into(),
         paths.config_dir.display().to_string(),
@@ -112,14 +127,6 @@ pub fn agent_env(exe: &Path, repo: &str, paths: &Paths) -> Vec<(String, String)>
         paths.state_dir.display().to_string(),
     ));
     env
-}
-
-/// `GIT_ASKPASS` names one command, and git runs anything with a space in it
-/// through `sh -c '<cmd> "$@"'`. That is how the subcommand gets there — and
-/// why the path has to be quoted: an executable under `/Applications/Some
-/// App.app/…` would otherwise arrive as two words.
-fn askpass_command(exe: &Path) -> String {
-    format!("{} git-askpass", sh_quote(&exe.display().to_string()))
 }
 
 /// Single-quote for `sh`, the way `'` itself has to be escaped there: end the
@@ -209,6 +216,83 @@ pub fn self_exe() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// The askpass shim
+// ---------------------------------------------------------------------------
+
+/// The file name of the askpass shim inside the board's shim directory.
+///
+/// Deliberately not `git-askpass`: that directory goes on a dispatched agent's
+/// PATH, and git treats any `git-<word>` on PATH as a subcommand of its own.
+pub const ASKPASS_SHIM: &str = "comet-askpass";
+
+/// The askpass shim's text: hand git's prompt to `comet-board git-askpass`.
+///
+/// One line of shell, and it exists for one reason — `GIT_ASKPASS` can name an
+/// executable and nothing else (see the module header), so the subcommand needs
+/// somewhere to live. `exec` rather than a call, so the helper *is* the process
+/// git is waiting on and its stdout is git's pipe, unmediated.
+pub fn askpass_shim_script(board_exe: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Generated by comet-board (gh#233). Rewritten on dispatch — edits are lost.\n\
+         #\n\
+         # git execs GIT_ASKPASS directly: one executable, no shell, no arguments.\n\
+         # The subcommand cannot ride in the variable, so it rides here.\n\
+         exec {} git-askpass \"$@\"\n",
+        sh_quote(&board_exe.display().to_string())
+    )
+}
+
+/// Write the askpass shim into `dir` and answer **the shim's own path** —
+/// what `GIT_ASKPASS` is set to.
+///
+/// The `gh` shim answers with its directory because that one goes on PATH; this
+/// one is never looked up by name, only exec'd by git.
+#[cfg(unix)]
+pub fn install_askpass_shim(dir: &Path, board_exe: &Path) -> Result<PathBuf> {
+    install_shim(dir, ASKPASS_SHIM, &askpass_shim_script(board_exe))
+}
+
+#[cfg(not(unix))]
+pub fn install_askpass_shim(_dir: &Path, _board_exe: &Path) -> Result<PathBuf> {
+    anyhow::bail!("the askpass shim is a shell script; only unix boxes dispatch agents")
+}
+
+/// Ask the shim the one question that needs no credential, no network and no
+/// board: what username does a GitHub App push with?
+///
+/// The answer is the fixed [`APP_USERNAME`], so what this actually tests is the
+/// part gh#233 was about — that the path in `GIT_ASKPASS` can be exec'd, that
+/// what it reaches is a `comet-board` that understands `git-askpass`, and that
+/// the answer arrives on stdout. Every layer of the credential path except the
+/// mint itself, for the price of one `fork`.
+///
+/// Called the way git calls it: the prompt as the single argument.
+pub fn verify_askpass(askpass: &Path) -> Result<()> {
+    let out = std::process::Command::new(askpass)
+        .arg("Username for 'https://github.com': ")
+        .output()
+        .with_context(|| format!("running the askpass helper at {}", askpass.display()))?;
+    let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "the askpass helper at {} exited {}: {}",
+            askpass.display(),
+            out.status,
+            err.trim().lines().next_back().unwrap_or("no output")
+        );
+    }
+    if answer != APP_USERNAME {
+        anyhow::bail!(
+            "the askpass helper at {} answered {answer:?} where git expects {APP_USERNAME:?}",
+            askpass.display()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // gh
 // ---------------------------------------------------------------------------
 
@@ -247,31 +331,37 @@ exec @GH@ "$@"
 
 /// Write the `gh` shim into `dir` and answer the directory to put on the front
 /// of the agent's PATH.
-///
-/// Written through a temporary file and renamed into place: the shim can be
-/// executing (some other run's `gh pr list`) while this rewrites it, and a
-/// rename swaps the name rather than the open file.
 #[cfg(unix)]
 pub fn install_gh_shim(dir: &Path, board_exe: &Path, gh: &Path) -> Result<PathBuf> {
+    install_shim(dir, "gh", &gh_shim_script(board_exe, gh))?;
+    Ok(dir.to_path_buf())
+}
+
+/// Write one executable shim into `dir`, atomically, and answer its path.
+///
+/// Written through a temporary file and renamed into place: the shim can be
+/// executing (some other run's `gh pr list`, some other run's push) while this
+/// rewrites it, and a rename swaps the name rather than the open file.
+#[cfg(unix)]
+fn install_shim(dir: &Path, name: &str, script: &str) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let script = gh_shim_script(board_exe, gh);
-    let path = dir.join("gh");
+    let path = dir.join(name);
     // Unchanged is the common case (one shim per device, rewritten per
-    // dispatch): skip the write so a running `gh` is not even briefly racing a
+    // dispatch): skip the write so a running shim is not even briefly racing a
     // rename.
     if std::fs::read_to_string(&path).is_ok_and(|existing| existing == script) {
-        return Ok(dir.to_path_buf());
+        return Ok(path);
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     // Per-process temp name: two engines (or two runs starting together) must
     // not rename each other's half-written file into place.
-    let tmp = dir.join(format!("gh.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &script).with_context(|| format!("writing {}", tmp.display()))?;
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, script).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("making {} executable", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
-    Ok(dir.to_path_buf())
+    Ok(path)
 }
 
 #[cfg(not(unix))]
@@ -372,6 +462,14 @@ mod tests {
     use super::*;
     use crate::sources::github_app::test_app;
 
+    /// A scratch directory of this test's own, emptied first.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("comet-cred-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// gh#184: the directory an agent gets on PATH is the one the resolved
     /// binary sits in — so it always holds a `comet-board`, and it is the same
     /// copy the askpass helper runs as.
@@ -410,13 +508,13 @@ mod tests {
         // The point of the whole module: everything here is safe to appear in
         // `ps`, in a log line, or in `/proc/<pid>/environ`. The token only ever
         // exists on the helper's stdout.
-        let env = push_env(Path::new("/usr/local/bin/comet-board"), "o/r");
+        let env = push_env(Path::new("/state/bin/comet-askpass"), "o/r");
         let joined = env
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(joined.contains("GIT_ASKPASS='/usr/local/bin/comet-board' git-askpass"));
+        assert!(joined.contains("GIT_ASKPASS=/state/bin/comet-askpass"));
         assert!(joined.contains("COMET_BOARD_ASKPASS_REPO=o/r"));
         assert!(joined.contains("GIT_TERMINAL_PROMPT=0"));
         assert!(
@@ -429,17 +527,98 @@ mod tests {
         );
     }
 
+    /// gh#233. `GIT_ASKPASS` holds a path and nothing else — no subcommand, no
+    /// quoting, nothing for a shell to split, because no shell is involved.
+    /// The rule is mechanical enough to assert: whatever is in there has to
+    /// name a file on disk.
     #[test]
-    fn an_executable_path_with_a_space_in_it_still_reaches_the_subcommand() {
-        // git runs a GIT_ASKPASS containing a space through `sh -c`, so an
-        // unquoted `/Applications/My App/comet-board` would arrive as two words
-        // and the helper would never run — leaving git to fail the push with a
-        // credential error that says nothing about why.
-        assert_eq!(
-            askpass_command(Path::new("/Applications/My App/comet-board")),
-            "'/Applications/My App/comet-board' git-askpass"
+    #[cfg(unix)]
+    fn the_askpass_variable_is_a_bare_path_to_something_that_exists() {
+        let dir = scratch("askpass-env");
+        let shim = install_askpass_shim(&dir, Path::new("/Applications/My App/comet-board"))
+            .expect("shim installed");
+        let env: std::collections::BTreeMap<_, _> = push_env(&shim, "o/r").into_iter().collect();
+        let value = env.get("GIT_ASKPASS").expect("GIT_ASKPASS").clone();
+        assert_eq!(value, shim.display().to_string());
+        assert!(
+            Path::new(&value).is_file(),
+            "GIT_ASKPASS does not name a file git can exec: {value}"
+        );
+        // The subcommand rides in the script, with the path quoted for the
+        // shell that *does* read it.
+        let script = std::fs::read_to_string(&shim).unwrap();
+        assert!(
+            script.contains("exec '/Applications/My App/comet-board' git-askpass \"$@\""),
+            "{script}"
         );
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shim is a script `sh` will run, end to end: git's prompt in, the
+    /// helper's answer out.
+    #[test]
+    #[cfg(unix)]
+    fn the_askpass_shim_hands_gits_prompt_to_the_helper_and_answers_on_stdout() {
+        let dir = scratch("askpass-run");
+        // A "comet-board" that answers the way the real one does, and reports
+        // the argv it was given.
+        let board = dir.join("comet board");
+        std::fs::write(
+            &board,
+            "#!/bin/sh\necho \"$1\" >&2\necho \"$2\" >&2\necho x-access-token\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
+        verify_askpass(&shim).expect("the credential path answers");
+        let out = std::process::Command::new(&shim)
+            .arg("Password for 'https://x-access-token@github.com': ")
+            .output()
+            .unwrap();
+        let seen = String::from_utf8_lossy(&out.stderr);
+        assert!(seen.contains("git-askpass"), "{seen}");
+        assert!(seen.contains("Password for"), "{seen}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of gh#233: a credential path that cannot answer says so,
+    /// rather than being something the caller has to infer from a failed push.
+    #[test]
+    #[cfg(unix)]
+    fn a_credential_path_that_cannot_answer_is_an_error_with_the_reason_in_it() {
+        let dir = scratch("askpass-broken");
+        // Nothing there at all — the gh#233 shape, where git said only
+        // "cannot exec".
+        let err = verify_askpass(&dir.join("missing"))
+            .expect_err("a missing helper verified")
+            .to_string();
+        assert!(err.contains("running the askpass helper"), "{err}");
+
+        // There, but pointed at a binary that is not comet-board.
+        let board = dir.join("comet-board");
+        std::fs::write(&board, "#!/bin/sh\necho 'unknown subcommand' >&2\nexit 2\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
+        let err = verify_askpass(&shim)
+            .expect_err("a helper that exits 2 verified")
+            .to_string();
+        assert!(err.contains("unknown subcommand"), "{err}");
+
+        // There, running, and answering something git would send as a
+        // username.
+        std::fs::write(&board, "#!/bin/sh\necho hello\n").unwrap();
+        let err = verify_askpass(&shim)
+            .expect_err("a helper answering rubbish verified")
+            .to_string();
+        assert!(err.contains("\"hello\""), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

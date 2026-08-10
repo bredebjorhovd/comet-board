@@ -239,6 +239,19 @@ it finds an attempt in that state. If `git push` fails, say so in the chat
 rather than stopping quietly — a push nobody can make is a board problem, not
 yours (`comet-board doctor` reports the credential).
 
+**A push that cannot authenticate is a stop, not a puzzle to route around.**
+The board hands your run a credential: `GIT_ASKPASS` points at a helper that
+mints a short-lived installation token onto git's own pipe, and `gh` on your
+PATH is a wrapper that does the same per invocation. That arrangement is the
+whole of gh#68 — the token is never in argv, never in `.git/config`, never in
+your environment, on a box several people share. If the helper will not run,
+**say so and stop**; do not write a credential wrapper of your own, do not
+export a token you found, do not put one in a remote URL. A push that succeeds
+by another route is worse than one that fails, because the failure is visible
+and the workaround is not: the board now notices when its credential was never
+the one that pushed (gh#233), and it will say so on the issue. Report the error
+and let the box be fixed.
+
 The two artifacts are not weighed the same. A pull request is your own
 statement that you are finished, so it settles the attempt promptly. Commits
 are not — you were told to make them mid-flight — so they settle it only once

@@ -25,3 +25,8 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Tests only, and only for gh#233's question: the credential environment the
+# board builds has to reach the opencode child unchanged, so the test builds it
+# with the real thing rather than a hand-written copy that could drift. Nothing
+# in the library depends on the board.
+comet-board.workspace = true
