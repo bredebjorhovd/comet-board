@@ -260,24 +260,37 @@ impl Runtime for CometRuntime {
         let local_device = self.workspace.device_id();
         Ok(chats
             .into_iter()
-            // A checkout path belongs to its host device. The board must not
-            // run local git against a path copied from another Mac.
-            .filter(|chat| chat.device_id == local_device)
             .filter_map(|chat| {
-                let worktree = chat.cwd?.trim().to_string();
                 let branch = chat.branch?.trim().to_string();
-                if worktree.is_empty() || branch.is_empty() || branch == "HEAD" {
+                if branch.is_empty() || branch == "HEAD" {
                     return None;
                 }
+                // A checkout path belongs to its host device. Keep the remote
+                // chat as provenance, but never run local git against its path.
+                let worktree = (chat.device_id == local_device)
+                    .then(|| chat.cwd.as_deref().map(str::trim).map(str::to_string))
+                    .flatten()
+                    .filter(|path| !path.is_empty());
+                let repo = chat
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.push_repo.clone())
+                    .or_else(|| {
+                        worktree
+                            .as_deref()
+                            .and_then(comet_board::git_credentials::repo_for_checkout)
+                    });
                 let workspace = chat
                     .space_id
                     .as_deref()
                     .and_then(|id| spaces.iter().find(|space| space.id == id))
                     .map(|space| space.display_name().to_string())
                     .or_else(|| {
-                        std::path::Path::new(&worktree)
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
+                        chat.cwd.as_deref().and_then(|path| {
+                            std::path::Path::new(path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                        })
                     })
                     .unwrap_or_else(|| "Comet".into());
                 let runtime = chat
@@ -291,7 +304,9 @@ impl Runtime for CometRuntime {
                     workspace,
                     runtime,
                     worktree,
+                    repo,
                     branch,
+                    last_message_preview: chat.last_message_preview,
                     account,
                     created_at: chat.created_at,
                 })

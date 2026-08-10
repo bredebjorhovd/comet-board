@@ -969,6 +969,7 @@ impl Db {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts
               WHERE outcome IS NOT NULL
+                AND board_managed = 1
                 AND pane_id IS NOT NULL
                 AND chat_archived_at IS NULL
               ORDER BY id"
@@ -988,6 +989,7 @@ impl Db {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts
               WHERE outcome IS NOT NULL
+                AND board_managed = 1
                 AND worktree IS NOT NULL
                 AND collected_at IS NULL
               ORDER BY id"
@@ -1386,7 +1388,8 @@ impl Db {
     /// Live attempts across all tasks, for reconciliation and concurrency caps.
     pub fn live_attempts(&self) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE outcome IS NULL ORDER BY id"
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts
+              WHERE outcome IS NULL AND board_managed = 1 ORDER BY id"
         ))?;
         let rows = stmt.query_map([], read_attempt)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1406,7 +1409,9 @@ impl Db {
     pub fn settled_attempts(&self) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts
-              WHERE outcome IN ('done', 'orphaned') AND pane_id IS NOT NULL
+              WHERE outcome IN ('done', 'orphaned')
+                AND board_managed = 1
+                AND pane_id IS NOT NULL
               ORDER BY id"
         ))?;
         let rows = stmt.query_map([], read_attempt)?;
@@ -1430,7 +1435,8 @@ impl Db {
     /// counts. `blocked` is included because it still holds a pane.
     pub fn live_count_in_workspace(&self, workspace: &str) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM attempts WHERE outcome IS NULL AND workspace = ?1",
+            "SELECT COUNT(*) FROM attempts
+              WHERE outcome IS NULL AND board_managed = 1 AND workspace = ?1",
             params![workspace],
             |r| r.get(0),
         )?;

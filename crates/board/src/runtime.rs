@@ -321,8 +321,16 @@ pub struct ReviewCandidate {
     pub chat_id: String,
     pub workspace: String,
     pub runtime: String,
-    pub worktree: String,
+    /// Local checkout when this device owns the chat. A path synced from a
+    /// different device is not a local filesystem capability and stays None.
+    pub worktree: Option<String>,
+    /// GitHub repository derived by the owning device when it can inspect the
+    /// checkout. None is still usable when this branch names exactly one PR.
+    pub repo: Option<String>,
     pub branch: String,
+    /// Synced tail of the conversation. An exact PR URL is explicit adoption
+    /// evidence even when the chat and checkout live on another device.
+    pub last_message_preview: Option<String>,
     pub account: Option<String>,
     pub created_at: DateTime<Utc>,
 }

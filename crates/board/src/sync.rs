@@ -657,8 +657,9 @@ impl SyncEngine {
     ///
     /// GitHub supplies the immutable comparison base; Comet supplies the chat,
     /// checkout and branch. Repository + branch is the ownership proof already
-    /// used for dispatched attempts. When several chats share one checkout,
-    /// the newest is the one that adopted the branch most recently.
+    /// used for dispatched attempts. If several chats share a checkout, an
+    /// exact PR URL or the `gh pr create` command is required; recency alone is
+    /// not authorship and must never route feedback into the wrong conversation.
     fn adopt_session_pull_requests(
         &self,
         pulls: &[PullRequest],
@@ -673,8 +674,7 @@ impl SyncEngine {
                 continue;
             };
             if let Some(attempt) = task.attempts.iter().rev().find(|attempt| {
-                !attempt.board_managed
-                    && attempt.branch.as_deref() == Some(pr.head_ref.as_str())
+                !attempt.board_managed && attempt.branch.as_deref() == Some(pr.head_ref.as_str())
             }) {
                 // Direct agents often open a PR and continue working. Keep the
                 // review snapshot current instead of freezing it at the first
@@ -687,15 +687,69 @@ impl SyncEngine {
             if !task.attempts.is_empty() {
                 continue;
             }
-            let Some(candidate) = candidates
+            let branch_is_unique = pulls
+                .iter()
+                .filter(|other| other.open && other.head_ref == pr.head_ref)
+                .count()
+                == 1;
+            let matching: Vec<_> = candidates
                 .iter()
                 .filter(|candidate| candidate.branch == pr.head_ref)
                 .filter(|candidate| {
-                    crate::git_credentials::repo_for_checkout(&candidate.worktree)
+                    candidate
+                        .repo
+                        .as_deref()
                         .is_some_and(|repo| repo.eq_ignore_ascii_case(&pr.repo))
+                        || (candidate.repo.is_none() && branch_is_unique)
                 })
-                .max_by_key(|candidate| candidate.created_at)
-            else {
+                .collect();
+            let mut explicit: Vec<_> = matching
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    candidate
+                        .last_message_preview
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&pr.url))
+                        || runtime
+                            .run_message(&candidate.chat_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|text| text.contains(&pr.url))
+                })
+                .collect();
+            explicit.sort_by_key(|candidate| candidate.created_at);
+            let creators: Vec<_> = matching
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    runtime
+                        .run_commands(&candidate.chat_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|commands| {
+                            commands.iter().any(|ran| {
+                                ran.command
+                                    .split_whitespace()
+                                    .collect::<Vec<_>>()
+                                    .windows(3)
+                                    .any(|words| words == ["gh", "pr", "create"])
+                            })
+                        })
+                })
+                .collect();
+            let candidate = explicit
+                .last()
+                .copied()
+                .or_else(|| (creators.len() == 1).then_some(creators[0]))
+                .or_else(|| (matching.len() == 1).then_some(matching[0]));
+            let Some(candidate) = candidate else {
+                if !matching.is_empty() {
+                    self.log.warn(format!(
+                        "{}: {} matches several Comet chats, but none proves it created or adopted the PR — review not linked",
+                        task.identifier, pr.url
+                    ));
+                }
                 continue;
             };
 
@@ -704,7 +758,7 @@ impl SyncEngine {
                 pane_id: Some(candidate.chat_id.clone()),
                 workspace: candidate.workspace.clone(),
                 runtime: candidate.runtime.clone(),
-                worktree: Some(candidate.worktree.clone()),
+                worktree: candidate.worktree.clone(),
                 repo_path: None,
                 branch: Some(candidate.branch.clone()),
                 dispatched_by: None,
@@ -6560,7 +6614,7 @@ max_duration = "{max_duration}"
 
     #[derive(Clone)]
     struct DirectReviewChat {
-        candidate: crate::runtime::ReviewCandidate,
+        candidates: Vec<crate::runtime::ReviewCandidate>,
     }
 
     impl Runtime for DirectReviewChat {
@@ -6580,10 +6634,13 @@ max_duration = "{max_duration}"
             Ok(true)
         }
         fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
-            Ok(Some(self.candidate.worktree.clone()))
+            Ok(self
+                .candidates
+                .first()
+                .and_then(|candidate| candidate.worktree.clone()))
         }
         fn review_candidates(&self) -> anyhow::Result<Vec<crate::runtime::ReviewCandidate>> {
-            Ok(vec![self.candidate.clone()])
+            Ok(self.candidates.clone())
         }
         fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
             Ok(Some(RunEnd::Completed))
@@ -6630,15 +6687,30 @@ max_duration = "{max_duration}"
         e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
             .unwrap();
         let runtime = DirectReviewChat {
-            candidate: crate::runtime::ReviewCandidate {
-                chat_id: "comet-chat".into(),
-                workspace: "comet-board".into(),
-                runtime: "claude-code".into(),
-                worktree: work.to_string_lossy().into_owned(),
-                branch: "direct-pr".into(),
-                account: None,
-                created_at: chrono::Utc::now(),
-            },
+            candidates: vec![
+                crate::runtime::ReviewCandidate {
+                    chat_id: "comet-chat".into(),
+                    workspace: "comet-board".into(),
+                    runtime: "claude-code".into(),
+                    worktree: Some(work.to_string_lossy().into_owned()),
+                    repo: Some("o/r".into()),
+                    branch: "direct-pr".into(),
+                    last_message_preview: Some(pr.url.clone()),
+                    account: None,
+                    created_at: chrono::Utc::now(),
+                },
+                crate::runtime::ReviewCandidate {
+                    chat_id: "newer-unrelated-chat".into(),
+                    workspace: "comet-board".into(),
+                    runtime: "codex".into(),
+                    worktree: Some(work.to_string_lossy().into_owned()),
+                    repo: Some("o/r".into()),
+                    branch: "direct-pr".into(),
+                    last_message_preview: None,
+                    account: None,
+                    created_at: chrono::Utc::now() + chrono::Duration::seconds(1),
+                },
+            ],
         };
 
         e.adopt_session_pull_requests(std::slice::from_ref(&pr), &runtime)
@@ -6650,6 +6722,18 @@ max_duration = "{max_duration}"
         assert_eq!(attempt.pane_id.as_deref(), Some("comet-chat"));
         assert_eq!(attempt.outcome, Some(Outcome::Done));
         assert!(!attempt.board_managed, "the person's checkout stays theirs");
+        assert_eq!(e.db.live_count_in_workspace("comet-board").unwrap(), 0);
+        assert!(e.db.settled_attempts().unwrap().is_empty());
+        assert!(e.db.collectable_attempts().unwrap().is_empty());
+        assert!(e.db.archivable_chat_attempts().unwrap().is_empty());
+        assert!(
+            !e.rewatch_settled_attempts(
+                &statuses(&[("comet-chat", AgentStatus::Working)]),
+                Some(&runtime)
+            )
+            .unwrap(),
+            "a normal chat continuing work is not reopened as a Board run"
+        );
         let branches = e.attempt_branches();
         assert!(
             e.should_import_pull_request_row(&branches, &pr),
@@ -6683,7 +6767,11 @@ max_duration = "{max_duration}"
             "the review follows work committed after the PR first appeared"
         );
         assert_eq!(
-            e.db.get_task(&pr.task_id()).unwrap().unwrap().attempts.len(),
+            e.db.get_task(&pr.task_id())
+                .unwrap()
+                .unwrap()
+                .attempts
+                .len(),
             1,
             "refreshing the review does not invent another run"
         );
@@ -6699,6 +6787,57 @@ max_duration = "{max_duration}"
         assert_eq!(preserved.collectable_at, None);
         assert_eq!(preserved.cache_sweepable_at, None);
         assert_eq!(preserved.chat_archivable_at, None);
+    }
+
+    #[test]
+    fn a_remote_comet_chat_can_make_its_unique_pr_reviewable() {
+        let e = engine(None);
+        let pr = PullRequest {
+            repo: "o/r".into(),
+            number: 266,
+            title: "Made on the other Mac".into(),
+            body: None,
+            url: "https://github.com/o/r/pull/266".into(),
+            head_ref: "comet/remote-pr".into(),
+            base_sha: Some("base".into()),
+            open: true,
+            merged: false,
+            draft: false,
+            updated_at: crate::db::now(),
+        };
+        e.db.upsert_task(&pr.to_upsert()).unwrap();
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
+            .unwrap();
+        let runtime = DirectReviewChat {
+            candidates: vec![crate::runtime::ReviewCandidate {
+                chat_id: "remote-chat".into(),
+                workspace: "remote-space".into(),
+                runtime: "codex".into(),
+                // A synced path from another device is deliberately not used
+                // as a local checkout. The attempt still carries the chat.
+                worktree: None,
+                repo: None,
+                branch: "comet/remote-pr".into(),
+                last_message_preview: Some(pr.url.clone()),
+                account: None,
+                created_at: chrono::Utc::now(),
+            }],
+        };
+
+        e.adopt_session_pull_requests(std::slice::from_ref(&pr), &runtime)
+            .unwrap();
+
+        let task = e.db.get_task(&pr.task_id()).unwrap().unwrap();
+        assert_eq!(task.attempts.len(), 1);
+        assert_eq!(task.attempts[0].pane_id.as_deref(), Some("remote-chat"));
+        assert_eq!(task.attempts[0].worktree, None);
+        assert!(
+            matches!(
+                e.review(&pr.task_id(), None).unwrap().diff,
+                crate::claims::DiffSource::Unavailable { .. }
+            ),
+            "a remote diff is unknown, never clean"
+        );
     }
 
     #[test]
