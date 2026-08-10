@@ -598,6 +598,10 @@ enum TaskBody: Equatable {
 /// holding a copy here would be a second, staler board.
 struct OpenedRow: Identifiable, Hashable {
     var id: String
+    /// Skip the reading and land on the review (gh#256). Only the screenshot
+    /// rig sets it — a tap always opens the row, and the review is a push from
+    /// there.
+    var openReview = false
 }
 
 /// One thing a surface offers to do with a row. Ported from `RowAction`.
@@ -667,6 +671,27 @@ func boardDetailActions(_ row: TaskRow) -> [BoardRowAction] {
     if nonEmpty(row.prUrl) != nil, !out.contains(.openPR) { out.append(.openPR) }
     if !row.url.isEmpty { out.append(.openIssue) }
     return out
+}
+
+/// Is there an attempt on this row worth reviewing (gh#256)?
+///
+/// Not a `BoardRowAction`: the actions are the shared rule `row_actions` owns,
+/// and the review is a *screen* rather than something a row does — the desktop
+/// reaches it through `shell::Route::Review`, not through a chip. This is the
+/// phone's port of `comet_proto::view::board::reviewable`, exactly: an attempt
+/// exists once `attempts > 0`, independently of the row's current state. That
+/// includes a cancelled attempt returned to `ready`, and the historical
+/// attempt while a retry is `working`; both still have a diff, claims and a
+/// journal worth reading.
+func boardReviewable(_ row: TaskRow) -> Bool {
+    row.attempts > 0
+}
+
+/// The detail sheet's navigation door. Kept as a named derivation so the
+/// cross-language review runner checks the actual presentation decision, not
+/// only the lower-level row rule it is built from.
+func boardShowsReviewDoor(_ row: TaskRow) -> Bool {
+    boardReviewable(row)
 }
 
 /// The URL an action opens, or nil for the ones that are not links.

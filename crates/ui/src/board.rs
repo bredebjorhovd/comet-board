@@ -2735,7 +2735,11 @@ impl BoardPanel {
             // there, and two hairlines a pixel apart is a border.
             .when(!first, |el| el.border_t_1().border_color(theme.border))
             .cursor_pointer()
-            .list_row(&theme, Bed::Shell, selected, &fade_key)
+            // [`Bed::Card`], not `Shell`: this list is inside the main panel —
+            // the reference's `--card` — so a selected row here is its
+            // `--selcard`. In dark the two land on the same tone; in light the
+            // panel is white and the row has to step DOWN into it (gh#258).
+            .list_row(&theme, Bed::Card, selected, &fade_key)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.model.toggle_collapsed(state);
                 cx.notify();
@@ -2825,7 +2829,7 @@ impl BoardPanel {
             .pl(px(Theme::SPACE_LG + 12.0))
             .pr(px(Theme::SPACE_LG))
             .cursor_pointer()
-            .list_row(&theme, Bed::Shell, selected, &fade_key)
+            .list_row(&theme, Bed::Card, selected, &fade_key)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.model.toggle_group(state, toggle_route.as_deref());
                 cx.notify();
@@ -2913,7 +2917,7 @@ impl BoardPanel {
             .justify_center()
             .px(px(Theme::SPACE_LG))
             .cursor_pointer()
-            .list_row(&theme, Bed::Shell, selected, &fade_key)
+            .list_row(&theme, Bed::Card, selected, &fade_key)
             // A row is a door (gh#132): clicking one selects it AND opens the
             // peek, because a truncated title that answers a click with nothing
             // is what made the extra text feel like a tooltip. `enter` still

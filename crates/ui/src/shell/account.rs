@@ -96,7 +96,10 @@ pub fn avatar(theme: &Theme, initial: impl Into<SharedString>) -> Div {
         .justify_center()
         .text_size(px(Theme::TEXT_DENSE))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme.card)
+        // Knocked out in the PAGE tone, which is the far end of the ramp from
+        // `text` in both variants — an inner-panel grey would leave the letter
+        // muddy on light's near-black circle (gh#258).
+        .text_color(theme.bg)
         .child(initial)
 }
 

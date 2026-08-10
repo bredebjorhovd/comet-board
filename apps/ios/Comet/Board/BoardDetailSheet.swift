@@ -34,6 +34,17 @@ struct BoardDetailSheet: View {
     /// Opening the chat leaves the board screen entirely, so the board screen
     /// is what pushes it — for the same reason.
     let onOpenChat: (String) -> Void
+    /// Screenshot rig: land on the review rather than on the reading (gh#256).
+    var openReview = false
+
+    /// Where inside this sheet the reader is. One case, and it is a path rather
+    /// than a `NavigationLink` destination so `-sheet review` can put the rig
+    /// there without a tap.
+    enum Inner: Hashable {
+        case review
+    }
+
+    @State private var path: [Inner] = []
 
     /// The issue text. Nil is still reading; the rest is [`TaskBody`]'s three
     /// answers.
@@ -48,7 +59,7 @@ struct BoardDetailSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             Group {
                 if let row {
                     content(row)
@@ -69,10 +80,20 @@ struct BoardDetailSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .navigationDestination(for: Inner.self) { inner in
+                switch inner {
+                case .review: ReviewScreen(taskId: taskId, workspace: row?.workspace)
+                }
+            }
         }
         .presentationDetents([.large])
         .task(id: taskId) {
             issue = await model.boardTaskDetail(taskId: taskId)
+        }
+        .onAppear {
+            if openReview, path.isEmpty, let row, boardShowsReviewDoor(row) {
+                path = [.review]
+            }
         }
     }
 
@@ -80,6 +101,7 @@ struct BoardDetailSheet: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 head(row)
+                reviewCard(row)
                 bodyCard
                 actionCard(row)
             }
@@ -169,6 +191,53 @@ struct BoardDetailSheet: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// The door to the review (gh#256), above the issue body and above the
+    /// actions.
+    ///
+    /// It sits first because of what it is: the issue text below is what you
+    /// asked for, and this is the only thing on the sheet that says what came
+    /// back. `boardShowsReviewDoor` follows the shared attempts-only rule, so a
+    /// cancelled attempt on a ready row and history behind a live retry remain
+    /// reachable.
+    ///
+    /// It pushes rather than presenting: the review is a whole screen with its
+    /// own bar, and a second sheet over this one would put two modals between a
+    /// thumb and a verdict.
+    @ViewBuilder
+    private func reviewCard(_ row: TaskRow) -> some View {
+        if boardShowsReviewDoor(row) {
+            VStack(alignment: .leading, spacing: 8) {
+                SheetLabel("The attempt")
+                SheetCard {
+                    NavigationLink(value: Inner.review) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "checkmark.seal")
+                                .font(.system(size: 15))
+                                .foregroundStyle(Theme.textMuted)
+                                .frame(width: 22)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Review what it did")
+                                    .font(Theme.sans(Theme.textTitle))
+                                    .foregroundStyle(Theme.text)
+                                Text("Claims, effects, and what nobody claimed")
+                                    .font(Theme.sans(Theme.textDense))
+                                    .foregroundStyle(Theme.textSubtle)
+                            }
+                            Spacer(minLength: 8)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Theme.textFaint)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SheetRowButtonStyle())
+                }
+            }
         }
     }
 

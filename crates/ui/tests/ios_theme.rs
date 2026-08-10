@@ -11,8 +11,9 @@
 //! Rust, while holding light to the supplied iOS reference. Eight checks,
 //! mirroring `text_tones.rs` and `scale.rs` for the other viewport:
 //!
-//! 1. **Parity, in both variants.** Dark paint and the shared radii/type scale
-//!    stay equal to [`Theme::dark`]. Light paint stays equal to the exact
+//! 1. **Parity, in both variants.** Shared dark paint and the radii/type scale
+//!    stay equal to [`Theme::dark`]; phone-specific dark values remain pinned
+//!    to the supplied iOS design. Light paint stays equal to the exact
 //!    neutral, status and Claude variables in `Comet iOS.dc.html`, which
 //!    deliberately differ from [`Theme::light`]
 //!    (`ios_theme_declares_the_shared_system_and_ios_reference`).
@@ -44,10 +45,10 @@
 //!
 //! It lives in `comet-ui` rather than `comet-proto` because it needs both ends:
 //! the status ramp from `comet_proto::view::status`, and `Theme::RADIUS_*` /
-//! `Theme::TEXT_*` / `Theme::dark()` from here.
+//! `Theme::TEXT_*` / shared parts of `Theme::dark()` from here.
 
 use comet_proto::view::status;
-use comet_ui::theme::{Theme, cool, grey, ink, neutral, oklch, wash, white_alpha};
+use comet_ui::theme::{Theme, grey, ink, neutral, oklch, wash, white_alpha};
 use gpui::{Hsla, Rgba};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -242,9 +243,6 @@ fn paint(src: &str, expr: &str) -> Hsla {
     if let Some(a) = args("neutral") {
         return neutral(a[0]);
     }
-    if let Some(a) = args("cool") {
-        return cool(a[0], a[1]);
-    }
     if let Some(a) = args("ink") {
         return ink(a[0]);
     }
@@ -350,9 +348,11 @@ fn ios_theme_declares_the_shared_system_and_ios_reference() {
     );
     check("textFigure", number(&src, "textFigure"), Theme::TEXT_FIGURE);
 
-    // Paint is compared as COLOUR, not spelling. Dark stays on the desktop
-    // system. Light is the supplied iOS reference's own table — not the cool
-    // desktop-light palette that the review explicitly rejected.
+    // Paint is compared as COLOUR, not spelling. Shared dark tokens stay on
+    // the desktop system; the four values gh#258 deliberately retuned only for
+    // the desktop stay pinned to the phone's established dark reference.
+    // Light is the supplied iOS reference's own table — not a derivation of
+    // the desktop-light palette.
     let dark = Theme::dark();
     for (name, want_dark, want_light) in [
         // --text / --muted / --subtle / --faint
@@ -361,16 +361,16 @@ fn ios_theme_declares_the_shared_system_and_ios_reference() {
         ("textSubtle", dark.text_subtle, hex(0x6b6b6b)),
         ("textFaint", dark.text_faint, hex(0x8a8a8a)),
         // --card / --raised / --sel / --selcard / --chip
-        ("bg", dark.bg, hex(0xffffff)),
+        ("bg", grey(6), hex(0xffffff)),
         ("surface", dark.surface, hex(0xffffff)),
-        ("surfaceRaised", dark.surface_raised, hex(0xf4f4f7)),
+        ("surfaceRaised", neutral(0.235), hex(0xf4f4f7)),
         ("sheetPanel", grey(0x14), hex(0xf4f4f7)),
         ("card", white_alpha(0.045), hex(0xffffff)),
-        ("elementHover", dark.element_hover, black_alpha(0.05)),
+        ("elementHover", wash(0.07), black_alpha(0.05)),
         ("elementActive", wash(0.10), hex(0xeeeef2)),
         // --line / --line2
         ("border", dark.border, hex(0xe4e4e8)),
-        ("borderStrong", dark.border_strong, hex(0xd6d6dc)),
+        ("borderStrong", white_alpha(0.14), hex(0xd6d6dc)),
         ("separator", white_alpha(0.06), hex(0xe4e4e8)),
         // --review / --blocked / --working / --settled
         ("accent", dark.accent, oklch(0.52, 0.16, status::REVIEW)),
@@ -417,10 +417,10 @@ fn ios_theme_declares_the_shared_system_and_ios_reference() {
 
     assert!(
         wrong.is_empty(),
-        "{} value(s) where the phone has drifted off the shared dark/scales or \
-         the supplied iOS light reference. Dark and layout numbers live in \
-         crates/ui/src/theme.rs and comet_proto::view::status; the light paint \
-         values live in Comet iOS.dc.html and are restated explicitly above:\n{}",
+        "{} value(s) where the phone has drifted off its shared dark/scales or \
+         supplied iOS references. Shared dark and layout numbers live in \
+         crates/ui/src/theme.rs and comet_proto::view::status; the phone-only \
+         dark values and light paint values are restated explicitly above:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
@@ -459,7 +459,6 @@ fn every_paint_token_answers_for_both_variants() {
             "whiteAlpha(",
             "oklch(",
             "neutral(",
-            "cool(",
             "grey(",
             "ink(",
             "wash(",
@@ -976,7 +975,6 @@ enum Theme {
         assert_eq!(paint(src, "grey(0x14)"), grey(0x14));
         assert_eq!(paint(src, "hex(0x171717)"), hex(0x171717));
         assert_eq!(paint(src, "neutral(0.938)"), neutral(0.938));
-        assert_eq!(paint(src, "cool(0.986, 0.003)"), cool(0.986, 0.003));
         assert_eq!(paint(src, "Color.white.opacity(0.08)"), white_alpha(0.08));
         assert_eq!(
             paint(src, "oklch(0.702, 0.183, 293.541).opacity(0.12)"),
