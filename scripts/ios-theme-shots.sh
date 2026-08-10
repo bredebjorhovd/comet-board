@@ -15,25 +15,50 @@
 # and look like a bug in the theme. See `Comet/Theme/Appearance.swift`.
 #
 # The four land in docs/screenshots/ by default, where the desktop's live —
-# they are the evidence for the PR, so they are meant to be committed.
+# they are the evidence for the PR, so they are meant to be committed. Captures
+# stage under /tmp and are copied there only after all four prove they are the
+# required 1179x2556 pixels (393x852pt at 3x).
 #
 # Usage: scripts/ios-theme-shots.sh [outdir] [simulator name]
-# Env:   COMET_SPEC_SIM (default "iPhone 17 Pro"; pass a 15 Pro for 393x852pt)
+# Env:   COMET_SPEC_SIM (default "iPhone 15 Pro" — 393x852pt)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/docs/screenshots}"
-SIM="${2:-${COMET_SPEC_SIM:-iPhone 17 Pro}}"
+SIM="${2:-${COMET_SPEC_SIM:-iPhone 15 Pro}}"
 DERIVED="$(mktemp -d /tmp/comet-ios-shots.XXXXXX)"
+STAGED="$DERIVED/screenshots"
+EXPECTED_WIDTH=1179
+EXPECTED_HEIGHT=2556
 
 cleanup() { rm -rf "$DERIVED"; }
 trap cleanup EXIT
 
 mkdir -p "$OUT"
+mkdir -p "$STAGED"
 # `simctl io screenshot` resolves its destination outside this shell's cwd;
 # normalize a caller-provided relative directory before handing it across.
 OUT="$(cd "$OUT" && pwd)"
+
+assert_required_size() {
+  local file="$1" label="$2" width height
+  width="$(sips -g pixelWidth "$file" | awk '/pixelWidth/ { print $2 }')"
+  height="$(sips -g pixelHeight "$file" | awk '/pixelHeight/ { print $2 }')"
+  if [[ "$width" != "$EXPECTED_WIDTH" || "$height" != "$EXPECTED_HEIGHT" ]]; then
+    echo "FAIL: $label is ${width}x${height}; required evidence is ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT} (393x852pt at 3x)" >&2
+    echo "      existing files in $OUT were not changed" >&2
+    exit 1
+  fi
+}
+
+# Reject the wrong device before a build or any committed screenshot can be
+# touched. Names are user-configurable; dimensions are the actual contract.
+echo "shots: checking $SIM is 393x852pt"
+xcrun simctl boot "$SIM" >/dev/null 2>&1 || true
+xcrun simctl bootstatus "$SIM" -b >/dev/null 2>&1
+xcrun simctl io "$SIM" screenshot --type=png "$DERIVED/size-probe.png" >/dev/null 2>&1
+assert_required_size "$DERIVED/size-probe.png" "$SIM"
 
 echo "shots: building for $SIM"
 xcodebuild -project "$ROOT/apps/ios/Comet.xcodeproj" -scheme Comet \
@@ -49,9 +74,7 @@ APP="$DERIVED/Build/Products/Debug-iphonesimulator/Comet.app"
 # overrides it, and it applies to simulator builds too.
 APP_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")"
 
-echo "shots: booting $SIM ($APP_ID)"
-xcrun simctl boot "$SIM" >/dev/null 2>&1 || true
-xcrun simctl bootstatus "$SIM" -b >/dev/null 2>&1 || true
+echo "shots: installing on $SIM ($APP_ID)"
 # `simctl install` exits 4 when this bundle is still running (for example after
 # a previously interrupted capture), so make reruns self-healing.
 xcrun simctl terminate "$SIM" "$APP_ID" >/dev/null 2>&1 || true
@@ -69,8 +92,9 @@ shot() {
   xcrun simctl launch --terminate-running-process \
     "$SIM" "$APP_ID" -demo -theme "$theme" "$@" >/dev/null
   sleep 4
-  xcrun simctl io "$SIM" screenshot --type=png "$OUT/ios-$name-$theme.png" >/dev/null 2>&1
-  echo "  $OUT/ios-$name-$theme.png"
+  local file="$STAGED/ios-$name-$theme.png"
+  xcrun simctl io "$SIM" screenshot --type=png "$file" >/dev/null 2>&1
+  assert_required_size "$file" "$name/$theme"
 }
 
 for theme in dark light; do
@@ -79,4 +103,8 @@ for theme in dark light; do
 done
 
 xcrun simctl terminate "$SIM" "$APP_ID" >/dev/null 2>&1 || true
+for file in "$STAGED"/*.png; do
+  cp "$file" "$OUT/$(basename "$file")"
+  echo "  $OUT/$(basename "$file")"
+done
 echo "shots: done"

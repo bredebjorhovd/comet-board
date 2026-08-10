@@ -150,12 +150,11 @@
 //! there** — the test will say so, and the fix is the Swift constant, never a
 //! second opinion.
 //!
-//! [`Theme::light`] crossed in gh#257, and the assertion crossed with it: the
-//! phone declares each colour as `themed(dark:light:)` and the test holds the
-//! two halves to [`Theme::dark`] and [`Theme::light`] respectively. Three of
-//! its light tokens are deliberately assigned to a DIFFERENT job than the name
-//! suggests, because a phone has one screen where a desktop has a shell beside
-//! a panel — the Swift says which and why at each one. Still not ported:
+//! Light crossed in gh#257, but its paint does NOT come from [`Theme::light`]:
+//! the supplied `Comet iOS.dc.html` declares a distinct neutral/status palette
+//! for the phone. The phone declares each colour as `themed(dark:light:)`, and
+//! `tests/ios_theme.rs` holds the dark halves plus shared scales to this file
+//! while holding the light halves to that iOS reference. Still not ported:
 //! [`Theme::row`] (a phone has no pointer).
 
 use comet_proto::ChatIndicator;
