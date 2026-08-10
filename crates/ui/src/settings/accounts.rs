@@ -590,7 +590,7 @@ impl AccountsPage {
     }
 
     /// The page-header device switcher (comet device-switcher.tsx): a quiet
-    /// trigger — platform glyph · name · presence dot · sort glyph — opening a
+    /// trigger — platform glyph · name · disclosure chevron — opening a
     /// dropdown of every registered device. Selecting one retargets the page.
     fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         use crate::icons::{self, icon};
@@ -631,20 +631,23 @@ impl AccountsPage {
         let mut trigger = div()
             .id("accounts-device-switcher")
             .flex_none()
-            .h(px(28.0))
-            .px(px(8.0))
+            .h(px(26.0))
+            .px(px(9.0))
             .rounded(px(Theme::RADIUS_CHIP))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(7.0))
             .cursor_pointer()
+            // The reference draws this one as a standing chip, not a ghost:
+            // it is naming the page's subject, so it has to read as a control
+            // before the pointer finds it (gh#258).
             .bg(if open {
-                theme.white_alpha(0.06)
+                theme.white_alpha(0.12)
             } else {
-                gpui::transparent_black()
+                theme.white_alpha(if theme.light { 0.05 } else { 0.07 })
             })
-            .when(!open, |el| el.hover(|s| s.bg(theme.white_alpha(0.04))))
+            .when(!open, |el| el.hover(|s| s.bg(theme.white_alpha(0.12))))
             .on_click(cx.listener(|this, _, _, cx| {
                 let just_dismissed = this
                     .device_menu_dismissed_at
@@ -655,7 +658,7 @@ impl AccountsPage {
             }))
             .child(
                 icon(trigger_glyph)
-                    .size(px(16.0))
+                    .size(px(13.0))
                     .flex_none()
                     .text_color(theme.text_muted),
             )
@@ -664,25 +667,12 @@ impl AccountsPage {
                     .min_w_0()
                     .truncate()
                     .text_size(px(Theme::TEXT_DENSE))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
+                    .text_color(theme.text_muted)
                     .child(trigger_label),
             )
             .child(
-                div()
-                    .size(px(6.0))
-                    // round-ok: status dot
-                    .rounded_full()
-                    .flex_none()
-                    .bg(if effective == local_id {
-                        emerald
-                    } else {
-                        theme.white_alpha(0.2)
-                    }),
-            )
-            .child(
-                icon(icons::SORT_VERTICAL)
-                    .size(px(14.0))
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(12.0))
                     .flex_none()
                     .text_color(if open {
                         theme.text_muted
@@ -1042,8 +1032,8 @@ impl AccountsPage {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .text_size(px(Theme::TEXT_CAPTION))
+            .gap(px(10.0))
+            .text_size(px(Theme::TEXT_DENSE))
             .text_color(theme.text_subtle)
             .child(
                 div()
@@ -1056,7 +1046,7 @@ impl AccountsPage {
                 div()
                     .flex_1()
                     .min_w(px(56.0))
-                    .max_w(px(230.0))
+                    .max_w(px(240.0))
                     .h(px(5.0))
                     // round-ok: usage bar — a 5px bar with round caps, not a box
                     .rounded_full()
@@ -1090,6 +1080,7 @@ impl AccountsPage {
                     div()
                         .flex_none()
                         .truncate()
+                        .text_color(theme.text_faint)
                         .child(SharedString::from(reset)),
                 )
             })
@@ -1097,8 +1088,8 @@ impl AccountsPage {
     }
 
     /// One account row (comet settings.agents.tsx `AccountRow`): initial
-    /// avatar, email + usage meters left; badges over the Switch/Forget
-    /// actions right-anchored.
+    /// avatar, email + badges + usage meters left; Switch/Forget right-anchored
+    /// only when the account is inactive.
     fn render_account_row(
         &self,
         account: &AgentAccount,
@@ -1124,6 +1115,7 @@ impl AccountsPage {
             .into();
         let switch_account = account.clone();
         let forget_account = account.clone();
+        let has_usage = !account.usage_windows.is_empty();
 
         let badges = div()
             .flex()
@@ -1143,15 +1135,14 @@ impl AccountsPage {
         // nowhere to go is worse than no field.
         let plan = plan_for(&self.plans.entries, account);
         let plan_writing = self.plans.busy.as_deref() == Some(plan_slot(account).as_str());
-        let plan_row: Option<AnyElement> = self.plans.reachable.then(|| {
+        let plan_control: Option<AnyElement> = self.plans.reachable.then(|| {
             let account = account.clone();
             widgets::ghost_action(theme)
                 .id(("account-plan", ix))
-                .self_start()
-                .mt(px(6.0))
                 .px(px(6.0))
                 .py(px(2.0))
-                .text_size(px(Theme::TEXT_DENSE))
+                .rounded(px(Theme::RADIUS_CHIP))
+                .text_size(px(Theme::TEXT_CAPTION))
                 .text_color(if plan.is_some() {
                     theme.text_subtle
                 } else {
@@ -1218,7 +1209,7 @@ impl AccountsPage {
         });
 
         div()
-            .px(px(20.0))
+            .px(px(18.0))
             .py(px(14.0))
             .when(!first, |el| el.border_t_1().border_color(theme.border))
             .flex()
@@ -1226,12 +1217,15 @@ impl AccountsPage {
             .items_stretch()
             .gap(px(12.0))
             .child(
-                // Initial avatar: size-8 rounded-full border bg-white/[0.03].
+                // Initial avatar: 30px circle, like the identity mark in the
+                // supplied Accounts reference.
                 div()
                     .flex_none()
-                    .self_center()
-                    .size(px(32.0))
-                    .rounded(px(Theme::RADIUS_ROW))
+                    .self_start()
+                    .when(!has_usage, |el| el.self_center())
+                    .size(px(30.0))
+                    // round-ok: account avatar — an identity mark is a face.
+                    .rounded_full()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.white_alpha(0.03))
@@ -1249,7 +1243,16 @@ impl AccountsPage {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(widgets::row_title(theme, email))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(widgets::row_title(theme, email))
+                            .child(badges)
+                            .children(plan_control),
+                    )
                     .map(|el| {
                         // Meters XOR the quiet fallback line — never both
                         // (comet: `usage ? meters : "Usage unavailable"…`).
@@ -1276,20 +1279,9 @@ impl AccountsPage {
                                 ),
                             )
                         }
-                    })
-                    .children(plan_row),
+                    }),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(badges)
-                    .children(actions),
-            )
+            .children(actions)
             .into_any_element()
     }
 
@@ -1703,13 +1695,12 @@ impl Render for AccountsPage {
                 Some(crate::icons::claude_brand()),
             ),
         };
-        // Brand mark inside a 24px centered box (comet: `grid size-6
-        // place-items-center [&_svg]:size-4`).
+        // Brand mark in the reference's compact 16px slot.
         let provider_mark = |harness: HarnessId, theme: &Theme| {
             let (mark, tint) = provider_icon(harness);
             div()
                 .flex_none()
-                .size(px(24.0))
+                .size(px(16.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1732,7 +1723,7 @@ impl Render for AccountsPage {
                         _ => "accounts-skeleton-claude",
                     };
                     div()
-                        .mt(px(24.0))
+                        .mt(px(12.0))
                         .flex()
                         .flex_col()
                         .child(
@@ -1754,7 +1745,7 @@ impl Render for AccountsPage {
                             // Ghost rows shaped like real ones (row two dimmed)
                             // so the card keeps its size while data develops.
                             widgets::section_card(&theme)
-                                .mt(px(8.0))
+                                .mt(px(0.0))
                                 .child(self.render_skeleton_row(
                                     (skeleton_id, 0),
                                     false,
@@ -1813,7 +1804,7 @@ impl Render for AccountsPage {
                             .collect();
                         let has_rows = !rows.is_empty();
                         let add_id: SharedString = format!("add-account-{name}").into();
-                        let card = widgets::section_card(&theme).mt(px(8.0));
+                        let card = widgets::section_card(&theme).mt(px(0.0));
                         let card = if !has_rows {
                             card.child(
                                 div()
@@ -1863,7 +1854,7 @@ impl Render for AccountsPage {
                             div().into_any_element()
                         };
                         div()
-                            .mt(px(24.0))
+                            .mt(px(12.0))
                             .flex()
                             .flex_col()
                             .child(
@@ -1876,7 +1867,7 @@ impl Render for AccountsPage {
                                     .child(
                                         div()
                                             .text_size(px(Theme::TEXT_BODY))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child(SharedString::from(name)),
                                     )
@@ -1909,10 +1900,19 @@ impl Render for AccountsPage {
                             .gap(px(10.0))
                             .child(widgets::page_header(&theme, "Accounts", account_count))
                             .child(div().flex_1())
+                            // WHICH device, then what to do about it (gh#258).
+                            // The reference puts the switcher first because it
+                            // is the subject of the page — every row under it
+                            // is that machine's login, and Refresh is a verb
+                            // applied to whatever the switcher currently names.
+                            // Reading verb-then-subject had the button offering
+                            // to refresh a device the reader had not chosen yet.
+                            .child(self.render_device_switcher(&theme, cx))
                             .child(
-                                // `text-[12.5px]` + leading 16px Refresh icon,
-                                // dimmed while a refresh is in flight (comet
-                                // `disabled:opacity-50`).
+                                // The word alone, dimmed while a refresh is in
+                                // flight. No icon: the switcher beside it wears
+                                // one, and two glyphs in a header this small
+                                // read as a toolbar.
                                 widgets::ghost_action(&theme)
                                     .id("accounts-refresh")
                                     .flex_none()
@@ -1922,20 +1922,13 @@ impl Render for AccountsPage {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.load(force_usage_for(LoadTrigger::Refresh), cx)
                                     }))
-                                    .child(
-                                        crate::icons::icon(crate::icons::REFRESH)
-                                            .size(px(16.0))
-                                            .text_color(theme.text_muted),
-                                    )
                                     .child(SharedString::from("Refresh")),
-                            )
-                            .child(self.render_device_switcher(&theme, cx)),
+                            ),
                     )
                     .child(widgets::page_subtitle(
                         &theme,
                         "The Claude Code, Codex and OpenCode logins on this device. Comet \
-                         detects the live sessions, keeps each account backed up, and can swap \
-                         between them.",
+                         spends whichever one a route names.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1948,38 +1941,10 @@ impl Render for AccountsPage {
                                 })),
                         )
                     })
-                    .children(sections)
-                    // Footer note (comet: `mt-6 text-[12px] leading-relaxed`).
-                    .child(
-                        div()
-                            .mt(px(24.0))
-                            .text_size(px(Theme::TEXT_DENSE))
-                            .line_height(px(19.0))
-                            .text_color(theme.text_subtle)
-                            .child(SharedString::from(
-                                "Switching rewrites the CLI\u{2019}s stored login, so new \
-                                 agent sessions use the selected account immediately. On \
-                                 macOS, an already-running Claude Code can hold the previous \
-                                 login for up to ~30 seconds (Keychain cache).",
-                            )),
-                    )
-                    // What a plan costs is the one fact here nobody can detect
-                    // — say so where the field is, not only inside its dialog.
-                    .when(self.plans.reachable, |el| {
-                        el.child(
-                            div()
-                                .mt(px(8.0))
-                                .text_size(px(Theme::TEXT_DENSE))
-                                .line_height(px(19.0))
-                                .text_color(theme.text_subtle)
-                                .child(SharedString::from(
-                                    "Comet never sees your bill. The plan cost under each \
-                                     login is what you tell it, kept in the board\u{2019}s \
-                                     routing.toml, and Board stats reads it against the list \
-                                     price of the work those logins actually ran.",
-                                )),
-                        )
-                    }),
+                    // The supplied page ends with its structured account/rate
+                    // content. Operational caveats live in the relevant
+                    // dialogs instead of forming an unrelated prose footer.
+                    .children(sections),
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
     }

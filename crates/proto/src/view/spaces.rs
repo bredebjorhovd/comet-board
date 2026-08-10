@@ -270,6 +270,35 @@ pub fn active_placements<'a>(
         .collect()
 }
 
+/// The live chats a space's disclosure draws, in the order Active derived them
+/// (needs-you first, then working).
+///
+/// Since gh#258 the sidebar has no Active group above Spaces: Spaces is the
+/// primary group, and a live run's row is drawn under the space it belongs to
+/// rather than in a list that displaces the tree. This is the half of that
+/// split a space claims; [`homeless_live`] is the remainder.
+pub fn space_live<'a>(space_id: &str, active: &[(&'a str, Option<&'a str>)]) -> Vec<&'a str> {
+    active
+        .iter()
+        .filter(|(_, space)| *space == Some(space_id))
+        .map(|(chat, _)| *chat)
+        .collect()
+}
+
+/// The live chats no space claims — a run whose chat has no `space_id`, which
+/// no disclosure can draw.
+///
+/// These are the only rows that still need a group of their own, and it sits
+/// BELOW the spaces tree: a live run must always have a row somewhere, and the
+/// hierarchy the tree states is not the thing that should give way for it.
+pub fn homeless_live<'a>(active: &[(&'a str, Option<&'a str>)]) -> Vec<&'a str> {
+    active
+        .iter()
+        .filter(|(_, space)| space.is_none())
+        .map(|(chat, _)| *chat)
+        .collect()
+}
+
 /// What a space's nested shelf draws, and what it defers to Active.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SpaceShelf<'a> {
@@ -330,6 +359,10 @@ pub fn running_count_label(running: usize) -> Option<String> {
 /// reason (the space has no sessions at all) — that case is the caller's own
 /// empty state. Expanding a space and finding a gap would read as a bug; the
 /// shelf answers with its own truth instead.
+///
+/// Read by the TUI, whose sidebar keeps the Active group above the tree. The
+/// desktop's disclosure draws its own live rows since gh#258
+/// ([`space_live`]), so nothing is "above" for it to point at.
 pub fn shelf_note(shelf: &SpaceShelf<'_>) -> Option<String> {
     if !shelf.idle.is_empty() || shelf.running == 0 {
         return None;
@@ -628,6 +661,31 @@ mod tests {
         let shelf = space_shelf("s1", ["c2", "c3"], &active);
         assert_eq!(shelf.idle, ["c3"]);
         assert_eq!(shelf.running, 1);
+    }
+
+    #[test]
+    fn a_space_claims_its_live_rows_in_actives_own_order() {
+        // gh#258: Spaces is the primary group, so a live run's row is drawn
+        // under the space it belongs to. The ORDER is Active's — needs-you
+        // first, then working — and it survives the split.
+        let active = [
+            ("blocked", Some("s1")),
+            ("elsewhere", Some("s2")),
+            ("working", Some("s1")),
+            ("loose", None),
+        ];
+        assert_eq!(space_live("s1", &active), ["blocked", "working"]);
+        assert_eq!(space_live("s2", &active), ["elsewhere"]);
+        assert!(space_live("s3", &active).is_empty());
+    }
+
+    #[test]
+    fn only_a_spaceless_run_still_needs_a_group_of_its_own() {
+        let active = [("in-a-space", Some("s1")), ("loose", None)];
+        assert_eq!(homeless_live(&active), ["loose"]);
+        // And when every run has a home the group disappears entirely, rather
+        // than sitting empty above the tree it used to displace.
+        assert!(homeless_live(&[("in-a-space", Some("s1"))]).is_empty());
     }
 
     #[test]

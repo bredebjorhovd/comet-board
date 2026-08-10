@@ -172,14 +172,22 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
+    /// Nav order, from the supplied Settings design file (gh#258).
+    ///
+    /// The two board-hosted pages sit AFTER the four that are about this
+    /// device and this window, not between them: Devices/Agents/Members are
+    /// who and what is signed in here, Appearance/Shortcuts are how this app
+    /// behaves, and Routing/Stats are about a board that may live on another
+    /// machine entirely. Archived closes the list, as the tail of it always
+    /// has.
     pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
         SettingsSection::Members,
-        SettingsSection::Routing,
-        SettingsSection::Stats,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
+        SettingsSection::Routing,
+        SettingsSection::Stats,
         SettingsSection::Archived,
     ];
 
@@ -2069,16 +2077,21 @@ impl Shell {
         )
     }
 
-    /// Settings-mode sidebar (comet settings-sidebar.tsx): window-control
-    /// strip, "Settings" heading, icon section rows styled like session rows,
-    /// then a Back row and the account footer pinned to the bottom.
+    /// Settings-mode sidebar: "Settings" heading, icon section rows styled
+    /// like session rows, then a rule and a `Back` row pinned to the bottom.
+    ///
+    /// No account footer (gh#258). The chat sidebar closes with one and this
+    /// one deliberately does not: the supplied Settings design ends the column
+    /// at `Back`, and the reason holds up — the account block's job is to say
+    /// who you are while you are working somewhere that might not be your own
+    /// machine, and Settings is where the Accounts page answers that question
+    /// properly, at length, three feet to the right.
     fn render_settings_nav(
         &mut self,
         section: SettingsSection,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let account_footer = self.render_account_footer(theme, cx);
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
@@ -2149,12 +2162,22 @@ impl Shell {
                         }),
                     )),
             )
-            // Back pinned to the bottom (comet settings-sidebar.tsx), in the
-            // shared footer-row chrome — it and the account block below it are
-            // the same construction in the design, so they are one widget.
+            // Back pinned to the bottom, under the same hairline the chat
+            // sidebar draws over its footer: the rule is what makes the row
+            // read as the end of the column rather than a ninth nav item.
             .child(
-                div().px(px(Theme::SPACE_SM)).child(
+                // The nav already owns an 8px gutter; the divider has its own
+                // 8px inset inside that, matching the reference's x=16…240.
+                div()
+                    .px(px(Theme::SPACE_SM))
+                    .child(account::footer_divider(theme)),
+            )
+            .child(
+                div().px(px(Theme::SPACE_SM)).my(px(Theme::SPACE_SM)).child(
                     account::footer_row(theme, "settings-back")
+                        .h(px(30.0))
+                        .py(px(0.0))
+                        .gap(px(7.0))
                         .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_muted)
                         .hover(|s| s.text_color(theme.text))
@@ -2169,9 +2192,6 @@ impl Shell {
                         .child(SharedString::from("Back")),
                 ),
             )
-            // …and the same account footer the chat sidebar closes with: the
-            // anchor is only an anchor if Settings has it too (gh#230).
-            .child(account_footer)
             .into_any_element()
     }
 
@@ -2183,10 +2203,22 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
-    /// Chat-mode sidebar (gh#124): the Needs-you inbox, the orchestrator slot,
-    /// the Spaces section — each space disclosing its own sessions inline, the
-    /// ONE authoritative session surface — then the live-work groups (Agents /
-    /// Running), the notice strip, and the account footer (gh#230).
+    /// Chat-mode sidebar: the Needs-you inbox, then **Spaces** — the primary
+    /// group, each space disclosing its own sessions inline — then the notice
+    /// strip and the account footer (gh#230).
+    ///
+    /// gh#258 put the hierarchy back. Active used to be a group of its own
+    /// between the inbox and the tree, holding the full row of every live run
+    /// and leaving the tree to enumerate what was left; the orchestrator had a
+    /// pinned slot above that. Three groups deep, the reader had to know which
+    /// surface a chat was on this frame before they could look for it, and the
+    /// thing the window is actually organised by — the spaces — started a
+    /// third of the way down the column. Now the tree owns every row: a live
+    /// run's row is drawn inside its own space's disclosure, above that
+    /// space's idle sessions, and the orchestrator is the first row under the
+    /// selected space. What is left of Active is a fallback group BELOW the
+    /// tree for runs whose chat names no space at all — the one case a
+    /// disclosure cannot draw.
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -2203,17 +2235,13 @@ impl Shell {
         let account_footer = self.render_account_footer(theme, cx);
 
         // First, the inbox (gh#122): does anything want me — in words, and it
-        // cannot miss. Then the orchestrator's pinned slot, then the live-work
-        // groups (gh#103/gh#117) — everything active sits ABOVE the spaces
-        // tree (gh#124), which is the calm, complete enumeration underneath.
+        // cannot miss. Then the spaces tree, which owns every other row.
         let needs_section = self.render_needs_section(theme, cx);
-        let orchestrator_slot = self.render_orchestrator_slot(theme, cx);
-        // Everything alive in one Active group (gh#123) — board attempts and
-        // the runs the board never released, needs-you first — derived ONCE
-        // here, because since gh#138 the spaces tree below is defined by it:
-        // Active owns a chat's row while its session is live, and the tree
-        // shows it when idle. One derivation, so the two can never disagree
-        // about which surface a chat is on this frame.
+        // Everything alive (gh#103/gh#117), derived ONCE here, because the tree
+        // below is defined by it: each space's disclosure draws the live rows
+        // that belong to it and then its idle ones. One derivation, so the two
+        // halves of a space's list can never disagree about which chats are
+        // running this frame.
         let active_now = Utc::now();
         let active = self.board.read(cx).active(cx, active_now);
         let placements: Vec<(String, Option<String>)> = {
@@ -2223,8 +2251,13 @@ impl Shell {
                 .map(|(chat, space)| (chat.to_string(), space.map(str::to_string)))
                 .collect()
         };
-        let spaces_section = self.render_spaces_section(&placements, theme, cx);
-        let active_section = self.render_active_section(active, active_now, theme, cx);
+        let spaces_section = self.render_spaces_section(&active, &placements, theme, cx);
+        // The remainder: live runs whose chat names no space, which no
+        // disclosure can hold. Below the tree, not above it.
+        let loose_section =
+            self.render_loose_active_section(&active, &placements, active_now, theme, cx);
+        // …and the orchestrator, when no expanded space is there to host it.
+        let orchestrator_slot = self.render_orphan_orchestrator_slot(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2262,8 +2295,8 @@ impl Shell {
                                     .child(Self::render_orchestrator_rule(theme))
                                     .into_any_element()
                             }))
-                            .children(active_section)
                             .child(spaces_section)
+                            .children(loose_section)
                             .child(div().pb(px(Theme::SPACE_SM))),
                     )
                     .when(lists_fade_top && !glass, |el| {
@@ -4299,6 +4332,28 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The settings nav, in the order the supplied design file lists it
+    /// (gh#258). Order is the only thing the rail communicates beyond the
+    /// eight labels, so it is worth a test: it groups this device (Devices,
+    /// Agents, Members), then this app (Appearance, Shortcuts), then the board
+    /// — which may be on another machine entirely — and closes with Archived.
+    #[test]
+    fn the_settings_nav_is_in_the_designs_order() {
+        assert_eq!(
+            SettingsSection::ALL.map(SettingsSection::label),
+            [
+                "Devices",
+                "Agents",
+                "Members",
+                "Appearance",
+                "Shortcuts",
+                "Routing",
+                "Stats",
+                "Archived",
+            ]
+        );
+    }
 
     #[test]
     fn titlebar_cluster_matches_comet_window_controls() {

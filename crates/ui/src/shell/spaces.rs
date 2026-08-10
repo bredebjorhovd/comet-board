@@ -480,13 +480,15 @@ impl Shell {
     /// grouped by device — the device named ONCE per group — with each space's
     /// sessions disclosed inline under its row (gh#124).
     ///
-    /// `active` is [`spaces_view::active_placements`] for the whole sidebar:
-    /// which chats the Active list above is drawing, and where each lives. The
-    /// tree answers "what lives here" WITHOUT re-listing what Active already
-    /// says is alive (gh#138) — a space row carries the count instead, and a
-    /// space whose sessions are all up there says so where its rows would be.
+    /// `live` is everything the board says is running this frame and `active`
+    /// is [`spaces_view::active_placements`] for it — which chat lives where.
+    /// Since gh#258 the tree DRAWS those rows rather than deferring them to a
+    /// group above it: a space's disclosure holds its live rows and then its
+    /// idle ones, and the space row's `N running` count still says how many of
+    /// the first kind a collapsed row is hiding.
     pub(super) fn render_spaces_section(
         &mut self,
+        live: &[comet_proto::view::board::ActiveRow],
         active: &[(String, Option<String>)],
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -750,11 +752,23 @@ impl Shell {
                             .into_any_element(),
                         _ => row.into_any_element(),
                     });
-                    // The disclosure: the space's IDLE sessions, inline under
-                    // its row (gh#124's containment, gh#138's division of
-                    // labour — the live ones have their row in Active).
+                    // The disclosure: everything that lives in this space,
+                    // inline under its row (gh#124's containment) — the
+                    // orchestrator when this is the selected space, then the
+                    // live rows, then the idle ones (gh#258).
                     if expanded {
-                        rows.push(self.render_space_sessions(&shelf, theme, cx));
+                        let held: Vec<&comet_proto::view::board::ActiveRow> =
+                            spaces_view::space_live(&id, &borrowed_active)
+                                .into_iter()
+                                .filter_map(|chat| live.iter().find(|row| row.chat_id() == chat))
+                                .collect();
+                        rows.push(self.render_space_disclosure(
+                            &shelf,
+                            &held,
+                            is_selected,
+                            theme,
+                            cx,
+                        ));
                     }
                 }
                 let group_device = device_id.clone();
@@ -1130,22 +1144,56 @@ impl Shell {
             )
     }
 
-    /// A space's disclosed sessions: the tab strip's order (creation + manual
-    /// drag), vertical, inset under an indent rule so the containment is
-    /// visible. No space name repeated on the row, because the row is IN the
-    /// space.
+    /// A space's disclosure — everything that lives here, in one list, inset
+    /// under an indent rule so the containment is visible. No space name
+    /// repeated on any row, because the row is IN the space.
     ///
-    /// The shelf draws what Active is NOT drawing (gh#138). When Active holds
-    /// every one of them it says so ([`spaces_view::shelf_note`]) rather than
-    /// disclosing into a gap — expanding a space must always answer with
-    /// something true about what lives here.
-    fn render_space_sessions(
-        &self,
+    /// Three things stack, in this order (gh#258):
+    ///
+    /// 1. **The orchestrator**, on the SELECTED space only, followed by its
+    ///    hairline. It is the row you talk TO rather than check on, it outlives
+    ///    every attempt in the list under it, and it belongs to the space whose
+    ///    board it is orchestrating — which is what putting it here says.
+    /// 2. **The live rows** — board attempts and the runs the board never
+    ///    released — in Active's own order, needs-you first.
+    /// 3. **The idle sessions**, in the tab strip's order (creation + manual
+    ///    drag), so the shelf and the tabs agree.
+    ///
+    /// Expanding a space must always answer with something true about what
+    /// lives here, so an empty one says so rather than disclosing into a gap.
+    fn render_space_disclosure(
+        &mut self,
         shelf: &spaces_view::SpaceShelf<'_>,
+        live: &[&comet_proto::view::board::ActiveRow],
+        orchestrator: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use comet_proto::view::board::ActiveRow;
         let now = Utc::now();
+        let head: Vec<AnyElement> = if orchestrator {
+            self.render_orchestrator_slot(theme, cx)
+                .map(|slot| vec![slot, Self::render_orchestrator_rule(theme)])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let live_rows: Vec<AnyElement> = {
+            let selected = self.state.read(cx).selected_chat.clone();
+            live.iter()
+                .map(|row| {
+                    let is_selected = selected.as_deref() == Some(row.chat_id());
+                    match row {
+                        ActiveRow::Agent(agent) => {
+                            self.render_agent_row(agent, is_selected, now, theme, cx)
+                        }
+                        ActiveRow::Unmanaged(run) => {
+                            self.render_running_row(run, is_selected, now, theme, cx)
+                        }
+                    }
+                })
+                .collect()
+        };
         let order = &shelf.idle;
         let rows: Vec<AnyElement> = {
             let (selected, pinned) = {
@@ -1173,24 +1221,21 @@ impl Shell {
                 })
                 .collect()
         };
-        let body: AnyElement = if rows.is_empty() {
-            // Either the space has no sessions, or Active is holding all of
-            // them — and the difference is exactly what a reader who just
-            // expanded an obviously-busy space needs told.
-            let note =
-                spaces_view::shelf_note(shelf).unwrap_or_else(|| "No sessions yet".to_string());
+        let body: AnyElement = if rows.is_empty() && live_rows.is_empty() {
+            // Nothing lives here at all — the one honest gap, and it says so.
             div()
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
                 .text_size(px(Theme::TEXT_DENSE))
                 .text_color(theme.text_subtle)
-                .child(SharedString::from(note))
+                .child(SharedString::from("No sessions yet"))
                 .into_any_element()
         } else {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
+                .children(live_rows)
                 .children(rows)
                 .into_any_element()
         };
@@ -1206,6 +1251,7 @@ impl Shell {
             .border_color(theme.border)
             .flex()
             .flex_col()
+            .children(head)
             .child(body)
             .into_any_element()
     }
@@ -1581,12 +1627,17 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The orchestrator's fixed slot above Spaces (gh#122): a pinned thread —
-    /// ◆ identity, the name, an unread badge, the latest report's preview —
-    /// not a decorated session row. `None` only when no orchestrator is pinned
-    /// (or its chat has not synced here); a pinned-but-silent orchestrator
-    /// renders as the empty fixture, teaching where to look before the first
-    /// notice arrives.
+    /// The orchestrator's pinned row (gh#122): ◆ identity, the name, an unread
+    /// badge, the latest report's preview — not a decorated session row.
+    /// `None` only when no orchestrator is pinned (or its chat has not synced
+    /// here); a pinned-but-silent orchestrator renders as the empty fixture,
+    /// teaching where to look before the first notice arrives.
+    ///
+    /// It is the first row inside the selected space's disclosure (gh#258),
+    /// and falls back above Spaces when no expanded space can host it
+    /// ([`Self::render_orphan_orchestrator_slot`]). The row itself carries no
+    /// outer margin, so whichever of the two places it lands in owns its
+    /// spacing.
     pub(super) fn render_orchestrator_slot(
         &mut self,
         theme: &Theme,
@@ -1666,7 +1717,6 @@ impl Shell {
         Some(
             div()
                 .id(SharedString::from(format!("orchestrator-{}", slot.chat_id)))
-                .mt(px(12.0))
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
@@ -1747,50 +1797,52 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The "Active" section (gh#123): everything alive on the box in one
-    /// group — live board attempts (gh#103) and the working chats the board
-    /// never released (gh#117), needs-you first, then working, blind to how
-    /// each one started. Origin still shows on the row: an attempt wears its
-    /// issue identifier as a chip and keeps its branch and cap, an unmanaged
-    /// run is its own bare title.
+    /// What is left of the "Active" group (gh#123, cut back by gh#258): the
+    /// live runs no space can hold — a working chat whose `space_id` is unset,
+    /// which no disclosure in the tree above will ever draw.
     ///
-    /// `None` when nothing is running — an empty section here would be a
-    /// permanent reminder that a board exists, on a machine that may host none.
-    /// The rows come from the board panel's standing `WatchBoard` stream joined
-    /// to chats and sessions ([`BoardPanel::active`]); the board dock stays the
-    /// deep view, and this is the glance.
-    ///
-    /// Since gh#138 this list OWNS its chats: while a session is live its full
-    /// row is here and nowhere else, and the space's shelf below picks it back
-    /// up when it goes idle. So `active` arrives from the caller rather than
-    /// being derived here — the spaces tree is derived from the same value on
-    /// the same frame ([`Shell::render_chat_sidebar`]).
-    pub(super) fn render_active_section(
+    /// It sits BELOW the tree, not above it, and it is `None` whenever every
+    /// run has a home — which is the ordinary case. A live run must always
+    /// have a row somewhere; that guarantee is what this group is for, and
+    /// nothing else. Rows that DO belong to a space are drawn there
+    /// ([`Self::render_space_disclosure`]) from the same derivation on the same
+    /// frame, so the two can never draw one chat twice.
+    pub(super) fn render_loose_active_section(
         &mut self,
-        active: Vec<comet_proto::view::board::ActiveRow>,
+        live: &[comet_proto::view::board::ActiveRow],
+        active: &[(String, Option<String>)],
         now: DateTime<Utc>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         use comet_proto::view::board::ActiveRow;
-        if active.is_empty() {
+        let borrowed: Vec<(&str, Option<&str>)> = active
+            .iter()
+            .map(|(chat, space)| (chat.as_str(), space.as_deref()))
+            .collect();
+        let loose: Vec<&ActiveRow> = spaces_view::homeless_live(&borrowed)
+            .into_iter()
+            .filter_map(|chat| live.iter().find(|row| row.chat_id() == chat))
+            .collect();
+        if loose.is_empty() {
             return None;
         }
-        let blocked = comet_proto::view::board::active_needing_attention(&active);
+        let owned: Vec<ActiveRow> = loose.iter().map(|row| (*row).clone()).collect();
+        let blocked = comet_proto::view::board::active_needing_attention(&owned);
         let selected = self.state.read(cx).selected_chat.clone();
 
         let header = Self::render_active_header(blocked, theme);
 
-        let rows: Vec<AnyElement> = active
+        let rows: Vec<AnyElement> = loose
             .into_iter()
             .map(|row| {
                 let is_selected = selected.as_deref() == Some(row.chat_id());
                 match row {
                     ActiveRow::Agent(agent) => {
-                        self.render_agent_row(&agent, is_selected, now, theme, cx)
+                        self.render_agent_row(agent, is_selected, now, theme, cx)
                     }
                     ActiveRow::Unmanaged(run) => {
-                        self.render_running_row(&run, is_selected, now, theme, cx)
+                        self.render_running_row(run, is_selected, now, theme, cx)
                     }
                 }
             })
@@ -1802,6 +1854,34 @@ impl Shell {
                 .flex_col()
                 .child(header)
                 .child(div().flex().flex_col().gap(px(2.0)).children(rows))
+                .into_any_element(),
+        )
+    }
+
+    /// The orchestrator's slot when no expanded space is there to host it —
+    /// nothing selected yet, or the selected space collapsed.
+    ///
+    /// The pinned slot is the only way to reach the orchestrator's thread when
+    /// its chat has no other row on screen, so it cannot simply disappear with
+    /// the disclosure it normally lives in. It reappears above Spaces, where it
+    /// used to live full-time.
+    pub(super) fn render_orphan_orchestrator_slot(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let hosted = {
+            let state = self.state.read(cx);
+            state.selected_space.clone()
+        }
+        .is_some_and(|space| self.space_expanded(&space));
+        if hosted {
+            return None;
+        }
+        Some(
+            div()
+                .mt(px(Theme::SPACE_MD))
+                .child(self.render_orchestrator_slot(theme, cx)?)
                 .into_any_element(),
         )
     }
