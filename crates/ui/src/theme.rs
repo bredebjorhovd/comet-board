@@ -148,8 +148,15 @@
 //! runs the same three scans over the Swift that `tests/text_tones.rs` and
 //! `tests/scale.rs` run over this crate. **Changing a number here changes it
 //! there** — the test will say so, and the fix is the Swift constant, never a
-//! second opinion. What is deliberately NOT ported: [`Theme::light`] (that app
-//! is always-dark) and [`Theme::row`] (a phone has no pointer).
+//! second opinion.
+//!
+//! [`Theme::light`] crossed in gh#257, and the assertion crossed with it: the
+//! phone declares each colour as `themed(dark:light:)` and the test holds the
+//! two halves to [`Theme::dark`] and [`Theme::light`] respectively. Three of
+//! its light tokens are deliberately assigned to a DIFFERENT job than the name
+//! suggests, because a phone has one screen where a desktop has a shell beside
+//! a panel — the Swift says which and why at each one. Still not ported:
+//! [`Theme::row`] (a phone has no pointer).
 
 use comet_proto::ChatIndicator;
 use comet_proto::view::board::{AgentState, BoardState};

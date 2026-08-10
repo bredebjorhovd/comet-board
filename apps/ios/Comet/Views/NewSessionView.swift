@@ -440,7 +440,7 @@ struct ModelPickerSheet: View {
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
+        .cometAppearance()
     }
 
     private var selectedModel: ModelInfo? {
@@ -666,7 +666,7 @@ struct RefPickerSheet: View {
         .presentationDetents([.medium])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
+        .cometAppearance()
     }
 
     private func row(_ ref: RepoRef) -> some View {
@@ -772,7 +772,7 @@ struct CheckoutPickerSheet: View {
         .presentationDetents([.medium])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
+        .cometAppearance()
     }
 
     private func row(_ rowKind: CheckoutKind, icon: LineIcon, title: String, subtitle: String) -> some View {

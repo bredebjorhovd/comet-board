@@ -87,7 +87,8 @@ happen to a file git never looks at.
   explore the UI with no infrastructure. Launch args for screenshot rigs:
   `-demo [-route chat:<id>|space:<id>|board|stats] [-sheet dispatch] [-stream]`.
   `-route`/`-sheet` work against a live edge too, which is where the rows that
-  matter are.
+  matter are. `-theme light|dark|system` (or `COMET_THEME`) picks the variant
+  for a rig without touching the stored preference — see below.
 
 ### Keeping the ported rules honest (gh#157)
 
@@ -141,12 +142,19 @@ apart, long after the desktop had settled that argument.
 cargo test -p comet-ui --test ios_theme
 ```
 
-Four checks, and unlike the stats fixture above **these run in CI** — they read
+Six checks, and unlike the stats fixture above **these run in CI** — they read
 Swift as text, so they need no simulator:
 
-- **Parity.** The status ramp, the three radii, the type scale and the four text
-  greys are the same numbers the desktop paints, and the greys are compared as
-  paint rather than as lightness.
+- **Parity, in both variants.** The status ramp, the three radii, the type
+  scale, the surfaces and the four text greys are the same numbers the desktop
+  paints, and the colours are compared as paint rather than as lightness. Since
+  gh#257 the test reads the `dark:` and `light:` halves of each `themed(…)`
+  token and holds them to `Theme::dark()` and `Theme::light()` — a light theme
+  that drifts is the easier one to ship unnoticed.
+- **Every paint token declares both variants** (gh#257) — hatch
+  `one-tone-ok:`, which one brand mark uses. A token with a single value is
+  where a scattered `colorScheme ==` check at a call site starts.
+- **Nothing pins a colour scheme** (gh#257). Four call sites used to.
 - **No text tone multiplied by an alpha** (gh#172) — hatch `theme-opacity-ok:`,
   and it is for animation fades only.
 - **No literal radius or font size outside `Theme.swift`** (gh#174) — hatch
@@ -156,6 +164,29 @@ Swift as text, so they need no simulator:
 
 A number that genuinely does not fit becomes a token on *both* ends, never an
 alpha or a literal on this one.
+
+### Light mode, and the one line that is not in this repo yet (gh#257)
+
+The phone follows the system by default; the account menu offers Light and Dark
+for somebody who wants this one app the other way round. What a text scan
+cannot check is what the paint looks like, so:
+
+```sh
+scripts/ios-theme-shots.sh          # Home + Board, both variants, 393x852
+```
+
+**`Comet/Info.plist` still carries `UIUserInterfaceStyle = Dark`.** That key
+forces every window in the app and beats the device setting, so while it is
+there "System" resolves to dark and only the two explicit choices do anything.
+gh#257 ring-fenced the file, so `Theme/Appearance.swift` reads the key rather
+than removing it and stays honest about it in two ways: `Appearance.system`
+resolves to the forced style, and the picker does not offer System at all.
+Delete those two lines from `Info.plist` and both behaviours correct themselves
+with no code change — that is the whole of the remaining work.
+
+The same key is why the shot script passes `-theme light` rather than
+`xcrun simctl ui <sim> appearance light`: a window-level override (which is what
+`preferredColorScheme` installs) wins, a device setting does not.
 
 ### Verifying the board against a real box
 
@@ -255,7 +286,12 @@ Theme/                  theme.rs port (gh#181): oklch→sRGB converter, the four
                         text greys, the `Status` vocabulary and the one function
                         that turns a meaning into paint, three radii + the
                         nesting rule, four type sizes + the reserved prose pair,
-                        Geist/Geist Mono, motion timings + flavour words
+                        Geist/Geist Mono, motion timings + flavour words.
+                        Two variants since gh#257: every paint token is
+                        `themed(dark:light:)`, one Color that resolves against
+                        the trait collection, so no screen asks which scheme it
+                        is in. Appearance.swift holds the preference (System by
+                        default) and is the one place a scheme is chosen
 ```
 
 ### Parity notes (desktop ⇄ mobile translations)
@@ -283,7 +319,7 @@ Theme/                  theme.rs port (gh#181): oklch→sRGB converter, the four
 | Stick-to-bottom spring, wheel-up breaks pin | Scroll-phase-gated pin + spring scrollTo, same 70/320pt thresholds |
 | `Theme::status` — four hues at one lightness, and every state type maps into `Status` once (gh#173) | `Theme.status` and the same `Status.ofBoard` / `ofAgent` / `ofChat`, so a working agent is the same amber on the board and on Home |
 | Three radii, four type sizes, four text greys (gh#172/gh#174) | The same numbers, asserted equal by `crates/ui/tests/ios_theme.rs` |
-| Light theme (gh#177) | Not ported — the phone is always-dark, and a light design is a design rather than an inversion |
+| Light theme (gh#177) | Ported in gh#257 — the desktop's own declared light values, assigned to the phone's jobs (a full screen of the shell's ground is not a page, and a meter track cannot lift to white). Chosen once in `Appearance.swift`, resolved per token, never per view |
 | Hover wash vs selection lift (gh#175) | Not ported — no pointer; `elementHover` is what a finger holds down |
 
 Status colors, fonts, spacing, markdown metrics, veil timing, command-ledger
