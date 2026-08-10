@@ -377,7 +377,7 @@ final class BoardStore {
     /// decode ends it instead — that host HAS a board and is running a different
     /// version, and asking the next device would report the wrong problem.
     enum ReviewOutcome {
-        case read(AttemptReview)
+        case read(AttemptReview, host: String)
         case failed(String)
     }
 
@@ -394,8 +394,8 @@ final class BoardStore {
         for deviceId in candidates {
             do {
                 let review: AttemptReview = try await relay(for: deviceId)
-                    .call(method: "ReadAttemptReview", params: ["taskId": taskId])
-                return .read(review)
+                    .call(method: "ReadAttemptReview", params: reviewReadParams(taskId: taskId))
+                return .read(review, host: deviceId)
             } catch is DecodingError {
                 return .failed("Unreadable review — the board is on another version")
             } catch {
@@ -416,13 +416,12 @@ final class BoardStore {
         case failed(String)
     }
 
-    func submitVerdict(taskId: String, kind: VerdictKind,
+    func submitVerdict(target: ReviewTarget, kind: VerdictKind,
                        comment: String) async -> VerdictOutcome {
-        guard let host = hostDeviceId else { return .failed("No board host") }
         do {
-            let receipt: VerdictReceipt = try await relay(for: host)
+            let receipt: VerdictReceipt = try await relay(for: target.host)
                 .call(method: "SubmitVerdict",
-                      params: ["taskId": taskId, "kind": kind.rawValue, "comment": comment])
+                      params: reviewVerdictParams(target, kind: kind, comment: comment))
             return .sent(receipt)
         } catch {
             return .failed(error.localizedDescription)

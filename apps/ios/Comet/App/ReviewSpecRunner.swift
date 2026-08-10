@@ -61,7 +61,14 @@ enum ReviewSpecRunner {
 
     private struct Spec: Decodable {
         var reviews: [ReviewCase]
+        var reviewable: [ReviewableCase]
         var runsTests: [CommandCase]
+    }
+
+    private struct ReviewableCase: Decodable {
+        var state: String
+        var attempts: Int
+        var expect: Bool
     }
 
     private struct ReviewCase: Decodable {
@@ -127,8 +134,10 @@ enum ReviewSpecRunner {
             return
         }
         let spec: Spec
+        let fixtureData: Data
         do {
-            spec = try JSONDecoder().decode(Spec.self, from: try Data(contentsOf: url))
+            fixtureData = try Data(contentsOf: url)
+            spec = try JSONDecoder().decode(Spec.self, from: fixtureData)
         } catch {
             // A fixture this side cannot read is itself a drift report: the
             // Rust emitted a shape the Swift models no longer describe.
@@ -179,8 +188,89 @@ enum ReviewSpecRunner {
                    "\(what): contract line (posted only)")
         }
 
+        // The navigation door is the shared Rust rule, not an iOS state list:
+        // every row with an attempt remains reviewable, including a cancelled
+        // attempt back at ready and history behind a working retry.
+        for c in spec.reviewable {
+            let row = TaskRow(id: "gh:o/r#1", identifier: "gh#1", title: "A task",
+                              state: BoardState.parse(c.state), attempts: c.attempts)
+            let what = "review door — \(c.state), attempts \(c.attempts)"
+            expect(boardReviewable(row), c.expect, "\(what): shared rule")
+            expect(boardShowsReviewDoor(row), c.expect, "\(what): detail-sheet presentation")
+        }
+
         for c in spec.runsTests {
             expect(reviewRunsTests(c.command), c.expect, "runsTests(\(c.command))")
+        }
+
+        // Required wire keys fail closed. These three are the dangerous ones:
+        // defaulting any of them manufactures a clean remainder. The only two
+        // top-level compatibility defaults remain decodable when absent.
+        if let object = try? JSONSerialization.jsonObject(with: fixtureData) as? [String: Any],
+           let reviews = object["reviews"] as? [[String: Any]],
+           let first = reviews.first,
+           let reviewObject = first["review"] as? [String: Any] {
+            for key in ["claims", "unclaimed", "changed"] {
+                var missing = reviewObject
+                missing.removeValue(forKey: key)
+                expect(decodesAttemptReview(missing), false, "wire: missing required \(key) fails")
+            }
+            for key in ["claims_error", "effects"] {
+                var compatible = reviewObject
+                compatible.removeValue(forKey: key)
+                expect(decodesAttemptReview(compatible), true,
+                       "wire: missing defaulted \(key) remains compatible")
+            }
+            var missingNullable = reviewObject
+            missingNullable.removeValue(forKey: "claimed_at")
+            expect(decodesAttemptReview(missingNullable), false,
+                   "wire: a missing nullable claimed_at is version skew, not null")
+        } else {
+            expect(false, true, "wire: fixture exposes a review object for strictness checks")
+        }
+
+        if let first = spec.reviews.first {
+            let loaded = LoadedAttemptReview(review: first.review, host: "host-that-answered")
+            expect(loaded.target.taskId, first.review.taskId,
+                   "RPC identity: target keeps the reviewed task")
+            expect(loaded.target.attempt, first.review.attempt,
+                   "RPC identity: target pins the reviewed attempt")
+            expect(loaded.target.host, "host-that-answered",
+                   "RPC identity: target keeps the host that answered")
+
+            let read = reviewReadParams(taskId: first.review.taskId)
+            expect(Set(read.keys), Set(["taskId"]), "RPC identity: exact read params")
+            expect(read["taskId"] as? String, first.review.taskId,
+                   "RPC identity: read task id")
+
+            let verdict = reviewVerdictParams(loaded.target, kind: .changesRequested,
+                                              comment: "Please fix it")
+            expect(Set(verdict.keys), Set(["taskId", "attempt", "kind", "comment"]),
+                   "RPC identity: exact verdict params")
+            expect(verdict["taskId"] as? String, first.review.taskId,
+                   "RPC identity: verdict task id")
+            expect(verdict["attempt"] as? Int64, first.review.attempt,
+                   "RPC identity: verdict attempt")
+            expect(verdict["kind"] as? String, VerdictKind.changesRequested.rawValue,
+                   "RPC identity: verdict kind")
+            expect(verdict["comment"] as? String, "Please fix it",
+                   "RPC identity: verdict comment")
+
+            expect(reviewPresentation(nil), .loading,
+                   "presentation: nil is the loading state")
+            let noPayload = "This row has no attempt to review."
+            expect(reviewPresentation(.failed(noPayload)),
+                   .unavailable(title: "Nothing to review", message: noPayload),
+                   "presentation: no payload is named, never a clean review")
+            expect(reviewPresentation(.read(loaded)), .review(loaded),
+                   "presentation: a loaded payload reaches the review card")
+
+            expect(reviewContextLine(first.review, workspace: "comet-board"),
+                   "gh#117 · PR #9 · comet-board",
+                   "header: identifier, PR, and workspace")
+            expect(reviewContextLine(first.review, workspace: nil),
+                   "gh#117 · PR #9 · r",
+                   "header: repository is the workspace fallback")
         }
 
         // The two rules the fixture cannot carry: `turn_pill` and
@@ -226,5 +316,10 @@ enum ReviewSpecRunner {
             ? "OK \(checks) checks, no drift"
             : "FAILED \(failures) of \(checks) checks")
         log("done")
+    }
+
+    private static func decodesAttemptReview(_ object: [String: Any]) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
+        return (try? JSONDecoder().decode(AttemptReview.self, from: data)) != nil
     }
 }

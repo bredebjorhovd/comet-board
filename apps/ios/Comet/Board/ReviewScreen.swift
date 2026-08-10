@@ -57,11 +57,39 @@ private enum ReviewMetrics {
 
 // MARK: - The screen
 
+enum ReviewLoad: Equatable {
+    case read(LoadedAttemptReview)
+    case failed(String)
+}
+
+/// The three things the screen can present. Factored from the SwiftUI body so
+/// the no-payload state is checked by the simulator runner instead of existing
+/// only as a screenshot path.
+enum ReviewPresentation: Equatable {
+    case loading
+    case unavailable(title: String, message: String)
+    case review(LoadedAttemptReview)
+}
+
+func reviewPresentation(_ load: ReviewLoad?) -> ReviewPresentation {
+    switch load {
+    case .none:
+        return .loading
+    case .failed(let message):
+        return .unavailable(title: "Nothing to review", message: message)
+    case .read(let loaded):
+        return .review(loaded)
+    }
+}
+
 struct ReviewScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openURL) private var openURL
 
     let taskId: String
+    /// The board row carries the Comet workspace; the review RPC deliberately
+    /// carries attempt facts only. Used for the reference's context line.
+    let workspace: String?
 
     /// Nil while the read is still out; the rest is the answer, good or bad.
     @State private var loaded: ReviewLoad?
@@ -77,20 +105,15 @@ struct ReviewScreen: View {
     @State private var openEvidence = false
     @State private var openClaims: Set<Int> = []
 
-    enum ReviewLoad {
-        case read(AttemptReview)
-        case failed(String)
-    }
-
     var body: some View {
         Group {
-            switch loaded {
-            case .none:
+            switch reviewPresentation(loaded) {
+            case .loading:
                 loading
-            case .failed(let message):
-                unavailable(message)
-            case .read(let review):
-                card(review)
+            case .unavailable(let title, let message):
+                unavailable(title: title, message: message)
+            case .review(let loaded):
+                card(loaded)
             }
         }
         .background(SheetStyle.panel.ignoresSafeArea())
@@ -117,14 +140,15 @@ struct ReviewScreen: View {
     /// another version. Named rather than drawn as an empty review: a blank
     /// claims list is a *claim* about the attempt, and this is the absence of
     /// one.
-    private func unavailable(_ message: String) -> some View {
-        ContentUnavailableView("Nothing to review",
+    private func unavailable(title: String, message: String) -> some View {
+        ContentUnavailableView(title,
                                systemImage: "text.magnifyingglass",
                                description: Text(message))
     }
 
-    private func card(_ review: AttemptReview) -> some View {
-        VStack(spacing: 0) {
+    private func card(_ loaded: LoadedAttemptReview) -> some View {
+        let review = loaded.review
+        return VStack(spacing: 0) {
             header(review)
             Divider().overlay(Theme.border)
             ScrollView {
@@ -143,7 +167,7 @@ struct ReviewScreen: View {
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
             if review.prUrl != nil {
-                bar(review)
+                bar(loaded)
             }
         }
     }
@@ -158,7 +182,7 @@ struct ReviewScreen: View {
                     .foregroundStyle(Theme.text)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(contextLine(review))
+                Text(reviewContextLine(review, workspace: workspace))
                     .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textSubtle)
                     .lineLimit(1)
@@ -176,17 +200,6 @@ struct ReviewScreen: View {
         }
         .padding(.horizontal, Theme.spaceLG)
         .padding(.vertical, Theme.spaceMD)
-    }
-
-    /// `gh#138 · PR #212 · attempt 2` — where this review sits, in one line.
-    private func contextLine(_ review: AttemptReview) -> String {
-        var parts = [review.brief.identifier]
-        if let pr = review.prUrl, let number = pr.split(separator: "/").last, !number.isEmpty {
-            parts.append("PR #\(number)")
-        }
-        if review.attemptNumber > 1 { parts.append("attempt \(review.attemptNumber)") }
-        if let branch = review.branch { parts.append(branch) }
-        return parts.joined(separator: " · ")
     }
 
     // MARK: The verdict
@@ -624,7 +637,8 @@ struct ReviewScreen: View {
     /// Whose turn it is, answered (§gh#239). Two buttons and not the desktop's
     /// three: a bare `Comment` is a conversation, and the chat it belongs in is
     /// one tap away on the board. What the phone is for is the decision.
-    private func bar(_ review: AttemptReview) -> some View {
+    private func bar(_ loaded: LoadedAttemptReview) -> some View {
+        let review = loaded.review
         let trimmed = comment.trimmingCharacters(in: .whitespacesAndNewlines)
         // Which verdict the sentence is about: with an empty box the only
         // button that can be pressed is Approve, and a bare approval is not
@@ -663,8 +677,8 @@ struct ReviewScreen: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: Theme.spaceSM) {
                     Spacer(minLength: 0)
-                    verdictButton(.approve, filled: false)
-                    verdictButton(.changesRequested, filled: true)
+                    verdictButton(.approve, target: loaded.target, filled: false)
+                    verdictButton(.changesRequested, target: loaded.target, filled: true)
                 }
             }
             if let submitError {
@@ -681,14 +695,15 @@ struct ReviewScreen: View {
         .overlay(alignment: .top) { hairline }
     }
 
-    private func verdictButton(_ kind: VerdictKind, filled: Bool) -> some View {
+    private func verdictButton(_ kind: VerdictKind, target: ReviewTarget,
+                               filled: Bool) -> some View {
         // GitHub refuses an empty `REQUEST_CHANGES` and it is right to: a
         // verdict with nothing in it tells the agent to change something
         // unnamed. So the button that needs prose is dark until there is some.
         let ready = !(kind.needsComment
             && comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         return Button {
-            send(kind)
+            send(kind, target: target)
         } label: {
             Text(sending == kind ? "Sending…" : kind.label)
                 .font(Theme.sans(Theme.textBody, weight: filled ? .medium : .regular))
@@ -712,13 +727,13 @@ struct ReviewScreen: View {
         return ready ? Theme.text : whiteAlpha(0.08)
     }
 
-    private func send(_ kind: VerdictKind) {
+    private func send(_ kind: VerdictKind, target: ReviewTarget) {
         guard sending == nil, receipt == nil else { return }
         sending = kind
         submitError = nil
         let text = comment.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
-            switch await model.submitVerdict(taskId: taskId, kind: kind, comment: text) {
+            switch await model.submitVerdict(target: target, kind: kind, comment: text) {
             case .sent(let sent):
                 receipt = sent
             case .failed(let message):

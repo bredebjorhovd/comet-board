@@ -82,7 +82,7 @@ struct BoardDetailSheet: View {
             }
             .navigationDestination(for: Inner.self) { inner in
                 switch inner {
-                case .review: ReviewScreen(taskId: taskId)
+                case .review: ReviewScreen(taskId: taskId, workspace: row?.workspace)
                 }
             }
         }
@@ -91,7 +91,7 @@ struct BoardDetailSheet: View {
             issue = await model.boardTaskDetail(taskId: taskId)
         }
         .onAppear {
-            if openReview, path.isEmpty, let row, boardReviewable(row) {
+            if openReview, path.isEmpty, let row, boardShowsReviewDoor(row) {
                 path = [.review]
             }
         }
@@ -199,15 +199,16 @@ struct BoardDetailSheet: View {
     ///
     /// It sits first because of what it is: the issue text below is what you
     /// asked for, and this is the only thing on the sheet that says what came
-    /// back. Only for a row with an ended attempt — `boardReviewable` — so a
-    /// ready row is not offered a screen that would have nothing on it.
+    /// back. `boardShowsReviewDoor` follows the shared attempts-only rule, so a
+    /// cancelled attempt on a ready row and history behind a live retry remain
+    /// reachable.
     ///
     /// It pushes rather than presenting: the review is a whole screen with its
     /// own bar, and a second sheet over this one would put two modals between a
     /// thumb and a verdict.
     @ViewBuilder
     private func reviewCard(_ row: TaskRow) -> some View {
-        if boardReviewable(row) {
+        if boardShowsReviewDoor(row) {
             VStack(alignment: .leading, spacing: 8) {
                 SheetLabel("The attempt")
                 SheetCard {

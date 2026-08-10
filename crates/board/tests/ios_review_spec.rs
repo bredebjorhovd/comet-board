@@ -33,6 +33,7 @@ use comet_board::claims::{
 use comet_board::effects::{CallSites, Effects, FileKind, FileScan, Ground};
 use comet_board::evidence::{Check, RunEvidence, runs_tests};
 use comet_board::verdict;
+use comet_proto::view::board::{TaskRow, reviewable};
 use serde_json::{Value, json};
 
 // ---- the vocabulary, as the fixture spells it ----------------------------
@@ -499,6 +500,37 @@ fn diff_totals(review: &AttemptReview) -> (String, u32, u32) {
     (label, added, removed)
 }
 
+/// One row for the shared review-door rule. Decoded from the published board
+/// wire shape so this fixture checks the same input the phone receives.
+fn reviewable_case(state: &str, attempts: usize) -> Value {
+    let row: TaskRow = serde_json::from_value(json!({
+        "id": "gh:o/r#1",
+        "identifier": "gh#1",
+        "title": "A task",
+        "state": state,
+        "source": "github",
+        "url": "https://github.com/o/r/issues/1",
+        "labels": [],
+        "dispatchable": true,
+        "gone": false,
+        "route": "r",
+        "workspace": "r",
+        "runtime": null,
+        "chat_id": null,
+        "pr_url": null,
+        "pr_number": null,
+        "branch": null,
+        "dispatched_by": null,
+        "dispatched_by_chat": null,
+        "last_outcome": null,
+        "last_outcome_at": null,
+        "attempts": attempts,
+        "reopened": 0
+    }))
+    .expect("published task row");
+    json!({ "state": state, "attempts": attempts, "expect": reviewable(&row) })
+}
+
 fn build() -> Value {
     let tests_cases: Vec<Value> = [
         "cargo test -p comet-ui",
@@ -531,6 +563,16 @@ fn build() -> Value {
             case("a clean remainder that is still wrong", &the_complete_but_wrong_one()),
             case("a branch the board never read", &the_unread_one()),
             case("binary, uncounted call sites, and an unrun suite", &the_unknowable_one()),
+        ],
+        "reviewable": [
+            reviewable_case("blocked", 1),
+            reviewable_case("working", 1),
+            reviewable_case("ready", 1),
+            reviewable_case("review", 1),
+            reviewable_case("failed", 1),
+            reviewable_case("done", 1),
+            reviewable_case("ready", 0),
+            reviewable_case("review", 0),
         ],
         "runsTests": tests_cases,
     })
@@ -571,7 +613,7 @@ fn the_cross_language_fixture_matches_this_reading() {
     // Report the case that moved rather than the whole document — a diff of
     // four hundred lines is a diff nobody reads.
     let mut moved = Vec::new();
-    for key in ["note", "runsTests"] {
+    for key in ["note", "reviewable", "runsTests"] {
         if disk.get(key) != built.get(key) {
             moved.push(format!("  {key} changed"));
         }

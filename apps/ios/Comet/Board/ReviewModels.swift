@@ -29,6 +29,42 @@
 import Foundation
 
 // MARK: - The wire shape
+//
+// **Required is required, and only serde's `#[serde(default)]` is optional.**
+//
+// The first cut of this file defaulted nearly every field to zero or `[]`, on
+// the reflex that a lenient decoder is a kind one. On this screen it is the
+// opposite: a payload missing `unclaimed`, `claims` or `changed` would have
+// decoded into a review that says *the claims account for the whole diff* —
+// manufacturing the one answer the screen exists to withhold. It also disarmed
+// the version-skew path, since `BoardStore.attemptReview` distinguishes a
+// `DecodingError` ("that host has a board and is on another build, stop
+// sweeping") from a refusal ("no board here, ask the next device") and nothing
+// could ever throw one.
+//
+// So each `decode` / `decodeIfPresent` below mirrors the Rust field for field:
+// `decodeIfPresent` **only** where `comet_board` writes `#[serde(default)]`
+// — `claims_error` and `effects` on the review, `symbols` and `call_sites` on a
+// claim, `binary` and `symbols` on a changed file. Everything else, including
+// the nullable ones, is `require`d: serde emits `null` for an `Option` with no
+// `skip_serializing_if`, so a *missing* key means a different shape and not an
+// absent value.
+
+/// Decode a key the Rust writes unconditionally, but whose value may be null.
+///
+/// `decodeIfPresent` alone cannot tell "the board sent null" from "the board
+/// never heard of this field", and those are the two facts this file must not
+/// confuse. Throws `.keyNotFound` on the second.
+private func requireNullable<T: Decodable, K: CodingKey>(
+    _ type: T.Type, _ c: KeyedDecodingContainer<K>, _ key: K
+) throws -> T? {
+    guard c.contains(key) else {
+        throw DecodingError.keyNotFound(key, DecodingError.Context(
+            codingPath: c.codingPath,
+            debugDescription: "\(key.stringValue) is written on every review the board serializes"))
+    }
+    return try c.decodeIfPresent(T.self, forKey: key)
+}
 
 /// What the agent was asked to do — the left-hand side of a review.
 struct ReviewBrief: Decodable, Hashable {
@@ -36,6 +72,26 @@ struct ReviewBrief: Decodable, Hashable {
     var title: String
     var url: String
     var body: String?
+
+    enum CodingKeys: String, CodingKey {
+        case identifier, title, url, body
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try c.decode(String.self, forKey: .identifier)
+        title = try c.decode(String.self, forKey: .title)
+        url = try c.decode(String.self, forKey: .url)
+        // An issue with no description sends `null`, never nothing.
+        body = try requireNullable(String.self, c, .body)
+    }
+
+    init(identifier: String, title: String, url: String, body: String? = nil) {
+        self.identifier = identifier
+        self.title = title
+        self.url = url
+        self.body = body
+    }
 }
 
 /// One file the attempt's branch touched, as git reports it.
@@ -56,9 +112,11 @@ struct ChangedFile: Decodable, Hashable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         path = try c.decode(String.self, forKey: .path)
-        status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
-        added = try c.decodeIfPresent(Int.self, forKey: .added) ?? 0
-        removed = try c.decodeIfPresent(Int.self, forKey: .removed) ?? 0
+        status = try c.decode(String.self, forKey: .status)
+        added = try c.decode(Int.self, forKey: .added)
+        removed = try c.decode(Int.self, forKey: .removed)
+        // `binary` and `symbols` are the two the Rust defaults — `symbols`
+        // arrived with §gh#235 and every row written before it has none.
         binary = try c.decodeIfPresent(Bool.self, forKey: .binary) ?? false
         symbols = try c.decodeIfPresent([String].self, forKey: .symbols) ?? []
     }
@@ -88,6 +146,28 @@ struct CallSites: Decodable, Hashable {
     /// The count in the base tree, or nil when the board could not read it —
     /// which is not zero, and must never render as "new".
     var before: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case symbol, now, before
+    }
+
+    /// Hand-written because Swift's synthesized decoder reaches for
+    /// `decodeIfPresent` on every `Optional`, which would let a missing
+    /// `before` read as "the board could not count it" — the chip that says
+    /// nothing — when the truth is that the payload is a shape this build does
+    /// not know.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        symbol = try c.decode(String.self, forKey: .symbol)
+        now = try c.decode(Int.self, forKey: .now)
+        before = try requireNullable(Int.self, c, .before)
+    }
+
+    init(symbol: String, now: Int, before: Int?) {
+        self.symbol = symbol
+        self.now = now
+        self.before = before
+    }
 }
 
 /// One claim, checked against the diff.
@@ -109,10 +189,12 @@ struct ClaimView: Decodable, Hashable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         text = try c.decode(String.self, forKey: .text)
-        files = try c.decodeIfPresent([String].self, forKey: .files) ?? []
+        files = try c.decode([String].self, forKey: .files)
+        matched = try c.decode([String].self, forKey: .matched)
+        unmatched = try c.decode([String].self, forKey: .unmatched)
+        // The two the Rust defaults, both for the same reason: they arrived
+        // with §gh#235 and §gh#236 over a column already full of claims.
         symbols = try c.decodeIfPresent([String].self, forKey: .symbols) ?? []
-        matched = try c.decodeIfPresent([String].self, forKey: .matched) ?? []
-        unmatched = try c.decodeIfPresent([String].self, forKey: .unmatched) ?? []
         callSites = try c.decodeIfPresent([CallSites].self, forKey: .callSites) ?? []
     }
 
@@ -146,12 +228,20 @@ enum DiffSource: Decodable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        switch try c.decodeIfPresent(String.self, forKey: .source) ?? "unavailable" {
+        // Internally tagged on `source`, and there is no fourth variant. An
+        // unrecognised tag is a board on another build, not an unreadable diff
+        // — reading it as `unavailable` would turn a version skew into a
+        // sentence about a reclaimed checkout that nobody said.
+        let source = try c.decode(String.self, forKey: .source)
+        switch source {
         case "checkout": self = .checkout
         case "recorded": self = .recorded
+        case "unavailable":
+            self = .unavailable(reason: try c.decode(String.self, forKey: .reason))
         default:
-            self = .unavailable(reason: try c.decodeIfPresent(String.self, forKey: .reason)
-                ?? "the board did not say")
+            throw DecodingError.dataCorruptedError(
+                forKey: .source, in: c,
+                debugDescription: "\(source) is not a diff source this build knows")
         }
     }
 
@@ -185,10 +275,12 @@ struct RunEvidence: Decodable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        commands = try c.decodeIfPresent(Int.self, forKey: .commands) ?? 0
-        failed = try c.decodeIfPresent(Int.self, forKey: .failed) ?? 0
-        checks = try c.decodeIfPresent([RunCheck].self, forKey: .checks) ?? []
-        truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+        // `RunEvidence` defaults nothing in the Rust, and a defaulted `checks`
+        // here would read as "nothing verified this" about a run that did.
+        commands = try c.decode(Int.self, forKey: .commands)
+        failed = try c.decode(Int.self, forKey: .failed)
+        checks = try c.decode([RunCheck].self, forKey: .checks)
+        truncated = try c.decode(Bool.self, forKey: .truncated)
     }
 
     init(commands: Int = 0, failed: Int = 0, checks: [RunCheck] = [], truncated: Bool = false) {
@@ -260,12 +352,13 @@ struct ReviewFileScan: Decodable, Hashable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         path = try c.decode(String.self, forKey: .path)
-        kind = try c.decodeIfPresent(FileKind.self, forKey: .kind)
-        testsAdded = try c.decodeIfPresent(Int.self, forKey: .testsAdded) ?? 0
-        testsRemoved = try c.decodeIfPresent(Int.self, forKey: .testsRemoved) ?? 0
-        api = try c.decodeIfPresent(Int.self, forKey: .api) ?? 0
-        schema = try c.decodeIfPresent(Int.self, forKey: .schema) ?? 0
-        configKeys = try c.decodeIfPresent(Int.self, forKey: .configKeys) ?? 0
+        // Written on every scan, `null` for a file the board has no rule for.
+        kind = try requireNullable(FileKind.self, c, .kind)
+        testsAdded = try c.decode(Int.self, forKey: .testsAdded)
+        testsRemoved = try c.decode(Int.self, forKey: .testsRemoved)
+        api = try c.decode(Int.self, forKey: .api)
+        schema = try c.decode(Int.self, forKey: .schema)
+        configKeys = try c.decode(Int.self, forKey: .configKeys)
     }
 
     init(path: String, kind: FileKind? = nil, testsAdded: Int = 0, testsRemoved: Int = 0,
@@ -304,6 +397,10 @@ struct ReviewEffects: Decodable, Hashable {
     }
 
     init(from decoder: Decoder) throws {
+        // Every field here IS `#[serde(default)]` in the Rust, and the default
+        // is `read: false` — which renders as "not read" rather than as five
+        // clean results. This is the one struct in the file where leniency is
+        // the contract rather than a shortcut.
         let c = try decoder.container(keyedBy: CodingKeys.self)
         read = try c.decodeIfPresent(Bool.self, forKey: .read) ?? false
         files = try c.decodeIfPresent([ReviewFileScan].self, forKey: .files) ?? []
@@ -374,26 +471,35 @@ struct AttemptReview: Decodable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // The remainder, the changed set and the diff source are the fields a
+        // defaulted decode would turn into a falsely clean review, so they lead
+        // the strictness rather than trailing it.
         taskId = try c.decode(String.self, forKey: .taskId)
-        attempt = try c.decodeIfPresent(Int64.self, forKey: .attempt) ?? 0
-        attemptNumber = try c.decodeIfPresent(Int.self, forKey: .attemptNumber) ?? 1
-        state = try c.decodeIfPresent(String.self, forKey: .state) ?? ""
-        outcome = try c.decodeIfPresent(String.self, forKey: .outcome)
-        branch = try c.decodeIfPresent(String.self, forKey: .branch)
-        worktree = try c.decodeIfPresent(String.self, forKey: .worktree)
-        prUrl = try c.decodeIfPresent(String.self, forKey: .prUrl)
+        attempt = try c.decode(Int64.self, forKey: .attempt)
+        attemptNumber = try c.decode(Int.self, forKey: .attemptNumber)
+        state = try c.decode(String.self, forKey: .state)
         brief = try c.decode(ReviewBrief.self, forKey: .brief)
-        claimedAt = try c.decodeIfPresent(String.self, forKey: .claimedAt)
+        claims = try c.decode([ClaimView].self, forKey: .claims)
+        unclaimed = try c.decode([ChangedFile].self, forKey: .unclaimed)
+        unmatchedAnchors = try c.decode([String].self, forKey: .unmatchedAnchors)
+        claimedCount = try c.decode(Int.self, forKey: .claimedCount)
+        changed = try c.decode([ChangedFile].self, forKey: .changed)
+        diff = try c.decode(DiffSource.self, forKey: .diff)
+        evidence = try c.decode(RunEvidence.self, forKey: .evidence)
+        // Written on every review, null where there is no answer. `claimed_at`
+        // especially: nil is what tells "never answered the contract" from
+        // "claimed nothing", and a nil invented by a missing key would put the
+        // screen on the wrong side of the distinction it exists to keep.
+        outcome = try requireNullable(String.self, c, .outcome)
+        branch = try requireNullable(String.self, c, .branch)
+        worktree = try requireNullable(String.self, c, .worktree)
+        prUrl = try requireNullable(String.self, c, .prUrl)
+        claimedAt = try requireNullable(String.self, c, .claimedAt)
+        uncommitted = try requireNullable(Int.self, c, .uncommitted)
+        // The only two the Rust marks `#[serde(default)]`: `claims_error`
+        // arrived with §gh#235 and `effects` with §gh#236, both over attempts
+        // already on disk.
         claimsError = try c.decodeIfPresent(String.self, forKey: .claimsError)
-        claims = try c.decodeIfPresent([ClaimView].self, forKey: .claims) ?? []
-        unclaimed = try c.decodeIfPresent([ChangedFile].self, forKey: .unclaimed) ?? []
-        unmatchedAnchors = try c.decodeIfPresent([String].self, forKey: .unmatchedAnchors) ?? []
-        claimedCount = try c.decodeIfPresent(Int.self, forKey: .claimedCount) ?? 0
-        changed = try c.decodeIfPresent([ChangedFile].self, forKey: .changed) ?? []
-        diff = try c.decodeIfPresent(DiffSource.self, forKey: .diff) ?? .unavailable(
-            reason: "the board did not say")
-        uncommitted = try c.decodeIfPresent(Int.self, forKey: .uncommitted)
-        evidence = try c.decodeIfPresent(RunEvidence.self, forKey: .evidence) ?? RunEvidence()
         effects = try c.decodeIfPresent(ReviewEffects.self, forKey: .effects) ?? ReviewEffects()
     }
 
@@ -909,6 +1015,112 @@ func reviewTurnPill(state: String, answered: Bool) -> TurnPill? {
     }
 }
 
+// MARK: - Which attempt, on which host
+
+/// The identity of the thing a reviewer just read, carried from the read to the
+/// write.
+///
+/// Two facts, and both of them were wrong in this screen's first cut:
+///
+/// - **The attempt.** `SubmitVerdict` takes an optional `attempt` and resolves
+///   the task's *latest* when it is omitted. Omitting it means a retry that
+///   starts while the screen is open silently re-points Approve at work the
+///   human never saw — the one mistake this whole screen exists to prevent,
+///   made by the screen itself. The verdict is pinned to `review.attempt`.
+/// - **The host.** `board.db` lives on whichever device hosts the board, and
+///   the read sweeps candidates until one answers. That answer can come from a
+///   device other than `hostDeviceId` — the sweep exists precisely because the
+///   watch stream may not have settled — so the device that answered is carried
+///   here and the write is addressed to it. A verdict posted to a different
+///   host is a verdict about a different board.
+struct ReviewTarget: Equatable, Hashable {
+    var taskId: String
+    /// The attempt row id the reader was shown, never "whichever is latest".
+    var attempt: Int64
+    /// The device that answered `ReadAttemptReview`.
+    var host: String
+}
+
+/// A decoded review together with the identity established by the read that
+/// produced it. Keeping these in one value makes it impossible for the screen
+/// to render one attempt and later reconstruct a write target from mutable
+/// board state.
+struct LoadedAttemptReview: Equatable, Hashable {
+    var review: AttemptReview
+    var target: ReviewTarget
+
+    init(review: AttemptReview, host: String) {
+        self.review = review
+        target = review.target(host: host)
+    }
+}
+
+extension AttemptReview {
+    /// This review's identity, once the host that answered for it is known.
+    func target(host: String) -> ReviewTarget {
+        ReviewTarget(taskId: taskId, attempt: attempt, host: host)
+    }
+}
+
+/// The params `ReadAttemptReview` is called with.
+///
+/// Deliberately unpinned: opening the screen asks for whatever the latest
+/// attempt is, because that is the one a reviewer means. Pinning starts at the
+/// answer — see [`ReviewTarget`] — not at the question.
+func reviewReadParams(taskId: String) -> [String: Any] {
+    ["taskId": taskId]
+}
+
+/// The params `SubmitVerdict` is called with. Pure, and separate from the
+/// call, so the identity going out can be asserted without a board to post to.
+func reviewVerdictParams(_ target: ReviewTarget, kind: VerdictKind,
+                         comment: String) -> [String: Any] {
+    [
+        "taskId": target.taskId,
+        "attempt": target.attempt,
+        "kind": kind.rawValue,
+        "comment": comment,
+    ]
+}
+
+// MARK: - Header context
+
+/// The reference's context line: identifier · pull request · workspace (or
+/// repository when the row did not carry a workspace). Branch and attempt are
+/// deliberately absent: they are run details, not where the task belongs.
+func reviewContextLine(_ review: AttemptReview, workspace: String?) -> String {
+    var parts = [review.brief.identifier]
+    if let number = reviewPullRequestNumber(review.prUrl) {
+        parts.append("PR #\(number)")
+    }
+    let namedWorkspace = workspace?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let namedWorkspace, !namedWorkspace.isEmpty {
+        parts.append(namedWorkspace)
+    } else if let repository = reviewRepository(review.brief.url) ?? reviewRepository(review.prUrl) {
+        parts.append(repository)
+    }
+    return parts.joined(separator: " · ")
+}
+
+private func reviewPullRequestNumber(_ raw: String?) -> String? {
+    guard let raw, let url = URL(string: raw) else { return nil }
+    let parts = url.pathComponents.filter { $0 != "/" }
+    guard let pull = parts.firstIndex(of: "pull"), parts.indices.contains(pull + 1) else {
+        return nil
+    }
+    let number = parts[pull + 1]
+    return number.allSatisfy(\.isNumber) ? number : nil
+}
+
+private func reviewRepository(_ raw: String?) -> String? {
+    guard let raw, let url = URL(string: raw), url.host?.lowercased() == "github.com" else {
+        return nil
+    }
+    let parts = url.pathComponents.filter { $0 != "/" }
+    guard parts.count >= 2 else { return nil }
+    return parts[1]
+}
+
 // MARK: - The verdict, going out (§gh#239)
 
 /// What a reviewer can send. `comment` is the one that needs words; the other
@@ -970,16 +1182,19 @@ struct VerdictReceipt: Decodable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        taskId = try c.decodeIfPresent(String.self, forKey: .taskId) ?? ""
-        attempt = try c.decodeIfPresent(Int64.self, forKey: .attempt) ?? 0
-        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? ""
-        reviewId = try c.decodeIfPresent(Int64.self, forKey: .reviewId) ?? 0
-        posted = try c.decodeIfPresent(Bool.self, forKey: .posted) ?? false
-        chatId = try c.decodeIfPresent(String.self, forKey: .chatId)
-        delivered = try c.decodeIfPresent(Bool.self, forKey: .delivered) ?? false
-        notDelivered = try c.decodeIfPresent(String.self, forKey: .notDelivered)
-        unclaimed = try c.decodeIfPresent(Int.self, forKey: .unclaimed) ?? 0
-        payload = try c.decodeIfPresent(String.self, forKey: .payload) ?? ""
+        // `VerdictReceipt` defaults nothing either, and the field that matters
+        // most is `delivered`: a false invented by a missing key would tell a
+        // reviewer nobody was told, about a verdict that reached the agent.
+        taskId = try c.decode(String.self, forKey: .taskId)
+        attempt = try c.decode(Int64.self, forKey: .attempt)
+        kind = try c.decode(String.self, forKey: .kind)
+        reviewId = try c.decode(Int64.self, forKey: .reviewId)
+        posted = try c.decode(Bool.self, forKey: .posted)
+        chatId = try requireNullable(String.self, c, .chatId)
+        delivered = try c.decode(Bool.self, forKey: .delivered)
+        notDelivered = try requireNullable(String.self, c, .notDelivered)
+        unclaimed = try c.decode(Int.self, forKey: .unclaimed)
+        payload = try c.decode(String.self, forKey: .payload)
     }
 
     init(taskId: String, attempt: Int64 = 0, kind: String = "", reviewId: Int64 = 0,

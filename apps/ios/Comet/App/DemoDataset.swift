@@ -447,29 +447,23 @@ final class DemoDataset {
         return try? JSONDecoder().decode(AttemptReview.self, from: data)
     }
 
-    /// Does this demo row have an attempt to review at all? The same question
-    /// `boardReviewable` asks of a live row, answered from the fixture so the
-    /// door and the screen behind it cannot disagree.
-    static func reviewable(taskId: String) -> Bool {
-        reviewPayloads[taskId] != nil
-    }
-
     /// The receipt a demo verdict comes back with. Delivered into the branch,
     /// because that is the case worth seeing: the phone said something and an
     /// agent in a checkout was told.
-    static func receipt(taskId: String, kind: VerdictKind, comment: String) -> VerdictReceipt {
-        let unclaimed = review(taskId: taskId)?.unclaimed.count ?? 0
+    static func receipt(target: ReviewTarget, kind: VerdictKind, comment: String) -> VerdictReceipt {
+        let unclaimed = review(taskId: target.taskId)?.unclaimed.count ?? 0
         let json = """
-            {"task_id": "\(taskId)", "attempt": 1, "kind": "\(kind.rawValue)",
+            {"task_id": "\(target.taskId)", "attempt": \(target.attempt), "kind": "\(kind.rawValue)",
              "review_id": 4021, "posted": true, "chat_id": "chat-tabs",
              "delivered": \(reviewWorthDelivering(kind, comment)),
-             "unclaimed": \(unclaimed), "payload": ""}
+             "not_delivered": null, "unclaimed": \(unclaimed), "payload": ""}
             """
         // The fixture is this file's own literal, so a decode that fails here
         // is a bug in the model rather than a thing the demo should invent
         // around — the fallback says the plain truth and nothing more.
         return (try? JSONDecoder().decode(VerdictReceipt.self, from: Data(json.utf8)))
-            ?? VerdictReceipt(taskId: taskId, kind: kind.rawValue, posted: true)
+            ?? VerdictReceipt(taskId: target.taskId, attempt: target.attempt,
+                              kind: kind.rawValue, posted: true)
     }
 
     /// The demo's review row: a codex attempt that claimed three things, and a

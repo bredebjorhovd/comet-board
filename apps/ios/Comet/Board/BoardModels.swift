@@ -678,20 +678,20 @@ func boardDetailActions(_ row: TaskRow) -> [BoardRowAction] {
 /// Not a `BoardRowAction`: the actions are the shared rule `row_actions` owns,
 /// and the review is a *screen* rather than something a row does — the desktop
 /// reaches it through `shell::Route::Review`, not through a chip. This is the
-/// phone's own door rule, and it is deliberately narrow.
-///
-/// An attempt has to have ENDED. A `working` row's agent has not submitted its
-/// claims yet, so a review of it would be the screen's unknown state dressed up
-/// as a finding about work still in progress — and a `ready` row with attempts
-/// behind it has had them cleared away. What is left is exactly the three
-/// states a human is looked at over: the review gate, a question, and a run
-/// that died.
+/// phone's port of `comet_proto::view::board::reviewable`, exactly: an attempt
+/// exists once `attempts > 0`, independently of the row's current state. That
+/// includes a cancelled attempt returned to `ready`, and the historical
+/// attempt while a retry is `working`; both still have a diff, claims and a
+/// journal worth reading.
 func boardReviewable(_ row: TaskRow) -> Bool {
-    guard row.attempts > 0 else { return false }
-    switch row.boardState {
-    case .review, .blocked, .failed, .done: return true
-    case .working, .ready: return false
-    }
+    row.attempts > 0
+}
+
+/// The detail sheet's navigation door. Kept as a named derivation so the
+/// cross-language review runner checks the actual presentation decision, not
+/// only the lower-level row rule it is built from.
+func boardShowsReviewDoor(_ row: TaskRow) -> Bool {
+    boardReviewable(row)
 }
 
 /// The URL an action opens, or nil for the ones that are not links.
