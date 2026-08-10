@@ -64,18 +64,22 @@
 //! neither says why rather than rendering an empty diff.
 
 use gpui::{
-    AnyElement, Context, Entity, ScrollHandle, SharedString, Task, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, ScrollHandle, SharedString, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 
 use comet_board::claims::{
     AnchorKind, AttemptReview, ChangedFile, ClaimMark, ClaimView, DiffSource, FindingKind, Tone,
     Verdict, anchor_kind,
 };
+use comet_board::verdict::{self, VerdictKind, VerdictReceipt};
 use comet_board::effects::{Chip, Ground};
 use comet_proto::view::board;
 use comet_rpc::methods;
 
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
+use crate::popover;
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -92,6 +96,28 @@ const BRIEF_MAX_H: f32 = 220.0;
 /// unclaimed rows line up as one table even though they are drawn by different
 /// functions.
 const FILE_GUTTER: f32 = 10.0;
+
+/// How tall the delivery preview is allowed to be before it fades out
+/// (§gh#239). Enough for the header, a verdict, a sentence and a couple of
+/// unclaimed lines — the shape of the payload rather than all of it, which is
+/// what the fade says.
+const PREVIEW_MAX_H: f32 = 168.0;
+
+/// Where the preview starts fading, as the design gives it: a mask from 72% of
+/// the card's height to its bottom edge. Expressed as the band
+/// [`crate::edge_fade`] wants, so the number that moves is the design's one.
+const PREVIEW_FADE_AT: f32 = 0.72;
+
+/// The payload's own leading, in the mono 11/17 the design specifies.
+const PREVIEW_LINE_H: f32 = 17.0;
+
+/// The three verdicts, in the order the bar draws them: quietest first, so the
+/// one that interrupts an agent is not the one under the cursor by default.
+const VERDICTS: [(VerdictKind, &str); 3] = [
+    (VerdictKind::Comment, "Comment"),
+    (VerdictKind::Approve, "Approve"),
+    (VerdictKind::ChangesRequested, "Request changes"),
+];
 
 /// One chip on the effects row, and under a claim (§gh#236). A row of these is
 /// the densest thing on the screen, so the numbers are the design's: 22 high,
@@ -124,6 +150,25 @@ pub struct ReviewPanel {
     task: Option<Task<()>>,
     body_scroll: ScrollHandle,
     brief_scroll: ScrollHandle,
+    // -- the verdict bar (§gh#239) -------------------------------------------
+    /// What the reviewer is writing.
+    comment: Entity<ComposerInput>,
+    /// Which verdict the bar is armed with. Held rather than decided at the
+    /// click, because the preview has to show the payload *before* submit and
+    /// a payload that did not know its own verdict would be a preview of
+    /// something else.
+    kind: VerdictKind,
+    submitting: bool,
+    /// What the last submission did — where it went, and what it could not
+    /// reach. Kept on screen: "posted, and the chat is gone" is the one
+    /// outcome a reviewer has to know about, and it is not an error.
+    receipt: Option<VerdictReceipt>,
+    submit_error: Option<SharedString>,
+    submit_task: Option<Task<()>>,
+    /// The comment box's events: every edit, so the preview follows the
+    /// typing, and Enter, which submits here as it does everywhere else in
+    /// this app (shift-Enter is the newline).
+    _edits: Subscription,
 }
 
 impl ReviewPanel {
@@ -133,6 +178,22 @@ impl ReviewPanel {
         attempt: Option<i64>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let comment = cx.new(|cx| {
+            ComposerInput::new(
+                "What is wrong, or what is right — the agent reads this.",
+                cx,
+            )
+        });
+        // The preview promises "this is what will be sent", which is only true
+        // if it moves with the sentence being written.
+        let edits = cx.subscribe(
+            &comment,
+            |panel: &mut Self, _, event: &ComposerInputEvent, cx| match event {
+                ComposerInputEvent::Edited => cx.notify(),
+                ComposerInputEvent::Submitted => panel.submit(cx),
+                _ => {}
+            },
+        );
         let mut panel = Self {
             state,
             task_id,
@@ -144,6 +205,13 @@ impl ReviewPanel {
             task: None,
             body_scroll: ScrollHandle::new(),
             brief_scroll: ScrollHandle::new(),
+            comment,
+            kind: VerdictKind::Comment,
+            submitting: false,
+            receipt: None,
+            submit_error: None,
+            submit_task: None,
+            _edits: edits,
         };
         panel.reload(cx);
         panel
@@ -217,6 +285,70 @@ impl ReviewPanel {
                     last.unwrap_or_else(|| "No device on this account hosts a board".into())
                         .into(),
                 );
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Submit the armed verdict (§gh#239): one review on the pull request, one
+    /// prompt into the checkout the agent is still in.
+    ///
+    /// Sent to the device that answered the read, not swept for again: this is
+    /// a write, and a write that wandered to a second board would be a verdict
+    /// posted about somebody else's row. The unclaimed changes are not sent —
+    /// they are derived on that host from the diff, so the payload cannot
+    /// disagree with the screen that promised it.
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        if self.submitting {
+            return;
+        }
+        let comment = self.comment.read(cx).text().trim().to_string();
+        if self.kind.needs_comment() && comment.is_empty() {
+            self.submit_error = Some("Write something first — an empty verdict is not one.".into());
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.submit_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let mut params = serde_json::json!({
+            "taskId": self.task_id,
+            "kind": self.kind.as_str(),
+            "comment": comment,
+        });
+        if let Some(object) = params.as_object_mut() {
+            if let Some(review) = &self.review {
+                object.insert("attempt".into(), serde_json::json!(review.attempt));
+            }
+            if let Some(host) = self.host.as_deref() {
+                object.insert("targetDeviceId".into(), serde_json::json!(host));
+            }
+        }
+        self.submitting = true;
+        self.submit_error = None;
+        self.receipt = None;
+        cx.notify();
+        self.submit_task = Some(cx.spawn(async move |this, cx| {
+            let reply = engine.client().call(methods::SUBMIT_VERDICT, params).await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.submitting = false;
+                match reply.map(serde_json::from_value::<VerdictReceipt>) {
+                    Ok(Ok(receipt)) => {
+                        // The verdict is sent; the box is for the next one. A
+                        // resend would be refused as the same submission
+                        // anyway, but leaving it there invites the click.
+                        panel
+                            .comment
+                            .update(cx, |input, cx| input.set_text(String::new(), cx));
+                        panel.receipt = Some(receipt);
+                    }
+                    Ok(Err(err)) => {
+                        panel.submit_error = Some(format!("Unreadable receipt: {err}").into());
+                    }
+                    Err(err) => panel.submit_error = Some(err.to_string().into()),
+                }
                 cx.notify();
             });
         }));
@@ -1021,6 +1153,245 @@ impl ReviewPanel {
             .into_any_element()
     }
 
+    /// What the submission did, in one line. Not an error even when nothing
+    /// was delivered: a verdict that reached the pull request and not the chat
+    /// is a real outcome, and the reviewer is the person who needs to know it
+    /// happened.
+    fn receipt_line(receipt: &VerdictReceipt) -> String {
+        let posted = if receipt.posted {
+            "Posted on the pull request"
+        } else {
+            // The idempotent path: this exact verdict was already submitted.
+            "Already on the pull request"
+        };
+        match (receipt.delivered, receipt.not_delivered.as_deref()) {
+            (true, _) => format!("{posted}, and delivered into the chat once."),
+            (false, Some(why)) => format!("{posted}. Nothing was delivered into the chat: {why}."),
+            (false, None) => format!("{posted}."),
+        }
+    }
+
+    /// The payload, before it is sent.
+    ///
+    /// Rendered from [`comet_board::verdict::compose`] — the same function the
+    /// board sends with, called here rather than reimplemented, because the
+    /// one promise this card makes is that it is showing what will be sent.
+    /// Mono 11/17 in a dashed card, faded out at the bottom: it is the shape of
+    /// the message, not a document to read.
+    fn render_preview(&self, review: &AttemptReview, comment: &str, theme: &Theme) -> AnyElement {
+        let payload = verdict::compose(review, self.kind, comment);
+        let lines: Vec<AnyElement> = payload
+            .lines()
+            .map(|line| {
+                div()
+                    .flex_none()
+                    .h(px(PREVIEW_LINE_H))
+                    .min_w_0()
+                    .truncate()
+                    .text_color(if line.starts_with("[unclaimed]") {
+                        // The one thing in the payload the reviewer did not
+                        // type, and the reason it is worth previewing.
+                        theme.danger
+                    } else if line.starts_with('[') || line.starts_with("comet-board:") {
+                        theme.text_muted
+                    } else {
+                        theme.text_subtle
+                    })
+                    .child(SharedString::from(line.to_string()))
+                    .into_any_element()
+            })
+            .collect();
+        // Whether the payload runs past the card. Counted rather than measured
+        // — a long comment wraps and this does not know it — so the fade is
+        // sometimes absent from a payload that just overflows, and never
+        // present on one that plainly does not.
+        let overflows = lines.len() as f32 * PREVIEW_LINE_H > PREVIEW_MAX_H;
+        let body = div()
+            .flex()
+            .flex_col()
+            .font_family(theme.font_mono.clone())
+            .text_size(px(Theme::TEXT_CAPTION))
+            .line_height(px(PREVIEW_LINE_H))
+            .children(lines);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_XS))
+            .child(Self::heading(theme, "WILL BE DELIVERED ON SUBMIT", None))
+            .child(
+                div()
+                    .max_h(px(PREVIEW_MAX_H))
+                    .overflow_hidden()
+                    .p(px(Theme::SPACE_SM))
+                    .rounded(px(Theme::RADIUS_ROW))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(theme.border_strong)
+                    .child(crate::edge_fade::edge_faded(
+                        PREVIEW_MAX_H * (1.0 - PREVIEW_FADE_AT),
+                        false,
+                        overflows,
+                        body,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// The verdict bar: the comment, the three verdicts, and the sentence that
+    /// says where it goes.
+    ///
+    /// Absent when there is no pull request to review — the whole bar is about
+    /// posting one, and a row with no PR has nowhere to post it.
+    fn render_verdict_bar(
+        &mut self,
+        review: &AttemptReview,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        review.pr_url.as_ref()?;
+        let comment = self.comment.read(cx).text().trim().to_string();
+        let armed = self.kind;
+        let submitting = self.submitting;
+        let ready = !(armed.needs_comment() && comment.is_empty());
+        let preview = self.render_preview(review, &comment, theme);
+        // What the screen promises. Delivery into the chat is the default and
+        // the point; the two ways it does not happen are a verdict not worth
+        // interrupting anybody with (a bare approval), and an author who has
+        // moved — which only the board can know, and which the receipt says
+        // afterwards rather than the bar guessing at beforehand.
+        let contract = verdict::contract_line(review, verdict::worth_delivering(armed, &comment));
+        let picker = div()
+            .flex()
+            .flex_row()
+            .gap(px(Theme::SPACE_XS))
+            .children(VERDICTS.map(|(kind, label)| {
+                let on = kind == armed;
+                let loud = kind == VerdictKind::ChangesRequested;
+                div()
+                    .id(SharedString::from(format!("verdict-{}", kind.as_str())))
+                    .flex_none()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .border_1()
+                    .border_color(if on && loud {
+                        theme.danger.opacity(0.45)
+                    } else if on {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    })
+                    .bg(if on && loud {
+                        theme.danger.opacity(0.10)
+                    } else if on {
+                        theme.wash(0.06)
+                    } else {
+                        theme.wash(0.0)
+                    })
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(if on && loud {
+                        theme.danger
+                    } else if on {
+                        theme.text
+                    } else {
+                        theme.text_subtle
+                    })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.wash(0.10)))
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.kind = kind;
+                        panel.submit_error = None;
+                        cx.notify();
+                    }))
+            }));
+        let bar = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_SM))
+            .pt(px(Theme::SPACE_MD))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(preview)
+            .child(
+                div()
+                    .min_h(px(52.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(Theme::RADIUS_ROW))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.wash(0.03))
+                    .text_size(px(Theme::TEXT_BODY))
+                    .child(self.comment.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .child(picker)
+                    .child(div().flex_1())
+                    .child(
+                        popover::btn_primary(
+                            theme,
+                            if submitting {
+                                "Submitting…"
+                            } else {
+                                "Submit"
+                            },
+                        )
+                        .id("verdict-submit")
+                        .h(px(26.0))
+                        .flex()
+                        .items_center()
+                        .when(submitting || !ready, |el| el.opacity(0.5))
+                        .on_click(cx.listener(|panel, _, _, cx| panel.submit(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(Theme::SPACE_SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(contract)),
+                    ),
+            )
+            .when_some(self.submit_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.warning)
+                        .child(error),
+                )
+            })
+            .when_some(self.receipt.as_ref(), |el, receipt| {
+                let told = receipt.delivered;
+                el.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(if told {
+                            theme.settled
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(SharedString::from(Self::receipt_line(receipt))),
+                )
+            });
+        Some(bar.into_any_element())
+    }
+
     /// The quiet line under everything: which device answered.
     fn render_host(&self, theme: &Theme, cx: &gpui::App) -> AnyElement {
         let label = match self.host.as_deref() {
@@ -1090,6 +1461,7 @@ impl Render for ReviewPanel {
         let evidence = Self::render_evidence(&review, &theme);
         let remainder = Self::render_remainder(&review, &theme);
         let host = self.render_host(&theme, cx);
+        let bar = self.render_verdict_bar(&review, &theme, cx);
 
         // The question in order — what was asked, what the branch did, what the
         // agent says it did, what the board saw the run do, and what nobody
@@ -1112,9 +1484,12 @@ impl Render for ReviewPanel {
             .child(remainder)
             .child(host);
 
+        // The verdict bar is pinned under the scroll for the same reason the
+        // verdict strip is pinned above it: the thing you came to do must not
+        // be reachable only by scrolling past a long issue body.
         motion::fade_quick(
             SharedString::from(format!("review-in-{}", review.task_id)),
-            card.child(header).child(verdict).child(body),
+            card.child(header).child(verdict).child(body).children(bar),
         )
         .into_any_element()
     }
@@ -1146,6 +1521,113 @@ mod tests {
             assert_ne!(alarm, unknown);
             assert_ne!(settled, unknown);
         }
+    }
+
+    /// A submission is not an error, and the two ways it lands are not the
+    /// same sentence. "Posted and delivered" and "posted, and the author is
+    /// gone" are the difference between a review that arrived and one that is
+    /// sitting on GitHub waiting for somebody to notice it.
+    #[test]
+    fn the_receipt_says_what_reached_the_chat_and_what_did_not() {
+        let base = VerdictReceipt {
+            task_id: "gh:o/r#138".into(),
+            attempt: 7,
+            kind: VerdictKind::ChangesRequested,
+            review_id: 900,
+            posted: true,
+            chat_id: Some("chat-1".into()),
+            delivered: true,
+            not_delivered: None,
+            unclaimed: 2,
+            payload: String::new(),
+        };
+        assert_eq!(
+            ReviewPanel::receipt_line(&base),
+            "Posted on the pull request, and delivered into the chat once."
+        );
+        // The idempotent path says so rather than pretending it just posted.
+        let retried = VerdictReceipt {
+            posted: false,
+            ..base.clone()
+        };
+        assert!(
+            ReviewPanel::receipt_line(&retried).starts_with("Already on the pull request"),
+            "{}",
+            ReviewPanel::receipt_line(&retried)
+        );
+        let undelivered = VerdictReceipt {
+            delivered: false,
+            not_delivered: Some("chat chat-1 no longer holds the agent".into()),
+            ..base
+        };
+        let line = ReviewPanel::receipt_line(&undelivered);
+        assert!(line.contains("Nothing was delivered"), "{line}");
+        assert!(line.contains("no longer holds the agent"), "{line}");
+    }
+
+    /// The preview is the payload, not a paraphrase of it: it is composed by
+    /// the same function the board sends with, so the card cannot promise one
+    /// message and the chat receive another — including the unclaimed lines,
+    /// which are the part nobody typed.
+    /// A finished attempt with one change nobody claimed — the shape the
+    /// preview is about.
+    fn reviewed() -> AttemptReview {
+        let unclaimed = ChangedFile {
+            path: "Cargo.toml".into(),
+            status: "A".into(),
+            added: 1,
+            removed: 0,
+            binary: false,
+            symbols: vec![],
+        };
+        AttemptReview {
+            // gh#236's field, defaulted: read = false, so this fixture claims
+            // nothing about effects it does not exercise.
+            effects: Default::default(),
+            task_id: "gh:o/r#138".into(),
+            attempt: 7,
+            attempt_number: 1,
+            state: "review".into(),
+            outcome: Some("done".into()),
+            branch: Some("board/gh-138".into()),
+            worktree: Some("/wt/gh-138-1".into()),
+            pr_url: Some("https://github.com/o/r/pull/212".into()),
+            brief: comet_board::claims::Brief {
+                identifier: "gh#138".into(),
+                title: "Active owns a chat's row while its session is live".into(),
+                url: "https://github.com/o/r/issues/138".into(),
+                body: None,
+            },
+            claimed_at: Some("2026-08-09T10:00:00Z".into()),
+            claims_error: None,
+            remainder: comet_board::claims::Remainder {
+                unclaimed: vec![unclaimed.clone()],
+                claimed: 0,
+                ..Default::default()
+            },
+            changed: vec![unclaimed],
+            diff: DiffSource::Checkout,
+            uncommitted: Some(0),
+            evidence: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_preview_is_the_payload_the_board_will_send() {
+        let review = reviewed();
+        let payload = verdict::compose(
+            &review,
+            VerdictKind::ChangesRequested,
+            "Why does this need itertools?",
+        );
+        assert!(
+            payload.contains("[review · changes requested]"),
+            "{payload}"
+        );
+        assert!(payload.contains("[unclaimed] Cargo.toml"), "{payload}");
+        // And the card fades where the design says it does, at 72% of its own
+        // height — the band is the remainder of it.
+        assert!((PREVIEW_MAX_H * (1.0 - PREVIEW_FADE_AT) - 168.0 * 0.28).abs() < 0.01);
     }
 
     /// The tone the surface paints is the reading's, never the renderer's —

@@ -1278,6 +1278,10 @@ fn forwardable(method: &str) -> bool {
             // an agent submitting claims is usually not sitting on it.
             | methods::SUBMIT_CLAIMS
             | methods::READ_ATTEMPT_REVIEW
+            // A verdict is written on a laptop and lands in two places that
+            // are both on the box: GitHub, with the board's credential, and
+            // the chat the box is hosting (§gh#239).
+            | methods::SUBMIT_VERDICT
             | methods::LIST_BOARD_RUNTIMES
             // Throughput is read off `board.db`, which only the box has
             // (gh#143) — a laptop's stats page is asking about the board, not
@@ -1726,6 +1730,36 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&review)
+            }
+            // The outbound half (§gh#239): one review on GitHub, one prompt
+            // into the checkout the agent is still in, the remainder on both.
+            // The refusals — a closed pull request, a verdict with nothing in
+            // it — come back as the call's error, because they are decided
+            // where the pull request and the diff are.
+            methods::SUBMIT_VERDICT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    #[serde(default)]
+                    attempt: Option<i64>,
+                    kind: String,
+                    #[serde(default)]
+                    comment: String,
+                }
+                let p: P = parse_params(params)?;
+                let kind = comet_board::verdict::VerdictKind::parse(&p.kind).ok_or_else(|| {
+                    RpcError::BadParams(format!(
+                        "{}: a verdict is `comment`, `approve` or `changes_requested`",
+                        p.kind
+                    ))
+                })?;
+                let receipt = self
+                    .board()?
+                    .submit_verdict(&p.task_id, p.attempt, kind, &p.comment)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&receipt)
             }
             // The routing surface (gh#75). Served off the board's own paths, so
             // this answers about the config the running loop reads — and keeps

@@ -44,3 +44,4 @@ pub mod skill;
 pub mod sources;
 pub mod stats;
 pub mod sync;
+pub mod verdict;

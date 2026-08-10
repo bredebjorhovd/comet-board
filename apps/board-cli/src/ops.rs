@@ -28,6 +28,7 @@ use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
 use comet_board::rows::TaskRow;
 use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
+use comet_board::verdict::VerdictReceipt;
 use comet_proto::Device;
 use comet_proto::view::board as view;
 use comet_rpc::{RpcClient, connect_ws, methods};
@@ -336,6 +337,79 @@ pub fn print_claim_result(review: &AttemptReview, json: bool) -> Result<()> {
         print!("{}", render_claim_result(review));
     }
     Ok(())
+}
+
+/// Submit a verdict on an attempt's pull request (§gh#239).
+///
+/// The unclaimed changes are not a parameter here either: they are derived on
+/// the board's host and attached to both copies, so a caller cannot send a
+/// verdict whose remainder disagrees with the one `review` just printed it.
+pub async fn submit_verdict(
+    board: &Board,
+    task_id: &str,
+    attempt: Option<i64>,
+    kind: &str,
+    comment: &str,
+) -> Result<VerdictReceipt> {
+    let mut params = serde_json::json!({
+        "taskId": task_id, "kind": kind, "comment": comment
+    });
+    if let (Some(attempt), Some(object)) = (attempt, params.as_object_mut()) {
+        object.insert("attempt".into(), serde_json::json!(attempt));
+    }
+    let reply = board
+        .client
+        .call(methods::SUBMIT_VERDICT, board.params(params))
+        .await?;
+    serde_json::from_value(reply).context("parsing SubmitVerdict reply")
+}
+
+/// What `verdict` prints back: where it went, and — the part worth reading —
+/// where it did not.
+pub fn print_verdict(receipt: &VerdictReceipt, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(receipt)?);
+    } else {
+        print!("{}", render_verdict(receipt));
+    }
+    Ok(())
+}
+
+pub fn render_verdict(receipt: &VerdictReceipt) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "· {} on the pull request{}",
+        receipt.kind.label(),
+        if receipt.posted {
+            ""
+        } else {
+            " — already posted, nothing sent twice"
+        }
+    );
+    match (receipt.delivered, receipt.not_delivered.as_deref()) {
+        (true, _) => {
+            let _ = writeln!(
+                out,
+                "· delivered into chat {}",
+                receipt.chat_id.as_deref().unwrap_or("?")
+            );
+        }
+        (false, Some(why)) => {
+            let _ = writeln!(out, "! not delivered into the chat: {why}");
+        }
+        (false, None) => {}
+    }
+    if receipt.unclaimed > 0 {
+        let _ = writeln!(
+            out,
+            "· {} unclaimed change{} attached to both",
+            receipt.unclaimed,
+            if receipt.unclaimed == 1 { "" } else { "s" }
+        );
+    }
+    out
 }
 
 /// Rendered rather than printed, so what a reviewer reads is testable. The

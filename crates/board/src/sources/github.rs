@@ -590,6 +590,24 @@ impl<T: Rest> Github<T> {
         Ok((number, url))
     }
 
+    /// Submit a review on a pull request (§gh#239) — a verdict and a body, as
+    /// one submission rather than a loose comment.
+    ///
+    /// Answers with the id GitHub assigned, which is the whole reason this is
+    /// not [`Github::comment`]: that id is what the caller watermarks so the
+    /// board's own verdict can never be read back off the reviews endpoint and
+    /// relayed into the chat it was just delivered into. `0` when GitHub
+    /// answered without one — the caller's fallback is documented at
+    /// [`crate::verdict::POSTED_MARK`], and it is a fallback rather than a
+    /// failure because the review itself did land.
+    pub fn post_review(&self, repo: &str, number: i64, event: &str, body: &str) -> Result<i64> {
+        let r = self.rest.post(
+            &format!("/repos/{repo}/pulls/{number}/reviews"),
+            &serde_json::json!({ "event": event, "body": body }),
+        )?;
+        Ok(r.get("id").and_then(Value::as_i64).unwrap_or_default())
+    }
+
     /// Whether a pull request can merge as it stands.
     ///
     /// The list endpoint does not carry this, so it is one call per open PR —
@@ -868,7 +886,19 @@ impl Rest for FixtureRest {
         self.wrote
             .borrow_mut()
             .push(("POST".into(), path.into(), body.clone()));
-        Ok(Value::Null)
+        // A canned reply when the test recorded one under `POST <path>` — a
+        // review post reads the id back out of it. Keyed with the verb because
+        // several endpoints here answer a GET and a POST at the same path, and
+        // a list of reviews is not the review you just wrote. Null otherwise,
+        // which is what every write whose answer nobody looks at has always
+        // got.
+        let key = format!("POST {path}");
+        Ok(self
+            .routes
+            .iter()
+            .find(|(p, _)| key.starts_with(p.as_str()))
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Null))
     }
 
     fn patch(&self, path: &str, body: &Value) -> Result<Value> {
