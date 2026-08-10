@@ -1,6 +1,6 @@
 # The review screen on the phone — **done** (gh#256)
 
-Follow-up to §gh#234. `BoardDetailSheet` is a generic task reader: it draws the
+Follow-up to gh#234. `BoardDetailSheet` is a generic task reader: it draws the
 whole title, the issue body, the labels and the actions. That is what you *asked
 for*, and until now the phone had nothing at all that said what came back — the
 claims-and-effects review in `Comet iOS.dc.html` was the one screen in the
@@ -10,7 +10,7 @@ It is now `ReviewScreen`, pushed from the sheet, and it is the desktop's
 `crates/ui/src/review.rs` in the phone's design language rather than a new
 opinion about what a review is.
 
-## Look at it first
+### Look at it first
 
 Both at **393×852** (iPhone 16 Pro, iOS 26.4), demo dataset, no box.
 
@@ -25,7 +25,7 @@ proved nothing; a screen that painted that green would be reporting an absence
 of evidence as evidence of absence. It reads `unknown`, quietly — and the two
 changes nobody claimed are still named, because they are still true.
 
-## The order is the argument
+### The order is the argument
 
 Straight from `review.rs`, because the order is the whole design:
 
@@ -42,7 +42,7 @@ Straight from `review.rs`, because the order is the whole design:
    drops to a dot.
 4. **What nobody claimed**, which is the product.
 
-## What the phone does differently, and why
+### What the phone does differently, and why
 
 - **The detail folds.** The desktop draws every claim's matched files and every
   effect's reason at once because it has a column to spend. Here the sections
@@ -70,13 +70,16 @@ Straight from `review.rs`, because the order is the whole design:
 - **The contract line sits above the buttons**, on its own row. Beside them,
   where the design draws it, it is the first thing a 393pt column truncates, and
   a promise that ends in an ellipsis is not one.
+- **The header names task · PR · workspace**, as the reference does. The board
+  row already carries the workspace, so the phone does not substitute branch or
+  attempt; the GitHub repository is the fallback if the row has no workspace.
 
-## Where it is reachable from
+### Where it is reachable from
 
-`boardReviewable(row)` — an attempt that has **ended**: `review`, `blocked`,
-`failed` or `done`, with `attempts > 0`. A `working` row's agent has not
-submitted its claims yet, so reviewing it would dress the unknown state up as a
-finding about work still in progress.
+`boardReviewable(row)` ports `comet_proto::view::board::reviewable` exactly:
+`attempts > 0`, independent of current state. A cancelled attempt remains
+reachable after its row returns to `ready`, and historical review data remains
+reachable while a retry is `working`.
 
 It is deliberately **not** a `BoardRowAction`. Those are the shared rule
 `row_actions` owns, ported from `comet_proto::view::board`; the review is a
@@ -85,11 +88,13 @@ not through a chip. The phone's door is a row at the top of the detail sheet —
 above the issue body, because the issue is what you asked for and this is the
 only thing on the sheet that says what came back.
 
-A row with no attempt still opens the screen and gets **"Nothing to review"** in
-words. A blank claims list is a *claim* about the attempt; this is the absence
-of one, and they must not look alike.
+A row with no attempt has no review door. If an attempted read has no payload —
+the host refuses it, the row moved underneath the sheet, or the host is on
+another wire version — the screen gets **"Nothing to review"** in words. A
+blank claims list is a *claim* about the attempt; this is the absence of one,
+and they must not look alike.
 
-## The reading is ported, and pinned
+### The reading is ported, and pinned
 
 `ReviewModels.swift` is a second implementation of `comet_board::claims` and
 `comet_board::effects` — it has to be, no Rust runs on that device — and two
@@ -110,8 +115,10 @@ screen, never-claimed, claimed-nothing, a malformed block, no diff at all, a
 clean remainder that is still wrong, a branch nobody read, and one with a binary
 file and uncountable call sites — asks the Rust for every verdict, finding,
 effect chip, claim mark, claim chip, diff total and contract line, and writes the
-lot to `apps/ios/Comet/Spec/review-spec.json`. `ReviewSpecRunner` (launch arg
-`-review-spec`) asserts the Swift against the same file: **139 checks, no drift**.
+lot to `apps/ios/Comet/Spec/review-spec.json`. The same fixture also carries the
+canonical reviewability matrix. `ReviewSpecRunner` (launch arg `-review-spec`)
+asserts the Swift reading, navigation, no-payload presentation, strict decoding
+and RPC identity against it: **176 checks, no drift**.
 
 The `AttemptReview` in each case is a real serialized one, so decoding it is half
 the test — a key whose name skewed would otherwise reach the screen as a zero.
@@ -123,7 +130,7 @@ the standing gap `apps/ios/README.md` describes: regenerating the fixture withou
 running `scripts/ios-review-spec.sh` turns the build green while leaving the
 phone wrong about the rule that just changed. Nothing catches that but a person.
 
-## Not touched
+### Not touched
 
 `Theme.swift`, `Comet.xcscheme`, `Info.plist`, and the forced dark scheme in
 `CometApp` — light theme is its own ticket. `crates/ui/tests/ios_theme.rs` passes:
