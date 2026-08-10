@@ -83,6 +83,15 @@ pub struct Delivered {
     /// operator archived does not write the same line every 30 seconds.
     #[serde(default)]
     pub noted_gone: bool,
+    /// Verdicts submitted from the review window (§gh#239), oldest first.
+    ///
+    /// Outbound work in an inbound record on purpose: it is the same fact about
+    /// the same pull request — what has already been said to this agent about
+    /// this work — and the id of a verdict posted from here is written into
+    /// [`Delivered::review`] above, so the two halves cannot disagree about
+    /// what has been delivered.
+    #[serde(default)]
+    pub submissions: Vec<crate::verdict::Submission>,
 }
 
 impl Delivered {
@@ -139,7 +148,13 @@ pub fn is_actionable(f: &Feedback) -> bool {
 
 pub(crate) fn is_the_boards_own(body: &str) -> bool {
     let b = body.trim_start();
-    b.starts_with("comet-board:") || b.starts_with("Dispatched to comet")
+    b.starts_with("comet-board:")
+        || b.starts_with("Dispatched to comet")
+        // A verdict written in the review window (§gh#239). Its id is
+        // watermarked the moment it is posted, so this is the backstop and not
+        // the mechanism — it is what keeps the relay shut when GitHub answers
+        // the post without an id to watermark.
+        || b.contains(crate::verdict::POSTED_MARK)
 }
 
 /// Decide what to do about one pull request, asking GitHub only if the decision
@@ -232,6 +247,26 @@ pub fn still_the_authors_checkout(chat_cwd: Option<&str>, attempt: &Attempt) -> 
     }
 }
 
+/// How every delivery into an authoring chat opens: who is talking, which task,
+/// and the pull request it is about.
+///
+/// Shared with the outbound half (§gh#239) rather than written twice. An agent
+/// reads relayed feedback and a verdict written in the review window in the
+/// same conversation, and two spellings of the same four lines would read as
+/// two different systems talking.
+pub(crate) fn reviewed_header(identifier: &str, title: &str, pr_url: &str) -> String {
+    format!(
+        "comet-board: your pull request has been reviewed.\n\n  {identifier} · {title}\n  {pr_url}\n"
+    )
+}
+
+/// The two sentences that say where the fix goes. Shared with the outbound half
+/// for the same reason [`reviewed_header`] is.
+pub(crate) const STILL_OPEN: &str =
+    "The pull request is still open and you are still in the checkout you wrote it in.";
+pub(crate) const ADDRESS_IT: &str =
+    "Address the feedback there, commit, and push to the same branch";
+
 /// The message an agent's chat is queued with.
 ///
 /// Enough to act on without a lookup: the body, the pull request URL, and for
@@ -239,11 +274,7 @@ pub fn still_the_authors_checkout(chat_cwd: Option<&str>, attempt: &Attempt) -> 
 /// consequence of author-blind delivery — a comment the agent itself wrote may
 /// come back once — so recognising the relay takes no cleverness.
 pub fn compose(task: &Task, pr: &PullRequest, items: &[Feedback]) -> String {
-    let mut s = format!(
-        "comet-board: your pull request has been reviewed.\n\n  \
-         {} · {}\n  {}\n",
-        task.identifier, task.title, pr.url
-    );
+    let mut s = reviewed_header(&task.identifier, &task.title, &pr.url);
     for f in items {
         s.push('\n');
         match (f.kind, f.state.as_deref()) {
@@ -271,20 +302,19 @@ pub fn compose(task: &Task, pr: &PullRequest, items: &[Feedback]) -> String {
             s.push('\n');
         }
     }
-    s.push_str(
-        "\nThe pull request is still open and you are still in the checkout you wrote it \
-         in. Address the feedback there, commit, and push to the same branch — do not open \
-         a second pull request. If you disagree with a point, say so on the pull request \
-         rather than silently skipping it. The board cannot tell comment authors apart, so \
-         a comment you write on the pull request may be relayed back to you once — if a \
-         comment above is your own, it needs nothing from you.\n",
-    );
+    s.push_str(&format!(
+        "\n{STILL_OPEN} {ADDRESS_IT} — do not open a second pull request. If you disagree \
+         with a point, say so on the pull request rather than silently skipping it. The \
+         board cannot tell comment authors apart, so a comment you write on the pull \
+         request may be relayed back to you once — if a comment above is your own, it \
+         needs nothing from you.\n",
+    ));
     s
 }
 
 /// Load a task's delivery state. A missing or unreadable value starts over,
 /// which costs one round of re-consumption and never a wrong delivery.
-fn load(db: &Db, task_id: &str) -> Delivered {
+pub(crate) fn load(db: &Db, task_id: &str) -> Delivered {
     db.meta_get(&crate::sync::meta::reviews_for(task_id))
         .ok()
         .flatten()
@@ -292,7 +322,7 @@ fn load(db: &Db, task_id: &str) -> Delivered {
         .unwrap_or_default()
 }
 
-fn store(db: &Db, task_id: &str, state: &Delivered) -> Result<()> {
+pub(crate) fn store(db: &Db, task_id: &str, state: &Delivered) -> Result<()> {
     db.meta_set(
         &crate::sync::meta::reviews_for(task_id),
         &serde_json::to_string(state)?,
@@ -412,7 +442,7 @@ impl SyncEngine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{AgentStatus, Outcome, Source, UpstreamState};
     use crate::runtime::{DispatchHandle, DispatchSpec};
@@ -668,7 +698,7 @@ mod tests {
 
     // ---- chat verification ----------------------------------------------
 
-    fn task_row() -> Task {
+    pub(crate) fn task_row() -> Task {
         Task {
             id: "gh:o/r#13".into(),
             source: Source::Github,
@@ -695,7 +725,7 @@ mod tests {
         }
     }
 
-    fn pull(head_ref: &str) -> PullRequest {
+    pub(crate) fn pull(head_ref: &str) -> PullRequest {
         PullRequest {
             repo: "o/r".into(),
             number: 14,
@@ -780,15 +810,15 @@ mod tests {
 
     /// Answers like a healthy comet and records what the board queued. The
     /// chat's whereabouts are the knobs the tests turn.
-    struct FakeRuntime {
-        alive: bool,
-        cwd: Option<String>,
-        prompts: std::cell::RefCell<Vec<(String, String)>>,
-        prompt_fails: bool,
+    pub(crate) struct FakeRuntime {
+        pub(crate) alive: bool,
+        pub(crate) cwd: Option<String>,
+        pub(crate) prompts: std::cell::RefCell<Vec<(String, String)>>,
+        pub(crate) prompt_fails: bool,
     }
 
     impl FakeRuntime {
-        fn holding(cwd: &str) -> FakeRuntime {
+        pub(crate) fn holding(cwd: &str) -> FakeRuntime {
             FakeRuntime {
                 alive: true,
                 cwd: Some(cwd.into()),
@@ -797,7 +827,7 @@ mod tests {
             }
         }
 
-        fn gone() -> FakeRuntime {
+        pub(crate) fn gone() -> FakeRuntime {
             FakeRuntime {
                 alive: false,
                 cwd: None,
@@ -839,7 +869,7 @@ mod tests {
 
     /// Shares one fixture between the engine, which owns its transport, and the
     /// test, which needs to read back what was asked.
-    struct Shared(std::rc::Rc<crate::sources::github::FixtureRest>);
+    pub(crate) struct Shared(std::rc::Rc<crate::sources::github::FixtureRest>);
 
     impl Rest for Shared {
         fn get(&self, path: &str) -> Result<serde_json::Value> {
@@ -857,7 +887,7 @@ mod tests {
     }
 
     /// An engine over an in-memory board and a recorded GitHub.
-    fn engine(rest: std::rc::Rc<crate::sources::github::FixtureRest>) -> SyncEngine {
+    pub(crate) fn engine(rest: std::rc::Rc<crate::sources::github::FixtureRest>) -> SyncEngine {
         let dir = std::env::temp_dir().join(format!("cb-review-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         SyncEngine {
@@ -877,7 +907,7 @@ mod tests {
 
     /// A finished attempt on gh#13, with an open pull request — the row this
     /// whole module is about.
-    fn seed_reviewed_task(e: &SyncEngine, branch: &str, chat: &str) {
+    pub(crate) fn seed_reviewed_task(e: &SyncEngine, branch: &str, chat: &str) {
         e.db.upsert_task(&crate::db::UpsertTask {
             id: "gh:o/r#13".into(),
             source: Source::Github,
@@ -929,7 +959,7 @@ mod tests {
         );
     }
 
-    fn state_of(e: &SyncEngine) -> Delivered {
+    pub(crate) fn state_of(e: &SyncEngine) -> Delivered {
         load(&e.db, "gh:o/r#13")
     }
 

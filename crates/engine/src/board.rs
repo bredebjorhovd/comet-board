@@ -43,6 +43,7 @@ use comet_board::rows::{TaskDetail, TaskRow, board_rows, task_detail};
 use comet_board::runtime::{Runtime, agent_status};
 use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
+use comet_board::verdict::{VerdictKind, VerdictReceipt};
 use comet_proto::view::board::OrchestratorPin;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
@@ -100,6 +101,17 @@ enum Msg {
         task_id: String,
         attempt: Option<i64>,
         reply: oneshot::Sender<anyhow::Result<AttemptReview>>,
+    },
+    /// A verdict written in the review window (§gh#239): a GitHub post and a
+    /// prompt into the authoring chat. On this thread because it is both a
+    /// write to `board.db` and a use of the loop's runtime, and because the
+    /// idempotency it promises is only worth anything with one writer.
+    Verdict {
+        task_id: String,
+        attempt: Option<i64>,
+        kind: VerdictKind,
+        comment: String,
+        reply: oneshot::Sender<anyhow::Result<VerdictReceipt>>,
     },
     Shutdown,
 }
@@ -370,6 +382,34 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
     }
 
+    /// Submit a verdict on an attempt's pull request (§gh#239): posted on
+    /// GitHub, delivered into the chat that wrote it, with the unclaimed
+    /// changes attached to both.
+    ///
+    /// Idempotent on what was said — a retry finishes the half that failed —
+    /// so a caller whose call times out should re-send it verbatim rather than
+    /// guessing whether it landed.
+    pub async fn submit_verdict(
+        &self,
+        task_id: &str,
+        attempt: Option<i64>,
+        kind: VerdictKind,
+        comment: &str,
+    ) -> anyhow::Result<VerdictReceipt> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Verdict {
+                task_id: task_id.to_string(),
+                attempt,
+                kind,
+                comment: comment.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-verdict"))?
+    }
+
     /// Stop the loop and wait for the in-flight cycle to finish, so shutdown
     /// never truncates a SQLite write mid-transaction.
     pub fn shutdown(&self) {
@@ -543,6 +583,26 @@ fn run_loop(
                 reply,
             }) => {
                 let _ = reply.send(engine.review(&task_id, attempt));
+            }
+            // The outbound half (§gh#239). The runtime rides along for the
+            // same reason it does on `Claims`: the delivery is a prompt into a
+            // live chat, and the author check that guards it is a question
+            // only the runtime can answer.
+            Ok(Msg::Verdict {
+                task_id,
+                attempt,
+                kind,
+                comment,
+                reply,
+            }) => {
+                let result = engine.submit_verdict(
+                    Some(runtime.as_ref()),
+                    &task_id,
+                    attempt,
+                    kind,
+                    &comment,
+                );
+                let _ = reply.send(result);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Ok(Msg::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {

@@ -236,6 +236,39 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Give the verdict: post it on the pull request, and hand it to the agent
+    /// still standing in the checkout.
+    ///
+    /// The changes no claim accounts for ride along on both copies — the board
+    /// derives them from the diff, so there is nothing to retype and nothing to
+    /// get wrong. The agent is prompted in the chat it wrote the branch in, so
+    /// the fix is a commit on that branch rather than a new dispatch.
+    ///
+    /// Sending the same verdict twice sends it once: the submission is
+    /// recorded, and a retry finishes whichever half failed.
+    Verdict {
+        /// The task whose pull request this is about.
+        #[arg(long)]
+        task: String,
+        /// Which attempt, by id. Defaults to the task's latest.
+        #[arg(long)]
+        attempt: Option<i64>,
+        /// What to say. `-` reads it from stdin. Required for everything but
+        /// `--approve`, because a verdict with nothing in it tells an agent to
+        /// change something unnamed.
+        #[arg(long)]
+        comment: Option<String>,
+        /// Approve, rather than comment.
+        #[arg(long, conflicts_with = "changes")]
+        approve: bool,
+        /// Request changes — the one verdict that is actionable with or without
+        /// prose.
+        #[arg(long = "request-changes")]
+        changes: bool,
+        /// Print the receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a ticket. Cheaper than not writing one.
     New {
         title: String,
@@ -745,6 +778,36 @@ fn main() -> Result<()> {
                 ops::attempt_review(&board, &task, attempt).await
             })?;
             ops::print_review(&review, json)
+        }
+        Command::Verdict {
+            task,
+            attempt,
+            comment,
+            approve,
+            changes,
+            json,
+        } => {
+            let comment = match comment.as_deref() {
+                Some("-") => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+                Some(text) => text.to_string(),
+                None => String::new(),
+            };
+            let kind = if approve {
+                "approve"
+            } else if changes {
+                "changes_requested"
+            } else {
+                "comment"
+            };
+            let receipt = runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                ops::submit_verdict(&board, &task, attempt, kind, &comment).await
+            })?;
+            ops::print_verdict(&receipt, json)
         }
         Command::New {
             title,
