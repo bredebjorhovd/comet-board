@@ -271,6 +271,24 @@ impl Runtime for CometRuntime {
                     .then(|| chat.cwd.as_deref().map(str::trim).map(str::to_string))
                     .flatten()
                     .filter(|path| !path.is_empty());
+                let local = chat.device_id == local_device;
+                let mut pull_request_urls = chat
+                    .last_message_preview
+                    .as_deref()
+                    .map(github_pull_request_urls)
+                    .unwrap_or_default();
+                if local && let Ok(Some(text)) = self.journal.final_text(&chat.id) {
+                    pull_request_urls.extend(github_pull_request_urls(&text));
+                }
+                pull_request_urls.sort();
+                pull_request_urls.dedup();
+                let created_pull_request = local
+                    && self
+                        .journal
+                        .commands(&chat.id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|commands| commands.iter().any(ran_gh_pr_create));
                 let repo = chat
                     .config
                     .as_ref()
@@ -306,7 +324,8 @@ impl Runtime for CometRuntime {
                     worktree,
                     repo,
                     branch,
-                    last_message_preview: chat.last_message_preview,
+                    pull_request_urls,
+                    created_pull_request,
                     account,
                     created_at: chat.created_at,
                 })
@@ -427,6 +446,69 @@ impl Runtime for CometRuntime {
     /// one instead of running the verb. See [`RunJournal::final_text`].
     fn run_message(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self.journal.final_text(chat_id)?)
+    }
+}
+
+fn ran_gh_pr_create(command: &RanCommand) -> bool {
+    command
+        .command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|words| words == ["gh", "pr", "create"])
+}
+
+/// Canonical PR URLs mentioned in one message. The workspace row only syncs a
+/// bounded preview; the owning host also supplies the journal tail above.
+fn github_pull_request_urls(text: &str) -> Vec<String> {
+    text.match_indices("https://github.com/")
+        .filter_map(|(start, _)| {
+            let url = text[start..]
+                .split(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, ')' | ']' | '>' | ',' | ';' | '"' | '\'')
+                })
+                .next()?
+                .trim_end_matches('.');
+            let rest = url.strip_prefix("https://github.com/")?;
+            let mut parts = rest.split('/');
+            let (Some(owner), Some(repo), Some("pull"), Some(number)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return None;
+            };
+            if owner.is_empty()
+                || repo.is_empty()
+                || number.parse::<u64>().is_err()
+                || parts.next().is_some()
+            {
+                return None;
+            }
+            Some(format!("https://github.com/{owner}/{repo}/pull/{number}"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod review_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_provenance_reads_plain_and_markdown_urls_only() {
+        assert_eq!(
+            github_pull_request_urls(
+                "Opened [the PR](https://github.com/o/r/pull/265). Issue: https://github.com/o/r/issues/1"
+            ),
+            vec!["https://github.com/o/r/pull/265"]
+        );
+    }
+
+    #[test]
+    fn pr_creation_is_a_command_signal_not_arbitrary_prose() {
+        let ran = RanCommand {
+            command: "env CI=1 gh pr create --fill".into(),
+            failed: false,
+        };
+        assert!(ran_gh_pr_create(&ran));
     }
 }
 

@@ -328,9 +328,11 @@ pub struct ReviewCandidate {
     /// checkout. None is still usable when this branch names exactly one PR.
     pub repo: Option<String>,
     pub branch: String,
-    /// Synced tail of the conversation. An exact PR URL is explicit adoption
-    /// evidence even when the chat and checkout live on another device.
-    pub last_message_preview: Option<String>,
+    /// Canonical GitHub PR URLs explicitly mentioned by this conversation.
+    /// An exact URL is adoption evidence even when the chat lives elsewhere.
+    pub pull_request_urls: Vec<String>,
+    /// This chat ran the GitHub CLI's PR-creation command on its local host.
+    pub created_pull_request: bool,
     pub account: Option<String>,
     pub created_at: DateTime<Utc>,
 }

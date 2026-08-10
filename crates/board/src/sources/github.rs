@@ -274,6 +274,8 @@ pub struct PullRequest {
     pub body: Option<String>,
     pub url: String,
     pub head_ref: String,
+    /// Repository the head branch belongs to. Differs from `repo` for forks.
+    pub head_repo: Option<String>,
     /// The exact commit the PR compares its head against. This is the review
     /// baseline for ordinary Comet chats, which did not have a Board dispatch
     /// available to snapshot HEAD before the agent started.
@@ -846,6 +848,13 @@ fn parse_pull(repo: &str, n: &Value) -> Option<PullRequest> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        head_repo: n
+            .get("head")
+            .and_then(|head| head.get("repo"))
+            .and_then(|repo| repo.get("full_name"))
+            .and_then(Value::as_str)
+            .filter(|repo| !repo.is_empty())
+            .map(str::to_string),
         base_sha: n
             .get("base")
             .and_then(|base| base.get("sha"))
@@ -1177,12 +1186,13 @@ mod tests {
             "/repos/o/r/pulls".into(),
             json!([{ "number": 508, "title": "Fix the gate", "html_url": "u",
                      "state": "open", "updated_at": "t", "draft": false,
-                     "head": { "ref": "fix/rls" },
+                     "head": { "ref": "fix/rls", "repo": { "full_name": "fork/r" } },
                      "base": { "sha": "abc123" } }]),
         )]));
         let pr = &g.pulls("o/r").unwrap()[0];
         assert_eq!(pr.task_id(), "gh:o/r!508");
         assert_eq!(pr.identifier(), "gh!508");
+        assert_eq!(pr.head_repo.as_deref(), Some("fork/r"));
         assert_eq!(pr.base_sha.as_deref(), Some("abc123"));
         let up = pr.to_upsert();
         // Open: not terminal, so derivation with pr_open reaches `review`.

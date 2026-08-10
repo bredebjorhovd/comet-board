@@ -673,94 +673,101 @@ impl SyncEngine {
                 // deliberately not imported as a separate PR task.
                 continue;
             };
-            if let Some(attempt) = task.attempts.iter().rev().find(|attempt| {
-                !attempt.board_managed && attempt.branch.as_deref() == Some(pr.head_ref.as_str())
-            }) {
-                // Direct agents often open a PR and continue working. Keep the
-                // review snapshot current instead of freezing it at the first
-                // GitHub poll that happened to see the PR.
-                self.harvest_claims(Some(runtime), attempt);
-                self.record_tokens(Some(runtime), attempt);
-                self.record_review_facts(Some(runtime), attempt);
-                continue;
-            }
-            if !task.attempts.is_empty() {
-                continue;
-            }
             let branch_is_unique = pulls
                 .iter()
                 .filter(|other| other.open && other.head_ref == pr.head_ref)
                 .count()
                 == 1;
+            // An exact URL means this conversation adopted this exact PR. It
+            // outranks repository inference: a fork's origin is the head repo,
+            // and a remote chat may not expose any repo metadata to this host.
+            let mut explicit: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate.pull_request_urls.iter().any(|url| url == &pr.url))
+                .collect();
+            explicit.sort_by_key(|candidate| candidate.created_at);
             let matching: Vec<_> = candidates
                 .iter()
                 .filter(|candidate| candidate.branch == pr.head_ref)
                 .filter(|candidate| {
-                    candidate
-                        .repo
-                        .as_deref()
-                        .is_some_and(|repo| repo.eq_ignore_ascii_case(&pr.repo))
-                        || (candidate.repo.is_none() && branch_is_unique)
+                    candidate.repo.as_deref().is_some_and(|repo| {
+                        repo.eq_ignore_ascii_case(&pr.repo)
+                            || pr
+                                .head_repo
+                                .as_deref()
+                                .is_some_and(|head| repo.eq_ignore_ascii_case(head))
+                    }) || (candidate.repo.is_none() && branch_is_unique)
                 })
                 .collect();
-            let mut explicit: Vec<_> = matching
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    candidate
-                        .last_message_preview
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&pr.url))
-                        || runtime
-                            .run_message(&candidate.chat_id)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|text| text.contains(&pr.url))
-                })
-                .collect();
-            explicit.sort_by_key(|candidate| candidate.created_at);
             let creators: Vec<_> = matching
                 .iter()
                 .copied()
-                .filter(|candidate| {
-                    runtime
-                        .run_commands(&candidate.chat_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|commands| {
-                            commands.iter().any(|ran| {
-                                ran.command
-                                    .split_whitespace()
-                                    .collect::<Vec<_>>()
-                                    .windows(3)
-                                    .any(|words| words == ["gh", "pr", "create"])
-                            })
-                        })
-                })
+                .filter(|candidate| candidate.created_pull_request)
                 .collect();
-            let candidate = explicit
+            let author = explicit
                 .last()
                 .copied()
-                .or_else(|| (creators.len() == 1).then_some(creators[0]))
-                .or_else(|| (matching.len() == 1).then_some(matching[0]));
-            let Some(candidate) = candidate else {
-                if !matching.is_empty() {
-                    self.log.warn(format!(
-                        "{}: {} matches several Comet chats, but none proves it created or adopted the PR — review not linked",
-                        task.identifier, pr.url
-                    ));
+                .or_else(|| (creators.len() == 1).then(|| creators[0]))
+                .or_else(|| (matching.len() == 1).then(|| matching[0]));
+            // Review eligibility and author attribution are separate. Several
+            // matching chats with no proof still establish that this is Comet
+            // work, so create an attempt with no chat rather than guessing.
+            let candidate = author.or_else(|| {
+                matching
+                    .iter()
+                    .copied()
+                    .max_by_key(|candidate| candidate.created_at)
+            });
+
+            if let Some(existing) = task.attempts.iter().rev().find(|attempt| {
+                !attempt.board_managed && attempt.branch.as_deref() == Some(pr.head_ref.as_str())
+            }) {
+                let mut attempt = existing.clone();
+                let mut relinked = false;
+                if let Some(author) = author {
+                    if attempt.pane_id.is_none() {
+                        self.db.set_attempt_pane(attempt.id, &author.chat_id)?;
+                        relinked = true;
+                    }
+                    if attempt.worktree.is_none()
+                        && author.branch == pr.head_ref
+                        && let Some(worktree) = author.worktree.as_deref()
+                    {
+                        self.db.set_attempt_worktree(attempt.id, worktree)?;
+                        relinked = true;
+                    }
                 }
+                if relinked {
+                    attempt = self.db.get_attempt(attempt.id)?.ok_or_else(|| {
+                        anyhow::anyhow!("adopted attempt {} disappeared", attempt.id)
+                    })?;
+                }
+                // Direct agents often open a PR and continue working. Keep the
+                // review snapshot current instead of freezing it at first sight.
+                self.harvest_claims(Some(runtime), &attempt);
+                self.record_tokens(Some(runtime), &attempt);
+                self.record_review_facts(Some(runtime), &attempt);
+                continue;
+            }
+            if !task.attempts.is_empty() {
+                continue;
+            }
+            let Some(candidate) = candidate else {
                 continue;
             };
+            let author_chat_id = author.map(|author| author.chat_id.clone());
+            let worktree = author
+                .filter(|author| author.branch == pr.head_ref)
+                .and_then(|author| author.worktree.clone());
 
             let attempt_id = self.db.insert_adopted_attempt(&NewAttempt {
                 task_id: task_id.clone(),
-                pane_id: Some(candidate.chat_id.clone()),
+                pane_id: author_chat_id.clone(),
                 workspace: candidate.workspace.clone(),
                 runtime: candidate.runtime.clone(),
-                worktree: candidate.worktree.clone(),
+                worktree,
                 repo_path: None,
-                branch: Some(candidate.branch.clone()),
+                branch: Some(pr.head_ref.clone()),
                 dispatched_by: None,
                 dispatched_by_pane: None,
                 base_sha: pr.base_sha.clone(),
@@ -778,10 +785,16 @@ impl SyncEngine {
             self.record_tokens(Some(runtime), &attempt);
             self.record_review_facts(Some(runtime), &attempt);
             self.db.close_attempt(attempt_id, Outcome::Done)?;
-            self.log.info(format!(
-                "{}: linked {} to Comet chat {} — review available",
-                task.identifier, pr.url, candidate.chat_id
-            ));
+            match author_chat_id {
+                Some(chat_id) => self.log.info(format!(
+                    "{}: linked {} to Comet chat {chat_id} — review available",
+                    task.identifier, pr.url
+                )),
+                None => self.log.info(format!(
+                    "{}: {} belongs to several possible Comet chats — review available, author unresolved",
+                    task.identifier, pr.url
+                )),
+            }
         }
         Ok(())
     }
@@ -6597,6 +6610,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
+            head_repo: None,
             base_sha: None,
             open: true,
             merged: false,
@@ -6677,6 +6691,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/265".into(),
             head_ref: "direct-pr".into(),
+            head_repo: None,
             base_sha: Some(base.clone()),
             open: true,
             merged: false,
@@ -6695,7 +6710,8 @@ max_duration = "{max_duration}"
                     worktree: Some(work.to_string_lossy().into_owned()),
                     repo: Some("o/r".into()),
                     branch: "direct-pr".into(),
-                    last_message_preview: Some(pr.url.clone()),
+                    pull_request_urls: vec![pr.url.clone()],
+                    created_pull_request: false,
                     account: None,
                     created_at: chrono::Utc::now(),
                 },
@@ -6706,7 +6722,8 @@ max_duration = "{max_duration}"
                     worktree: Some(work.to_string_lossy().into_owned()),
                     repo: Some("o/r".into()),
                     branch: "direct-pr".into(),
-                    last_message_preview: None,
+                    pull_request_urls: Vec::new(),
+                    created_pull_request: false,
                     account: None,
                     created_at: chrono::Utc::now() + chrono::Duration::seconds(1),
                 },
@@ -6799,6 +6816,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/266".into(),
             head_ref: "comet/remote-pr".into(),
+            head_repo: None,
             base_sha: Some("base".into()),
             open: true,
             merged: false,
@@ -6818,13 +6836,28 @@ max_duration = "{max_duration}"
                 worktree: None,
                 repo: None,
                 branch: "comet/remote-pr".into(),
-                last_message_preview: Some(pr.url.clone()),
+                pull_request_urls: vec![pr.url.clone()],
+                created_pull_request: false,
                 account: None,
                 created_at: chrono::Utc::now(),
             }],
         };
+        let same_branch_elsewhere = PullRequest {
+            repo: "another/repo".into(),
+            number: 9,
+            title: "Same branch name elsewhere".into(),
+            body: None,
+            url: "https://github.com/another/repo/pull/9".into(),
+            head_ref: "comet/remote-pr".into(),
+            head_repo: None,
+            base_sha: Some("other-base".into()),
+            open: true,
+            merged: false,
+            draft: false,
+            updated_at: crate::db::now(),
+        };
 
-        e.adopt_session_pull_requests(std::slice::from_ref(&pr), &runtime)
+        e.adopt_session_pull_requests(&[pr.clone(), same_branch_elsewhere], &runtime)
             .unwrap();
 
         let task = e.db.get_task(&pr.task_id()).unwrap().unwrap();
@@ -6838,6 +6871,58 @@ max_duration = "{max_duration}"
             ),
             "a remote diff is unknown, never clean"
         );
+    }
+
+    #[test]
+    fn ambiguous_comet_authorship_keeps_review_and_guesses_no_chat() {
+        let e = engine(None);
+        let pr = PullRequest {
+            repo: "upstream/r".into(),
+            number: 267,
+            title: "Forked work".into(),
+            body: None,
+            url: "https://github.com/upstream/r/pull/267".into(),
+            head_ref: "feature".into(),
+            head_repo: Some("person/r".into()),
+            base_sha: Some("base".into()),
+            open: true,
+            merged: false,
+            draft: false,
+            updated_at: crate::db::now(),
+        };
+        e.db.upsert_task(&pr.to_upsert()).unwrap();
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
+            .unwrap();
+        let candidate = |chat_id: &str, created_at| crate::runtime::ReviewCandidate {
+            chat_id: chat_id.into(),
+            workspace: "fork".into(),
+            runtime: "codex".into(),
+            worktree: None,
+            repo: Some("person/r".into()),
+            branch: "feature".into(),
+            pull_request_urls: Vec::new(),
+            created_pull_request: false,
+            account: None,
+            created_at,
+        };
+        let now = chrono::Utc::now();
+        let runtime = DirectReviewChat {
+            candidates: vec![
+                candidate("older-chat", now),
+                candidate("newer-chat", now + chrono::Duration::seconds(1)),
+            ],
+        };
+
+        e.adopt_session_pull_requests(std::slice::from_ref(&pr), &runtime)
+            .unwrap();
+
+        let task = e.db.get_task(&pr.task_id()).unwrap().unwrap();
+        assert_eq!(task.attempts.len(), 1, "the review door is present");
+        assert_eq!(
+            task.attempts[0].pane_id, None,
+            "recency is not author proof"
+        );
+        assert_eq!(task.attempts[0].worktree, None);
     }
 
     #[test]
@@ -6861,6 +6946,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/bredebjorhovd/OIOS/pull/10".into(),
             head_ref: "board/gh-2".into(),
+            head_repo: None,
             base_sha: None,
             open: false,
             merged: true,
@@ -6939,6 +7025,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
+            head_repo: None,
             base_sha: None,
             open: false,
             merged: true,
