@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use comet_board::evidence::RanCommand;
 use comet_board::runtime::{
-    DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
+    DispatchHandle, DispatchSpec, ReviewCandidate, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
 };
 use comet_doc::SessionCommandPayload;
 use comet_proto::{
@@ -254,6 +254,90 @@ impl Runtime for CometRuntime {
         Ok(self.workspace.doc().chat(chat_id)?.and_then(|c| c.cwd))
     }
 
+    fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+        let chats = self.workspace.doc().read_chats()?;
+        let spaces = self.workspace.doc().read_spaces()?;
+        let local_device = self.workspace.device_id();
+        Ok(chats
+            .into_iter()
+            .filter_map(|chat| {
+                // A checkout path belongs to its host device. Keep the remote
+                // chat as provenance, but never run local git against its path.
+                let worktree = (chat.device_id == local_device)
+                    .then(|| chat.cwd.as_deref().map(str::trim).map(str::to_string))
+                    .flatten()
+                    .filter(|path| !path.is_empty());
+                let local = chat.device_id == local_device;
+                let mut pull_request_urls = chat
+                    .last_message_preview
+                    .as_deref()
+                    .map(github_pull_request_urls)
+                    .unwrap_or_default();
+                if local && let Ok(Some(text)) = self.journal.final_text(&chat.id) {
+                    pull_request_urls.extend(github_pull_request_urls(&text));
+                }
+                pull_request_urls.sort();
+                pull_request_urls.dedup();
+                let branch = chat
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                    .map(str::to_string);
+                let created_pull_request = local
+                    && self
+                        .journal
+                        .commands(&chat.id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|commands| commands.iter().any(ran_gh_pr_create));
+                if branch.is_none() && pull_request_urls.is_empty() {
+                    return None;
+                }
+                let repo = chat
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.push_repo.clone())
+                    .or_else(|| {
+                        worktree
+                            .as_deref()
+                            .and_then(comet_board::git_credentials::repo_for_checkout)
+                    });
+                let workspace = chat
+                    .space_id
+                    .as_deref()
+                    .and_then(|id| spaces.iter().find(|space| space.id == id))
+                    .map(|space| space.display_name().to_string())
+                    .or_else(|| {
+                        chat.cwd.as_deref().and_then(|path| {
+                            std::path::Path::new(path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                        })
+                    })
+                    .unwrap_or_else(|| "Comet".into());
+                let runtime = chat
+                    .config
+                    .as_ref()
+                    .map(|config| comet_board::runtime::runtime_name(config.harness).to_string())
+                    .unwrap_or_else(|| "agent".into());
+                let account = chat.config.and_then(|config| config.account);
+                Some(ReviewCandidate {
+                    chat_id: chat.id,
+                    workspace,
+                    runtime,
+                    worktree,
+                    repo,
+                    branch,
+                    pull_request_urls,
+                    created_pull_request,
+                    account,
+                    created_at: chat.created_at,
+                })
+            })
+            .collect())
+    }
+
     /// Hand a finished attempt's checkout back (gh#72): remove the worktree,
     /// prune the registration, delete the branch the board cut.
     ///
@@ -367,6 +451,76 @@ impl Runtime for CometRuntime {
     /// one instead of running the verb. See [`RunJournal::final_text`].
     fn run_message(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self.journal.final_text(chat_id)?)
+    }
+}
+
+fn ran_gh_pr_create(command: &RanCommand) -> bool {
+    !command.failed
+        && command
+            .command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .any(|words| words == ["gh", "pr", "create"])
+}
+
+/// Canonical PR URLs mentioned in one message. The workspace row only syncs a
+/// bounded preview; the owning host also supplies the journal tail above.
+fn github_pull_request_urls(text: &str) -> Vec<String> {
+    text.match_indices("https://github.com/")
+        .filter_map(|(start, _)| {
+            let url = text[start..]
+                .split(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, ')' | ']' | '>' | ',' | ';' | '"' | '\'')
+                })
+                .next()?
+                .trim_end_matches('.');
+            let rest = url.strip_prefix("https://github.com/")?;
+            let mut parts = rest.split('/');
+            let (Some(owner), Some(repo), Some("pull"), Some(number)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return None;
+            };
+            if owner.is_empty()
+                || repo.is_empty()
+                || number.parse::<u64>().is_err()
+                || parts.next().is_some()
+            {
+                return None;
+            }
+            Some(format!("https://github.com/{owner}/{repo}/pull/{number}"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod review_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_provenance_reads_plain_and_markdown_urls_only() {
+        assert_eq!(
+            github_pull_request_urls(
+                "Opened [the PR](https://github.com/o/r/pull/265). Issue: https://github.com/o/r/issues/1"
+            ),
+            vec!["https://github.com/o/r/pull/265"]
+        );
+    }
+
+    #[test]
+    fn pr_creation_is_a_command_signal_not_arbitrary_prose() {
+        let successful = RanCommand {
+            command: "env CI=1 gh pr create --fill".into(),
+            failed: false,
+        };
+        assert!(ran_gh_pr_create(&successful));
+
+        let failed = RanCommand {
+            command: "gh pr create --fill".into(),
+            failed: true,
+        };
+        assert!(!ran_gh_pr_create(&failed));
     }
 }
 

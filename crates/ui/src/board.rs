@@ -1843,7 +1843,7 @@ impl BoardPanel {
         }
         cx.emit(BoardEvent::OpenReview {
             task_id: row.id.clone(),
-            chat_id: row.chat_id.clone(),
+            chat_id: row.review_chat_id.clone().or_else(|| row.chat_id.clone()),
         });
     }
 
@@ -4072,6 +4072,7 @@ mod tests {
             workspace: Some("offhand".into()),
             runtime: Some("claude-code".into()),
             chat_id: None,
+            review_chat_id: None,
             pr_url: None,
             pr_number: None,
             branch: Some("board/gh-x".into()),

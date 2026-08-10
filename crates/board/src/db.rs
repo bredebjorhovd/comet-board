@@ -22,7 +22,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      dispatched_by_device, dispatched_by_user, dispatched_by_verified, billed_to, \
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
-     cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error";
+     cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -90,6 +90,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
             .unwrap_or_default(),
         claims_at: r.get(42)?,
         claims_error: r.get(43)?,
+        board_managed: r.get::<_, i64>(44)? != 0,
     })
 }
 
@@ -280,6 +281,10 @@ impl Db {
               -- the third answer they cannot express between them: never
               -- asked, answered, and answered in a way the board threw away.
               claims_error TEXT,
+              -- False for an attempt adopted from an ordinary Comet chat.
+              -- Its checkout and chat belong to the person, not the Board
+              -- retention policy, even though its review facts share this row.
+              board_managed INTEGER NOT NULL DEFAULT 1,
               -- The branch diff and the run's own commands, snapshotted off
               -- the live attempt (§gh#183). Kept out of the columns every
               -- board read selects: the board loads every attempt of every
@@ -468,6 +473,9 @@ impl Db {
                 // those rows are, and which the chips say out loud rather than
                 // rendering as five clean results.
                 ("effects", "TEXT"),
+                // Direct Comet chats can author reviewable PRs too. Existing
+                // attempts were created by Board dispatch and remain managed.
+                ("board_managed", "INTEGER NOT NULL DEFAULT 1"),
             ],
         )?;
         self.add_missing_columns(
@@ -747,14 +755,27 @@ impl Db {
     /// — that is the duplicate-dispatch guard, enforced by a partial unique
     /// index rather than a read-then-write race.
     pub fn insert_attempt(&self, a: &NewAttempt) -> Result<i64> {
+        self.insert_attempt_with_ownership(a, true)
+    }
+
+    /// Insert review provenance for an ordinary Comet chat.
+    ///
+    /// Unlike a Board dispatch, this checkout and chat remain owned by the
+    /// person who created them. Record that distinction in the same write as
+    /// the attempt so a crash can never expose their work to Board retention.
+    pub fn insert_adopted_attempt(&self, a: &NewAttempt) -> Result<i64> {
+        self.insert_attempt_with_ownership(a, false)
+    }
+
+    fn insert_attempt_with_ownership(&self, a: &NewAttempt, board_managed: bool) -> Result<i64> {
         let res = self.conn.execute(
             "INSERT INTO attempts
                (task_id, pane_id, workspace, runtime, worktree, branch,
                 dispatched_by, dispatched_by_pane, started_at, base_sha, account,
                 repo_path,
                 dispatched_by_device, dispatched_by_user, dispatched_by_verified,
-                billed_to)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                billed_to, board_managed)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -771,7 +792,8 @@ impl Db {
                 a.dispatched_by_device,
                 a.dispatched_by_user,
                 a.dispatched_by_verified as i64,
-                a.billed_to
+                a.billed_to,
+                board_managed as i64
             ],
         );
         match res {
@@ -947,6 +969,7 @@ impl Db {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts
               WHERE outcome IS NOT NULL
+                AND board_managed = 1
                 AND pane_id IS NOT NULL
                 AND chat_archived_at IS NULL
               ORDER BY id"
@@ -966,6 +989,7 @@ impl Db {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts
               WHERE outcome IS NOT NULL
+                AND board_managed = 1
                 AND worktree IS NOT NULL
                 AND collected_at IS NULL
               ORDER BY id"
@@ -1364,7 +1388,8 @@ impl Db {
     /// Live attempts across all tasks, for reconciliation and concurrency caps.
     pub fn live_attempts(&self) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE outcome IS NULL ORDER BY id"
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts
+              WHERE outcome IS NULL AND board_managed = 1 ORDER BY id"
         ))?;
         let rows = stmt.query_map([], read_attempt)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1384,7 +1409,9 @@ impl Db {
     pub fn settled_attempts(&self) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts
-              WHERE outcome IN ('done', 'orphaned') AND pane_id IS NOT NULL
+              WHERE outcome IN ('done', 'orphaned')
+                AND board_managed = 1
+                AND pane_id IS NOT NULL
               ORDER BY id"
         ))?;
         let rows = stmt.query_map([], read_attempt)?;
@@ -1408,7 +1435,8 @@ impl Db {
     /// counts. `blocked` is included because it still holds a pane.
     pub fn live_count_in_workspace(&self, workspace: &str) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM attempts WHERE outcome IS NULL AND workspace = ?1",
+            "SELECT COUNT(*) FROM attempts
+              WHERE outcome IS NULL AND board_managed = 1 AND workspace = ?1",
             params![workspace],
             |r| r.get(0),
         )?;

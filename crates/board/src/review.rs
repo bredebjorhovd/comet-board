@@ -733,6 +733,8 @@ pub(crate) mod tests {
             body: None,
             url: "https://github.com/o/r/pull/14".into(),
             head_ref: head_ref.into(),
+            head_repo: None,
+            base_sha: None,
             open: true,
             merged: false,
             draft: false,

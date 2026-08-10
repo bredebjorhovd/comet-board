@@ -153,7 +153,12 @@ pub fn gather_priced(tasks: &[Task], since_days: Option<i64>, prices: &Prices) -
 fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>) -> Stats {
     let attempts: Vec<(&Task, &Attempt)> = tasks
         .iter()
-        .flat_map(|t| t.attempts.iter().map(move |a| (t, a)))
+        .flat_map(|t| {
+            t.attempts
+                .iter()
+                .filter(|attempt| attempt.board_managed)
+                .map(move |attempt| (t, attempt))
+        })
         .filter(|(_, a)| started_within(a, since_days))
         .collect();
 

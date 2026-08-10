@@ -309,6 +309,36 @@ pub struct DispatchHandle {
     pub cwd: String,
 }
 
+/// A Comet chat whose checkout can be associated with a pull request.
+///
+/// Board dispatches already create attempts before their chats exist. This is
+/// the other provenance path: a person opened an ordinary Comet chat, the
+/// agent worked on its branch, and GitHub now reports a pull request for that
+/// branch. The sync loop turns the match into an attempt so every review
+/// surface reads the same model regardless of how the chat began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCandidate {
+    pub chat_id: String,
+    pub workspace: String,
+    pub runtime: String,
+    /// Local checkout when this device owns the chat. A path synced from a
+    /// different device is not a local filesystem capability and stays None.
+    pub worktree: Option<String>,
+    /// GitHub repository derived by the owning device when it can inspect the
+    /// checkout. None is still usable when this branch names exactly one PR.
+    pub repo: Option<String>,
+    /// Current branch when the chat still has usable checkout metadata. An
+    /// exact PR URL remains sufficient provenance when this is unavailable.
+    pub branch: Option<String>,
+    /// Canonical GitHub PR URLs explicitly mentioned by this conversation.
+    /// An exact URL is adoption evidence even when the chat lives elsewhere.
+    pub pull_request_urls: Vec<String>,
+    /// This chat ran the GitHub CLI's PR-creation command on its local host.
+    pub created_pull_request: bool,
+    pub account: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// What the board asks of comet. One implementation talks live RPC from inside
 /// the engine; tests use a recording fake, as herdr-board's fixture tests did.
 ///
@@ -348,6 +378,14 @@ pub trait Runtime {
     /// wrong author. What herdr-board read off the pane's live cwd, comet
     /// states on the chat row.
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>>;
+
+    /// Ordinary Comet chats that may have authored a newly discovered PR.
+    ///
+    /// Empty by default so read-only and legacy runtimes do not invent
+    /// provenance. A live engine answers from the workspace document.
+    fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+        Ok(Vec::new())
+    }
 
     /// Reclaim a finished attempt's checkout and the local branch it was cut
     /// on (gh#72) — herdr-board's `gc`, which the port left behind.

@@ -89,6 +89,8 @@ struct TaskRow: Decodable, Hashable, Identifiable {
     var runtime: String?
     /// The live attempt's chat (herdr-board's `pane_id`).
     var chatId: String?
+    /// The chat that authored the latest review, retained after it settles.
+    var reviewChatId: String?
     var prUrl: String?
     var prNumber: Int?
     var branch: String?
@@ -124,6 +126,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         case id, identifier, title, state, source, url, labels, dispatchable, gone
         case route, workspace, runtime, branch, attempts, reopened, account
         case chatId = "chat_id"
+        case reviewChatId = "review_chat_id"
         case prUrl = "pr_url"
         case prNumber = "pr_number"
         case dispatchedBy = "dispatched_by"
@@ -152,6 +155,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         workspace = try c.decodeIfPresent(String.self, forKey: .workspace)
         runtime = try c.decodeIfPresent(String.self, forKey: .runtime)
         chatId = try c.decodeIfPresent(String.self, forKey: .chatId)
+        reviewChatId = try c.decodeIfPresent(String.self, forKey: .reviewChatId)
         prUrl = try c.decodeIfPresent(String.self, forKey: .prUrl)
         prNumber = try c.decodeIfPresent(Int.self, forKey: .prNumber)
         branch = try c.decodeIfPresent(String.self, forKey: .branch)
@@ -174,6 +178,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
          source: String = "github", url: String = "", labels: [String] = [],
          dispatchable: Bool = true, gone: Bool = false, route: String? = nil,
          workspace: String? = nil, runtime: String? = nil, chatId: String? = nil,
+         reviewChatId: String? = nil,
          prUrl: String? = nil, prNumber: Int? = nil, branch: String? = nil,
          dispatchedBy: String? = nil, dispatchedByChat: String? = nil,
          lastOutcome: String? = nil, lastOutcomeAt: String? = nil,
@@ -194,6 +199,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         self.workspace = workspace
         self.runtime = runtime
         self.chatId = chatId
+        self.reviewChatId = reviewChatId
         self.prUrl = prUrl
         self.prNumber = prNumber
         self.branch = branch
