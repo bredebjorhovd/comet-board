@@ -11,7 +11,7 @@ enum SheetStyle {
     /// light, where a card that got DARKER than its page would read as a hole
     /// (gh#257 / gh#177's first finding).
     static let cardFill = Theme.card
-    static let rowSeparator = whiteAlpha(0.06)
+    static let rowSeparator = Theme.separator
     static let panel = Theme.sheetPanel
 }
 

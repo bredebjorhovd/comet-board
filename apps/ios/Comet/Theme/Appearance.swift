@@ -1,21 +1,19 @@
 // Which variant of the theme this device is painting (gh#257).
 //
 // The desktop picks its variant from a settings page and installs it as a
-// global (`comet_ui::theme::ThemeChoice`). A phone should not have to be told:
-// iOS already knows whether the user is in light or dark, and the answer
-// arrives through the trait collection that `themed(dark:light:)` resolves
-// against. So the default here is **System**, and the two explicit choices
-// exist for the same reason the desktop's do — somebody wants this one app the
-// other way round.
+// global (`comet_ui::theme::ThemeChoice`). The stored default here is System,
+// ready to follow the trait collection that `themed(dark:light:)` resolves
+// against. The still-shipped bundle override described below currently makes
+// that default resolve to Dark, however, so only the explicit Light/Dark
+// choices can change the shipped app today.
 //
 // # What replaced `.preferredColorScheme(.dark)`
 //
 // Four call sites used to force dark: the root scene and three sheets. The
-// sheets had to repeat it because a sheet is its own presentation host — a
-// scheme set on the presenting hierarchy does not always reach it — which is
-// exactly why `cometAppearance()` is a modifier rather than a one-liner in
-// `CometApp`. Every one of those four sites now applies the PREFERENCE, so
-// "System" means system in a sheet too instead of quietly meaning dark.
+// sheets had to repeat it because a sheet is its own presentation host. Every
+// one of those four sites now installs the same appearance adapter. The adapter
+// writes one explicit Light/Dark choice at the UIWindow boundary; it does not
+// ask SwiftUI and UIKit to race over the same property.
 //
 // # The one line that is not here (Info.plist)
 //
@@ -27,12 +25,11 @@
 // painted), `Appearance.offered` drops System from the picker while the key is
 // set, and `WindowScheme` below re-asserts the window override.
 //
-// That third one is not belt-and-braces, it is the bug. Both `preferredColorScheme`
-// and the Info.plist key end up writing `overrideUserInterfaceStyle` on the same
-// UIWindow, and **the last writer wins** — so a launch straight after install
-// came up light and the next four came up dark with identical arguments, which
-// reads as a broken theme rather than as a race. `WindowScheme` writes after
-// UIKit does, and again whenever the scene comes back.
+// That third one is not belt-and-braces, it is the bug. A SwiftUI
+// `preferredColorScheme` and the Info.plist key both end up writing
+// `overrideUserInterfaceStyle` on the same UIWindow, and **the last writer
+// wins**. `WindowScheme` is therefore the only writer for explicit choices: it
+// writes after UIKit attaches the window, and again whenever the scene returns.
 //
 // Delete the key and all three correct themselves with no code change: System
 // starts meaning system, the picker offers it, and `WindowScheme` resolves to
@@ -43,7 +40,8 @@ import SwiftUI
 /// The user's theme preference — the phone's `ThemeChoice`, plus the option the
 /// desktop does not need.
 enum Appearance: String, CaseIterable, Identifiable {
-    /// Follow iOS. The default, and the reason the tokens are dynamic.
+    /// Follow iOS once the ring-fenced bundle override is removed. This is the
+    /// stored default, but today it honestly resolves to that forced style.
     case system
     case light
     case dark
@@ -59,9 +57,9 @@ enum Appearance: String, CaseIterable, Identifiable {
         }
     }
 
-    /// What SwiftUI should be told to prefer. `nil` means "do not override",
-    /// which is only honest once nothing else is forcing a style — see the
-    /// Info.plist note above.
+    /// The style the window adapter should install. `nil` means "do not
+    /// override", which is only honest once nothing else is forcing a style —
+    /// see the Info.plist note above.
     var colorScheme: ColorScheme? {
         switch self {
         case .system: return Appearance.forcedByBundle
@@ -117,15 +115,14 @@ enum Appearance: String, CaseIterable, Identifiable {
     }
 }
 
-/// Apply the preference. On the root scene and on every sheet that presents its
-/// own host — see the note above about why a sheet needs its own.
+/// Apply the explicit preference at the window boundary. The root scene and
+/// every sheet use this same adapter.
 struct AppearanceModifier: ViewModifier {
     @AppStorage(Appearance.storageKey) private var stored = Appearance.system.rawValue
 
     func body(content: Content) -> some View {
         let scheme = Appearance.effective(stored: stored).colorScheme
         content
-            .preferredColorScheme(scheme)
             .background(WindowScheme(scheme: scheme))
     }
 }
@@ -149,17 +146,50 @@ private struct WindowScheme: UIViewRepresentable {
         }
     }
 
-    /// Holds the CURRENT style for the re-activation observer to read. Capturing
-    /// it in the closure instead would re-assert whatever was live when the view
-    /// was made — so switching the theme and then backgrounding the app would
-    /// switch it back.
+    /// Holds the CURRENT style for the re-activation observer to read, and owns
+    /// that observer's lifetime.
+    ///
+    /// The closure captures `self` **weakly**. A block-based observer is
+    /// retained by the notification centre, so a strong capture is a cycle the
+    /// coordinator can never break — `deinit` would never run, and every sheet
+    /// that was presented and dismissed would leave another live callback
+    /// walking every window on every activation. This app presents four of
+    /// them.
+    /// Once that cycle is broken, `deinit` can remove the observer normally.
+    /// The style lives here rather than being captured in the closure for a
+    /// second reason: a captured style would re-assert whatever was live when
+    /// the view was made, so switching the theme and then backgrounding the app
+    /// would switch it back.
     final class Coordinator {
         var style: UIUserInterfaceStyle = .unspecified
-        var observer: NSObjectProtocol?
+        private var observer: NSObjectProtocol?
 
-        deinit {
+        func observeActivation() {
+            guard observer == nil else { return }
+            observer = NotificationCenter.default.addObserver(
+                forName: UIScene.didActivateNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                Coordinator.apply(self.style)
+            }
+        }
+
+        func stopObserving() {
             if let observer {
                 NotificationCenter.default.removeObserver(observer)
+            }
+            observer = nil
+        }
+
+        deinit { stopObserving() }
+
+        /// Static so the closure above carries no reference to a view, a
+        /// representable or anything else that could outlive its scene.
+        static func apply(_ style: UIUserInterfaceStyle) {
+            for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+                for window in scene.windows where window.overrideUserInterfaceStyle != style {
+                    window.overrideUserInterfaceStyle = style
+                }
             }
         }
     }
@@ -169,12 +199,7 @@ private struct WindowScheme: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: .zero)
         view.isUserInteractionEnabled = false
-        let coordinator = context.coordinator
-        coordinator.observer = NotificationCenter.default.addObserver(
-            forName: UIScene.didActivateNotification, object: nil, queue: .main
-        ) { _ in
-            apply(coordinator.style)
-        }
+        context.coordinator.observeActivation()
         return view
     }
 
@@ -183,15 +208,7 @@ private struct WindowScheme: UIViewRepresentable {
         // After this layout pass, not during it: the window may not be attached
         // yet on the first one, and UIKit's own write lands in between.
         let style = style
-        DispatchQueue.main.async { apply(style) }
-    }
-
-    private func apply(_ style: UIUserInterfaceStyle) {
-        for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
-            for window in scene.windows where window.overrideUserInterfaceStyle != style {
-                window.overrideUserInterfaceStyle = style
-            }
-        }
+        DispatchQueue.main.async { Coordinator.apply(style) }
     }
 }
 

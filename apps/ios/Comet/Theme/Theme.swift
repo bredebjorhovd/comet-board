@@ -1,4 +1,5 @@
-// Monochrome theme, in two variants — a direct port of crates/ui/src/theme.rs.
+// Monochrome theme, in two variants. Dark and the shared scales are a direct
+// port of crates/ui/src/theme.rs; light is the supplied iOS reference's palette.
 //
 // Colors are computed from the same oklch definitions the desktop app uses
 // (Björn Ottosson's OKLab matrices, the ones CSS Color 4 specifies), so every
@@ -6,7 +7,7 @@
 // colors are paint**: layout constants are plain numbers and never depend on
 // which color is painted.
 //
-// # Light is a design, not an inversion (gh#257, porting gh#177)
+// # Light is a design, not an inversion (gh#257)
 //
 // Every paint token below is declared with `themed(dark:light:)`, which builds
 // one `Color` that resolves against the trait collection it is drawn into. The
@@ -16,25 +17,39 @@
 // values is what keeps `if colorScheme == .light` from spreading through the
 // screens, which is how a light theme rots into a per-view opinion.
 //
-// The light values are the desktop's, not new ones (`Theme::light()`), and
-// `crates/ui/tests/ios_theme.rs` now asserts BOTH variants against it. What
-// they carry over from gh#177's argument:
+// ## Where the light numbers come from
 //
-// - **Elevation runs toward white.** Dark walks `#060606 → #0d0d0d → #3a3a3a`,
-//   brighter as it rises; light puts a sheet's page on the ground `#edf0f4` and
-//   lifts its cards to pure white. Inverting dark's ramp instead would have put
-//   a card DARKER than the page behind it, which reads as a hole.
-// - **Neutrals lean blue** (`lightNeutralHue`) — a pure grey beside white makes
-//   the white read yellow. `card` is the one exception, and it is exactly why
-//   the others lean: it IS the white the trace protects.
-// - **Ink, not black.** Hairlines and washes over near-white are `ink` — a cool
-//   near-black — because black at a low alpha over paper reads as grime.
-// - **The status ramp drops an anchor.** `statusLLight` walks the four hues
-//   down to ~5:1 on paper, the same step the text ramp takes.
+// **The design doc for this phone, `Comet iOS.dc.html`, and not the desktop's
+// `Theme::light()`.** The two disagree, and the disagreement is deliberate on
+// the doc's side: it draws phone screens, so it declares a phone's surface
+// system rather than a shell-beside-a-panel one. Every light value below is
+// transcribed from its `.cw[data-theme="light"]` block, named in the comment
+// that carries it, and asserted against that same table by
+// `crates/ui/tests/ios_theme.rs`:
 //
-// The phone owns one thing the desktop does not: it never chooses the variant.
-// `Appearance.swift` holds a preference whose default is the SYSTEM's answer,
-// so the scheme arrives from iOS through the trait collection.
+//     --card #ffffff   --raised #f4f4f7   --sel #ffffff   --selcard #eeeef2
+//     --chip rgba(0,0,0,.05)   --line #e4e4e8   --line2 #d6d6dc
+//     --text #171717   --muted #545454   --subtle #6b6b6b   --faint #8a8a8a
+//     --blocked/working/review/settled  oklch(0.52 0.16 <hue>)
+//     --claude #c15f3c
+//
+// So: the page is white and elevation is a TINT DOWN from it (`--raised`), the
+// hairlines are opaque hexes rather than a translucent ink, and the status ramp
+// sits at L 0.52 / C 0.16 rather than the desktop light theme's 0.55 / 0.14.
+// **Dark is untouched and still the desktop's**, number for number — the phone
+// and the laptop agree about dark, and about the whole of the scale, the radii
+// and the four contrast steps. What the phone now owns alone is which paint
+// those steps land on when the lights are on.
+//
+// A handful of tokens have no counterpart in the doc, because the screens it
+// draws never show them: `accentStrong` (no filled accent button), the three
+// `*Text` foregrounds, the inline-code violet and the three syntax tones. Each
+// says at its declaration where its light value came from instead.
+//
+// The phone owns one more thing the desktop does not: `Appearance.swift` maps a
+// stored preference onto the window. Its stored default is System, but the
+// ring-fenced `Info.plist` key still forces Dark app-wide, so System cannot
+// follow the device until that separate integration dependency is removed.
 //
 // # The phone reads from the desktop's system (gh#181)
 //
@@ -140,79 +155,85 @@ enum Status {
 
 enum Theme {
     // ---- paint: neutral surfaces ----
-    // Dark's are achromatic (oklch chroma 0); light's carry `lightNeutralHue`'s
-    // trace of blue, and only `surfaceRaised` is the pure white that trace
-    // exists to protect.
+    // Dark's are achromatic (oklch chroma 0), sampled from the original app;
+    // light's are the reference's hexes, which carry their own faint blue in
+    // the last digit (`#f4f4f7`, `#e4e4e8`) — a pure grey beside white makes
+    // the white read yellow, and the doc's surfaces already account for it.
     /// The reading page: the transcript, the composer behind it, sign-in, the
-    /// new-session canvas. Dark's sampled #060606; light's paper.
-    static let bg = themed(dark: grey(6), light: cool(0.986, 0.003))
-    /// The page every LIST scrolls over — Home, Board, Stats. On the desktop
-    /// that is the shell beside the panel, so it walks one step away from `bg`
-    /// in whichever direction the variant has room; on a phone there is no
-    /// panel beside it, and a full screen of the desktop's #edf0f4 ground reads
-    /// as a page that never finished loading. So in light it is the paper, and
-    /// coincides with `bg` — the same way `card` and the shell coincide in the
-    /// desktop's dark, where the two jobs a token does happen to want the same
-    /// tone.
-    static let surface = themed(dark: grey(13), light: cool(0.986, 0.003))
-    /// Raised surface — but on this device that almost always means an inline
-    /// TILE rather than a float: a stats bar's track, a tool card in the
-    /// transcript, the plate behind a swipe action. So light steps DOWN into
-    /// the paper (the desktop's `bubble` tone, "a well drawn by its edge")
-    /// rather than up to white. Up is where a meter track goes invisible: it is
-    /// painted at half alpha over the very page it would have matched.
-    static let surfaceRaised = themed(dark: neutral(0.235), light: cool(0.965, 0.005))
+    /// new-session canvas. Dark's sampled #060606; light's `--card`.
+    static let bg = themed(dark: grey(6), light: hex(0xFFFFFF))
+    /// The page every LIST scrolls over — Home, Board, Stats. Dark walks UP
+    /// from `bg` to reach it (#0d0d0d, the desktop's shell). Light does not
+    /// walk anywhere: the reference gives a phone screen ONE page tone
+    /// (`--card`), because there is no panel beside it to be a step away from.
+    static let surface = themed(dark: grey(13), light: hex(0xFFFFFF))
+    /// Raised surface: a stats bar's track, a tool card in the transcript, the
+    /// plate behind a swipe action. Light TINTS DOWN from the white page
+    /// (`--raised`) rather than up — up is where a track painted at half alpha
+    /// over the page it would have matched goes invisible.
+    static let surfaceRaised = themed(dark: neutral(0.235), light: hex(0xF4F4F7))
     /// The page a sheet presents on. Between `bg` and `surfaceRaised` in dark;
-    /// the ground in light — a sheet is the one surface here that DOES have
-    /// something floating on it, and `card` needs somewhere to rise from.
-    static let sheetPanel = themed(dark: grey(0x14), light: cool(0.955, 0.006))
-    /// A grouped card ON `sheetPanel`: a translucent lift in dark, the white
-    /// object in light. Never darker than its page (gh#177's first finding —
-    /// an inverted ramp put popovers below the page and they read as holes).
-    static let card = themed(dark: Color.white.opacity(0.045), light: cool(1.0, 0.0))
-    /// Pressed wash for interactive rows — the desktop's `element_hover`, which
-    /// on a touch screen is what a finger holds down rather than what a pointer
-    /// rests on.
-    static let elementHover = themed(dark: wash(0.07), light: ink(0.06))
-    /// Active/selected wash. One step past `elementHover` in both variants —
-    /// no desktop counterpart, since selection there is a different channel
-    /// entirely (gh#175) and a phone has no pointer to tell it from hover.
-    static let elementActive = themed(dark: wash(0.10), light: ink(0.09))
-    /// Hairline border — white at low alpha over dark, cool ink over light. A
-    /// white hairline on near-white is no hairline at all.
-    static let border = themed(dark: Color.white.opacity(0.08), light: ink(0.13))
-    /// Stronger border for focused/raised edges.
-    static let borderStrong = themed(dark: Color.white.opacity(0.14), light: ink(0.20))
+    /// `--raised` in light, so the white cards on it read as the raised object.
+    /// It shares a tone with `surfaceRaised` there, the way `card` and the
+    /// shell share one in the desktop's dark: two jobs, one answer.
+    static let sheetPanel = themed(dark: grey(0x14), light: hex(0xF4F4F7))
+    /// A grouped card ON `sheetPanel` — a translucent lift in dark, the white
+    /// object (`--sel`) in light. Never darker than the bed it sits on.
+    static let card = themed(dark: Color.white.opacity(0.045), light: hex(0xFFFFFF))
+    /// Pressed wash for interactive rows and the fill behind a chip — the
+    /// desktop's `element_hover`, which on a touch screen is what a finger
+    /// holds down rather than what a pointer rests on. `--chip` in both: white
+    /// at 7% over dark, black at 5% over light.
+    static let elementHover = themed(dark: wash(0.07), light: Color.black.opacity(0.05))
+    /// Active/selected row. Dark keeps the app's existing pressed wash; light
+    /// uses the reference's exact `--selcard`, including its faint blue tint.
+    static let elementActive = themed(dark: wash(0.10), light: hex(0xEEEEF2))
+    /// Hairline border — `--line`. Translucent white over dark; an OPAQUE hex
+    /// over light, because a hairline is the one thing that must not fade into
+    /// the paper it is drawn on.
+    static let border = themed(dark: Color.white.opacity(0.08), light: hex(0xE4E4E8))
+    /// Stronger border for focused/raised edges — `--line2`.
+    static let borderStrong = themed(dark: Color.white.opacity(0.14), light: hex(0xD6D6DC))
+    /// The hairline BETWEEN rows inside a grouped card, where `border` draws
+    /// the card's own edge. Quieter than `border` in dark; in light the
+    /// reference has two line tones and this is the lighter of them.
+    static let separator = themed(dark: Color.white.opacity(0.06), light: hex(0xE4E4E8))
 
     // ---- paint: text — four tones, never multiplied (gh#172) ----
     // The same four contrast steps in both variants — 16.9 / 8.4 / 5.1 / 3.5 on
-    // `bg` — measured against each variant's own surfaces rather than inverted.
-    /// Headings, titles, the selected row. ~16.9:1 on `bg`.
-    static let text = themed(dark: neutral(0.938), light: cool(0.213, 0.008))
+    // `bg` — measured against each variant's own page rather than inverted.
+    /// Headings, titles, the selected row. ~16.9:1 on `bg` — `--text`.
+    static let text = themed(dark: neutral(0.938), light: hex(0x171717))
     /// Body copy and unselected rows — the default reading tone. ~8.4:1.
-    static let textMuted = themed(dark: neutral(0.728), light: cool(0.412, 0.008))
+    static let textMuted = themed(dark: neutral(0.728), light: hex(0x545454))
     /// Labels, metadata, captions, timestamps, sublines. ~5.1:1 — still AA body
     /// text, which the `.opacity(0.5)` sublines this token replaces were not.
-    static let textSubtle = themed(dark: neutral(0.598), light: cool(0.529, 0.008))
+    static let textSubtle = themed(dark: neutral(0.598), light: hex(0x6B6B6B))
     /// Disabled controls and placeholders, and nothing else. ~3.5:1 — the
     /// floor, so anything a user is meant to READ sits at `textSubtle` or up.
-    static let textFaint = themed(dark: neutral(0.508), light: cool(0.620, 0.008))
+    static let textFaint = themed(dark: neutral(0.508), light: hex(0x8A8A8A))
 
     // ---- the status ramp: four hues, one L, one C (gh#173) ----
-    // Anchored in `comet_proto::view::status`, because the desktop app, the
-    // terminal app and this one paint the same meanings and must land on the
-    // same hues. `crates/ui/tests/ios_theme.rs` asserts these five numbers
-    // still equal the Rust ones.
+    // The four HUES are anchored in `comet_proto::view::status`, because the
+    // desktop app, the terminal app and this one paint the same meanings and
+    // must land on the same hues — `crates/ui/tests/ios_theme.rs` asserts they
+    // still equal the Rust ones, in both variants. The two ANCHORS differ by
+    // variant, and light's are the reference's rather than the desktop's: it
+    // asks for a heavier ramp on a white page than `Theme::light()` wants on
+    // its cool paper, and the page is the thing that changed.
     /// The lightness every status hue is anchored to on a dark surface. One
     /// number, so "how loud is this state" is decided by the state and never by
     /// its hue.
     static let statusL: Double = 0.74
-    /// The same anchor on a light surface — walked down so the four hues keep
-    /// contrast on paper (~5:1, the same step the text ramp takes). Not a
-    /// second palette: same chroma, same four hues, one lightness lower.
-    static let statusLLight: Double = 0.55
-    /// The chroma every status hue carries.
+    /// The same anchor on the reference's white page: darker, so the hues keep
+    /// contrast, and carrying `statusCLight` with it.
+    static let statusLLight: Double = 0.52
+    /// The chroma every status hue carries on a dark surface.
     static let statusC: Double = 0.14
+    /// The same on light. A touch more, because a hue loses saturation to the
+    /// eye as it darkens and the four have to stay as distinct from each other
+    /// as they are in dark.
+    static let statusCLight: Double = 0.16
     /// Blocked · failed · errored.
     static let hueBlocked: Double = 25
     /// Working — an agent is running.
@@ -224,7 +245,7 @@ enum Theme {
 
     /// A status hue at whichever anchor the surface under it calls for.
     static func ramp(_ hue: Double) -> Color {
-        themed(dark: oklch(statusL, statusC, hue), light: oklch(statusLLight, statusC, hue))
+        themed(dark: oklch(statusL, statusC, hue), light: oklch(statusLLight, statusCLight, hue))
     }
 
     /// Accent — indigo, `Status.review`'s hue: review, a question, links,
@@ -233,8 +254,12 @@ enum Theme {
     /// The accent hue at fill weight — off the ramp on purpose: a filled button
     /// is not a status, and a status-weight fill under white text would not
     /// hold contrast. Same hue, so the two read as one colour.
+    ///
+    /// The reference draws no filled accent button, so light's value is derived
+    /// rather than transcribed: the same step off the ramp that dark takes
+    /// (−0.12 lightness, +0.05 chroma), applied to light's anchor.
     static let accentStrong = themed(dark: oklch(0.62, 0.19, hueReview),
-                                     light: oklch(0.47, 0.19, hueReview))
+                                     light: oklch(0.40, 0.21, hueReview))
     /// Danger — red, `Status.blocked`'s hue: errors, the stop button.
     static let danger = ramp(hueBlocked)
     /// Warning — amber, `Status.working`'s hue: a running agent, offline
@@ -259,34 +284,35 @@ enum Theme {
         }
     }
 
-    /// The danger text/icon tone for error UI (error chips, failure notices):
-    /// dark uses the pale red-300, readable on a near-black chip; light uses
-    /// red-700, which is what holds on white. Borders and washes stay on
-    /// `danger` — only the foreground swaps, because a pale tone on a pale wash
-    /// washes out.
-    static let dangerText = themed(dark: oklch(0.808, 0.114, 19.571),   // red-300
-                                   light: oklch(0.505, 0.213, 27.518))  // red-700
-    /// The warning text/icon tone for notice UI (offline notices) — amber-200
-    /// in dark, amber-700 in light. See `dangerText`.
-    static let warningText = themed(dark: oklch(0.924, 0.12, 95.746),    // amber-200
-                                    light: oklch(0.555, 0.163, 48.998))  // amber-700
-    /// The settled text/icon tone for presence UI (an "Active" badge, a copied
-    /// id's confirmation): the ramp's hue, off its lightness, because this one
-    /// sits ON a fill of its own colour.
+    // ---- the three foregrounds that sit ON a fill of their own colour ----
+    // Dark needs its own tones here: its ramp is anchored for a dark PAGE, and
+    // ramp-weight paint on a 12% wash of itself over near-black does not hold.
+    // Light does not — the reference's ramp is already anchored for the white
+    // page these washes sit on, so the foreground and the ramp coincide, and a
+    // fifth red invented to go on a pink chip is a tone nobody asked for. The
+    // three keep their own names because the DARK halves are real paint of
+    // their own.
+    /// Error chips and failure notices — on `danger.opacity(0.12…0.14)`.
+    static let dangerText = themed(dark: oklch(0.808, 0.114, 19.571),  // red-300
+                                   light: oklch(statusLLight, statusCLight, hueBlocked))
+    /// Offline notices — on `warning`'s wash. amber-200 in dark.
+    static let warningText = themed(dark: oklch(0.924, 0.12, 95.746),  // amber-200
+                                    light: oklch(statusLLight, statusCLight, hueWorking))
+    /// Presence UI: an "Active" badge, a copied id's confirmation.
     static let settledText = themed(dark: oklch(0.88, 0.11, hueSettled),
-                                    light: oklch(0.46, 0.13, hueSettled))
+                                    light: oklch(statusLLight, statusCLight, hueSettled))
 
-    /// Claude brand orange — kept even on the mono surface, and kept in BOTH
-    /// variants: it is a brand mark rather than a tone of ours to re-anchor,
-    /// and the desktop paints the same `#D97757` on white. Not a status either:
-    /// it identifies a harness, and `Status` is about what a run is doing.
-    ///
-    /// one-tone-ok: a brand mark is one colour — re-anchoring it for light
-    /// would be inventing a second Claude orange, and the desktop paints this
-    /// exact value on white already.
-    static let claudeBrand = Color(red: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0)
+    /// Claude brand orange — kept even on the mono surface, because it
+    /// identifies a harness rather than a state, and `Status` is about what a
+    /// run is doing. `--claude` in both: the brand's own #D97757 on dark, and
+    /// the reference's darker mix of it on white, where #D97757 carries barely
+    /// 2.6:1 against the page.
+    static let claudeBrand = themed(dark: hex(0xD97757), light: hex(0xC15F3C))
 
     // ---- paint: markdown inline code (violet family) ----
+    // The reference draws no rendered markdown, so this pair and the three
+    // syntax tones below keep the desktop's light values (`markdown::render`)
+    // — the only other place in this repo that has ever declared them.
     /// violet-300 on the near-black code bed; violet-600 on paper, where the
     /// pale one would vanish.
     static let inlineCodeText = themed(dark: oklch(0.811, 0.111, 293.571),  // violet-300
@@ -396,20 +422,13 @@ extension Theme {
 // MARK: - The two variants
 
 extension Theme {
-    /// The hue every light neutral carries a trace of. A pure grey beside white
-    /// makes the white read yellow, so the light surfaces, hairlines, washes
-    /// and text tones are all mixed at this hue with a chroma small enough that
-    /// nobody would call them blue — and `surfaceRaised` stays pure white,
-    /// which is the point.
-    static let lightNeutralHue: Double = 255
-    /// What a `whiteAlpha` hairline's alpha becomes when it is made of `ink`
-    /// instead. White at 8% over #060606 is a clean line; ink at 8% over
-    /// #f9fafc is barely there, because the eye reads a light surface's
-    /// contrast on a shorter scale. The scale is set by the token that matters
-    /// most: `border`'s 0.08 lands on the desktop light theme's `ink(0.13)`,
-    /// and every other call site rides the same ratio rather than being retuned
-    /// one at a time.
-    static let lightInkScale: Double = 1.625
+    /// What a `whiteAlpha` overlay's alpha becomes when it is made of black
+    /// instead. Set by the one value the reference declares for this job:
+    /// `--chip` is white at 7% in dark and black at 5% in light, so 5/7. Every
+    /// other translucent call site rides the same ratio rather than being
+    /// retuned one at a time — an overlay reads heavier as ink on paper than as
+    /// light on near-black, and by the same factor throughout.
+    static let lightInkScale: Double = 5.0 / 7.0
 }
 
 /// One token, two values — resolved against the trait collection it is drawn
@@ -420,7 +439,8 @@ extension Theme {
 /// alternative — a `@Environment(\.colorScheme)` read at the call site — puts
 /// the design system's decisions in the views, where the two halves drift and
 /// nothing can check them; `crates/ui/tests/ios_theme.rs` reads the `dark:` and
-/// `light:` arguments below and holds both to `crates/ui/src/theme.rs`.
+/// `light:` arguments below and holds dark to `crates/ui/src/theme.rs` and
+/// light to the reference's own table.
 func themed(dark: Color, light: Color) -> Color {
     Color(UIColor { traits in
         UIColor(traits.userInterfaceStyle == .light ? light : dark)
@@ -436,33 +456,28 @@ func neutral(_ lightness: Double) -> Color {
     return Color(red: v, green: v, blue: v)
 }
 
-/// A light-mode neutral: an oklch tone carrying `Theme.lightNeutralHue`'s trace
-/// of blue. `cool(l, 0)` is exactly `neutral(l)` — which is how `surfaceRaised`
-/// gets to be pure white while everything around it leans cool, so the white
-/// reads as white.
-func cool(_ lightness: Double, _ chroma: Double) -> Color {
-    oklch(lightness, chroma, Theme.lightNeutralHue)
+/// An exact sRGB colour from a 24-bit hex literal — how the reference declares
+/// every one of its light surfaces, hairlines and text tones, so this is how
+/// they are transcribed.
+func hex(_ rgb: UInt32) -> Color {
+    Color(red: Double((rgb >> 16) & 0xFF) / 255.0,
+          green: Double((rgb >> 8) & 0xFF) / 255.0,
+          blue: Double(rgb & 0xFF) / 255.0)
 }
 
-/// The light theme's ink — what a hairline or a wash is MADE of. Not black: a
-/// cool near-black, so a 9% wash over a cool surface stays on the same side of
-/// neutral instead of going flat grey. Black over near-white is the tone the
-/// whole of gh#177 is arguing with.
-func ink(_ alpha: Double) -> Color {
-    cool(0.30, 0.012).opacity(alpha)
-}
-
-/// The hairline/wash primitive, in whichever ink the surface calls for: white
-/// at low alpha over dark, cool `ink` at `Theme.lightInkScale` of that alpha
-/// over light. A white hairline on near-white is not a faint hairline, it is
-/// no hairline.
+/// The translucent-overlay primitive, in whichever ink the surface calls for:
+/// white at low alpha over dark, black at `Theme.lightInkScale` of that alpha
+/// over light — the reference's `--chip`, generalised.
 ///
 /// Dynamic rather than dark-only because it is the one primitive the SCREENS
-/// call — chips, separators, card fills and pressed states all reach for it
-/// directly, and rewriting those two dozen call sites into paired tokens would
-/// have bought nothing the resolution below does not.
+/// call — chips, card fills and pressed states all reach for it directly, and
+/// rewriting those two dozen call sites into paired tokens would have bought
+/// nothing the resolution below does not. The two places where an overlay is
+/// the wrong answer in light are the two hairline tokens, which the reference
+/// declares as opaque hexes and `Theme` therefore declares in full.
 func whiteAlpha(_ alpha: Double) -> Color {
-    themed(dark: Color.white.opacity(alpha), light: ink(alpha * Theme.lightInkScale))
+    themed(dark: Color.white.opacity(alpha),
+           light: Color.black.opacity(alpha * Theme.lightInkScale))
 }
 
 /// Interactive-state wash: translucent soft-white rather than pure white, so a

@@ -7,31 +7,34 @@
 //! `boardStateColor` said amber and `ChatIndicator.dotColor` said pink, one
 //! screen apart, months after the desktop had settled that argument.
 //!
-//! So this file reads the Swift as text and holds it to the Rust. Six checks,
+//! So this file reads the Swift as text and holds dark plus the shared scales to
+//! Rust, while holding light to the supplied iOS reference. Eight checks,
 //! mirroring `text_tones.rs` and `scale.rs` for the other viewport:
 //!
-//! 1. **Parity, in both variants.** The status ramp, the three radii, the type
-//!    scale and the surfaces/text greys are the same NUMBERS the desktop paints
-//!    (`ios_theme_declares_the_same_system`). Since gh#257 the phone has a light
-//!    variant, so the paint checks read the `dark:` and `light:` arguments of
-//!    each `themed(…)` token and hold them to [`Theme::dark`] and
-//!    [`Theme::light`] respectively — a light theme that drifts is the same
-//!    class of bug as a dark one that does, and it is the easier one to ship
-//!    unnoticed on a device nobody uses in daylight.
+//! 1. **Parity, in both variants.** Dark paint and the shared radii/type scale
+//!    stay equal to [`Theme::dark`]. Light paint stays equal to the exact
+//!    neutral, status and Claude variables in `Comet iOS.dc.html`, which
+//!    deliberately differ from [`Theme::light`]
+//!    (`ios_theme_declares_the_shared_system_and_ios_reference`).
 //! 2. **Every paint token declares both variants**
 //!    (`every_paint_token_answers_for_both_variants`), hatch `one-tone-ok:`.
 //!    A token that resolves to one colour in both schemes is the crack a
 //!    scattered `if colorScheme == .light` grows out of.
-//! 3. **Nothing forces a scheme** (`nothing_in_the_app_forces_a_colour_scheme`).
-//!    Before gh#257 four call sites pinned `.dark` — the scene and three
-//!    sheets — which is why the light design in the reference could not be
-//!    reached at all.
+//! 3. **No Swift view pins a scheme**
+//!    (`no_swift_view_pins_a_colour_scheme`). Before gh#257 four call sites
+//!    pinned `.dark` — the scene and three sheets. The separate, ring-fenced
+//!    `UIUserInterfaceStyle = Dark` bundle key is still present and is checked
+//!    explicitly rather than hidden by this claim.
 //! 4. **No text tone is multiplied by an alpha** (gh#172), hatch
 //!    `theme-opacity-ok:`.
 //! 5. **No literal radius or font size outside `Theme.swift`** (gh#174), hatch
 //!    `scale-ok:`.
 //! 6. **`Capsule()` / `Circle()` is a dot, a drawn cap or the send button**
 //!    (gh#174), hatch `round-ok:`.
+//! 7. **The ring-fenced bundle override is handled honestly**
+//!    (`bundle_style_dependency_is_explicit`).
+//! 8. **The activation observer has a bounded lifetime**
+//!    (`window_scheme_observer_has_a_bounded_lifetime`).
 //!
 //! Why here and not in the phone's own harness: `SpecRunner` needs a simulator,
 //! so it runs when somebody remembers to run it and never in CI (see
@@ -45,7 +48,7 @@
 
 use comet_proto::view::status;
 use comet_ui::theme::{Theme, cool, grey, ink, neutral, oklch, wash, white_alpha};
-use gpui::Hsla;
+use gpui::{Hsla, Rgba};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +62,15 @@ fn ios_root() -> PathBuf {
 
 fn theme_swift() -> String {
     std::fs::read_to_string(ios_root().join("Theme/Theme.swift")).expect("read Theme.swift")
+}
+
+fn appearance_swift() -> String {
+    std::fs::read_to_string(ios_root().join("Theme/Appearance.swift"))
+        .expect("read Appearance.swift")
+}
+
+fn info_plist() -> String {
+    std::fs::read_to_string(ios_root().join("Info.plist")).expect("read Info.plist")
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +134,7 @@ fn number(src: &str, name: &str) -> f32 {
 ///
 /// Every colour in `Theme.swift` is `themed(dark: …, light: …)` or one of the
 /// two shorthands that expand to it — `ramp(hue)` (the same hue at the two
-/// status anchors) and `whiteAlpha(a)` (white over dark, cool ink over light).
+/// status anchors) and `whiteAlpha(a)` (white over dark, black over light).
 /// Anything else is a token that paints one colour in both schemes, which
 /// `every_paint_token_answers_for_both_variants` is the test for.
 fn variants(src: &str, name: &str) -> Option<(String, String)> {
@@ -133,13 +145,13 @@ fn split_variants(raw: &str) -> Option<(String, String)> {
     if let Some(hue) = call_body(raw, "ramp") {
         return Some((
             format!("oklch(statusL, statusC, {hue})"),
-            format!("oklch(statusLLight, statusC, {hue})"),
+            format!("oklch(statusLLight, statusCLight, {hue})"),
         ));
     }
     if let Some(alpha) = call_body(raw, "whiteAlpha") {
         return Some((
             format!("Color.white.opacity({alpha})"),
-            format!("ink({alpha} * lightInkScale)"),
+            format!("Color.black.opacity({alpha} * lightInkScale)"),
         ));
     }
     let body = call_body(raw, "themed")?;
@@ -208,6 +220,9 @@ fn paint(src: &str, expr: &str) -> Hsla {
         if base == "Color.white" {
             return white_alpha(scalar(src, alpha));
         }
+        if base == "Color.black" {
+            return black_alpha(scalar(src, alpha));
+        }
         return paint(src, base).opacity(scalar(src, alpha));
     }
     let args = |name: &str| -> Option<Vec<f32>> {
@@ -220,6 +235,9 @@ fn paint(src: &str, expr: &str) -> Hsla {
     };
     if let Some(a) = args("grey") {
         return grey(a[0] as u8);
+    }
+    if let Some(a) = args("hex") {
+        return hex(a[0] as u32);
     }
     if let Some(a) = args("neutral") {
         return neutral(a[0]);
@@ -239,6 +257,24 @@ fn paint(src: &str, expr: &str) -> Hsla {
     panic!(
         "Theme.swift paints `{expr}`, which this test cannot evaluate — teach it the constructor or use one it knows"
     );
+}
+
+fn hex(rgb: u32) -> Hsla {
+    Hsla::from(Rgba {
+        r: ((rgb >> 16) & 0xff) as f32 / 255.0,
+        g: ((rgb >> 8) & 0xff) as f32 / 255.0,
+        b: (rgb & 0xff) as f32 / 255.0,
+        a: 1.0,
+    })
+}
+
+fn black_alpha(alpha: f32) -> Hsla {
+    Hsla::from(Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: alpha,
+    })
 }
 
 fn split_args(body: &str) -> Vec<String> {
@@ -265,7 +301,7 @@ fn scalar(src: &str, expr: &str) -> f32 {
 }
 
 #[test]
-fn ios_theme_declares_the_same_system() {
+fn ios_theme_declares_the_shared_system_and_ios_reference() {
     let src = theme_swift();
     let mut wrong = Vec::new();
     let mut check = |what: &str, phone: f32, desktop: f32| {
@@ -276,12 +312,9 @@ fn ios_theme_declares_the_same_system() {
 
     // The status ramp — one lightness, one chroma, four hues (gh#173).
     check("statusL", number(&src, "statusL"), status::L);
-    check(
-        "statusLLight",
-        number(&src, "statusLLight"),
-        status::L_LIGHT,
-    );
+    check("statusLLight", number(&src, "statusLLight"), 0.52);
     check("statusC", number(&src, "statusC"), status::C);
+    check("statusCLight", number(&src, "statusCLight"), 0.16);
     check("hueBlocked", number(&src, "hueBlocked"), status::BLOCKED);
     check("hueWorking", number(&src, "hueWorking"), status::WORKING);
     check("hueReview", number(&src, "hueReview"), status::REVIEW);
@@ -317,49 +350,51 @@ fn ios_theme_declares_the_same_system() {
     );
     check("textFigure", number(&src, "textFigure"), Theme::TEXT_FIGURE);
 
-    // The paint, in BOTH variants (gh#257). Compared as COLOUR, not as
-    // lightness: both languages run the same oklch→sRGB conversion, so the
-    // assertion is that what lands on the phone's screen is what lands on the
-    // desktop's — in the scheme the reader is actually in.
-    //
-    // The pairs are (phone token, desktop's dark, desktop's light). Where the
-    // phone's job for a token differs from the desktop's, the LIGHT column says
-    // so by naming a different desktop token — see the notes.
+    // Paint is compared as COLOUR, not spelling. Dark stays on the desktop
+    // system. Light is the supplied iOS reference's own table — not the cool
+    // desktop-light palette that the review explicitly rejected.
     let dark = Theme::dark();
-    let light = Theme::light();
     for (name, want_dark, want_light) in [
-        // Four text greys (gh#172), four contrast steps, twice.
-        ("text", dark.text, light.text),
-        ("textMuted", dark.text_muted, light.text_muted),
-        ("textSubtle", dark.text_subtle, light.text_subtle),
-        ("textFaint", dark.text_faint, light.text_faint),
-        // Surfaces. `surface` is the shell on a desktop and the whole screen on
-        // a phone, which is why its light half is the desktop's PAPER: a full
-        // screen of the shell's ground reads as a page that failed to load.
-        ("bg", dark.bg, light.bg),
-        ("surface", dark.surface, light.bg),
-        // `surfaceRaised` is an inline tile here (a meter track, a tool card),
-        // so light steps DOWN into the paper — the desktop's `bubble`, its
-        // token for a well rather than a float.
-        ("surfaceRaised", dark.surface_raised, light.bubble),
-        // A sheet IS the one surface with something floating on it, so its page
-        // is the ground and its cards are the raised white object.
-        ("sheetPanel", grey(0x14), light.surface),
-        ("card", white_alpha(0.045), light.surface_raised),
-        ("elementHover", dark.element_hover, light.element_hover),
-        ("border", dark.border, light.border),
-        ("borderStrong", dark.border_strong, light.border_strong),
-        // The status ramp, at its two anchors.
-        ("accent", dark.accent, light.accent),
-        ("accentStrong", dark.accent_strong, light.accent_strong),
-        ("danger", dark.danger, light.danger),
-        ("warning", dark.warning, light.warning),
-        ("settled", dark.settled, light.settled),
-        // The foregrounds that sit ON a fill of their own colour, and so invert
-        // rather than following the ramp.
-        ("dangerText", dark.danger_text(), light.danger_text()),
-        ("warningText", dark.warning_text(), light.warning_text()),
-        ("settledText", dark.settled_text(), light.settled_text()),
+        // --text / --muted / --subtle / --faint
+        ("text", dark.text, hex(0x171717)),
+        ("textMuted", dark.text_muted, hex(0x545454)),
+        ("textSubtle", dark.text_subtle, hex(0x6b6b6b)),
+        ("textFaint", dark.text_faint, hex(0x8a8a8a)),
+        // --card / --raised / --sel / --selcard / --chip
+        ("bg", dark.bg, hex(0xffffff)),
+        ("surface", dark.surface, hex(0xffffff)),
+        ("surfaceRaised", dark.surface_raised, hex(0xf4f4f7)),
+        ("sheetPanel", grey(0x14), hex(0xf4f4f7)),
+        ("card", white_alpha(0.045), hex(0xffffff)),
+        ("elementHover", dark.element_hover, black_alpha(0.05)),
+        ("elementActive", wash(0.10), hex(0xeeeef2)),
+        // --line / --line2
+        ("border", dark.border, hex(0xe4e4e8)),
+        ("borderStrong", dark.border_strong, hex(0xd6d6dc)),
+        ("separator", white_alpha(0.06), hex(0xe4e4e8)),
+        // --review / --blocked / --working / --settled
+        ("accent", dark.accent, oklch(0.52, 0.16, status::REVIEW)),
+        ("danger", dark.danger, oklch(0.52, 0.16, status::BLOCKED)),
+        ("warning", dark.warning, oklch(0.52, 0.16, status::WORKING)),
+        ("settled", dark.settled, oklch(0.52, 0.16, status::SETTLED)),
+        // Foregrounds on status washes use that same reference ramp in light.
+        (
+            "dangerText",
+            dark.danger_text(),
+            oklch(0.52, 0.16, status::BLOCKED),
+        ),
+        (
+            "warningText",
+            dark.warning_text(),
+            oklch(0.52, 0.16, status::WORKING),
+        ),
+        (
+            "settledText",
+            dark.settled_text(),
+            oklch(0.52, 0.16, status::SETTLED),
+        ),
+        // --claude
+        ("claudeBrand", hex(0xd97757), hex(0xc15f3c)),
     ] {
         let Some((dark_expr, light_expr)) = variants(&src, name) else {
             wrong.push(format!(
@@ -374,7 +409,7 @@ fn ios_theme_declares_the_same_system() {
             let got = paint(&src, &expr);
             if got != want {
                 wrong.push(format!(
-                    "  {name} ({scheme}): phone {expr} = {got:?}, desktop {want:?}"
+                    "  {name} ({scheme}): phone {expr} = {got:?}, expected {want:?}"
                 ));
             }
         }
@@ -382,11 +417,10 @@ fn ios_theme_declares_the_same_system() {
 
     assert!(
         wrong.is_empty(),
-        "{} value(s) where the phone has drifted off the desktop's system. \
-         The numbers live in crates/ui/src/theme.rs and comet_proto::view::status; \
-         apps/ios/Comet/Theme/Theme.swift restates them because no Rust runs on \
-         that device, and restating them differently is the bug this test \
-         exists for:\n{}",
+        "{} value(s) where the phone has drifted off the shared dark/scales or \
+         the supplied iOS light reference. Dark and layout numbers live in \
+         crates/ui/src/theme.rs and comet_proto::view::status; the light paint \
+         values live in Comet iOS.dc.html and are restated explicitly above:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
@@ -450,31 +484,23 @@ fn every_paint_token_answers_for_both_variants() {
         violations,
         "paint token(s) that paint the same colour in light and dark. Declare \
          both — `themed(dark: …, light: …)`, or `ramp(hue)` for a status hue — \
-         with the light half taken from `Theme::light()` in \
-         crates/ui/src/theme.rs rather than invented here. If the colour really \
+         with the light half taken from the supplied iOS reference where it \
+         declares that job. If the colour really \
          is one colour in both (a brand mark is), say so with a \
          `one-tone-ok: <reason>` comment:",
     );
 }
 
-/// Nothing pins a scheme (gh#257).
+/// No Swift view pins a scheme (gh#257).
 ///
 /// Four call sites used to: the scene in `CometApp.swift` and three sheets,
 /// each `.preferredColorScheme(.dark)`. That is why the light design in the
-/// reference could not be reached — and why the sheets needed their own line in
-/// the first place is worth remembering, because it is the trap a future
-/// "just set it at the root" would fall into: a sheet is its own presentation
-/// host. `cometAppearance()` is the one modifier that answers for all four, and
-/// it answers with a preference.
+/// reference could not be reached. `cometAppearance()` is now the one modifier
+/// that translates an explicit preference into the window-level override.
 #[test]
-fn nothing_in_the_app_forces_a_colour_scheme() {
+fn no_swift_view_pins_a_colour_scheme() {
     let mut violations = Vec::new();
     for file in swift_sources() {
-        // Appearance.swift is where the preference is TURNED INTO a scheme —
-        // that is the point of it.
-        if file.file_name().is_some_and(|n| n == "Appearance.swift") {
-            continue;
-        }
         let body = std::fs::read_to_string(&file).expect("read source");
         for (ix, line) in body.lines().enumerate() {
             if line.trim_start().starts_with("//") {
@@ -496,9 +522,51 @@ fn nothing_in_the_app_forces_a_colour_scheme() {
     report(
         violations,
         "call site(s) pinning a colour scheme. The scheme is a preference — \
-         `.cometAppearance()`, which reads it and defaults to the system's \
-         answer. A constant here is how the phone spent gh#181 through gh#254 \
-         unable to show the light design it had tokens for:",
+         `.cometAppearance()`, which reads the explicit preference. This claim \
+         is intentionally limited to Swift views: Info.plist still forces Dark \
+         at the bundle level, and `bundle_style_dependency_is_explicit` holds \
+         that remaining integration dependency visible:",
+    );
+}
+
+/// The ticket forbids editing Info.plist, so this PR cannot honestly claim that
+/// the app follows the device appearance by default. Keep the forced key and
+/// the code that accounts for it visible until a separately-authorized change
+/// removes both together.
+#[test]
+fn bundle_style_dependency_is_explicit() {
+    let plist = info_plist();
+    assert!(
+        plist.contains("<key>UIUserInterfaceStyle</key>")
+            && plist.contains("<string>Dark</string>"),
+        "gh#257 ring-fences Info.plist; update this contract when the bundle-level Dark override is separately removed"
+    );
+
+    let appearance = appearance_swift();
+    for contract in [
+        "object(forInfoDictionaryKey: \"UIUserInterfaceStyle\")",
+        "case .system: return Appearance.forcedByBundle",
+        "forcedByBundle == nil ? allCases : [.light, .dark]",
+    ] {
+        assert!(
+            appearance.contains(contract),
+            "Appearance.swift no longer accounts for the ring-fenced bundle override: missing `{contract}`"
+        );
+    }
+}
+
+/// A block observer retained by NotificationCenter must not strongly retain its
+/// coordinator. That breaks the retain cycle so deinit can stop it.
+#[test]
+fn window_scheme_observer_has_a_bounded_lifetime() {
+    let appearance = appearance_swift();
+    assert!(
+        appearance.contains(") { [weak self] _ in"),
+        "WindowScheme's activation observer must capture its coordinator weakly"
+    );
+    assert!(
+        appearance.contains("deinit { stopObserving() }"),
+        "WindowScheme must remove the weak observer when its coordinator deinitializes"
     );
 }
 
@@ -860,14 +928,14 @@ mod unit {
             split_variants("ramp(hueReview)"),
             Some((
                 "oklch(statusL, statusC, hueReview)".into(),
-                "oklch(statusLLight, statusC, hueReview)".into()
+                "oklch(statusLLight, statusCLight, hueReview)".into()
             ))
         );
         assert_eq!(
             split_variants("whiteAlpha(0.08)"),
             Some((
                 "Color.white.opacity(0.08)".into(),
-                "ink(0.08 * lightInkScale)".into()
+                "Color.black.opacity(0.08 * lightInkScale)".into()
             ))
         );
         // One tone in both schemes — the thing the scan is looking for.
@@ -904,8 +972,9 @@ enum Theme {
     /// this crate's own primitives — including the alpha and the scale.
     #[test]
     fn paint_evaluates_to_this_crates_colours() {
-        let src = "static let lightInkScale: Double = 1.625\n";
+        let src = "static let lightInkScale: Double = 0.714285714\n";
         assert_eq!(paint(src, "grey(0x14)"), grey(0x14));
+        assert_eq!(paint(src, "hex(0x171717)"), hex(0x171717));
         assert_eq!(paint(src, "neutral(0.938)"), neutral(0.938));
         assert_eq!(paint(src, "cool(0.986, 0.003)"), cool(0.986, 0.003));
         assert_eq!(paint(src, "Color.white.opacity(0.08)"), white_alpha(0.08));
@@ -914,7 +983,10 @@ enum Theme {
             oklch(0.702, 0.183, 293.541).opacity(0.12)
         );
         // A named constant, and arithmetic on one.
-        assert_eq!(paint(src, "ink(0.08 * lightInkScale)"), ink(0.08 * 1.625));
+        assert_eq!(
+            paint(src, "Color.black.opacity(0.07 * lightInkScale)"),
+            black_alpha(0.07 * (5.0 / 7.0))
+        );
     }
 
     #[test]
