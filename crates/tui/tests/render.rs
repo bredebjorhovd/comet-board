@@ -2244,6 +2244,7 @@ fn board_row(
         workspace: Some("offhand".into()),
         runtime: Some("claude-code".into()),
         chat_id: None,
+        review_chat_id: None,
         pr_url: None,
         pr_number: Some(9),
         branch: Some("board/gh-x".into()),
