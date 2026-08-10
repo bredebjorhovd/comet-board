@@ -54,7 +54,7 @@ pub fn page_column() -> gpui::Div {
 /// choosing between two named widths is a decision, a page redefining the
 /// column privately is a fork.
 pub fn dashboard_column() -> gpui::Div {
-    column(DASHBOARD_WIDTH).gap(px(14.0))
+    column(DASHBOARD_WIDTH).gap(px(12.0))
 }
 
 fn column(max_width: f32) -> gpui::Div {

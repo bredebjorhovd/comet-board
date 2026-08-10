@@ -521,6 +521,15 @@ impl Theme {
     /// figure at title size stops being a figure — and it is ONE size, not the
     /// 21 / 22 / 30 it replaces.
     pub const TEXT_FIGURE: f32 = 21.0;
+    /// A figure that IS the page's headline — the spend band on Board stats,
+    /// whose card carries no title because these two numbers are it.
+    ///
+    /// The second and last step off the UI ramp, and it earns the exception the
+    /// same way [`Self::TEXT_FIGURE`] does: at 21px in a 238px cell, under a
+    /// page header at 15, the number a reader opened the page for reads as one
+    /// more tile. A figure inside a *titled* card is still `TEXT_FIGURE`; this
+    /// is for the one that replaces the title.
+    pub const TEXT_DISPLAY: f32 = 34.0;
 
     // ---- the status ramp (gh#173) ----
     // Defined in `comet-proto` (`view::status`), not here: the terminal app
