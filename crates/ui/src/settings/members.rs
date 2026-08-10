@@ -262,10 +262,7 @@ impl MembersPage {
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(
-                    methods::INVITE_MEMBER,
-                    serde_json::json!({ "email": email }),
-                )
+                .call(methods::INVITE_MEMBER, serde_json::json!({ "email": email }))
                 .await;
             this.update(cx, |page, cx| {
                 page.inviting = false;

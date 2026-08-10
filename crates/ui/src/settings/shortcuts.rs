@@ -269,7 +269,11 @@ impl Render for ShortcutsPage {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(widgets::page_header(&theme, "Keyboard shortcuts", None))
+                                    .child(widgets::page_header(
+                                        &theme,
+                                        "Keyboard shortcuts",
+                                        None,
+                                    ))
                                     .child(
                                         widgets::page_subtitle(
                                             &theme,
@@ -291,16 +295,15 @@ impl Render for ShortcutsPage {
                                     .when(disabled, |el| el.opacity(0.35))
                                     .when(!disabled, |el| {
                                         el.hover(|s| {
-                                            s.bg(theme.white_alpha(0.04)).text_color(theme.text)
+                                            s.bg(theme.white_alpha(0.04))
+                                                .text_color(theme.text)
                                         })
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.keymap = KeymapConfig::default();
-                                                this.recording = None;
-                                                this.conflict_notice = None;
-                                                this.commit(cx);
-                                            }),
-                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.keymap = KeymapConfig::default();
+                                            this.recording = None;
+                                            this.conflict_notice = None;
+                                            this.commit(cx);
+                                        }))
                                     })
                                     .child(
                                         crate::icons::icon(crate::icons::RESTART)
@@ -370,10 +373,7 @@ mod tests {
             Some(ShortcutId::ToggleChanges)
         );
         // Re-recording a shortcut's own combo is not a conflict.
-        assert_eq!(
-            conflict_owner(&keymap, ShortcutId::ToggleChanges, &combo),
-            None
-        );
+        assert_eq!(conflict_owner(&keymap, ShortcutId::ToggleChanges, &combo), None);
         // A free combo conflicts with nothing.
         assert_eq!(
             conflict_owner(&keymap, ShortcutId::ToggleSidebar, "mod-shift-x"),

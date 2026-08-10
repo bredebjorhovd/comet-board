@@ -319,8 +319,8 @@ impl EngineHandle {
 pub use comet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, HostPresence, Indicator, SESSION_STALE_MS,
     attention_rank, chat_location, display_status, effective_indicator, format_time_ago,
-    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
-    sort_tabs,
+    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats,
+    sort_spaces, sort_tabs,
 };
 
 // ---------------------------------------------------------------------------

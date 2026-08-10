@@ -751,9 +751,9 @@ impl Pickers {
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 if let Loadable::Ready(models) = &loaded {
-                    let fresh = pickers
-                        .defaults
-                        .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
+                    let fresh = pickers.defaults.remember_labels(
+                        models.iter().map(|m| (m.id.as_str(), m.label.as_str())),
+                    );
                     if fresh {
                         pickers.save_defaults();
                     }
@@ -1548,7 +1548,11 @@ impl Pickers {
 
     /// A read-only footer label (locked sessions — t3code's
     /// `resolveLockedWorkspaceLabel` span).
-    fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
+    fn footer_label(
+        icon_path: &'static str,
+        label: SharedString,
+        theme: &Theme,
+    ) -> gpui::Div {
         div()
             .h(px(20.0))
             .max_w(px(280.0))
@@ -2031,16 +2035,13 @@ impl Pickers {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
                             }))
-                            .child(
-                                crate::icons::icon(icon_path)
-                                    .size(px(16.0))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(if is_viewed {
-                                        theme.text
-                                    } else {
-                                        theme.text_muted
-                                    })),
-                            )
+                            .child(crate::icons::icon(icon_path).size(px(16.0)).flex_none().text_color(
+                                tint.unwrap_or(if is_viewed {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                }),
+                            ))
                             .child(div().min_w_0().truncate().child(name))
                     }))
                     .into_any_element()
@@ -2202,7 +2203,10 @@ impl Pickers {
                             .child(
                                 // The search input (search_input_frame: the
                                 // input's own frame — rounded, quiet fill).
-                                div().flex_none().px(px(4.0)).child(self.search_box(&theme)),
+                                div()
+                                    .flex_none()
+                                    .px(px(4.0))
+                                    .child(self.search_box(&theme)),
                             )
                             .child(
                                 // Models scroll — gutters on the WRAPPER,
@@ -2584,10 +2588,8 @@ impl Render for Pickers {
         }
         // A popover opened data-side (COMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
-        if matches!(
-            self.open,
-            Some(PickerKind::Branch) | Some(PickerKind::Checkout)
-        ) && matches!(self.refs, Loadable::Idle)
+        if matches!(self.open, Some(PickerKind::Branch) | Some(PickerKind::Checkout))
+            && matches!(self.refs, Loadable::Idle)
         {
             self.ensure_refs(false, cx);
         }
