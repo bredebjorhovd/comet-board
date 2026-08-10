@@ -27,6 +27,17 @@
 //! because work described that did not happen is as interesting as work nobody
 //! described.
 //!
+//! **The effects row comes before the claims, and that order is the argument**
+//! (§gh#236). A reader who has already been told a fluent story reads numbers
+//! underneath it as confirmation of the story; the same numbers read first are
+//! what the story then has to agree with. Every chip on that row —
+//! `Tests 41 → 47, all passing`, `Public API unchanged`, `1 dependency added` —
+//! is derived by [`comet_board::effects`] from the checkout and the run
+//! journal, and a fact the board could not establish wears the unknown ground
+//! rather than the reassuring one. The same goes for a claim: `✓` is reserved
+//! for one something the agent did not author stands behind, and a claim
+//! nothing checks says `no test covers this` and drops to a dot.
+//!
 //! **Unclaimed changes are the product, and they are the only thing here that
 //! shouts.** One hue on this screen means "look at this", and it is the ramp's
 //! blocked hue (gh#173) — the verdict strip under the header wears it, the
@@ -58,10 +69,11 @@ use gpui::{
 };
 
 use comet_board::claims::{
-    AnchorKind, AttemptReview, ChangedFile, ClaimView, DiffSource, FindingKind, Tone, Verdict,
-    anchor_kind,
+    AnchorKind, AttemptReview, ChangedFile, ClaimMark, ClaimView, DiffSource, FindingKind, Tone,
+    Verdict, anchor_kind,
 };
 use comet_board::verdict::{self, VerdictKind, VerdictReceipt};
+use comet_board::effects::{Chip, Ground};
 use comet_proto::view::board;
 use comet_rpc::methods;
 
@@ -106,6 +118,18 @@ const VERDICTS: [(VerdictKind, &str); 3] = [
     (VerdictKind::Approve, "Approve"),
     (VerdictKind::ChangesRequested, "Request changes"),
 ];
+
+/// One chip on the effects row, and under a claim (§gh#236). A row of these is
+/// the densest thing on the screen, so the numbers are the design's: 22 high,
+/// 8 of side padding, a 5px dot.
+const CHIP_H: f32 = 22.0;
+const CHIP_PAD: f32 = 8.0;
+const CHIP_DOT: f32 = 5.0;
+
+/// How hard a tinted chip's ground sits under its text. The design's 12%, and
+/// the same weight the verdict strip's tint uses — a chip that shouted louder
+/// than the verdict would be arguing with it.
+const CHIP_TINT: f32 = 0.12;
 
 /// One attempt's review, fetched and drawn.
 pub struct ReviewPanel {
@@ -355,6 +379,100 @@ impl ReviewPanel {
             .into_any_element()
     }
 
+    /// A claim's own glyph (§gh#236): `!`, `✓` or `·`.
+    ///
+    /// The third state is the one that had to exist. A claim the diff supports
+    /// and nothing corroborates is neither contradicted nor verified, and
+    /// letting it borrow the tick would be this screen doing the flattening it
+    /// was built to undo — so the tick is reserved for a claim something the
+    /// agent did not author stands behind, and everything else drops to a dot
+    /// in [`Theme::text_subtle`].
+    fn claim_glyph(mark: ClaimMark, theme: &Theme) -> AnyElement {
+        div()
+            .flex_none()
+            .w(px(10.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(Theme::TEXT_CAPTION))
+            .text_color(Self::claim_color(mark, theme))
+            .child(SharedString::from(mark.glyph()))
+            .into_any_element()
+    }
+
+    /// What colour a claim's glyph is. Only the contradicted one is allowed
+    /// the screen's loud hue.
+    fn claim_color(mark: ClaimMark, theme: &Theme) -> gpui::Hsla {
+        match mark {
+            ClaimMark::Contradicted => theme.danger,
+            ClaimMark::Corroborated => theme.settled,
+            ClaimMark::Bare => theme.text_subtle,
+        }
+    }
+
+    /// The two colours one chip is painted in: its dot, and its text.
+    ///
+    /// The grounds come from [`comet_board::effects`], which is where the
+    /// meaning is decided; this only says which of the theme's existing hues
+    /// each one wears. None of them is [`Theme::danger`] — the review's one
+    /// loud hue belongs to the unclaimed set, and a chip row competing with it
+    /// would leave the screen with nothing to shout with.
+    fn chip_colors(ground: Ground, theme: &Theme) -> (gpui::Hsla, gpui::Hsla) {
+        match ground {
+            // A checked fact that is not news: a settled dot, so the row reads
+            // at a glance as "the board looked", with quiet text.
+            Ground::Neutral => (theme.settled, theme.text_muted),
+            Ground::Settled => (theme.settled, theme.settled),
+            Ground::Working => (theme.warning, theme.warning),
+            // The one a reader must not mistake for either: no status colour at
+            // all, because there is no status.
+            Ground::Unknown => (theme.text_faint, theme.text_subtle),
+        }
+    }
+
+    /// One chip: a 5px dot, and the sentence the board phrased.
+    ///
+    /// A tinted ground for the two chips that carry a status, the flat chip
+    /// wash for the rest — so a row of five reads as one row with one thing in
+    /// it, rather than five things of equal weight.
+    fn chip(chip: &Chip, theme: &Theme) -> AnyElement {
+        let (dot, text) = Self::chip_colors(chip.ground, theme);
+        let tinted = matches!(chip.ground, Ground::Settled | Ground::Working);
+        div()
+            .flex_none()
+            .h(px(CHIP_H))
+            .px(px(CHIP_PAD))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .bg(if tinted {
+                dot.opacity(CHIP_TINT)
+            } else {
+                theme.wash(0.08)
+            })
+            // round-ok: a status dot — the design's 5px, one per chip.
+            .child(div().flex_none().size(px(CHIP_DOT)).rounded_full().bg(dot))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(text)
+                    .child(SharedString::from(chip.text.clone())),
+            )
+            .into_any_element()
+    }
+
+    /// A row of chips that wraps, because the effects row is five sentences and
+    /// the card is not always wide.
+    fn chip_row(chips: &[Chip], theme: &Theme) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(6.0))
+            .children(chips.iter().map(|chip| Self::chip(chip, theme)))
+            .into_any_element()
+    }
+
     /// A section heading: the label, and the aside that qualifies it.
     fn heading(theme: &Theme, title: &str, aside: Option<String>) -> AnyElement {
         div()
@@ -426,10 +544,17 @@ impl ReviewPanel {
     /// carried on the claim: `matched` is a list of paths, and a reviewer needs
     /// the counts beside them or the "evidence" is the agent's own words again
     /// with a filename attached.
-    fn claim_row(claim: &ClaimView, changed: &[ChangedFile], theme: &Theme) -> AnyElement {
+    fn claim_row(
+        review: &AttemptReview,
+        claim: &ClaimView,
+        changed: &[ChangedFile],
+        theme: &Theme,
+    ) -> AnyElement {
         // A claim nothing in the diff supports is the screen's second-loudest
         // row, after the unclaimed set itself.
         let unsupported = !claim.anchored();
+        let mark = review.claim_mark(claim);
+        let chips = review.claim_chips(claim);
         let matched: Vec<AnyElement> = claim
             .matched
             .iter()
@@ -446,7 +571,7 @@ impl ReviewPanel {
                     .flex_row()
                     .items_start()
                     .gap(px(6.0))
-                    .child(Self::mark(unsupported, theme))
+                    .child(Self::claim_glyph(mark, theme))
                     .child(
                         div()
                             .flex_1()
@@ -460,6 +585,35 @@ impl ReviewPanel {
                             .child(SharedString::from(claim.text.clone())),
                     ),
             )
+            // The evidence for this one claim, directly under it — because a
+            // sentence and the thing that checks it are one unit, and a reader
+            // scanning claims must not have to go looking for the second half.
+            .when(!chips.is_empty(), |el| {
+                el.child(div().pl(px(16.0)).child(Self::chip_row(&chips, theme)))
+            })
+            // What the claim named, as it named it. The file rows below are
+            // what those anchors *reached*, which for a symbol is not the same
+            // list and for a directory is longer than one.
+            .when(!claim.files.is_empty() || !claim.symbols.is_empty(), |el| {
+                el.child(div().pl(px(16.0)).child(
+                    div().flex().flex_row().flex_wrap().gap(px(4.0)).children(
+                        claim.files.iter().chain(&claim.symbols).map(|anchor| {
+                            div()
+                                .flex_none()
+                                .h(px(CHIP_H))
+                                .px(px(CHIP_PAD))
+                                .flex()
+                                .items_center()
+                                .rounded(px(Theme::RADIUS_CHIP))
+                                .bg(theme.wash(0.08))
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child(SharedString::from(anchor.clone()))
+                        }),
+                    ),
+                ))
+            })
             .when(!matched.is_empty(), |el| {
                 el.child(
                     div()
@@ -659,7 +813,7 @@ impl ReviewPanel {
             .remainder
             .claims
             .iter()
-            .map(|claim| Self::claim_row(claim, &review.changed, theme))
+            .map(|claim| Self::claim_row(review, claim, &review.changed, theme))
             .collect();
         div()
             .flex()
@@ -681,6 +835,24 @@ impl ReviewPanel {
                     .gap(px(Theme::SPACE_MD))
                     .children(claims),
             )
+            .into_any_element()
+    }
+
+    /// The effects row (§gh#236): what the board read off the branch itself.
+    ///
+    /// Above the claims, deliberately. A reader who has already been told a
+    /// fluent story about the work reads the numbers underneath it as
+    /// confirmation of the story; the same numbers read first are what the
+    /// story then has to agree with. That ordering is the whole of why this row
+    /// exists, and it is the design's own.
+    fn render_effects(review: &AttemptReview, theme: &Theme) -> AnyElement {
+        let chips = review.effect_chips();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_SM))
+            .child(Self::heading(theme, "EFFECTS", None))
+            .child(Self::chip_row(&chips, theme))
             .into_any_element()
     }
 
@@ -1284,16 +1456,17 @@ impl Render for ReviewPanel {
         let header = self.render_header(&review, &theme, cx);
         let verdict = Self::render_verdict(&review.verdict(), &theme);
         let brief = self.render_brief(&review, &theme, window);
+        let effects = Self::render_effects(&review, &theme);
         let claims = Self::render_claims(&review, &theme);
         let evidence = Self::render_evidence(&review, &theme);
         let remainder = Self::render_remainder(&review, &theme);
         let host = self.render_host(&theme, cx);
         let bar = self.render_verdict_bar(&review, &theme, cx);
 
-        // The question in order — what was asked, what the agent says it did,
-        // what the board saw for itself, and what nobody accounted for — with
-        // the verdict pinned above the scroll so the loudest fact cannot be
-        // pushed under the fold by a long issue body.
+        // The question in order — what was asked, what the branch did, what the
+        // agent says it did, what the board saw the run do, and what nobody
+        // accounted for — with the verdict pinned above the scroll so the
+        // loudest fact cannot be pushed under the fold by a long issue body.
         let body = div()
             .id("review-body")
             .flex_1()
@@ -1305,6 +1478,7 @@ impl Render for ReviewPanel {
             .gap(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
             .child(brief)
+            .child(effects)
             .child(claims)
             .child(evidence)
             .child(remainder)
@@ -1468,5 +1642,65 @@ mod tests {
         assert!(!FindingKind::NoDiff.tone().loud());
         assert!(FindingKind::Unclaimed.tone().loud());
         assert!(FindingKind::Uncommitted.tone().loud());
+    }
+
+    /// The effects row must not be able to shout (§gh#236). One hue on this
+    /// screen means "look at this" and it belongs to the unclaimed set; a chip
+    /// that borrowed it would leave the block that is actually the product
+    /// with nothing of its own.
+    #[test]
+    fn no_chip_on_the_effects_row_wears_the_screens_one_loud_hue() {
+        for theme in [Theme::dark(), Theme::light()] {
+            for ground in [
+                Ground::Neutral,
+                Ground::Settled,
+                Ground::Working,
+                Ground::Unknown,
+            ] {
+                let (dot, text) = ReviewPanel::chip_colors(ground, &theme);
+                assert_ne!(dot, theme.danger, "{ground:?} dot");
+                assert_ne!(text, theme.danger, "{ground:?} text");
+            }
+            // …and an unknown chip carries no status colour at all, because
+            // there is no status: "the board looked and nothing moved" and
+            // "the board could not look" must not paint alike.
+            let (unknown, _) = ReviewPanel::chip_colors(Ground::Unknown, &theme);
+            let (neutral, _) = ReviewPanel::chip_colors(Ground::Neutral, &theme);
+            assert_ne!(unknown, neutral);
+            assert_ne!(unknown, theme.settled);
+            assert_ne!(unknown, theme.warning);
+        }
+    }
+
+    /// Three glyphs for three states, and the middle one is the point: a claim
+    /// the diff supports and nothing corroborates must not be able to borrow
+    /// the tick.
+    #[test]
+    fn a_claim_earns_its_tick_and_cannot_borrow_it() {
+        assert_eq!(ClaimMark::Corroborated.glyph(), "✓");
+        assert_eq!(ClaimMark::Bare.glyph(), "·");
+        assert_eq!(ClaimMark::Contradicted.glyph(), "!");
+        for theme in [Theme::dark(), Theme::light()] {
+            // Only a contradicted claim is allowed the loud hue: a claim
+            // nothing checks is quiet, not alarming.
+            assert_eq!(
+                ReviewPanel::claim_color(ClaimMark::Contradicted, &theme),
+                theme.danger
+            );
+            assert_ne!(
+                ReviewPanel::claim_color(ClaimMark::Bare, &theme),
+                theme.danger
+            );
+            assert_ne!(
+                ReviewPanel::claim_color(ClaimMark::Corroborated, &theme),
+                theme.danger
+            );
+            // …and the three are three, or the tick and the dot would be one
+            // state wearing two glyphs.
+            assert_ne!(
+                ReviewPanel::claim_color(ClaimMark::Bare, &theme),
+                ReviewPanel::claim_color(ClaimMark::Corroborated, &theme)
+            );
+        }
     }
 }

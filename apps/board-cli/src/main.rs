@@ -589,14 +589,40 @@ fn main() -> Result<()> {
         // an IPC port to print one line.
         Command::GitAskpass { prompt } => {
             let repo = std::env::var(comet_board::git_credentials::ASKPASS_REPO_ENV).ok();
-            let secret = comet_board::git_credentials::askpass(
-                &paths,
-                prompt.as_deref().unwrap_or_default(),
-                repo.as_deref(),
-            )?;
-            // Straight to stdout, which is the pipe git is holding. Nowhere else.
-            println!("{secret}");
-            Ok(())
+            let prompt = prompt.unwrap_or_default();
+            let chat = std::env::var(ops::CHAT_ID_ENV).ok();
+            match comet_board::git_credentials::askpass(&paths, &prompt, repo.as_deref()) {
+                Ok(secret) => {
+                    // A username prompt is answered off a constant, so it is
+                    // not a mint and must not be recorded as one — an alibi
+                    // for a push has to be a credential that was issued.
+                    if !prompt.to_ascii_lowercase().contains("username") {
+                        comet_board::credential_ledger::minted(
+                            &paths,
+                            "git-askpass",
+                            repo.as_deref().unwrap_or_default(),
+                            chat.as_deref(),
+                        );
+                    }
+                    // Straight to stdout, which is the pipe git is holding.
+                    // Nowhere else.
+                    println!("{secret}");
+                    Ok(())
+                }
+                // git swallows this helper's stderr into a push that fails
+                // with "could not read Password", so stderr alone is not a
+                // record anybody will find (gh#233). The ledger is.
+                Err(e) => {
+                    comet_board::credential_ledger::failed(
+                        &paths,
+                        "git-askpass",
+                        repo.as_deref().unwrap_or_default(),
+                        chat.as_deref(),
+                        &e.to_string(),
+                    );
+                    Err(e)
+                }
+            }
         }
         // Same deal for `gh`, and for the same reason it is answered before
         // anything dials the engine: this runs inside every `gh` the agent
@@ -611,8 +637,32 @@ fn main() -> Result<()> {
                         comet_board::git_credentials::ASKPASS_REPO_ENV
                     )
                 })?;
-            println!("{}", comet_board::git_credentials::token(&paths, &repo)?);
-            Ok(())
+            let chat = std::env::var(ops::CHAT_ID_ENV).ok();
+            match comet_board::git_credentials::token(&paths, &repo) {
+                Ok(token) => {
+                    comet_board::credential_ledger::minted(
+                        &paths,
+                        "gh-token",
+                        &repo,
+                        chat.as_deref(),
+                    );
+                    println!("{token}");
+                    Ok(())
+                }
+                // The shim discards this too (`2>/dev/null`, so a box with its
+                // own `gh auth login` keeps working), which makes the ledger
+                // the only place a failed mint is written down.
+                Err(e) => {
+                    comet_board::credential_ledger::failed(
+                        &paths,
+                        "gh-token",
+                        &repo,
+                        chat.as_deref(),
+                        &e.to_string(),
+                    );
+                    Err(e)
+                }
+            }
         }
         // Also answered without the engine: the skill is compiled in, and a
         // laptop installing it has no board of its own to dial (gh#133).

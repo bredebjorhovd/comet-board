@@ -26,7 +26,9 @@
 //!   earns a place here.
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
+use crate::credential_ledger;
 use crate::db::{Db, NewWriteback, Reaped};
+use crate::dispatch::RanOn;
 use crate::gc;
 use crate::log::Logger;
 use crate::model::*;
@@ -1108,15 +1110,26 @@ impl SyncEngine {
     /// as it was. What that costs is visible in the review itself, as
     /// [`crate::claims::DiffSource::Unavailable`].
     pub fn record_review_facts(&self, runtime: Option<&dyn Runtime>, attempt: &Attempt) {
-        if let Some(changed) = self.branch_changes(attempt) {
+        if let Some((changed, effects)) = self.branch_facts(attempt) {
             // The board reads this every cycle and the diff only moves when the
             // agent commits, so a write per tick is a write nobody needs.
             let stored = self.db.attempt_changes(attempt.id).unwrap_or_default();
-            if stored != changed
-                && let Err(e) = self.db.set_attempt_changes(attempt.id, &changed)
-            {
+            let moved = stored != changed;
+            if moved && let Err(e) = self.db.set_attempt_changes(attempt.id, &changed) {
                 self.log.warn(format!(
                     "recording changes for attempt {}: {e:#}",
+                    attempt.id
+                ));
+            }
+            // The effects are a function of the diff, so a branch that did not
+            // move does not need them derived again — except on a row that has
+            // none at all, which is every attempt that was already running when
+            // §gh#236 landed and whose branch may never move again.
+            if (moved || self.db.attempt_effects(attempt.id).ok().flatten().is_none())
+                && let Err(e) = self.db.set_attempt_effects(attempt.id, &effects)
+            {
+                self.log.warn(format!(
+                    "recording effects for attempt {}: {e:#}",
                     attempt.id
                 ));
             }
@@ -1161,7 +1174,10 @@ impl SyncEngine {
     /// function keeps for pre-`base_sha` rows is a weaker measurement, and a
     /// *remainder* computed against the wrong base would invent unclaimed files
     /// out of somebody else's commits.
-    pub fn branch_changes(&self, attempt: &Attempt) -> Option<Vec<crate::claims::ChangedFile>> {
+    pub fn branch_facts(
+        &self,
+        attempt: &Attempt,
+    ) -> Option<(Vec<crate::claims::ChangedFile>, crate::effects::Effects)> {
         let worktree = attempt.worktree.as_deref()?;
         if !std::path::Path::new(worktree).exists() {
             return None;
@@ -1175,15 +1191,95 @@ impl SyncEngine {
         let name_status = git_out(worktree, &["diff", "--name-status", "--no-renames", &range])
             .unwrap_or_default();
         let mut changed = crate::claims::parse_diff(&numstat, &name_status);
-        // A third read of the same range, for the symbol anchors (§gh#235).
-        // `-U0` because only the lines that actually moved are evidence: a
-        // symbol three lines above the edit is context the agent did not touch,
-        // and letting it anchor a claim would be exactly the generous reading
-        // this module refuses everywhere else.
-        if let Some(diff) = git_out(worktree, &["diff", "-U0", "--no-renames", &range]) {
-            crate::claims::attach_symbols(&mut changed, &diff);
+        // A third read of the same range, for the symbol anchors (§gh#235) and
+        // for the effects (§gh#236). `-U0` because only the lines that actually
+        // moved are evidence: a symbol three lines above the edit is context
+        // the agent did not touch, and letting it anchor a claim — or count as
+        // a public API change — would be exactly the generous reading this
+        // module refuses everywhere else.
+        let unified = git_out(worktree, &["diff", "-U0", "--no-renames", &range]);
+        if let Some(diff) = &unified {
+            crate::claims::attach_symbols(&mut changed, diff);
         }
-        Some(changed)
+        let effects = self.branch_effects(worktree, base, &changed, unified.as_deref());
+        Some((changed, effects))
+    }
+
+    /// What this attempt's branch had as an *effect* (§gh#236): the tests
+    /// either side of it, the public surface, the schema, the config keys and
+    /// the dependencies.
+    ///
+    /// Everything here is read from git, and every failure lands as "unknown"
+    /// rather than as a clean result — a diff the board could not read at all
+    /// returns [`crate::effects::Effects::default`], whose `read` flag is
+    /// `false` and whose chip row says so in one line.
+    fn branch_effects(
+        &self,
+        worktree: &str,
+        base: &str,
+        changed: &[crate::claims::ChangedFile],
+        diff: Option<&str>,
+    ) -> crate::effects::Effects {
+        let Some(diff) = diff else {
+            return crate::effects::Effects::default();
+        };
+        let (deps_added, deps_known) = self.deps_added(worktree, base, changed);
+        crate::effects::Effects {
+            read: true,
+            files: crate::effects::scan(changed, diff),
+            // Both counted the same way in the two trees the diff spans, so the
+            // pair is comparable even where the rule is coarse. `HEAD` rather
+            // than the working tree: the branch is what a reviewer can fetch,
+            // and uncommitted work is reported on its own line.
+            tests_after: test_total(worktree, "HEAD"),
+            tests_before: test_total(worktree, base),
+            deps_added,
+            deps_known,
+        }
+    }
+
+    /// Dependencies this branch added, read out of the manifests on both sides.
+    ///
+    /// Not a diff heuristic: the file as it was and the file as it is, each
+    /// parsed for the names it lists. A manifest that will not parse, or a side
+    /// git will not hand over, returns `false` for "known" — which makes the
+    /// chip say unknown, because "no dependencies added" is the one thing the
+    /// board must not say about a manifest it failed to read.
+    fn deps_added(
+        &self,
+        worktree: &str,
+        base: &str,
+        changed: &[crate::claims::ChangedFile],
+    ) -> (Vec<String>, bool) {
+        let mut added: Vec<String> = Vec::new();
+        let mut known = true;
+        for file in changed
+            .iter()
+            .filter(|f| crate::effects::is_manifest(&f.path))
+        {
+            // An added file had no `before` and a deleted one has no `after`:
+            // git is right to refuse those, and empty is the honest content.
+            let before = match file.status.starts_with('A') {
+                true => Some(String::new()),
+                false => git_out(worktree, &["show", &format!("{base}:{}", file.path)]),
+            };
+            let after = match file.status.starts_with('D') {
+                true => Some(String::new()),
+                false => git_out(worktree, &["show", &format!("HEAD:{}", file.path)]),
+            };
+            match (before, after) {
+                (Some(before), Some(after)) => {
+                    match crate::effects::deps_added(&file.path, &before, &after) {
+                        Some(names) => added.extend(names),
+                        None => known = false,
+                    }
+                }
+                _ => known = false,
+            }
+        }
+        added.sort();
+        added.dedup();
+        (added, known)
     }
 
     /// Read an agent's claims off the attempt it just finished (§gh#235).
@@ -1332,30 +1428,71 @@ impl SyncEngine {
                     anyhow::anyhow!("{} has no attempts to review", task.identifier)
                 })?,
             };
-        let (changed, diff) = match self.branch_changes(&attempt) {
-            Some(changed) => (changed, DiffSource::Checkout),
+        let (changed, effects, diff) = match self.branch_facts(&attempt) {
+            Some((changed, effects)) => (changed, effects, DiffSource::Checkout),
             None => {
                 let recorded = self.db.attempt_changes(attempt.id)?;
+                // The snapshot's effects, which are the ones taken against the
+                // snapshot's diff. Absent is `read = false`, and the chip row
+                // says the board never read this branch rather than saying
+                // nothing moved in it.
+                let effects = self.db.attempt_effects(attempt.id)?.unwrap_or_default();
                 if recorded.is_empty() {
                     (
                         Vec::new(),
+                        effects,
                         DiffSource::Unavailable {
                             reason: unreadable_diff(&attempt),
                         },
                     )
                 } else {
-                    (recorded, DiffSource::Recorded)
+                    (recorded, effects, DiffSource::Recorded)
                 }
             }
         };
-        Ok(crate::claims::review(
+        let mut review = crate::claims::review(
             &task,
             &attempt,
             changed,
             diff,
             self.uncommitted(&attempt),
             self.db.attempt_evidence(attempt.id)?.unwrap_or_default(),
-        ))
+            effects,
+        );
+        self.count_call_sites(&attempt, &mut review);
+        Ok(review)
+    }
+
+    /// Count, for every symbol anchor on every claim, how many lines name it
+    /// now and how many named it before (§gh#236).
+    ///
+    /// Done here rather than in the snapshot because it needs a checkout and
+    /// two greps per symbol: cheap when somebody opens a review, and not
+    /// something to run on every attempt on every reconcile. When the checkout
+    /// is gone the claims simply carry no call-site chips — the absence of a
+    /// count is the honest rendering of a count that was never taken.
+    fn count_call_sites(&self, attempt: &Attempt, review: &mut crate::claims::AttemptReview) {
+        let (Some(worktree), Some(base)) =
+            (attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+        else {
+            return;
+        };
+        if !std::path::Path::new(worktree).exists() {
+            return;
+        }
+        for claim in &mut review.remainder.claims {
+            for symbol in claim.symbols.clone() {
+                let Some(now) = git_grep(worktree, &symbol, "HEAD") else {
+                    continue;
+                };
+                claim.call_sites.push(crate::effects::CallSites {
+                    now: crate::effects::count_call_sites(&symbol, &now),
+                    before: git_grep(worktree, &symbol, base)
+                        .map(|before| crate::effects::count_call_sites(&symbol, &before)),
+                    symbol,
+                });
+            }
+        }
     }
 
     /// How many files are changed in this attempt's checkout but not committed.
@@ -2231,6 +2368,10 @@ impl SyncEngine {
             task.identifier,
             evidence.as_str()
         ));
+        // Every settle is a settle on work that reached origin — a pull
+        // request, or commits the branch check found on the remote — so this
+        // is the moment to ask what pushed it (gh#233).
+        let credential = self.note_credential_path(task, attempt);
         self.announce(
             runtime,
             task,
@@ -2239,10 +2380,80 @@ impl SyncEngine {
                 outcome: Outcome::Done,
                 evidence: Some(evidence),
                 pr_url: pr_url.map(str::to_string),
-                note: None,
+                note: credential,
             },
         );
         Ok(())
+    }
+
+    /// Did the board's own credential push this? (gh#233.)
+    ///
+    /// The failure this exists for arrived from the inside. The first opencode
+    /// dispatch could not exec the askpass helper, wrote a credential wrapper
+    /// of its own, pushed with it, opened its pull request and finished green —
+    /// and the board recorded a clean attempt, because a board that only
+    /// watches outcomes cannot tell a sanctioned push from an improvised one.
+    /// gh#68 kept the token out of argv, out of `.git/config` and out of the
+    /// environment; none of that survives a wrapper script written under time
+    /// pressure by an agent whose push just failed.
+    ///
+    /// So the ledger is consulted at the one moment there is something to
+    /// compare it against. The board handed this run a credential and was never
+    /// asked for it, or could not hand one over at all — yet here is work on
+    /// origin. That is not proof of wrongdoing and the wording does not claim
+    /// it is: it is the board saying, out loud and on the issue, that it cannot
+    /// account for the credential that pushed.
+    ///
+    /// Returns the clause the settle notice carries, so the agent that released
+    /// the work hears it too — an orchestrator collecting a finished step is
+    /// exactly who needs to know the step's push went around the board.
+    fn note_credential_path(&self, task: &Task, attempt: &Attempt) -> Option<String> {
+        let chat = attempt.pane_id.as_deref()?;
+        let record = credential_ledger::for_chat(&self.paths, chat);
+        // Said whether or not the verdict below fires: a helper that failed and
+        // then worked is a box on its way to gh#233, and the log is where that
+        // is visible before it costs anybody a run.
+        for failure in &record.failures {
+            self.log.error(format!(
+                "{}: the board's credential path failed during this attempt — {}",
+                task.identifier,
+                failure.summary()
+            ));
+        }
+        if !record.unsanctioned() {
+            return None;
+        }
+        let reason = record
+            .last_failure()
+            .map(|f| f.summary())
+            .unwrap_or_else(|| "the helper was never asked".to_string());
+        self.log.error(format!(
+            "{}: this attempt's work is on origin, but the board's credential never pushed it \
+             ({reason}) — the push used a credential the board did not issue",
+            task.identifier
+        ));
+        let queued = self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "credential".into(),
+            payload: json!({
+                "attempt": task.attempt_count(),
+                "branch": attempt.branch,
+                "reason": reason,
+                "log": self.paths.logfile().to_string_lossy(),
+            })
+            .to_string(),
+            // Per attempt: a re-opened attempt that settles twice has one
+            // credential story, and telling it twice on the issue would only
+            // make it easier to scroll past.
+            idem_key: format!("{}:credential:{}", task.id, attempt.id),
+        });
+        if let Err(e) = queued {
+            self.log.error(format!(
+                "{}: queueing the credential notice: {e}",
+                task.identifier
+            ));
+        }
+        Some("the board's credential did not push this — see the issue".to_string())
     }
 
     // ---- notification (gh#71) --------------------------------------------
@@ -2929,13 +3140,19 @@ impl SyncEngine {
 
     // ---- writeback ------------------------------------------------------
 
+    /// `ran` is what the attempt actually runs under — the dispatch's overrides
+    /// where it made them, not the route's defaults (gh#232). The comment
+    /// outlives the chat, the row and the worktree, so it is the one surface
+    /// that cannot afford to name the route instead.
+    ///
     /// `via` is the dispatcher already named for a reader — an issue identifier,
-    /// or the chat an orchestrator is running in. `None` is the operator, and
-    /// says nothing upstream.
+    /// the human who released it, or the chat an orchestrator is running in.
+    /// `None` is a dispatch the board can put no name to, and says nothing
+    /// upstream.
     pub fn enqueue_dispatch(
         &self,
         task: &Task,
-        runtime: &str,
+        ran: RanOn<'_>,
         workspace: &str,
         attempt_no: usize,
         via: Option<&str>,
@@ -2947,7 +3164,11 @@ impl SyncEngine {
             task_id: task.id.clone(),
             kind: "dispatch".into(),
             payload: json!({
-                "runtime": runtime,
+                "runtime": ran.runtime,
+                // Absent when the dispatch named none, which is the harness
+                // default and not a fact this board can spell — the comment
+                // says the runtime alone rather than guessing at a model id.
+                "model": ran.model,
                 "workspace": workspace,
                 "attempt": attempt_no,
                 "via": via,
@@ -3112,22 +3333,7 @@ impl SyncEngine {
                                 "no started-type state for team {team}; commenting only"
                             ));
                         }
-                        let via = match payload["via"].as_str() {
-                            Some(v) => format!(" · dispatched by {v}"),
-                            None => String::new(),
-                        };
-                        let billed = dispatch_billing_suffix(&payload);
-                        linear.comment(
-                            &task.source_id,
-                            &format!(
-                                "Dispatched to comet · {} · space:{} · attempt {}{}{}",
-                                payload["runtime"].as_str().unwrap_or("?"),
-                                payload["workspace"].as_str().unwrap_or("?"),
-                                payload["attempt"].as_u64().unwrap_or(1),
-                                via,
-                                billed,
-                            ),
-                        )?;
+                        linear.comment(&task.source_id, &dispatch_comment(&payload))?;
                     }
                     "outcome" => {
                         let outcome = payload["outcome"].as_str().unwrap_or("done");
@@ -3166,6 +3372,11 @@ impl SyncEngine {
                     // a thing to say rather than a state to move to.
                     "blocked" => {
                         linear.comment(&task.source_id, &blocked_comment(&payload))?;
+                    }
+                    // The board could not account for the credential that
+                    // pushed this attempt's work (gh#233).
+                    "credential" => {
+                        linear.comment(&task.source_id, &credential_comment(&payload))?;
                     }
                     // The attempt settled with work waiting on a human. Dispatch
                     // moved this issue to In Progress and, without this, nothing
@@ -3234,23 +3445,7 @@ impl SyncEngine {
                 }
                 match w.kind.as_str() {
                     "dispatch" => {
-                        let via = match payload["via"].as_str() {
-                            Some(v) => format!(" · dispatched by {v}"),
-                            None => String::new(),
-                        };
-                        let billed = dispatch_billing_suffix(&payload);
-                        gh.comment(
-                            &repo,
-                            number,
-                            &format!(
-                                "Dispatched to comet · {} · space:{} · attempt {}{}{}",
-                                payload["runtime"].as_str().unwrap_or("?"),
-                                payload["workspace"].as_str().unwrap_or("?"),
-                                payload["attempt"].as_u64().unwrap_or(1),
-                                via,
-                                billed,
-                            ),
-                        )?;
+                        gh.comment(&repo, number, &dispatch_comment(&payload))?;
                     }
                     "outcome" => {
                         let outcome = payload["outcome"].as_str().unwrap_or("done");
@@ -3270,6 +3465,9 @@ impl SyncEngine {
                     }
                     "blocked" => {
                         gh.comment(&repo, number, &blocked_comment(&payload))?;
+                    }
+                    "credential" => {
+                        gh.comment(&repo, number, &credential_comment(&payload))?;
                     }
                     // Close on done. This is what makes "mark done" mean the
                     // same thing on a GitHub row as on a Linear one.
@@ -3421,6 +3619,47 @@ fn blocked_comment(payload: &Value) -> String {
     )
 }
 
+/// The gh#233 notice, composed at delivery like every other comment.
+fn credential_comment(payload: &Value) -> String {
+    notify::credential_comment(
+        payload["attempt"].as_u64().unwrap_or(1),
+        payload["branch"].as_str(),
+        payload["reason"]
+            .as_str()
+            .unwrap_or("the helper was never asked"),
+        payload["log"].as_str().unwrap_or("(none)"),
+    )
+}
+
+/// The line a dispatch leaves on the issue, rendered from the queued payload
+/// (gh#232).
+///
+/// One function for both sources because there is one sentence: Linear and
+/// GitHub had the same `format!` twice, and a fix to either was a fix to one
+/// half of the board's readers.
+///
+/// The model rides beside the runtime when the dispatch named one. For a board
+/// spreading work across harnesses that is the half worth having — `codex` says
+/// what ran, `codex · gpt-5.6-luna` says what to compare the next attempt
+/// against. Absent means the harness default, which the board does not know and
+/// so does not name.
+fn dispatch_comment(payload: &Value) -> String {
+    let field = |key: &str| payload[key].as_str().filter(|v| !v.trim().is_empty());
+    let segment = |prefix: &str, value: Option<&str>| match value {
+        Some(v) => format!(" · {prefix}{v}"),
+        None => String::new(),
+    };
+    format!(
+        "Dispatched to comet · {}{} · space:{} · attempt {}{}{}",
+        field("runtime").unwrap_or("?"),
+        segment("", field("model")),
+        field("workspace").unwrap_or("?"),
+        payload["attempt"].as_u64().unwrap_or(1),
+        segment("dispatched by ", field("via")),
+        dispatch_billing_suffix(payload),
+    )
+}
+
 /// What a dispatch comment appends when the run spends somebody else's
 /// subscription (gh#101) — empty when it does not, which is most of them.
 ///
@@ -3518,6 +3757,76 @@ fn git_out(worktree: &str, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The regexes that find a test declaration in a whole tree (§gh#236).
+///
+/// The `git grep` half of [`crate::effects::is_test_decl`], and deliberately
+/// the same rules: the two numbers on the tests chip are counted by this, in
+/// both trees, so a rule that misses a language misses it symmetrically and the
+/// *pair* stays honest even where the total is low. Searching every tracked
+/// file rather than a pathspec per language costs the odd markdown code fence,
+/// on both sides, for the same reason.
+const TEST_PATTERNS: &[&str] = &[
+    r"^[[:space:]]*#\[(tokio::|async_std::)?test\]",
+    r"^[[:space:]]*#\[(rstest|test_case)",
+    r"^func Test",
+    r"^[[:space:]]*(async )?def test_",
+    r"^[[:space:]]*(it|test)\(",
+    r"^[[:space:]]*func test",
+];
+
+/// How many test declarations one tree holds, or `None` when git could not say.
+///
+/// `None` is not zero and the chip renders it as neither: a suite the board
+/// could not count is a suite it must not report a count for.
+fn test_total(worktree: &str, rev: &str) -> Option<u32> {
+    let mut args: Vec<&str> = vec!["grep", "-I", "-c", "-E"];
+    for pattern in TEST_PATTERNS {
+        args.push("-e");
+        args.push(pattern);
+    }
+    args.push(rev);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(&args)
+        .output()
+        .ok()?;
+    match out.status.code() {
+        // `git grep -c` prints `rev:path:count` per file.
+        Some(0) => Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.rsplit_once(':'))
+                .filter_map(|(_, count)| count.trim().parse::<u32>().ok())
+                .sum(),
+        ),
+        // Exit 1 is git grep's "nothing matched", which is a count.
+        Some(1) => Some(0),
+        _ => None,
+    }
+}
+
+/// Every line in one tree that names `symbol` as a whole word.
+///
+/// `-F` and `-w`: a fixed string on a word boundary, so `note` cannot answer
+/// for `shelf_note` — the same exactness [`crate::claims::names_symbol`] holds
+/// to, and for the same reason. `-h` drops the `rev:path:` prefix, so what
+/// comes back is the lines themselves and [`crate::effects::count_call_sites`]
+/// can read them.
+fn git_grep(worktree: &str, symbol: &str, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["grep", "-h", "-I", "-w", "-F", "-e", symbol, rev])
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(String::from_utf8_lossy(&out.stdout).to_string()),
+        Some(1) => Some(String::new()),
+        _ => None,
+    }
 }
 
 /// Why an attempt's diff could not be read, in the words a review prints
@@ -3834,6 +4143,56 @@ mod tests {
 
     fn live(e: &SyncEngine) -> Attempt {
         e.db.attempts_for("linear:LIN-142").unwrap().remove(0)
+    }
+
+    /// The one line a dispatch leaves upstream, from the payload the queue
+    /// holds — including the model, which for a board spreading work across
+    /// harnesses is what makes the next comparison possible (gh#232).
+    #[test]
+    fn a_dispatch_comment_names_the_runtime_and_the_model_that_ran() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-232", "LIN-232", UpstreamState::Started);
+        let task = e.db.get_task("linear:LIN-232").unwrap().unwrap();
+        e.enqueue_dispatch(
+            &task,
+            RanOn {
+                runtime: "codex",
+                model: Some("gpt-5.6-luna"),
+            },
+            "comet-board",
+            1,
+            Some("brede@tally.no"),
+            None,
+        )
+        .unwrap();
+        let queued = e.db.pending_writebacks(10).unwrap();
+        let payload: Value = serde_json::from_str(&queued[0].payload).unwrap();
+        assert_eq!(
+            dispatch_comment(&payload),
+            "Dispatched to comet · codex · gpt-5.6-luna · space:comet-board · attempt 1 · \
+             dispatched by brede@tally.no"
+        );
+
+        // No model named is the harness default, which the board cannot spell —
+        // so it says the runtime alone rather than guessing.
+        e.enqueue_dispatch(
+            &task,
+            RanOn {
+                runtime: "claude-code",
+                model: None,
+            },
+            "comet-board",
+            2,
+            None,
+            None,
+        )
+        .unwrap();
+        let queued = e.db.pending_writebacks(10).unwrap();
+        let payload: Value = serde_json::from_str(&queued[1].payload).unwrap();
+        assert_eq!(
+            dispatch_comment(&payload),
+            "Dispatched to comet · claude-code · space:comet-board · attempt 2"
+        );
     }
 
     // ---- session reconciliation -----------------------------------------
@@ -5251,6 +5610,105 @@ mod tests {
 
         assert!(hook.posts.lock().unwrap().is_empty());
         assert_eq!(blocked_writebacks(&e).len(), 1);
+    }
+
+    // ---- the credential that pushed (gh#233) -----------------------------
+
+    fn credential_writebacks(e: &SyncEngine) -> Vec<Value> {
+        e.db.pending_writebacks(50)
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind == "credential")
+            .map(|w| serde_json::from_str(&w.payload).unwrap())
+            .collect()
+    }
+
+    /// Settle a dispatched attempt on a pull request, having first written
+    /// `ledger` into the board's credential record for its chat.
+    fn settle_with_ledger(ledger: impl FnOnce(&Paths)) -> (SyncEngine, Arc<RecordingWebhook>) {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        ledger(&e.paths);
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).outcome, Some(Outcome::Done), "the attempt settled");
+        (e, hook)
+    }
+
+    /// gh#233, as it actually happened: the board wired the run to its askpass
+    /// helper, the helper was never asked, and a pull request exists anyway.
+    /// Something pushed that branch and it was not the board's credential.
+    #[test]
+    fn work_on_origin_that_the_boards_credential_never_pushed_is_said_out_loud() {
+        let (e, hook) = settle_with_ledger(|paths| {
+            credential_ledger::handed(paths, "owner/widget", Some("chat-9"));
+        });
+
+        let notices = credential_writebacks(&e);
+        assert_eq!(notices.len(), 1, "one comment upstream: {notices:?}");
+        assert_eq!(notices[0]["branch"], json!("board/lin-142"));
+        let comment = credential_comment(&notices[0]);
+        assert!(comment.contains("never asked"), "{comment}");
+        assert!(comment.contains("comet-board doctor"), "{comment}");
+
+        // And the agent that released the work hears it on the settle itself,
+        // rather than finding out from the issue next week.
+        let posts = hook.posts.lock().unwrap().clone();
+        assert!(
+            posts[0].1["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("did not push this")),
+            "{:?}",
+            posts[0].1
+        );
+    }
+
+    /// The same settle on a box that could not hand the credential over at
+    /// all. The engine refuses a path it cannot exec (that is the gh#233 fix),
+    /// so nothing is `handed` — but the refusal is on the record, and work
+    /// still reached origin.
+    #[test]
+    fn a_credential_path_that_was_refused_still_accuses_the_push_that_happened() {
+        let (e, _) = settle_with_ledger(|paths| {
+            credential_ledger::unusable(
+                paths,
+                "owner/widget",
+                Some("chat-9"),
+                "cannot exec the askpass helper",
+            );
+        });
+
+        let notices = credential_writebacks(&e);
+        assert_eq!(notices.len(), 1);
+        let comment = credential_comment(&notices[0]);
+        assert!(comment.contains("cannot exec"), "{comment}");
+    }
+
+    /// The case that must stay quiet, because it is every normal dispatch: the
+    /// board handed its credential over and the helper answered a push with it.
+    #[test]
+    fn a_push_the_boards_credential_made_is_not_worth_a_word() {
+        let (e, hook) = settle_with_ledger(|paths| {
+            credential_ledger::handed(paths, "owner/widget", Some("chat-9"));
+            credential_ledger::minted(paths, "git-askpass", "owner/widget", Some("chat-9"));
+        });
+
+        assert!(credential_writebacks(&e).is_empty());
+        assert_eq!(hook.posts.lock().unwrap()[0].1["note"], Value::Null);
+    }
+
+    /// And the case that must stay quiet for a different reason: a box with no
+    /// board credential at all never claimed to be the thing that pushes, so
+    /// an empty ledger is not an accusation — it is a device pushing the way
+    /// every device did before gh#68.
+    #[test]
+    fn a_box_that_never_issues_credentials_is_not_accused_of_losing_one() {
+        let (e, _) = settle_with_ledger(|_| {});
+        assert!(credential_writebacks(&e).is_empty());
     }
 
     /// A notification is best effort by construction. An endpoint that is down
@@ -8275,6 +8733,149 @@ max_duration = "{max_duration}"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// §gh#236, end to end: every chip on the row comes off the checkout and
+    /// the journal, and the one thing that arrived is the one thing that is not
+    /// neutral.
+    ///
+    /// The claims in here are deliberately *correct* — the point is not that
+    /// the board catches a lie, it is that a true claim reads differently when
+    /// something the agent did not write stands behind it.
+    #[test]
+    fn the_board_derives_the_effects_of_a_branch_without_asking_the_agent() {
+        let (dir, _) = checkout_with_a_base();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn active_placements() -> usize { 0 }\n\
+             fn a() { let _ = active_placements(); }\n\
+             fn b() { let _ = active_placements(); }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("app.toml"), "[sync]\n").unwrap();
+        commit_all(&dir, "a base with a dependency and a symbol");
+        let base = String::from_utf8_lossy(
+            &Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+
+        // The branch: a dependency arrives, the schema moves, a config key is
+        // added, a test is written, and one of the two call sites goes.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1.2\"\ntoml = \"1.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/db.rs"),
+            "// base\nconst UP: &str = \"ALTER TABLE attempts ADD COLUMN effects TEXT\";\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("app.toml"), "[sync]\ninterval = \"5m\"\n").unwrap();
+        std::fs::write(
+            dir.join("src/effects.rs"),
+            "pub fn scan() {}\n#[test]\nfn it_scans() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn active_placements() -> usize { 0 }\n\
+             fn a() { let _ = active_placements(); }\n\
+             fn b() {}\n",
+        )
+        .unwrap();
+        commit_all(&dir, "the work");
+
+        // What the harness recorded while the agent worked — the only source
+        // for "did the tests pass", and not one the agent wrote.
+        e.db.set_attempt_evidence(
+            a,
+            &crate::evidence::gather(&[crate::evidence::RanCommand {
+                command: "cargo test".into(),
+                failed: false,
+            }]),
+        )
+        .unwrap();
+
+        let review = e
+            .submit_claims(
+                None,
+                "linear:LIN-142",
+                "The scan and its test :: src/effects.rs\n\
+                 One call site went :: active_placements\n",
+            )
+            .unwrap();
+
+        let effects = &review.effects;
+        assert!(effects.read);
+        assert_eq!(
+            (effects.tests_before, effects.tests_after),
+            (Some(0), Some(1)),
+            "counted in both trees by the same rule"
+        );
+        assert_eq!(effects.deps_added, vec!["toml".to_string()]);
+        assert!(effects.deps_known);
+        assert!(matches!(
+            effects.public_api(),
+            crate::effects::Surface::Changed { .. }
+        ));
+        assert_eq!(
+            effects.schema(),
+            crate::effects::Surface::Changed { count: 1 },
+            "a migration written in Rust is still a migration"
+        );
+        assert_eq!(
+            effects.config_keys(),
+            crate::effects::Surface::Changed { count: 1 }
+        );
+
+        let chips = review.effect_chips();
+        assert_eq!(chips[0].text, "Tests 0 → 1, all passing");
+        assert_eq!(chips[0].ground, crate::effects::Ground::Neutral);
+        assert_eq!(chips.last().unwrap().text, "1 dependency added");
+        assert_eq!(
+            chips.last().unwrap().ground,
+            crate::effects::Ground::Working,
+            "a new dependency is the one chip on this row that is not neutral"
+        );
+
+        // The claim with a passing new test behind it is corroborated; the one
+        // about a symbol carries the count from both trees.
+        let tested = &review.remainder.claims[0];
+        assert_eq!(review.claim_chips(tested)[0].text, "1 new test passes");
+        assert_eq!(
+            review.claim_mark(tested),
+            crate::claims::ClaimMark::Corroborated
+        );
+        let moved = &review.remainder.claims[1];
+        let chips = review.claim_chips(moved);
+        assert_eq!(chips[0].text, "1 call site, was 2");
+        assert!(
+            chips.iter().any(|c| c.text == "no test covers this"),
+            "\"somebody calls it\" and \"something checks it\" are different news"
+        );
+        // Still a tick: a count taken in both trees is evidence the agent did
+        // not author, which is the whole bar this glyph is set at.
+        assert_eq!(
+            review.claim_mark(moved),
+            crate::claims::ClaimMark::Corroborated
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The one way an empty remainder could mislead: an agent that claims
     /// before it commits has shown the board nothing, and "all accounted for"
     /// would be the friendliest possible lie.
@@ -8372,6 +8973,15 @@ max_duration = "{max_duration}"
         assert!(matches!(review.diff, crate::claims::DiffSource::Recorded));
         assert_eq!(review.remainder.unclaimed.len(), 1);
         assert_eq!(review.remainder.unclaimed[0].path, "Cargo.lock");
+        // The effects were snapshotted with it (§gh#236) — they are read from
+        // the same checkout, so a review that kept the remainder and lost them
+        // would go from "the board looked" to "the board never looked" purely
+        // because gc ran.
+        assert!(review.effects.read, "the snapshot carries what was derived");
+        assert_eq!(review.effects.files.len(), 2);
+        // …and the call-site counts do NOT survive, because they were never
+        // stored: they need a tree to grep. Absent rather than stale.
+        assert!(review.remainder.claims[0].call_sites.is_empty());
     }
 
     /// …and when there is neither a checkout nor a snapshot, the review says

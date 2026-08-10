@@ -462,6 +462,12 @@ impl Db {
                 // nothing read a block off them, so none of them wrote one
                 // badly.
                 ("claims_error", "TEXT"),
+                // What the board read off the branch itself (§gh#236). NULL on
+                // every row that came before, which deserializes to
+                // `Effects::read = false` — "nobody looked", which is what
+                // those rows are, and which the chips say out loud rather than
+                // rendering as five clean results.
+                ("effects", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -1108,6 +1114,29 @@ impl Db {
         self.conn.execute(
             "UPDATE attempts SET run_evidence = ?2 WHERE id = ?1",
             params![attempt_id, serde_json::to_string(evidence)?],
+        )?;
+        Ok(())
+    }
+
+    /// What the board derived from this attempt's branch (§gh#236). `None` is
+    /// "never recorded" — every row from before this existed, and every attempt
+    /// whose checkout the board could not read while it was live.
+    ///
+    /// Snapshotted for [`Db::attempt_changes`]'s reason: the effects are read
+    /// from the checkout, and the checkout is reclaimed (gh#72). A review
+    /// opened after that shows what the board saw while it could still see.
+    pub fn attempt_effects(&self, attempt_id: i64) -> Result<Option<crate::effects::Effects>> {
+        self.attempt_json("effects", attempt_id)
+    }
+
+    pub fn set_attempt_effects(
+        &self,
+        attempt_id: i64,
+        effects: &crate::effects::Effects,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET effects = ?2 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(effects)?],
         )?;
         Ok(())
     }

@@ -32,6 +32,16 @@ you and your agents invisible to every surface.
 **Close the issue from the work**: `Closes #N` in a commit on the branch. A
 merged PR settles the row itself.
 
+**The credential for your push is the board's, and it is the only one.** A
+dispatched run gets `GIT_ASKPASS` pointed at a helper that mints a short-lived
+token onto git's pipe, and a `gh` wrapper that does the same — so no token is
+ever in argv, in `.git/config`, or in your environment. If a push cannot
+authenticate, **say so and stop**. Do not write your own askpass or credential
+wrapper, do not export a token, do not put one in a remote URL. The board now
+records whether its credential was the one that pushed, and comments on the
+issue when it was not; a push that got through some other way is a finding, not
+a finish.
+
 ## Finishing: claim what you did
 
 Before you say you are done, tell the board what you changed — in **claims**,
@@ -84,8 +94,17 @@ look at them — they are the ones a reviewer would have caught.
 
 Claims live on the attempt, so they outlive this chat; a retry makes its own.
 Submitting again replaces the set. `comet-board review --task <id> [--json]`
-prints the whole thing back: brief, claims, the commands the run ran, and the
-remainder.
+prints the whole thing back: brief, the effects the board derived, claims, the
+commands the run ran, and the remainder.
+
+Those effects are not yours to write and there is nothing to submit for them.
+The board reads them off the branch and the journal itself — tests before and
+after, whether the public surface moved, the schema, config keys, dependencies
+— and it attaches to each claim what it found in the files that claim anchors.
+A claim with a new passing test under it reads as checked; one with nothing
+under it says `no test covers this`. Neither is an instruction to write a test
+you would not otherwise write; it is what a reviewer sees, so it is worth
+knowing it is being read.
 
 **Releasing and waiting:**
 

@@ -447,6 +447,8 @@ pub fn render_review(review: &AttemptReview) -> String {
         verdict.text
     );
     out.push('\n');
+    effects_section(review, &mut out);
+    out.push('\n');
     claims_section(review, &mut out);
     out.push('\n');
     evidence_section(&review.evidence, &mut out);
@@ -473,6 +475,34 @@ pub fn render_claim_result(review: &AttemptReview) -> String {
     out.push('\n');
     remainder_section(review, &mut out);
     out
+}
+
+/// The effects row (§gh#236): what the board read off the branch itself, above
+/// anything the agent said about it.
+///
+/// Above the claims for the same reason it sits above them on the desktop
+/// screen — a reader who has already been told a fluent story about the work
+/// reads the numbers as confirmation of it. These come first so they are read
+/// as what they are.
+fn effects_section(review: &AttemptReview, out: &mut String) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "EFFECTS");
+    for chip in review.effect_chips() {
+        let _ = writeln!(out, "  {} {}", ground_mark(chip.ground), chip.text);
+    }
+}
+
+/// One glyph per [`Ground`], so a terminal reader gets the distinction the
+/// colours carry on the desktop. `?` is the one that matters: a fact the board
+/// could not establish must not read like a fact it established.
+fn ground_mark(ground: comet_board::effects::Ground) -> &'static str {
+    use comet_board::effects::Ground;
+    match ground {
+        Ground::Neutral => "·",
+        Ground::Settled => "✓",
+        Ground::Working => "*",
+        Ground::Unknown => "?",
+    }
 }
 
 fn claims_section(review: &AttemptReview, out: &mut String) {
@@ -506,15 +536,17 @@ fn claims_section(review: &AttemptReview, out: &mut String) {
     );
     for claim in &review.remainder.claims {
         // `!` is a claim nothing in the diff supports — a claim about work that
-        // did not happen, which is at least as interesting as an unclaimed file.
-        let _ = writeln!(
-            out,
-            "  {} {}",
-            if claim.anchored() { "·" } else { "!" },
-            claim.text
-        );
+        // did not happen, which is at least as interesting as an unclaimed
+        // file. `✓` is one something the agent did not author stands behind,
+        // and `·` is the middle: anchored, and corroborated by nothing
+        // (§gh#236).
+        let _ = writeln!(out, "  {} {}", review.claim_mark(claim).glyph(), claim.text);
         if !claim.matched.is_empty() {
             let _ = writeln!(out, "      {}", claim.matched.join(", "));
+        }
+        // The evidence that attaches to this one claim, under it.
+        for chip in review.claim_chips(claim) {
+            let _ = writeln!(out, "      {} {}", ground_mark(chip.ground), chip.text);
         }
         // A path nothing happened to and a symbol no changed line names are
         // the same finding said about different anchors, and a reviewer needs
@@ -2091,6 +2123,7 @@ mod tests {
             diff: DiffSource::Checkout,
             uncommitted: Some(0),
             evidence: RunEvidence::default(),
+            effects: comet_board::effects::Effects::default(),
         }
     }
 
@@ -2106,6 +2139,7 @@ mod tests {
                     symbols: vec![],
                     matched: vec!["src/db.rs".into()],
                     unmatched: vec![],
+                    call_sites: vec![],
                 }],
                 unclaimed: vec![changed("Cargo.lock", "A")],
                 unmatched_anchors: vec![],
@@ -2168,6 +2202,7 @@ mod tests {
                     symbols: vec![],
                     matched: vec![],
                     unmatched: vec!["src/retry.rs".into()],
+                    call_sites: vec![],
                 }],
                 unmatched_anchors: vec!["src/retry.rs".into()],
                 ..Default::default()
@@ -2199,6 +2234,73 @@ mod tests {
             receipt.contains("! nothing in the diff matches: Fixed the retry path"),
             "{receipt}"
         );
+    }
+
+    /// The effects row (§gh#236): above the claims, because a reader who has
+    /// been told a fluent story reads numbers underneath it as confirmation.
+    #[test]
+    fn the_effects_the_board_derived_come_before_anything_the_agent_said() {
+        use comet_board::effects::{Effects, FileScan};
+        let mut review = review_of(
+            Remainder {
+                claims: vec![ClaimView {
+                    text: "The scan and its test".into(),
+                    files: vec!["src/effects.rs".into()],
+                    symbols: vec![],
+                    matched: vec!["src/effects.rs".into()],
+                    unmatched: vec![],
+                    call_sites: vec![],
+                }],
+                claimed: 1,
+                ..Default::default()
+            },
+            vec![changed("src/effects.rs", "A")],
+        );
+        review.effects = Effects {
+            read: true,
+            files: vec![FileScan {
+                path: "src/effects.rs".into(),
+                kind: Some(comet_board::effects::FileKind::Rust),
+                tests_added: 4,
+                ..Default::default()
+            }],
+            tests_before: Some(41),
+            tests_after: Some(47),
+            deps_added: vec!["toml".into()],
+            deps_known: true,
+        };
+        review.evidence = RunEvidence {
+            commands: 12,
+            failed: 1,
+            checks: vec![Check {
+                command: "cargo test".into(),
+                runs: 2,
+                failed: 1,
+            }],
+            truncated: false,
+        };
+        let text = render_review(&review);
+        assert!(text.contains("Tests 41 → 47, all passing"), "{text}");
+        assert!(text.contains("* 1 dependency added"), "{text}");
+        assert!(text.contains("· Public API unchanged"), "{text}");
+        // The claim carries its own evidence, and a tick it had to earn.
+        assert!(text.contains("✓ The scan and its test"), "{text}");
+        assert!(text.contains("✓ 4 new tests pass"), "{text}");
+        let (before, after) = text.split_once("CLAIMS").expect("a claims section");
+        assert!(before.contains("EFFECTS"), "the effects come first");
+        assert!(!after.contains("EFFECTS"));
+    }
+
+    /// The exit condition, in the terminal: a review the board never read says
+    /// so, instead of printing five clean results.
+    #[test]
+    fn a_review_with_no_effects_read_says_that_rather_than_reassuring_anybody() {
+        let text = render_review(&review_of(Remainder::default(), vec![]));
+        assert!(
+            text.contains("? no effects read from this branch"),
+            "{text}"
+        );
+        assert!(!text.contains("Public API unchanged"), "{text}");
     }
 
     /// The two states that would otherwise read as "nothing changed".

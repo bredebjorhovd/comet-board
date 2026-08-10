@@ -1183,16 +1183,28 @@ impl EngineRpc {
 /// fails on git's own 403, naming the URL, which is a truer error than one this
 /// could invent.
 fn clone_env(slug: &str, paths: &comet_board::config::Paths) -> Vec<(String, String)> {
-    match comet_board::git_credentials::resolve_board_exe() {
-        Some(exe) => comet_board::git_credentials::agent_env(&exe, slug, paths),
-        None => {
+    match askpass_for_clone(paths) {
+        Ok(askpass) => comet_board::git_credentials::agent_env(&askpass, slug, paths),
+        Err(err) => {
             tracing::warn!(
-                "onboard: no comet-board binary found for the askpass helper — cloning \
-                 {slug} without the board's credential"
+                "onboard: no working askpass helper — cloning {slug} without the board's \
+                 credential ({err:#})"
             );
             vec![("GIT_TERMINAL_PROMPT".into(), "0".into())]
         }
     }
+}
+
+/// The askpass shim for a clone: the same file a dispatched run gets, written
+/// and checked the same way (gh#233). One `fork` on a code path that is about
+/// to clone a repository over the network.
+fn askpass_for_clone(paths: &comet_board::config::Paths) -> anyhow::Result<std::path::PathBuf> {
+    let exe = comet_board::git_credentials::resolve_board_exe()
+        .ok_or_else(|| anyhow::anyhow!("no comet-board binary found on this device"))?;
+    let dir = paths.state_dir.join(crate::push_credentials::SHIM_DIR);
+    let shim = comet_board::git_credentials::install_askpass_shim(&dir, &exe)?;
+    comet_board::git_credentials::verify_askpass(&shim)?;
+    Ok(shim)
 }
 
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this

@@ -217,6 +217,68 @@ async fn stream_end_while_serve_alive_finishes_completed_and_reaps() {
     assert_serve_reaped(&dir).await;
 }
 
+/// gh#233: what does the opencode child actually get?
+///
+/// The first opencode dispatch could not exec the board's askpass helper and
+/// pushed with a wrapper of its own, which put the harness under suspicion —
+/// maybe this adapter mangles the environment on the way down. It does not, and
+/// this is where that stops being a belief. `opencode serve` is the parent of
+/// every `git` an opencode agent runs, so the variables it received *are* the
+/// ones those pushes inherit, and the fake writes them out.
+///
+/// What is asserted is the property that failed: `GIT_ASKPASS` arrives byte for
+/// byte, and it names a file — because git execs it, and a value that is not a
+/// path is a push that cannot authenticate.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_serve_child_gets_the_credential_environment_byte_for_byte() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The shape a dispatched run is given: the board's shim, installed the way
+    // the engine installs it, at a path with a space in it for good measure.
+    let board = dir.path().join("comet board");
+    std::fs::write(&board, "#!/bin/sh\necho x-access-token\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let askpass =
+        comet_board::git_credentials::install_askpass_shim(&dir.path().join("bin"), &board)
+            .expect("shim installed");
+    let env = comet_board::git_credentials::push_env(&askpass, "owner/widget");
+
+    let (mut controls, _steer, _token) = fake_controls();
+    controls.push = Some(comet_harness::PushCredentials {
+        env: env.clone(),
+        bin_dir: None,
+    });
+    run_to_end(
+        &harness(),
+        fake_request("scenario:stream-end", &dir),
+        controls,
+    )
+    .await;
+
+    let seen: std::collections::BTreeMap<String, String> =
+        std::fs::read_to_string(dir.path().join("fake-opencode.env"))
+            .expect("the fake serve wrote its environment")
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+            .collect();
+    let handed: std::collections::BTreeMap<String, String> = env.into_iter().collect();
+    for (key, value) in &handed {
+        assert_eq!(
+            seen.get(key),
+            Some(value),
+            "{key} did not survive the opencode child's launch: {seen:?}"
+        );
+    }
+    let arrived = seen.get("GIT_ASKPASS").expect("GIT_ASKPASS reached serve");
+    assert!(
+        Path::new(arrived).is_file(),
+        "GIT_ASKPASS names nothing git could exec: {arrived}"
+    );
+}
+
 /// A serve that actually dies mid-run must STILL surface as an Errored crash
 /// (with the real exit status, not a "still running" shrug) and be reaped.
 #[cfg(unix)]
@@ -389,12 +451,7 @@ async fn sse_stream_survives_past_the_total_request_deadline() {
     // to send, so stretching it with the runner would quietly stop the test
     // from reproducing gh#46 at all.
     let harness = harness().with_request_timeout(Duration::from_millis(300));
-    let events = run_to_end(
-        &harness,
-        fake_request("scenario:slow-turn", &dir),
-        controls,
-    )
-    .await;
+    let events = run_to_end(&harness, fake_request("scenario:slow-turn", &dir), controls).await;
 
     assert!(
         events.contains(&AgentEvent::TextDelta {

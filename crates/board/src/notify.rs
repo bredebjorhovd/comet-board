@@ -211,6 +211,31 @@ pub fn upstream_comment(attempt_no: u64, why: Stopped, log: &str) -> String {
     )
 }
 
+/// The comment an attempt leaves when the board cannot account for the
+/// credential that pushed its work (gh#233).
+///
+/// Addressed to a person, and careful about what it asserts. The board knows
+/// two things — it meant to be this run's credential, and its helper was never
+/// asked — and neither of them is "the agent did something wrong". What it
+/// asks for is the one thing a reader can actually do: look at how the branch
+/// got there before trusting the box's credential path again.
+pub fn credential_comment(
+    attempt_no: u64,
+    branch: Option<&str>,
+    reason: &str,
+    log: &str,
+) -> String {
+    format!(
+        "comet-board: attempt {attempt_no} finished with work on origin{}, but the board's \
+         credential helper was never asked for it — {reason}. Whatever pushed, it was not the \
+         installation token the board issues, so the guarantees in gh#68 (no token in argv, in \
+         `.git/config`, or in the environment) were not the ones in force. Check how the branch \
+         was pushed, and run `comet-board doctor` on the box before dispatching more work to it. \
+         · log: {log}",
+        branch.map(|b| format!(" ({b})")).unwrap_or_default(),
+    )
+}
+
 /// The prompt queued into the chat of the agent that released this work.
 ///
 /// Addressed to an agent, so it says what changed and what is actionable, and
