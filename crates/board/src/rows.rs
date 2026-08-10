@@ -72,6 +72,7 @@ pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> Task
             .map(|a| a.runtime.clone())
             .or_else(|| route.map(|r| r.runtime.clone())),
         chat_id: live.and_then(|a| a.pane_id.clone()),
+        review_chat_id: last.and_then(|a| a.pane_id.clone()),
         pr_url: task.pr_url.clone(),
         pr_number: task.pr_number,
         branch: live.or(last).and_then(|a| a.branch.clone()),
@@ -213,10 +214,20 @@ mod tests {
         let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id.as_deref(), Some("chat-1"));
+        assert_eq!(rows[0].review_chat_id.as_deref(), Some("chat-1"));
         assert_eq!(rows[0].dispatched_by_chat.as_deref(), Some("chat-parent"));
         assert_eq!(rows[0].branch.as_deref(), Some("board/gh-1-r"));
         // No route configured: on the board, not dispatchable.
         assert!(!rows[0].dispatchable);
+
+        db.close_attempt(a, Outcome::Done).unwrap();
+        let settled = board_rows(&db, &RoutingConfig::default()).unwrap();
+        assert_eq!(settled[0].chat_id, None, "a settled run is not live");
+        assert_eq!(
+            settled[0].review_chat_id.as_deref(),
+            Some("chat-1"),
+            "review keeps its authoring conversation"
+        );
     }
 
     /// gh#74: the row names the human who released it, so a reader of

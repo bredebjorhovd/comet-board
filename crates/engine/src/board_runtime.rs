@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use comet_board::evidence::RanCommand;
 use comet_board::runtime::{
-    DispatchHandle, DispatchSpec, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
+    DispatchHandle, DispatchSpec, ReviewCandidate, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
 };
 use comet_doc::SessionCommandPayload;
 use comet_proto::{
@@ -252,6 +252,51 @@ impl Runtime for CometRuntime {
 
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self.workspace.doc().chat(chat_id)?.and_then(|c| c.cwd))
+    }
+
+    fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+        let chats = self.workspace.doc().read_chats()?;
+        let spaces = self.workspace.doc().read_spaces()?;
+        let local_device = self.workspace.device_id();
+        Ok(chats
+            .into_iter()
+            // A checkout path belongs to its host device. The board must not
+            // run local git against a path copied from another Mac.
+            .filter(|chat| chat.device_id == local_device)
+            .filter_map(|chat| {
+                let worktree = chat.cwd?.trim().to_string();
+                let branch = chat.branch?.trim().to_string();
+                if worktree.is_empty() || branch.is_empty() || branch == "HEAD" {
+                    return None;
+                }
+                let workspace = chat
+                    .space_id
+                    .as_deref()
+                    .and_then(|id| spaces.iter().find(|space| space.id == id))
+                    .map(|space| space.display_name().to_string())
+                    .or_else(|| {
+                        std::path::Path::new(&worktree)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| "Comet".into());
+                let runtime = chat
+                    .config
+                    .as_ref()
+                    .map(|config| comet_board::runtime::runtime_name(config.harness).to_string())
+                    .unwrap_or_else(|| "agent".into());
+                let account = chat.config.and_then(|config| config.account);
+                Some(ReviewCandidate {
+                    chat_id: chat.id,
+                    workspace,
+                    runtime,
+                    worktree,
+                    branch,
+                    account,
+                    created_at: chat.created_at,
+                })
+            })
+            .collect())
     }
 
     /// Hand a finished attempt's checkout back (gh#72): remove the worktree,

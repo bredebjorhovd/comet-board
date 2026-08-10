@@ -309,6 +309,24 @@ pub struct DispatchHandle {
     pub cwd: String,
 }
 
+/// A Comet chat whose checkout can be associated with a pull request.
+///
+/// Board dispatches already create attempts before their chats exist. This is
+/// the other provenance path: a person opened an ordinary Comet chat, the
+/// agent worked on its branch, and GitHub now reports a pull request for that
+/// branch. The sync loop turns the match into an attempt so every review
+/// surface reads the same model regardless of how the chat began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCandidate {
+    pub chat_id: String,
+    pub workspace: String,
+    pub runtime: String,
+    pub worktree: String,
+    pub branch: String,
+    pub account: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// What the board asks of comet. One implementation talks live RPC from inside
 /// the engine; tests use a recording fake, as herdr-board's fixture tests did.
 ///
@@ -348,6 +366,14 @@ pub trait Runtime {
     /// wrong author. What herdr-board read off the pane's live cwd, comet
     /// states on the chat row.
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>>;
+
+    /// Ordinary Comet chats that may have authored a newly discovered PR.
+    ///
+    /// Empty by default so read-only and legacy runtimes do not invent
+    /// provenance. A live engine answers from the workspace document.
+    fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
+        Ok(Vec::new())
+    }
 
     /// Reclaim a finished attempt's checkout and the local branch it was cut
     /// on (gh#72) — herdr-board's `gc`, which the port left behind.

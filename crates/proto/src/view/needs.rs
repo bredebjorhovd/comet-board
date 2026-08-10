@@ -390,6 +390,7 @@ mod tests {
             workspace: None,
             runtime: None,
             chat_id: Some(chat_id.into()),
+            review_chat_id: Some(chat_id.into()),
             pr_url: None,
             pr_number: None,
             branch: None,

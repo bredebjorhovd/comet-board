@@ -27,7 +27,7 @@
 
 use crate::config::{Credentials, Paths, RouteContext, RoutingConfig};
 use crate::credential_ledger;
-use crate::db::{Db, NewWriteback, Reaped};
+use crate::db::{Db, NewAttempt, NewWriteback, Reaped};
 use crate::dispatch::RanOn;
 use crate::gc;
 use crate::log::Logger;
@@ -327,6 +327,12 @@ impl SyncEngine {
     ) -> Result<Vec<PullRequest>> {
         self.poll_linear();
         let pulls = self.poll_github();
+        if let Some(runtime) = runtime
+            && let Err(e) = self.adopt_session_pull_requests(&pulls, runtime)
+        {
+            self.log
+                .warn(format!("linking Comet chats to pull requests: {e:#}"));
+        }
 
         if let Some(statuses) = statuses {
             self.reconcile_sessions_with(statuses, runtime)?;
@@ -581,7 +587,7 @@ impl SyncEngine {
 
         if self.cfg.github.pull_requests {
             for pr in &all_pulls {
-                if attempt_branches.claims(pr) {
+                if !self.should_import_pull_request_row(&attempt_branches, pr) {
                     continue;
                 }
                 if let Err(e) = self.db.upsert_task(&pr.to_upsert()) {
@@ -621,6 +627,109 @@ impl SyncEngine {
             }
         }
         all_pulls
+    }
+
+    /// A dispatched issue owns its PR, so the PR is not duplicated as `gh!…`.
+    /// An ordinary Comet chat is different: its adopted attempt lives on the
+    /// `gh!…` row itself, and that row must continue to be refreshed and marked
+    /// seen on every poll rather than disappearing behind its own branch.
+    fn should_import_pull_request_row(
+        &self,
+        attempt_branches: &AttemptBranches,
+        pr: &PullRequest,
+    ) -> bool {
+        if !attempt_branches.claims(pr) {
+            return true;
+        }
+        self.db
+            .get_task(&pr.task_id())
+            .ok()
+            .flatten()
+            .is_some_and(|task| {
+                task.attempts
+                    .iter()
+                    .any(|attempt| attempt.branch.as_deref() == Some(pr.head_ref.as_str()))
+            })
+    }
+
+    /// Give a directly-created Comet PR the same attempt-backed review model
+    /// as a Board dispatch.
+    ///
+    /// GitHub supplies the immutable comparison base; Comet supplies the chat,
+    /// checkout and branch. Repository + branch is the ownership proof already
+    /// used for dispatched attempts. When several chats share one checkout,
+    /// the newest is the one that adopted the branch most recently.
+    fn adopt_session_pull_requests(
+        &self,
+        pulls: &[PullRequest],
+        runtime: &dyn Runtime,
+    ) -> Result<()> {
+        let candidates = runtime.review_candidates()?;
+        for pr in pulls.iter().filter(|pr| pr.open) {
+            let task_id = pr.task_id();
+            let Some(task) = self.db.get_task(&task_id)? else {
+                // A dispatched branch is represented by its issue row and is
+                // deliberately not imported as a separate PR task.
+                continue;
+            };
+            if let Some(attempt) = task.attempts.iter().rev().find(|attempt| {
+                !attempt.board_managed
+                    && attempt.branch.as_deref() == Some(pr.head_ref.as_str())
+            }) {
+                // Direct agents often open a PR and continue working. Keep the
+                // review snapshot current instead of freezing it at the first
+                // GitHub poll that happened to see the PR.
+                self.harvest_claims(Some(runtime), attempt);
+                self.record_tokens(Some(runtime), attempt);
+                self.record_review_facts(Some(runtime), attempt);
+                continue;
+            }
+            if !task.attempts.is_empty() {
+                continue;
+            }
+            let Some(candidate) = candidates
+                .iter()
+                .filter(|candidate| candidate.branch == pr.head_ref)
+                .filter(|candidate| {
+                    crate::git_credentials::repo_for_checkout(&candidate.worktree)
+                        .is_some_and(|repo| repo.eq_ignore_ascii_case(&pr.repo))
+                })
+                .max_by_key(|candidate| candidate.created_at)
+            else {
+                continue;
+            };
+
+            let attempt_id = self.db.insert_adopted_attempt(&NewAttempt {
+                task_id: task_id.clone(),
+                pane_id: Some(candidate.chat_id.clone()),
+                workspace: candidate.workspace.clone(),
+                runtime: candidate.runtime.clone(),
+                worktree: Some(candidate.worktree.clone()),
+                repo_path: None,
+                branch: Some(candidate.branch.clone()),
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: pr.base_sha.clone(),
+                account: candidate.account.clone(),
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })?;
+            let attempt = self
+                .db
+                .get_attempt(attempt_id)?
+                .ok_or_else(|| anyhow::anyhow!("adopted attempt {attempt_id} disappeared"))?;
+            self.harvest_claims(Some(runtime), &attempt);
+            self.record_tokens(Some(runtime), &attempt);
+            self.record_review_facts(Some(runtime), &attempt);
+            self.db.close_attempt(attempt_id, Outcome::Done)?;
+            self.log.info(format!(
+                "{}: linked {} to Comet chat {} — review available",
+                task.identifier, pr.url, candidate.chat_id
+            ));
+        }
+        Ok(())
     }
 
     /// Every branch the board has dispatched onto, with the repository it was
@@ -1792,7 +1901,10 @@ impl SyncEngine {
         };
         for task in &tasks {
             for attempt in &task.attempts {
-                if attempt.collected_at.is_some() || attempt.worktree.is_none() {
+                if !attempt.board_managed
+                    || attempt.collected_at.is_some()
+                    || attempt.worktree.is_none()
+                {
                     continue;
                 }
                 let spent = attempt
@@ -1919,7 +2031,8 @@ impl SyncEngine {
                 // reclaimed whole, or this cache already swept. The last is what
                 // keeps a box that has been up for months from re-walking every
                 // source tree it has ever cut, every cycle.
-                if attempt.worktree.is_none()
+                if !attempt.board_managed
+                    || attempt.worktree.is_none()
                     || attempt.collected_at.is_some()
                     || attempt.cache_swept_at.is_some()
                 {
@@ -2073,7 +2186,10 @@ impl SyncEngine {
                 continue;
             };
             for attempt in &task.attempts {
-                if attempt.chat_archived_at.is_some() || attempt.pane_id.is_none() {
+                if !attempt.board_managed
+                    || attempt.chat_archived_at.is_some()
+                    || attempt.pane_id.is_none()
+                {
                     continue;
                 }
                 let spent = attempt
@@ -6420,23 +6536,169 @@ max_duration = "{max_duration}"
         dispatch(&e, "linear:LIN-142", "chat-9");
         seed(&e, "linear:LIN-999", "LIN-999", UpstreamState::Started);
 
-        e.link_pull_requests(&[PullRequest {
+        let pr = PullRequest {
             repo: "o/r".into(),
             number: 291,
             title: "Add retry".into(),
             body: None,
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
+            base_sha: None,
             open: true,
             merged: false,
             draft: false,
             updated_at: crate::db::now(),
-        }])
-        .unwrap();
+        };
+        let branches = e.attempt_branches();
+        assert!(!e.should_import_pull_request_row(&branches, &pr));
+        e.link_pull_requests(std::slice::from_ref(&pr)).unwrap();
 
         assert!(e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_open);
         // The unrelated task must not pick up the PR.
         assert!(!e.db.get_task("linear:LIN-999").unwrap().unwrap().pr_open);
+    }
+
+    #[derive(Clone)]
+    struct DirectReviewChat {
+        candidate: crate::runtime::ReviewCandidate,
+    }
+
+    impl Runtime for DirectReviewChat {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("adoption never dispatches")
+        }
+        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("adoption never cancels")
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(Some(self.candidate.worktree.clone()))
+        }
+        fn review_candidates(&self) -> anyhow::Result<Vec<crate::runtime::ReviewCandidate>> {
+            Ok(vec![self.candidate.clone()])
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(Some(RunEnd::Completed))
+        }
+        fn run_commands(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<Vec<crate::evidence::RanCommand>>> {
+            Ok(Some(vec![crate::evidence::RanCommand {
+                command: "cargo test -p comet-board".into(),
+                failed: false,
+            }]))
+        }
+    }
+
+    #[test]
+    fn a_pr_from_an_ordinary_comet_chat_gets_an_attempt_backed_review() {
+        let e = engine(None);
+        let work = repo_ahead_of_its_remote();
+        git_in(
+            &work,
+            &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+        );
+        let base = git_out(&work.to_string_lossy(), &["rev-parse", "origin/main"]).unwrap();
+        git_in(&work, &["switch", "-c", "direct-pr"]);
+        std::fs::write(work.join("agent-change"), "made in Comet").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "-m", "agent change"]);
+
+        let pr = PullRequest {
+            repo: "o/r".into(),
+            number: 265,
+            title: "Made by a normal Comet agent".into(),
+            body: None,
+            url: "https://github.com/o/r/pull/265".into(),
+            head_ref: "direct-pr".into(),
+            base_sha: Some(base.clone()),
+            open: true,
+            merged: false,
+            draft: false,
+            updated_at: crate::db::now(),
+        };
+        e.db.upsert_task(&pr.to_upsert()).unwrap();
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
+            .unwrap();
+        let runtime = DirectReviewChat {
+            candidate: crate::runtime::ReviewCandidate {
+                chat_id: "comet-chat".into(),
+                workspace: "comet-board".into(),
+                runtime: "claude-code".into(),
+                worktree: work.to_string_lossy().into_owned(),
+                branch: "direct-pr".into(),
+                account: None,
+                created_at: chrono::Utc::now(),
+            },
+        };
+
+        e.adopt_session_pull_requests(std::slice::from_ref(&pr), &runtime)
+            .unwrap();
+
+        let task = e.db.get_task(&pr.task_id()).unwrap().unwrap();
+        assert_eq!(task.attempts.len(), 1);
+        let attempt = &task.attempts[0];
+        assert_eq!(attempt.pane_id.as_deref(), Some("comet-chat"));
+        assert_eq!(attempt.outcome, Some(Outcome::Done));
+        assert!(!attempt.board_managed, "the person's checkout stays theirs");
+        let branches = e.attempt_branches();
+        assert!(
+            e.should_import_pull_request_row(&branches, &pr),
+            "an adopted PR row must not disappear behind its own attempt"
+        );
+        let review = e.review(&pr.task_id(), None).unwrap();
+        assert_eq!(review.diff, crate::claims::DiffSource::Checkout);
+        assert!(
+            review
+                .changed
+                .iter()
+                .any(|file| file.path == "agent-change"),
+            "the direct chat's PR receives the real branch review"
+        );
+        assert!(
+            !review.claimed(),
+            "missing claims remain unknown, never clean"
+        );
+
+        std::fs::write(work.join("later-change"), "after opening the PR").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "-m", "continue after opening PR"]);
+        e.adopt_session_pull_requests(std::slice::from_ref(&pr), &runtime)
+            .unwrap();
+        let refreshed = e.review(&pr.task_id(), None).unwrap();
+        assert!(
+            refreshed
+                .changed
+                .iter()
+                .any(|file| file.path == "later-change"),
+            "the review follows work committed after the PR first appeared"
+        );
+        assert_eq!(
+            e.db.get_task(&pr.task_id()).unwrap().unwrap().attempts.len(),
+            1,
+            "refreshing the review does not invent another run"
+        );
+
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), false)
+            .unwrap();
+        e.db.set_local_done(&pr.task_id(), true).unwrap();
+        e.rederive_all().unwrap();
+        e.collect_worktrees(Some(&runtime));
+        e.sweep_build_output(Some(&runtime));
+        e.archive_chats(Some(&runtime));
+        let preserved = e.db.get_attempt(attempt.id).unwrap().unwrap();
+        assert_eq!(preserved.collectable_at, None);
+        assert_eq!(preserved.cache_sweepable_at, None);
+        assert_eq!(preserved.chat_archivable_at, None);
     }
 
     #[test]
@@ -6460,6 +6722,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/bredebjorhovd/OIOS/pull/10".into(),
             head_ref: "board/gh-2".into(),
+            base_sha: None,
             open: false,
             merged: true,
             draft: false,
@@ -6537,6 +6800,7 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
+            base_sha: None,
             open: false,
             merged: true,
             draft: false,

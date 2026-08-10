@@ -329,6 +329,10 @@ pub struct Attempt {
     pub workspace: String,
     pub runtime: String,
     pub worktree: Option<String>,
+    /// Whether Board created and therefore owns the checkout/chat lifecycle.
+    /// False for a PR adopted from an ordinary Comet chat: review may read it,
+    /// but retention must never delete its checkout or archive its chat.
+    pub board_managed: bool,
     /// The repo the worktree was cut from (gh#72) — recorded at dispatch,
     /// because reclaiming the checkout's branch afterwards is work that happens
     /// in the repo and not in the (by then deleted) worktree. `None` on every
@@ -595,6 +599,7 @@ pub(crate) mod tests {
             workspace: "offhand".into(),
             runtime: "claude-code".into(),
             worktree: None,
+            board_managed: true,
             repo_path: None,
             branch: Some("board/gh-1".into()),
             started_at: "2026-08-09T09:00:00Z".into(),

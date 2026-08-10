@@ -286,6 +286,11 @@ pub struct TaskRow {
     pub runtime: Option<String>,
     /// The live attempt's chat (herdr-board's `pane_id`).
     pub chat_id: Option<String>,
+    /// The chat that authored the latest reviewable attempt, including after
+    /// that attempt has settled. Kept separate from `chat_id`: a finished chat
+    /// is review context, not a live agent consuming a concurrency slot.
+    #[serde(default)]
+    pub review_chat_id: Option<String>,
     /// Set on `review` rows, which is how a PR reaches an orchestrator.
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
@@ -1996,6 +2001,7 @@ mod tests {
             workspace: Some("offhand".into()),
             runtime: Some("claude-code".into()),
             chat_id: None,
+            review_chat_id: None,
             pr_url: None,
             pr_number: None,
             branch: Some("board/gh-x".into()),

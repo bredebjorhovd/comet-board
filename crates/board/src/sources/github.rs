@@ -274,6 +274,10 @@ pub struct PullRequest {
     pub body: Option<String>,
     pub url: String,
     pub head_ref: String,
+    /// The exact commit the PR compares its head against. This is the review
+    /// baseline for ordinary Comet chats, which did not have a Board dispatch
+    /// available to snapshot HEAD before the agent started.
+    pub base_sha: Option<String>,
     pub open: bool,
     /// Merged, as opposed to closed without merging — a real difference to
     /// whoever has to decide what happens next.
@@ -842,6 +846,12 @@ fn parse_pull(repo: &str, n: &Value) -> Option<PullRequest> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        base_sha: n
+            .get("base")
+            .and_then(|base| base.get("sha"))
+            .and_then(Value::as_str)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string),
         open: n.get("state").and_then(Value::as_str) == Some("open"),
     })
 }
@@ -1167,11 +1177,13 @@ mod tests {
             "/repos/o/r/pulls".into(),
             json!([{ "number": 508, "title": "Fix the gate", "html_url": "u",
                      "state": "open", "updated_at": "t", "draft": false,
-                     "head": { "ref": "fix/rls" } }]),
+                     "head": { "ref": "fix/rls" },
+                     "base": { "sha": "abc123" } }]),
         )]));
         let pr = &g.pulls("o/r").unwrap()[0];
         assert_eq!(pr.task_id(), "gh:o/r!508");
         assert_eq!(pr.identifier(), "gh!508");
+        assert_eq!(pr.base_sha.as_deref(), Some("abc123"));
         let up = pr.to_upsert();
         // Open: not terminal, so derivation with pr_open reaches `review`.
         assert_eq!(up.upstream, UpstreamState::Unstarted);
