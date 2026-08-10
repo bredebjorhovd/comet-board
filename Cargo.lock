@@ -1290,6 +1290,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "comet-board",
  "comet-proto",
  "futures",
  "libc",
