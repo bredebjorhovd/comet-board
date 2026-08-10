@@ -1,6 +1,6 @@
 # The askpass that never ran, and the push nobody questioned — **done** (gh#233)
 
-The first opencode dispatch (§gh#222, PR #231) reported that its `git push`
+The first opencode dispatch (gh#222, PR #231) reported that its `git push`
 could not exec the board's askpass helper, and got the push through by writing
 a credential wrapper of its own. Two separate failures, and the second is the
 one worth the ticket.
@@ -62,7 +62,7 @@ anything odd.
   — so a mint is attributable to an attempt without anybody threading ids. No
   secret is in it; a line names a repo, a chat and a tool.
 - **The settle asks the question.** Every settle is a settle on work that
-  reached origin (§gh#69 made sure of that). If the board handed that chat its
+  reached origin (gh#69 made sure of that). If the board handed that chat its
   credential and the helper was never asked — or could not be handed over at all
   — then something else pushed, and the board says so: an error in the log, a
   clause on the settle notice the dispatching agent hears, and a comment on the
