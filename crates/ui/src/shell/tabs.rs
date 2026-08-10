@@ -199,7 +199,12 @@ impl Shell {
             .as_deref()
             .map(|space| self.tab_ids(space, cx))
             .unwrap_or_default();
-        let tabs: Vec<(String, SharedString, Option<comet_proto::HarnessId>, ChatIndicator)> = {
+        let tabs: Vec<(
+            String,
+            SharedString,
+            Option<comet_proto::HarnessId>,
+            ChatIndicator,
+        )> = {
             let state = self.state.read(cx);
             order
                 .iter()
@@ -455,7 +460,11 @@ impl Shell {
                 this.state.update(cx, |s, cx| s.select_chat(None, cx));
                 cx.notify();
             }))
-            .child(icon(icons::PLUS).size(px(16.0)).text_color(theme.text_muted));
+            .child(
+                icon(icons::PLUS)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
 
         // Overflow: the tab region scrolls horizontally; edge fades appear on
         // whichever side has hidden tabs (offset from the LAST frame — a

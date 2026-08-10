@@ -304,12 +304,7 @@ impl TerminalPanel {
     /// "Session working directory is unavailable" (user report).
     fn chat_target(&self, chat: &str, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state
-            .chats
-            .iter()
-            .find(|c| c.id == chat)?
-            .device_id
-            .clone();
+        let device = state.chats.iter().find(|c| c.id == chat)?.device_id.clone();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 

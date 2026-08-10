@@ -68,9 +68,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    actions, AnyElement, App, Context, Entity, FocusHandle, Focusable as _, IntoElement,
-    KeyDownEvent, MouseButton, Render, ScrollHandle, SharedString, Subscription, Task, Window,
-    div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, IntoElement, KeyDownEvent,
+    MouseButton, Render, ScrollHandle, SharedString, Subscription, Task, Window, actions, div,
+    prelude::*, px,
 };
 
 use comet_proto::view::board::{self, BoardState, Filter, RowAction, TaskDetail, TaskRow};
@@ -319,7 +319,10 @@ struct PendingBill {
 /// picker that offered every slot for every runtime would be offering dispatches
 /// that refuse themselves (gh#59). An unknown harness (the runtime list has not
 /// landed yet) matches nothing rather than everything.
-fn accounts_for_harness(accounts: &[AgentAccount], harness: Option<HarnessId>) -> Vec<&AgentAccount> {
+fn accounts_for_harness(
+    accounts: &[AgentAccount],
+    harness: Option<HarnessId>,
+) -> Vec<&AgentAccount> {
     let Some(harness) = harness else {
         return Vec::new();
     };
@@ -678,9 +681,7 @@ impl BoardModel {
     pub fn on_group(&self) -> Option<(BoardState, Option<String>)> {
         let id = self.selected.as_deref()?;
         self.lines().into_iter().find_map(|line| match line {
-            BoardLine::Group(state, route)
-                if group_row_id(state, route.as_deref()) == id =>
-            {
+            BoardLine::Group(state, route) if group_row_id(state, route.as_deref()) == id => {
                 Some((state, route))
             }
             _ => None,
@@ -964,13 +965,13 @@ impl BoardPanel {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
             this.ensure_watch(cx);
         });
-        let dispatch_search = cx.new(|cx| {
-            ComposerInput::with_context("Search models…", "PaletteSearch", cx)
-        });
+        let dispatch_search =
+            cx.new(|cx| ComposerInput::with_context("Search models…", "PaletteSearch", cx));
         // Type-to-filter: a fresh query re-homes the model highlight on the
         // first match (the Edited event fires on every keystroke).
-        let dispatch_search_events =
-            cx.subscribe(&dispatch_search, |this: &mut Self, _, event, cx| match event {
+        let dispatch_search_events = cx.subscribe(
+            &dispatch_search,
+            |this: &mut Self, _, event, cx| match event {
                 ComposerInputEvent::Edited => {
                     if let Some(draft) = this.dispatch.as_mut() {
                         draft.active_model = 0;
@@ -983,7 +984,8 @@ impl BoardPanel {
                 | ComposerInputEvent::Submitted
                 | ComposerInputEvent::PastedImages(_)
                 | ComposerInputEvent::PastedPaths(_) => {}
-            });
+            },
+        );
         let ticker = cx.spawn(async move |this, cx| {
             // Whether the last tick found anything live. An unmanaged row's
             // membership is staleness-gated, and staleness passes with no frame
@@ -1178,8 +1180,7 @@ impl BoardPanel {
                     (state.devices.clone(), state.local_device_id.clone())
                 };
                 let candidates = board::host_candidates(&devices, local.as_deref());
-                if let Some(next) = board::next_host_candidate(&candidates, self.host.as_deref())
-                {
+                if let Some(next) = board::next_host_candidate(&candidates, self.host.as_deref()) {
                     // First held answer wins the fallback slot — it is the
                     // earliest in sweep order, which is the old tie-break.
                     if self.sweep_fallback.is_none() {
@@ -1282,7 +1283,8 @@ impl BoardPanel {
             loop {
                 // The sweep's current position, read fresh — the operator may
                 // have pinned a device while the last stream was running.
-                let Ok(params) = this.update(cx, |panel, _| panel.host_params(serde_json::json!({})))
+                let Ok(params) =
+                    this.update(cx, |panel, _| panel.host_params(serde_json::json!({})))
                 else {
                     return;
                 };
@@ -1290,7 +1292,11 @@ impl BoardPanel {
                 // The sweep held this host's answer and moved on (gh#125):
                 // drop the stream and re-subscribe at the new candidate now.
                 let mut advanced = false;
-                match engine.client().subscribe(methods::WATCH_BOARD, params).await {
+                match engine
+                    .client()
+                    .subscribe(methods::WATCH_BOARD, params)
+                    .await
+                {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
                             delivered = true;
@@ -1358,7 +1364,9 @@ impl BoardPanel {
             self.set_notice("Engine not connected", cx);
             return;
         };
-        let Some(row) = self.model.task(id) else { return };
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
         if !row.dispatchable {
             self.set_notice(
                 format!("{} has no route — it cannot be dispatched", row.identifier),
@@ -1370,7 +1378,8 @@ impl BoardPanel {
         let identifier = row.identifier.clone();
         // A fresh picker starts with an empty model filter (the search input
         // persists across dispatches on the panel).
-        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+        self.dispatch_search
+            .update(cx, |input, cx| input.set_text("", cx));
         self.dispatch = Some(DispatchDraft {
             route_runtime: row.runtime.clone(),
             route_account: row.account.clone(),
@@ -1419,7 +1428,9 @@ impl BoardPanel {
                 .await;
             this.update(cx, |panel, cx| {
                 // A newer pick (or a cancel) replaced this one mid-flight.
-                let Some(draft) = panel.dispatch.as_mut() else { return };
+                let Some(draft) = panel.dispatch.as_mut() else {
+                    return;
+                };
                 if draft.task_id != task_id {
                     return;
                 }
@@ -1501,8 +1512,12 @@ impl BoardPanel {
     /// loaded yet. Idempotent per runtime: a catalog that landed stays cached,
     /// so highlighting back and forth never re-fetches.
     fn ensure_dispatch_models(&mut self, engine: EngineHandle, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.as_mut() else { return };
-        let Some(runtime) = draft.active_runtime_name() else { return };
+        let Some(draft) = self.dispatch.as_mut() else {
+            return;
+        };
+        let Some(runtime) = draft.active_runtime_name() else {
+            return;
+        };
         let slot = draft.catalogs.entry(runtime.clone()).or_default();
         if !matches!(slot, ModelCatalog::Idle) {
             return;
@@ -1522,16 +1537,16 @@ impl BoardPanel {
             let result = engine.client().call(methods::LIST_MODELS, params).await;
             this.update(cx, |panel, cx| {
                 // A newer pick (or a cancel) replaced this one mid-flight.
-                let Some(draft) = panel.dispatch.as_mut() else { return };
+                let Some(draft) = panel.dispatch.as_mut() else {
+                    return;
+                };
                 if draft.task_id != task_id {
                     return;
                 }
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<BoardModelInfo>>(value) {
                         Ok(models) => ModelCatalog::Ready(models),
-                        Err(err) => {
-                            ModelCatalog::Error(format!("Couldn't read models: {err}"))
-                        }
+                        Err(err) => ModelCatalog::Error(format!("Couldn't read models: {err}")),
                     },
                     Err(err) => ModelCatalog::Error(format!("Couldn't list models: {err}")),
                 };
@@ -1558,7 +1573,9 @@ impl BoardPanel {
     /// rows, and enter dispatches the highlighted match.
     fn confirm_dispatch(&mut self, cx: &mut Context<Self>) {
         let indices = self.dispatch_filtered_models(cx);
-        let Some(draft) = self.dispatch.take() else { return };
+        let Some(draft) = self.dispatch.take() else {
+            return;
+        };
         let catalog_ix = indices.get(draft.active_model).copied();
         let choice = draft.choice(catalog_ix);
         let billed_to = draft.billed_to();
@@ -1588,7 +1605,9 @@ impl BoardPanel {
     /// Clicking a runtime chip: select that runtime and load its models. A
     /// selection is never itself a release — the model row (or enter) is.
     fn select_runtime(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.as_mut() else { return };
+        let Some(draft) = self.dispatch.as_mut() else {
+            return;
+        };
         let Some(ix) = draft.runtimes.iter().position(|r| r.name == name) else {
             return;
         };
@@ -1602,11 +1621,14 @@ impl BoardPanel {
             // The runtime is settled; the next input belongs to the models.
             draft.row = PickerRow::Model;
         }
-        let Some(engine) = self.engine(cx) else { return };
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
         self.ensure_dispatch_models(engine, cx);
         // Typing after a click lands in the model filter, not nowhere; a query
         // that narrowed the old harness's catalog gets dropped for the new one.
-        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+        self.dispatch_search
+            .update(cx, |input, cx| input.set_text("", cx));
         self.focus_dispatch_model_search(window, cx);
         cx.notify();
     }
@@ -1616,7 +1638,9 @@ impl BoardPanel {
     /// strip. Whose limits a run burns is too consequential to be one click
     /// away from happening by accident.
     fn select_account(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.as_mut() else { return };
+        let Some(draft) = self.dispatch.as_mut() else {
+            return;
+        };
         if ix > draft.account_options().len() {
             return;
         }
@@ -1629,7 +1653,9 @@ impl BoardPanel {
     /// `catalog_ix` is the catalog row's own index (rows carry it through the
     /// filtered display).
     fn confirm_with_model(&mut self, catalog_ix: usize, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.take() else { return };
+        let Some(draft) = self.dispatch.take() else {
+            return;
+        };
         let choice = draft.choice(Some(catalog_ix));
         let billed_to = draft.billed_to();
         self.send_dispatch(&draft.task_id, &draft.identifier, choice, billed_to, cx);
@@ -1805,7 +1831,9 @@ impl BoardPanel {
             self.set_notice("Engine not connected", cx);
             return;
         };
-        let Some(row) = self.model.task(id) else { return };
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
         let identifier = row.identifier.clone();
         let task_id = row.id.clone();
         let params = self.host_params(serde_json::json!({ "taskId": task_id }));
@@ -1851,7 +1879,9 @@ impl BoardPanel {
     /// where the work is, and comet's answer to a pane is a chat. The board
     /// gives way — the chat is the destination.
     fn open_chat(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(row) = self.model.task(id) else { return };
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
         let Some(chat_id) = row.chat_id.clone() else {
             self.set_notice(
                 format!("{} is running but has no chat to open", row.identifier),
@@ -1859,7 +1889,8 @@ impl BoardPanel {
             );
             return;
         };
-        self.state.update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        self.state
+            .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         window.dispatch_action(Box::new(ToggleBoard), cx);
     }
 
@@ -1976,9 +2007,8 @@ impl BoardPanel {
     fn open_find_field(&mut self, cx: &mut Context<Self>) {
         self.model.open_find();
         if self.find.is_none() {
-            let input = cx.new(|cx| {
-                ComposerInput::with_context("Search the board…", "PaletteSearch", cx)
-            });
+            let input =
+                cx.new(|cx| ComposerInput::with_context("Search the board…", "PaletteSearch", cx));
             let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
                 if matches!(event, ComposerInputEvent::Edited)
                     && let Some(q) = this.find.as_ref().map(|f| f.read(cx).text().to_string())
@@ -2148,7 +2178,8 @@ impl BoardPanel {
                     // model filter — the query that narrowed the old harness's
                     // catalog would otherwise read as "no matches" on the new.
                     if runtime_moved {
-                        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+                        self.dispatch_search
+                            .update(cx, |input, cx| input.set_text("", cx));
                     }
                     // Either way keep the highlight in view.
                     self.reveal_model_chip();
@@ -2171,7 +2202,8 @@ impl BoardPanel {
                 }
                 "escape" => {
                     self.dispatch = None;
-                    self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+                    self.dispatch_search
+                        .update(cx, |input, cx| input.set_text("", cx));
                     window.focus(&self.focus_handle, cx);
                     cx.notify();
                     cx.stop_propagation();
@@ -2553,7 +2585,11 @@ impl BoardPanel {
         };
         // Registration order, matching the sweep and the settings switcher, so
         // rows never reshuffle on a heartbeat.
-        devices.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        devices.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let label = self.host_label(cx);
         let open = self.host_menu_open;
         let confirmed = self.host_confirmed;
@@ -2637,9 +2673,13 @@ impl BoardPanel {
                     popover::menu_row(theme, !pinned, "board-host-auto")
                         .id("board-host-auto")
                         .on_click(cx.listener(|this, _, _, cx| this.set_host(None, false, cx)))
-                        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
-                            "Automatic",
-                        )))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from("Automatic")),
+                        )
                         .when(!pinned, |el| el.child(popover::menu_check(theme))),
                 )
                 .children(devices.into_iter().enumerate().map(|(ix, d)| {
@@ -2879,12 +2919,7 @@ impl BoardPanel {
     ///
     /// The full title lives in the peek panel, which is what a click opens.
     #[allow(clippy::too_many_arguments)]
-    fn render_task(
-        &mut self,
-        row: &TaskRow,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_task(&mut self, row: &TaskRow, selected: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let state = row.state();
         let color = state_color(state, &theme);
@@ -3122,7 +3157,10 @@ impl BoardPanel {
     /// Before the options load each strip is a single "Loading…" label.
     fn render_dispatch_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let draft = self.dispatch.clone().expect("picker renders only when open");
+        let draft = self
+            .dispatch
+            .clone()
+            .expect("picker renders only when open");
         let runtime_focused = draft.row == PickerRow::Runtime;
         let model_focused = draft.row == PickerRow::Model;
         let query = self.dispatch_search.read(cx).text().to_string();
@@ -3430,7 +3468,11 @@ impl BoardPanel {
             std::iter::once((0, default_label, default_bills.is_some()))
                 .chain(options.iter().enumerate().map(|(ix, account)| {
                     match draft.bills(Some(&account.id)) {
-                        Some(bills) => (ix + 1, format!("{} · {bills}", account_label(account)), true),
+                        Some(bills) => (
+                            ix + 1,
+                            format!("{} · {bills}", account_label(account)),
+                            true,
+                        ),
                         None => (ix + 1, account_label(account), false),
                     }
                 }))
@@ -3895,7 +3937,11 @@ impl BoardPanel {
             // The door, named (gh#132) — an affordance nobody can find is one
             // that does not exist.
             if selected_task.is_some() {
-                hints.push(if peek_open { "space closes" } else { "space to open" });
+                hints.push(if peek_open {
+                    "space closes"
+                } else {
+                    "space to open"
+                });
             }
             if reviewable {
                 hints.push("r to review");
@@ -3970,8 +4016,7 @@ impl Render for BoardPanel {
                             self.render_group(*state, route.clone(), cx)
                         }
                         BoardLine::Task(id) => {
-                            let selected =
-                                self.model.selected.as_deref() == Some(id.as_str());
+                            let selected = self.model.selected.as_deref() == Some(id.as_str());
                             match self.model.task(id).cloned() {
                                 Some(row) => self.render_task(&row, selected, cx),
                                 None => gpui::Empty.into_any_element(),
@@ -4040,9 +4085,7 @@ impl Render for BoardPanel {
             // The peek sits between the list and the footer: the list keeps the
             // top of the panel (it is what you are navigating), and the row you
             // opened reads directly under it.
-            .when(self.peek, |el| {
-                el.child(self.render_peek(window, cx))
-            })
+            .when(self.peek, |el| el.child(self.render_peek(window, cx)))
             .child(self.render_footer(cx))
             .into_any_element()
     }
@@ -4244,7 +4287,10 @@ mod tests {
 
     #[test]
     fn a_single_routed_group_keeps_the_section_flat() {
-        let m = model(vec![row("1", BoardState::Working), row("2", BoardState::Working)]);
+        let m = model(vec![
+            row("1", BoardState::Working),
+            row("2", BoardState::Working),
+        ]);
         let lines = m.lines();
         assert!(
             !lines.iter().any(|l| matches!(l, BoardLine::Group(..))),
@@ -4272,10 +4318,16 @@ mod tests {
 
     #[test]
     fn selection_survives_refresh_by_id() {
-        let mut m = model(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
+        let mut m = model(vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+        ]);
         m.selected = Some("2".into());
         // A later frame with the same row keeps the cursor.
-        m.set_rows(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
+        m.set_rows(vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+        ]);
         assert_eq!(m.selected.as_deref(), Some("2"));
         // A frame where the row left the board re-clamps.
         m.set_rows(vec![row("1", BoardState::Ready)]);
@@ -4320,7 +4372,10 @@ mod tests {
             dispatch_picker_owns_key(key, true),
             "the focused search owns the letter"
         );
-        let mut m = model(vec![row("a", BoardState::Ready), row("b", BoardState::Ready)]);
+        let mut m = model(vec![
+            row("a", BoardState::Ready),
+            row("b", BoardState::Ready),
+        ]);
         let before = m.filter.clone();
         if !dispatch_picker_owns_key(key, true) {
             // The buggy fall-through: the frame handler runs cycle_filter.
@@ -4335,7 +4390,10 @@ mod tests {
             !dispatch_picker_owns_key(key, false),
             "frame-focused f still cycles"
         );
-        let mut frame = model(vec![row("a", BoardState::Ready), row("b", BoardState::Ready)]);
+        let mut frame = model(vec![
+            row("a", BoardState::Ready),
+            row("b", BoardState::Ready),
+        ]);
         frame.cycle_filter();
         assert_eq!(frame.filter, Filter::Route("offhand".into()));
 
@@ -4347,7 +4405,10 @@ mod tests {
     #[test]
     fn empty_board_filter_cycle_clears_and_says_so() {
         let mut m = model(vec![]);
-        assert_eq!(m.cycle_filter(), Some("nothing on the board to filter".into()));
+        assert_eq!(
+            m.cycle_filter(),
+            Some("nothing on the board to filter".into())
+        );
         assert_eq!(m.filter, Filter::All);
     }
 
@@ -4371,7 +4432,10 @@ mod tests {
 
     #[test]
     fn selection_skips_folded_sections_and_clamps() {
-        let mut m = model(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
+        let mut m = model(vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+        ]);
         m.selected = Some("1".into());
         m.select_delta(1);
         assert_eq!(m.selected.as_deref(), Some("2"));
@@ -4390,7 +4454,10 @@ mod tests {
     fn section_header_ids_cannot_collide_with_task_ids() {
         for state in BoardState::SECTION_ORDER {
             let id = section_row_id(state);
-            assert!(id.starts_with('\u{0}'), "NUL prefix keeps headers out of the task space");
+            assert!(
+                id.starts_with('\u{0}'),
+                "NUL prefix keeps headers out of the task space"
+            );
             assert_ne!(id, "anything");
         }
     }
@@ -4613,11 +4680,13 @@ mod tests {
     fn a_picked_model_is_the_override_and_the_effective_model() {
         let catalog = models();
         assert_eq!(
-            catalog[1].id,
-            "opencode/deepseek-v4-flash",
+            catalog[1].id, "opencode/deepseek-v4-flash",
             "deepseek-v4-flash is selectable, one row past the default"
         );
-        assert_eq!(override_model_id(&catalog, 1), Some("opencode/deepseek-v4-flash"));
+        assert_eq!(
+            override_model_id(&catalog, 1),
+            Some("opencode/deepseek-v4-flash")
+        );
     }
 
     #[test]
@@ -4732,7 +4801,11 @@ mod tests {
         let mut anonymous = account("slot-x", "", HarnessId::ClaudeCode);
         anonymous.email = None;
         assert_eq!(
-            account_label(&account("slot-ana", "ana@example.com", HarnessId::ClaudeCode)),
+            account_label(&account(
+                "slot-ana",
+                "ana@example.com",
+                HarnessId::ClaudeCode
+            )),
             "ana@example.com"
         );
         anonymous.display_name = Some("Ana".into());

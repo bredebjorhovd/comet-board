@@ -41,11 +41,7 @@ pub const RESIZE_DEBOUNCE_MS: u64 = 80;
 /// near-black `#090909` (one step below the app's `#0a0a0a`); light mode uses
 /// the theme surface so the pane reads as a light well inside the light UI.
 pub fn terminal_bg(theme: &Theme) -> Hsla {
-    if theme.light {
-        theme.surface
-    } else {
-        grey(9)
-    }
+    if theme.light { theme.surface } else { grey(9) }
 }
 
 /// The 16 ANSI colors (indexes 0-7 normal, 8-15 bright). This is the terminal
@@ -747,7 +743,11 @@ mod tests {
         // trace of blue every light neutral carries (gh#177).
         let light_bg = terminal_bg(&Theme::light());
         assert!(!crate::theme::spends_colour(light_bg));
-        assert!(light_bg.l > 0.9, "light terminal bg {}, expected bright", light_bg.l);
+        assert!(
+            light_bg.l > 0.9,
+            "light terminal bg {}, expected bright",
+            light_bg.l
+        );
         assert!(light_bg.l > dark_bg.l);
     }
 
@@ -767,7 +767,10 @@ mod tests {
         let light_black = resolve_color(CellColor::Indexed(0), &light);
         let dark_black = resolve_color(CellColor::Indexed(0), &dark);
         assert!(light_black.l < 0.5, "light ANSI black readable on light bg");
-        assert!(dark_black.l > light_black.l, "dark ANSI black is the raised grey");
+        assert!(
+            dark_black.l > light_black.l,
+            "dark ANSI black is the raised grey"
+        );
         // Hue bands (1-6) and the 8-15 bright range never change with the
         // theme — the protocol palette stays fixed.
         for ix in 1..=15 {

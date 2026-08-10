@@ -1671,7 +1671,10 @@ mod tests {
         // reads against the paper.
         let picked = t.row(Bed::Shell, true);
         assert_eq!(picked.rest.l, 1.0);
-        assert!(is_ink(picked.ring[0].color), "and the edge is ink, not black");
+        assert!(
+            is_ink(picked.ring[0].color),
+            "and the edge is ink, not black"
+        );
     }
 
     /// gh#177's second failure: your own message. Inverted, the bubble painted
@@ -1849,8 +1852,14 @@ mod tests {
     fn theme_choice_round_trips() {
         // The persisted form is `theme: "light"` / `"dark"` (camelCase file,
         // lowercase values).
-        assert_eq!(serde_json::from_str::<ThemeChoice>("\"light\"").unwrap(), ThemeChoice::Light);
-        assert_eq!(serde_json::from_str::<ThemeChoice>("\"dark\"").unwrap(), ThemeChoice::Dark);
+        assert_eq!(
+            serde_json::from_str::<ThemeChoice>("\"light\"").unwrap(),
+            ThemeChoice::Light
+        );
+        assert_eq!(
+            serde_json::from_str::<ThemeChoice>("\"dark\"").unwrap(),
+            ThemeChoice::Dark
+        );
         assert_eq!(
             serde_json::to_string(&ThemeChoice::Light).unwrap(),
             "\"light\""

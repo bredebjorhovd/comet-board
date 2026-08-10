@@ -33,7 +33,7 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, RESIZE, SPLASH_OUT};
 use crate::popover::{self, Loadable};
 use crate::rail;
-use crate::review::ReviewPanel;
+use crate::review::{ReviewEvent, ReviewPanel};
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearanceEvent, AppearancePage};
 use crate::settings::archived::ArchivedPage;
@@ -457,6 +457,9 @@ pub struct Shell {
     /// different task: a reply for the review you just left must have nowhere
     /// to land.
     review: Option<Entity<ReviewPanel>>,
+    /// The live review card's event subscription (§gh#238's `Read the diff`).
+    /// Replaced with the panel, so a dropped card's subscription goes with it.
+    review_events: Option<Subscription>,
     /// Chat outlet vs settings pages vs one attempt's review.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -698,6 +701,7 @@ impl Shell {
             board,
             board_open: false,
             review: None,
+            review_events: None,
             route,
             nav,
             devices_page: None,
@@ -1255,15 +1259,7 @@ impl Shell {
         // A different task is a different panel: replacing it (rather than
         // re-pointing one) is what makes an in-flight reply for the review you
         // just left have nowhere to land.
-        if self
-            .review
-            .as_ref()
-            .is_none_or(|panel| panel.read(cx).task_id() != task_id)
-        {
-            let state = self.state.clone();
-            let id = task_id.clone();
-            self.review = Some(cx.new(|cx| ReviewPanel::new(state, id, None, cx)));
-        }
+        self.ensure_review(&task_id, chat_id.as_deref(), cx);
         self.board_open = false;
         self.route = Route::Review {
             task_id: task_id.clone(),
@@ -1275,11 +1271,64 @@ impl Shell {
         cx.notify();
     }
 
+    /// Build the review card for `task_id` if the live one is not already it.
+    ///
+    /// A different task is a different panel — replacing it rather than
+    /// re-pointing one is what makes an in-flight reply for the review you just
+    /// left have nowhere to land — and the subscription is replaced with it, so
+    /// a dropped card cannot still be asking for the diff.
+    fn ensure_review(&mut self, task_id: &str, chat_id: Option<&str>, cx: &mut Context<Self>) {
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).task_id() == task_id)
+        {
+            return;
+        }
+        let state = self.state.clone();
+        let id = task_id.to_string();
+        let chat = chat_id.map(str::to_string);
+        let panel = cx.new(|cx| ReviewPanel::new(state, id, chat, None, cx));
+        self.review_events = Some(cx.subscribe(
+            &panel,
+            |this: &mut Shell, _, event: &ReviewEvent, cx| match event {
+                ReviewEvent::ReadTheDiff { chat_id } => this.read_the_diff(chat_id.clone(), cx),
+            },
+        ));
+        self.review = Some(panel);
+    }
+
+    /// The `Read the diff` chip (§gh#238): leave the review for the diff it is
+    /// about.
+    ///
+    /// The review card refuses to draw a diff and the [`Changes`] pane is
+    /// chat-route chrome, so "one click away" is one route change and one dock:
+    /// select the chat that owns the checkout, drop back to the chat route, and
+    /// open the pane if it is not already open. Idempotent on the pane — a
+    /// second click on a session whose pane is already open would otherwise
+    /// close the very thing the chip was asking for.
+    ///
+    /// `active_chat` is set here rather than waited for: the panel key the
+    /// pane's open flag lives under is derived from it, and the observation
+    /// that normally sets it has not run yet inside this update.
+    fn read_the_diff(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+            self.state
+                .update(cx, |s, cx| s.select_chat(Some(chat_id.clone()), cx));
+        }
+        self.active_chat = chat_id;
+        self.close_review(cx);
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+    }
+
     /// Leave a review for the session it was about. The panel is dropped: a
     /// review is a snapshot of a diff and a run journal, and the next visit
     /// should re-read both rather than show what the box said last time.
     fn close_review(&mut self, cx: &mut Context<Self>) {
         self.review = None;
+        self.review_events = None;
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
@@ -1320,15 +1369,7 @@ impl Shell {
                 {
                     self.state.update(cx, |s, cx| s.select_chat(Some(chat), cx));
                 }
-                if self
-                    .review
-                    .as_ref()
-                    .is_none_or(|panel| panel.read(cx).task_id() != task_id)
-                {
-                    let state = self.state.clone();
-                    let id = task_id.clone();
-                    self.review = Some(cx.new(|cx| ReviewPanel::new(state, id, None, cx)));
-                }
+                self.ensure_review(&task_id, chat_id.as_deref(), cx);
                 self.route = Route::Review { task_id, chat_id };
             }
         }

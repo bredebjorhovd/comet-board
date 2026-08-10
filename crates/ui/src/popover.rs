@@ -11,7 +11,9 @@
 //! classification) lives in free functions with unit tests; the elements only
 //! feed them measurements/events.
 
-use gpui::{Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px};
+use gpui::{
+    Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px,
+};
 
 use crate::motion::{self, AnimationExt as _, COMET_PULSE};
 use crate::theme::{Bed, ListRow as _, Theme};
@@ -192,7 +194,10 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
             gpui::anchored()
                 .anchor(Anchor::TopLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(id, div().occlude().pt(px(6.0)).child(content))),
+                .child(motion::menu_in(
+                    id,
+                    div().occlude().pt(px(6.0)).child(content),
+                )),
         )
         .priority(1)
         .into_any_element(),
@@ -209,7 +214,10 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
             gpui::anchored()
                 .anchor(Anchor::BottomLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(id, div().occlude().pb(px(6.0)).child(content))),
+                .child(motion::menu_in(
+                    id,
+                    div().occlude().pb(px(6.0)).child(content),
+                )),
         )
         .priority(1)
         .into_any_element(),
@@ -231,7 +239,10 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
                 gpui::anchored()
                     .anchor(Anchor::BottomRight)
                     .snap_to_window_with_margin(px(8.0))
-                    .child(motion::menu_in(id, div().occlude().pb(px(6.0)).child(content))),
+                    .child(motion::menu_in(
+                        id,
+                        div().occlude().pb(px(6.0)).child(content),
+                    )),
             )
             .priority(1)
             .into_any_element(),
@@ -580,7 +591,8 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         ))
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
-    btn.interactivity().on_hover(motion::hover_listener(fade_key));
+    btn.interactivity()
+        .on_hover(motion::hover_listener(fade_key));
     btn
 }
 
@@ -704,7 +716,10 @@ mod tests {
     #[test]
     fn tracked_upper_spaces_letters() {
         assert_eq!(tracked_upper("ab"), "A\u{200A}B");
-        assert_eq!(tracked_upper("Question"), "Q\u{200A}U\u{200A}E\u{200A}S\u{200A}T\u{200A}I\u{200A}O\u{200A}N");
+        assert_eq!(
+            tracked_upper("Question"),
+            "Q\u{200A}U\u{200A}E\u{200A}S\u{200A}T\u{200A}I\u{200A}O\u{200A}N"
+        );
         assert_eq!(tracked_upper(""), "");
     }
 

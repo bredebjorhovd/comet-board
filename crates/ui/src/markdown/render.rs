@@ -451,7 +451,12 @@ fn render_table(
                 TableAlign::Right => cell.text_right(),
             };
             if let Some(flat) = cell_flat {
-                cell = cell.child(flat_text_element(flat, table_cell_ix(ix, r, c), opts, theme));
+                cell = cell.child(flat_text_element(
+                    flat,
+                    table_cell_ix(ix, r, c),
+                    opts,
+                    theme,
+                ));
             }
             row_el = row_el.child(cell);
         }
