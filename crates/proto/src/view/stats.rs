@@ -1405,6 +1405,156 @@ pub fn percent(rate: Option<f64>) -> Option<String> {
     rate.map(|r| format!("{:.0}%", (r * 100.0).clamp(0.0, 100.0)))
 }
 
+// ---------------------------------------------------------------------------
+// Which board the page is reading (gh#254)
+// ---------------------------------------------------------------------------
+
+/// One board a stats sweep found, and enough of what it holds to say whether
+/// it is the one worth reading.
+///
+/// A viewport sweeping [`crate::view::board::host_candidates`] settles on
+/// whichever device answers first, and on a laptop running Comet beside the box
+/// that is the laptop — §gh#195's "two boards and neither knew", arrived at by
+/// a page rather than by a doctor. The sweep can see the other candidates, so
+/// the page it feeds can name them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostBoard {
+    /// The device hosting it. `None` is this device — the same absent
+    /// `targetDeviceId` the sweep uses, so the two representations match.
+    pub device_id: Option<String>,
+    /// What to call it: the device's name.
+    pub label: String,
+    pub attempts: usize,
+    pub attempts_with_tokens: usize,
+    pub tokens: u64,
+}
+
+impl HostBoard {
+    /// Read one off a window's answer.
+    pub fn of(device_id: Option<String>, label: impl Into<String>, stats: &BoardStats) -> Self {
+        Self {
+            device_id,
+            label: label.into(),
+            attempts: stats.attempts,
+            attempts_with_tokens: stats.attempts_with_tokens,
+            tokens: stats.tokens.total(),
+        }
+    }
+
+    /// Did anything on it report token usage? The question the spend card is
+    /// really asking, and the one that separates a board worth opening from a
+    /// board that will read "nothing metered" forever.
+    pub fn has_tokens(&self) -> bool {
+        self.attempts_with_tokens > 0
+    }
+
+    /// Why this board has no money on it, in its own terms.
+    ///
+    /// The three cases are three different facts and a page that collapsed them
+    /// would be back where this ticket started: nothing was ever dispatched
+    /// here, work ran here but none of it was metered, or it was metered and
+    /// the rates could not price it (which is not this function's business —
+    /// [`BoardStats::spend_label`] owns that one).
+    pub fn emptiness(&self) -> String {
+        match (self.attempts, self.attempts_with_tokens) {
+            (0, _) => format!(
+                "Nothing has been dispatched from the board on {}.",
+                self.label
+            ),
+            (attempts, 0) => format!(
+                "The board on {} has {}, none of which recorded token usage.",
+                self.label,
+                attempts_phrase(attempts)
+            ),
+            (attempts, metered) => format!(
+                "The board on {} recorded {} over {} of {}.",
+                self.label,
+                human_tokens(self.tokens),
+                metered,
+                attempts_phrase(attempts)
+            ),
+        }
+    }
+}
+
+/// **What the sweep found that the page is not showing (gh#254).**
+///
+/// `nothing metered to price` is true and useless when the sweep resolved onto
+/// an empty board and a full one was one candidate further down the list. This
+/// is the sentence that names both: what THIS board holds, and what the others
+/// hold — the reader can then disbelieve the empty state on evidence rather
+/// than on suspicion.
+///
+/// `None` when the sweep found only one board: there is nothing to compare
+/// against, and "no other board exists" is not news to somebody running one.
+pub fn other_boards_note(boards: &[HostBoard], current: Option<&str>) -> Option<String> {
+    let here = boards.iter().find(|b| b.device_id.as_deref() == current)?;
+    let elsewhere = elsewhere_note(boards, current)?;
+    Some(format!("{} {elsewhere}", here.emptiness()))
+}
+
+/// The second half alone: what the *other* boards hold.
+///
+/// The page's own empty state already says nothing was dispatched in the
+/// window, so it wants this half without [`HostBoard::emptiness`] repeating it
+/// back in different words.
+pub fn elsewhere_note(boards: &[HostBoard], current: Option<&str>) -> Option<String> {
+    // A current host nothing answered for has no board to write about, and
+    // naming the others under it would imply a comparison there is no left
+    // side to.
+    boards.iter().find(|b| b.device_id.as_deref() == current)?;
+    let others: Vec<&HostBoard> = boards
+        .iter()
+        .filter(|b| b.device_id.as_deref() != current)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+
+    // Biggest first: if one of the others is the board the work actually runs
+    // on, it is the one the reader wants named first.
+    let mut with_tokens: Vec<&HostBoard> =
+        others.iter().copied().filter(|b| b.has_tokens()).collect();
+    with_tokens.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.label.cmp(&b.label)));
+
+    Some(if with_tokens.is_empty() {
+        format!(
+            "The other {} the sweep found ({}) recorded no token usage either.",
+            if others.len() == 1 { "board" } else { "boards" },
+            others
+                .iter()
+                .map(|b| b.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        let listed = with_tokens
+            .iter()
+            .map(|b| {
+                format!(
+                    "the board on {} has {} tokens over {}",
+                    b.label,
+                    human_tokens(b.tokens),
+                    attempts_phrase(b.attempts)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Meanwhile {listed}. Pick {} in the header to read it.",
+            if with_tokens.len() == 1 { "it" } else { "one" }
+        )
+    })
+}
+
+/// `1 attempt` / `19 attempts` — a count that reads as English at both ends.
+fn attempts_phrase(attempts: usize) -> String {
+    match attempts {
+        1 => "1 attempt".to_string(),
+        n => format!("{n} attempts"),
+    }
+}
+
 /// The windows a stats page offers, and what each is called.
 pub const WINDOWS: &[(Option<i64>, &str)] = &[
     (Some(1), "24h"),
@@ -1493,6 +1643,122 @@ mod tests {
         assert_eq!(BoardStats::empty(Some(1)).window_label(), "last 24 hours");
         // 24 hour slots exist even before anything has run in them.
         assert_eq!(s.hour_of_day.len(), 24);
+    }
+
+    // -- which board the page is reading (gh#254) ----------------------------
+
+    /// A board that answered a sweep: attempts, how many of them metered, and
+    /// what they spent.
+    fn board(
+        device: Option<&str>,
+        label: &str,
+        attempts: usize,
+        metered: usize,
+        tokens: u64,
+    ) -> HostBoard {
+        HostBoard {
+            device_id: device.map(str::to_string),
+            label: label.into(),
+            attempts,
+            attempts_with_tokens: metered,
+            tokens,
+        }
+    }
+
+    /// The state this ticket was raised from, measured on the operator's own
+    /// machine: the sweep resolves to the local board because it answers first,
+    /// and the local board is the one with no tokens on it.
+    #[test]
+    fn an_empty_board_names_the_one_that_has_the_numbers() {
+        let boards = vec![
+            board(None, "this Mac", 19, 0, 0),
+            board(Some("box"), "the box", 12, 6, 46_100_000),
+        ];
+        let note =
+            other_boards_note(&boards, None).expect("two boards, so there is something to say");
+        // Both halves: what is wrong with THIS board, and where the work is.
+        assert!(
+            note.contains("19 attempts, none of which recorded token usage"),
+            "{note}"
+        );
+        assert!(
+            note.contains("the board on the box has 46.10M tokens over 12 attempts"),
+            "{note}"
+        );
+        assert!(note.contains("Pick it in the header"), "{note}");
+    }
+
+    /// Read from the other side, the same sweep has nothing to complain about
+    /// — and the note still names the empty one rather than pretending the
+    /// sweep found one board.
+    #[test]
+    fn the_note_is_written_from_whichever_board_is_on_screen() {
+        let boards = vec![
+            board(None, "this Mac", 19, 0, 0),
+            board(Some("box"), "the box", 12, 6, 46_100_000),
+        ];
+        let note = other_boards_note(&boards, Some("box")).expect("still two boards");
+        assert!(
+            note.starts_with("The board on the box recorded 46.10M over 6 of 12 attempts."),
+            "{note}"
+        );
+        assert!(
+            note.contains("(this Mac) recorded no token usage either"),
+            "{note}"
+        );
+    }
+
+    /// One board is the ordinary install, and it is owed no comparison: the
+    /// page keeps its own empty state instead of a sentence about nobody.
+    #[test]
+    fn a_lone_board_says_nothing_about_boards_it_did_not_find() {
+        let boards = vec![board(None, "this Mac", 0, 0, 0)];
+        assert_eq!(other_boards_note(&boards, None), None);
+        // And a host the sweep never got an answer from has no note either —
+        // there is no "here" to write the first half from.
+        assert_eq!(other_boards_note(&boards, Some("ghost")), None);
+    }
+
+    /// Never dispatched from is a different fact from ran and never metered,
+    /// and the note has to keep them apart — they call for different actions.
+    #[test]
+    fn a_board_nothing_ever_ran_on_says_that_rather_than_blaming_the_meter() {
+        let quiet = board(None, "laptop", 0, 0, 0);
+        assert_eq!(
+            quiet.emptiness(),
+            "Nothing has been dispatched from the board on laptop."
+        );
+        assert_eq!(
+            board(None, "laptop", 1, 0, 0).emptiness(),
+            "The board on laptop has 1 attempt, none of which recorded token usage."
+        );
+    }
+
+    /// Biggest first among the boards that have data, so the one the work
+    /// actually runs on is the one named first.
+    #[test]
+    fn the_fullest_other_board_is_named_first() {
+        let boards = vec![
+            board(None, "this Mac", 19, 0, 0),
+            board(Some("small"), "old box", 4, 2, 3_200_000),
+            board(Some("big"), "the box", 12, 6, 46_100_000),
+        ];
+        let note = other_boards_note(&boards, None).expect("three boards");
+        let big = note.find("the box").expect("named");
+        let small = note.find("old box").expect("named");
+        assert!(big < small, "{note}");
+        assert!(note.contains("Pick one in the header"), "{note}");
+    }
+
+    /// A board read off the wire keeps the three numbers the control needs and
+    /// nothing else.
+    #[test]
+    fn a_host_board_is_read_off_the_window_it_answered_with() {
+        let mut stats = BoardStats::empty(Some(7));
+        stats.attempts = 19;
+        let read = HostBoard::of(None, "this Mac", &stats);
+        assert_eq!(read, board(None, "this Mac", 19, 0, 0));
+        assert!(!read.has_tokens());
     }
 
     // -- the crossing (gh#179) -----------------------------------------------

@@ -84,6 +84,24 @@
 //! duration or a multiple) is in `comet_proto::view::stats`, so the CLI, this
 //! page and anything after it agree on the arithmetic.
 //!
+//! **Which board, said as a control rather than as a fact (gh#254).** The sweep
+//! settles on whichever candidate answers first, and on a machine running Comet
+//! beside the box that is the local one — §gh#195's "two boards and neither
+//! knew", reached by a page instead of by the doctor. Read on the operator's
+//! own Mac the headline figure was permanently blank, because the local board's
+//! nineteen attempts all predate token capture while the box's twelve hold
+//! 46.1M tokens, and nothing on screen said a second board existed.
+//!
+//! So two things changed. The sweep asks **every** candidate rather than
+//! stopping at the first answer, and the boards it finds are a segmented
+//! control in the header beside the window picker — the sweep's answer
+//! selected, the choice remembered in `stats-prefs.json` (a page that had to be
+//! re-pointed every launch is the same bug with a click in it). And an empty
+//! board says *why*: `nothing metered to price` is true and useless, so
+//! [`comet_proto::view::stats::other_boards_note`] writes both halves — what
+//! this board holds, and what the others do. The page could always see the
+//! other candidates; it just never mentioned them.
+//!
 //! The spend card carries its coverage in the footer, because a figure summed
 //! from two of five attempts is not the window's spend, and a window that
 //! reported nothing says so instead of drawing zeroes.
@@ -98,14 +116,18 @@
 //! Descriptive, like the CLI it shares a source with: it reports what
 //! happened. Nothing here grades the operator.
 
+use std::io;
+use std::path::{Path, PathBuf};
+
 use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
+use serde::{Deserialize, Serialize};
 
 use comet_proto::view::board;
 use comet_proto::view::rates::human_usd;
 use comet_proto::view::stats::{
-    BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit, Dimension, LandingKind, WINDOWS,
-    bar_fraction, day_captions_fit, day_columns, hour_grid, human_minutes, human_multiple,
-    human_tokens, peak_tokens, percent,
+    BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit, Dimension, HostBoard, LandingKind,
+    WINDOWS, bar_fraction, day_captions_fit, day_columns, elsewhere_note, hour_grid, human_minutes,
+    human_multiple, human_tokens, other_boards_note, peak_tokens, percent,
 };
 use comet_rpc::methods;
 
@@ -193,6 +215,115 @@ const LANDING_BAND_MIN: f32 = 6.0;
 /// A legend's colour chip.
 const SWATCH: f32 = 7.0;
 
+// ---- which board (gh#254) --------------------------------------------------
+
+/// The board the operator picked, as it is written down.
+///
+/// `ThisDevice` rather than the local device's own id, so a pin survives the
+/// device being re-registered — and so a pinned local host and an unpinned one
+/// address the same engine through the same absent `targetDeviceId`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostChoice {
+    ThisDevice,
+    Device(String),
+}
+
+impl HostChoice {
+    /// What to remember for a candidate the sweep offers.
+    fn of(target: Option<&str>, local: Option<&str>) -> Self {
+        match target {
+            Some(id) if Some(id) != local => Self::Device(id.to_string()),
+            _ => Self::ThisDevice,
+        }
+    }
+
+    /// Does this pick name that candidate? The local device answers to both
+    /// spellings — its own id, and the absent target the sweep asks it by.
+    fn matches(&self, target: Option<&str>, local: Option<&str>) -> bool {
+        match self {
+            Self::ThisDevice => target.is_none() || (target == local && local.is_some()),
+            Self::Device(id) => {
+                target == Some(id.as_str()) || (target.is_none() && local == Some(id.as_str()))
+            }
+        }
+    }
+}
+
+/// Where the stats page's own preferences live.
+const PREFS_FILE: &str = "stats-prefs.json";
+
+/// The stats page's preference file, beside `composer-defaults.json`.
+///
+/// Its own file rather than a field on `ui-settings.json`: the shell saves that
+/// one debounced from a copy it has held since boot, so a settings page writing
+/// into it would have its write undone by the next sidebar drag.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StatsPrefs {
+    /// The board the page reads. Absent follows the sweep, which is the right
+    /// answer on every install with one board on it.
+    pub host: Option<HostChoice>,
+}
+
+impl StatsPrefs {
+    /// Load from `{data_dir}/stats-prefs.json`; defaults on any failure.
+    pub fn load(data_dir: &Path) -> Self {
+        match std::fs::read_to_string(Self::path(data_dir)) {
+            Ok(text) => match serde_json::from_str::<StatsPrefs>(&text) {
+                Ok(prefs) => prefs,
+                Err(err) => {
+                    tracing::warn!(error = %err, "stats-prefs corrupt; using defaults");
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Write atomically (temp file + rename) so a crash mid-write never
+    /// corrupts. Synchronous: picking a host is a rare click, not a drag.
+    pub fn save(&self, data_dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(data_dir)?;
+        let path = Self::path(data_dir);
+        let tmp = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)
+    }
+
+    pub fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join(PREFS_FILE)
+    }
+}
+
+/// Which of the answers the page shows.
+///
+/// The pin wins while the board it names is still answering; the sweep's own
+/// answer — the first candidate that replied — is the default and the fallback.
+/// A pin that has not answered *yet* holds the page rather than flashing
+/// somebody else's numbers: mid-sweep is not evidence that the box is gone.
+fn resolve(
+    answers: &[(Option<String>, BoardStats)],
+    pinned: Option<&HostChoice>,
+    local: Option<&str>,
+    swept: bool,
+) -> Option<usize> {
+    if let Some(pin) = pinned {
+        if let Some(found) = answers
+            .iter()
+            .position(|(target, _)| pin.matches(target.as_deref(), local))
+        {
+            return Some(found);
+        }
+        if !swept {
+            return None;
+        }
+    }
+    (!answers.is_empty()).then_some(0)
+}
+
 pub struct StatsPage {
     state: Entity<AppState>,
     /// The window in days; `None` is all time. Mirrors the CLI's
@@ -202,10 +333,16 @@ pub struct StatsPage {
     /// query: every cut arrives in the one reply, so the toggle costs nothing
     /// but a redraw.
     dimension: Dimension,
-    stats: Option<BoardStats>,
-    /// The device that answered. `None` before the first reply, and on a board
-    /// hosted right here.
-    host: Option<String>,
+    /// **Every candidate that answered, in sweep order** (gh#254) — the host
+    /// control's contents, the numbers of whichever one is selected, and what
+    /// an empty board names instead of only its own emptiness. `None` in the
+    /// target is this device, exactly as the sweep spells it.
+    answers: Vec<(Option<String>, BoardStats)>,
+    /// The remembered pick. `None` follows the sweep.
+    pinned: Option<HostChoice>,
+    /// Every candidate has been asked. Until then, a pin with no answer yet is
+    /// still worth waiting for.
+    swept: bool,
     loaded: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
@@ -213,6 +350,11 @@ pub struct StatsPage {
 
 impl StatsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let pinned = state
+            .read(cx)
+            .data_dir
+            .as_deref()
+            .and_then(|dir| StatsPrefs::load(dir).host);
         let mut page = Self {
             state,
             // A week: long enough to have a shape, short enough that today is
@@ -221,8 +363,9 @@ impl StatsPage {
             // The axis where the answer is usually one row, and the one the
             // page could not ask about at all before gh#227.
             dimension: Dimension::Model,
-            stats: None,
-            host: None,
+            answers: Vec::new(),
+            pinned,
+            swept: false,
             loaded: false,
             error: None,
             task: None,
@@ -231,12 +374,21 @@ impl StatsPage {
         page
     }
 
-    /// Read the numbers, sweeping for the device that hosts the board.
+    /// Read the numbers off **every** device that hosts a board (gh#254).
     ///
     /// A candidate that errors has answered "I host no board" — the engine's
-    /// contract for every board method — so the sweep moves on. When nobody
-    /// answers, the last error is what the page shows: "board unavailable"
-    /// from every device is a true and useful thing to read.
+    /// contract for every board method — so the sweep moves on. It no longer
+    /// *stops* on the first that answers: two boards on one account is the
+    /// state this page handled worst, and a control that offers only the
+    /// candidate already on screen is not a control. When nobody answers, the
+    /// last error is what the page shows: "board unavailable" from every device
+    /// is a true and useful thing to read.
+    ///
+    /// Answers land one at a time and in sweep order, so the first board still
+    /// paints as soon as it replies rather than waiting on a device that is
+    /// asleep — and the numbers already on screen stay there until the first
+    /// new one lands, which is what makes a two-click window comparison
+    /// readable.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
@@ -250,43 +402,98 @@ impl StatsPage {
         let candidates = board::host_candidates(&devices, local.as_deref());
         let since_days = self.since_days;
         self.error = None;
+        self.swept = false;
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut last: Option<String> = None;
+            let mut found: Vec<(Option<String>, BoardStats)> = Vec::new();
             for candidate in candidates {
                 let mut params = serde_json::json!({ "sinceDays": since_days });
                 if let (Some(host), Some(object)) = (candidate.as_deref(), params.as_object_mut()) {
                     object.insert("targetDeviceId".into(), serde_json::json!(host));
                 }
                 match engine.client().call(methods::BOARD_STATS, params).await {
-                    Ok(value) => {
-                        let parsed = serde_json::from_value::<BoardStats>(value);
-                        let _ = this.update(cx, |page, cx| {
-                            page.loaded = true;
-                            match parsed {
-                                Ok(stats) => {
-                                    page.host = candidate;
-                                    page.stats = Some(stats);
-                                }
-                                Err(err) => {
-                                    page.error = Some(format!("Unreadable stats: {err}").into());
-                                }
-                            }
-                            cx.notify();
-                        });
-                        return;
-                    }
+                    Ok(value) => match serde_json::from_value::<BoardStats>(value) {
+                        Ok(stats) => {
+                            found.push((candidate, stats));
+                            let answers = found.clone();
+                            let _ = this.update(cx, |page, cx| {
+                                page.loaded = true;
+                                page.answers = answers;
+                                cx.notify();
+                            });
+                        }
+                        // A board that answered unreadably has still answered,
+                        // but there is nothing to draw from it — carry it as
+                        // the error the page falls back to.
+                        Err(err) => last = Some(format!("Unreadable stats: {err}")),
+                    },
                     Err(err) => last = Some(err.to_string()),
                 }
             }
             let _ = this.update(cx, |page, cx| {
                 page.loaded = true;
-                page.error = Some(
-                    last.unwrap_or_else(|| "No device on this account hosts a board".into())
-                        .into(),
-                );
+                page.swept = true;
+                if page.answers.is_empty() {
+                    page.error = Some(
+                        last.unwrap_or_else(|| "No device on this account hosts a board".into())
+                            .into(),
+                    );
+                }
                 cx.notify();
             });
         }));
+    }
+
+    /// This device's id, as the sweep and the pin both spell it.
+    fn local_device(&self, cx: &gpui::App) -> Option<String> {
+        self.state.read(cx).local_device_id.clone()
+    }
+
+    /// Which answer is on screen.
+    fn resolved(&self, cx: &gpui::App) -> Option<usize> {
+        resolve(
+            &self.answers,
+            self.pinned.as_ref(),
+            self.local_device(cx).as_deref(),
+            self.swept,
+        )
+    }
+
+    /// Every board the sweep found, as the control and the empty states read
+    /// them.
+    fn boards(&self, cx: &gpui::App) -> Vec<HostBoard> {
+        self.answers
+            .iter()
+            .map(|(target, stats)| {
+                HostBoard::of(
+                    target.clone(),
+                    self.device_label(target.as_deref(), cx),
+                    stats,
+                )
+            })
+            .collect()
+    }
+
+    /// Read the board on that device instead, and remember it.
+    ///
+    /// No reload: the control only offers boards that already answered this
+    /// window, so switching is a redraw over numbers the page is holding.
+    fn set_host(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        let local = self.local_device(cx);
+        let choice = HostChoice::of(target.as_deref(), local.as_deref());
+        if self.pinned.as_ref() == Some(&choice) {
+            return;
+        }
+        self.pinned = Some(choice.clone());
+        if let Some(dir) = self.state.read(cx).data_dir.clone() {
+            let prefs = StatsPrefs { host: Some(choice) };
+            if let Err(err) = prefs.save(&dir) {
+                // The pick still applies to this session; only the memory of
+                // it was lost, and that is not worth a strip over the page.
+                tracing::warn!(error = %err, "failed to persist the stats host");
+            }
+        }
+        cx.notify();
     }
 
     fn set_window(&mut self, since_days: Option<i64>, cx: &mut Context<Self>) {
@@ -310,18 +517,22 @@ impl StatsPage {
         cx.notify();
     }
 
-    /// The host's display name, for the subtitle.
-    fn host_label(&self, cx: &gpui::App) -> SharedString {
-        let Some(host) = self.host.as_deref() else {
-            return "this device".into();
-        };
-        self.state
-            .read(cx)
-            .devices
-            .iter()
-            .find(|d| d.id == host)
-            .map(|d| SharedString::from(d.name.clone()))
-            .unwrap_or_else(|| SharedString::from(host.to_string()))
+    /// What to call a candidate: the device's own name.
+    ///
+    /// The local board is named too, rather than called "this device" — a
+    /// control whose segments read *this device* and *the box* makes the
+    /// reader do the mapping, and the whole point of gh#254 is that the two
+    /// were indistinguishable. The generic wording survives only where there
+    /// is genuinely no name to use.
+    fn device_label(&self, target: Option<&str>, cx: &gpui::App) -> String {
+        let state = self.state.read(cx);
+        let id = target.or(state.local_device_id.as_deref());
+        id.and_then(|id| state.devices.iter().find(|d| d.id == id))
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| match target {
+                Some(id) => id.to_string(),
+                None => "this device".to_string(),
+            })
     }
 
     /// The track a segmented control's choices sit in.
@@ -399,6 +610,45 @@ impl StatsPage {
             );
         }
         row.into_any_element()
+    }
+
+    /// **The host picker (gh#254): the same segmented control, one segment per
+    /// board the sweep found.**
+    ///
+    /// It is drawn only when there is a choice to make. One board is every
+    /// ordinary install, and a segmented control with a single segment in it is
+    /// furniture that implies an alternative there isn't — on those the header
+    /// names the host in its subtitle, as it always did.
+    ///
+    /// The segments are the boards that *answered*, not the devices on the
+    /// account: a laptop that hosts no board is not a board you can read, and
+    /// offering it would be offering an error.
+    fn render_hosts(
+        &self,
+        boards: &[HostBoard],
+        current: Option<&str>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if boards.len() < 2 {
+            return None;
+        }
+        let mut row = Self::track(theme);
+        for (index, host) in boards.iter().enumerate() {
+            let target = host.device_id.clone();
+            let selected = host.device_id.as_deref() == current;
+            row = row.child(
+                Self::segment(
+                    theme,
+                    format!("stats-host-{index}"),
+                    &host.label,
+                    Theme::TEXT_DENSE,
+                    selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_host(target.clone(), cx))),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     // -- the shared furniture of a card --------------------------------------
@@ -548,7 +798,7 @@ impl StatsPage {
     /// (gh#178), possibly several people's on a box carrying several slots. The
     /// only honest thing to do with the pair is divide it, which is the
     /// multiple the second cell shows.
-    fn render_spend(stats: &BoardStats, theme: &Theme) -> AnyElement {
+    fn render_spend(stats: &BoardStats, wrong_board: Option<String>, theme: &Theme) -> AnyElement {
         let Some(spend) = stats.spend.as_ref().filter(|s| s.has_price()) else {
             // The two ways there is no number, said apart — `spend_label` owns
             // which one this is, and neither of them is $0.00. No band and no
@@ -562,6 +812,13 @@ impl StatsPage {
                     stats.spend_label()
                 ),
             ));
+            // **The third way there is no number: the wrong board (gh#254).**
+            // `nothing metered to price` is true of a board whose attempts all
+            // predate token capture, and says nothing about the one next to it
+            // that holds 46 million tokens. This is the sentence that does.
+            if let Some(note) = wrong_board {
+                card = card.child(Self::note(theme, note));
+            }
             if stats.spend.is_none() {
                 card = card.child(Self::note(
                     theme,
@@ -1671,7 +1928,23 @@ fn scroll_page(column: gpui::Div) -> gpui::Stateful<gpui::Div> {
 impl Render for StatsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let host = self.host_label(cx);
+        // Which board, and which others there were (gh#254). Resolved once per
+        // frame: the header, both empty states and the spend card are all
+        // answering the same question, and three of them used to answer it by
+        // not asking.
+        let boards = self.boards(cx);
+        let resolved = self.resolved(cx);
+        let current: Option<String> = resolved.and_then(|ix| self.answers[ix].0.clone());
+        let stats = resolved.map(|ix| self.answers[ix].1.clone());
+        let host = self.device_label(current.as_deref(), cx);
+        let picker = self.render_hosts(&boards, current.as_deref(), &theme, cx);
+        // The subtitle stops stating the host as a fact once a control names
+        // it — the same sentence twice, one of them un-clickable, was half of
+        // what made the wrong board so easy to believe.
+        let subtitle = match picker.is_some() {
+            true => "What the board you are reading did with the work it was given.".to_string(),
+            false => format!("What the board on {host} did with the work it was given."),
+        };
         // The wide column the shared layer declares (gh#178) — this page is a
         // dashboard, and picking the width is a choice between two named ones
         // rather than a private copy of the column with a note attached.
@@ -1681,6 +1954,7 @@ impl Render for StatsPage {
                 .flex_row()
                 .items_end()
                 .justify_between()
+                .flex_wrap()
                 .gap(px(16.0))
                 .child(
                     div()
@@ -1688,19 +1962,44 @@ impl Render for StatsPage {
                         .flex_col()
                         .min_w_0()
                         .child(widgets::page_header(&theme, "Board stats", None))
-                        .child(widgets::page_subtitle(
-                            &theme,
-                            format!("What the board on {host} did with the work it was given."),
-                        )),
+                        .child(widgets::page_subtitle(&theme, subtitle)),
                 )
-                .child(self.render_windows(&theme, cx)),
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .flex_wrap()
+                        .justify_end()
+                        .gap(px(8.0))
+                        // Host first, then window: which board, then how much
+                        // of it — the order the sentence under them reads in.
+                        .when_some(picker, |el, picker| el.child(picker))
+                        .child(self.render_windows(&theme, cx)),
+                ),
         );
 
         if let Some(error) = self.error.clone() {
             column = column.child(widgets::error_strip(&theme, error));
         }
 
-        let Some(stats) = self.stats.clone() else {
+        // A pin whose board has stopped answering: the page falls back to the
+        // sweep rather than showing nothing, and says which board it is
+        // showing instead of quietly becoming the bug this ticket is about.
+        if self.swept
+            && self.pinned.is_some()
+            && !self.answers.is_empty()
+            && !self.pinned.as_ref().is_some_and(|pin| {
+                pin.matches(current.as_deref(), self.local_device(cx).as_deref())
+            })
+        {
+            column = column.child(widgets::warning_strip(
+                &theme,
+                format!("The board you picked did not answer. Showing the board on {host}."),
+            ));
+        }
+
+        let Some(stats) = stats else {
             let note = if self.loaded {
                 "No board answered."
             } else {
@@ -1717,18 +2016,34 @@ impl Render for StatsPage {
         };
 
         if stats.is_empty() {
-            return scroll_page(
-                column.child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from(format!(
-                            "No dispatches in the {}. Release a task and this fills in.",
-                            stats.window_label()
-                        ))),
-                ),
-            );
+            // A board with nothing in the window says so — and, when the sweep
+            // found others, what they have (gh#254). Only the second half:
+            // "nothing was dispatched here" is the line above it.
+            let empty = div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .text_size(px(Theme::TEXT_BODY))
+                .text_color(theme.text_subtle)
+                .child(SharedString::from(format!(
+                    "No dispatches on the board on {host} in the {}. Release a task and this \
+                     fills in.",
+                    stats.window_label()
+                )))
+                .when_some(elsewhere_note(&boards, current.as_deref()), |el, note| {
+                    el.child(SharedString::from(note))
+                });
+            return scroll_page(column.child(empty));
         }
+
+        // The board that has attempts and no tokens on it — the state this
+        // page read as "nothing metered to price" forever. The sentence names
+        // the other candidates; the spend card is where a reader is standing
+        // when they need it.
+        let wrong_board = match stats.has_tokens() {
+            true => None,
+            false => other_boards_note(&boards, current.as_deref()),
+        };
 
         // Five cards in four rows, and the order is the argument: what it cost,
         // what that bought day by day, when and where it ran, and then — side
@@ -1736,7 +2051,7 @@ impl Render for StatsPage {
         // the window cut whichever way the reader wants it, beside where the
         // work actually landed.
         column = column
-            .child(Self::render_spend(&stats, &theme))
+            .child(Self::render_spend(&stats, wrong_board, &theme))
             .child(Self::render_chart(&stats, &theme))
             .child(Self::render_when_and_where(&stats, &theme));
         if let Some(row) = self.render_bottom_row(&stats, &theme, cx) {
@@ -1744,5 +2059,99 @@ impl Render for StatsPage {
         }
 
         scroll_page(column)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One candidate's answer. Only the attempt count separates them here —
+    /// which board is which is the whole question.
+    fn answer(target: Option<&str>, attempts: usize) -> (Option<String>, BoardStats) {
+        let mut stats = BoardStats::empty(Some(7));
+        stats.attempts = attempts;
+        (target.map(str::to_string), stats)
+    }
+
+    /// The default, and the behaviour every single-board install keeps: the
+    /// sweep's own answer, which is the first candidate that replied.
+    #[test]
+    fn with_nothing_pinned_the_page_shows_the_sweep_s_answer() {
+        let answers = vec![answer(None, 19), answer(Some("box"), 12)];
+        assert_eq!(resolve(&answers, None, Some("mac"), true), Some(0));
+        // And nothing at all before anybody has answered.
+        assert_eq!(resolve(&[], None, Some("mac"), true), None);
+    }
+
+    /// The fix, in one assertion: the operator picked the box, so the box is
+    /// what the page reads — even though the local board answers first and
+    /// would otherwise win forever.
+    #[test]
+    fn a_pinned_board_beats_the_one_that_answered_first() {
+        let answers = vec![answer(None, 19), answer(Some("box"), 12)];
+        let pin = HostChoice::Device("box".into());
+        assert_eq!(resolve(&answers, Some(&pin), Some("mac"), true), Some(1));
+    }
+
+    /// A pin still being swept for holds the page rather than flashing the
+    /// other board's numbers: mid-sweep is not evidence that the box is gone.
+    #[test]
+    fn a_pin_that_has_not_answered_yet_is_waited_for_and_then_given_up_on() {
+        let answers = vec![answer(None, 19)];
+        let pin = HostChoice::Device("box".into());
+        assert_eq!(resolve(&answers, Some(&pin), Some("mac"), false), None);
+        // Once every candidate has been asked, the sweep's answer is the best
+        // there is — shown, and said out loud in a strip above it.
+        assert_eq!(resolve(&answers, Some(&pin), Some("mac"), true), Some(0));
+    }
+
+    /// The local board answers to both of its spellings — the absent target
+    /// the sweep asks it by, and its own device id — so a pin written either
+    /// way finds it.
+    #[test]
+    fn this_device_is_the_same_board_under_either_name() {
+        let answers = vec![answer(Some("box"), 12), answer(None, 19)];
+        let here = HostChoice::ThisDevice;
+        assert_eq!(resolve(&answers, Some(&here), Some("mac"), true), Some(1));
+        let by_id = HostChoice::Device("mac".into());
+        assert_eq!(resolve(&answers, Some(&by_id), Some("mac"), true), Some(1));
+        // And picking the local candidate is remembered as `ThisDevice`, so it
+        // survives the device being registered again under a new id.
+        assert_eq!(HostChoice::of(None, Some("mac")), HostChoice::ThisDevice);
+        assert_eq!(
+            HostChoice::of(Some("mac"), Some("mac")),
+            HostChoice::ThisDevice
+        );
+        assert_eq!(
+            HostChoice::of(Some("box"), Some("mac")),
+            HostChoice::Device("box".into())
+        );
+    }
+
+    /// The choice persists — the exit condition this ticket names, and the
+    /// difference between a fix and a click to repeat every launch.
+    #[test]
+    fn the_pick_round_trips_through_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs = StatsPrefs {
+            host: Some(HostChoice::Device("box".into())),
+        };
+        prefs.save(dir.path()).unwrap();
+        assert_eq!(StatsPrefs::load(dir.path()), prefs);
+        // Never `ui-settings.json`: the shell owns that file and saves it from
+        // a copy held since boot.
+        assert!(StatsPrefs::path(dir.path()).ends_with("stats-prefs.json"));
+    }
+
+    /// A missing or corrupt file follows the sweep rather than refusing to
+    /// draw. Nothing here is worth an error strip.
+    #[test]
+    fn a_missing_or_corrupt_file_falls_back_to_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(StatsPrefs::load(dir.path()), StatsPrefs::default());
+        assert_eq!(StatsPrefs::load(dir.path()).host, None);
+        std::fs::write(StatsPrefs::path(dir.path()), "{not json").unwrap();
+        assert_eq!(StatsPrefs::load(dir.path()), StatsPrefs::default());
     }
 }
