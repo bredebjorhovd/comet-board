@@ -4263,21 +4263,29 @@ impl Render for Shell {
                     .relative()
                     .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
-                // Sidebar tone: a slightly lighter column behind the sidebar,
-                // spanning the FULL window height (under the traffic lights,
-                // through the titlebar, down to the bottom edge). Its width
-                // rides the same tween as the sidebar, so the tone melts away
-                // with the collapse instead of vanishing in a frame.
+                // The sidebar column: a full-window-height band (under the
+                // traffic lights, through the titlebar, down to the bottom
+                // edge) whose only mark is the hairline on its right edge. Its
+                // width rides the same tween as the sidebar, so the seam melts
+                // away with the collapse instead of vanishing in a frame.
+                //
+                // It paints NO fill. The canvas separates the sidebar from the
+                // shell with the 1px `--line` hairline and nothing else (claim
+                // A3) — one tone on both sides. A `wash(0.05)` used to sit here
+                // on top of the window's frost, a 13-point step in light
+                // (218 against the shell's 231) that read as two panels; since
+                // gh#293/#299 put the tab strip where the canvas puts it, at
+                // x=172, the strip crossed that seam and the tabs looked like
+                // they straddled it. The frost itself is untouched (root `.bg`
+                // is [`Theme::glass`]) — the window stays translucent, and what
+                // went is the internal step the canvas never had (gh#304).
                 let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-                // Hairline on its right edge — full height like the tone,
-                // so the sidebar column reads as its own surface.
-                let sidebar_tone = div()
+                let sidebar_column = div()
                     .absolute()
                     .top_0()
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(theme.wash(0.05))
                     .border_r_1()
                     .border_color(border_color);
                 let page = div()
@@ -4298,7 +4306,7 @@ impl Render for Shell {
                     )
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
-                root.child(sidebar_tone)
+                root.child(sidebar_column)
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
