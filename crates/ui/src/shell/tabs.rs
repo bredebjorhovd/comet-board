@@ -11,6 +11,23 @@
 //! this strip only walks the selected space's tabs (same order — see
 //! [`Shell::tab_ids`]) while carrying the titlebar.
 //!
+//! ## A tab that is not a chat (gh#311)
+//!
+//! On [`Route::Review`] the strip leads with the REVIEW's own tab — the canvas
+//! puts it there (`docs/design/canvas/comet-review-window.dc.html:44`), and it
+//! is the answer to a review being a room you could only leave by knowing a
+//! shortcut. So a tab is no longer necessarily a chat: this one is titled off
+//! the route, wears the `--review` hue at rest instead of a session's status,
+//! is pinned at the head (no drag order — it belongs to no space), and closing
+//! it leaves the route. Everything after it is still the selected space's
+//! chats, drawn unselected, because on this route the review is what is
+//! selected; clicking one leaves the review for it.
+//!
+//! The lead tab occupies the first slot of the SAME scroll container as the
+//! chats, so it scrolls and gaps with them — which means the two index maths in
+//! here (drop slot, scroll-to-selected) run one slot in from the left. That is
+//! `lead` below, and it is the whole cost of the second kind of tab.
+//!
 //! Styling and drag-reorder mirror the terminal tab bar
 //! (`terminal/panel.rs::render_tab_bar`) — same fixed-width tabs, drop-index
 //! math, 150ms sibling slide, and drag ghost. The manual order is device-local
@@ -20,7 +37,7 @@
 use super::*;
 use crate::motion::TAB_SLIDE;
 use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
-use crate::theme::Bed;
+use crate::theme::{Bed, Status};
 use comet_proto::ChatIndicator;
 
 /// Fixed tab width — the canvas draws a 150×28 tab
@@ -229,7 +246,28 @@ impl Shell {
                 })
                 .collect()
         };
-        let selected = self.state.read(cx).selected_chat.clone();
+        // The review's own tab, and with it the whole route's selection: on
+        // this route the REVIEW is what is selected, so the authoring session —
+        // which is genuinely selected in state, because the column beside the
+        // card is it — must not also read as the selected tab. Two lit tabs
+        // would be two answers to "where am I".
+        let review_tab: Option<SharedString> = match &self.route {
+            Route::Review { task_id, .. } => Some(match &self.review {
+                Some(panel) => panel.read(cx).tab_title(),
+                // The route outliving its panel is the same fallback the route
+                // itself takes (`render_review_route`); name it anyway.
+                None => SharedString::from(crate::review::review_tab_title(None, task_id)),
+            }),
+            _ => None,
+        };
+        let on_review = review_tab.is_some();
+        // Slots the chats are offset by — see the module header.
+        let lead = usize::from(on_review);
+        let selected = if on_review {
+            None
+        } else {
+            self.state.read(cx).selected_chat.clone()
+        };
         // Keep the selected tab visible: on selection change, scroll it into
         // view (minimal movement — a new session's tab materializes at the far
         // right of an overflowing strip and would otherwise be stranded
@@ -237,7 +275,7 @@ impl Shell {
         match selected.as_deref() {
             Some(sel) if self.tabs_scrolled_to.as_deref() != Some(sel) => {
                 if let Some(ix) = order.iter().position(|id| id == sel) {
-                    self.tabs_scroll.scroll_to_item(ix);
+                    self.tabs_scroll.scroll_to_item(ix + lead);
                 }
                 self.tabs_scrolled_to = Some(sel.to_string());
             }
@@ -247,7 +285,10 @@ impl Shell {
         let has_space = space_id.is_some();
         let git = self.space_git_detected(cx);
         let hovered = self.tab_hover.clone();
-        let on_canvas = selected.is_none();
+        // The `+` carries the active wash only where the new-session canvas is
+        // actually what is showing — `selected` is None on the review route
+        // too, and a lit `+` there would claim the wrong destination.
+        let on_canvas = selected.is_none() && !on_review;
         // No sessions yet → the canvas already shows; a `+` would be redundant.
         let has_tabs = !tabs.is_empty();
         let count = tabs.len();
@@ -382,6 +423,13 @@ impl Shell {
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
+                        // Selecting another tab is one of the three ways out of
+                        // a review (gh#311) — the same one every other surface
+                        // in this app has.
+                        if matches!(this.route, Route::Review { .. }) {
+                            this.leave_review_for(select_id.clone(), cx);
+                            return;
+                        }
                         this.state
                             .update(cx, |s, cx| s.select_chat(Some(select_id.clone()), cx));
                     }))
@@ -442,6 +490,77 @@ impl Shell {
             })
             .collect();
 
+        // The review's tab (gh#311; canvas
+        // `comet-review-window.dc.html:44`): the strip's own measures, and the
+        // selected paint — on this route it IS the selection. Two departures
+        // from a chat tab, both forced by what a review is: the dot wears the
+        // `--review` hue rather than a status, because a review is not a run
+        // with a status; and the tab is not draggable, because drag order is
+        // persisted per space and a review belongs to no space.
+        let review_tab_el: Option<AnyElement> = review_tab.map(|title| {
+            let paint = theme.row(Bed::Shell, true);
+            div()
+                .id("review-tab")
+                .w(px(SESSION_TAB_WIDTH))
+                .h(px(28.0))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .pl(px(8.0))
+                .pr(px(4.0))
+                .rounded(px(Theme::RADIUS_ROW))
+                .text_size(px(Theme::TEXT_DENSE))
+                .text_color(paint.text)
+                .bg(paint.rest)
+                .hover(|s| s.bg(paint.hovered))
+                .shadow(paint.ring.clone())
+                // Same carve-out as a chat tab: out of the titlebar drag
+                // region, but not out of the strip's own wheel scrolling.
+                .block_mouse_except_scroll()
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                // Middle-click closes, as it does on a chat tab.
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_review(cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .size(px(TAB_DOT))
+                        // round-ok: status dot
+                        .rounded_full()
+                        .flex_none()
+                        .bg(theme.status(Status::Review)),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(title))
+                .child(
+                    div()
+                        .id("review-tab-close")
+                        .size(px(TAB_CLOSE))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.wash(0.14)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_review(cx);
+                        }))
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(TAB_CLOSE_GLYPH))
+                                .text_color(theme.text_subtle),
+                        ),
+                )
+                .into_any_element()
+        });
+
         // `+` — the new-session canvas "is" the unmaterialized tab, so the
         // button carries the active wash while the canvas shows.
         let new_tab = div()
@@ -463,6 +582,13 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
+                // Off a review, `+` is a way out too — and leaving the route
+                // without dropping the card would leave a live review panel
+                // mounted behind the canvas.
+                if matches!(this.route, Route::Review { .. }) {
+                    this.active_chat = String::new();
+                    this.close_review(cx);
+                }
                 this.route = Route::Chat;
                 this.state.update(cx, |s, cx| s.select_chat(None, cx));
                 cx.notify();
@@ -504,10 +630,13 @@ impl Shell {
                             }
                             let from = payload.from;
                             // Drop math runs in CONTENT coordinates: viewport-
-                            // relative x plus the scrolled-off width.
+                            // relative x plus the scrolled-off width — and past
+                            // the lead review tab, which is in this container
+                            // but not in the chat order the indices address.
                             let rel_x = f32::from(event.event.position.x)
                                 - f32::from(event.bounds.left())
-                                + -f32::from(scroll_for_drag.offset().x);
+                                + -f32::from(scroll_for_drag.offset().x)
+                                - lead as f32 * (SESSION_TAB_WIDTH + TAB_GAP);
                             let over = drop_index(rel_x, SESSION_TAB_WIDTH + TAB_GAP, count);
                             this.update_tab_drag_over(from, over, cx);
                         },
@@ -528,6 +657,7 @@ impl Shell {
                             this.commit_tab_reorder(&space, payload.from, to, cx);
                         },
                     ))
+                    .children(review_tab_el)
                     .children(tab_elements),
             )
             .when(fade_left && !glass, |el| {
@@ -596,9 +726,12 @@ impl Shell {
                 theme.wash(0.2),
             ))
             .on_hover(motion::hover_listener("toggle-board"))
+            // The route-aware toggle, which is what `mod-shift-b` runs too: the
+            // strip is drawn on the review route now, where this gesture means
+            // "leave the review and go back to the queue it came from".
             .on_click(cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
-                this.toggle_board(window, cx);
+                this.toggle_board_from_route(window, cx);
             }))
             .child(
                 icon(icons::CHECKLIST)
@@ -620,7 +753,10 @@ impl Shell {
             // Stable location: the toggle shows whether the pane is open or
             // not (the pane's own header is gone).
             .child(board_button)
-            .when(git, |el| {
+            // The changes pane is chat-route chrome (its action is gated the
+            // same way): on the review route that slot already holds the
+            // authoring session, so the toggle would toggle nothing.
+            .when(git && !on_review, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
                     icons::SIDEBAR_MINIMALISTIC,

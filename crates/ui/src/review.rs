@@ -231,6 +231,36 @@ pub enum ReviewEvent {
     ReadTheDiff { chat_id: String },
 }
 
+/// The review's name in the tab strip (`docs/design/window.md` B10):
+/// `Review · gh#138`.
+///
+/// The brief is the source of the identifier, but the tab exists from the first
+/// frame of the route and the brief arrives an RPC later — so a review still
+/// loading names itself off the task id the route carries rather than showing a
+/// nameless tab and then a titled one. Pure, and the fallback is exact:
+/// `gh:owner/repo#138` is `gh#138`, `gh:owner/repo!212` is `gh!212`, and
+/// `linear:LIN-142` is `LIN-142`.
+pub(crate) fn review_tab_title(identifier: Option<&str>, task_id: &str) -> String {
+    let name = match identifier.filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => task_identifier(task_id),
+    };
+    format!("Review · {name}")
+}
+
+/// The identifier a task id spells — `<source>:<scope><sep><number>` keeps the
+/// source and the number, and anything this shape cannot parse is returned as
+/// it came (a made-up identifier would be worse than a literal id).
+fn task_identifier(task_id: &str) -> String {
+    let Some((source, rest)) = task_id.split_once(':') else {
+        return task_id.to_string();
+    };
+    match rest.find(['#', '!']) {
+        Some(ix) if ix + 1 < rest.len() => format!("{source}{}", &rest[ix..]),
+        _ => rest.to_string(),
+    }
+}
+
 /// One attempt's review, fetched and drawn.
 pub struct ReviewPanel {
     state: Entity<AppState>,
@@ -328,6 +358,16 @@ impl ReviewPanel {
     /// whether a navigation is a re-point or a new panel.
     pub fn task_id(&self) -> &str {
         &self.task_id
+    }
+
+    /// What the tab strip calls this review (review.md A7): `Review · gh#138`,
+    /// off the same identifier the card's own header leads with — the tab and
+    /// the card have to be naming one thing.
+    pub fn tab_title(&self) -> SharedString {
+        SharedString::from(review_tab_title(
+            self.review.as_ref().map(|r| r.brief.identifier.as_str()),
+            &self.task_id,
+        ))
     }
 
     /// Read the review, sweeping for the device that hosts the board.
@@ -2091,6 +2131,29 @@ mod tests {
     use super::*;
     use crate::board::state_color;
     use comet_proto::view::board::BoardState;
+
+    /// The tab is on screen before the brief is, and a tab that renamed itself
+    /// mid-read would be a tab you had to re-find. The loading name is the
+    /// loaded one wherever the id spells the identifier — which is everywhere
+    /// the board mints ids.
+    #[test]
+    fn the_review_tab_is_named_before_the_brief_lands() {
+        // Loaded: the brief's identifier, verbatim — the card's own header
+        // leads with this exact string.
+        assert_eq!(
+            review_tab_title(Some("gh#138"), "gh:o/r#138"),
+            "Review · gh#138"
+        );
+        // Still loading: parsed off the id, and identical to the loaded name.
+        assert_eq!(review_tab_title(None, "gh:o/r#138"), "Review · gh#138");
+        // A pull-request id keeps its `!` — `gh!212` and `gh#212` are two rows.
+        assert_eq!(review_tab_title(None, "gh:o/r!212"), "Review · gh!212");
+        // Linear spells its own identifier after the colon.
+        assert_eq!(review_tab_title(None, "linear:LIN-142"), "Review · LIN-142");
+        // Unparseable ids are shown as they came rather than invented.
+        assert_eq!(review_tab_title(None, "weird-id"), "Review · weird-id");
+        assert_eq!(review_tab_title(Some(""), "gh:o/r#7"), "Review · gh#7");
+    }
 
     /// One hue on this screen means "look at this", and it is the ramp's
     /// blocked hue — the same red the board paints a blocked or failed row in

@@ -31,7 +31,9 @@ the first board frame, because `r` on a row is the keypress a capture script
 cannot rely on.
 
 Captures: `screenshots/review-{dark,light}-{before,after}.png`, plus
-`-after-scrolled` for the unclaimed block and the diff strip.
+`-after-scrolled` for the unclaimed block and the diff strip. The tab and its
+exits (gh#311) are `screenshots/gh311-review-tab-{dark,light}.png` and
+`gh311-review-closed-dark.png` — the same window one click of the tab's ✕ later.
 
 ## A. The route's frame
 
@@ -47,6 +49,15 @@ Captures: `screenshots/review-{dark,light}-{before,after}.png`, plus
   bottom gutter.
 - **A6** The review card is three bands in a column: a header (flex none), the
   body (flex 1, scrolls), and the verdict bar (flex none). Nothing else scrolls.
+- **A7** **A review is a tab.** The strip is drawn on this route, and the review
+  leads it: 150×28 at x=172, radius 10, `--sel` under the `--sellift` ring, a
+  5px dot in `--review`, `Review · <identifier>` in 12px `--text`, and the 18px
+  `--subtle` close — `window.md` B3–B7 exactly, and B10. The space's chats
+  follow it, drawn unselected.
+- **A8** **You can leave.** Three ways out, none of them a shortcut you have to
+  know first: the tab's ✕, clicking another tab, and `esc`. Each drops the card
+  and lands on the chat route. (`mod-shift-b` also leaves, back to the board the
+  review was opened from — that one is a shortcut, and it is not the only way.)
 
 ## B. Review header
 
