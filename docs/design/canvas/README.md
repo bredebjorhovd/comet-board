@@ -11,7 +11,8 @@ a canvas disagree, the app is wrong.
 | `comet-stats-window.dc.html` | Stats page | gh#278 |
 | `comet-ios.dc.html` | iOS app | gh#279 |
 
-They came from the "App design improvement review" project on claude.ai/design.
+They are a verbatim export of the "App design improvement review" project on
+claude.ai/design.
 An agent cannot reach that project, which is why they are vendored here — gh#258
 pointed at `/Users/brede/Downloads/*.dc.html` and no worktree could read it.
 
