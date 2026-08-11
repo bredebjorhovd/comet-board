@@ -1226,6 +1226,91 @@ fn board_hosts_check(local: Option<&RoutingConfig>, peers: Option<&Peers>) -> Ch
     }
 }
 
+/// One peer's [`PeerBoard`], from its `ReadBoardConfig` reply (gh#195).
+///
+/// A reply whose `config` is absent is a board whose `routing.toml` does not
+/// parse — reported as unknown rather than as empty, because "polls nothing"
+/// would rule out a collision this cannot see.
+///
+/// Here rather than beside the sweep that reads it, because there are now two
+/// sweeps: `doctor`'s, from the CLI, and the one the board's host runs before
+/// it writes a repo into its own config (gh#343). They have to read a peer's
+/// answer the same way, or the check that refuses and the check that reports
+/// would be able to disagree about what the same board polls.
+pub fn peer_board(device: String, reply: &serde_json::Value) -> PeerBoard {
+    let config = reply
+        .get("routing")
+        .and_then(|r| r.get("config"))
+        .and_then(|c| serde_json::from_value::<RoutingConfig>(c.clone()).ok());
+    match config {
+        Some(cfg) => PeerBoard {
+            device,
+            repos: cfg.github.repos.clone(),
+            linear_teams: cfg
+                .linear_teams()
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
+            unparsed: false,
+        },
+        None => PeerBoard {
+            device,
+            repos: Vec::new(),
+            linear_teams: Vec::new(),
+            unparsed: true,
+        },
+    }
+}
+
+/// Which other board on this account already polls `slug` — the refusal
+/// `onboard` and `routes add` owe before the config is written (gh#343).
+///
+/// [`board_hosts_check`] is the same comparison, and it runs too late to help:
+/// the repo is already in both files by the time anybody runs `doctor`, and
+/// what it has cost by then is a duplicate attempt — two agents, two branches,
+/// one ticket, each board's row looking perfectly normal. Asked at write time
+/// instead, the same fact costs one flag.
+///
+/// `Some(_)` is the whole sentence to refuse with, naming the board and what to
+/// do about it. It says `--force` out loud because two boards polling one repo
+/// *is* a legitimate choice on a board where nobody dispatches, and because the
+/// settings page onboards through the same refusal with no flag to type: what
+/// it can offer a reader there is the other half of the sentence, which is
+/// taking the slug off one of the two boards.
+///
+/// What does **not** refuse, deliberately: a peer that could not be asked, and
+/// a peer whose own `routing.toml` does not parse. Both are "unknown", not
+/// "collides", and refusing on either would block every add on this account for
+/// as long as somebody's laptop is shut or somebody's config is broken —
+/// failure modes with no bound on how long they last. `doctor` still names both
+/// afterwards, which is the surface that can afford to be uncertain out loud.
+pub fn already_polled(slug: &str, boards: &[PeerBoard]) -> Option<String> {
+    let want = slug.trim().to_ascii_lowercase();
+    // Case-folded for the same reason `overlaps` is: GitHub reads `Tally` and
+    // `tally` as one repo, and a comparison that did not would wave through the
+    // collision on exactly the day somebody retyped a slug from memory.
+    let hosts: Vec<&str> = boards
+        .iter()
+        .filter(|b| {
+            b.repos
+                .iter()
+                .any(|r| r.trim().to_ascii_lowercase() == want)
+        })
+        .map(|b| b.device.as_str())
+        .collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{slug} is already polled by the board on {} — both boards would see the same \
+         issue as ready, either could dispatch it, and neither would record the other's \
+         attempt: two agents, two worktrees, two branches on one ticket. Take it off \
+         that board's `[github] repos`, or pass --force if this board is meant to share \
+         the repo (nobody dispatching from one of the two makes it safe)",
+        hosts.join(", ")
+    ))
+}
+
 /// What one peer board polls, in one clause. `unparsed` is its own sentence
 /// because "polls nothing" and "would not say" are different answers, and the
 /// second is the one where a collision cannot be ruled out.
@@ -3146,6 +3231,100 @@ mod tests {
         let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&Peers::default()));
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("only one registered"), "{}", c.detail);
+    }
+
+    /// What the box would answer: its `routing.toml`, parsed, with the repos it
+    /// polls and the Linear teams its routes match on.
+    #[test]
+    fn a_peers_reply_carries_what_that_board_polls() {
+        let reply = serde_json::json!({
+            "routing": {
+                "path": "/home/comet/.comet-native/board/routing.toml",
+                "exists": true,
+                "text": "",
+                "config": {
+                    "github": { "repos": ["tally/Tally", "tally/oppgang"] },
+                    "route": [{
+                        "match": { "linear_team": "AGE" },
+                        "workspace": "tally",
+                        "repo": "/home/comet/code/tally",
+                        "runtime": "claude-code",
+                    }],
+                },
+                "problems": [],
+                "backup": false,
+            },
+            "unadopted": [],
+        });
+        let board = peer_board("box".into(), &reply);
+        assert!(!board.unparsed);
+        assert_eq!(board.repos, ["tally/Tally", "tally/oppgang"]);
+        assert_eq!(board.linear_teams, ["AGE"]);
+    }
+
+    /// A peer whose config did not parse answers without one. "Polls nothing"
+    /// would rule out a collision this cannot see, so it is unknown instead.
+    #[test]
+    fn a_peer_with_no_parse_is_unknown_rather_than_empty() {
+        let reply = serde_json::json!({
+            "routing": {
+                "path": "/home/comet/.comet-native/board/routing.toml",
+                "exists": true,
+                "text": "[[route]\n",
+                "problems": ["routing.toml does not parse"],
+                "backup": false,
+            },
+            "unadopted": [],
+        });
+        let board = peer_board("box".into(), &reply);
+        assert!(board.unparsed);
+        assert!(board.repos.is_empty());
+    }
+
+    // --- refusing the second board at write time (gh#343) --------------------
+
+    /// The whole point of moving the check earlier: the slug another board
+    /// already polls is refused before it can be written, and the sentence
+    /// names the board it is on.
+    #[test]
+    fn a_repo_another_board_polls_is_refused_by_name() {
+        let boards = [peer("Tokenmaxxer9000", &["bredebjorhovd/itsm-agent"])];
+        let refusal = already_polled("bredebjorhovd/itsm-agent", &boards)
+            .expect("the collision this exists for");
+        assert!(refusal.contains("Tokenmaxxer9000"), "{refusal}");
+        // The two ways out, both said: take it off the other board, or say
+        // out loud that sharing it is intended.
+        assert!(refusal.contains("--force"), "{refusal}");
+    }
+
+    /// Same repo, other spelling. GitHub reads them as one repo and so must
+    /// this, or the refusal misses the day somebody retypes a slug.
+    #[test]
+    fn a_differently_cased_slug_is_the_same_repo() {
+        let boards = [peer("box", &["bredebjorhovd/ATTN"])];
+        assert!(already_polled(" bredebjorhovd/attn ", &boards).is_some());
+    }
+
+    /// Two boards over disjoint repos is the legitimate setup gh#195 declined
+    /// to fail on, and adding to it must stay silent.
+    #[test]
+    fn a_repo_nobody_else_polls_is_written_without_a_word() {
+        let boards = [peer("box", &["tally/Tally", "tally/oppgang"])];
+        assert!(already_polled("bredebjorhovd/attn", &boards).is_none());
+    }
+
+    /// A peer that would not say what it polls does not refuse: unknown is not
+    /// a collision, and a board blocked by somebody else's broken config would
+    /// be a worse failure than the one being prevented. `doctor` still names it.
+    #[test]
+    fn a_peer_whose_config_does_not_parse_does_not_refuse_the_write() {
+        let boards = [PeerBoard {
+            device: "box".into(),
+            repos: Vec::new(),
+            linear_teams: Vec::new(),
+            unparsed: true,
+        }];
+        assert!(already_polled("bredebjorhovd/attn", &boards).is_none());
     }
 
     /// A peer whose own `routing.toml` will not parse polls *something*

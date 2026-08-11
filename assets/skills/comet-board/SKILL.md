@@ -153,9 +153,12 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 - Never dispatch speculatively — a human keypress or explicit instruction
   releases tasks. Reading is always safe.
 - New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
-  one verb). New *person*: `comet-board member add <their-sign-in-email>
-  --github <login>`, or their dispatches commit under the box owner's name —
-  `comet-board member list` shows who is mapped and who has no agent account
+  one verb). It refuses a repo another board on this account already polls,
+  naming that board — two boards on one repo race every issue in it. Do not
+  reach for `--force` to get past that; ask first. New *person*: `comet-board
+  member add <their-sign-in-email> --github <login>`, or their dispatches commit
+  under the box owner's name — `comet-board member list` shows who is mapped and
+  who has no agent account
   (docs/teammate.md). `comet-board doctor` explains a board that looks wrong.
 - **Screenshots in a PR description**: commit them and link them with a
   relative path from a markdown file in the repo. A
@@ -186,7 +189,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `routes` | — | Read and change the board's `routing.toml` — over the RPC, so `--device` reaches the box that hosts the board (gh#75) |
 | `routes list` | `--json` | The routes in force, what is wrong with the config, and what is not routed yet |
 | `routes show` | — | Print `routing.toml` verbatim. Comments and all: this is the file |
-| `routes add <slug>` | `--labels`, `--all-issues` | Route a repo that has a space on the board's device but nothing watching it — the `[[route]]` and `[github] repos` halves, written together |
+| `routes add <slug>` | `--labels`, `--all-issues`, `--force` | Route a repo that has a space on the board's device but nothing watching it — the `[[route]]` and `[github] repos` halves, written together |
 | `routes ignore <slug>` | — | Stop offering a repo — you are only reading it |
 | `routes set <route> <key> [value]` | `--unset` | Set one key on one route: `routes set 2 account brede-personal` |
 | `routes defaults <key> [value]` | `--unset` | Set one key under `[defaults]`: `routes defaults max_duration 4h` |
@@ -195,7 +198,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `member add <email>` | `--github`, `--name` | Map a teammate's sign-in email to their GitHub identity, so their dispatches commit as them |
 | `member list` | `--json` | The map, the box's agent-account slots, and who has one without the other |
 | `member remove <email>` | — | Take somebody out of the map — offboarding, or an entry for the wrong account |
-| `onboard [slug]` | `--dir`, `--labels`, `--all-issues`, `--json` | Put a repo the board has never seen on the board: clone it, give it a space, and route it — one verb (gh#97) |
+| `onboard [slug]` | `--dir`, `--labels`, `--all-issues`, `--force`, `--json` | Put a repo the board has never seen on the board: clone it, give it a space, and route it — one verb (gh#97) |
 | `adopt [slug]` | `--labels`, `--all-issues`, `--ignore` | Offer git-detected spaces the board is not watching; adopt one by slug |
 | `skill` | — | Install this skill — the one you are reading — where agents on this machine will find it |
 | `skill install` | `--dir` | Write it into a Claude config dir (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) |

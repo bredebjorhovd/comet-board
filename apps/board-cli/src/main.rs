@@ -409,6 +409,16 @@ enum Command {
         /// overriding a narrower global filter).
         #[arg(long, conflicts_with = "labels")]
         all_issues: bool,
+        /// Onboard it even though another board on this account already polls
+        /// it (gh#343).
+        ///
+        /// Refused without this, because both boards would then see the same
+        /// issue as ready and either could dispatch it — two agents on one
+        /// ticket, invisible until two pull requests appear. Say this when the
+        /// sharing is intended: a second board that polls and never dispatches
+        /// is a real setup.
+        #[arg(long)]
+        force: bool,
         /// The whole result as JSON — every step's outcome, for an orchestrating
         /// agent that has to decide what to do next.
         #[arg(long)]
@@ -555,6 +565,10 @@ enum RoutesCommand {
         /// Poll every open issue, said out loud (writes `labels = []`).
         #[arg(long, conflicts_with = "labels")]
         all_issues: bool,
+        /// Route it even though another board on this account already polls it
+        /// (gh#343) — see `comet-board onboard --help` for what that costs.
+        #[arg(long)]
+        force: bool,
     },
     /// Stop offering a repo — you are only reading it.
     Ignore { slug: String },
@@ -1106,6 +1120,7 @@ fn main() -> Result<()> {
             dir,
             labels,
             all_issues,
+            force,
             json,
         } => {
             // Parsed before the round trip: a typo costs an error naming what to
@@ -1122,7 +1137,8 @@ fn main() -> Result<()> {
                     let repos = ops::app_repos(&board).await?;
                     return ops::print_candidates(&repos, board.host(), json);
                 };
-                let done = ops::onboard(&board, &slug, dir.as_deref(), labels.as_deref()).await?;
+                let done =
+                    ops::onboard(&board, &slug, dir.as_deref(), labels.as_deref(), force).await?;
                 ops::print_onboarded(&done, board.host(), json)
             })
         }
@@ -1494,11 +1510,14 @@ async fn routes(board: &ops::Board, command: RoutesCommand) -> Result<()> {
             slug,
             labels,
             all_issues,
+            force,
         } => {
             let labels: Option<Vec<String>> = if all_issues { Some(Vec::new()) } else { labels };
             let cfg = ops::write_config(
                 board,
-                serde_json::json!({ "op": "adopt", "slug": slug, "labels": labels }),
+                serde_json::json!({
+                    "op": "adopt", "slug": slug, "labels": labels, "force": force,
+                }),
             )
             .await?;
             println!("adopted {slug}");
@@ -1721,7 +1740,9 @@ async fn sweep_boards(
         )
         .await;
         match answer {
-            Ok(Ok(reply)) => peers.boards.push(peer_board(name, &reply)),
+            Ok(Ok(reply)) => peers
+                .boards
+                .push(comet_board::doctor::peer_board(name, &reply)),
             // Answered, and the answer is "no board here".
             Ok(Err(e)) if hosts_no_board(&e) => {}
             // Never landed, or the budget ran out before it could.
@@ -1733,37 +1754,6 @@ async fn sweep_boards(
         }
     }
     Ok(peers)
-}
-
-/// One peer's [`comet_board::doctor::PeerBoard`], from its `ReadBoardConfig`
-/// reply.
-///
-/// A reply whose `config` is absent is a board whose `routing.toml` does not
-/// parse — reported as unknown rather than as empty, because "polls nothing"
-/// would rule out a collision this cannot see.
-fn peer_board(device: String, reply: &serde_json::Value) -> comet_board::doctor::PeerBoard {
-    let config = reply
-        .get("routing")
-        .and_then(|r| r.get("config"))
-        .and_then(|c| serde_json::from_value::<comet_board::config::RoutingConfig>(c.clone()).ok());
-    match config {
-        Some(cfg) => comet_board::doctor::PeerBoard {
-            device,
-            repos: cfg.github.repos.clone(),
-            linear_teams: cfg
-                .linear_teams()
-                .iter()
-                .map(|t| (*t).to_string())
-                .collect(),
-            unparsed: false,
-        },
-        None => comet_board::doctor::PeerBoard {
-            device,
-            repos: Vec::new(),
-            linear_teams: Vec::new(),
-            unparsed: true,
-        },
-    }
 }
 
 /// What one loopback conversation with the local engine yields.
@@ -1917,53 +1907,5 @@ mod tests {
             "relay 500".into()
         )));
         assert!(!hosts_no_board(&comet_rpc::RpcError::Closed));
-    }
-
-    /// What the box would answer: its `routing.toml`, parsed, with the repos it
-    /// polls and the Linear teams its routes match on.
-    #[test]
-    fn a_peers_reply_carries_what_that_board_polls() {
-        let reply = serde_json::json!({
-            "routing": {
-                "path": "/home/comet/.comet-native/board/routing.toml",
-                "exists": true,
-                "text": "",
-                "config": {
-                    "github": { "repos": ["tally/Tally", "tally/oppgang"] },
-                    "route": [{
-                        "match": { "linear_team": "AGE" },
-                        "workspace": "tally",
-                        "repo": "/home/comet/code/tally",
-                        "runtime": "claude-code",
-                    }],
-                },
-                "problems": [],
-                "backup": false,
-            },
-            "unadopted": [],
-        });
-        let board = peer_board("box".into(), &reply);
-        assert!(!board.unparsed);
-        assert_eq!(board.repos, ["tally/Tally", "tally/oppgang"]);
-        assert_eq!(board.linear_teams, ["AGE"]);
-    }
-
-    /// A peer whose config did not parse answers without one. "Polls nothing"
-    /// would rule out a collision this cannot see, so it is unknown instead.
-    #[test]
-    fn a_peer_with_no_parse_is_unknown_rather_than_empty() {
-        let reply = serde_json::json!({
-            "routing": {
-                "path": "/home/comet/.comet-native/board/routing.toml",
-                "exists": true,
-                "text": "[[route]\n",
-                "problems": ["routing.toml does not parse"],
-                "backup": false,
-            },
-            "unadopted": [],
-        });
-        let board = peer_board("box".into(), &reply);
-        assert!(board.unparsed);
-        assert!(board.repos.is_empty());
     }
 }

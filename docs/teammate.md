@@ -158,6 +158,11 @@ comet-board onboard                    # everything the App can see, and what is
 comet-board onboard acme/new-thing     # clone on the box + space + route, one verb
 ```
 
+A repo another board on this account already polls is refused, naming that board
+(§gh#343): both boards would see the same issue as ready and either could
+dispatch it. Take it off the other board, or `--force` if the sharing is
+intended.
+
 **If you skip it:** the repo answers 404 to the board — GitHub does not
 distinguish "no such repo" from "not yours", and neither can we — so `onboard`
 refuses before anything is cloned and says which of the two credentials needs

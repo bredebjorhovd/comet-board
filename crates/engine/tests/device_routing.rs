@@ -255,6 +255,33 @@ fn board_paths(dir: &std::path::Path) -> comet_board::config::Paths {
     comet_board::config::Paths::under(dir).expect("board dirs")
 }
 
+/// A board service on `paths`, for an engine that has to *host* one — the box
+/// in the forwarding tests, and either side of the two-board sweep (gh#343).
+fn board_service(
+    core: &EngineCore,
+    paths: comet_board::config::Paths,
+) -> comet_engine::BoardService {
+    let runtime = Arc::new(comet_engine::CometRuntime::new(
+        core.repos.clone(),
+        core.workspace.clone(),
+        core.doc_host.clone(),
+        core.workspace
+            .merged_sessions_watch(core.sessions.watch_sessions()),
+        core.sessions.journal(),
+        core.agent_accounts.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    comet_engine::BoardService::spawn_at(
+        paths,
+        core.workspace
+            .merged_sessions_watch(core.sessions.watch_sessions()),
+        runtime,
+        core.workspace.watch_spaces(),
+        tokio::runtime::Handle::current(),
+    )
+    .expect("board service")
+}
+
 fn registry() -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(InstantHarness));
@@ -627,28 +654,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     }
 
     let core_b = assemble(&dirs.path().join("b"), "device-b");
-    let runtime_b = Arc::new(comet_engine::CometRuntime::new(
-        core_b.repos.clone(),
-        core_b.workspace.clone(),
-        core_b.doc_host.clone(),
-        core_b
-            .workspace
-            .merged_sessions_watch(core_b.sessions.watch_sessions()),
-        core_b.sessions.journal(),
-        core_b.agent_accounts.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    let board_b = comet_engine::BoardService::spawn_at(
-        paths,
-        core_b
-            .workspace
-            .merged_sessions_watch(core_b.sessions.watch_sessions()),
-        runtime_b,
-        core_b.workspace.watch_spaces(),
-        tokio::runtime::Handle::current(),
-    )
-    .expect("board service on B");
-    core_b.set_board(Arc::new(board_b));
+    core_b.set_board(Arc::new(board_service(&core_b, paths)));
     let _host = core_b.start_host_relay(&relay_url);
 
     // Engine A is a teammate's laptop: no board of its own.
@@ -1156,28 +1162,7 @@ async fn require_own_refuses_the_teammate_the_relay_names_not_the_user_they_clai
     .expect("write routing.toml");
 
     let core_box = assemble_as(&dirs.path().join("box"), "device-box", OWNER, ORG);
-    let runtime_box = Arc::new(comet_engine::CometRuntime::new(
-        core_box.repos.clone(),
-        core_box.workspace.clone(),
-        core_box.doc_host.clone(),
-        core_box
-            .workspace
-            .merged_sessions_watch(core_box.sessions.watch_sessions()),
-        core_box.sessions.journal(),
-        core_box.agent_accounts.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    let board = comet_engine::BoardService::spawn_at(
-        paths,
-        core_box
-            .workspace
-            .merged_sessions_watch(core_box.sessions.watch_sessions()),
-        runtime_box,
-        core_box.workspace.watch_spaces(),
-        tokio::runtime::Handle::current(),
-    )
-    .expect("board service on the box");
-    core_box.set_board(Arc::new(board));
+    core_box.set_board(Arc::new(board_service(&core_box, paths)));
     let _host = core_box.start_host_relay(&relay_url);
 
     // The dispatch every laptop below sends: no `account` (the silent default),
@@ -1248,6 +1233,130 @@ async fn require_own_refuses_the_teammate_the_relay_names_not_the_user_they_clai
     core_box.shutdown().await;
     core_mate.shutdown().await;
     core_own.shutdown().await;
+}
+
+/// gh#343: the second board on one repo is refused when it is *added*, not
+/// discovered by `doctor` afterwards.
+///
+/// The failure this prevents has no symptom until it has an expensive one:
+/// both boards derive the same issue as ready, either dispatches it, and
+/// neither records the other's attempt — two agents, two worktrees, two
+/// branches on one ticket, each board's row looking perfectly normal until two
+/// pull requests appear. This test is the wiring that makes the refusal
+/// possible at all: the box asks the other devices what they poll, over the
+/// same relay every other board verb rides, before it writes.
+///
+/// The org registry is written by hand here because nothing in this harness
+/// syncs it — in production it is the room that carries the fleet (gh#66), and
+/// it is what the sweep enumerates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repo_another_board_already_polls_is_refused_before_it_is_written() {
+    const SHARED: &str = "bredebjorhovd/itsm-agent";
+
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    // The Mac: a board of its own, polling the repo, reachable over the relay.
+    let paths_a = board_paths(&dirs.path().join("board-a"));
+    std::fs::create_dir_all(paths_a.routing().parent().expect("config dir")).expect("config dir");
+    std::fs::write(
+        paths_a.routing(),
+        format!("[github]\nrepos = [\"{SHARED}\"]\n"),
+    )
+    .expect("A's routing.toml");
+    let core_a = assemble(&dirs.path().join("a"), "device-a");
+    core_a.set_board(Arc::new(board_service(&core_a, paths_a)));
+    let _host_a = core_a.start_host_relay(&relay_url);
+
+    // The box: its own board, and the links that let it ask.
+    let paths_b = board_paths(&dirs.path().join("board-b"));
+    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    core_b.set_board(Arc::new(board_service(&core_b, paths_b.clone())));
+    core_b.set_links(links(&relay_url, OWNER, ORG));
+    core_b
+        .workspace
+        .org_devices()
+        .upsert_device(&comet_proto::Device {
+            id: "device-a".into(),
+            name: "Tokenmaxxer9000".into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        });
+
+    let client = comet_rpc::memory_client(core_b.rpc_service());
+    // B starts from a config that parses, so what refuses the adopt below is
+    // the other board rather than an unreadable file.
+    client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({
+                "op": "text",
+                "text": "[[route]]\nmatch = { gh_repo = \"o/r\" }\nworkspace = \"box\"\n\
+                         repo = \"/tmp\"\nruntime = \"claude-code\"\n",
+            }),
+        )
+        .await
+        .expect("B's first config");
+
+    // A's host relay dials with backoff; wait for it on the call the sweep
+    // itself makes, so the assertion below cannot pass by nobody answering.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Err(err) = client
+        .call(
+            methods::READ_BOARD_CONFIG,
+            serde_json::json!({ "targetDeviceId": "device-a" }),
+        )
+        .await
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "A's relay never came up: {err}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let refused = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({ "op": "adopt", "slug": SHARED }),
+        )
+        .await
+        .expect_err("the Mac already polls it");
+    assert!(
+        refused.to_string().contains("Tokenmaxxer9000"),
+        "the refusal names the board it is already on, because the fix is \
+         deleting a line from one of two files: {refused}"
+    );
+    assert!(
+        refused.to_string().contains("--force"),
+        "…and the way to say the sharing is intended: {refused}"
+    );
+    assert!(
+        !std::fs::read_to_string(paths_b.routing())
+            .expect("B's routing.toml")
+            .contains(SHARED),
+        "a refused add leaves the config the board polls on untouched"
+    );
+
+    // With `--force`, the sweep is no longer what stands in the way: the adopt
+    // proceeds to the ordinary check it would always have hit, since nothing on
+    // this device has a checkout of that repo.
+    let forced = client
+        .call(
+            methods::WRITE_BOARD_CONFIG,
+            serde_json::json!({ "op": "adopt", "slug": SHARED, "force": true }),
+        )
+        .await
+        .expect_err("no space on B holds that repo");
+    assert!(
+        forced.to_string().contains("unadopted list"),
+        "--force must get past the second board and no further: {forced}"
+    );
+
+    core_a.shutdown().await;
+    core_b.shutdown().await;
 }
 
 #[tokio::test]
