@@ -71,9 +71,36 @@ struct RepoSpacesReply {
     repos_note: Option<String>,
 }
 
-/// Space-row slot height for drag drop-index math: py(6)×2 + 17px line ≈ 29,
-/// plus the 2px column gap.
-const SPACE_ROW_SLOT: f32 = 31.0;
+/// Space-row slot height for drag drop-index math: py(6)×2 + the 18px line the
+/// canvas sets on the name (claim C2.4) = 30, plus the 2px column gap.
+const SPACE_ROW_SLOT: f32 = 32.0;
+
+/// The line box every span on a space row shares — the canvas's `line-height:18`
+/// on the name (claim C2.4). Named because it also decides [`SPACE_ROW_SLOT`],
+/// and the two drifting apart is how a drag lands one row off.
+const SPACE_ROW_LINE: f32 = 18.0;
+
+/// The source glyph on a space row: 15px, per claim C2.4.
+const SPACE_ROW_ICON: f32 = 15.0;
+
+/// The disclosure chevron's hit box on a space row: 16px, per claim C2.4.
+const SPACE_ROW_CHEVRON: f32 = 16.0;
+
+/// The rail the disclosed children hang off (claim C2.7): the child list is
+/// inset [`RAIL_INSET`] at [`RAIL_OFFSET`] with a 1px `--line` left border.
+/// This — not the indent alone — is what makes a chat read as *inside* a space
+/// rather than under it, so the two measures are named rather than typed twice.
+const RAIL_OFFSET: f32 = 9.0;
+/// See [`RAIL_OFFSET`].
+const RAIL_INSET: f32 = 14.0;
+
+/// The hairline between Orchestrator and the chats under it — margin 3/9/4,
+/// per claim C2.9, and drawn INSIDE the rail rather than across the sidebar.
+const ORCHESTRATOR_RULE_TOP: f32 = 3.0;
+/// See [`ORCHESTRATOR_RULE_TOP`].
+const ORCHESTRATOR_RULE_SIDE: f32 = 9.0;
+/// See [`ORCHESTRATOR_RULE_TOP`].
+const ORCHESTRATOR_RULE_BOTTOM: f32 = 4.0;
 
 /// How much of a space row the disambiguating tail may claim (gh#138). It wins
 /// the width fight against the repo name — that is the whole point — but not
@@ -1053,7 +1080,7 @@ impl Shell {
                 } else {
                     icons::FOLDER
                 })
-                .size(px(16.0))
+                .size(px(SPACE_ROW_ICON))
                 .flex_none()
                 .text_color(theme.text_muted),
             )
@@ -1062,7 +1089,7 @@ impl Shell {
                     .min_w_0()
                     .truncate()
                     .text_size(px(Theme::TEXT_BODY))
-                    .line_height(px(17.0))
+                    .line_height(px(SPACE_ROW_LINE))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(base),
             )
@@ -1079,7 +1106,7 @@ impl Shell {
                         .max_w(px(SPACE_QUALIFIER_MAX))
                         .truncate()
                         .text_size(px(Theme::TEXT_CAPTION))
-                        .line_height(px(17.0))
+                        .line_height(px(SPACE_ROW_LINE))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(format!("· {tail}"))),
                 )
@@ -1097,7 +1124,7 @@ impl Shell {
                         .max_w(px(SPACE_BRANCH_MAX))
                         .truncate()
                         .text_size(px(Theme::TEXT_DENSE))
-                        .line_height(px(17.0))
+                        .line_height(px(SPACE_ROW_LINE))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(branch)),
                 )
@@ -1132,8 +1159,11 @@ impl Shell {
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .line_height(px(17.0))
+                                // 12px, not the header's 11 (claim C2.4): the
+                                // count sits on the row's own line, beside a
+                                // branch of the same size.
+                                .text_size(px(Theme::TEXT_DENSE))
+                                .line_height(px(SPACE_ROW_LINE))
                                 .font_weight(gpui::FontWeight::NORMAL)
                                 .text_color(theme.text_subtle)
                                 .child(SharedString::from(label)),
@@ -1146,7 +1176,7 @@ impl Shell {
             .child(
                 div()
                     .id(SharedString::from(chevron_key.clone()))
-                    .size(px(18.0))
+                    .size(px(SPACE_ROW_CHEVRON))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1179,12 +1209,16 @@ impl Shell {
     /// under an indent rule so the containment is visible. No space name
     /// repeated on any row, because the row is IN the space.
     ///
-    /// Three things stack, in this order (gh#258):
+    /// The rail is claim C2.7 and it is the point: `padding-left:14` at
+    /// `margin-left:9` with one `--line` hairline down the left. Three things
+    /// stack inside it, in this order (gh#258, claims C2.3/C2.8/C2.9):
     ///
     /// 1. **The orchestrator**, on the SELECTED space only, followed by its
     ///    hairline. It is the row you talk TO rather than check on, it outlives
     ///    every attempt in the list under it, and it belongs to the space whose
     ///    board it is orchestrating — which is what putting it here says.
+    ///    Because it is drawn here, the pinned chat is dropped from the lists
+    ///    below: one Orchestrator per rail.
     /// 2. **The live rows** — board attempts and the runs the board never
     ///    released — in Active's own order, needs-you first.
     /// 3. **The idle sessions**, in the tab strip's order (creation + manual
@@ -1202,6 +1236,19 @@ impl Shell {
     ) -> AnyElement {
         use comet_proto::view::board::ActiveRow;
         let now = Utc::now();
+        // The chat the slot above is already drawing, when it drew one. The
+        // canvas has exactly one Orchestrator in the tree (claim C2.8) and the
+        // pinned chat is an ordinary member of its space, so without this it
+        // appeared twice inside one rail — once as the first child and again,
+        // four rows down, among the chats it is supposed to be separated from
+        // by the hairline. `held` is scoped to THIS disclosure: a pinned chat
+        // living in some other space still draws its own row there, wearing
+        // the ◆ that says which one it is.
+        let held: Option<String> = if orchestrator {
+            self.state.read(cx).orchestrator_slot(now).map(|s| s.chat_id)
+        } else {
+            None
+        };
         let head: Vec<AnyElement> = if orchestrator {
             self.render_orchestrator_slot(theme, cx)
                 .map(|slot| vec![slot, Self::render_orchestrator_rule(theme)])
@@ -1212,6 +1259,7 @@ impl Shell {
         let live_rows: Vec<AnyElement> = {
             let selected = self.state.read(cx).selected_chat.clone();
             live.iter()
+                .filter(|row| held.as_deref() != Some(row.chat_id()))
                 .map(|row| {
                     // The selected Space owns selection for its disclosed
                     // hierarchy. Painting the selected child too nests two
@@ -1240,6 +1288,7 @@ impl Shell {
             };
             order
                 .iter()
+                .filter(|chat_id| held.as_deref() != Some(**chat_id))
                 .filter_map(|chat_id| {
                     let (chat, status) = {
                         let state = self.state.read(cx);
@@ -1262,8 +1311,10 @@ impl Shell {
                 })
                 .collect()
         };
-        let body: AnyElement = if rows.is_empty() && live_rows.is_empty() {
+        let body: AnyElement = if rows.is_empty() && live_rows.is_empty() && head.is_empty() {
             // Nothing lives here at all — the one honest gap, and it says so.
+            // With the slot drawn there IS something here, and the note would
+            // be denying the row directly above it.
             div()
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
@@ -1280,13 +1331,14 @@ impl Shell {
                 .children(rows)
                 .into_any_element()
         };
-        // The guide rail: a hairline the disclosed rows hang off, starting
-        // under the space row's glyph and holding them a clear step to its
-        // right — these BELONG to the row above (gh#229 sets the measures:
-        // 9px out, 14px in, one hairline).
+        // The guide rail (claim C2.7): a hairline the disclosed rows hang off,
+        // starting under the space row's glyph and holding them a clear step to
+        // its right — these BELONG to the row above. It is the single most
+        // structural thing in the tree: without it the children read as rows
+        // *after* the space rather than rows *in* it.
         div()
-            .ml(px(9.0))
-            .pl(px(14.0))
+            .ml(px(RAIL_OFFSET))
+            .pl(px(RAIL_INSET))
             .my(px(2.0))
             .border_l_1()
             .border_color(theme.border)
@@ -1668,13 +1720,20 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The orchestrator's pinned row (gh#122): ◆ identity, the name, an unread
-    /// badge, the latest report's preview — not a decorated session row.
+    /// The orchestrator's pinned row — the FIRST child of the selected space's
+    /// disclosure (claims C2.3, C2.8), inside the rail and above the hairline.
     /// `None` only when no orchestrator is pinned (or its chat has not synced
-    /// here); a pinned-but-silent orchestrator renders as the empty fixture,
-    /// teaching where to look before the first notice arrives.
+    /// here).
     ///
-    /// It is the first row inside the selected space's disclosure (gh#258).
+    /// One line, exactly as the canvas draws it: a 5px status dot, the ◆ in
+    /// `--review`, the name 13/18/500 in `--text`, and how long ago it last
+    /// spoke at 12px `--subtle`. It used to carry two more things — a green
+    /// "new" badge and a preview of the latest report — and both said what
+    /// "Needs you" says four rows above in words ("Orchestrator · finished a
+    /// turn you haven't seen"). The inbox is where an unread report is
+    /// supposed to catch you (claim C1.3); repeating it here made the tree's
+    /// first child two lines tall so it could restate its own inbox entry.
+    ///
     /// That disclosure is forced open while this row exists, so the ownership
     /// stays visible even if the saved disclosure state says collapsed.
     pub(super) fn render_orchestrator_slot(
@@ -1684,16 +1743,15 @@ impl Shell {
     ) -> Option<AnyElement> {
         let now = Utc::now();
         let slot = self.state.read(cx).orchestrator_slot(now)?;
-        let subline = theme.text_subtle;
         let fade_key = format!("orch-slot-{}", slot.chat_id);
         let chat_id = slot.chat_id.clone();
         let menu_id = slot.chat_id.clone();
-        // The ◆ is identity; state is carried honestly beside it — the spinner
-        // while a turn runs, so an 8h-old report can never be mistaken for a
-        // turn running now.
-        let lead: AnyElement = if slot.indicator == ChatIndicator::Working {
+        // The dot is state, in the same 5px slot every sibling chat row uses —
+        // and the same spinner substitution while a turn runs, so an 8h-old
+        // report can never be mistaken for a turn running now.
+        let dot: AnyElement = if slot.indicator == ChatIndicator::Working {
             div()
-                .w(px(12.0))
+                .w(px(5.0))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -1705,58 +1763,21 @@ impl Shell {
                 .into_any_element()
         } else {
             div()
-                .w(px(12.0))
+                .size(px(5.0))
+                // round-ok: status dot
+                .rounded_full()
                 .flex_none()
-                .text_size(px(Theme::TEXT_CAPTION))
-                .text_color(theme.accent)
-                .child(SharedString::from(
-                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
-                ))
+                .bg(status_dot_color(slot.indicator, theme))
                 .into_any_element()
-        };
-        // The right column: the badge while something is unread, the time it
-        // last spoke otherwise. Words either way.
-        let tail: AnyElement = if slot.unseen {
-            div()
-                .flex_none()
-                .px(px(5.0))
-                .py(px(1.0))
-                .rounded(px(Theme::RADIUS_CHIP))
-                .bg(status_dot_color(ChatIndicator::Completed, theme).opacity(0.16))
-                .text_size(px(Theme::TEXT_CAPTION))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(status_dot_color(ChatIndicator::Completed, theme))
-                .child(SharedString::from("new"))
-                .into_any_element()
-        } else {
-            div()
-                .flex_none()
-                .text_size(px(Theme::TEXT_CAPTION))
-                .text_color(subline)
-                .child(SharedString::from(
-                    slot.last_at
-                        .map(|at| format_time_ago(at, now))
-                        .unwrap_or_default(),
-                ))
-                .into_any_element()
-        };
-        let preview = slot
-            .preview
-            .clone()
-            .unwrap_or_else(|| needs_view::NO_REPORTS.to_string());
-        // The latest report is the payload: brighter while unread.
-        let preview_color = if slot.unseen {
-            theme.text_muted
-        } else {
-            subline
         };
 
         Some(
             div()
                 .id(SharedString::from(format!("orchestrator-{}", slot.chat_id)))
                 .flex()
-                .flex_col()
-                .gap(px(2.0))
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
                 .rounded(px(Theme::RADIUS_ROW))
                 .px(px(Theme::SPACE_SM))
                 .py(px(6.0))
@@ -1766,13 +1787,13 @@ impl Shell {
                 .list_row(theme, Bed::Shell, false, fade_key)
                 .cursor_pointer()
                 // Opening it opens the thread — and marks it seen, the synced
-                // marker that clears the badge on every device.
+                // marker that clears the inbox entry on every device.
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let id = chat_id.clone();
                     this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
                 }))
                 // The same right-click menu every chat row has — because this
-                // row may be the ONLY place the pinned chat appears. Unpinning
+                // row is the ONLY place the pinned chat appears. Unpinning
                 // lives on the row that is pinned (shell.rs), and a chat whose
                 // session has ended and whose space shelf never held it left
                 // the operator with a permanent slot and no way to reach the
@@ -1784,36 +1805,39 @@ impl Shell {
                         cx.notify();
                     }),
                 )
+                .child(dot)
+                // The ◆ is identity, and it is the accent (`--review`) — the
+                // one row in the tree you talk TO rather than check on.
                 .child(
                     div()
-                        .w_full()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(lead)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(Theme::TEXT_BODY))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .line_height(px(17.0))
-                                .child(SharedString::from(needs_view::ORCHESTRATOR_NAME)),
-                        )
-                        .child(tail),
+                        .flex_none()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.accent)
+                        .child(SharedString::from(
+                            comet_proto::view::board::ORCHESTRATOR_GLYPH,
+                        )),
                 )
                 .child(
                     div()
-                        .w_full()
-                        .pl(px(14.0))
+                        .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .line_height(px(14.0))
-                        .text_color(preview_color)
-                        .child(SharedString::from(preview)),
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .line_height(px(SPACE_ROW_LINE))
+                        .text_color(theme.text)
+                        .child(SharedString::from(needs_view::ORCHESTRATOR_NAME)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(
+                            slot.last_at
+                                .map(|at| format_time_ago(at, now))
+                                .unwrap_or_default(),
+                        )),
                 )
                 .into_any_element(),
         )
@@ -1828,9 +1852,9 @@ impl Shell {
     /// have been told.
     pub(super) fn render_orchestrator_rule(theme: &Theme) -> AnyElement {
         div()
-            .mt(px(3.0))
-            .mx(px(9.0))
-            .mb(px(4.0))
+            .mt(px(ORCHESTRATOR_RULE_TOP))
+            .mx(px(ORCHESTRATOR_RULE_SIDE))
+            .mb(px(ORCHESTRATOR_RULE_BOTTOM))
             .h(px(1.0))
             .flex_none()
             .bg(theme.border)
