@@ -2247,6 +2247,10 @@ fn board_row(
         review_chat_id: None,
         pr_url: None,
         pr_number: Some(9),
+        pr_base_ref: None,
+        pr_mergeable: None,
+        landing: None,
+        stack: None,
         branch: Some("board/gh-x".into()),
         dispatched_by: None,
         dispatched_by_chat: None,
@@ -2553,6 +2557,63 @@ fn space_opens_a_row_over_the_board_with_everything_the_list_cannot_say() {
     assert!(screen.contains("Dispatch"), "the actions:\n{screen}");
     assert!(screen.contains("Open issue"), "the links:\n{screen}");
     assert!(screen.contains("space closes"), "the way out:\n{screen}");
+}
+
+/// gh#283: a layer of a stack says so on the list *and* in the panel — where
+/// it sits, what it merges onto, where the chain lands, and the map of its
+/// siblings with the stuck one marked. The row's own `clean` never appears
+/// unqualified: it is clean against the branch below it, and merging it does
+/// nothing until that branch can merge too.
+#[test]
+fn a_stacked_row_says_which_layer_it_is_and_what_clean_meant() {
+    use comet_proto::view::board::{BoardState, RowStack, StackLayer};
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    let layers: Vec<StackLayer> = [(1, "dirty"), (2, "clean"), (3, "clean")]
+        .into_iter()
+        .map(|(p, state)| StackLayer {
+            id: p.to_string(),
+            identifier: format!("gh!{}", 10 + p),
+            pr_number: Some(10 + p),
+            position: Some(p),
+            open: true,
+            mergeable: Some(state.into()),
+        })
+        .collect();
+    let mut row = board_row("2", BoardState::Review);
+    row.pr_number = Some(12);
+    row.pr_base_ref = Some("board/gh-11-lexer".into());
+    row.pr_mergeable = Some("clean".into());
+    row.landing = Some("waiting-on-stack".into());
+    row.stack = Some(RowStack {
+        number: 7,
+        position: Some(2),
+        size: Some(3),
+        base_ref: Some("main".into()),
+        layers,
+    });
+    app.apply(Update::Board(vec![row]));
+
+    let screen = joined(&snapshot(&mut app, 120, 26));
+    assert!(screen.contains("2 of 3"), "which layer, on the row:\n{screen}");
+    assert!(
+        screen.contains("waiting on PR #11"),
+        "and what merging it would actually wait for:\n{screen}"
+    );
+
+    app.board.selected = Some("2".into());
+    app.act(Action::BoardPeek);
+    let screen = joined(&snapshot(&mut app, 120, 26));
+    assert!(
+        screen.contains("stack 2 of 3") && screen.contains("onto board/gh-11-lexer"),
+        "the stack line:\n{screen}"
+    );
+    assert!(screen.contains("lands on main"), "where it lands:\n{screen}");
+    assert!(
+        screen.contains("#11 ↑ #12 ↑ #13"),
+        "the map, bottom first:\n{screen}"
+    );
+    assert!(screen.contains("[/] stack"), "and how to walk it:\n{screen}");
 }
 
 #[test]

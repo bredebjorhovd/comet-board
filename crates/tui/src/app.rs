@@ -1080,6 +1080,7 @@ impl App {
                 Vec::new()
             }
             Action::BoardPeek => self.board_peek(),
+            Action::BoardStackStep(delta) => self.board_stack_step(delta),
             Action::BoardPeekScroll(delta) => {
                 if let Some(peek) = self.board.peek.as_mut() {
                     peek.scroll = peek.scroll.saturating_add_signed(delta);
@@ -1119,6 +1120,41 @@ impl App {
             return Vec::new();
         };
         let task_id = row.id.clone();
+        self.board.peek = Some(Peek::new(task_id.clone()));
+        vec![Command::ReadBoardTask { task_id }]
+    }
+
+    /// `[` / `]` on an open row: walk down or up its stack (gh#283).
+    ///
+    /// The terminal's answer to the desktop's clickable stack map. It moves the
+    /// *selection* as well as the panel, so closing the panel leaves the cursor
+    /// on the layer you walked to rather than back where you started — this is
+    /// navigation between rows, not a second cursor.
+    ///
+    /// Silent at either end of the chain, and silent on a layer the board does
+    /// not hold: a stack can reach into a repository nobody polls, and a
+    /// keypress that blanks the panel to show a row that is not there is worse
+    /// than one that does nothing.
+    fn board_stack_step(&mut self, delta: isize) -> Effects {
+        let Some(peek) = self.board.peek.as_ref() else {
+            return Vec::new();
+        };
+        let Some(row) = self.board.task(&peek.task_id) else {
+            return Vec::new();
+        };
+        let layers = comet_proto::view::board::stack_map(row);
+        let Some(here) = layers.iter().position(|layer| layer.id == row.id) else {
+            return Vec::new();
+        };
+        let Some(next) = here
+            .checked_add_signed(delta)
+            .and_then(|ix| layers.get(ix))
+            .filter(|layer| self.board.task(&layer.id).is_some())
+        else {
+            return Vec::new();
+        };
+        let task_id = next.id.clone();
+        self.board.selected = Some(task_id.clone());
         self.board.peek = Some(Peek::new(task_id.clone()));
         vec![Command::ReadBoardTask { task_id }]
     }
@@ -4387,6 +4423,10 @@ mod tests {
             review_chat_id: None,
             pr_url: None,
             pr_number: None,
+            pr_base_ref: None,
+            pr_mergeable: None,
+            landing: None,
+            stack: None,
             branch: Some("board/gh-x".into()),
             dispatched_by: None,
             dispatched_by_chat: None,
@@ -4470,6 +4510,89 @@ mod tests {
         // Space again shuts it, and asks the host for nothing.
         assert!(app.act(Action::BoardPeek).is_empty());
         assert!(app.board.peek.is_none());
+    }
+
+    /// Three rows of one stack, as the board streams them (gh#283).
+    fn stacked_rows() -> Vec<comet_proto::view::board::TaskRow> {
+        use comet_proto::view::board::{RowStack, StackLayer};
+        let layers: Vec<StackLayer> = (1..=3)
+            .map(|p| StackLayer {
+                id: p.to_string(),
+                identifier: format!("gh!{}", 10 + p),
+                pr_number: Some(10 + p),
+                position: Some(p),
+                open: true,
+                mergeable: Some("clean".into()),
+            })
+            .collect();
+        (1..=3)
+            .map(|p| {
+                let mut row = board_row(&p.to_string(), BoardState::Review);
+                row.pr_number = Some(10 + p);
+                row.stack = Some(RowStack {
+                    number: 7,
+                    position: Some(p),
+                    size: Some(3),
+                    base_ref: Some("main".into()),
+                    layers: layers.clone(),
+                });
+                row
+            })
+            .collect()
+    }
+
+    /// `[` and `]` walk the stack from inside the open panel — the terminal's
+    /// stack map. The cursor comes along, so shutting the panel leaves you on
+    /// the layer you walked to.
+    #[test]
+    fn brackets_walk_a_stacked_row_to_its_siblings() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(stacked_rows()));
+        app.board.selected = Some("2".into());
+        app.act(Action::BoardPeek);
+
+        match app.act(Action::BoardStackStep(-1)).first() {
+            Some(Command::ReadBoardTask { task_id }) => assert_eq!(task_id, "1"),
+            other => panic!("expected the layer below to be fetched, got {other:?}"),
+        }
+        assert_eq!(app.board.peek.as_ref().unwrap().task_id, "1");
+        assert_eq!(app.board.selected.as_deref(), Some("1"));
+
+        // The bottom of the chain is the end of the walk, not a wrap-around to
+        // the top: a stack has a direction and so does the key.
+        assert!(app.act(Action::BoardStackStep(-1)).is_empty());
+        assert_eq!(app.board.peek.as_ref().unwrap().task_id, "1");
+
+        app.act(Action::BoardStackStep(1));
+        app.act(Action::BoardStackStep(1));
+        assert_eq!(app.board.peek.as_ref().unwrap().task_id, "3");
+        assert!(app.act(Action::BoardStackStep(1)).is_empty(), "and at the top");
+    }
+
+    /// A layer GitHub named that the board does not hold — a stack reaching
+    /// into a repository nobody polls — is not a row to open.
+    #[test]
+    fn walking_off_the_board_leaves_the_panel_where_it_is() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        // Only the middle layer is on this board.
+        app.apply(Update::Board(vec![stacked_rows().remove(1)]));
+        app.board.selected = Some("2".into());
+        app.act(Action::BoardPeek);
+        assert!(app.act(Action::BoardStackStep(-1)).is_empty());
+        assert_eq!(app.board.peek.as_ref().unwrap().task_id, "2");
+    }
+
+    /// An unstacked row has nothing to walk, and the key says nothing.
+    #[test]
+    fn brackets_do_nothing_on_a_row_that_is_not_in_a_stack() {
+        let mut app = seeded();
+        app.act(Action::ToggleBoard);
+        app.apply(Update::Board(vec![board_row("1", BoardState::Review)]));
+        app.act(Action::BoardPeek);
+        assert!(app.act(Action::BoardStackStep(1)).is_empty());
+        assert_eq!(app.board.peek.as_ref().unwrap().task_id, "1");
     }
 
     #[test]

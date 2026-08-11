@@ -120,6 +120,23 @@ went; it is what makes a cancelled child legible, since `cancelled` derives
 back to `ready` and `state` alone cannot distinguish a row the operator killed
 from one that was never dispatched.
 
+A row whose pull request is a layer of a GitHub **stack** carries `stack`
+(`number`, `position`, `size`, `base_ref` — where the whole chain lands — and
+`layers`, every sibling the board can see, bottom first) alongside `pr_base_ref`,
+the branch this pull request merges into. `layers` may be shorter than `size`
+when a stack reaches into a repository the board does not poll; the count is
+GitHub's and the map is ours.
+
+**Never read `pr_mergeable` on its own.** It is GitHub's `mergeable_state` for
+that pull request against *its own base*, which mid-stack is the layer below —
+`clean` there means "clean against the branch underneath me", not "ready to
+land". Read `landing` instead: `ready` (this and every open layer below it can
+merge, and merging it lands them all), `waiting-on-stack` (clean against its own
+base only), `not-clean` (GitHub objects to this pull request itself — see
+`pr_mergeable` for how), or absent, meaning nobody has asked yet. Absent is
+common: mergeability costs a call per open pull request and rides the full
+sweep. It never means ready.
+
 States: `blocked` (agent waiting on input) → `working` → `ready` (nothing
 running) → `review` (finished or PR open) → `failed` → `done` (issue closed).
 Note `done` means the *issue* is closed; an agent that finished with a PR open

@@ -255,6 +255,88 @@ pub struct OrchestratorPin {
     pub chat_id: Option<String>,
 }
 
+/// One layer of a stacked pull request, as a sibling row sees it (gh#283).
+///
+/// Carried on every member's row rather than left for a reader to join for
+/// itself, because the two questions a stack raises are both about the *other*
+/// layers: which one is this, and can the ones underneath merge. A surface with
+/// the whole board in hand could join by [`RowStack::number`]; the `list --json`
+/// reader the agent conventions teach is looking at one row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackLayer {
+    /// The task id of the row that carries this layer — where a surface
+    /// navigates to when somebody picks it out of the map.
+    pub id: String,
+    /// What that row prints as, for a surface with no room for a map.
+    pub identifier: String,
+    pub pr_number: Option<i64>,
+    /// GitHub's place for it in the stack, counting from the bottom. `None`
+    /// where the preview did not say; [`RowStack::layers`] is ordered
+    /// regardless, so the order is not read off this.
+    pub position: Option<i64>,
+    /// The pull request is still open. A layer that has landed is no longer in
+    /// anybody's way, which is what keeps a merged parent out of
+    /// [`landing`]'s answer.
+    pub open: bool,
+    /// That layer's own `mergeable_state`, so the AND that answers "can this
+    /// land" can be made without a second lookup — and so a map can mark the
+    /// layer that is stuck.
+    pub mergeable: Option<String>,
+}
+
+/// A row's place in a stacked pull request, and the map of its siblings
+/// (gh#283).
+///
+/// GitHub's stacks are an ordered chain — each layer targets the branch below
+/// it, the bottom targets trunk, and merging a layer merges everything below it
+/// with it, atomically. That last half is why the row carries the whole map
+/// rather than only its own position: what merging *this* pull request does
+/// depends entirely on layers that are other rows on the board.
+///
+/// The map is what the board can see. A stack whose lower layers are pull
+/// requests in a repository the board does not poll has fewer [`layers`] than
+/// [`size`] — so the count stays GitHub's, never `layers.len()`, and a reader
+/// is never told a stack is shorter than it is.
+///
+/// [`layers`]: RowStack::layers
+/// [`size`]: RowStack::size
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowStack {
+    /// Identifies the stack. Unique per repository, like a pull request number
+    /// — two repos can both have a stack 3, and the board scopes the grouping
+    /// accordingly.
+    pub number: i64,
+    /// This row's place in it, counting from the bottom.
+    pub position: Option<i64>,
+    /// How many layers GitHub says the stack holds.
+    pub size: Option<i64>,
+    /// The branch the *stack* lands on — the bottom layer's base, and the only
+    /// branch in a stack that is not itself somebody's pull request.
+    pub base_ref: Option<String>,
+    /// Every layer the board can see, bottom first, this row included.
+    pub layers: Vec<StackLayer>,
+}
+
+impl RowStack {
+    /// The layers under `id`, bottom first — what merging that row would take
+    /// with it.
+    ///
+    /// Read off the order rather than off [`StackLayer::position`], which the
+    /// preview leaves out often enough that a rule keyed on it would go quiet
+    /// exactly when the board is least sure of the topology.
+    pub fn below(&self, id: &str) -> &[StackLayer] {
+        match self.layers.iter().position(|layer| layer.id == id) {
+            Some(i) => &self.layers[..i],
+            None => &[],
+        }
+    }
+
+    /// One layer by task id.
+    pub fn layer(&self, id: &str) -> Option<&StackLayer> {
+        self.layers.iter().find(|layer| layer.id == id)
+    }
+}
+
 /// One task, in the shape callers are promised: herdr-board's `list --json`
 /// contract with the pane→chat rename applied.
 ///
@@ -294,6 +376,37 @@ pub struct TaskRow {
     /// Set on `review` rows, which is how a PR reaches an orchestrator.
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
+    /// The branch the pull request merges *into* (gh#282). Trunk for a
+    /// standalone one; mid-stack it is the branch of the layer below, which is
+    /// what makes [`pr_mergeable`](Self::pr_mergeable) mean less than it looks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_base_ref: Option<String>,
+    /// GitHub's `mergeable_state` for this pull request **alone**: `clean`,
+    /// `behind`, `dirty`, `blocked`, `unstable`, `draft`. `None` where it has
+    /// not been asked — it costs a call per open PR and rides the full sweep.
+    ///
+    /// Never render this unqualified. For a layer of a stack, `clean` means
+    /// clean *against the layer below*, not "ready to land", and the board
+    /// spent this whole issue not saying the second when GitHub said the first
+    /// (gh#283). [`landing`] is the answer to the question a reader is actually
+    /// asking; this is the raw fact it is derived from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_mergeable: Option<String>,
+    /// Whether this pull request can land, with the layers below it taken into
+    /// account: `ready`, `waiting-on-stack`, `not-clean` — or absent, meaning
+    /// nobody has asked GitHub yet (gh#283).
+    ///
+    /// The verdict rather than its parts, because the AND across a stack is the
+    /// one thing every reader of this contract would otherwise have to
+    /// reimplement, and a reader who skipped it would believe `clean`. Derived
+    /// by [`landing`] from the two fields above and [`stack`](Self::stack); the
+    /// board fills it with that same function, so the wire and the viewports
+    /// can never come to disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<String>,
+    /// Set when GitHub says this pull request is one layer of a stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<RowStack>,
     pub branch: Option<String>,
     /// Parent task id when the board dispatched the releasing agent too. Null
     /// on its own does **not** mean the operator: an orchestrating chat has no
@@ -878,9 +991,15 @@ fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> V
         }
         BoardState::Failed => vec![MetaField::flow("pane exited without completing")],
         BoardState::Review => match (row.pr_number, row.branch.as_deref()) {
+            // A stacked PR says which layer it is, and — where the board has
+            // asked — what merging it would actually do. The landing note
+            // replaces "waiting on you" rather than joining it: both are the
+            // row's call to action, and the one that names the branch says
+            // strictly more (gh#283).
             (Some(n), _) => vec![
                 MetaField::flow(format!("PR #{n}")),
-                MetaField::flow("waiting on you"),
+                MetaField::flow(stack_note(row).unwrap_or_default()),
+                MetaField::flow(landing_note(row).unwrap_or_else(|| "waiting on you".into())),
             ],
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.
@@ -966,6 +1085,206 @@ pub fn row_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) ->
 /// everywhere else.
 pub fn row_metadata_line(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> String {
     row_metadata_fields(row, selected, now).join(" · ")
+}
+
+// ---------------------------------------------------------------------------
+// Stacks: what `mergeable` means when a pull request is a layer (gh#283)
+// ---------------------------------------------------------------------------
+//
+// GitHub answers `mergeable_state` per pull request, against that pull
+// request's own base. For a standalone PR the base is trunk and the answer is
+// the whole story. For a layer of a stack the base is the layer below, so
+// `clean` means "clean against the branch underneath me" — and the board reader
+// asking whether to merge reads it as "ready to land", which it is not until
+// everything below it is clean too.
+//
+// So the vocabulary is one step removed from GitHub's: [`Landing`] is what the
+// board is willing to *claim*, and it is derived by ANDing this layer's answer
+// with every open layer under it — GitHub's own semantics, where merging a
+// layer merges or queues everything below it, atomically. A layer below that
+// nobody has asked about yet takes the answer to "clean against its base" and
+// no further. Not knowing is never rounded up to ready.
+
+/// The one `mergeable_state` that is not an objection.
+const MERGEABLE_CLEAN: &str = "clean";
+
+/// Whether a pull request can land, said honestly for a layer of a stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing<'a> {
+    /// This pull request merges, and so does every open layer under it —
+    /// merging it lands all `below` of them with it. `below` is 0 for a
+    /// standalone PR and for the bottom of a stack.
+    Ready { below: usize },
+    /// Clean against its own base and no further: mid-stack, that base is the
+    /// layer below rather than trunk. `blocker` is the lowest layer under it
+    /// that GitHub objects to, or `None` when the layers below simply have not
+    /// been asked yet — "I do not know" and "I know it is stuck" are different
+    /// answers and neither is "ready".
+    CleanAgainstBase { blocker: Option<&'a StackLayer> },
+    /// GitHub objects to this pull request itself, in its own vocabulary:
+    /// `behind`, `dirty`, `blocked`, `unstable`, `draft`.
+    NotClean(&'a str),
+    /// Nobody has asked GitHub. Mergeability costs a call per open PR and rides
+    /// the full sweep, so this is the ordinary state of a freshly-seen row.
+    Unknown,
+}
+
+impl Landing<'_> {
+    /// How the wire spells it — [`TaskRow::landing`]'s three values, and `None`
+    /// for the unknown that is written as an absent field.
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            Landing::Ready { .. } => Some("ready"),
+            Landing::CleanAgainstBase { .. } => Some("waiting-on-stack"),
+            Landing::NotClean(_) => Some("not-clean"),
+            Landing::Unknown => None,
+        }
+    }
+
+    /// Would merging this pull request land it? The one-bit answer, for a
+    /// caller that wants the AND and not the reason.
+    pub fn ready(&self) -> bool {
+        matches!(self, Landing::Ready { .. })
+    }
+}
+
+/// Can this row's pull request land? (gh#283.)
+///
+/// The single implementation of the AND: the board fills
+/// [`TaskRow::landing`] with it so `list --json` carries the verdict, and both
+/// viewports call it for the words. A caller holding a row that came off the
+/// wire can call it too — it reads nothing but the row.
+pub fn landing(row: &TaskRow) -> Landing<'_> {
+    let Some(state) = row.pr_mergeable.as_deref().filter(|s| !s.is_empty()) else {
+        return Landing::Unknown;
+    };
+    if state != MERGEABLE_CLEAN {
+        return Landing::NotClean(state);
+    }
+    let Some(stack) = row.stack.as_ref() else {
+        return Landing::Ready { below: 0 };
+    };
+    let seen = stack.below(&row.id);
+    // A layer that already landed is nobody's obstacle — which is exactly the
+    // child whose parent merged and whose own PR GitHub retargeted onto trunk.
+    let below: Vec<&StackLayer> = seen.iter().filter(|l| l.open).collect();
+    if let Some(blocker) = below
+        .iter()
+        .find(|l| l.mergeable.as_deref().is_some_and(|m| m != MERGEABLE_CLEAN))
+    {
+        return Landing::CleanAgainstBase { blocker: Some(blocker) };
+    }
+    if below.iter().any(|l| l.mergeable.is_none()) {
+        return Landing::CleanAgainstBase { blocker: None };
+    }
+    // Does the board hold every layer GitHub says is underneath this one? A
+    // stack reaching into a repository nobody polls is a map with holes, and a
+    // hole under you is not a clean parent — the count is GitHub's for exactly
+    // this reason. Without a position there is nothing to check against, and
+    // "ready" is not the answer to give when the topology is the part in doubt.
+    let complete = stack
+        .position
+        .is_some_and(|p| seen.len() as i64 >= (p - 1).max(0));
+    if !complete {
+        return Landing::CleanAgainstBase { blocker: None };
+    }
+    Landing::Ready { below: below.len() }
+}
+
+/// The branch a pull request's `mergeable_state` was measured against, for
+/// wording that has to name it. Falls back to a phrase rather than a branch:
+/// "conflicts with its base" is still true when the board never learned which
+/// branch that is.
+fn base_of(row: &TaskRow) -> &str {
+    row.pr_base_ref
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .unwrap_or("its base")
+}
+
+/// How a layer of a stack is named in a sentence: its pull request number where
+/// there is one, else the row's identifier.
+fn layer_name(layer: &StackLayer) -> String {
+    match layer.pr_number {
+        Some(n) => format!("PR #{n}"),
+        None => layer.identifier.clone(),
+    }
+}
+
+/// What the board says about whether this pull request can land — the sentence
+/// [`landing`] earns.
+///
+/// `None` when nobody has asked GitHub yet: a blank is honest and an invented
+/// verdict is not. Every other answer names the branch it is measured against,
+/// because that is the fact the flat `mergeable_state` was missing.
+pub fn landing_note(row: &TaskRow) -> Option<String> {
+    let base = base_of(row);
+    Some(match landing(row) {
+        Landing::Unknown => return None,
+        Landing::Ready { below: 0 } => "ready to land".to_string(),
+        Landing::Ready { below } => format!("ready to land with {below} below"),
+        Landing::CleanAgainstBase { blocker: Some(layer) } => {
+            format!("clean against {base} · waiting on {}", layer_name(layer))
+        }
+        Landing::CleanAgainstBase { blocker: None } => format!("clean against {base}"),
+        Landing::NotClean(state) => match state {
+            "behind" => format!("behind {base}"),
+            "dirty" => format!("conflicts with {base}"),
+            "blocked" => "blocked on a check or review".to_string(),
+            "unstable" => "a check is failing".to_string(),
+            "draft" => "still a draft".to_string(),
+            // GitHub's preview may grow a state we have no words for. Say the
+            // word it used against the branch it used it about, rather than
+            // swallowing an objection we do not recognise.
+            other => format!("{other} against {base}"),
+        },
+    })
+}
+
+/// Where this row sits in its stack, short enough for a list: `2 of 5`.
+///
+/// `None` on a row that is not part of one. GitHub's own count, so a stack
+/// whose lower layers are outside the board's repos still reads its true size.
+pub fn stack_note(row: &TaskRow) -> Option<String> {
+    let stack = row.stack.as_ref()?;
+    Some(match (stack.position, stack.size) {
+        (Some(p), Some(size)) => format!("{p} of {size}"),
+        (Some(p), None) => format!("layer {p}"),
+        // GitHub said this PR is in a stack and nothing else about where. The
+        // fact that it is stacked is the half that changes what `clean` means,
+        // so it is still worth a word.
+        (None, _) => "stacked".to_string(),
+    })
+}
+
+/// The stack, in full, for a detail surface: `stack 2 of 5 · onto
+/// board/gh-11-lexer · lands on main`.
+///
+/// The middle fact appears only when it differs from the last one — for the
+/// bottom layer the branch it targets *is* where the stack lands, and saying
+/// that twice reads as two different branches.
+pub fn stack_line(row: &TaskRow) -> Option<String> {
+    let stack = row.stack.as_ref()?;
+    let mut parts = vec![format!("stack {}", stack_note(row)?)];
+    let target = stack.base_ref.as_deref().filter(|b| !b.is_empty());
+    if let Some(base) = row.pr_base_ref.as_deref().filter(|b| !b.is_empty())
+        && Some(base) != target
+    {
+        parts.push(format!("onto {base}"));
+    }
+    if let Some(target) = target {
+        parts.push(format!("lands on {target}"));
+    }
+    Some(parts.join(" · "))
+}
+
+/// The stack map a detail surface draws, bottom layer first — one entry per
+/// sibling the board can see, this row included.
+///
+/// Empty for a row that is not stacked, so a surface can call it
+/// unconditionally and draw nothing.
+pub fn stack_map(row: &TaskRow) -> &[StackLayer] {
+    row.stack.as_ref().map_or(&[], |stack| stack.layers.as_slice())
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,6 +2379,10 @@ mod tests {
             review_chat_id: None,
             pr_url: None,
             pr_number: None,
+            pr_base_ref: None,
+            pr_mergeable: None,
+            landing: None,
+            stack: None,
             branch: Some("board/gh-x".into()),
             dispatched_by: None,
             dispatched_by_chat: None,
@@ -2353,6 +2676,83 @@ mod tests {
         assert!(row_metadata(&r, false, 80, now()).contains("· no PR"));
         r.branch = None;
         assert_eq!(row_metadata(&r, false, 80, now()), "waiting on you");
+    }
+
+    /// A layer of a stack, as it comes off the wire.
+    fn stacked(id: &str, position: i64, size: i64, base: &str) -> TaskRow {
+        let mut r = row(id, BoardState::Review);
+        r.pr_number = Some(10 + position);
+        r.pr_base_ref = Some(base.into());
+        r.pr_mergeable = Some("clean".into());
+        r.stack = Some(RowStack {
+            number: 7,
+            position: Some(position),
+            size: Some(size),
+            base_ref: Some("main".into()),
+            layers: (1..=size)
+                .map(|p| StackLayer {
+                    id: format!("l{p}"),
+                    identifier: format!("gh!{}", 10 + p),
+                    pr_number: Some(10 + p),
+                    position: Some(p),
+                    open: true,
+                    mergeable: Some("clean".into()),
+                })
+                .collect(),
+        });
+        r.id = format!("l{position}");
+        r
+    }
+
+    /// The row a reader sees: which layer, and what merging it would actually
+    /// do — never GitHub's `clean` on its own (gh#283).
+    #[test]
+    fn a_stacked_review_row_says_which_layer_and_whether_it_can_land() {
+        let r = stacked("s", 2, 3, "board/gh-11-lexer");
+        assert_eq!(
+            row_metadata(&r, false, 80, now()),
+            "PR #12 · 2 of 3 · ready to land with 1 below",
+        );
+    }
+
+    /// The lie this issue is about: `clean` against the layer below is not
+    /// "ready to land", and the row says which branch it is clean against.
+    #[test]
+    fn a_clean_layer_over_a_stuck_one_says_what_clean_meant() {
+        let mut r = stacked("s", 2, 3, "board/gh-11-lexer");
+        r.stack.as_mut().unwrap().layers[0].mergeable = Some("dirty".into());
+        assert_eq!(
+            row_metadata(&r, false, 80, now()),
+            "PR #12 · 2 of 3 · clean against board/gh-11-lexer · waiting on PR #11",
+        );
+        assert_eq!(landing(&r).as_str(), Some("waiting-on-stack"));
+        assert!(!landing(&r).ready());
+    }
+
+    /// Nobody has asked GitHub yet — the ordinary state of a freshly-seen row,
+    /// since mergeability rides the full sweep. The row falls back to the call
+    /// to action it has always had rather than inventing a verdict.
+    #[test]
+    fn an_unpolled_review_row_still_says_it_is_waiting_on_you() {
+        let mut r = stacked("s", 2, 3, "board/gh-11-lexer");
+        r.pr_mergeable = None;
+        assert_eq!(row_metadata(&r, false, 80, now()), "PR #12 · 2 of 3 · waiting on you");
+        assert_eq!(landing(&r), Landing::Unknown);
+        assert_eq!(landing_note(&r), None);
+    }
+
+    /// The wire carries the new facts as absent rather than null on a row that
+    /// has none, so a standalone pull request's JSON is the shape it always was.
+    #[test]
+    fn an_unstacked_row_adds_nothing_to_the_wire() {
+        let wire = serde_json::to_string(&row("r", BoardState::Review)).unwrap();
+        for field in ["stack", "landing", "pr_mergeable", "pr_base_ref"] {
+            assert!(!wire.contains(field), "{field} in {wire}");
+        }
+        // And an old client's row still parses: every one of them defaults.
+        let back: TaskRow = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.stack, None);
+        assert_eq!(back.landing, None);
     }
 
     #[test]

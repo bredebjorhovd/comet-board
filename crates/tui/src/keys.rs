@@ -147,6 +147,11 @@ pub enum Action {
     BoardPeek,
     /// `j`/`k` while a row is open: scroll its body.
     BoardPeekScroll(isize),
+    /// `[`/`]` while a stacked row is open: walk down or up its stack (gh#283).
+    /// The terminal's spelling of the desktop's clickable stack map — a layer's
+    /// siblings are rows elsewhere on the board, and finding them by hand means
+    /// closing the panel and hunting for a pull request number.
+    BoardStackStep(isize),
 }
 
 /// A composer mutation. Separated from [`Action`] so the app can apply the whole
@@ -300,6 +305,11 @@ fn map_board(typing: bool, peek: bool, key: KeyEvent) -> Option<Action> {
             KeyCode::Char('k') | KeyCode::Up => Some(Action::BoardPeekScroll(-1)),
             KeyCode::PageDown => Some(Action::BoardPeekScroll(10)),
             KeyCode::PageUp => Some(Action::BoardPeekScroll(-10)),
+            // The stack map's keys (gh#283). Bracket-shaped because the panel
+            // has already taken `j`/`k` for the body it scrolls, and because a
+            // stack is a thing you walk up and down.
+            KeyCode::Char('[') => Some(Action::BoardStackStep(-1)),
+            KeyCode::Char(']') => Some(Action::BoardStackStep(1)),
             KeyCode::Char('c') if ctrl => Some(Action::Quit),
             KeyCode::Char('?') => Some(Action::ToggleHelp),
             _ => None,
@@ -826,6 +836,10 @@ mod tests {
         assert_eq!(open(KeyCode::Esc), Some(Action::BoardPeek));
         assert_eq!(open(KeyCode::Char('j')), Some(Action::BoardPeekScroll(1)));
         assert_eq!(open(KeyCode::Char('k')), Some(Action::BoardPeekScroll(-1)));
+        // The stack map's own keys (gh#283): `j`/`k` are the body's, so
+        // walking the chain takes a spelling of its own.
+        assert_eq!(open(KeyCode::Char('[')), Some(Action::BoardStackStep(-1)));
+        assert_eq!(open(KeyCode::Char(']')), Some(Action::BoardStackStep(1)));
         // The detail is for reading and must not become a step on the way to a
         // release: enter still dispatches from inside it.
         assert_eq!(open(KeyCode::Enter), Some(Action::BoardEnter));

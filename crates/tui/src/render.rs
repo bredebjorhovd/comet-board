@@ -2704,13 +2704,42 @@ fn draw_board_detail(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
     for line in wrap::wrap(&row.title, text_width, "") {
         head.push(Line::from(Span::styled(line, theme.body())));
     }
-    for fact in [board::placement_line(&row), board::history_line(&row, chrono::Utc::now())]
-        .into_iter()
-        .flatten()
+    for fact in [
+        board::placement_line(&row),
+        // Which layer this is and where the chain lands (gh#283).
+        board::stack_line(&row),
+        board::history_line(&row, chrono::Utc::now()),
+    ]
+    .into_iter()
+    .flatten()
     {
         for line in wrap::wrap(&fact, text_width, "  ") {
             head.push(Line::from(Span::styled(line, theme.hint())));
         }
+    }
+    // The stack map, on one line: the layers bottom-first, this one marked, and
+    // any layer GitHub objects to in the failed colour. `[`/`]` walk it.
+    let layers = board::stack_map(&row);
+    if !layers.is_empty() {
+        let mut spans = vec![Span::styled("  ", theme.hint())];
+        for (ix, layer) in layers.iter().enumerate() {
+            if ix > 0 {
+                spans.push(Span::styled(" ↑ ", theme.hint()));
+            }
+            let label = match layer.pr_number {
+                Some(n) => format!("#{n}"),
+                None => layer.identifier.clone(),
+            };
+            let style = if layer.id == row.id {
+                theme.body()
+            } else if layer.mergeable.as_deref().is_some_and(|m| m != "clean") {
+                theme.board_state(BoardState::Failed)
+            } else {
+                theme.hint()
+            };
+            spans.push(Span::styled(label, style));
+        }
+        head.push(Line::from(spans));
     }
     if !row.labels.is_empty() {
         for line in wrap::wrap(&row.labels.join(", "), text_width, "  ") {
@@ -2804,10 +2833,17 @@ fn draw_board_detail(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
     for line in foot {
         put(frame, line, &mut foot_y);
     }
+    // A key nobody can see is a key nobody presses, and the stack map is the
+    // only place `[`/`]` do anything — so the hint names them exactly where
+    // there is a chain to walk (gh#283).
+    let stack_hint = if layers.len() > 1 { "[/] stack · " } else { "" };
     let hint = if max_scroll > scroll {
-        format!(" j/k scroll · ↓{} · space closes ", max_scroll - scroll)
+        format!(
+            " j/k scroll · ↓{} · {stack_hint}space closes ",
+            max_scroll - scroll
+        )
     } else {
-        " enter dispatches · space closes ".to_string()
+        format!(" enter dispatches · {stack_hint}space closes ")
     };
     frame.render_widget(
         Paragraph::new(Span::styled(hint, theme.panel_hint())),
