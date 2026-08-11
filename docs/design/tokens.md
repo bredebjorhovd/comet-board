@@ -102,12 +102,34 @@ already exact.
 
 ## Deliberate deviations
 
-One, and it predates this pass:
+Two, both of which predate this pass:
 
 - **`--hover` in dark** is soft-white (L 0.92) at 5%, not pure white at 5%. A
   hover over the glass sidebar rested on pure white and flashed dark mid-fade
   (user reports). Same alpha, same neutral, one step off pure. Asserted in the
   token test so it stays a decision rather than becoming a drift.
+
+- **The sidebar is glass, and `--shell` is not.** The canvases paint one flat
+  `--shell` for the window ground and the sidebar alike. On macOS the app paints
+  the sidebar with [`Theme::glass`] instead — `#080808` at 90% in dark, the
+  light `--shell` at 93% in light — so it takes a vibrancy scrim over the
+  desktop rather than a fixed tone.
+
+  Measured on gh#275's captures: the light sidebar reads `(218,218,219)` where
+  the shell beside it reads `(231,231,232)`; dark reads `(28,28,28)` against
+  `(26,26,26)`. So the two surfaces the canvas draws as one number are visibly
+  two on screen.
+
+  Kept deliberately (decision: Brede, 2026-08-11). The frost is a real macOS
+  affordance a static canvas cannot express, and it was argued once already:
+  gh#177 replaced a merely transparent sidebar because plain white at 80% let
+  the wallpaper tint it — dark neutralises by being far from everything, and the
+  light scrim earns it with its own tone. `GLASS_ALPHA` is 1.0 off macOS, where
+  the sidebar falls back to flat `surface` and the canvas holds exactly.
+
+  **The consequence for every surface issue: the sidebar's tone cannot be
+  checked against a canvas by sampling a screenshot.** Sample the shell beside
+  it instead, and check the sidebar against [`Theme::glass`].
 
 Anything else that differs from the table above is a bug, not a deviation. Add
 to this list only with the reason, and assert the deviating value.
