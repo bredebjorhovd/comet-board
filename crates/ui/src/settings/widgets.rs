@@ -115,12 +115,32 @@ pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Di
         })
 }
 
-/// Subtitle under the headline (`docs/design/settings.md` D6/J1): 13px/20 in
-/// `--subtle`, 4px under the title, capped at the prose measure.
+/// **The headline over a dashboard** — 20px, and only Board stats has one
+/// (gh#278).
 ///
-/// `--subtle` and not `--muted`: the canvas keeps `--muted` for things you read
-/// one of (a row's name, a nav label) and drops the standing explanation a step
-/// below it. A subtitle set at row weight competes with the rows it introduces.
+/// Its own function rather than a flag on [`page_header`], so the one page that
+/// is a dashboard says so at the call site and [`Theme::TEXT_HEADLINE`] has
+/// exactly one caller. A settings *section* keeps [`page_header`] at 15: the
+/// accounts canvas and the stats canvas disagree about this on purpose, and a
+/// shared header that split the difference would be wrong on both.
+pub fn dashboard_header(theme: &Theme, title: &str) -> gpui::Div {
+    div()
+        .text_size(px(Theme::TEXT_HEADLINE))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.text)
+        .child(SharedString::from(title.to_string()))
+}
+
+/// Subtitle under the headline (`docs/design/settings.md` D6/J1): 13px on a
+/// 20px line in `--subtle`, 4px under the title, capped at the prose measure.
+///
+/// `--subtle` and not `--muted` — and this one was found twice, independently,
+/// from two different canvases (gh#277 off the settings canvas, gh#278 off the
+/// stats one), which is about as much evidence as a tone choice gets. The
+/// canvases keep `--muted` for things you read one of (a row's name, a nav
+/// label) and drop the standing explanation a step below it; the widget was
+/// paying the reading grey on all eight pages. A subtitle set at row weight
+/// competes with the rows it introduces — the header saying itself twice.
 pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
     div()
         .mt(px(Theme::SPACE_XS))
@@ -433,5 +453,18 @@ mod tests {
         assert_eq!(SUBTITLE_WIDTH, 560.0);
         // A width apiece, and the wide one is the wide one.
         const { assert!(DASHBOARD_WIDTH > FORM_WIDTH) };
+    }
+
+    /// Two headers, and the dashboard's is the loud one (gh#278). The stats
+    /// canvas heads its page at 20 and the accounts canvas heads its own at 15;
+    /// a single shared header would be wrong on one of them whichever way it
+    /// went, which is why there are two functions and this test.
+    #[test]
+    fn a_dashboard_is_headed_louder_than_a_section() {
+        assert_eq!(Theme::TEXT_HEADLINE, 20.0);
+        assert_eq!(Theme::TEXT_TITLE, 15.0);
+        const { assert!(Theme::TEXT_HEADLINE > Theme::TEXT_TITLE) };
+        // Still under the figure it heads, or the header would be the headline.
+        const { assert!(Theme::TEXT_HEADLINE < Theme::TEXT_DISPLAY) };
     }
 }

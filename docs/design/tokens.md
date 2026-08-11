@@ -6,6 +6,8 @@ field that paints it. Reconciled for gh#274.
 The canvases are in `canvas/`. All five declare the same table, so this is one
 palette, not five — see `canvas/README.md`.
 
+Per-surface specs: `window.md` (gh#275), `stats.md` (gh#278).
+
 Locked by `every_canvas_token_is_the_value_the_canvas_declares` in `theme.rs`.
 Change a value here and that test fails, which is the point: the last redesign
 pass drifted because nothing compared the two.
@@ -58,13 +60,19 @@ spec; the surface issues wire them.
 
 | Canvas | Dark | Light | Theme |
 | --- | --- | --- | --- |
-| `--lift` | `none` | `0 1px 2px rgba(0,0,0,.05)` | `float_card` |
+| `--lift` | `none` | `0 1px 2px rgba(0,0,0,.05)` | `lift_shadow()` |
 | `--sellift` | `0 0 0 1px rgba(255,255,255,.13)` | `0 0 0 1px #dcdce2, 0 1px 2px rgba(0,0,0,.06)` | `row_edge` (+ `LIGHT_SELECT_EDGE`) |
-| `--cardshadow` | `none` | `0 1px 2px rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.18)` | `float_card` |
+| `--cardshadow` | `none` | `0 1px 2px rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.18)` | `float_shadow()` |
 
 Dark lifts with tone and a ring; light lifts with shadow. A selected row's ring
 is painted as an INSET shadow (`hairline_ring`) — a drop shadow behind a
 translucent fill shows through as a plate.
+
+The three are different sizes of the same idea and are not interchangeable.
+`--lift` is the smallest — the chosen segment of a segmented control, rising out
+of a chip wash — and `--cardshadow` is what a whole floating panel casts over
+the page. `float_card` is the float's *surface*, not its shadow; it was in the
+`--lift` row here until gh#278 wanted the shadow and found a colour.
 
 ## Borrowed marks
 
@@ -109,16 +117,22 @@ Two, both of which predate this pass:
   (user reports). Same alpha, same neutral, one step off pure. Asserted in the
   token test so it stays a decision rather than becoming a drift.
 
-- **The sidebar is glass, and `--shell` is not.** The canvases paint one flat
+- **The window is glass, and `--shell` is not.** The canvases paint one flat
   `--shell` for the window ground and the sidebar alike. On macOS the app paints
-  the sidebar with [`Theme::glass`] instead — `#080808` at 90% in dark, the
+  that ground with [`Theme::glass`] instead — `#080808` at 90% in dark, the
   light `--shell` at 93% in light — so it takes a vibrancy scrim over the
   desktop rather than a fixed tone.
 
-  Measured on gh#275's captures: the light sidebar reads `(218,218,219)` where
-  the shell beside it reads `(231,231,232)`; dark reads `(28,28,28)` against
-  `(26,26,26)`. So the two surfaces the canvas draws as one number are visibly
-  two on screen.
+  Measured on the running app at 1320×880: the window's own surface reads 26 in
+  dark where flat `--shell` is 13, and ~231 in light where flat `--shell` is
+  233. So the number the canvas draws is not the number on screen.
+
+  The sidebar and the shell are *equally* glassy — one root fill, one hairline
+  between them, no step. Earlier revisions of this note quoted a light sidebar
+  of `(218,218,219)` against a shell of `(231,231,232)` as its evidence; that
+  13-point gap was a `wash(0.05)` painted over the sidebar column, not the
+  glass, and it was removed in gh#304. Neither side of the seam is glassier
+  than the other, which is the point.
 
   Kept deliberately (decision: Brede, 2026-08-11). The frost is a real macOS
   affordance a static canvas cannot express, and it was argued once already:
@@ -127,9 +141,11 @@ Two, both of which predate this pass:
   light scrim earns it with its own tone. `GLASS_ALPHA` is 1.0 off macOS, where
   the sidebar falls back to flat `surface` and the canvas holds exactly.
 
-  **The consequence for every surface issue: the sidebar's tone cannot be
-  checked against a canvas by sampling a screenshot.** Sample the shell beside
-  it instead, and check the sidebar against [`Theme::glass`].
+  **The consequence for every surface issue: the window ground's tone cannot be
+  checked against a canvas by sampling a screenshot** — neither the sidebar's
+  nor the shell's. Check it against [`Theme::glass`] instead. What a screenshot
+  *can* settle is the two against each other: sample both sides of the seam,
+  and they must read the same number.
 
 Anything else that differs from the table above is a bug, not a deviation. Add
 to this list only with the reason, and assert the deviating value.
