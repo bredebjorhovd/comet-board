@@ -65,8 +65,24 @@ An installed copy is a build artifact. Edit
 place reads as stale (the doctor line says "not the shipped text") and the next
 install overwrites it.
 
-Codex slots get nothing here: skills are a Claude Code discovery mechanism and
-`CODEX_HOME` has no equivalent. The canonical prose those runtimes need is
-[`docs/agent-conventions.md`](agent-conventions.md), which is also where the
-skill's rules come from — the skill is the short form, that file is the long
-one.
+## The other channel
+
+Codex slots get no skill: skills are a Claude Code discovery mechanism and
+`CODEX_HOME` has no equivalent. What every runtime does have is an instruction
+file it reads on its own — `CLAUDE.md` in the Claude config dir, `AGENTS.md` in
+`CODEX_HOME` — and as of §gh#272 a dispatch writes the board's conventions into
+it, between `<!-- BEGIN comet-board conventions -->` markers, on the same
+schedule the skill is installed on.
+
+It is a *shorter* text than this skill, on purpose: an instruction file is in
+context on every turn, so it carries only what has to be true before anything is
+invoked, and then points at the skill for the rest. Codex, which can invoke no
+skill, gets this text appended to it instead. Only what is between the markers
+is managed — your own instruction file is left exactly as it was around it, and
+`[defaults] agent_instructions = false` (or the same key on a `[[route]]`) takes
+the block back out on the next dispatch. `comet-board doctor`'s **agent
+instructions** line reports what is installed where.
+
+The canonical prose behind all of it is
+[`docs/agent-conventions.md`](agent-conventions.md) — the skill and the block
+are the two short forms, that file is the long one.

@@ -439,9 +439,13 @@ impl AgentAccounts {
                     tracing::warn!(slot = %slot.id, error = %err, "skill install into slot failed");
                 }
             }
-            // Nothing for Codex: skills are a Claude Code discovery mechanism,
-            // and `CODEX_HOME` has no equivalent. A Codex slot learns the board
-            // from `docs/agent-conventions.md` the way it always has.
+            // No skill for Codex: skills are a Claude Code discovery mechanism
+            // and `CODEX_HOME` has no equivalent. What a Codex slot gets
+            // instead is the conventions block in `AGENTS.md`, written by the
+            // dispatch itself (`comet_board::conventions`, gh#272) rather than
+            // here — it is a property of the *route*, which this call has never
+            // heard of, and it is also how a Claude slot gets the same text
+            // beside the skill above.
             HarnessId::Codex => {
                 let file = dir.join("auth.json");
                 if is_stale(&file, harness, &slot.credentials) {

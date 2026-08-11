@@ -243,6 +243,16 @@ archive_chats = "on-settle"
 # id. Unset, those three reach no agent at all and the log says so once per
 # event. `docs/orchestrator.md` is the brief to open that chat with.
 # orchestrator_chat = "chat_01J8Z…"
+# Whether a dispatch writes the board's conventions into the instruction file
+# its runtime reads on its own — `CLAUDE.md` in the Claude config dir,
+# `AGENTS.md` in `CODEX_HOME`. On, because a Codex agent has no skill mechanism
+# and without this is the one agent on the box that has never heard of the board
+# that started it. Only the text between the `comet-board conventions` markers
+# is ours: your own instruction file is left exactly as it was around it, and
+# turning this off takes the block back out on the next dispatch. Worth turning
+# off on a box where a dispatch names no account — that one reads your own
+# ~/.claude/CLAUDE.md, so the block lands there. Also settable per route.
+# agent_instructions = true
 
 [linear]
 # Which state means "finished, waiting on a human". Uncomment and Linear moves

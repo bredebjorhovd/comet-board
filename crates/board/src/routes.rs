@@ -240,6 +240,7 @@ const ROUTE_KEYS: &[(&str, Kind)] = &[
     ("max_tool_calls", Kind::Str),
     ("archive_chats", Kind::Str),
     ("billing_guard", Kind::Str),
+    ("agent_instructions", Kind::Bool),
 ];
 
 /// The keys [`Edit::Default`] may set.
@@ -266,6 +267,11 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("retain_build_output", Kind::Str),
     ("archive_chats", Kind::Str),
     ("billing_guard", Kind::Str),
+    // The one write that reaches into a file the board does not own — the box
+    // user's own instruction file (gh#272). Here because turning it off is the
+    // whole opt-out, and the box where somebody wants it off is as likely to be
+    // reached over ssh as sat at.
+    ("agent_instructions", Kind::Bool),
 ];
 
 /// The keys [`Edit::Account`] may set on one `[account."<slot>"]` table.

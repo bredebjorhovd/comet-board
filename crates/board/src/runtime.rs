@@ -257,6 +257,26 @@ pub struct DispatchSpec {
     /// carries.
     #[serde(default)]
     pub turn_limits: comet_proto::TurnLimits,
+    /// Whether this attempt's runtime is handed the board's conventions in the
+    /// instruction file it reads on its own — `CLAUDE.md` in the Claude config
+    /// dir, `AGENTS.md` in `CODEX_HOME` (gh#272). The route's
+    /// `agent_instructions`, resolved against `[defaults]`.
+    ///
+    /// On the spec for [`Self::turn_limits`]' reason: the write belongs beside
+    /// the config dir the executor materializes, which is engine ground with no
+    /// board to ask. Unlike the turn limits it is *not* stamped on the chat —
+    /// the instruction file is a property of the account dir rather than of
+    /// this attempt, and a later run in the same chat reads whatever the most
+    /// recent dispatch on that dir left.
+    ///
+    /// `false` is not merely "do not write": the executor takes an existing
+    /// block back out ([`crate::conventions::apply`]), because account dirs are
+    /// reused and a route that opted out would otherwise keep serving whatever
+    /// the last dispatch left there. It is also what a spec that predates the
+    /// field deserializes to, which lands on the same behaviour a board with
+    /// the flag off would ask for.
+    #[serde(default)]
+    pub agent_instructions: bool,
     /// The brief: task title, body, links, and the board conventions
     /// (commit as you go, open a PR, `comet-board list --json` to poll).
     /// `{worktree}` may still be unresolved — see [`DispatchSpec::prompt_at`].
@@ -745,6 +765,7 @@ mod tests {
             push_repo: None,
             git_author: None,
             turn_limits: Default::default(),
+            agent_instructions: true,
             prompt: String::new(),
         }
     }

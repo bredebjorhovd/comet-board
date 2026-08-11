@@ -1,9 +1,16 @@
 # Board conventions for coding agents
 
 The canonical text every runtime's agent should have in context. Ported from
-herdr-board with the names swapped (herdr-board → comet-board, pane → chat);
-the markers are kept so an installer can write it into each runtime's global
-instruction file and a correction here reaches all of them.
+herdr-board with the names swapped (herdr-board → comet-board, pane → chat).
+
+The markers were kept so that an installer could write this into each runtime's
+global instruction file. One does, as of §gh#272 — but not from this file.
+`crates/board/src/conventions.rs` renders a *shorter* compiled-in block into
+`CLAUDE.md` / `AGENTS.md` on every dispatch, between these same markers, because
+what sits in an instruction file is in context on every turn and pays rent
+forever. This document stays the long canonical version: the place a correction
+is made and argued, and the text the two shipped short forms — the block and the
+`comet-board` skill — are answerable to.
 
 Nothing below is runtime-specific.
 

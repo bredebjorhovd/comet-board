@@ -1279,6 +1279,15 @@ pub fn print_config(cfg: &BoardConfig, host: Option<&str>, json: bool) -> Result
                 if let Some(n) = r.max_concurrent {
                     meta.push(format!("max_concurrent {n}"));
                 }
+                // Same rule for the instruction file (gh#272): named on the
+                // route that answers differently from the board, and nowhere
+                // else. `doctor` says what the board itself does.
+                if r.agent_instructions.is_some() {
+                    meta.push(format!(
+                        "agent_instructions {}",
+                        c.agent_instructions(Some(r))
+                    ));
+                }
                 println!("    {}", meta.join(" · "));
             }
             if !c.github.repos.is_empty() {

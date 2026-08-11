@@ -523,7 +523,8 @@ enum RoutesCommand {
         route: usize,
         /// One of: name, workspace, repo, runtime, account, branch_template,
         /// base, max_concurrent, max_duration, max_tool_failures,
-        /// max_tool_calls, archive_chats, billing_guard.
+        /// max_tool_calls, archive_chats, billing_guard,
+        /// agent_instructions.
         key: String,
         /// The new value. Omit with `--unset` to remove the key, which falls
         /// the route back to `[defaults]`.
@@ -537,7 +538,8 @@ enum RoutesCommand {
         /// One of: max_concurrent_per_workspace, branch_template, base,
         /// notify, notify_dispatcher, orchestrator_chat, new_source,
         /// max_duration, max_tool_failures, max_tool_calls, retain_worktrees,
-        /// retain_build_output, archive_chats, billing_guard.
+        /// retain_build_output, archive_chats, billing_guard,
+        /// agent_instructions.
         key: String,
         value: Option<String>,
         #[arg(long, conflicts_with = "value")]

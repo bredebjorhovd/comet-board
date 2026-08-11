@@ -783,6 +783,29 @@ pub struct Defaults {
     /// See [`crate::billing`].
     #[serde(default = "default_billing_guard")]
     pub billing_guard: String,
+    /// Whether a dispatch writes the board's conventions into the instruction
+    /// file its runtime reads — `CLAUDE.md` in the Claude config dir,
+    /// `AGENTS.md` in `CODEX_HOME` (gh#272). On by default. Overridden per
+    /// route.
+    ///
+    /// On, because the alternative is what the board did before: a Claude
+    /// dispatch found the skill in the config dir the engine pointed it at, and
+    /// a Codex one — which has no skill mechanism — was the one agent on the box
+    /// that had never heard of the board that started it. Nothing about the
+    /// contract is optional in the way a *setting* usually is; the flag exists
+    /// for the two boxes where the write is unwelcome rather than for the
+    /// choice being interesting.
+    ///
+    /// Which is: a box whose operator keeps their own `~/.claude/CLAUDE.md` and
+    /// wants nothing written into it (a dispatch naming no account reads
+    /// exactly that file, so that is where the block lands), and an account slot
+    /// shared with work that is not the board's. Turning it off does not merely
+    /// stop writing — the next dispatch on that route takes the block back out,
+    /// because slot dirs are reused and a stale contract is worse than none.
+    /// Everything outside the markers is left alone in both directions; see
+    /// [`crate::conventions`].
+    #[serde(default = "default_true")]
+    pub agent_instructions: bool,
     /// Per-model rate overrides for the spend figures (gh#182), in US dollars
     /// per million tokens:
     ///
@@ -951,6 +974,7 @@ impl Default for Defaults {
             retain_build_output: default_retain_build_output(),
             archive_chats: default_archive_chats(),
             billing_guard: default_billing_guard(),
+            agent_instructions: true,
             rates: BTreeMap::new(),
         }
     }
@@ -1211,6 +1235,17 @@ pub struct Route {
     /// side project is the one where the warning is noise on every dispatch.
     #[serde(default)]
     pub billing_guard: Option<String>,
+    /// Per-route override of `defaults.agent_instructions` (gh#272) — whether
+    /// this route's dispatches write the board's conventions into the
+    /// instruction file their runtime reads.
+    ///
+    /// Per route because the file belongs to an *account*, and routes are how
+    /// work is pointed at accounts: the route running the board's own repos
+    /// under a slot nothing else touches is not the route pointed at a
+    /// teammate's login that they also sit at. The second is the one worth
+    /// being able to answer separately.
+    #[serde(default)]
+    pub agent_instructions: Option<bool>,
 }
 
 impl Route {
@@ -1690,6 +1725,20 @@ impl RoutingConfig {
                 .ok()
                 .flatten()
         })
+    }
+
+    /// Does a dispatch on this route write the board's conventions into its
+    /// runtime's instruction file (gh#272)? The route's own answer, else
+    /// `defaults.agent_instructions`, which is on.
+    ///
+    /// Resolved at dispatch and carried on the spec, exactly as
+    /// [`Self::turn_limits`] is and for the same reason: the write happens
+    /// inside the engine, beside the config dir it just materialized, and that
+    /// code has no board to ask.
+    pub fn agent_instructions(&self, route: Option<&Route>) -> bool {
+        route
+            .and_then(|r| r.agent_instructions)
+            .unwrap_or(self.defaults.agent_instructions)
     }
 }
 
@@ -2497,6 +2546,45 @@ max_tool_calls = "off"
         // A route deleted from under a live attempt falls back to the
         // defaults, never to unbounded.
         assert_eq!(c.turn_limits(None).tool_failures, Some(10));
+    }
+
+    // ---- the instruction file (gh#272) ------------------------------------
+
+    #[test]
+    fn a_board_that_says_nothing_hands_its_agents_the_conventions() {
+        // On by default, because the thing it replaces is a Codex dispatch that
+        // had never heard of the board that started it.
+        assert!(RoutingConfig::default().agent_instructions(None));
+    }
+
+    #[test]
+    fn a_route_can_keep_its_account_out_of_it() {
+        let c = github(
+            r#"
+[defaults]
+agent_instructions = true
+
+[[route]]
+match = { label = "theirs" }
+workspace = "w"
+repo = "/tmp"
+runtime = "codex"
+account = "0011223344556677"
+agent_instructions = false
+
+[[route]]
+match = { label = "ours" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+"#,
+        );
+        assert!(!c.agent_instructions(Some(&c.routes[0])));
+        assert!(c.agent_instructions(Some(&c.routes[1])));
+        // And a board that turns it off everywhere turns it off for the route
+        // that never mentioned it.
+        let off = github("[defaults]\nagent_instructions = false\n");
+        assert!(!off.agent_instructions(None));
     }
 
     #[test]
