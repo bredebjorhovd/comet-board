@@ -79,6 +79,62 @@ pub fn push_url(repo: &str) -> String {
     format!("https://{APP_USERNAME}@github.com/{repo}.git")
 }
 
+/// The canonical remote for a repo — the URL a human would have typed, and the
+/// one a checkout should be left holding.
+pub fn https_url(repo: &str) -> String {
+    format!("https://github.com/{repo}.git")
+}
+
+/// How to speak to a repo somebody named: the URL git is given, the URL the
+/// checkout keeps, and the repo to mint a credential for (gh#316).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneUrls {
+    /// What `git clone` is handed. Carries `x-access-token@` for a GitHub repo,
+    /// so askpass has a username to answer against.
+    pub auth: String,
+    /// What `origin` ends up as — never the authenticating form.
+    pub canonical: String,
+    /// `owner/repo`, when this is a GitHub repo the board can mint for. `None`
+    /// means "not ours to authenticate": the URL is passed through untouched.
+    pub slug: Option<String>,
+}
+
+/// Read whatever the caller named — `owner/repo`, an HTTPS URL, an SSH remote —
+/// into the pair of URLs a clone should use.
+///
+/// **A GitHub repo is always cloned over HTTPS**, whichever form was asked for.
+/// An installation token is a password over HTTPS and nothing else; the SSH form
+/// authenticates with the *device's* keys, which on a freshly provisioned box are
+/// no keys at all — and its first failure is not even an authentication one, it
+/// is `Host key verification failed` against an empty `known_hosts`. That is the
+/// gh#316 failure, and rewriting the URL is what removes the whole class of it:
+/// the board can only lend the credential it has.
+///
+/// Anything that is not a GitHub repo — a `file://` origin, a GitLab remote, an
+/// absolute path — passes through unchanged and unauthenticated. The board has
+/// no credential for it and must not invent a URL for a host it does not know.
+///
+/// A bare `owner/repo` is read as GitHub's, the way [`crate::onboard::parse_slug`]
+/// reads it everywhere else. It is ambiguous with a *relative* path, and that
+/// ambiguity resolves the same way `onboard::checkout_path` resolves it: a clone
+/// is device-addressed, and a path relative to the engine's working directory on
+/// a machine nobody is sitting at is not something anybody means.
+pub fn clone_urls(named: &str) -> CloneUrls {
+    let named = named.trim();
+    match crate::onboard::parse_slug(named).ok() {
+        Some(slug) => CloneUrls {
+            auth: push_url(&slug),
+            canonical: https_url(&slug),
+            slug: Some(slug),
+        },
+        None => CloneUrls {
+            auth: named.to_string(),
+            canonical: named.to_string(),
+            slug: None,
+        },
+    }
+}
+
 /// The environment a `git push` needs to authenticate as the board's credential.
 ///
 /// `askpass` is the shim [`install_askpass_shim`] wrote — a path, because a
@@ -606,6 +662,56 @@ mod tests {
             .next()
             .unwrap();
         assert!(!userinfo.contains(':'), "the URL carries a password: {url}");
+    }
+
+    /// gh#316. Whatever form the repo was named in, a clone of it goes over
+    /// HTTPS with the board's username in the URL — that is the only form the
+    /// credential works over, and the SSH form on a fresh box fails on host keys
+    /// before it ever reaches authentication.
+    #[test]
+    fn a_github_repo_clones_over_https_however_it_was_named() {
+        for named in [
+            "bredebjorhovd/itsm-agent",
+            "https://github.com/bredebjorhovd/itsm-agent",
+            "https://github.com/bredebjorhovd/itsm-agent.git",
+            "git@github.com:bredebjorhovd/itsm-agent.git",
+            "ssh://git@github.com/bredebjorhovd/itsm-agent.git",
+            "  https://github.com/bredebjorhovd/itsm-agent/  ",
+        ] {
+            let urls = clone_urls(named);
+            assert_eq!(
+                urls.slug.as_deref(),
+                Some("bredebjorhovd/itsm-agent"),
+                "{named} named no repo to mint for"
+            );
+            assert_eq!(
+                urls.auth, "https://x-access-token@github.com/bredebjorhovd/itsm-agent.git",
+                "{named}"
+            );
+            // What the checkout is left holding: no userinfo, no ssh.
+            assert_eq!(
+                urls.canonical, "https://github.com/bredebjorhovd/itsm-agent.git",
+                "{named}"
+            );
+        }
+    }
+
+    /// The board has one credential and it is GitHub's. Anything else is
+    /// somebody else's remote: cloned exactly as it was written, with nothing
+    /// of ours attached to it.
+    #[test]
+    fn a_remote_that_is_not_github_is_passed_through_untouched() {
+        for named in [
+            "file:///srv/mirrors/thing.git",
+            "git@gitlab.com:offhand/tally.git",
+            "https://gitlab.com/offhand/tally.git",
+            "/home/comet/src/thing",
+        ] {
+            let urls = clone_urls(named);
+            assert_eq!(urls.slug, None, "{named} was read as a GitHub repo");
+            assert_eq!(urls.auth, named);
+            assert_eq!(urls.canonical, named);
+        }
     }
 
     #[test]

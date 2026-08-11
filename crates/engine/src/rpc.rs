@@ -993,6 +993,37 @@ impl EngineRpc {
         })
     }
 
+    /// `CloneRepo` — a clone into this device's repo folder, carrying the
+    /// board's credential (gh#316).
+    ///
+    /// The call is device-addressed ([`forwardable`]), so "this device" is
+    /// routinely *not* the one the operator is sitting at. That is the whole
+    /// problem it had: it ran a bare `git clone`, so a private repo the board
+    /// could see authenticated with whatever the target device's ambient git
+    /// config happened to offer — a `gh` login on the box, no keys and no
+    /// `known_hosts` on a fresh one — and failed there for reasons that belonged
+    /// to the machine rather than to the repo.
+    ///
+    /// A GitHub repo is now cloned the way the board clones everything else:
+    /// over HTTPS, through the askpass helper, with the credential minted at the
+    /// moment git asks. Anything else — a `file://` origin, somebody's GitLab
+    /// mirror — is cloned as it was named and authenticates as it always did,
+    /// since the board has no credential to lend it.
+    async fn clone_repo(&self, url: &str) -> Result<comet_proto::Repo, RpcError> {
+        let urls = comet_board::git_credentials::clone_urls(url);
+        // No board on this device is not a refusal here: a public repo (or one
+        // the box's own config can reach) still clones, exactly as it did before
+        // this method had a credential to offer.
+        let env = match (&urls.slug, self.board().ok()) {
+            (Some(slug), Some(board)) => clone_env(slug, board.paths()),
+            _ => vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+        };
+        self.repos
+            .clone_repo(&urls.auth, &urls.canonical, &env)
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))
+    }
+
     /// The repos the App can see, crossed with what the board already watches.
     async fn list_app_repos(&self) -> anyhow::Result<Vec<comet_board::onboard::Candidate>> {
         let paths = self.board()?.paths().clone();
@@ -1170,7 +1201,8 @@ impl EngineRpc {
     }
 }
 
-/// The environment an onboarding clone authenticates with (gh#97).
+/// The environment a clone authenticates with — onboarding's (gh#97) and
+/// `CloneRepo`'s (gh#316).
 ///
 /// The same pairs a dispatched agent's `git push` gets, for the same reason: the
 /// board's App is the credential that will push this repo's branches, so it is
@@ -1187,7 +1219,7 @@ fn clone_env(slug: &str, paths: &comet_board::config::Paths) -> Vec<(String, Str
         Ok(askpass) => comet_board::git_credentials::agent_env(&askpass, slug, paths),
         Err(err) => {
             tracing::warn!(
-                "onboard: no working askpass helper — cloning {slug} without the board's \
+                "clone: no working askpass helper — cloning {slug} without the board's \
                  credential ({err:#})"
             );
             vec![("GIT_TERMINAL_PROMPT".into(), "0".into())]
@@ -1832,11 +1864,7 @@ impl RpcService for EngineRpc {
                     url: String,
                 }
                 let p: P = parse_params(params)?;
-                let repo = self
-                    .repos
-                    .clone_repo(&p.url)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let repo = self.clone_repo(&p.url).await?;
                 RpcReply::value(&repo)
             }
             methods::CREATE_REPO => {
