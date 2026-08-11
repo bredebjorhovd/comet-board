@@ -636,6 +636,61 @@ pub fn skeleton_rows(id: &'static str, theme: &Theme, count: usize) -> AnyElemen
         .into_any_element()
 }
 
+/// The one line of a multi-line failure worth a one-line surface (gh#317).
+///
+/// git writes its diagnosis LAST and its progress chatter first, so a footer
+/// that keeps the head of the message keeps the least useful half of it:
+///
+/// ```text
+/// Cloning into '/home/comet/.comet-native/repos/itsm-agent'...   ← chatter
+/// Host key verification failed.
+/// fatal: Could not read from remote repository.                  ← the answer
+/// ```
+///
+/// Truncated to one line from the front, that reads as a clone in progress.
+/// From the back it reads as what happened. The engine's `git: ` prefix is kept
+/// (it says whose words these are) and the middle lines are not lost — every
+/// surface using this offers the whole message alongside, and the engine traces
+/// it at the failure.
+///
+/// Read from the back, but not blindly: git often signs off with a paragraph of
+/// advice ("Please make sure you have the correct access rights / and the
+/// repository exists.") whose last line says nothing at all. So the LAST line
+/// git marked as a diagnosis wins, and the last line of any kind is the
+/// fallback.
+pub fn error_headline(message: &str) -> String {
+    let (prefix, body) = match message.strip_prefix(GIT_PREFIX) {
+        Some(rest) => (GIT_PREFIX, rest),
+        None => ("", message),
+    };
+    let lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    match lines
+        .iter()
+        .rev()
+        .find(|line| is_diagnosis(line))
+        .or_else(|| lines.last())
+    {
+        Some(line) => format!("{prefix}{line}"),
+        // Nothing but whitespace after the prefix: say what there is.
+        None => message.trim().to_string(),
+    }
+}
+
+/// A line git wrote as its verdict rather than as chatter or advice.
+fn is_diagnosis(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    ["fatal:", "error:", "remote: error:", "remote: fatal:"]
+        .iter()
+        .any(|marker| line.starts_with(marker))
+}
+
+/// How `Repos::git_env` names git's own stderr.
+const GIT_PREFIX: &str = "git: ";
+
 /// Inline error row + Retry affordance (the caller attaches the listener to the
 /// returned id).
 pub fn error_row(theme: &Theme, message: &str) -> gpui::Div {
@@ -679,6 +734,65 @@ mod tests {
         // Empty / whitespace query keeps input order.
         assert_eq!(filter_indices("", &labels), vec![0, 1, 2, 3]);
         assert_eq!(filter_indices("   ", &labels), vec![0, 1, 2, 3]);
+    }
+
+    /// gh#317, verbatim: the message that cost an hour, and the line that would
+    /// have ended it in two minutes.
+    #[test]
+    fn a_git_error_is_headlined_by_its_last_line() {
+        let message = "git: Cloning into '/home/comet/.comet-native/repos/itsm-agent'...\n\
+                       Host key verification failed.\n\
+                       fatal: Could not read from remote repository.";
+        assert_eq!(
+            error_headline(message),
+            "git: fatal: Could not read from remote repository."
+        );
+    }
+
+    #[test]
+    fn a_one_line_error_is_its_own_headline() {
+        assert_eq!(error_headline("git: nope"), "git: nope");
+        assert_eq!(
+            error_headline("Engine not connected"),
+            "Engine not connected"
+        );
+        // Trailing blank lines are not the diagnosis.
+        assert_eq!(
+            error_headline("git: fatal: bad ref\n\n"),
+            "git: fatal: bad ref"
+        );
+        // Nothing to headline: whatever there is, trimmed.
+        assert_eq!(error_headline("git: \n  \n"), "git:");
+        assert_eq!(error_headline(""), "");
+    }
+
+    /// A message that is not git's keeps its own shape — the last line is still
+    /// the one a one-line surface should show.
+    #[test]
+    fn a_multi_line_message_without_the_git_prefix_keeps_no_prefix() {
+        assert_eq!(error_headline("first\nsecond"), "second");
+    }
+
+    /// git's parting advice is not its diagnosis. A clone of a path that is not
+    /// there ends four lines below the only line worth showing, and the last of
+    /// those four ("and the repository exists.") says nothing on its own.
+    #[test]
+    fn gits_closing_advice_does_not_outrank_its_verdict() {
+        let message = "git: Cloning into 'target'...\n\
+                       fatal: '/tmp/no-such-repo' does not appear to be a git repository\n\
+                       fatal: Could not read from remote repository.\n\
+                       \n\
+                       Please make sure you have the correct access rights\n\
+                       and the repository exists.";
+        assert_eq!(
+            error_headline(message),
+            "git: fatal: Could not read from remote repository."
+        );
+        // A push refused by the far end is marked the same way.
+        assert_eq!(
+            error_headline("git: remote: error: denied\nTo github.com:o/r.git"),
+            "git: remote: error: denied"
+        );
     }
 
     #[test]

@@ -34,6 +34,9 @@ reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tests/onboard_clone.rs` reads the log back: gh#317's claim is that a git
+# failure is written down, which is only testable with a subscriber attached.
+tracing-subscriber.workspace = true
 tokio-tungstenite.workspace = true
 # The fake edge in `tests/edge_reconnect.rs` answers real loro-protocol frames,
 # so the room clients under test take their production path end to end.

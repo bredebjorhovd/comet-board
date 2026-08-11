@@ -303,7 +303,13 @@ pub(super) struct AddSpaceFlow {
     /// Keyboard highlight within the FILTERED rows of whichever list is open.
     active: usize,
     submit_busy: bool,
+    /// The WHOLE of the last failure, git's every line of it. The footer has
+    /// room for one (`popover::error_headline`); the rest is a click away and
+    /// in the log (gh#317). Set through [`AddSpaceFlow::fail`], never directly.
     error: Option<SharedString>,
+    /// Briefly true after the footer's error was copied, so the chip can say so.
+    error_copied: bool,
+    copy_task: Option<Task<()>>,
     /// Tracked on the card (`track_focus`) — puts the card on the keyboard
     /// dispatch path so ↑↓/⌫/esc reach `add_space_key` while the search input
     /// holds focus (the structure every working picker uses).
@@ -322,6 +328,25 @@ pub(super) struct AddSpaceFlow {
 }
 
 impl AddSpaceFlow {
+    /// Land a failure on the footer, and write it down (gh#317).
+    ///
+    /// Always through here rather than by assignment: the footer shows one line
+    /// of what can be a dozen, so the whole message has to reach somewhere a
+    /// person can read it without a debugger — the app's own tracing, which is
+    /// also what a bug report can be asked for. The "Copied" chip belongs to the
+    /// message it copied, so it resets here too.
+    fn fail(&mut self, what: impl std::fmt::Display, message: impl Into<SharedString>) {
+        let message = message.into();
+        tracing::warn!(what = %what, error = %message, "add-space palette failed");
+        self.error = Some(message);
+        self.error_copied = false;
+    }
+
+    fn clear_error(&mut self) {
+        self.error = None;
+        self.error_copied = false;
+    }
+
     /// The board host an onboard clones onto, if the sweep found one.
     fn host(&self) -> Option<&RepoHost> {
         self.hosts.get(self.target).or_else(|| self.hosts.first())
@@ -2220,6 +2245,8 @@ impl Shell {
             active: 0,
             submit_busy: false,
             error: None,
+            error_copied: false,
+            copy_task: None,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
             focus_pending: true,
@@ -2229,6 +2256,21 @@ impl Shell {
             _search_events: search_events,
         });
         self.load_repo_hosts(cx);
+        cx.notify();
+    }
+
+    /// Capture knob (`COMET_OPEN_DIALOG=add-space-error`): land gh#316's clone
+    /// failure on the open palette, so the footer's one line can be looked at
+    /// without a board host, an App grant and a repo that really will not clone.
+    pub(super) fn seed_add_space_error(&mut self, cx: &mut Context<Self>) {
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.fail(
+                "capture knob",
+                "git: Cloning into '/home/comet/.comet-native/repos/itsm-agent'...\n\
+                 Host key verification failed.\n\
+                 fatal: Could not read from remote repository.",
+            );
+        }
         cx.notify();
     }
 
@@ -2243,7 +2285,7 @@ impl Shell {
         }
         flow.mode = mode;
         flow.active = 0;
-        flow.error = None;
+        flow.clear_error();
         flow.list_scroll.set_offset(gpui::Point::default());
         let search = flow.search.clone();
         let needs_browse = mode == AddSpaceMode::Folders && matches!(flow.browser, Loadable::Idle);
@@ -2420,7 +2462,7 @@ impl Shell {
         flow.home = None;
         flow.browser_repo = false;
         flow.active = 0;
-        flow.error = None;
+        flow.clear_error();
         let search = flow.search.clone();
         search.update(cx, |input, cx| input.set_text("", cx));
         self.load_space_folders(None, cx);
@@ -2483,7 +2525,7 @@ impl Shell {
     fn submit_onboard(&mut self, slug: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             if let Some(flow) = self.add_space.as_mut() {
-                flow.error = Some("Engine not connected".into());
+                flow.fail(format_args!("onboard {slug}"), "Engine not connected");
             }
             cx.notify();
             return;
@@ -2501,11 +2543,16 @@ impl Shell {
                 // Which of these is true decides what to do next, so the refusal
                 // has to say (gh#155): install a board, fix the relay, or go and
                 // wake the box.
-                flow.error = Some(match silence {
-                    Some(note) => format!("Nowhere to clone this repo yet — {note}").into(),
-                    None => "No device here hosts a board, so there is nowhere to clone this repo"
-                        .into(),
-                });
+                flow.fail(
+                    format_args!("onboard {slug}"),
+                    match silence {
+                        Some(note) => format!("Nowhere to clone this repo yet — {note}"),
+                        None => {
+                            "No device here hosts a board, so there is nowhere to clone this repo"
+                                .to_string()
+                        }
+                    },
+                );
             }
             cx.notify();
             return;
@@ -2516,9 +2563,10 @@ impl Shell {
         }
         if let Some(flow) = self.add_space.as_mut() {
             flow.onboarding = Some(slug.clone().into());
-            flow.error = None;
+            flow.clear_error();
         }
         cx.notify();
+        let failed_slug = slug.clone();
         self.repo_task_set(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::ONBOARD_REPO, params).await;
             this.update(cx, |shell, cx| {
@@ -2557,7 +2605,7 @@ impl Shell {
                     }
                     Err(message) => {
                         if let Some(flow) = shell.add_space.as_mut() {
-                            flow.error = Some(message.into());
+                            flow.fail(format_args!("onboard {failed_slug}"), message);
                         }
                     }
                 }
@@ -2565,6 +2613,36 @@ impl Shell {
             })
             .ok();
         }));
+    }
+
+    /// Put the WHOLE failure on the clipboard (gh#317).
+    ///
+    /// The footer shows one line of it, which is the line worth reading — but
+    /// the reader's next move is usually to tell somebody, and a person who
+    /// cannot read the error cannot report it. That is how gh#316 arrived as
+    /// "cloning to the box seems to be broken".
+    fn copy_add_space_error(&mut self, cx: &mut Context<Self>) {
+        let Some(message) = self.add_space.as_ref().and_then(|flow| flow.error.clone()) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(message.to_string()));
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut() {
+                    flow.error_copied = false;
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.error_copied = true;
+            flow.copy_task = Some(task);
+        }
+        cx.notify();
     }
 
     /// The current listing's folder rows filtered by the search query
@@ -2713,7 +2791,7 @@ impl Shell {
             return;
         };
         flow.submit_busy = true;
-        flow.error = None;
+        flow.clear_error();
         let space_id = uuid::Uuid::new_v4().to_string();
         // Optimistic echo: the watch frame carrying the real row replaces it
         // by id (apply_spaces re-sorts; same-id upsert is idempotent).
@@ -2758,7 +2836,7 @@ impl Shell {
                         });
                         if let Some(flow) = shell.add_space.as_mut() {
                             flow.submit_busy = false;
-                            flow.error = Some(format!("{err}").into());
+                            flow.fail("add space", format!("{err}"));
                         }
                     }
                 }
@@ -2914,12 +2992,13 @@ impl Shell {
                 window.focus(&handle, cx);
             }
         }
-        let (mode, search, error, active, focus, list_scroll, onboarding) = {
+        let (mode, search, error, error_copied, active, focus, list_scroll, onboarding) = {
             let flow = self.add_space.as_ref()?;
             (
                 flow.mode,
                 flow.search.clone(),
                 flow.error.clone(),
+                flow.error_copied,
                 flow.active,
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
@@ -3103,15 +3182,45 @@ impl Shell {
             .items_center()
             .gap(px(12.0))
             .children(hints)
+            // The failure gets ONE line here, and it is the last one (gh#317):
+            // git writes `Cloning into …` first and `fatal: …` last, so a line
+            // truncated from the front reads as a clone in progress while the
+            // diagnosis falls off the end. The rest of the message is one click
+            // away — and already in the log, which is where the reader who
+            // cannot fit it on this line goes next.
             .when_some(error, |el, message| {
+                let headline: SharedString = popover::error_headline(&message).into();
                 el.child(
                     div()
+                        .id("add-space-error")
                         .min_w_0()
                         .flex_1()
-                        .truncate()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(theme.danger)
-                        .child(message),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_add_space_error(cx)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.danger)
+                                .child(headline),
+                        )
+                        .child(
+                            key_chip(&theme)
+                                .id("add-space-error-copy")
+                                .flex_none()
+                                .hover(|s| s.bg(theme.white_alpha(0.09)))
+                                .child(SharedString::from(if error_copied {
+                                    "Copied"
+                                } else {
+                                    "Copy"
+                                })),
+                        ),
                 )
             });
 
