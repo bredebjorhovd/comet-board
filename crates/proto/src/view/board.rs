@@ -1278,13 +1278,76 @@ pub fn stack_line(row: &TaskRow) -> Option<String> {
     Some(parts.join(" · "))
 }
 
+/// What a merge confirmation has to say before the board takes the one action
+/// it cannot undo (gh#290).
+///
+/// The fact a confirm dialog exists to carry: merging a layer of a stack is not
+/// merging a pull request. GitHub merges — or queues — every layer up to and
+/// including the one asked for, as one atomic group, so a reader confirming on
+/// the third of five is confirming three pull requests. The board knows which
+/// three (gh#283 grouped them) and names them, because "and the 2 below it" is
+/// exactly the kind of phrasing that gets read as "and some other things".
+///
+/// Only the layers *below* appear: they are the ones that come along. The two
+/// above are untouched by this merge, and mentioning them would suggest
+/// otherwise. Already-merged layers are left out for the same reason — they are
+/// history in the chain, not cargo.
+///
+/// The board's own reservations come last and only when it has one. A reader who
+/// opened the confirm on a pull request the board does not think can land is the
+/// reader most in need of the sentence, and GitHub evaluates the rules at
+/// execution time rather than at submission, so nothing upstream will stop them.
+pub fn merge_confirmation(row: &TaskRow) -> String {
+    let what = match row.pr_number {
+        Some(n) => format!("PR #{n}"),
+        None => row.identifier.clone(),
+    };
+    // Where the merge lands: for a stack that is the stack's target, which is
+    // trunk, and not this layer's base — the branch below it disappears into
+    // the group merge.
+    let target = row
+        .stack
+        .as_ref()
+        .and_then(|s| s.base_ref.as_deref())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| base_of(row));
+    let below: Vec<&StackLayer> = row
+        .stack
+        .as_ref()
+        .map(|s| s.below(&row.id))
+        .unwrap_or_default()
+        .iter()
+        .filter(|l| l.open)
+        .collect();
+
+    let mut parts = vec![format!("merge {what} into {target}")];
+    if !below.is_empty() {
+        let names: Vec<String> = below.iter().map(|l| layer_name(l)).collect();
+        parts.push(format!(
+            "this lands {} with it — GitHub merges the group or none of it",
+            names.join(", ")
+        ));
+    }
+    // `Ready` is the one verdict that adds nothing here: the sentence above
+    // already said what merging does, and repeating "ready to land with 2
+    // below" after naming the two is noise.
+    if !landing(row).ready()
+        && let Some(note) = landing_note(row)
+    {
+        parts.push(note);
+    }
+    parts.join(" · ")
+}
+
 /// The stack map a detail surface draws, bottom layer first — one entry per
 /// sibling the board can see, this row included.
 ///
 /// Empty for a row that is not stacked, so a surface can call it
 /// unconditionally and draw nothing.
 pub fn stack_map(row: &TaskRow) -> &[StackLayer] {
-    row.stack.as_ref().map_or(&[], |stack| stack.layers.as_slice())
+    row.stack
+        .as_ref()
+        .map_or(&[], |stack| stack.layers.as_slice())
 }
 
 // ---------------------------------------------------------------------------
