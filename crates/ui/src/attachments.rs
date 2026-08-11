@@ -39,8 +39,8 @@ const MAX_READ_CHUNKS: usize = 1_000;
 // Text transport (message-attachments.ts)
 // ---------------------------------------------------------------------------
 
-/// The body used for image-only sends (`use-attachments.ts`).
-pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
+/// The body used for attachment-only sends (`use-attachments.ts`).
+pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached file(s).";
 
 /// How attachments ride the prompt (use-attachments.ts `withAttachments`):
 /// plain local paths appended to the text — the files are staged on the device
@@ -57,7 +57,7 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         text
     };
     format!(
-        "{body}\n\nAttached images (local files — open them to view):\n{}",
+        "{body}\n\nAttached files (local files — open them to view):\n{}",
         refs.join("\n")
     )
 }
@@ -84,33 +84,37 @@ fn name_from_path(path: &str) -> String {
         .map(str::trim)
         .unwrap_or_default();
     if name.is_empty() {
-        "image".to_string()
+        "file".to_string()
     } else {
         name.to_string()
     }
 }
 
 /// Find the refs trailer: a blank line, then a line starting (case-insensitive)
-/// with `Attached images (local files` and ending `):`. Returns
-/// `(body_end, refs_start)` byte offsets — the tolerant equivalent of comet's
-/// `ATTACHED_IMAGES_RE`.
+/// with `Attached images (local files` or `Attached files (local files` and
+/// ending `):`. Returns `(body_end, refs_start)` byte offsets — the tolerant
+/// equivalent of comet's `ATTACHED_IMAGES_RE`.
 fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
-    let needle = "\n\nattached images (local files";
-    let mut from = 0usize;
-    while let Some(rel) = lower[from..].find(needle) {
-        let gap = from + rel;
-        let line_start = gap + 2;
-        let line_end = content[line_start..]
-            .find('\n')
-            .map(|p| line_start + p)
-            .unwrap_or(content.len());
-        let line = content[line_start..line_end].trim_end_matches('\r');
-        if line.ends_with("):") {
-            let refs_start = (line_end + 1).min(content.len());
-            return Some((gap, refs_start));
+    for needle in [
+        "\n\nattached files (local files",
+        "\n\nattached images (local files",
+    ] {
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(needle) {
+            let gap = from + rel;
+            let line_start = gap + 2;
+            let line_end = content[line_start..]
+                .find('\n')
+                .map(|p| line_start + p)
+                .unwrap_or(content.len());
+            let line = content[line_start..line_end].trim_end_matches('\r');
+            if line.ends_with("):") {
+                let refs_start = (line_end + 1).min(content.len());
+                return Some((gap, refs_start));
+            }
+            from = line_start;
         }
-        from = line_start;
     }
     None
 }
@@ -155,7 +159,7 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
 }
 
 /// message-attachments.ts `userMessageRailText`: what the rail/sidebar shows
-/// for a user message ("Attached image" / "N attached images" when image-only).
+/// for a user message ("Attached file" / "N attached files" when file-only).
 pub fn user_message_rail_text(content: &str) -> String {
     let parsed = parse_user_message_images(content);
     if !parsed.text.trim().is_empty() {
@@ -163,8 +167,8 @@ pub fn user_message_rail_text(content: &str) -> String {
     }
     match parsed.attachments.len() {
         0 => content.to_string(),
-        1 => "Attached image".to_string(),
-        n => format!("{n} attached images"),
+        1 => "Attached file".to_string(),
+        n => format!("{n} attached files"),
     }
 }
 
@@ -172,54 +176,135 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// An image staged in the composer, before upload. The raw bytes live inside
-/// the [`Image`] (gpui decodes them at paint; the same Arc feeds thumbnails,
-/// the lightbox, the upload, and the post-send cache seed).
+/// An file staged in the composer, before upload. Raw bytes and MIME type are
+/// always set; for recognised image formats the decoded [`Image`] is also
+/// available (feeds thumbnails, the lightbox, and the post-send cache seed).
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
     /// File name with a type-matching extension (use-attachments.ts
-    /// `ensureExtension` — agents sniff images by extension).
+    /// `ensureExtension` — agents sniff files by extension).
     pub name: String,
-    pub image: Arc<Image>,
+    pub image: Option<Arc<Image>>,
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
 }
 
 impl StagedAttachment {
     pub fn bytes(&self) -> &[u8] {
-        &self.image.bytes
+        &self.bytes
+    }
+}
+
+/// MIME type for a file extension (mirrors the engine's `mime_by_ext`). Returns
+/// `application/octet-stream` for unrecognised extensions.
+pub fn mime_by_ext(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
+        Some("txt") | Some("text") => "text/plain",
+        Some("md") | Some("markdown") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("html") | Some("htm") => "text/html",
+        Some("css") => "text/css",
+        Some("js") | Some("mjs") => "text/javascript",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("yaml") | Some("yml") => "application/yaml",
+        Some("toml") => "application/toml",
+        Some("rs") => "text/rust",
+        Some("py") => "text/x-python",
+        Some("rb") => "text/x-ruby",
+        Some("c") => "text/x-c",
+        Some("h") | Some("hpp") | Some("hxx") => "text/x-c-header",
+        Some("cpp") | Some("cxx") | Some("cc") => "text/x-c++src",
+        Some("ts") | Some("tsx") => "text/typescript",
+        Some("jsx") => "text/jsx",
+        Some("sh") | Some("bash") => "text/x-shellscript",
+        Some("zsh") => "text/x-shellscript",
+        Some("sql") => "text/x-sql",
+        Some("diff") | Some("patch") => "text/x-diff",
+        Some("log") => "text/x-log",
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("zip") => "application/zip",
+        Some("tar") => "application/x-tar",
+        Some("gz") | Some("tgz") => "application/gzip",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") | Some("woff2") => "font/woff",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Check whether a file extension maps to an image format.
+pub fn is_image_extension(path: &Path) -> bool {
+    matches!(mime_by_ext(path), "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/svg+xml" | "image/bmp" | "image/tiff" | "image/avif" | "image/heic")
+}
+
+/// MIME type string for a gpui `ImageFormat`.
+pub fn mime_type_for_format(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::Gif => "image/gif",
+        ImageFormat::Webp => "image/webp",
+        ImageFormat::Svg => "image/svg+xml",
+        ImageFormat::Bmp => "image/bmp",
+        ImageFormat::Tiff => "image/tiff",
+        ImageFormat::Ico => "image/x-icon",
+        ImageFormat::Pnm => "image/x-portable-anymap",
     }
 }
 
 /// Image formats the whole pipeline supports: intersection of gpui's decoders
-/// and the engine's `mime_by_ext` read-back jail.
-pub fn format_by_extension(path: &Path) -> Option<ImageFormat> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "png" => Some(ImageFormat::Png),
-        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
-        "gif" => Some(ImageFormat::Gif),
-        "webp" => Some(ImageFormat::Webp),
-        "svg" => Some(ImageFormat::Svg),
-        "bmp" => Some(ImageFormat::Bmp),
-        "tif" | "tiff" => Some(ImageFormat::Tiff),
+/// and the engine's read-back.
+pub fn format_by_mime(mime: &str) -> Option<ImageFormat> {
+    match mime {
+        "image/png" => Some(ImageFormat::Png),
+        "image/jpeg" => Some(ImageFormat::Jpeg),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::Webp),
+        "image/svg+xml" => Some(ImageFormat::Svg),
+        "image/bmp" => Some(ImageFormat::Bmp),
+        "image/tiff" => Some(ImageFormat::Tiff),
         _ => None,
     }
 }
 
 /// use-attachments.ts `ensureExtension`: pasted screenshots often arrive as a
 /// bare "image" — make sure the staged name carries a type-matching extension.
-pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
+pub fn ensure_extension(name: &str, ext: &str) -> String {
     let has_ext = name
         .rsplit_once('.')
-        .map(|(stem, ext)| {
+        .map(|(stem, ext_part)| {
             !stem.is_empty()
-                && (2..=5).contains(&ext.len())
-                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && (2..=5).contains(&ext_part.len())
+                && ext_part.chars().all(|c| c.is_ascii_alphanumeric())
         })
         .unwrap_or(false);
     if has_ext {
         name.to_string()
     } else {
-        format!("{name}.{}", format.extension())
+        format!("{name}.{ext}")
     }
 }
 
@@ -229,29 +314,49 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     let display_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "image".to_string());
-    let Some(format) = format_by_extension(path) else {
-        return Err(format!("{display_name} is not a supported image."));
-    };
+        .unwrap_or_else(|| "file".to_string());
+    let mime_type = mime_by_ext(path).to_string();
+    let is_image = is_image_extension(path);
     let meta = std::fs::metadata(path).map_err(|_| format!("{display_name} could not be read."))?;
     if meta.len() > MAX_ATTACHMENT_BYTES {
         return Err(format!("{display_name} is too large (24 MB max)."));
     }
     let bytes = std::fs::read(path).map_err(|_| format!("{display_name} could not be read."))?;
+    let default_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let image = if is_image {
+        match format_by_mime(&mime_type) {
+            Some(fmt) => {
+                let img = Image::from_bytes(fmt, bytes.clone());
+                Some(Arc::new(img))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     Ok(StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
-        name: ensure_extension(&display_name, format),
-        image: Arc::new(Image::from_bytes(format, bytes)),
+        name: ensure_extension(&display_name, default_ext),
+        image,
+        bytes,
+        mime_type,
     })
 }
 
 /// Stage an image pasted from the clipboard.
 pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
     let format = image.format;
+    let bytes = image.bytes.clone();
+    let mime_type = mime_type_for_format(format).to_string();
     StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
-        name: ensure_extension("image", format),
-        image: Arc::new(image),
+        name: ensure_extension("image", format.extension()),
+        image: Some(Arc::new(image)),
+        bytes,
+        mime_type,
     }
 }
 
@@ -365,20 +470,21 @@ pub async fn upload_attachment(
         .ok_or_else(|| "upload commit returned no path".to_string())
 }
 
-/// A transcript image read back from the owning device.
-pub struct LoadedAttachmentImage {
+/// A transcript attachment read back from the owning device.
+pub struct LoadedAttachment {
     pub name: String,
-    pub image: Arc<Image>,
+    pub mime_type: String,
+    pub image: Option<Arc<Image>>,
 }
 
 /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
 /// the same stuck-offset guard as comet's `readAttachmentImage`).
-pub async fn read_attachment_image(
+pub async fn read_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
     path: &str,
-) -> Option<LoadedAttachmentImage> {
+) -> Option<LoadedAttachment> {
     let mut name = String::new();
     let mut mime = String::new();
     let mut b64 = String::new();
@@ -415,14 +521,16 @@ pub async fn read_attachment_image(
         return None;
     }
     let bytes = BASE64.decode(b64.as_bytes()).ok()?;
-    let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
-    Some(LoadedAttachmentImage {
+    let image = format_by_mime(&mime)
+        .map(|fmt| Arc::new(Image::from_bytes(fmt, bytes)));
+    Some(LoadedAttachment {
         name: if name.is_empty() {
             name_from_path(path)
         } else {
             name
         },
-        image: Arc::new(Image::from_bytes(format, bytes)),
+        mime_type: mime,
+        image,
     })
 }
 
@@ -430,18 +538,19 @@ pub async fn read_attachment_image(
 // Transcript image cache (transcript-attachment-cache.ts)
 // ---------------------------------------------------------------------------
 
-/// A decoded transcript image, ready for `img(...)`.
+/// A decoded transcript attachment, ready for rendering.
 #[derive(Clone)]
-pub struct CachedAttachmentImage {
+pub struct CachedAttachment {
     pub name: SharedString,
-    pub image: Arc<Image>,
+    pub mime_type: SharedString,
+    pub image: Option<Arc<Image>>,
 }
 
 /// What a render pass sees for one `(deviceId, path)` source.
 #[derive(Clone)]
 pub enum AttachmentSnapshot {
     Loading,
-    Loaded(CachedAttachmentImage),
+    Loaded(CachedAttachment),
     /// Load failed; `retry_in` is how long until [`begin_load`] would hand out
     /// another attempt (the exponential 2s→15s ladder from user-attachments.tsx).
     Error {
@@ -451,7 +560,7 @@ pub enum AttachmentSnapshot {
 
 enum CacheEntry {
     Loading { attempts: u32 },
-    Loaded(CachedAttachmentImage),
+    Loaded(CachedAttachment),
     Error { attempts: u32, at: Instant },
 }
 
@@ -502,10 +611,20 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
     }
 }
 
-pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
+pub fn store_loaded(
+    device_id: &str,
+    path: &str,
+    name: SharedString,
+    mime_type: SharedString,
+    image: Option<Arc<Image>>,
+) {
     cache().lock().unwrap().insert(
         key(device_id, path),
-        CacheEntry::Loaded(CachedAttachmentImage { name, image }),
+        CacheEntry::Loaded(CachedAttachment {
+            name,
+            mime_type,
+            image,
+        }),
     );
 }
 
@@ -527,8 +646,20 @@ pub fn store_error(device_id: &str, path: &str) {
 
 /// Seed the cache after a successful upload (composer send path) so the just-
 /// sent bubble's thumbnails render from local bytes instead of a round-trip.
-pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image>) {
-    store_loaded(device_id, path, name.to_string().into(), image);
+pub fn seed_attachment(
+    device_id: &str,
+    path: &str,
+    name: &str,
+    mime_type: &str,
+    image: Option<Arc<Image>>,
+) {
+    store_loaded(
+        device_id,
+        path,
+        name.to_string().into(),
+        mime_type.to_string().into(),
+        image,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +675,7 @@ pub struct PreviewImage {
 
 /// The bare lightbox: dim scrim, the image at ≤85vh/90vw, the file name under
 /// it. Any click closes (the whole dialog is the close button, as in the
-/// original's `cursor-zoom-out` figure).
+/// original's `cursor-zoom-out` figure). Only valid for image attachments.
 pub fn lightbox(
     viewport: Size<gpui::Pixels>,
     preview: &PreviewImage,
@@ -627,24 +758,30 @@ mod tests {
 
     #[test]
     fn marker_is_case_insensitive_and_requires_ref_lines() {
+        // New-style "files" marker
         let parsed = parse_user_message_images(
-            "hi\n\nATTACHED IMAGES (local files — open them to view):\n- /p/q.png",
+            "hi\n\nATTACHED FILES (local files — open them to view):\n- /p/q.png",
         );
         assert_eq!(parsed.attachments.len(), 1);
+        // Old-style "images" marker (legacy compatibility)
+        let old = parse_user_message_images(
+            "hi\n\nAttached images (local files — open them to view):\n- /p/q.png",
+        );
+        assert_eq!(old.attachments.len(), 1);
         // A trailer with no valid `- path` lines is left as plain text.
         let empty = parse_user_message_images(
-            "hi\n\nAttached images (local files — open them to view):\nnothing",
+            "hi\n\nAttached files (local files — open them to view):\nnothing",
         );
         assert!(empty.attachments.is_empty());
-        assert!(empty.text.contains("Attached images"));
+        assert!(empty.text.contains("Attached files"));
     }
 
     #[test]
-    fn rail_text_summarizes_image_only_sends() {
+    fn rail_text_summarizes_attachment_only_sends() {
         let one = with_attachments("", &["/a/b.png".to_string()]);
-        assert_eq!(user_message_rail_text(&one), "Attached image");
+        assert_eq!(user_message_rail_text(&one), "Attached file");
         let two = with_attachments("", &["/a/b.png".to_string(), "/c/d.png".into()]);
-        assert_eq!(user_message_rail_text(&two), "2 attached images");
+        assert_eq!(user_message_rail_text(&two), "2 attached files");
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");
@@ -652,34 +789,25 @@ mod tests {
 
     #[test]
     fn ensure_extension_matches_browser_heuristic() {
-        assert_eq!(ensure_extension("shot.png", ImageFormat::Png), "shot.png");
-        assert_eq!(ensure_extension("image", ImageFormat::Png), "image.png");
-        assert_eq!(
-            ensure_extension("photo.j", ImageFormat::Jpeg),
-            "photo.j.jpg"
-        );
-        assert_eq!(
-            ensure_extension("archive.tar.gz", ImageFormat::Png),
-            "archive.tar.gz"
-        );
+        assert_eq!(ensure_extension("shot.png", "png"), "shot.png");
+        assert_eq!(ensure_extension("image", "png"), "image.png");
+        assert_eq!(ensure_extension("photo.j", "jpg"), "photo.j.jpg");
+        assert_eq!(ensure_extension("archive.tar.gz", "png"), "archive.tar.gz");
     }
 
     #[test]
-    fn supported_formats_match_engine_jail() {
-        for (ext, expect) in [
-            ("png", Some(ImageFormat::Png)),
-            ("JPG", Some(ImageFormat::Jpeg)),
-            ("webp", Some(ImageFormat::Webp)),
-            ("svg", Some(ImageFormat::Svg)),
-            ("ico", None),
-            ("txt", None),
-        ] {
-            assert_eq!(
-                format_by_extension(Path::new(&format!("f.{ext}"))),
-                expect,
-                "ext {ext}"
-            );
-        }
+    fn mime_by_extension_covers_all() {
+        assert_eq!(mime_by_ext(Path::new("f.png")), "image/png");
+        assert_eq!(mime_by_ext(Path::new("f.JPG")), "image/jpeg");
+        assert_eq!(mime_by_ext(Path::new("f.webp")), "image/webp");
+        assert_eq!(mime_by_ext(Path::new("f.txt")), "text/plain");
+        assert_eq!(mime_by_ext(Path::new("f.pdf")), "application/pdf");
+        assert_eq!(mime_by_ext(Path::new("f.unknown")), "application/octet-stream");
+        assert!(is_image_extension(Path::new("f.png")));
+        assert!(is_image_extension(Path::new("f.JPG")));
+        assert!(!is_image_extension(Path::new("f.txt")));
+        assert!(!is_image_extension(Path::new("f.pdf")));
+        assert!(!is_image_extension(Path::new("f.bin")));
     }
 
     #[test]

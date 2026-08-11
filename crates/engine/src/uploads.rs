@@ -15,10 +15,9 @@
 //! reads local-first (`read_chunk` proxies through the owning device), so the
 //! GET fallback is the disaster path, not the hot path.
 //!
-//! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
-//! only files under the uploads dir or a workspace-known chat cwd are readable
-//! (the RPC layer supplies the cwd roots) — and only supported image types, as
-//! in comet.
+//! `read_chunk` serves transcript attachments back in 45KB base64 chunks. Path
+//! jail: only files under the uploads dir or a workspace-known chat cwd are
+//! readable (the RPC layer supplies the cwd roots).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -242,8 +241,7 @@ impl Uploads {
         if meta.len() > MAX_BYTES {
             return Err(EngineError::Other("Attachment is too large".into()));
         }
-        let mime_type = mime_by_ext(&resolved)
-            .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?;
+        let mime_type = mime_by_ext(&resolved);
         Ok(InspectedFile {
             name: resolved
                 .file_name()
@@ -262,9 +260,7 @@ impl Uploads {
             return;
         };
         let sha = hex(&Sha256::digest(&bytes));
-        let mime = mime_by_ext(path)
-            .unwrap_or("application/octet-stream")
-            .to_string();
+        let mime = mime_by_ext(path).to_string();
         let url = format!("{}/attachments/{sha}", edge.url.trim_end_matches('/'));
         let http = self.inner.http.clone();
         tokio::spawn(async move {
@@ -360,18 +356,82 @@ fn sanitize(file_name: &str) -> String {
     }
 }
 
-fn mime_by_ext(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "svg" => Some("image/svg+xml"),
-        "bmp" => Some("image/bmp"),
-        "tif" | "tiff" => Some("image/tiff"),
-        "avif" => Some("image/avif"),
-        "heic" => Some("image/heic"),
-        _ => None,
+fn mime_by_ext(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        // Images
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
+        // Text / code
+        Some("txt") | Some("text") => "text/plain",
+        Some("md") | Some("markdown") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("html") | Some("htm") => "text/html",
+        Some("css") => "text/css",
+        Some("js") | Some("mjs") => "text/javascript",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("yaml") | Some("yml") => "application/yaml",
+        Some("toml") => "application/toml",
+        Some("rs") => "text/rust",
+        Some("py") => "text/x-python",
+        Some("rb") => "text/x-ruby",
+        Some("c") => "text/x-c",
+        Some("h") | Some("hpp") | Some("hxx") => "text/x-c-header",
+        Some("cpp") | Some("cxx") | Some("cc") => "text/x-c++src",
+        Some("ts") | Some("tsx") => "text/typescript",
+        Some("jsx") => "text/jsx",
+        Some("sh") | Some("bash") => "text/x-shellscript",
+        Some("zsh") => "text/x-shellscript",
+        Some("fish") => "text/x-fish",
+        Some("sql") => "text/x-sql",
+        Some("diff") | Some("patch") => "text/x-diff",
+        Some("log") => "text/x-log",
+        // Documents
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        // Archives
+        Some("zip") => "application/zip",
+        Some("tar") => "application/x-tar",
+        Some("gz") | Some("tgz") => "application/gzip",
+        Some("bz2") => "application/x-bzip2",
+        Some("xz") => "application/x-xz",
+        Some("7z") => "application/x-7z-compressed",
+        Some("rar") => "application/vnd.rar",
+        // Audio
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") | Some("oga") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("aac") => "audio/aac",
+        Some("m4a") => "audio/mp4",
+        // Video
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("avi") => "video/x-msvideo",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        // Fonts
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        // Binary / other
+        Some("wasm") => "application/wasm",
+        Some("bin") => "application/octet-stream",
+        Some("exe") | Some("dll") | Some("so") | Some("dylib") => "application/octet-stream",
+        _ => "application/octet-stream",
     }
 }
 

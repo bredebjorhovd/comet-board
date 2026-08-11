@@ -504,11 +504,14 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .read_chunk(&outside.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
         .expect("cwd-rooted read");
     assert_eq!(BASE64.decode(&ok.data).expect("data"), b"nope");
-    // Non-image extensions are refused even inside the jail (comet parity).
+    // Non-image extensions are now readable (all file types supported).
     let text = PathBuf::from(uploads.dir()).join("notes.txt");
     std::fs::create_dir_all(uploads.dir()).expect("uploads dir");
     std::fs::write(&text, b"text").expect("txt");
-    assert!(uploads.read_chunk(&text.to_string_lossy(), 0, &[]).is_err());
+    let ok = uploads
+        .read_chunk(&text.to_string_lossy(), 0, &[])
+        .expect("txt readable");
+    assert_eq!(BASE64.decode(&ok.data).expect("data"), b"text");
 
     // Bogus upload ids never become paths.
     assert!(uploads.append("../evil", "aGk=", None).is_err());

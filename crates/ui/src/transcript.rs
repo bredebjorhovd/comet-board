@@ -1411,8 +1411,8 @@ impl Transcript {
     ) -> crate::attachments::AttachmentSnapshot {
         use crate::attachments::{AttachmentSnapshot, attachment_snapshot, begin_load};
         for dev in device_ids {
-            if let AttachmentSnapshot::Loaded(image) = attachment_snapshot(dev, path) {
-                return AttachmentSnapshot::Loaded(image);
+            if let AttachmentSnapshot::Loaded(att) = attachment_snapshot(dev, path) {
+                return AttachmentSnapshot::Loaded(att);
             }
         }
         let mut any_loading = false;
@@ -1422,7 +1422,7 @@ impl Transcript {
                 self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
             }
             match attachment_snapshot(dev, path) {
-                AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
+                AttachmentSnapshot::Loaded(att) => return AttachmentSnapshot::Loaded(att),
                 AttachmentSnapshot::Loading => any_loading = true,
                 AttachmentSnapshot::Error { retry_in } => {
                     min_retry = Some(min_retry.map_or(retry_in, |m| m.min(retry_in)));
@@ -1447,7 +1447,7 @@ impl Transcript {
     }
 
     fn spawn_attachment_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
-        use crate::attachments::{read_attachment_image, store_error, store_loaded};
+        use crate::attachments::{read_attachment, store_error, store_loaded};
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             store_error(&device_id, &path);
             return;
@@ -1458,10 +1458,16 @@ impl Transcript {
         let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
         let key = (device_id.clone(), path.clone());
         let task = cx.spawn(async move |this, cx| {
-            match read_attachment_image(&engine, cx.background_executor(), target.as_deref(), &path)
+            match read_attachment(&engine, cx.background_executor(), target.as_deref(), &path)
                 .await
             {
-                Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
+                Some(loaded) => store_loaded(
+                    &device_id,
+                    &path,
+                    loaded.name.into(),
+                    loaded.mime_type.into(),
+                    loaded.image,
+                ),
                 None => store_error(&device_id, &path),
             }
             this.update(cx, |transcript, cx| {
@@ -1530,27 +1536,46 @@ impl Transcript {
                 .rounded(px(Theme::RADIUS_ROW))
                 .overflow_hidden();
             let thumb: AnyElement = match state {
-                AttachmentSnapshot::Loaded(image) => {
-                    let preview = crate::attachments::PreviewImage {
-                        name: image.name.clone(),
-                        image: image.image.clone(),
-                    };
-                    frame
-                        .id(SharedString::from(format!("{row_id}#att{aix}")))
-                        .border_1()
-                        .border_color(theme.white_alpha(0.11))
-                        .bg(theme.white_alpha(0.035))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.attachment_preview = Some(preview.clone());
-                            cx.notify();
-                        }))
-                        .child(
-                            img(image.image.clone())
-                                .size_full()
-                                .object_fit(ObjectFit::Cover),
-                        )
-                        .into_any_element()
+                AttachmentSnapshot::Loaded(att) => {
+                    if let Some(image) = &att.image {
+                        let preview = crate::attachments::PreviewImage {
+                            name: att.name.clone(),
+                            image: image.clone(),
+                        };
+                        frame
+                            .id(SharedString::from(format!("{row_id}#att{aix}")))
+                            .border_1()
+                            .border_color(theme.white_alpha(0.11))
+                            .bg(theme.white_alpha(0.035))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.attachment_preview = Some(preview.clone());
+                                cx.notify();
+                            }))
+                            .child(
+                                img(image.clone())
+                                    .size_full()
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                            .into_any_element()
+                    } else {
+                        // Non-image file: show file name chip
+                        frame
+                            .id(SharedString::from(format!("{row_id}#att{aix}")))
+                            .border_1()
+                            .border_color(theme.white_alpha(0.11))
+                            .bg(theme.white_alpha(0.035))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(theme.text_muted)
+                                    .child(att.name.clone()),
+                            )
+                            .into_any_element()
+                    }
                 }
                 // Errored/unavailable: the dashed "missing" thumb.
                 AttachmentSnapshot::Error { .. } => frame

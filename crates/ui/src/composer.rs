@@ -1803,10 +1803,11 @@ impl Composer {
                 .collect();
             if std::env::var("COMET_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
+                && let Some(image) = &first.image
             {
                 composer.preview = Some(attachments::PreviewImage {
                     name: first.name.clone().into(),
-                    image: first.image.clone(),
+                    image: image.clone(),
                 });
             }
             if !staged.is_empty() {
@@ -1852,15 +1853,11 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
+    /// Stage files from disk (picker / drop / pasted paths). All file types are
+    /// accepted; read failures and oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut staged = Vec::new();
         for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
             match attachments::stage_file(path) {
                 Ok(att) => staged.push(att),
                 Err(message) => {
@@ -1899,34 +1896,60 @@ impl Composer {
             .pt(px(STRIP_PAD_TOP));
         for (ix, att) in staged.iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let preview = attachments::PreviewImage {
-                name: att.name.clone().into(),
-                image: att.image.clone(),
-            };
             let remove_id = att.id.clone();
+
+            // Build the thumb container with the remove button overlay
+            let thumb_content: AnyElement = if let Some(image) = &att.image {
+                let preview = attachments::PreviewImage {
+                    name: att.name.clone().into(),
+                    image: image.clone(),
+                };
+                let preview_clone = preview.clone();
+                div()
+                    .id(("composer-att-thumb", ix))
+                    .size(px(STRIP_THUMB))
+                    .rounded(px(Theme::RADIUS_ROW))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme.white_alpha(0.10))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.preview = Some(preview_clone.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        img(image.clone())
+                            .size_full()
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            } else {
+                // Non-image file: show file name label
+                div()
+                    .id(("composer-att-thumb", ix))
+                    .px(px(8.0))
+                    .h(px(STRIP_THUMB))
+                    .rounded(px(Theme::RADIUS_ROW))
+                    .bg(theme.white_alpha(0.06))
+                    .border_1()
+                    .border_color(theme.white_alpha(0.10))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(att.name.as_str())),
+                    )
+                    .into_any_element()
+            };
+
             strip = strip.child(
                 div()
                     .group(group.clone())
                     .relative()
-                    .child(
-                        div()
-                            .id(("composer-att-thumb", ix))
-                            .size(px(STRIP_THUMB))
-                            .rounded(px(Theme::RADIUS_ROW))
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(theme.white_alpha(0.10))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.preview = Some(preview.clone());
-                                cx.notify();
-                            }))
-                            .child(
-                                img(att.image.clone())
-                                    .size_full()
-                                    .object_fit(ObjectFit::Cover),
-                            ),
-                    )
+                    .child(thumb_content)
                     .child(
                         div()
                             .id(("composer-att-remove", ix))
@@ -2524,9 +2547,21 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        attachments::seed_attachment(
+                            &seed_device,
+                            path,
+                            &att.name,
+                            &att.mime_type,
+                            att.image.clone(),
+                        );
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_attachment(
+                                &device_id,
+                                path,
+                                &att.name,
+                                &att.mime_type,
+                                att.image.clone(),
+                            );
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
