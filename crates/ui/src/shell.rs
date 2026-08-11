@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, IntoElement,
+    KeyBinding, Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
+    SharedString, Subscription, Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use comet_proto::view::account as view_account;
@@ -800,9 +800,18 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         // Capture knob: the add-space palette needs only the device registry.
-        if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
+        // `add-space-error` opens it already carrying a failed clone (gh#317) —
+        // the footer's one line is otherwise reachable only with a real board
+        // host, a real App grant and a repo that really cannot be cloned.
+        let wants_error = self.debug_dialog.as_deref() == Some("add-space-error");
+        if (self.debug_dialog.as_deref() == Some("add-space") || wants_error)
+            && !state.read(cx).devices.is_empty()
+        {
             self.debug_dialog = None;
             self.open_add_space(cx);
+            if wants_error {
+                self.seed_add_space_error(cx);
+            }
         }
         // Capture knob: pop the requested dialog once chats have landed.
         if let Some(which) = self.debug_dialog.clone()

@@ -73,6 +73,37 @@ fn default_worktrees_root() -> PathBuf {
     comet_board::config::worktrees_root()
 }
 
+/// How loudly a failing git command is written down (gh#317).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Noise {
+    /// Failure is news: it broke something a person asked for.
+    Loud,
+    /// Failure is the answer to a question ("is this a repo?"), so it goes to
+    /// `debug` — a probe that warned on every non-repo folder would make the
+    /// warn stream useless on the day it matters.
+    Probe,
+}
+
+/// The command as it goes into the log: `git <args>`, with any URL password
+/// blanked.
+///
+/// The URL itself is kept on purpose — gh#316 was a clone that failed over
+/// *which* URL it used, and a log line that omits it cannot answer that. Only
+/// the `:password` half of a URL's userinfo is blanked; the board's own
+/// `x-access-token@` is a username, not a secret, and reading it in the log is
+/// how you tell an authenticated clone from an ambient one.
+fn redacted_command(args: &[&str]) -> String {
+    let mut out = String::from("git");
+    for arg in args {
+        out.push(' ');
+        out.push_str(&loggable_url(arg));
+    }
+    out
+}
+
+/// `scheme://user:secret@host/…` → `scheme://user:***@host/…`. Anything that is
+/// not a URL with a password comes back untouched.
+
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
@@ -138,6 +169,14 @@ impl Repos {
         self.git_env(args, cwd, &[]).await
     }
 
+    /// [`Repos::git`] for a command whose failure is an ANSWER rather than a
+    /// fault: "is this a repo?", "does this branch exist?", "has it a remote?".
+    /// Those fail constantly and by design, and logging them at `warn` would
+    /// bury the one failure a reader is looking for (gh#317).
+    async fn git_probe(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+        self.run_git(args, cwd, &[], Noise::Probe).await
+    }
+
     /// [`Repos::git`], with extra environment for the child.
     ///
     /// The environment is how a credential reaches git without being written
@@ -150,6 +189,24 @@ impl Repos {
         cwd: Option<&Path>,
         env: &[(String, String)],
     ) -> Result<String, EngineError> {
+        self.run_git(args, cwd, env, Noise::Loud).await
+    }
+
+    /// The one place a `git` child is spawned — and the one place its failure is
+    /// written down.
+    ///
+    /// Every git failure is traced here, with git's WHOLE stderr, because the
+    /// caller's copy of it goes to a screen that has room for one line (gh#317).
+    /// The half-truth on that line cost an hour of live reproduction across
+    /// three watchers to diagnose (gh#316) for want of the two lines git had
+    /// already written and nobody kept.
+    async fn run_git(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        noise: Noise,
+    ) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args);
         if let Some(cwd) = cwd {
@@ -159,13 +216,34 @@ impl Repos {
             cmd.env(k, v);
         }
         cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        let output = cmd.output().await.map_err(|e| {
+            let command = redacted_command(args);
+            tracing::warn!(command, error = %e, "git spawn failed");
+            EngineError::Other(format!("git spawn failed: {e}"))
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
+            let command = redacted_command(args);
+            let cwd = cwd.map(|p| p.display().to_string());
+            // The whole of git's stderr, every line of it: the last line is the
+            // diagnosis, and it is exactly the one a footer drops.
+            match noise {
+                Noise::Loud => tracing::warn!(
+                    command,
+                    cwd,
+                    status = %output.status,
+                    stderr = message,
+                    "git failed"
+                ),
+                Noise::Probe => tracing::debug!(
+                    command,
+                    cwd,
+                    status = %output.status,
+                    stderr = message,
+                    "git probe failed"
+                ),
+            }
             return Err(EngineError::Other(if message.is_empty() {
                 format!(
                     "git {} failed ({})",
@@ -192,7 +270,7 @@ impl Repos {
     /// Is `path` inside a git work tree? (Also the SpacesSync git-presence probe.)
     pub async fn is_repo(&self, path: &Path) -> bool {
         matches!(
-            self.git(&["rev-parse", "--is-inside-work-tree"], Some(path)).await,
+            self.git_probe(&["rev-parse", "--is-inside-work-tree"], Some(path)).await,
             Ok(out) if out == "true"
         )
     }
@@ -402,7 +480,7 @@ impl Repos {
     /// The `origin` of a checkout, or `None` when the path is not one. The
     /// existing-clone probe onboarding decides reuse on.
     pub async fn origin_url(&self, path: &Path) -> Option<String> {
-        self.git(&["remote", "get-url", "origin"], Some(path))
+        self.git_probe(&["remote", "get-url", "origin"], Some(path))
             .await
             .ok()
             .filter(|s| !s.is_empty())
@@ -801,7 +879,7 @@ impl Repos {
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
-        self.git(
+        self.git_probe(
             &[
                 "show-ref",
                 "--verify",
@@ -1098,6 +1176,36 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a failed git command puts in the log. The URL stays — gh#316 turned
+    /// on which one was used — but a password in it does not.
+    #[test]
+    fn a_logged_command_keeps_the_url_and_drops_the_password() {
+        assert_eq!(
+            redacted_command(&["clone", "https://github.com/o/r.git", "/tmp/r"]),
+            "git clone https://github.com/o/r.git /tmp/r"
+        );
+        // The board's own credential form: a username, and worth reading — it
+        // is how you tell an authenticated clone from an ambient one.
+        assert_eq!(
+            redacted_command(&["clone", "https://x-access-token@github.com/o/r.git"]),
+            "git clone https://x-access-token@github.com/o/r.git"
+        );
+        assert_eq!(
+            redacted_command(&["clone", "https://user:ghp_secret@github.com/o/r.git"]),
+            "git clone https://user:***@github.com/o/r.git"
+        );
+        // Not userinfo: an `@` in the path, and an SSH remote's `user@host`
+        // (no scheme, so nothing to mistake for a password either way).
+        assert_eq!(
+            loggable_url("https://github.com/o/r/blob/main/a@b"),
+            "https://github.com/o/r/blob/main/a@b"
+        );
+        assert_eq!(
+            loggable_url("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
 
     #[test]
     fn a_clone_url_names_the_folder_it_lands_in() {

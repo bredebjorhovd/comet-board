@@ -149,6 +149,134 @@ async fn an_occupied_target_is_refused_before_git_is_asked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// gh#317: the failure is written down, and whole.
+///
+/// The error string reaches a footer with room for one line of it, so the log
+/// is the only place the other lines exist. Without this, diagnosing gh#316
+/// took an hour of live reproduction across three watchers to recover two lines
+/// git had already written and nobody kept.
+#[tokio::test]
+async fn a_failed_clone_is_traced_with_every_line_git_wrote() {
+    let dir = scratch("traced");
+    let repos = Repos::with_worktrees_root(&dir.join("data"), "device-test", dir.join("worktrees"));
+    let target = dir.join("dev").join("nothing");
+    let url = format!("file://{}", dir.join("no-such-repo").display());
+
+    let (log, _guard) = capture::attach();
+    let err = repos
+        .clone_to(
+            &url,
+            &url,
+            &target,
+            &[("GIT_TERMINAL_PROMPT".into(), "0".into())],
+        )
+        .await
+        .expect_err("cloning a repo that is not there fails");
+    let lines = log.take();
+
+    // The error the caller carries is git's whole stderr — the RPC and the
+    // clipboard hand on what the footer cannot fit.
+    let message = format!("{err}");
+    assert!(
+        message.contains("does not appear to be a git repository"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Could not read from remote repository"),
+        "{message}"
+    );
+
+    // And it is in the log, at WARN, with the command that failed — gh#316
+    // turned on *which URL* was used, which a log line that omits it cannot
+    // answer.
+    let warned = lines
+        .iter()
+        .find(|line| line.starts_with("WARN") && line.contains("git failed"))
+        .unwrap_or_else(|| panic!("no warning for the failed clone in {lines:#?}"));
+    assert!(
+        warned.contains("Could not read from remote repository"),
+        "{warned}"
+    );
+    assert!(
+        warned.contains("does not appear to be a git repository"),
+        "{warned}"
+    );
+    assert!(warned.contains(&url), "{warned}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A probe whose failure is its answer stays out of the warn stream: it fails
+/// on every folder that is not a checkout, and a warning that is always on is
+/// one nobody reads on the day the box goes quiet.
+#[tokio::test]
+async fn a_probe_that_fails_by_design_does_not_warn() {
+    let dir = scratch("probe");
+    let repos = Repos::with_worktrees_root(&dir.join("data"), "device-test", dir.join("worktrees"));
+    let plain = dir.join("plain");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+
+    let (log, _guard) = capture::attach();
+    assert!(!repos.is_repo(&plain).await);
+    assert_eq!(repos.origin_url(&plain).await, None);
+    let lines = log.take();
+
+    assert!(
+        lines.iter().all(|line| !line.starts_with("WARN")),
+        "a folder that is not a repo is an answer, not news: {lines:#?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reading the log back inside a test: a layer that keeps every event as
+/// `LEVEL message field=value …`.
+mod capture {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    #[derive(Clone, Default)]
+    pub struct Log(Arc<Mutex<Vec<String>>>);
+
+    impl Log {
+        pub fn take(&self) -> Vec<String> {
+            std::mem::take(&mut self.0.lock().expect("log lock"))
+        }
+    }
+
+    /// Attach a capturing subscriber to THIS thread — where a `#[tokio::test]`
+    /// runs its futures — for as long as the returned guard is held.
+    pub fn attach() -> (Log, tracing::subscriber::DefaultGuard) {
+        let log = Log::default();
+        let guard = tracing_subscriber::registry()
+            .with(tracing::level_filters::LevelFilter::TRACE)
+            .with(log.clone())
+            .set_default();
+        (log, guard)
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Log {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            struct Fields<'a>(&'a mut String);
+            impl Visit for Fields<'_> {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    use std::fmt::Write as _;
+                    let _ = match field.name() {
+                        "message" => write!(self.0, " {value:?}"),
+                        name => write!(self.0, " {name}={value:?}"),
+                    };
+                }
+            }
+            let mut line = event.metadata().level().to_string();
+            event.record(&mut Fields(&mut line));
+            self.0.lock().expect("log lock").push(line);
+        }
+    }
+}
+
 /// `origin_url` is what decides between "reuse this checkout" and "refuse
 /// this directory", so it has to answer `None` for a folder that is not a
 /// checkout rather than erroring into the reuse path.

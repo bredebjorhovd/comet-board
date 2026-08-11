@@ -329,7 +329,8 @@ pub struct Pickers {
     /// In-flight mid-session `SwitchRef` (the ref being switched to).
     switching: Option<String>,
     switch_task: Option<Task<()>>,
-    /// Last mid-session switch failure (shown in the ref popover).
+    /// Last mid-session switch failure, WHOLE (the popover shows one line of
+    /// it — `popover::error_headline` — and the log keeps the rest, gh#317).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
@@ -337,6 +338,14 @@ pub struct Pickers {
 }
 
 impl Pickers {
+    /// A switch that failed says so on the popover — one line of it — and in
+    /// the log, all of it (gh#317). git's stderr is usually three lines with
+    /// the diagnosis on the last, and the popover is one line wide.
+    fn fail_switch(&mut self, message: String) {
+        tracing::warn!(error = %message, "ref switch failed");
+        self.switch_error = Some(message);
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         // PaletteSearch context: binds only text-editing keys, so ↑↓/enter
         // bubble to the popover frame and drive the list beneath the input —
@@ -911,7 +920,7 @@ impl Pickers {
                         pickers.open = None;
                         pickers.ensure_refs(true, cx);
                     }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
+                    Err(err) => pickers.fail_switch(err.to_string()),
                 }
                 cx.notify();
             })
@@ -1002,7 +1011,7 @@ impl Pickers {
                         // Checkout state changed — refresh tags/current.
                         pickers.ensure_refs(true, cx);
                     }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
+                    Err(err) => pickers.fail_switch(err.to_string()),
                 }
                 cx.notify();
             })
@@ -1882,8 +1891,10 @@ impl Pickers {
             .child(self.search_box(&theme))
             .child(body);
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
-        // git's own message, under a hairline.
+        // git's own message, under a hairline — its LAST line, which is the one
+        // git puts the diagnosis on (gh#317). The whole of it is in the log.
         if let Some(error) = &self.switch_error {
+            let headline = popover::error_headline(error);
             popover = popover.child(
                 popover::menu_section(&theme).child(
                     div()
@@ -1891,7 +1902,7 @@ impl Pickers {
                         .py(px(4.0))
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.danger_text())
-                        .child(SharedString::from(error.clone())),
+                        .child(SharedString::from(headline)),
                 ),
             );
         }
