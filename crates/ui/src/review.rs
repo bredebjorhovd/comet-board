@@ -13,9 +13,11 @@
 //! **The layout is inverted, and the inversion is the argument.** Everywhere
 //! else in this app the chat is the content and the diff is the reference in a
 //! dock. During review that is backwards: the review takes the main card and
-//! the authoring session becomes the narrow column beside it. The shell owns
-//! that half (`shell::Route::Review`) — what this module renders is the card
-//! itself.
+//! the authoring session becomes the narrow column beside it — in the dock's
+//! own slot on the right (gh#276), because the reference is what goes there
+//! and during a review the session is the reference. The shell owns that half
+//! (`shell::Route::Review`) — what this module renders is the card itself, and
+//! `docs/design/review.md` is the list of claims it is checked against.
 //!
 //! **Prose alone marks its own homework.** A summary written by the model that
 //! wrote the code inherits its blind spots: a misunderstanding comes back
@@ -99,6 +101,7 @@ use comet_proto::view::board;
 use comet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::icons::{self, icon};
 use crate::motion;
 use crate::popover;
 use crate::state::AppState;
@@ -119,10 +122,10 @@ const BRIEF_MAX_H: f32 = 220.0;
 const FILE_GUTTER: f32 = 10.0;
 
 /// How tall the delivery preview is allowed to be before it fades out
-/// (§gh#239). Enough for the header, a verdict, a sentence and a couple of
-/// unclaimed lines — the shape of the payload rather than all of it, which is
-/// what the fade says.
-const PREVIEW_MAX_H: f32 = 168.0;
+/// (§gh#239, review.md I6). Enough for the header, a verdict, a sentence and a
+/// couple of unclaimed lines — the shape of the payload rather than all of it,
+/// which is what the fade says.
+const PREVIEW_MAX_H: f32 = 196.0;
 
 /// Where the preview starts fading, as the design gives it: a mask from 72% of
 /// the card's height to its bottom edge. Expressed as the band
@@ -161,9 +164,57 @@ const PILL_TINT: f32 = 0.14;
 
 /// The diff strip that closes the body (§gh#238): `9px 12px` inside a hairline
 /// row. Tighter vertically than a section, because it is a signpost and not a
-/// section — the reading is over by the time a reader reaches it.
+/// section — the reading is over by the time a reader reaches it. The unclaimed
+/// block's rows take the same measures, so the two read as one table.
 const STRIP_PX: f32 = 12.0;
 const STRIP_PY: f32 = 9.0;
+
+/// The label column every band shares (review.md C2/D2): "Asked for",
+/// "Effects", "Evidence". One width, so the three bodies start on one line —
+/// which is what makes three different kinds of fact read as one column.
+const LABEL_W: f32 = 62.0;
+
+/// A band's own vertical padding, on the card's [`Theme::SPACE_LG`] sides.
+const BAND_PY: f32 = 11.0;
+
+/// The canvas's one gutter that is not on the spacing scale: between a band's
+/// label and its body, between the facts in the header, and between the cells
+/// of a row. Named rather than repeated, because it is one measure.
+const BAND_GAP: f32 = 10.0;
+
+/// A claim's chip (review.md E7): one step under the effects row's, and with
+/// no dot. The claims are a column of cards and the chips inside them are
+/// annotations on a sentence; at the effects row's weight they would compete
+/// with the sentence they annotate.
+const CLAIM_CHIP_H: f32 = 20.0;
+const CLAIM_CHIP_PAD: f32 = 7.0;
+
+/// The claim card's glyph column, and how far its glyph sits below the cap
+/// height of the sentence beside it.
+const GLYPH_W: f32 = 14.0;
+const GLYPH_NUDGE: f32 = 2.0;
+
+/// The unclaimed block's three weights of its own hue (review.md F1/F2): the
+/// border, the header's bed, and the hairline under the header. One hue at
+/// three strengths rather than three colours.
+const ALARM_BORDER: f32 = 0.32;
+const ALARM_BED: f32 = 0.09;
+const ALARM_RULE: f32 = 0.22;
+
+/// How loud the header's aside is against the header it sits in.
+const ALARM_ASIDE: f32 = 0.75;
+
+/// A header control (review.md B2): the links out, at the titlebar's own
+/// icon-button size.
+const ICON_BTN: f32 = 24.0;
+const ICON_GLYPH: f32 = 14.0;
+
+/// A fact's glyph on the header's second row (review.md B5).
+const FACT_GLYPH: f32 = 12.0;
+
+/// A verdict control in the bar (review.md H4).
+const VERDICT_H: f32 = 28.0;
+const VERDICT_PX: f32 = 11.0;
 
 /// What the review card asks the shell to do, because it cannot do it itself.
 ///
@@ -446,7 +497,10 @@ impl ReviewPanel {
     fn claim_glyph(mark: ClaimMark, theme: &Theme) -> AnyElement {
         div()
             .flex_none()
-            .w(px(10.0))
+            .w(px(GLYPH_W))
+            .pt(px(GLYPH_NUDGE))
+            .flex()
+            .justify_center()
             .font_family(theme.font_mono.clone())
             .text_size(px(Theme::TEXT_CAPTION))
             .text_color(Self::claim_color(mark, theme))
@@ -518,42 +572,99 @@ impl ReviewPanel {
     }
 
     /// A row of chips that wraps, because the effects row is five sentences and
-    /// the card is not always wide.
+    /// the card is not always wide. The canvas's `6px 8px`: tighter between
+    /// wrapped lines than along one, so a wrapped row still reads as a row.
     fn chip_row(chips: &[Chip], theme: &Theme) -> AnyElement {
         div()
             .flex()
             .flex_row()
             .flex_wrap()
-            .gap(px(6.0))
+            .gap_y(px(6.0))
+            .gap_x(px(Theme::SPACE_SM))
             .children(chips.iter().map(|chip| Self::chip(chip, theme)))
             .into_any_element()
     }
 
-    /// A section heading: the label, and the aside that qualifies it.
-    fn heading(theme: &Theme, title: &str, aside: Option<String>) -> AnyElement {
+    /// A chip under a claim (review.md E7/E8): 20 high, no dot.
+    ///
+    /// The same two grounds the effects row uses, said with the fill alone —
+    /// a dot on a chip this size is a speck, and the row it sits in is already
+    /// indented under a glyph that carries the claim's own state.
+    fn claim_chip(chip: &Chip, theme: &Theme) -> AnyElement {
+        let (hue, text) = Self::chip_colors(chip.ground, theme);
+        let tinted = matches!(chip.ground, Ground::Settled | Ground::Working);
         div()
+            .flex_none()
+            .h(px(CLAIM_CHIP_H))
+            .px(px(CLAIM_CHIP_PAD))
+            .flex()
+            .items_center()
+            .rounded(px(Theme::RADIUS_CHIP))
+            .bg(if tinted {
+                hue.opacity(CHIP_TINT)
+            } else {
+                theme.wash(0.08)
+            })
+            .text_size(px(Theme::TEXT_CAPTION))
+            .text_color(text)
+            .child(SharedString::from(chip.text.clone()))
+            .into_any_element()
+    }
+
+    /// One anchor, as the claim named it (review.md E8): the `--chip` wash,
+    /// mono, at the claim chip's measures so the two kinds line up as one row.
+    fn anchor_chip(anchor: &str, theme: &Theme) -> AnyElement {
+        div()
+            .flex_none()
+            .h(px(CLAIM_CHIP_H))
+            .px(px(CLAIM_CHIP_PAD))
+            .flex()
+            .items_center()
+            .rounded(px(Theme::RADIUS_CHIP))
+            .bg(theme.wash(0.08))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(Theme::TEXT_CAPTION))
+            .text_color(theme.text_subtle)
+            .child(SharedString::from(anchor.to_string()))
+            .into_any_element()
+    }
+
+    /// A full-bleed band (review.md C/D): a label in a fixed column, and a
+    /// body that starts where every other band's body starts.
+    ///
+    /// The card's top half is bands and its bottom half is inset blocks, and
+    /// that is the whole of its rhythm. A band is told from its neighbour by a
+    /// hairline and — for the brief — by tone; never by a heading, which is
+    /// what the uppercase labels used to be.
+    fn band(
+        theme: &Theme,
+        label: &'static str,
+        nudge: f32,
+        raised: bool,
+        body: AnyElement,
+    ) -> AnyElement {
+        div()
+            .flex_none()
             .flex()
             .flex_row()
-            .items_baseline()
-            .gap(px(Theme::SPACE_SM))
+            .items_start()
+            .gap(px(BAND_GAP))
+            .px(px(Theme::SPACE_LG))
+            .py(px(BAND_PY))
+            .border_b_1()
+            .border_color(theme.border)
+            .when(raised, |el| el.bg(theme.surface_raised))
             .child(
                 div()
                     .flex_none()
+                    .w(px(LABEL_W))
+                    .pt(px(nudge))
                     .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_subtle)
-                    .child(SharedString::from(title.to_string())),
+                    .child(SharedString::from(label)),
             )
-            .when_some(aside, |el, aside| {
-                el.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(aside)),
-                )
-            })
+            .child(div().flex_1().min_w_0().child(body))
             .into_any_element()
     }
 
@@ -617,68 +728,55 @@ impl ReviewPanel {
             .filter_map(|path| changed.iter().find(|f| &f.path == path))
             .map(|file| Self::file_row(file, theme, false))
             .collect();
-        div()
+        // Everything the claim carries, in one column beside the glyph: the
+        // sentence, then what stands behind it. A card rather than a row
+        // (review.md E3) — the sentence and its evidence are one unit, and a
+        // hairline around them is what says so on a screen of five sections.
+        let body = div()
+            .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_XS))
+            .gap(px(7.0))
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap(px(6.0))
-                    .child(Self::claim_glyph(mark, theme))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .text_color(if unsupported {
-                                theme.text_muted
-                            } else {
-                                theme.text
-                            })
-                            .child(SharedString::from(claim.text.clone())),
-                    ),
+                    .min_w_0()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .line_height(px(19.0))
+                    .text_color(if unsupported {
+                        theme.text_muted
+                    } else {
+                        theme.text
+                    })
+                    .child(SharedString::from(claim.text.clone())),
             )
-            // The evidence for this one claim, directly under it — because a
-            // sentence and the thing that checks it are one unit, and a reader
-            // scanning claims must not have to go looking for the second half.
-            .when(!chips.is_empty(), |el| {
-                el.child(div().pl(px(16.0)).child(Self::chip_row(&chips, theme)))
-            })
-            // What the claim named, as it named it. The file rows below are
-            // what those anchors *reached*, which for a symbol is not the same
-            // list and for a directory is longer than one.
-            .when(!claim.files.is_empty() || !claim.symbols.is_empty(), |el| {
-                el.child(div().pl(px(16.0)).child(
-                    div().flex().flex_row().flex_wrap().gap(px(4.0)).children(
-                        claim.files.iter().chain(&claim.symbols).map(|anchor| {
-                            div()
-                                .flex_none()
-                                .h(px(CHIP_H))
-                                .px(px(CHIP_PAD))
-                                .flex()
-                                .items_center()
-                                .rounded(px(Theme::RADIUS_CHIP))
-                                .bg(theme.wash(0.08))
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .text_color(theme.text_subtle)
-                                .child(SharedString::from(anchor.clone()))
-                        }),
-                    ),
-                ))
-            })
+            // The evidence for this one claim, and the anchors it named, on one
+            // wrapping row: what checks it and what it is about are the same
+            // annotation, and two rows of chips under one sentence read as two
+            // claims.
+            .when(
+                !chips.is_empty() || !claim.files.is_empty() || !claim.symbols.is_empty(),
+                |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_y(px(5.0))
+                            .gap_x(px(7.0))
+                            .children(chips.iter().map(|chip| Self::claim_chip(chip, theme)))
+                            .children(
+                                claim
+                                    .files
+                                    .iter()
+                                    .chain(&claim.symbols)
+                                    .map(|anchor| Self::anchor_chip(anchor, theme)),
+                            ),
+                    )
+                },
+            )
             .when(!matched.is_empty(), |el| {
-                el.child(
-                    div()
-                        .pl(px(16.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .children(matched),
-                )
+                el.child(div().flex().flex_col().gap(px(2.0)).children(matched))
             })
             // An anchor the diff refuses, labelled by what kind it was
             // (§gh#235): "unchanged" is what a reviewer goes and checks about a
@@ -690,7 +788,6 @@ impl ReviewPanel {
                     AnchorKind::Symbol => format!("not in the diff  {anchor}"),
                 };
                 div()
-                    .pl(px(16.0))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -699,13 +796,31 @@ impl ReviewPanel {
                     .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(theme.danger)
                     .child(SharedString::from(label))
-            }))
+            }));
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(BAND_GAP))
+            .px(px(Theme::SPACE_MD))
+            .py(px(BAND_GAP))
+            .rounded(px(Theme::RADIUS_ROW))
+            .border_1()
+            .border_color(theme.border)
+            .child(Self::claim_glyph(mark, theme))
+            .child(body)
             .into_any_element()
     }
 
     /// The verdict strip: one line under the header, in the tone the reading
     /// gave it. Never absent — a review with nothing to report still says what
     /// it checked, or a quiet screen reads as a screen that failed to load.
+    ///
+    /// A band like the three under it (review.md C/D) rather than a tinted
+    /// card of its own, and quiet even when the reading is loud: it says the
+    /// same thing the unclaimed block's header says, and two blocks shouting
+    /// the same number leaves the screen with nothing to shout with. The hue
+    /// is carried by the glyph and the copy, and the bed stays the card's.
     fn render_verdict(verdict: &Verdict, theme: &Theme) -> AnyElement {
         let color = Self::tone_color(verdict.tone, theme);
         div()
@@ -713,26 +828,19 @@ impl ReviewPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .px(px(Theme::SPACE_MD))
-            .py(px(Theme::SPACE_SM))
-            .rounded(px(Theme::RADIUS_ROW))
-            .border_1()
-            .border_color(if verdict.tone.loud() {
-                color.opacity(0.45)
-            } else {
-                theme.border
-            })
-            .bg(if verdict.tone.loud() {
-                color.opacity(0.10)
-            } else {
-                theme.wash(0.03)
-            })
+            .gap(px(BAND_GAP))
+            .px(px(Theme::SPACE_LG))
+            .py(px(BAND_PY))
+            .border_b_1()
+            .border_color(theme.border)
             .child(
                 div()
                     .flex_none()
+                    .w(px(GLYPH_W))
+                    .flex()
+                    .justify_center()
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(Theme::TEXT_BODY))
+                    .text_size(px(Theme::TEXT_CAPTION))
                     .text_color(color)
                     .child(SharedString::from(if verdict.tone.loud() {
                         "!"
@@ -751,7 +859,7 @@ impl ReviewPanel {
                         gpui::FontWeight::NORMAL
                     })
                     .text_color(if verdict.tone.loud() {
-                        theme.text
+                        color
                     } else {
                         theme.text_muted
                     })
@@ -788,25 +896,77 @@ impl ReviewPanel {
                 .child(SharedString::from(board::NO_BODY))
                 .into_any_element(),
         };
+        // The band's label says what this is; the issue's URL is not repeated
+        // beside it, because the header's own control opens the issue and a
+        // link nobody can click is decoration (review.md C4, B2).
+        Self::band(
+            theme,
+            "Asked for",
+            GLYPH_NUDGE,
+            true,
+            div()
+                .id("review-brief")
+                .max_h(px(BRIEF_MAX_H))
+                .overflow_y_scroll()
+                .track_scroll(&self.brief_scroll)
+                .flex()
+                .flex_col()
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// The claims section's own heading (review.md E1): what it is, how many
+    /// of them, and — on the right — where the evidence under them came from.
+    ///
+    /// The aside is the section's whole argument in six words, and it is worth
+    /// the line: everything else on this screen is the agent's account of
+    /// itself, and this is the part that is not.
+    fn claims_heading(theme: &Theme, count: Option<String>, aside: &'static str) -> AnyElement {
         div()
+            .flex_none()
             .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .child(Self::heading(
-                theme,
-                "THE BRIEF",
-                Some(review.brief.url.clone()),
-            ))
+            .flex_row()
+            .items_center()
+            .gap(px(BAND_GAP))
+            .px(px(Theme::SPACE_LG))
+            .pt(px(BAND_PY))
+            .pb(px(Theme::SPACE_XS))
             .child(
                 div()
-                    .id("review-brief")
-                    .max_h(px(BRIEF_MAX_H))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.brief_scroll)
-                    .flex()
-                    .flex_col()
-                    .child(body),
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from("What it says it did")),
             )
+            .children(count.map(|count| {
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(count))
+            }))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(aside)),
+            )
+            .into_any_element()
+    }
+
+    /// One line where a claim card would be: the section's three empty states,
+    /// inset to the cards' own column so the section keeps its shape.
+    fn claims_line(color: gpui::Hsla, text: &'static str) -> AnyElement {
+        div()
+            .flex_none()
+            .px(px(Theme::SPACE_LG))
+            .text_size(px(Theme::TEXT_BODY))
+            .text_color(color)
+            .child(SharedString::from(text))
             .into_any_element()
     }
 
@@ -818,21 +978,19 @@ impl ReviewPanel {
         // went missing — the refusal is printed whole, since it names the line.
         if let Some(err) = &review.claims_error {
             return div()
+                .flex_none()
                 .flex()
                 .flex_col()
-                .gap(px(Theme::SPACE_SM))
-                .child(Self::heading(theme, "CLAIMS", Some("unreadable".into())))
+                .gap(px(Theme::SPACE_XS))
+                .child(Self::claims_heading(theme, None, "unreadable"))
+                .child(Self::claims_line(
+                    theme.text,
+                    "This attempt wrote a claims block the board could not parse, \
+                     so nothing was recorded from it.",
+                ))
                 .child(
                     div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text)
-                        .child(SharedString::from(
-                            "This attempt wrote a claims block the board could not parse, \
-                             so nothing was recorded from it.",
-                        )),
-                )
-                .child(
-                    div()
+                        .px(px(Theme::SPACE_LG))
                         .font_family(theme.font_mono.clone())
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.danger)
@@ -844,51 +1002,53 @@ impl ReviewPanel {
         // last place they could be flattened into one.
         if !review.claimed() {
             return div()
+                .flex_none()
                 .flex()
                 .flex_col()
-                .gap(px(Theme::SPACE_SM))
-                .child(Self::heading(theme, "CLAIMS", None))
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from(
-                            "This attempt never answered the claim contract. \
-                             Nothing here is asserted, and nothing is checked.",
-                        )),
-                )
+                .gap(px(Theme::SPACE_XS))
+                .child(Self::claims_heading(
+                    theme,
+                    None,
+                    "evidence gathered by the board, not the agent",
+                ))
+                .child(Self::claims_line(
+                    theme.text_subtle,
+                    "This attempt never answered the claim contract. \
+                     Nothing here is asserted, and nothing is checked.",
+                ))
                 .into_any_element();
         }
-        // `claimed()` is `claimed_at.is_some()`, so past the guard above there
-        // is always a timestamp to name.
-        let aside = review
-            .claimed_at
-            .as_deref()
-            .map(|at| format!("submitted {at}"));
         let claims: Vec<AnyElement> = review
             .remainder
             .claims
             .iter()
             .map(|claim| Self::claim_row(review, claim, &review.changed, theme))
             .collect();
+        let count = match claims.len() {
+            1 => "1 claim".to_string(),
+            n => format!("{n} claims"),
+        };
         div()
+            .flex_none()
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .child(Self::heading(theme, "CLAIMS", aside))
+            .child(Self::claims_heading(
+                theme,
+                Some(count),
+                "evidence gathered by the board, not the agent",
+            ))
             .when(claims.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from("Asked, and claimed nothing at all.")),
-                )
+                el.child(Self::claims_line(
+                    theme.text_subtle,
+                    "Asked, and claimed nothing at all.",
+                ))
             })
             .child(
                 div()
+                    .px(px(Theme::SPACE_LG))
                     .flex()
                     .flex_col()
-                    .gap(px(Theme::SPACE_MD))
+                    .gap(px(Theme::SPACE_SM))
                     .children(claims),
             )
             .into_any_element()
@@ -903,13 +1063,13 @@ impl ReviewPanel {
     /// exists, and it is the design's own.
     fn render_effects(review: &AttemptReview, theme: &Theme) -> AnyElement {
         let chips = review.effect_chips();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .child(Self::heading(theme, "EFFECTS", None))
-            .child(Self::chip_row(&chips, theme))
-            .into_any_element()
+        Self::band(
+            theme,
+            "Effects",
+            GLYPH_NUDGE + 1.0,
+            false,
+            Self::chip_row(&chips, theme),
+        )
     }
 
     /// What the board saw for itself: the commands the run executed, and how
@@ -918,20 +1078,19 @@ impl ReviewPanel {
     fn render_evidence(review: &AttemptReview, theme: &Theme) -> AnyElement {
         let evidence = &review.evidence;
         if evidence.commands == 0 {
-            return div()
-                .flex()
-                .flex_col()
-                .gap(px(Theme::SPACE_SM))
-                .child(Self::heading(theme, "EVIDENCE", None))
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from(
-                            "The board recorded no commands for this run.",
-                        )),
-                )
-                .into_any_element();
+            return Self::band(
+                theme,
+                "Evidence",
+                GLYPH_NUDGE,
+                false,
+                div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(
+                        "The board recorded no commands for this run.",
+                    ))
+                    .into_any_element(),
+            );
         }
         let aside = format!(
             "{} commands · {} exited non-zero",
@@ -974,29 +1133,43 @@ impl ReviewPanel {
                     .into_any_element()
             })
             .collect();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .child(Self::heading(theme, "EVIDENCE", Some(aside)))
-            .when(rows.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from("Nothing that verifies anything ran.")),
-                )
-            })
-            .child(div().flex().flex_col().gap(px(3.0)).children(rows))
-            .when(evidence.truncated, |el| {
-                el.child(
+        Self::band(
+            theme,
+            "Evidence",
+            GLYPH_NUDGE,
+            false,
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .when(rows.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from("Nothing that verifies anything ran.")),
+                    )
+                })
+                .children(rows)
+                .when(evidence.truncated, |el| {
+                    el.child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from("…and more; the list is capped.")),
+                    )
+                })
+                // The denominator, under the list rather than beside the label:
+                // "0 checks among 214 commands" is the finding the list itself
+                // cannot make, and it is the last thing to read, not the first.
+                .child(
                     div()
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_faint)
-                        .child(SharedString::from("…and more; the list is capped.")),
+                        .child(SharedString::from(aside)),
                 )
-            })
-            .into_any_element()
+                .into_any_element(),
+        )
     }
 
     /// The remainder — the only block on this screen that is allowed to shout.
@@ -1007,23 +1180,12 @@ impl ReviewPanel {
     /// of the same shape.
     fn render_remainder(review: &AttemptReview, theme: &Theme) -> AnyElement {
         if let DiffSource::Unavailable { reason } = &review.diff {
-            return div()
-                .flex()
-                .flex_col()
-                .gap(px(Theme::SPACE_SM))
-                .child(Self::heading(theme, "UNCLAIMED", None))
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from(format!(
-                            "Unknown — there is no diff to check against: {reason}"
-                        ))),
-                )
-                .into_any_element();
+            return Self::quiet_block(
+                theme.text_subtle,
+                format!("Unclaimed unknown — there is no diff to check against: {reason}"),
+            );
         }
         let loud = !review.remainder.complete();
-        let total = review.changed.len();
         let notes: Vec<AnyElement> = review
             .findings()
             .into_iter()
@@ -1047,63 +1209,14 @@ impl ReviewPanel {
             })
             .collect();
 
-        let body = div()
+        // Everything that is not the block itself: the notes, and where the
+        // diff came from. Quiet lines under it, inset to its column.
+        let footnotes = div()
+            .flex_none()
+            .px(px(Theme::SPACE_LG))
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .when(loud, |el| {
-                el.child(
-                    // The count as a figure (gh#174's one off-ramp size): this
-                    // is the number the screen exists to produce.
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_baseline()
-                        .gap(px(Theme::SPACE_SM))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(Theme::TEXT_FIGURE))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.danger)
-                                .child(SharedString::from(
-                                    review.remainder.unclaimed.len().to_string(),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(Theme::TEXT_BODY))
-                                .text_color(theme.text)
-                                .child(SharedString::from(format!(
-                                    "of {total} changed files are claimed by nobody"
-                                ))),
-                        ),
-                )
-                .child(
-                    div().flex().flex_col().gap(px(2.0)).children(
-                        review
-                            .remainder
-                            .unclaimed
-                            .iter()
-                            .map(|file| Self::file_row(file, theme, true)),
-                    ),
-                )
-            })
-            // No count here: the verdict strip at the top of the card already
-            // carries it, and the same number said twice on one screen is the
-            // reader wondering which of the two is the answer.
-            .when(!loud && review.claimed(), |el| {
-                el.child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.settled)
-                        .child(SharedString::from(
-                            "Nothing — every changed file is accounted for.",
-                        )),
-                )
-            })
+            .gap(px(Theme::SPACE_XS))
             .children(notes)
             .when(matches!(review.diff, DiffSource::Recorded), |el| {
                 el.child(
@@ -1117,18 +1230,143 @@ impl ReviewPanel {
                 )
             });
 
+        // Nothing unaccounted for: one quiet line, never the block. "Four files
+        // nobody mentioned" and "everything is accounted for" must not be two
+        // readings of the same shape.
+        if !loud {
+            return div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(Theme::SPACE_XS))
+                .when(review.claimed(), |el| {
+                    el.child(Self::quiet_block(
+                        theme.settled,
+                        "Nothing unclaimed — every changed file is accounted for.".to_string(),
+                    ))
+                })
+                .child(footnotes)
+                .into_any_element();
+        }
+
+        // The one thing on this screen that shouts (review.md F): its own
+        // hue at three strengths, and the count said once, in the header.
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .px(px(STRIP_PX))
+            .py(px(STRIP_PY))
+            .bg(theme.danger.opacity(ALARM_BED))
+            .border_b_1()
+            .border_color(theme.danger.opacity(ALARM_RULE))
+            .child(
+                icon(icons::DANGER_TRIANGLE)
+                    .size(px(ICON_GLYPH))
+                    .text_color(theme.danger),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.danger)
+                    .child(SharedString::from(match review.remainder.unclaimed.len() {
+                        1 => "1 change no claim accounts for".to_string(),
+                        n => format!("{n} changes no claim accounts for"),
+                    })),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    // Not one of the four text tones on purpose: a grey aside
+                    // inside the alarm block reads as unrelated to it, and the
+                    // whole block is the hue.
+                    // theme-opacity-ok: the block's own hue, one step quieter (review.md F3)
+                    .text_color(theme.danger.opacity(ALARM_ASIDE))
+                    .child(SharedString::from("this is where drift hides")),
+            );
+        let rows = review
+            .remainder
+            .unclaimed
+            .iter()
+            .enumerate()
+            .map(|(ix, file)| Self::unclaimed_row(file, ix > 0, theme));
         div()
+            .flex_none()
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .child(Self::heading(theme, "UNCLAIMED", None))
-            .child(body.when(loud, |el| {
-                el.p(px(Theme::SPACE_MD))
+            .gap(px(Theme::SPACE_XS))
+            .child(
+                div()
+                    .flex_none()
+                    .mx(px(Theme::SPACE_LG))
+                    .mt(px(GLYPH_NUDGE + Theme::SPACE_MD))
                     .rounded(px(Theme::RADIUS_ROW))
+                    .overflow_hidden()
                     .border_1()
-                    .border_color(theme.danger.opacity(0.45))
-                    .bg(theme.danger.opacity(0.08))
-            }))
+                    .border_color(theme.danger.opacity(ALARM_BORDER))
+                    .child(header)
+                    .children(rows),
+            )
+            .child(footnotes)
+            .into_any_element()
+    }
+
+    /// One unclaimed change (review.md F4): the path, what happened to it, and
+    /// nothing else.
+    ///
+    /// The counts are spelled as a sentence rather than as the file table's
+    /// `+6 −4`, because inside this block they are the *finding* — "modified,
+    /// and no claim mentions it" is the row's whole content, and a bare pair of
+    /// numbers reads as bookkeeping.
+    fn unclaimed_row(file: &ChangedFile, ruled: bool, theme: &Theme) -> AnyElement {
+        let counts = file.counts();
+        let what = match file.status.as_str() {
+            "A" => format!("added, {counts}"),
+            "D" => "deleted, and no claim mentions it".to_string(),
+            _ => format!("{counts}, unmentioned"),
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(BAND_GAP))
+            .px(px(STRIP_PX))
+            .py(px(STRIP_PY))
+            .when(ruled, |el| el.border_t_1().border_color(theme.border))
+            .text_size(px(Theme::TEXT_DENSE))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme.font_mono.clone())
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(file.path.clone())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(what)),
+            )
+            .into_any_element()
+    }
+
+    /// A section that is one sentence: inset to the blocks' column, with the
+    /// air above them.
+    fn quiet_block(color: gpui::Hsla, text: String) -> AnyElement {
+        div()
+            .flex_none()
+            .mx(px(Theme::SPACE_LG))
+            .mt(px(GLYPH_NUDGE + Theme::SPACE_MD))
+            .text_size(px(Theme::TEXT_BODY))
+            .text_color(color)
+            .child(SharedString::from(text))
             .into_any_element()
     }
 
@@ -1176,85 +1414,180 @@ impl ReviewPanel {
             .into_any_element()
     }
 
-    /// The card's own header: which attempt this is, whose turn it is, and the
-    /// links out.
+    /// One fact on the header's second row (review.md B5): a 12px glyph, and
+    /// what it is about.
+    fn fact(
+        theme: &Theme,
+        glyph: Option<&'static str>,
+        text: String,
+        tint: Option<gpui::Hsla>,
+    ) -> AnyElement {
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .children(glyph.map(|path| {
+                icon(path)
+                    .size(px(FACT_GLYPH))
+                    // Explicitly, always: gpui tints an svg from its OWN text
+                    // colour, which the row's does not reach.
+                    .text_color(tint.unwrap_or(theme.text_subtle))
+            }))
+            .child(SharedString::from(text))
+            .into_any_element()
+    }
+
+    /// The `·` between two facts, in the quietest tone on the row.
+    fn fact_sep(theme: &Theme) -> AnyElement {
+        div()
+            .flex_none()
+            .text_color(theme.text_faint)
+            .child(SharedString::from("·"))
+            .into_any_element()
+    }
+
+    /// The pull request's number, for the header's first fact. Off the URL,
+    /// which is the only place the review carries it.
+    fn pr_number(url: &str) -> String {
+        match url.rsplit('/').next().filter(|n| !n.is_empty()) {
+            Some(number) => format!("PR #{number}"),
+            None => "Pull request".to_string(),
+        }
+    }
+
+    /// The card's own header (review.md B): what this is, whose turn it is,
+    /// and the ways out — over a line of facts about the run.
     fn render_header(
         &self,
         review: &AttemptReview,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut facts = vec![format!("attempt {}", review.attempt_number.max(1))];
-        if let Some(branch) = &review.branch {
-            facts.push(branch.clone());
-        }
-        facts.push(match &review.outcome {
-            Some(outcome) => outcome.clone(),
-            None => "still running".to_string(),
-        });
-        let links: Vec<(SharedString, String)> = [
-            review.pr_url.clone().map(|url| ("Open PR", url)),
-            (!review.brief.url.is_empty()).then(|| ("Open issue", review.brief.url.clone())),
+        // The way out to the upstream. Two of them where there are two: a
+        // review is read on a device that may not hold the checkout, so
+        // dropping one would lose a route.
+        let links: Vec<(&'static str, &'static str, String)> = [
+            review
+                .pr_url
+                .clone()
+                .map(|url| ("review-open-pr", icons::GITHUB_MARK, url)),
+            (!review.brief.url.is_empty()).then(|| {
+                (
+                    "review-open-issue",
+                    icons::DOCUMENT,
+                    review.brief.url.clone(),
+                )
+            }),
         ]
         .into_iter()
         .flatten()
-        .map(|(label, url)| (SharedString::from(label), url))
         .collect();
-        // Beside the identifier rather than out by the links: whose turn it is
-        // is a fact about this review, not an action you can take on it.
+        // Beside the title rather than out by the links: whose turn it is is a
+        // fact about this review, not an action you can take on it.
         let pill = Self::turn_pill(&review.state, self.receipt.is_some(), theme)
             .map(|(label, color)| Self::render_pill(label, color));
+
+        let mut facts: Vec<AnyElement> = Vec::new();
+        if let Some(url) = review.pr_url.as_deref() {
+            facts.push(Self::fact(
+                theme,
+                Some(icons::GITHUB_MARK),
+                Self::pr_number(url),
+                None,
+            ));
+        }
+        if let Some(branch) = &review.branch {
+            facts.push(Self::fact(theme, Some(icons::GIT_BRANCH), branch.clone(), None));
+        }
+        // What the board knows about the run itself. The canvas names the model
+        // and how long it took; neither is on the wire (see review.md), and the
+        // attempt and its outcome are what the board does know.
+        facts.push(Self::fact(
+            theme,
+            None,
+            format!(
+                "attempt {} · {}",
+                review.attempt_number.max(1),
+                match &review.outcome {
+                    Some(outcome) => outcome.as_str(),
+                    None => "still running",
+                }
+            ),
+            None,
+        ));
+        let mut row: Vec<AnyElement> = Vec::new();
+        for (ix, fact) in facts.into_iter().enumerate() {
+            if ix > 0 {
+                row.push(Self::fact_sep(theme));
+            }
+            row.push(fact);
+        }
+
         div()
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_XS))
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_LG))
+            .pt(px(Theme::SPACE_MD))
+            .pb(px(BAND_GAP))
+            .border_b_1()
+            .border_color(theme.border)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(Theme::SPACE_SM))
+                    .gap(px(9.0))
                     .child(
                         div()
                             .flex_none()
                             .font_family(theme.font_mono.clone())
                             .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text_muted)
+                            .text_color(theme.text_subtle)
                             .child(SharedString::from(review.brief.identifier.clone())),
                     )
-                    .children(pill)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(facts.join(" · "))),
+                            .text_size(px(Theme::TEXT_PROSE))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(SharedString::from(review.brief.title.clone())),
                     )
-                    .children(links.into_iter().map(|(label, url)| {
+                    .children(pill)
+                    .children(links.into_iter().map(|(id, glyph, url)| {
                         div()
-                            .id(SharedString::from(format!("review-link-{label}")))
+                            .id(id)
                             .flex_none()
-                            .h(px(20.0))
-                            .px(px(8.0))
+                            .size(px(ICON_BTN))
                             .flex()
                             .items_center()
+                            .justify_center()
                             .rounded(px(Theme::RADIUS_CHIP))
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.accent)
-                            .hover(|s| s.bg(theme.wash(0.12)))
-                            .child(label)
+                            .text_color(theme.text_subtle)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.wash(0.08)))
+                            .child(
+                                icon(glyph).size(px(ICON_GLYPH)).text_color(theme.text_subtle),
+                            )
                             .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
                     })),
             )
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_TITLE))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(SharedString::from(review.brief.title.clone())),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(BAND_GAP))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .children(row),
             )
             .into_any_element()
     }
@@ -1315,7 +1648,7 @@ impl ReviewPanel {
             div()
                 .flex_none()
                 .font_family(theme.font_mono.clone())
-                .text_size(px(Theme::TEXT_CAPTION))
+                .text_size(px(Theme::TEXT_DENSE))
                 .text_color(color)
                 .child(SharedString::from(text))
         };
@@ -1325,7 +1658,9 @@ impl ReviewPanel {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(Theme::SPACE_SM))
+                .gap(px(BAND_GAP))
+                .mx(px(Theme::SPACE_LG))
+                .mt(px(Theme::SPACE_MD))
                 .px(px(STRIP_PX))
                 .py(px(STRIP_PY))
                 .rounded(px(Theme::RADIUS_ROW))
@@ -1334,8 +1669,8 @@ impl ReviewPanel {
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(theme.text_muted)
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .text_color(theme.text_subtle)
                         .child(SharedString::from(label)),
                 )
                 .child(counts(format!("+{added}"), theme.settled))
@@ -1354,7 +1689,7 @@ impl ReviewPanel {
                         .items_center()
                         .rounded(px(Theme::RADIUS_CHIP))
                         .bg(theme.wash(0.08))
-                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_size(px(Theme::TEXT_DENSE))
                         .text_color(theme.text)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.wash(0.14)))
@@ -1394,6 +1729,11 @@ impl ReviewPanel {
     /// one promise this card makes is that it is showing what will be sent.
     /// Mono 11/17 in a dashed card, faded out at the bottom: it is the shape of
     /// the message, not a document to read.
+    ///
+    /// It lives at the bottom of the authoring column (review.md I4), not in
+    /// the review card — the payload is a message that will arrive *over
+    /// there*, and the column it will arrive in is where the canvas shows it
+    /// waiting. The shell asks for it through [`Self::delivery_preview`].
     fn render_preview(&self, review: &AttemptReview, comment: &str, theme: &Theme) -> AnyElement {
         let payload = verdict::compose(review, self.kind, comment);
         let lines: Vec<AnyElement> = payload
@@ -1430,19 +1770,44 @@ impl ReviewPanel {
             .line_height(px(PREVIEW_LINE_H))
             .children(lines);
         div()
-            .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_XS))
-            .child(Self::heading(theme, "WILL BE DELIVERED ON SUBMIT", None))
+            .flex_none()
+            .mx(px(Theme::SPACE_MD))
+            .mb(px(Theme::SPACE_MD))
+            .rounded(px(Theme::RADIUS_ROW))
+            .overflow_hidden()
+            .border_1()
+            .border_dashed()
+            .border_color(theme.border_strong)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .px(px(Theme::SPACE_MD))
+                    .py(px(Theme::SPACE_SM))
+                    .bg(theme.surface_raised)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        icon(icons::INFO_CIRCLE)
+                            .size(px(13.0))
+                            .text_color(theme.text_subtle),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Will be delivered on submit")),
+                    ),
+            )
             .child(
                 div()
                     .max_h(px(PREVIEW_MAX_H))
                     .overflow_hidden()
-                    .p(px(Theme::SPACE_SM))
-                    .rounded(px(Theme::RADIUS_ROW))
-                    .border_1()
-                    .border_dashed()
-                    .border_color(theme.border_strong)
+                    .px(px(Theme::SPACE_MD))
+                    .py(px(BAND_GAP))
                     .child(crate::edge_fade::edge_faded(
                         PREVIEW_MAX_H * (1.0 - PREVIEW_FADE_AT),
                         false,
@@ -1451,6 +1816,19 @@ impl ReviewPanel {
                     )),
             )
             .into_any_element()
+    }
+
+    /// The payload preview, for the column it will be delivered into.
+    ///
+    /// The shell draws it there (review.md I4); this is the review's own
+    /// state, so the review composes it — the card and the column must not be
+    /// able to disagree about what is about to be sent.
+    pub fn delivery_preview(&self, theme: &Theme, cx: &gpui::App) -> Option<AnyElement> {
+        let review = self.review.as_ref()?;
+        // No pull request, no payload — the same guard the bar takes.
+        review.pr_url.as_ref()?;
+        let comment = self.comment.read(cx).text().trim().to_string();
+        Some(self.render_preview(review, &comment, theme))
     }
 
     /// The verdict bar: the comment, the three verdicts, and the sentence that
@@ -1469,53 +1847,44 @@ impl ReviewPanel {
         let armed = self.kind;
         let submitting = self.submitting;
         let ready = !(armed.needs_comment() && comment.is_empty());
-        let preview = self.render_preview(review, &comment, theme);
         // What the screen promises. Delivery into the chat is the default and
         // the point; the two ways it does not happen are a verdict not worth
         // interrupting anybody with (a bare approval), and an author who has
         // moved — which only the board can know, and which the receipt says
         // afterwards rather than the bar guessing at beforehand.
         let contract = verdict::contract_line(review, verdict::worth_delivering(armed, &comment));
+        // The three verdicts, bare (review.md H4): each one its own meaning's
+        // colour, and no bed under any of them — the armed one takes H5's
+        // filled treatment instead, so the bar has exactly one solid control
+        // and it is the one that is about to happen.
         let picker = div()
             .flex()
             .flex_row()
             .gap(px(Theme::SPACE_XS))
             .children(VERDICTS.map(|(kind, label)| {
                 let on = kind == armed;
-                let loud = kind == VerdictKind::ChangesRequested;
+                let quiet = match kind {
+                    VerdictKind::Approve => theme.settled,
+                    _ => theme.text_muted,
+                };
                 div()
                     .id(SharedString::from(format!("verdict-{}", kind.as_str())))
                     .flex_none()
-                    .h(px(26.0))
-                    .px(px(10.0))
+                    .h(px(VERDICT_H))
+                    .px(px(if on { Theme::SPACE_MD } else { VERDICT_PX }))
                     .flex()
                     .items_center()
                     .rounded(px(Theme::RADIUS_CHIP))
-                    .border_1()
-                    .border_color(if on && loud {
-                        theme.danger.opacity(0.45)
-                    } else if on {
-                        theme.border_strong
-                    } else {
-                        theme.border
+                    .when(on, |el| {
+                        el.bg(theme.text)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.bg)
                     })
-                    .bg(if on && loud {
-                        theme.danger.opacity(0.10)
-                    } else if on {
-                        theme.wash(0.06)
-                    } else {
-                        theme.wash(0.0)
+                    .when(!on, |el| {
+                        el.text_color(quiet).hover(|s| s.bg(theme.wash(0.08)))
                     })
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(if on && loud {
-                        theme.danger
-                    } else if on {
-                        theme.text
-                    } else {
-                        theme.text_subtle
-                    })
+                    .text_size(px(Theme::TEXT_DENSE))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.wash(0.10)))
                     .child(SharedString::from(label))
                     .on_click(cx.listener(move |panel, _, _, cx| {
                         panel.kind = kind;
@@ -1527,20 +1896,23 @@ impl ReviewPanel {
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_SM))
-            .pt(px(Theme::SPACE_MD))
+            .gap(px(BAND_GAP))
+            .px(px(Theme::SPACE_LG))
+            .py(px(Theme::SPACE_MD))
             .border_t_1()
             .border_color(theme.border)
-            .child(preview)
+            .bg(theme.surface_raised)
             .child(
+                // Darker than the bar it sits in, not lighter: an input is a
+                // hole in a raised surface (review.md H2).
                 div()
-                    .min_h(px(52.0))
-                    .px(px(10.0))
-                    .py(px(8.0))
+                    .min_h(px(42.0))
+                    .px(px(Theme::SPACE_MD))
+                    .py(px(9.0))
                     .rounded(px(Theme::RADIUS_ROW))
                     .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.wash(0.03))
+                    .border_color(theme.border_strong)
+                    .bg(theme.bg)
                     .text_size(px(Theme::TEXT_BODY))
                     .child(self.comment.clone()),
             )
@@ -1549,9 +1921,17 @@ impl ReviewPanel {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(Theme::SPACE_SM))
+                    .gap(px(BAND_GAP))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .line_height(px(17.0))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(contract)),
+                    )
                     .child(picker)
-                    .child(div().flex_1())
                     .child(
                         popover::btn_primary(
                             theme,
@@ -1562,26 +1942,11 @@ impl ReviewPanel {
                             },
                         )
                         .id("verdict-submit")
-                        .h(px(26.0))
+                        .h(px(VERDICT_H))
                         .flex()
                         .items_center()
                         .when(submitting || !ready, |el| el.opacity(0.5))
                         .on_click(cx.listener(|panel, _, _, cx| panel.submit(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(contract)),
                     ),
             )
             .when_some(self.submit_error.clone(), |el, error| {
@@ -1623,6 +1988,8 @@ impl ReviewPanel {
         };
         div()
             .flex_none()
+            .mx(px(Theme::SPACE_LG))
+            .mt(px(Theme::SPACE_MD))
             .text_size(px(Theme::TEXT_CAPTION))
             .text_color(theme.text_faint)
             .child(SharedString::from(format!(
@@ -1637,38 +2004,35 @@ impl gpui::EventEmitter<ReviewEvent> for ReviewPanel {}
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let card = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap(px(Theme::SPACE_MD))
-            .px(px(Theme::SPACE_LG))
-            .py(px(Theme::SPACE_MD));
+        // The card is the shell's; what this renders is its contents, and every
+        // band inside it brings its own padding — the top half is full-bleed
+        // bands and the bottom half is inset blocks (review.md A6).
+        let card = div().size_full().flex().flex_col();
+        // The two states with nothing to compose: one message, centred in the
+        // card's own gutters rather than in a band that has no label.
+        let message = |color: gpui::Hsla, text: SharedString| {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .px(px(Theme::SPACE_LG))
+                .py(px(Theme::SPACE_MD))
+                .child(div().text_size(px(Theme::TEXT_BODY)).text_color(color).child(text))
+                .into_any_element()
+        };
 
         if let Some(error) = self.error.clone() {
-            return card
-                .child(Self::heading(&theme, "REVIEW", None))
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.warning)
-                        .child(error),
-                )
-                .into_any_element();
+            return message(theme.warning, error);
         }
         let Some(review) = self.review.clone() else {
-            return card
-                .child(
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from(if self.loaded {
-                            "No review for this task."
-                        } else {
-                            "Reading the review…"
-                        })),
-                )
-                .into_any_element();
+            return message(
+                theme.text_subtle,
+                SharedString::from(if self.loaded {
+                    "No review for this task."
+                } else {
+                    "Reading the review…"
+                }),
+            );
         };
 
         let header = self.render_header(&review, &theme, cx);
@@ -1683,9 +2047,14 @@ impl Render for ReviewPanel {
         let bar = self.render_verdict_bar(&review, &theme, cx);
 
         // The question in order — what was asked, what the branch did, what the
-        // agent says it did, what the board saw the run do, and what nobody
+        // board saw the run do, what the agent says it did, and what nobody
         // accounted for — with the verdict pinned above the scroll so the
         // loudest fact cannot be pushed under the fold by a long issue body.
+        //
+        // Evidence sits with Effects rather than after the claims (review.md
+        // deviations): both are what the board read for itself, and the whole
+        // argument for the effects row's position is that numbers read *before*
+        // a fluent story are what the story then has to agree with.
         let body = div()
             .id("review-body")
             .flex_1()
@@ -1694,12 +2063,11 @@ impl Render for ReviewPanel {
             .track_scroll(&self.body_scroll)
             .flex()
             .flex_col()
-            .gap(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
             .child(brief)
             .child(effects)
-            .child(claims)
             .child(evidence)
+            .child(claims)
             .child(remainder)
             // Last, and after the remainder on purpose: "here is how much moved"
             // is the question a reader has once they have been told what nobody
@@ -1850,7 +2218,7 @@ mod tests {
         assert!(payload.contains("[unclaimed] Cargo.toml"), "{payload}");
         // And the card fades where the design says it does, at 72% of its own
         // height — the band is the remainder of it.
-        assert!((PREVIEW_MAX_H * (1.0 - PREVIEW_FADE_AT) - 168.0 * 0.28).abs() < 0.01);
+        assert!((PREVIEW_MAX_H * (1.0 - PREVIEW_FADE_AT) - 196.0 * 0.28).abs() < 0.01);
     }
 
     /// The strip restates the denominator, and the denominator is the same

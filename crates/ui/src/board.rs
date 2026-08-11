@@ -965,6 +965,10 @@ pub struct BoardPanel {
     /// The sweep is returning to its held fallback: nobody with dispatch
     /// evidence answered, so the next frame settles regardless.
     sweep_settling: bool,
+    /// `COMET_OPEN_REVIEW=1` has already fired. One-way: the knob opens the
+    /// first review it sees and then leaves the window alone, or every board
+    /// frame would drag the operator back out of wherever they navigated.
+    review_on_boot_done: bool,
     host_menu_open: bool,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
@@ -1087,6 +1091,7 @@ impl BoardPanel {
             host_confirmed: false,
             sweep_fallback: None,
             sweep_settling: false,
+            review_on_boot_done: false,
             host_menu_open: false,
             host_menu_dismissed_at: None,
             dispatch: None,
@@ -1250,8 +1255,41 @@ impl BoardPanel {
             self.sweep_settling = false;
         }
         self.model.set_rows(rows);
+        self.open_review_on_boot(cx);
         cx.notify();
         false
+    }
+
+    /// Capture knob of the `COMET_OPEN_BOARD` family (gh#276): with
+    /// `COMET_OPEN_REVIEW=1` the first board frame that carries a reviewable
+    /// row opens its review.
+    ///
+    /// A design pass has to photograph this surface, and the review route is
+    /// the one route with no deep link into it — it is reached by pressing `r`
+    /// on a row, which is exactly what a capture script cannot rely on: a
+    /// second app in front of this one swallows the key, and the pass then
+    /// photographs the chat instead (the same failure gh#295 added
+    /// `COMET_OPEN_BOARD` for).
+    fn open_review_on_boot(&mut self, cx: &mut Context<Self>) {
+        if self.review_on_boot_done || !std::env::var("COMET_OPEN_REVIEW").is_ok_and(|v| v == "1") {
+            return;
+        }
+        // A row in `review` first — that is the state this window is about —
+        // and any attempted row after it, so the knob still lands on a board
+        // whose only attempt failed.
+        let rows = self.model.rows.clone();
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.state == board::BoardState::Review.as_str() && board::reviewable(row))
+            .or_else(|| rows.iter().find(|row| board::reviewable(row)))
+        else {
+            return;
+        };
+        self.review_on_boot_done = true;
+        cx.emit(BoardEvent::OpenReview {
+            task_id: row.id.clone(),
+            chat_id: row.review_chat_id.clone().or_else(|| row.chat_id.clone()),
+        });
     }
 
     /// The watch loop's verdict on a host whose stream just ended. Returns
