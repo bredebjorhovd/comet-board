@@ -133,7 +133,7 @@ use comet_rpc::methods;
 
 use crate::settings::widgets;
 use crate::state::AppState;
-use crate::theme::{Bed, ListRow as _, Theme};
+use crate::theme::Theme;
 
 // ---- the design's measurements (`Comet Stats Window.dc.html`) --------------
 //
@@ -154,6 +154,14 @@ const CARD_GAP: f32 = 12.0;
 
 /// Between the cards themselves, and between the two halves of the bottom row.
 const PAGE_GAP: f32 = 12.0;
+
+/// The day chart's own interior gap, two more than every other card's.
+///
+/// The canvas gives this one card 14 and the other three 12, and it is not an
+/// accident of the drawing: the band is the only thing on the page with no box
+/// around it and no baseline under it, so its captions need the extra two to
+/// stop reading as a fifth row of the chart.
+const CHART_GAP: f32 = 14.0;
 
 /// The two fixed cells of the spend band, and their own deeper padding — this
 /// is the card carrying the page's headline figure, and it is the one place
@@ -214,6 +222,45 @@ const LANDING_BAND_MIN: f32 = 6.0;
 
 /// A legend's colour chip.
 const SWATCH: f32 = 7.0;
+
+/// The gutter a segmented track puts around and between its segments.
+///
+/// Two, not [`Theme::NEST_GUTTER`]'s four: a track is a chip bed with chips in
+/// it, not a card with rows in it, and at four the wash reads as a bar with
+/// buttons parked on it.
+const TRACK_GUTTER: f32 = 2.0;
+
+/// Which of the two segmented controls this is (gh#278).
+///
+/// The canvas draws them at different sizes in the same breath — the window
+/// picker heads the page, the axis toggle heads a card — and the difference is
+/// three properties, not one, so it is one named thing rather than three
+/// arguments a call site can get half right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackSize {
+    /// In the page header: 12px segments, a `--line` hairline, radius 10.
+    Page,
+    /// In a card header: 11px segments, no hairline, and the radius its own
+    /// gutter makes concentric with them.
+    Card,
+}
+
+impl TrackSize {
+    /// The outer radius. The page track closes at the row radius the rest of
+    /// the page's furniture uses; the card track closes at exactly its
+    /// segments' radius plus its gutter, which is the nesting rule (gh#174)
+    /// evaluated at this size rather than assumed from the other one.
+    ///
+    /// scale-ok: not a fourth radius — it is `RADIUS_CHIP` plus the gutter
+    /// around it, which is what makes the two curves concentric. Typing 8 here
+    /// would be the literal the scale exists to prevent.
+    fn radius(self) -> f32 {
+        match self {
+            Self::Page => Theme::RADIUS_ROW,
+            Self::Card => Theme::RADIUS_CHIP + TRACK_GUTTER,
+        }
+    }
+}
 
 // ---- which board (gh#254) --------------------------------------------------
 
@@ -537,24 +584,35 @@ impl StatsPage {
 
     /// The track a segmented control's choices sit in.
     ///
-    /// One recipe, used by the window picker and by the breakdown's dimension
-    /// toggle (gh#227): two segmented controls on one page that were built
-    /// twice would be two segmented controls that drift apart.
-    fn track(theme: &Theme) -> gpui::Div {
+    /// One recipe in two sizes, used by the window picker and by the
+    /// breakdown's dimension toggle (gh#227): two segmented controls on one
+    /// page that were built twice would be two segmented controls that drift
+    /// apart.
+    ///
+    /// **The bed is `--chip`** (gh#278). It was a private 2% wash, which is a
+    /// third of what the canvas declares and had no token behind it at all
+    /// until gh#274 gave `--chip` one. A chip bed is exactly what a track is:
+    /// the wash the unchosen segments sit in, and the thing the chosen one is
+    /// punched out of.
+    ///
+    /// The two sizes are the canvas's, and they differ in three ways at once
+    /// because they are a page header's control and a card header's control.
+    /// The `PAGE` track wears a hairline at [`Theme::RADIUS_ROW`]; the `CARD`
+    /// one wears none and closes at its segments' radius plus its own gutter,
+    /// which is what keeps the two curves concentric at the smaller size.
+    fn track(theme: &Theme, size: TrackSize) -> gpui::Div {
         div()
             .flex()
             .flex_row()
             .items_center()
             .flex_none()
-            .gap(px(2.0))
-            // The nesting rule (gh#174): segments at RADIUS_CHIP inside a track
-            // at RADIUS_ROW want exactly one gutter between them, and then the
-            // two curves are concentric instead of merely both round.
-            .p(px(Theme::NEST_GUTTER))
-            .rounded(px(Theme::RADIUS_ROW))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.white_alpha(0.02))
+            .gap(px(TRACK_GUTTER))
+            .p(px(TRACK_GUTTER))
+            .rounded(px(size.radius()))
+            .when(size == TrackSize::Page, |el| {
+                el.border_1().border_color(theme.border)
+            })
+            .bg(theme.chip)
     }
 
     /// One choice in that track.
@@ -562,6 +620,20 @@ impl StatsPage {
     /// The padding follows the type size rather than being a second knob: the
     /// design gives 8×3 around an 11px segment and 10×4 around a 12px one,
     /// which is one rule stated twice.
+    ///
+    /// **The chosen one is the page's own ground, not a selected row**
+    /// (gh#278). It used to go through [`crate::theme::Theme::row`] at
+    /// [`crate::theme::Bed::Card`], which paints `--selcard` — and that is
+    /// inverted in both themes here: the canvas fills the chosen segment with
+    /// `--card`, which is `#070707` under a dark chip wash and `#ffffff` under
+    /// a light one. So the segment steps DOWN in dark and UP in light, and
+    /// `--lift` carries the light half where a change of tone alone would not
+    /// read.
+    ///
+    /// That is not a contradiction of gh#175, which is about *rows in a list*:
+    /// a row is one of many on a surface and lifts off it, a segment is a hole
+    /// cut in a wash so the page shows through. Hover is still the shared wash,
+    /// because that part of the grammar does not change with the shape.
     fn segment(
         theme: &Theme,
         id: String,
@@ -584,17 +656,22 @@ impl StatsPage {
             } else {
                 gpui::FontWeight::NORMAL
             })
-            .when(!selected, |el| el.cursor_pointer())
-            // A segmented control inside a settings card: in light mode the
-            // card is white, so the chosen segment steps DOWN into it rather
-            // than trying to lift off it (gh#175).
-            .list_row(theme, Bed::Card, selected, id)
+            .text_color(if selected {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .when(selected, |el| el.bg(theme.bg).shadow(theme.lift_shadow()))
+            .when(!selected, |el| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme.element_hover).text_color(theme.text))
+            })
             .child(SharedString::from(label.to_string()))
     }
 
     /// The window picker: a segmented row, current one filled.
     fn render_windows(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = Self::track(theme);
+        let mut row = Self::track(theme, TrackSize::Page);
         for (days, label) in WINDOWS {
             let selected = self.since_days == *days;
             let days = *days;
@@ -633,7 +710,7 @@ impl StatsPage {
         if boards.len() < 2 {
             return None;
         }
-        let mut row = Self::track(theme);
+        let mut row = Self::track(theme, TrackSize::Page);
         for (index, host) in boards.iter().enumerate() {
             let target = host.device_id.clone();
             let selected = host.device_id.as_deref() == current;
@@ -1062,6 +1139,10 @@ impl StatsPage {
     const BILL_NOTE: &'static str = "What this work would cost at the list prices in \
          Settings → Agents, not what you were billed.";
 
+    /// The one span of that sentence the canvas lifts a tone: the page the
+    /// rates are on. Matched rather than re-spelled, so the two cannot drift.
+    const RATES_PAGE: &'static str = "Settings → Agents";
+
     /// The footer under the spend band: what the figures are, what they cover,
     /// and everything they leave out.
     ///
@@ -1124,10 +1205,44 @@ impl StatsPage {
                         div()
                             .text_size(px(Theme::TEXT_DENSE))
                             .text_color(theme.text_subtle)
-                            .child(SharedString::from(line))
+                            .child(Self::footer_line(theme, line))
                             .into_any_element()
                     })),
             )
+            .into_any_element()
+    }
+
+    /// One footer line, with the page it names lifted a tone (gh#278).
+    ///
+    /// The canvas writes the sentence in `--subtle` and sets `Settings →
+    /// Agents` in `--muted`, which is the footnote pointing at somewhere you
+    /// can go. Painted as two [`gpui::TextRun`]s over one shaped string rather
+    /// than as two elements in a row: the sentence wraps, and a row of spans
+    /// would wrap between them instead of inside them.
+    ///
+    /// A `TextRun` carries a colour and a font but no size, so this is exactly
+    /// as far as inline styling reaches here — the same limit `window.md`'s D6
+    /// records for inline code. Colour is all the canvas asks for.
+    fn footer_line(theme: &Theme, line: String) -> AnyElement {
+        let base = gpui::font(theme.font_sans.clone());
+        let run = |len: usize, color: gpui::Hsla| gpui::TextRun {
+            len,
+            font: base.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = match line.find(Self::RATES_PAGE) {
+            Some(at) => vec![
+                run(at, theme.text_subtle),
+                run(Self::RATES_PAGE.len(), theme.text_muted),
+                run(line.len() - at - Self::RATES_PAGE.len(), theme.text_subtle),
+            ],
+            None => vec![run(line.len(), theme.text_subtle)],
+        };
+        gpui::StyledText::new(SharedString::from(line))
+            .with_runs(runs)
             .into_any_element()
     }
 
@@ -1173,15 +1288,17 @@ impl StatsPage {
         // A month of captions is a month of collisions; past the cap the
         // columns go bare and the axis carries the range instead.
         let captioned = day_captions_fit(columns.len());
-        let mut card = Self::padded_card(theme).child(Self::card_head(
-            theme,
-            Self::CHART_TITLE,
-            Some(if peak > 0 {
-                format!("bars are tokens · peak {}", human_tokens(peak))
-            } else {
-                "no day in this window reported tokens".to_string()
-            }),
-        ));
+        let mut card = Self::padded_card(theme)
+            .gap(px(CHART_GAP))
+            .child(Self::card_head(
+                theme,
+                Self::CHART_TITLE,
+                Some(if peak > 0 {
+                    format!("bars are tokens · peak {}", human_tokens(peak))
+                } else {
+                    "no day in this window reported tokens".to_string()
+                }),
+            ));
 
         if peak > 0 {
             card = card.child(
@@ -1819,7 +1936,7 @@ impl StatsPage {
             .copied()
             .find(|d| *d == current)
             .or_else(|| offered.first().copied());
-        let mut row = Self::track(theme);
+        let mut row = Self::track(theme, TrackSize::Card);
         for dimension in offered {
             row = row.child(
                 Self::segment(
@@ -1961,7 +2078,10 @@ impl Render for StatsPage {
                         .flex()
                         .flex_col()
                         .min_w_0()
-                        .child(widgets::page_header(&theme, "Board stats", None))
+                        // The one dashboard headline in the app (gh#278): 20px
+                        // over a 34px figure, where every other settings page
+                        // is a section at 15.
+                        .child(widgets::dashboard_header(&theme, "Board stats"))
                         .child(widgets::page_subtitle(&theme, subtitle)),
                 )
                 .child(

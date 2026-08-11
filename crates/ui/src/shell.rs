@@ -1955,13 +1955,27 @@ impl Shell {
             // one attempt and the column beside it holding another. Back is the
             // way out, and it is already in the control cluster.
             Route::Settings(_) | Route::Review { .. } => {
+                let theme = Theme::of(cx).clone();
+                // Settings says so where the tab strip would be
+                // (`docs/design/settings.md` A3): one word, 13px/500 `--muted`,
+                // at the same x=172 the tabs start at. The review route names
+                // itself in the card's own header instead, so it draws nothing
+                // here.
+                let label = matches!(self.route, Route::Settings(_)).then(|| {
+                    div()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Settings"))
+                });
                 let inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
-                    .pr(px(Theme::SPACE_LG));
+                    .pr(px(Theme::SPACE_LG))
+                    .children(label);
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
@@ -2102,6 +2116,11 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        /// The nav's own side padding, inside the column's 8px gutter
+        /// (`docs/design/settings.md` B1/B2) — the same 9 the Back row's
+        /// [`account::footer_row`] uses, so heading, rows and Back share one
+        /// left edge at x=17.
+        const NAV_PAD_X: f32 = 9.0;
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
@@ -2130,16 +2149,17 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(
+                        // `docs/design/settings.md` B1: 10/9/6 at 11px/600.
                         div()
-                            .px(px(Theme::SPACE_SM))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
+                            .px(px(NAV_PAD_X))
+                            .pt(px(10.0))
+                            .pb(px(6.0))
                             .text_size(px(Theme::TEXT_CAPTION))
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text_subtle)
                             .child(SharedString::from("Settings")),
                     )
-                    .child(div().flex().flex_col().gap(px(2.0)).children(
+                    .child(div().flex().flex_col().gap(px(3.0)).children(
                         SettingsSection::ALL.into_iter().map(|item| {
                             let selected = item == section;
                             div()
@@ -2147,9 +2167,9 @@ impl Shell {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(8.0))
+                                .gap(px(9.0))
                                 .rounded(px(Theme::RADIUS_ROW))
-                                .px(px(Theme::SPACE_SM))
+                                .px(px(NAV_PAD_X))
                                 .py(px(6.0))
                                 .text_size(px(Theme::TEXT_BODY))
                                 .when(selected, |el| el.font_weight(gpui::FontWeight::MEDIUM))
@@ -2164,9 +2184,19 @@ impl Shell {
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
                                 .child(
-                                    icon(section_icon(item))
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
+                                    // The glyph moves with its label (B5): the
+                                    // selected row's icon is `--text`, the rest
+                                    // sit one tone under their own copy. An icon
+                                    // held at `--muted` on the selected row made
+                                    // the brightened label look mismatched with
+                                    // the mark that introduces it.
+                                    icon(section_icon(item)).size(px(16.0)).text_color(
+                                        if selected {
+                                            theme.text
+                                        } else {
+                                            theme.text_subtle
+                                        },
+                                    ),
                                 )
                                 .child(SharedString::from(item.label()))
                         }),
@@ -2194,10 +2224,12 @@ impl Shell {
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (comet settings-sidebar.tsx),
-                            // not the straight history arrow.
+                            // not the straight history arrow — and `--subtle`
+                            // under `--muted` copy, like every other nav row
+                            // (`docs/design/settings.md` B8).
                             icon(icons::ALT_ARROW_LEFT)
                                 .size(px(16.0))
-                                .text_color(theme.text_muted),
+                                .text_color(theme.text_subtle),
                         )
                         .child(SharedString::from("Back")),
                 ),
@@ -4263,21 +4295,29 @@ impl Render for Shell {
                     .relative()
                     .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
-                // Sidebar tone: a slightly lighter column behind the sidebar,
-                // spanning the FULL window height (under the traffic lights,
-                // through the titlebar, down to the bottom edge). Its width
-                // rides the same tween as the sidebar, so the tone melts away
-                // with the collapse instead of vanishing in a frame.
+                // The sidebar column: a full-window-height band (under the
+                // traffic lights, through the titlebar, down to the bottom
+                // edge) whose only mark is the hairline on its right edge. Its
+                // width rides the same tween as the sidebar, so the seam melts
+                // away with the collapse instead of vanishing in a frame.
+                //
+                // It paints NO fill. The canvas separates the sidebar from the
+                // shell with the 1px `--line` hairline and nothing else (claim
+                // A3) — one tone on both sides. A `wash(0.05)` used to sit here
+                // on top of the window's frost, a 13-point step in light
+                // (218 against the shell's 231) that read as two panels; since
+                // gh#293/#299 put the tab strip where the canvas puts it, at
+                // x=172, the strip crossed that seam and the tabs looked like
+                // they straddled it. The frost itself is untouched (root `.bg`
+                // is [`Theme::glass`]) — the window stays translucent, and what
+                // went is the internal step the canvas never had (gh#304).
                 let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-                // Hairline on its right edge — full height like the tone,
-                // so the sidebar column reads as its own surface.
-                let sidebar_tone = div()
+                let sidebar_column = div()
                     .absolute()
                     .top_0()
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(theme.wash(0.05))
                     .border_r_1()
                     .border_color(border_color);
                 let page = div()
@@ -4298,7 +4338,7 @@ impl Render for Shell {
                     )
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
-                root.child(sidebar_tone)
+                root.child(sidebar_column)
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot

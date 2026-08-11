@@ -313,10 +313,13 @@ impl Render for ShortcutsPage {
                                     .child(SharedString::from("Restore defaults"))
                             }),
                     )
-                    .child(widgets::section_card(&theme).mt(px(32.0)).children(rows))
+                    // One block gap, like every other settings page
+                    // (`docs/design/settings.md` C4) — the 32 this used to open
+                    // with was a rhythm of its own.
+                    .child(widgets::section_card(&theme).children(rows))
                     .child(
                         div()
-                            .mt(px(12.0))
+                            .mt(px(widgets::HEADER_GAP))
                             .px(px(4.0))
                             .min_h(px(20.0))
                             .text_size(px(Theme::TEXT_DENSE))
