@@ -4,7 +4,7 @@
 
 use crate::config::{Credentials, Paths};
 use crate::db::UpsertTask;
-use crate::model::{Source, UpstreamState};
+use crate::model::{PrStack, Source, UpstreamState};
 use crate::sources::github_app::{HttpAppApi, TokenProvider};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
@@ -274,6 +274,9 @@ pub struct PullRequest {
     pub body: Option<String>,
     pub url: String,
     pub head_ref: String,
+    /// The branch this PR merges into. Empty only when GitHub sent no `base.ref`
+    /// at all, which it does not do for a real pull request.
+    pub base_ref: String,
     /// Repository the head branch belongs to. Differs from `repo` for forks.
     pub head_repo: Option<String>,
     /// The exact commit the PR compares its head against. This is the review
@@ -285,6 +288,9 @@ pub struct PullRequest {
     /// whoever has to decide what happens next.
     pub merged: bool,
     pub draft: bool,
+    /// Where this PR sits in a GitHub stack, when it is in one at all. `None`
+    /// for every standalone pull request — which today is nearly all of them.
+    pub stack: Option<PrStack>,
     pub updated_at: String,
 }
 
@@ -855,13 +861,51 @@ fn parse_pull(repo: &str, n: &Value) -> Option<PullRequest> {
             .and_then(Value::as_str)
             .filter(|repo| !repo.is_empty())
             .map(str::to_string),
+        base_ref: n
+            .get("base")
+            .and_then(|base| base.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         base_sha: n
             .get("base")
             .and_then(|base| base.get("sha"))
             .and_then(Value::as_str)
             .filter(|sha| !sha.is_empty())
             .map(str::to_string),
+        stack: parse_stack(n.get("stack")),
         open: n.get("state").and_then(Value::as_str) == Some("open"),
+    })
+}
+
+/// The `stack` object GitHub hangs off a pull request in a stack, or `None`.
+///
+/// Lenient on purpose, and permanently so — stacked pull requests are in public
+/// preview. `None` covers all three of "this PR is standalone" (the field is
+/// absent or `null`, the overwhelming case), "the preview moved a field we
+/// read", and "the object is there but carries no identity we can group on".
+/// Every one of those is a board that shows no stack, never a poll that fails:
+/// [`Github::pulls`] would drop the whole pull request, and with it the review
+/// row it feeds.
+///
+/// Identity comes from `number`, falling back to `id`. GitHub documents both as
+/// optional and only `base` as required, so requiring `number` outright would
+/// silently un-stack every PR if the preview settles on the other name.
+fn parse_stack(v: Option<&Value>) -> Option<PrStack> {
+    let s = v.filter(|v| !v.is_null())?;
+    Some(PrStack {
+        number: s
+            .get("number")
+            .and_then(Value::as_i64)
+            .or_else(|| s.get("id").and_then(Value::as_i64))?,
+        size: s.get("size").and_then(Value::as_i64),
+        position: s.get("position").and_then(Value::as_i64),
+        base_ref: s
+            .get("base")
+            .and_then(|base| base.get("ref"))
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1198,6 +1242,89 @@ mod tests {
         // Open: not terminal, so derivation with pr_open reaches `review`.
         assert_eq!(up.upstream, UpstreamState::Unstarted);
         assert_eq!(up.source_state.as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn a_stacked_pull_request_carries_its_place_in_the_stack() {
+        // Everything here rode in on the list call the board already makes —
+        // `base.ref` and the `stack` object both (gh#282).
+        let g = Github::new(FixtureRest::new(vec![(
+            "/repos/o/r/pulls".into(),
+            json!([{ "number": 509, "title": "middle of the stack", "html_url": "u",
+                     "state": "open", "updated_at": "t",
+                     "head": { "ref": "feat/three" },
+                     "base": { "ref": "feat/two", "sha": "abc123" },
+                     "stack": { "id": 77, "number": 4, "size": 3, "position": 2,
+                                "base": { "ref": "main", "sha": "def456" } } }]),
+        )]));
+        let pr = &g.pulls("o/r").unwrap()[0];
+        // The PR's own base is the branch below it; the stack's is where the
+        // whole thing lands. Two different branches, and 7/9 needs both.
+        assert_eq!(pr.base_ref, "feat/two");
+        let stack = pr.stack.as_ref().expect("the stack object was sent");
+        assert_eq!(stack.number, 4);
+        assert_eq!(stack.size, Some(3));
+        assert_eq!(stack.position, Some(2));
+        assert_eq!(stack.base_ref.as_deref(), Some("main"));
+        assert_eq!(g.rest.asked.borrow().len(), 1, "no extra call was made");
+    }
+
+    #[test]
+    fn a_standalone_pull_request_has_no_stack() {
+        let g = Github::new(FixtureRest::new(vec![(
+            "/repos/o/r/pulls".into(),
+            json!([
+                { "number": 1, "title": "no stack field at all", "html_url": "u",
+                  "state": "open", "updated_at": "t", "head": { "ref": "a" },
+                  "base": { "ref": "main" } },
+                { "number": 2, "title": "an explicit null", "html_url": "u",
+                  "state": "open", "updated_at": "t", "head": { "ref": "b" },
+                  "base": { "ref": "main" }, "stack": null }
+            ]),
+        )]));
+        let pulls = g.pulls("o/r").unwrap();
+        assert_eq!(pulls.len(), 2);
+        assert!(pulls.iter().all(|p| p.stack.is_none()));
+        assert!(pulls.iter().all(|p| p.base_ref == "main"));
+    }
+
+    #[test]
+    fn a_stack_shape_we_do_not_recognise_costs_the_stack_not_the_pull_request() {
+        // Stacked pull requests are in public preview: the shape can move under
+        // us. When it does the board must lose the stack view and keep the
+        // review row — dropping the pull request would take the row with it.
+        let g = Github::new(FixtureRest::new(vec![(
+            "/repos/o/r/pulls".into(),
+            json!([{ "number": 3, "title": "renamed under us", "html_url": "u",
+                     "state": "open", "updated_at": "t", "head": { "ref": "c" },
+                     "base": { "ref": "main" },
+                     "stack": { "stackSize": 3, "slot": 1 } }]),
+        )]));
+        let pulls = g.pulls("o/r").unwrap();
+        assert_eq!(pulls.len(), 1, "the pull request survived");
+        assert_eq!(pulls[0].number, 3);
+        assert!(
+            pulls[0].stack.is_none(),
+            "a stack with no identity cannot be grouped on and is not one"
+        );
+    }
+
+    #[test]
+    fn a_stack_identified_only_by_id_still_groups() {
+        // GitHub documents `number` as optional on the stack object, so it is
+        // not the field to hang the whole feature on.
+        let g = Github::new(FixtureRest::new(vec![(
+            "/repos/o/r/pulls".into(),
+            json!([{ "number": 4, "title": "t", "html_url": "u",
+                     "state": "open", "updated_at": "t", "head": { "ref": "d" },
+                     "base": { "ref": "main" },
+                     "stack": { "id": 77, "size": 2 } }]),
+        )]));
+        let stack = g.pulls("o/r").unwrap()[0].stack.clone().unwrap();
+        assert_eq!(stack.number, 77);
+        assert_eq!(stack.size, Some(2));
+        assert_eq!(stack.position, None);
+        assert_eq!(stack.base_ref, None);
     }
 
     #[test]

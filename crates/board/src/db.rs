@@ -160,6 +160,14 @@ impl Db {
               pr_merged    INTEGER NOT NULL DEFAULT 0,
               -- GitHub's mergeable_state: clean, behind, dirty, blocked…
               pr_mergeable TEXT,
+              -- PR topology (gh#282). The branch the PR merges into, and — only
+              -- when GitHub says it is in a stack — which stack, where in it,
+              -- how big, and what the stack as a whole targets.
+              pr_base_ref        TEXT,
+              pr_stack_number    INTEGER,
+              pr_stack_size      INTEGER,
+              pr_stack_position  INTEGER,
+              pr_stack_base_ref  TEXT,
               updated_at   TEXT NOT NULL,
               synced_at    TEXT NOT NULL
             );
@@ -372,6 +380,13 @@ impl Db {
                 ("pr_open", "INTEGER NOT NULL DEFAULT 0"),
                 ("pr_merged", "INTEGER NOT NULL DEFAULT 0"),
                 ("pr_mergeable", "TEXT"),
+                // gh#282. Existing rows keep NULL until the next poll, which is
+                // the same thing "we have not looked yet" has always meant here.
+                ("pr_base_ref", "TEXT"),
+                ("pr_stack_number", "INTEGER"),
+                ("pr_stack_size", "INTEGER"),
+                ("pr_stack_position", "INTEGER"),
+                ("pr_stack_base_ref", "TEXT"),
                 ("upstream", "TEXT NOT NULL DEFAULT 'unstarted'"),
             ],
         )?;
@@ -697,6 +712,34 @@ impl Db {
         Ok(())
     }
 
+    /// Record where a PR sits relative to the rest of the tree (gh#282).
+    ///
+    /// Written whole every poll, stack and all, so a PR that leaves a stack —
+    /// or is retargeted onto `main` when its parent merges — clears the fields
+    /// it no longer answers to instead of keeping a stale position forever.
+    pub fn set_pr_topology(
+        &self,
+        task_id: &str,
+        base_ref: Option<&str>,
+        stack: Option<&PrStack>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET pr_base_ref = ?2, pr_stack_number = ?3,
+                              pr_stack_size = ?4, pr_stack_position = ?5,
+                              pr_stack_base_ref = ?6
+             WHERE id = ?1",
+            params![
+                task_id,
+                base_ref.filter(|r| !r.is_empty()),
+                stack.map(|s| s.number),
+                stack.and_then(|s| s.size),
+                stack.and_then(|s| s.position),
+                stack.and_then(|s| s.base_ref.as_deref()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_pr_merged(&self, task_id: &str, merged: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET pr_merged = ?2 WHERE id = ?1",
@@ -728,7 +771,9 @@ impl Db {
             "SELECT id, source, source_id, identifier, title, body, url, labels,
                     state, source_state, linear_team, linear_project, upstream,
                     local_done, pr_url, pr_number, pr_open, pr_merged,
-                    pr_mergeable, updated_at, synced_at
+                    pr_mergeable, updated_at, synced_at,
+                    pr_base_ref, pr_stack_number, pr_stack_size,
+                    pr_stack_position, pr_stack_base_ref
              FROM tasks",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -756,6 +801,18 @@ impl Db {
                 pr_mergeable: r.get(18)?,
                 updated_at: r.get(19)?,
                 synced_at: r.get(20)?,
+                pr_base_ref: r.get(21)?,
+                // The stack number is the witness: without an identity there is
+                // no stack to speak of, whatever the other three columns hold.
+                pr_stack: match r.get::<_, Option<i64>>(22)? {
+                    None => None,
+                    Some(number) => Some(PrStack {
+                        number,
+                        size: r.get(23)?,
+                        position: r.get(24)?,
+                        base_ref: r.get(25)?,
+                    }),
+                },
                 attempts: Vec::new(),
             })
         })?;

@@ -719,6 +719,8 @@ pub(crate) mod tests {
             pr_open: true,
             pr_merged: false,
             pr_mergeable: None,
+            pr_base_ref: None,
+            pr_stack: None,
             updated_at: "t".into(),
             synced_at: "t".into(),
             attempts: vec![],
@@ -733,11 +735,13 @@ pub(crate) mod tests {
             body: None,
             url: "https://github.com/o/r/pull/14".into(),
             head_ref: head_ref.into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: None,
             open: true,
             merged: false,
             draft: false,
+            stack: None,
             updated_at: "2026-07-28T11:30:00Z".into(),
         }
     }
