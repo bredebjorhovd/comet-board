@@ -11,11 +11,12 @@
 //!
 //! - Sections in fixed order (blocked → working → ready → review → failed →
 //!   done), empty ones omitted; `done` is bounded to today by the shared
-//!   derivation;
-//! - a row is one 32px line (gh#176): glyph, identifier, title, then the row's
-//!   own verb and its metadata right-aligned against the far edge. Every row is
-//!   that height in every state, so nothing the pointer does reflows the list
-//!   (gh#132);
+//!   derivation. A group header is a 26px line between two hairlines, with no
+//!   fill of its own (gh#295, claim E4);
+//! - a row is one 32px line in fixed columns (gh#176, gh#295, claim E6): the
+//!   status glyph, the id, the title, the repo, the time, then the row's own
+//!   verb as a neutral chip. Every row is that height in every state, so
+//!   nothing the pointer does reflows the list (gh#132);
 //! - `enter` runs the selected row's primary verb — the one the row draws
 //!   without being hovered, taken from `board::primary_action` so the chip and
 //!   the key are one rule (gh#176): dispatch a ready row (`DispatchTask`),
@@ -37,7 +38,9 @@
 //!   calls relay as the room owner, so the box cannot check them, and nothing
 //!   is authorized on them.
 //! - `f` cycles the routes on the board, `F` clears the filter, `/` opens the
-//!   find field (live substring matching), `esc` closes the panel;
+//!   find field (live substring matching), `esc` closes the panel. The header's
+//!   route chip is the same cycle for the mouse, and says which route the board
+//!   is showing rather than that filtering exists (gh#295, claim E3);
 //! - the `WatchBoard` subscription is **standing**, not lazy — the shell's
 //!   sidebar draws its Agents section ([`BoardPanel::agents`], gh#103) off these
 //!   rows with the dock shut — and reconnects with a 2 s backoff if the engine
@@ -476,16 +479,26 @@ fn group_row_id(state: BoardState, route: Option<&str>) -> String {
 /// is simpler for it — one line, its padding, and nothing a pointer does may
 /// change either.
 const ROW_H: f32 = ROW_PAD_Y * 2.0 + ROW_LINE_H;
-/// The row's one line — the action chip's height, so a row showing chips is
-/// exactly as tall as one that is not.
-const ROW_LINE_H: f32 = 20.0;
+/// The row's one line — the action chip's height (E9), so a row showing chips
+/// is exactly as tall as one that is not.
+const ROW_LINE_H: f32 = 22.0;
 /// The row's vertical padding, named because [`ROW_H`] is built from it and a
 /// row whose declared height disagreed with its content would clip the line.
-const ROW_PAD_Y: f32 = 6.0;
-/// How much of a row the metadata column may take before it truncates. The
-/// title is what the list is for; the facts beside it are a column to scan
-/// down, not a second title.
-const META_MAX_W: f32 = 150.0;
+const ROW_PAD_Y: f32 = 5.0;
+/// The panel's own side padding — its header, every group header, every row and
+/// the footer sit on it (E2, E4, E6, E14).
+///
+/// Fourteen is not a step on the spacing scale ([`Theme::SPACE_MD`] is 12 and
+/// [`Theme::SPACE_LG`] is 16), and `tokens.md` has no name for it, so it is a
+/// constant here rather than the nearest token wearing the wrong meaning.
+const PAD_X: f32 = 14.0;
+/// The row's fixed columns (E6), in the order they are drawn. The title takes
+/// whatever is left, which is why the three facts beside it are columns to read
+/// down rather than a sentence that ends wherever the title stopped.
+const COL_GLYPH: f32 = 10.0;
+const COL_ID: f32 = 56.0;
+const COL_REPO: f32 = 76.0;
+const COL_TIME: f32 = 60.0;
 /// How tall the peek's issue body may get before it scrolls (gh#132). Capped
 /// rather than proportional: the list above is the thing being navigated, and a
 /// panel that grew with a long issue would push the cursor's own row off screen.
@@ -553,15 +566,46 @@ pub fn agent_state_color(state: board::AgentState, theme: &Theme) -> gpui::Hsla 
     theme.status(crate::theme::Status::of_agent(state))
 }
 
-/// The facts a row carries in its right-hand column — the shared derivation's,
-/// in the spelling a proportional font can set (gh#176): joined with `·`, not
-/// padded into the terminal's monospace grid.
+/// The repo column (E6): the repository the row's work lands in.
 ///
-/// `selected: false` always. The grid's one selection-dependent field is the
-/// `[enter to dispatch]` hint, which this surface now draws as a chip that is
-/// always there rather than a note that appears under the cursor.
-fn metadata(row: &TaskRow, now: chrono::DateTime<Utc>) -> String {
-    board::row_metadata_line(row, false, now)
+/// A GitHub id carries it (`gh:Florin-AS/tally#507` → `tally`), and it is the
+/// half of the identifier that makes `#507` mean anything — which is why the id
+/// column can go back to the upstream spelling now that the repo has a column
+/// of its own. A Linear id names no repo, so the row says where the work runs
+/// instead: the space, which is the only answer that source has.
+fn repo_cell(row: &TaskRow) -> String {
+    board::gh_repo_name(&row.id)
+        .map(str::to_string)
+        .or_else(|| row.workspace.clone())
+        .unwrap_or_default()
+}
+
+/// The time column (E6): the one fact a row's own state measures itself by.
+///
+/// A live attempt is a clock; a review is the pull request you would open; a
+/// failed attempt is how it ended; a closed row is the agent that did it (E13).
+/// A ready row has nothing running and so nothing to say here, and says
+/// nothing — the column stays a column either way.
+fn time_cell(row: &TaskRow, now: chrono::DateTime<Utc>) -> String {
+    match row.state() {
+        BoardState::Working | BoardState::Blocked => row
+            .started_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            // Never negative: clock skew must not render as a count-up from
+            // the future (the same guard the shared derivation keeps).
+            .map(|start| {
+                board::format_elapsed((now - start.with_timezone(&Utc)).num_seconds().max(0))
+            })
+            .unwrap_or_default(),
+        BoardState::Review => match row.pr_number {
+            Some(number) => format!("PR #{number}"),
+            None => "no PR".to_string(),
+        },
+        BoardState::Failed => "exited".to_string(),
+        BoardState::Ready => String::new(),
+        BoardState::Done => row.runtime.clone().unwrap_or_default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,20 +1165,31 @@ impl BoardPanel {
         host_params(self.host.as_deref(), value)
     }
 
-    /// The host's display name, for the chip and the banners.
+    /// The host's display name, for the header and the banners.
+    ///
+    /// The local host is named too, not called "This device" (E2): the header
+    /// says which box produced these rows, and "this device" is the one answer
+    /// that stops meaning anything the moment a screenshot of it is read
+    /// somewhere else. Falls back to the pronoun only when the device list has
+    /// not landed yet.
     fn host_label(&self, cx: &App) -> SharedString {
-        let Some(host) = self.host.as_deref() else {
-            return "This device".into();
-        };
-        self.state
-            .read(cx)
+        let state = self.state.read(cx);
+        let id = self
+            .host
+            .as_deref()
+            .or(state.local_device_id.as_deref())
+            .unwrap_or_default();
+        state
             .devices
             .iter()
-            .find(|d| d.id == host)
+            .find(|d| d.id == id)
             .map(|d| SharedString::from(d.name.clone()))
-            // A host id with no device row (the row has not synced yet) is
-            // still worth naming — the id is what the call carries.
-            .unwrap_or_else(|| SharedString::from(host.to_string()))
+            .unwrap_or_else(|| match self.host.as_deref() {
+                // A host id with no device row (the row has not synced yet) is
+                // still worth naming — the id is what the call carries.
+                Some(host) => SharedString::from(host.to_string()),
+                None => "This device".into(),
+            })
     }
 
     /// Point the panel at a device, explicitly. `pinned` stops the automatic
@@ -2329,18 +2384,29 @@ impl BoardPanel {
 
     // ---- rendering ----
 
+    /// The panel's name, and the two controls the canvas gives it (E2).
+    ///
+    /// Left to right: "Board", the device serving it, that device's presence
+    /// dot, then — hard right — the route chip and the find button. gh#295 took
+    /// three things off it that the canvas does not have: a count badge (the
+    /// counts belong to the group headers, where they say which twelve), a
+    /// "Filter" control (the route chip IS the filter, and says what it is
+    /// filtered to rather than that filtering exists), and a close ✕ (the
+    /// titlebar's board toggle is the dock's switch, and `esc` still shuts it).
     fn render_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let typing = self.model.typing;
-        let shown = self.model.shown_tasks();
-        let filter_label = self.model.filter.label();
-        let filter_active = self.model.filter.active();
 
-        let mut title = div()
+        let mut header = div()
+            .h(px(40.0))
             .flex_none()
             .flex()
+            .flex_row()
             .items_center()
-            .gap(px(7.0))
+            .gap(px(Theme::SPACE_SM))
+            .px(px(PAD_X))
+            .border_b_1()
+            .border_color(theme.border)
             .child(
                 icon(icons::CHECKLIST)
                     .size(px(15.0))
@@ -2348,43 +2414,18 @@ impl BoardPanel {
             )
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_DENSE))
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_BODY))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from("Board")),
-            );
-        // Whose board this is belongs in the panel's name, not a whisper of a
-        // chip in the corner (gh#125): "Board on Tokenmaxxer9000 · 124" is the
-        // sentence the rows only mean something under. Silent only in the
-        // ordinary case — one device, serving its own board.
-        let one_device = self.state.read(cx).devices.len() <= 1;
-        if !(one_device && self.host.is_none() && self.host_confirmed) {
-            title = title.child(self.render_host_title(&theme, cx));
-        }
-        let title = title.child(
-            div()
-                .px(px(6.0))
-                .h(px(18.0))
-                .flex()
-                .items_center()
-                .rounded(px(Theme::RADIUS_CHIP))
-                .bg(theme.wash(0.08))
-                .text_size(px(Theme::TEXT_CAPTION))
-                .text_color(theme.text_subtle)
-                .child(SharedString::from(shown.to_string())),
-        );
-
-        let mut header = div()
-            .h(px(36.0))
-            .flex_none()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(Theme::SPACE_LG))
-            .border_b_1()
-            .border_color(theme.white_alpha(0.06))
-            .child(title)
+            )
+            // Whose board this is belongs in the panel's name (gh#125), and the
+            // canvas names it on every board rather than only on an install
+            // with two devices: the rows mean something different by which
+            // box produced them, and a header that is silent about it on the
+            // ordinary install is silent exactly where the habit forms.
+            .child(self.render_host_title(&theme, cx))
             .child(div().flex_1());
 
         if typing {
@@ -2427,75 +2468,54 @@ impl BoardPanel {
                     ),
             );
         } else {
-            // Filter cycle: click steps the routes like `f`; a clear chip
-            // appears while a filter is active.
-            let mut filter_chip = div()
-                .id("board-filter")
-                .h(px(24.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .px(px(8.0))
-                .rounded(px(Theme::RADIUS_CHIP))
-                .cursor_pointer()
-                .bg(motion::hover_blend(
-                    "board-filter",
-                    theme.wash(if filter_active { 0.09 } else { 0.0 }),
-                    theme.wash(0.14),
-                ))
-                .on_hover(motion::hover_listener("board-filter"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(message) = this.model.cycle_filter() {
-                        this.set_notice(message, cx);
-                    }
-                    cx.notify();
-                }))
-                .text_size(px(Theme::TEXT_CAPTION));
-            let label: SharedString = filter_label
-                .clone()
-                .map(Into::into)
-                .unwrap_or_else(|| "Filter".into());
-            let label_color = if filter_active {
-                theme.text
-            } else {
-                theme.text_subtle
+            // The route chip (E3): the word "route" in `--subtle`, then what
+            // the board is showing in `--text`. It is the filter — clicking it
+            // steps the routes exactly as `f` does — said as the state it puts
+            // the board in rather than as the verb that changes it, which is
+            // why it can be there when nothing is filtered ("route all") and
+            // still be worth reading.
+            let (word, value): (&str, SharedString) = match &self.model.filter {
+                Filter::All => ("route", "all".into()),
+                Filter::Route(route) => ("route", route.clone().into()),
+                Filter::NoRoute => ("route", board::NO_ROUTE.into()),
+                // A typed query is the other question (`/`), and the chip says
+                // which one it is holding rather than calling a query a route.
+                Filter::Text(query) => ("find", query.clone().into()),
             };
-            filter_chip = filter_chip
-                .child(icon(icons::TUNING).size(px(13.0)).text_color(label_color))
-                .child(
-                    div()
-                        .max_w(px(150.0))
-                        .truncate()
-                        .text_color(label_color)
-                        .child(label),
-                );
-            header = header.child(filter_chip);
-            if filter_active {
-                let clear_id = "board-filter-clear";
-                header = header.child(
-                    div()
-                        .id(clear_id)
-                        .size(px(24.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(Theme::RADIUS_CHIP))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.wash(0.1)))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.model.clear_filter();
-                            cx.notify();
-                        }))
-                        .child(
-                            icon(icons::CLOSE_CIRCLE)
-                                .size(px(14.0))
-                                .text_color(theme.text_muted),
-                        ),
-                );
-            }
+            header = header.child(
+                div()
+                    .id("board-route")
+                    .h(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(Theme::SPACE_SM))
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend("board-route", theme.chip, theme.wash(0.14)))
+                    .on_hover(motion::hover_listener("board-route"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(message) = this.model.cycle_filter() {
+                            this.set_notice(message, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(word)),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(140.0))
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(value),
+                    ),
+            );
             // `/` find.
             header = header.child(
                 div()
@@ -2512,27 +2532,6 @@ impl BoardPanel {
                     .child(
                         icon(icons::MAGNIFER)
                             .size(px(14.0))
-                            .text_color(theme.text_muted),
-                    ),
-            );
-            // Close the dock.
-            header = header.child(
-                div()
-                    .id("board-close")
-                    .size(px(24.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(Theme::RADIUS_CHIP))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.wash(0.1)))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(ToggleBoard), cx);
-                    })
-                    .child(
-                        icon(icons::CLOSE)
-                            .size(px(13.0))
                             .text_color(theme.text_muted),
                     ),
             );
@@ -2562,15 +2561,17 @@ impl BoardPanel {
         // Online: the settled hue, the same green the Devices page paints.
         let emerald = theme.settled;
 
-        // "on {host}", in the title's own type size so it reads as part of the
-        // panel's name rather than as a control that happens to be nearby.
+        // The device's name at 12px `--subtle` and its 5px dot, in the header's
+        // own gap (E2). The canvas drops the word "on": a name beside "Board"
+        // with a presence dot after it is already a sentence, and the preposition
+        // was the only part of it that could not be seen at a glance.
         let mut chip = div()
             .id("board-host")
             .h(px(24.0))
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(5.0))
+            .gap(px(Theme::SPACE_SM))
             .px(px(4.0))
             .rounded(px(Theme::RADIUS_CHIP))
             .cursor_pointer()
@@ -2591,32 +2592,21 @@ impl BoardPanel {
             .text_size(px(Theme::TEXT_DENSE))
             .child(
                 div()
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from("on")),
-            )
-            .child(
-                div()
                     .max_w(px(140.0))
                     .truncate()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(if confirmed {
-                        theme.text_muted
-                    } else {
-                        theme.text_subtle
-                    })
+                    .text_color(theme.text_subtle)
                     .child(label),
             )
             .child(
                 div()
-                    .size(px(6.0))
+                    .size(px(5.0))
                     .flex_none()
                     // round-ok: status dot
                     .rounded_full()
-                    .bg(if confirmed {
-                        emerald
-                    } else {
-                        theme.white_alpha(0.2)
-                    }),
+                    // Lit once that device has delivered rows the sweep settled
+                    // on; while the sweep is still asking, the dot is as quiet
+                    // as the answer is.
+                    .bg(if confirmed { emerald } else { theme.text_faint }),
             );
 
         if open {
@@ -2716,29 +2706,36 @@ impl BoardPanel {
         let len = self.model.section_len(state);
         let fade_key = format!("board-section-{}", state.as_str());
         let color = state_color(state, &theme);
+        let done = state == BoardState::Done;
 
         let el = div()
             .id(SharedString::from(format!(
                 "board-section-{}",
                 state.as_str()
             )))
-            .h(px(30.0))
+            .h(px(26.0))
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .px(px(Theme::SPACE_LG))
-            // The hairline the header sits on — the only line the list draws,
-            // and it separates sections rather than boxing them (gh#176). The
-            // topmost header skips it: the panel's own header already drew one
-            // there, and two hairlines a pixel apart is a border.
-            .when(!first, |el| el.border_t_1().border_color(theme.border))
+            .gap(px(Theme::SPACE_SM))
+            .px(px(PAD_X))
+            // The hairlines the header sits between (E4) — the whole separation
+            // the canvas gives a group, and the reason it needs no fill of its
+            // own. The topmost header skips the top one: the panel's header
+            // already drew a line there, and two hairlines a pixel apart is a
+            // border.
+            .when(!first, |el| el.border_t_1())
+            .border_b_1()
+            .border_color(theme.border)
             .cursor_pointer()
             // [`Bed::Card`], not `Shell`: this list is inside the main panel —
             // the reference's `--card` — so a selected row here is its
             // `--selcard`. In dark the two land on the same tone; in light the
             // panel is white and the row has to step DOWN into it (gh#258).
+            // At rest this paints nothing, which is what E4 asks for; the only
+            // fills a header takes are the pointer's and the cursor's, and the
+            // canvas has no state for either.
             .list_row(&theme, Bed::Card, selected, &fade_key)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.model.toggle_collapsed(state);
@@ -2746,7 +2743,10 @@ impl BoardPanel {
             }))
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_BODY))
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    // Done's glyph is `--faint` rather than its hue (E12): a
+                    // closed row spends no colour, and neither does its header.
                     .text_color(color)
                     .child(SharedString::from(state.glyph())),
             )
@@ -2758,42 +2758,50 @@ impl BoardPanel {
                     .flex_none()
                     .text_size(px(Theme::TEXT_DENSE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
+                    // Done today is quieter than the queue by design (E12).
+                    .text_color(if done { theme.text_muted } else { theme.text })
                     .child(SharedString::from(section_title(state))),
             )
-            // The count in the group headers' words — "· 12" — so one language
-            // reads down the whole list instead of a pill here and a suffix
-            // twelve pixels below it.
+            // A bare number (E4). The board says "how many" in one language
+            // from the panel's top to its bottom, and a leading `·` is a
+            // separator with nothing on the other side of it.
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(if folded {
-                        theme.text_muted
-                    } else {
-                        theme.text_subtle
-                    })
-                    .child(SharedString::from(format!("· {len}"))),
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(len.to_string())),
             )
             .child(div().flex_1())
-            .child(
-                icon(if folded {
-                    icons::ALT_ARROW_RIGHT
-                } else {
-                    icons::ALT_ARROW_DOWN
-                })
-                .size(px(13.0))
-                .text_color(theme.text_subtle),
-            );
+            // The chevron belongs to the group that is *foldable in the
+            // picture* (E12): Done carries one always, because it is history
+            // and folding it is the affordance; every other group grows one the
+            // moment it is folded, since a header with rows hidden under it and
+            // nothing saying so is a section that looks empty.
+            .when(done || folded, |el| {
+                el.child(
+                    icon(if folded {
+                        icons::ALT_ARROW_RIGHT
+                    } else {
+                        icons::ALT_ARROW_DOWN
+                    })
+                    .size(px(12.0))
+                    .text_color(theme.text_subtle),
+                )
+            });
 
         el.into_any_element()
     }
 
-    /// A route's group header inside a section (gh#125): chevron, the route's
-    /// name and its count — "tally · 34" is what makes 124 rows scannable.
-    /// `None` is the `no route` group, which starts folded at the bottom of its
-    /// section: those rows are visibility-only by design, worth a headline and
-    /// never pole position.
+    /// A route's group header inside a section (gh#125, E11): the route's name
+    /// and its count — "tally 34" is what makes 124 rows scannable.
+    ///
+    /// A 24px line indented to x=24, the name 12px `--subtle` and the count
+    /// 12px `--faint`: quieter than the group header above it in both tone and
+    /// height, because it divides a group rather than announcing one. `None` is
+    /// the `no route` group, which starts folded at the bottom of its section:
+    /// those rows are visibility-only by design, worth a headline and never
+    /// pole position.
     fn render_group(
         &mut self,
         state: BoardState,
@@ -2820,14 +2828,14 @@ impl BoardPanel {
                 state.as_str(),
                 label
             )))
-            .h(px(26.0))
+            .h(px(24.0))
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .pl(px(Theme::SPACE_LG + 12.0))
-            .pr(px(Theme::SPACE_LG))
+            .gap(px(Theme::SPACE_SM))
+            .pl(px(24.0))
+            .pr(px(PAD_X))
             .cursor_pointer()
             .list_row(&theme, Bed::Card, selected, &fade_key)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2835,21 +2843,11 @@ impl BoardPanel {
                 cx.notify();
             }))
             .child(
-                icon(if folded {
-                    icons::ALT_ARROW_RIGHT
-                } else {
-                    icons::ALT_ARROW_DOWN
-                })
-                .size(px(12.0))
-                .text_color(theme.text_subtle),
-            )
-            .child(
                 div()
                     .flex_none()
                     .max_w(px(180.0))
                     .truncate()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(Theme::TEXT_DENSE))
                     // The no-route group's headline uses the rows' own words,
                     // in the quiet tone of something you cannot dispatch.
                     .text_color(if unrouted {
@@ -2857,29 +2855,46 @@ impl BoardPanel {
                     } else if selected {
                         theme.text
                     } else {
-                        theme.text_muted
+                        theme.text_subtle
                     })
                     .child(label),
             )
             .child(
                 div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(format!("· {len}"))),
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(len.to_string())),
             )
+            // Same rule as the group header above it: the chevron appears when
+            // there is something folded away to say so about.
+            .when(folded, |el| {
+                el.child(div().flex_1()).child(
+                    icon(icons::ALT_ARROW_RIGHT)
+                        .size(px(12.0))
+                        .text_color(theme.text_subtle),
+                )
+            })
             .into_any_element()
     }
 
-    /// One task row, on one line (gh#176): glyph + identifier + title, then the
-    /// row's own verb and its metadata right-aligned against the far edge.
+    /// One task row, on one line, in fixed columns (E6): the status glyph, the
+    /// id, the title, the repo, the time, then the row's own verb.
+    ///
+    /// gh#176 put the row's facts in a `·`-joined string at the right edge,
+    /// which reads as a sentence whose length depends on the row — so no two
+    /// rows agree on where anything is, and the title truncates at a different
+    /// place on every line. The canvas spends the same pixels on three columns
+    /// that start where they start: an id you can scan down, the repo the work
+    /// lands in, and the one clock the row's state measures itself by.
     ///
     /// **Every row is exactly [`ROW_H`] tall, always** (gh#132). gh#125 gave the
     /// row under the pointer a second title line, which meant the list reflowed
     /// on every hover — the "laggy or jagged" the operator reported. Hover here
-    /// changes colour and nothing else that was on screen a moment ago: the
-    /// primary verb and the metadata column are both anchored to the right
-    /// edge, so the hover verbs open leftward into the title's slack rather
-    /// than pushing anything the eye had already found.
+    /// changes colour and nothing else: the second verb belongs to the SELECTED
+    /// row (E10), not the hovered one, so nothing slides sideways as the
+    /// pointer crosses a row — least of all a destructive verb arriving under
+    /// a pointer that was aimed at the chip beside it.
     ///
     /// The full title lives in the peek panel, which is what a click opens.
     #[allow(clippy::too_many_arguments)]
@@ -2893,16 +2908,20 @@ impl BoardPanel {
         let state = row.state();
         let color = state_color(state, &theme);
         let fade_key = format!("board-row-{}", row.id);
-        let hovered = motion::hover_t(&fade_key) > 0.5;
         let now = Utc::now();
-        let meta = metadata(row, now);
         let id = row.id.clone();
         let select_id = id.clone();
         let open_id = id.clone();
-        let identifier = row.display_identifier();
+        // The upstream spelling, not the repo-qualified one (gh#125): the repo
+        // has a column of its own now, and saying it twice cost the id column
+        // the width that lets `TAL-218` and `gh#144` line up under each other.
+        let identifier = row.identifier.clone();
+        let repo = repo_cell(row);
+        let time = time_cell(row, now);
         let title = row.title.clone();
+        let done = state == BoardState::Done;
 
-        let actions = self.render_row_actions(row, selected || hovered, cx);
+        let actions = self.render_row_actions(row, selected, cx);
 
         div()
             .id(SharedString::from(format!("board-row-{}", row.id)))
@@ -2915,7 +2934,7 @@ impl BoardPanel {
             .flex()
             .flex_col()
             .justify_center()
-            .px(px(Theme::SPACE_LG))
+            .px(px(PAD_X))
             .cursor_pointer()
             .list_row(&theme, Bed::Card, selected, &fade_key)
             // A row is a door (gh#132): clicking one selects it AND opens the
@@ -2944,10 +2963,9 @@ impl BoardPanel {
                     }
                 }),
             )
-            // The one line: glyph + the repo-qualified identifier + title, then
-            // the verbs and the metadata column. Its height is the chip's, so a
-            // row whose chips appear on hover is exactly as tall as one whose
-            // chips do not (gh#132).
+            // The one line, in the canvas's columns (E6). Its height is the
+            // action chip's, so a row that draws a second verb is exactly as
+            // tall as one that does not (gh#132).
             .child(
                 div()
                     .w_full()
@@ -2955,11 +2973,11 @@ impl BoardPanel {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(7.0))
+                    .gap(px(10.0))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(12.0))
+                            .w(px(COL_GLYPH))
                             .text_size(px(Theme::TEXT_CAPTION))
                             .text_color(color)
                             .child(SharedString::from(state.glyph())),
@@ -2967,12 +2985,18 @@ impl BoardPanel {
                     .child(
                         div()
                             .flex_none()
+                            .w(px(COL_ID))
+                            .truncate()
                             .font_family(theme.font_mono.clone())
                             .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(if state == BoardState::Done {
+                            // E7/E8/E13: the id trails the title by one tone,
+                            // whatever tone the title is in.
+                            .text_color(if done {
                                 theme.text_faint
-                            } else {
+                            } else if selected {
                                 theme.text_muted
+                            } else {
+                                theme.text_subtle
                             })
                             .child(SharedString::from(identifier.clone())),
                     )
@@ -2983,9 +3007,9 @@ impl BoardPanel {
                             // One line, on every row, in every state (gh#132).
                             // The whole title is in the peek panel.
                             .truncate()
-                            .text_size(px(Theme::TEXT_DENSE))
-                            .text_color(if state == BoardState::Done {
-                                theme.text_faint
+                            .text_size(px(Theme::TEXT_BODY))
+                            .text_color(if done {
+                                theme.text_subtle
                             } else if selected {
                                 theme.text
                             } else {
@@ -2993,57 +3017,75 @@ impl BoardPanel {
                             })
                             .child(SharedString::from(title.clone())),
                     )
-                    .child(actions)
-                    // The metadata, right-aligned against the row's far edge
-                    // (gh#176) — a column to read down rather than a
-                    // space-padded pseudo-table set in a proportional font. A
-                    // row with nothing to say takes no width, and the rows
-                    // that do say something all end in the same place.
-                    .when(!meta.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .max_w(px(META_MAX_W))
-                                .truncate()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .text_color(if state == BoardState::Done {
-                                    theme.text_faint
-                                } else {
-                                    theme.text_subtle
-                                })
-                                .child(SharedString::from(meta)),
-                        )
-                    }),
+                    // The repo and the clock: fixed columns, right-aligned, so
+                    // they read DOWN the list. Empty is a width, not a gap — a
+                    // ready row with no clock keeps the column open under the
+                    // running rows above it.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(COL_REPO))
+                            .truncate()
+                            .text_align(gpui::TextAlign::Right)
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(repo)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(COL_TIME))
+                            .truncate()
+                            .text_align(gpui::TextAlign::Right)
+                            .text_size(px(Theme::TEXT_DENSE))
+                            // On a done row this column carries the agent that
+                            // did it, in history's own tone (E13).
+                            .text_color(if done {
+                                theme.text_faint
+                            } else {
+                                theme.text_subtle
+                            })
+                            .child(SharedString::from(time)),
+                    )
+                    // Last (E6). A done row has no verb and draws nothing here.
+                    .child(actions),
             )
             .into_any_element()
     }
 
-    /// The row's verbs: the primary one always, the rest on hover or selection.
+    /// The row's verbs: the primary one always, the rest on the selected row.
     ///
     /// *Which* actions a row has is [`board::row_actions`] and *which of them is
     /// its own* is [`board::primary_action`] — the shared rules the TUI's keys
     /// and the phone's chip read too (gh#132, gh#176). This decides only how
     /// they look and what a click runs.
     ///
-    /// The primary chip is drawn last, hard against the metadata column, and
-    /// the hover verbs open to its left. A panel whose every verb appeared only
-    /// under the pointer read as inert to anyone who had not already learned
-    /// the footer's legend; one verb that is simply there answers "what does
-    /// this row do" without being asked, and it is the verb `enter` runs, so
-    /// the mouse and the keyboard are teaching the same lesson.
+    /// The primary is the chipped one and it comes first (E9): 22px on `--chip`
+    /// with `--text` copy — the token every other chip in the window sits on,
+    /// rather than the ad-hoc wash this row used to mix for itself. Its copy is
+    /// `--text` whatever the verb is: `Open PR` was drawn in the review hue and
+    /// that spends a status colour on something that is not a status — the four
+    /// hues mean blocked, working, review, settled, and a verb painted in one of
+    /// them is a row claiming a state it is not in. The rest follow it bare
+    /// (E10) — same box, no bed — where `Cancel` keeps the danger hue, which is
+    /// the one case where the colour IS about what the verb does to a run.
+    ///
+    /// A panel whose every verb appeared only under the pointer read as inert to
+    /// anyone who had not already learned the footer's legend; one verb that is
+    /// simply there answers "what does this row do" without being asked, and it
+    /// is the verb `enter` runs, so the mouse and the keyboard teach the same
+    /// lesson.
     fn render_row_actions(
         &mut self,
         row: &TaskRow,
-        visible: bool,
+        selected: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let primary = board::primary_action(row);
-        let mut actions: Vec<RowAction> = if visible {
-            board::secondary_actions(row)
-        } else {
-            Vec::new()
-        };
-        actions.extend(primary);
+        let mut actions: Vec<RowAction> = primary.into_iter().collect();
+        if selected {
+            actions.extend(board::secondary_actions(row));
+        }
         if actions.is_empty() {
             return gpui::Empty.into_any_element();
         }
@@ -3054,9 +3096,10 @@ impl BoardPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(5.0))
             .children(actions.into_iter().map(|action| {
                 let target = id.clone();
+                let chipped = Some(action) == primary;
                 div()
                     .id(SharedString::from(format!(
                         "board-action-{}-{}",
@@ -3065,14 +3108,18 @@ impl BoardPanel {
                     )))
                     .flex_none()
                     .h(px(ROW_LINE_H))
-                    .px(px(8.0))
+                    .px(px(9.0))
                     .rounded(px(Theme::RADIUS_CHIP))
-                    .bg(theme.wash(0.12))
+                    .when(chipped, |el| el.bg(theme.chip))
                     .flex()
                     .items_center()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(action_color(action, &theme))
-                    .hover(|s| s.bg(theme.wash(0.18)))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(if chipped {
+                        theme.text
+                    } else {
+                        action_color(action, &theme)
+                    })
+                    .hover(|s| s.bg(theme.wash(0.12)))
                     .child(SharedString::from(action.short_label()))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -3861,26 +3908,30 @@ impl BoardPanel {
 
     /// The footer: a transient dispatch/cancel message owns it until it
     /// expires, then the board's key hints take over.
+    ///
+    /// Three hints (E14), not eight: `↵ dispatch · space peek · / find`. The
+    /// footer had grown into a legend for every key the panel binds — which is
+    /// a list nobody reads, and a list that changes under you as the cursor
+    /// moves is worse than one that does not. The keys it stopped naming still
+    /// work (`f`/`F` cycle and clear the filter, `r` opens a review, `esc`
+    /// closes the panel); the route chip in the header is where filtering
+    /// became visible instead.
+    ///
+    /// `↵`'s verb still follows the selected row, from the same rule the row's
+    /// own chip draws (gh#176) — one designation, said twice in the same words.
     fn render_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let has_notice = self.notice.is_some();
         let notice = self.notice.clone();
         let typing = self.model.typing;
-        let filter_active = self.model.filter.active();
-        let on_section = self.model.on_section().is_some();
         let selected_task = self.model.selected_task().map(|r| r.state());
-        // The same designation the row's visible chip draws (gh#176): one rule
-        // for what enter does, said twice in the same words.
         let enter_hint = self
             .model
             .selected_task()
             .and_then(board::primary_action)
-            .map(|action| format!("enter to {}", action.verb()));
+            .map(|action| format!("↵ {}", action.verb()));
         let picking = self.dispatch.is_some();
         let peek_open = self.peek;
-        // Only on rows that have something to review (gh#180): a hint for a key
-        // that will answer "never dispatched" is worse than no hint.
-        let reviewable = self.model.selected_task().is_some_and(board::reviewable);
 
         let content: SharedString = if let Some(notice) = notice {
             notice
@@ -3890,37 +3941,27 @@ impl BoardPanel {
             "enter to keep the filter · esc to clear".into()
         } else {
             let mut hints: Vec<&str> = Vec::new();
-            if on_section {
-                hints.push("click to fold/unfold");
-            }
             if let Some(hint) = enter_hint.as_deref() {
                 hints.push(hint);
             }
             // The door, named (gh#132) — an affordance nobody can find is one
             // that does not exist.
             if selected_task.is_some() {
-                hints.push(if peek_open { "space closes" } else { "space to open" });
+                hints.push(if peek_open { "space close" } else { "space peek" });
             }
-            if reviewable {
-                hints.push("r to review");
-            }
-            hints.push("f filter · / find");
-            if filter_active {
-                hints.push("F clears");
-            }
-            hints.push("esc close");
+            hints.push("/ find");
             hints.join(" · ").into()
         };
 
         div()
-            .h(px(26.0))
+            .h(px(28.0))
             .flex_none()
             .flex()
             .items_center()
-            .px(px(Theme::SPACE_LG))
+            .px(px(PAD_X))
             .border_t_1()
-            .border_color(theme.white_alpha(0.06))
-            .text_size(px(Theme::TEXT_CAPTION))
+            .border_color(theme.border)
+            .text_size(px(Theme::TEXT_DENSE))
             .text_color(if has_notice {
                 theme.warning
             } else {
@@ -4400,26 +4441,54 @@ mod tests {
         }
     }
 
+    /// E6: the two right-hand columns say one thing each, and a row with
+    /// nothing to say there says nothing rather than something else.
     #[test]
-    fn metadata_reuses_the_shared_derivation() {
+    fn the_row_columns_are_one_fact_each() {
         let now = Utc::now();
-        // The route rides the group header now (gh#125); a workspace matching
-        // it says nothing the row does not already.
+        // A ready row has no clock — and the column stays a column.
         let ready = row("r", BoardState::Ready);
-        assert_eq!(metadata(&ready, now), "");
-        let mut w = row("w", BoardState::Working);
-        w.started_at = Some(now.to_rfc3339());
-        // No padding on this surface: the facts, joined (gh#176). A run of
-        // spaces is a column in a terminal and a ragged gap in a proportional
-        // font.
-        assert_eq!(metadata(&w, now), "claude-code · ws:offhand · 0s");
-        assert!(!metadata(&w, now).contains("  "));
-        let mut rev = row("v", BoardState::Review);
-        rev.pr_number = Some(7);
-        assert_eq!(metadata(&rev, now), "PR #7 · waiting on you");
-        let mut f = row("f", BoardState::Failed);
-        f.state = BoardState::Failed.as_str().into();
-        assert_eq!(metadata(&f, now), "pane exited without completing");
+        assert_eq!(time_cell(&ready, now), "");
+
+        let mut working = row("w", BoardState::Working);
+        working.started_at = Some(now.to_rfc3339());
+        assert_eq!(time_cell(&working, now), "0s");
+
+        let mut review = row("v", BoardState::Review);
+        review.pr_number = Some(7);
+        assert_eq!(time_cell(&review, now), "PR #7");
+        review.pr_number = None;
+        assert_eq!(time_cell(&review, now), "no PR");
+
+        let mut failed = row("f", BoardState::Failed);
+        failed.state = BoardState::Failed.as_str().into();
+        assert_eq!(time_cell(&failed, now), "exited");
+
+        // E13: history's column carries the agent that closed it.
+        let mut done = row("d", BoardState::Done);
+        done.state = BoardState::Done.as_str().into();
+        done.runtime = Some("claude".into());
+        assert_eq!(time_cell(&done, now), "claude");
+    }
+
+    /// The repo column is the repository a GitHub id names, and the space a
+    /// Linear one runs in — never the owner, and never empty when the row
+    /// knows either.
+    #[test]
+    fn the_repo_column_names_the_repository_or_the_space() {
+        let mut gh = row("x", BoardState::Ready);
+        gh.id = "gh:Florin-AS/tally#507".into();
+        assert_eq!(repo_cell(&gh), "tally");
+
+        let mut linear = row("y", BoardState::Ready);
+        linear.id = "lin:TAL-218".into();
+        linear.workspace = Some("tally-web".into());
+        assert_eq!(repo_cell(&linear), "tally-web");
+
+        let mut bare = row("z", BoardState::Ready);
+        bare.id = "lin:TAL-9".into();
+        bare.workspace = None;
+        assert_eq!(repo_cell(&bare), "");
     }
 
     /// gh#132: every row is the same height, whatever the pointer is doing.
@@ -4433,9 +4502,9 @@ mod tests {
         // declared more would drift from what it draws.
         assert_eq!(ROW_H, 32.0);
         assert_eq!(ROW_H, ROW_PAD_Y * 2.0 + ROW_LINE_H);
-        // The line is exactly the action chip's height, so a row showing chips
-        // on hover is exactly as tall as one that is not.
-        assert_eq!(ROW_LINE_H, 20.0);
+        // The line is exactly the action chip's height (E9), so a row that
+        // draws a second verb is exactly as tall as one that does not.
+        assert_eq!(ROW_LINE_H, 22.0);
     }
 
     /// gh#176's exit criterion, in the geometry it is a claim about: the list

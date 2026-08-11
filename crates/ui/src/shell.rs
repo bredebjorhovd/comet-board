@@ -712,7 +712,14 @@ impl Shell {
             terminal: None,
             changes: None,
             board,
-            board_open: false,
+            // Capture knob of the same family as the ones above
+            // (`COMET_OPEN_BOARD=1`): boot with the right dock already showing
+            // the board. The dock is a keypress away for a person, and that
+            // keypress is exactly what a capture script cannot rely on — a
+            // second app in front of this one swallows it, and the design pass
+            // that has to photograph this panel then photographs an empty
+            // window instead (gh#295).
+            board_open: std::env::var("COMET_OPEN_BOARD").is_ok_and(|v| v == "1"),
             review: None,
             review_events: None,
             route,
