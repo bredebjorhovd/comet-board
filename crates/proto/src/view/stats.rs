@@ -1006,6 +1006,48 @@ pub struct BoardStats {
     /// whose total is zero, and those two are different facts.
     #[serde(default)]
     pub spend: Option<BoardSpend>,
+
+    /// How close this window's attempts came to filling their context windows
+    /// (gh#271). Defaulted on the wire, like every field added after the
+    /// first release: an older board answers without it and the page simply
+    /// does not draw the line.
+    #[serde(default)]
+    pub context: ContextPressure,
+}
+
+/// The context half of the page: not what the window's work cost, but how
+/// close it ran to the limit of what its agents could hold (gh#271).
+///
+/// Deliberately three small numbers rather than a distribution. The question
+/// this answers is whether attempts on this board are routinely running out of
+/// context — which is a fact about how the work is *shaped* (too much in one
+/// attempt) and shows up nowhere in the spend, because a compacting agent and
+/// a comfortable one cost about the same.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ContextPressure {
+    /// Attempts in the window whose harness reported a window at all — this
+    /// half of the page's coverage line, and the same honesty
+    /// [`BoardStats::attempts_with_tokens`] keeps: the two below are shares of
+    /// this, never of the window.
+    pub attempts_reported: usize,
+    /// …of which this many were last seen at or past the point their harness
+    /// compacts (or, for a harness that names no point, 90% of the window).
+    pub near_compaction: usize,
+    /// The fullest any one attempt was last seen, `0..=100`. `None` when
+    /// nothing reported — never `Some(0)`, which would read as a board whose
+    /// agents ran empty.
+    pub peak_percent: Option<u8>,
+}
+
+impl ContextPressure {
+    /// Did anything in this window report a context window at all? The gate
+    /// the line renders behind — with nothing reported there is no share to
+    /// show, and a `0 of 0` would read as a board with no pressure rather than
+    /// one with no measurements.
+    pub fn is_reported(&self) -> bool {
+        self.attempts_reported > 0
+    }
 }
 
 impl BoardStats {
@@ -1042,6 +1084,7 @@ impl BoardStats {
             tokens_by_runtime: BTreeMap::new(),
             tokens_by_account: BTreeMap::new(),
             spend: None,
+            context: ContextPressure::default(),
         }
     }
 
@@ -2656,6 +2699,10 @@ mod spec {
                 "landingHeadline": stats.landing.headline(),
                 "landingSegments": stats.landing.segments(),
                 "landingInFlightNote": stats.landing.in_flight_note(),
+                // gh#271. The other meter: a window that reported nothing has
+                // no share to show, and `0 of 0` would read as a board with no
+                // context pressure rather than one with no measurements.
+                "contextReported": stats.context.is_reported(),
             }
         })
     }
@@ -2779,6 +2826,16 @@ mod spec {
             ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
             ("gpt-5.6-terra", usage(400, 100, 0, 500)),
         ]);
+
+        // Context pressure (gh#271): fewer attempts reported a window than
+        // reported tokens, which is the ordinary case — one of the three
+        // harnesses meters no window at all — and the share is taken over the
+        // ones that did, never over the week.
+        busy.context = ContextPressure {
+            attempts_reported: 6,
+            near_compaction: 2,
+            peak_percent: Some(97),
+        };
 
         // Attempts ran and none reported usage: a REAL 0% coverage, which is a
         // different fact from "nothing ran" and the one most easily lost.

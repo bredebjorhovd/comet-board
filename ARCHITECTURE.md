@@ -333,6 +333,10 @@ per `docs/research/durable-objects-language.md`.
   per-message token columns, `WatchUsage`). Rate-limit meters on agent accounts are *kept*
   (separate concern; probed from CLIs, not CRDT-synced), and so are the board's own per-attempt
   totals — summed off the host's run journal into `board.db`, never into a session doc (gh#151).
+  **Context fullness follows the same rule and gains a reason of its own** (gh#271): a level
+  rather than a flow, so a doc that kept every reading would replay a hundred stale gauges to
+  anybody scrolling back. It rides `AgentEvent::ContextUsage` to the run journal and, from
+  there, onto the attempt row — live-attempt state, not transcript content.
 - **Changed**: Postgres entity sync/server → workspace doc + edge; Electron/React/mugen → gpui with
   ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (comet
   had already made this move); mobile app → out of scope for this repo.

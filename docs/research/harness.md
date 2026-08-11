@@ -33,6 +33,13 @@
 - Control channel (bidirectional control_request/control_response, request_id-multiplexed):
   - client->CLI: initialize, interrupt, set_permission_mode, set_model, rewind_files,
     mcp_reconnect/toggle/status, get_context_usage, stop_task; model discovery is a control req.
+  - get_context_usage (WIRED, gh#271): polled on a coarse timer while a turn is live. Reply is a
+    control_response carrying {totalTokens, maxTokens (usable; rawMaxTokens is the unreduced
+    window), percentage, autoCompactThreshold, isAutoCompactEnabled, model, + a per-category
+    breakdown and a /context render grid we drop}. Verified against claude 2.1.227 over a live
+    stdio channel. Only the level is kept -> AgentEvent::ContextUsage. Never emitted after the
+    turn's Done: a run journal ending on a non-Done event reads as a run that died mid-stream.
+    An `error` subtype (older CLI, or --remote with no callback registered) is silent, not fatal.
   - CLI->client: can_use_tool {tool_name, input, permission_suggestions...} — reply
     {"behavior":"allow","updatedInput":{...}} or {"behavior":"deny","message":...}.
     AskUserQuestion ALWAYS reaches can_use_tool -> intercept, requestInput UI, allow with
@@ -54,6 +61,10 @@
   (item.type: agent_message, reasoning, command_execution, file_change, mcp_tool_call, web_search,
   todo_list); deltas item/agentMessage/delta, item/reasoning/textDelta|summaryTextDelta,
   item/commandExecution/outputDelta, item/plan/delta; thread/tokenUsage/updated.
+- thread/tokenUsage/updated carries {last, total, modelContextWindow?}. `last` is held for
+  turn/completed as the turn's spend (gh#151) AND read live for context fullness (gh#271):
+  last.totalTokens (or input+output) over modelContextWindow. No window stated -> no reading;
+  codex names no auto-compact point (it fails the turn with contextWindowExceeded instead).
 - Server->client approval REQUESTS (must answer): item/commandExecution/requestApproval,
   item/fileChange/requestApproval -> {accept|acceptForSession|decline|cancel}.
 - model/list {cursor?} -> supportedReasoningEfforts, service tiers (experimentalApi).

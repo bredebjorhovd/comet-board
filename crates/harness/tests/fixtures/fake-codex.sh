@@ -84,8 +84,13 @@ case "$turnline" in
   emit '{"method":"item/completed","params":{"item":{"id":"m2","type":"agentMessage","text":"unstreamed tail"}}}'
   # Unknown notification methods must be tolerated.
   emit '{"method":"some/unknownNotification","params":{"x":1}}'
-  emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"inputTokens":42,"outputTokens":7}}}}'
+  # Mid-turn snapshots: spend is held for the turn's end, fullness is not
+  # (gh#271). The window fills, then a compaction drops it back.
+  emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"modelContextWindow":272000,"last":{"inputTokens":230000,"outputTokens":20000,"totalTokens":250000},"total":{"totalTokens":250000}}}}'
+  emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"modelContextWindow":272000,"last":{"inputTokens":42,"outputTokens":7,"totalTokens":49},"total":{"totalTokens":250049}}}}'
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  # A straggling snapshot after the turn ended: must not follow the Done.
+  emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"modelContextWindow":272000,"last":{"totalTokens":271000},"total":{"totalTokens":521049}}}}'
   ;;
 
 # NOTE: steer-race before steer — `case` takes the first matching glob.

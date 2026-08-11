@@ -746,6 +746,7 @@ impl SyncEngine {
                 // review snapshot current instead of freezing it at first sight.
                 self.harvest_claims(Some(runtime), &attempt);
                 self.record_tokens(Some(runtime), &attempt);
+                self.record_context(Some(runtime), &attempt);
                 self.record_review_facts(Some(runtime), &attempt);
                 continue;
             }
@@ -783,6 +784,7 @@ impl SyncEngine {
                 .ok_or_else(|| anyhow::anyhow!("adopted attempt {attempt_id} disappeared"))?;
             self.harvest_claims(Some(runtime), &attempt);
             self.record_tokens(Some(runtime), &attempt);
+            self.record_context(Some(runtime), &attempt);
             self.record_review_facts(Some(runtime), &attempt);
             self.db.close_attempt(attempt_id, Outcome::Done)?;
             match author_chat_id {
@@ -1137,6 +1139,11 @@ impl SyncEngine {
             // orphaned, capped — and a total recorded after the close would
             // never be recorded at all (gh#151).
             self.record_tokens(runtime, &attempt);
+            // …and for how full its window is (gh#271), which is a live-attempt
+            // fact above all: an attempt that ends here keeps the last level
+            // it was seen at, and one that keeps running is where somebody
+            // can still act on it.
+            self.record_context(runtime, &attempt);
             // …and the same argument for the review's evidence (§gh#183): the
             // checkout and the journal both outlive the attempt by less than
             // the review does.
@@ -1259,6 +1266,50 @@ impl SyncEngine {
         {
             self.log.warn(format!(
                 "recording tokens for attempt {}: {e:#}",
+                attempt.id
+            ));
+        }
+    }
+
+    /// Copy how full the attempt's context window is onto its row (gh#271).
+    ///
+    /// Beside [`SyncEngine::record_tokens`] and on the same schedule, for the
+    /// same reason — the journal and the attempt have different lifetimes — but
+    /// answering a different question. Spend is what the attempt cost;
+    /// fullness is whether it is about to lose the context it is working from,
+    /// which is only worth anything while somebody can still act on it.
+    ///
+    /// Overwritten each time rather than added to: this is a level. A row that
+    /// stops moving is an attempt whose harness stopped reporting, and the
+    /// last reading is kept, which is the useful answer for an attempt that
+    /// ends by being orphaned or capped.
+    ///
+    /// Never fatal, and never noisy: a runtime that cannot answer, an
+    /// unreadable journal and a harness that meters no window all leave the
+    /// row exactly as it was.
+    pub fn record_context(&self, runtime: Option<&dyn Runtime>, attempt: &Attempt) {
+        let Some(runtime) = runtime else { return };
+        let Some(chat_id) = attempt.pane_id.as_deref() else {
+            return;
+        };
+        let context = match runtime.run_context(chat_id) {
+            Ok(Some(context)) => context,
+            Ok(None) => return,
+            Err(e) => {
+                self.log.warn(format!(
+                    "context usage for chat {chat_id} unreadable: {e:#}"
+                ));
+                return;
+            }
+        };
+        // A level that has not moved is a write nobody needs, and a live
+        // attempt is reconciled every few seconds.
+        if attempt.context == Some(context) {
+            return;
+        }
+        if let Err(e) = self.db.set_attempt_context(attempt.id, context) {
+            self.log.warn(format!(
+                "recording context usage for attempt {}: {e:#}",
                 attempt.id
             ));
         }
@@ -4494,23 +4545,33 @@ mod tests {
     /// A runtime that only meters. Everything else is unreachable: the token
     /// copy must not depend on any other verb, or a reconcile that cannot
     /// reach the chat would stop recording what it already knows.
-    struct Meter(std::sync::Mutex<Option<crate::runtime::RunTokens>>);
+    struct Meter(
+        std::sync::Mutex<Option<crate::runtime::RunTokens>>,
+        /// …and how full the window was, the other meter (gh#271).
+        std::sync::Mutex<Option<comet_proto::ContextUsage>>,
+    );
 
     impl Meter {
         fn saying(usage: comet_proto::TokenUsage, model: Option<&str>) -> Meter {
-            Meter(std::sync::Mutex::new(Some(crate::runtime::RunTokens {
-                usage,
-                model: model.map(str::to_string),
-            })))
+            Meter(
+                std::sync::Mutex::new(Some(crate::runtime::RunTokens {
+                    usage,
+                    model: model.map(str::to_string),
+                })),
+                std::sync::Mutex::new(None),
+            )
         }
         fn silent() -> Meter {
-            Meter(std::sync::Mutex::new(None))
+            Meter(std::sync::Mutex::new(None), std::sync::Mutex::new(None))
         }
         fn set(&self, usage: comet_proto::TokenUsage, model: Option<&str>) {
             *self.0.lock().unwrap() = Some(crate::runtime::RunTokens {
                 usage,
                 model: model.map(str::to_string),
             });
+        }
+        fn set_context(&self, context: Option<comet_proto::ContextUsage>) {
+            *self.1.lock().unwrap() = context;
         }
     }
 
@@ -4538,6 +4599,9 @@ mod tests {
         }
         fn run_tokens(&self, _: &str) -> anyhow::Result<Option<crate::runtime::RunTokens>> {
             Ok(self.0.lock().unwrap().clone())
+        }
+        fn run_context(&self, _: &str) -> anyhow::Result<Option<comet_proto::ContextUsage>> {
+            Ok(*self.1.lock().unwrap())
         }
     }
 
@@ -4613,6 +4677,87 @@ mod tests {
         let a = task.attempts.last().unwrap();
         assert_eq!(a.outcome, Some(Outcome::Orphaned));
         assert_eq!(a.tokens, Some(tokens(500, 50)));
+    }
+
+    // ---- how full the window is (gh#271) ---------------------------------
+
+    fn context(used: u64) -> comet_proto::ContextUsage {
+        comet_proto::ContextUsage {
+            used_tokens: used,
+            max_tokens: 200_000,
+            compact_at_tokens: Some(167_000),
+        }
+    }
+
+    /// Fullness is a LEVEL: each reconcile replaces the last reading rather
+    /// than adding to it — including when it falls, which is what a compaction
+    /// looks like from here. Summing these would put an attempt at 170% of a
+    /// window it never filled once.
+    #[test]
+    fn reconcile_replaces_the_context_level_instead_of_accumulating_it() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = Meter::saying(tokens(100, 10), Some("claude-opus-5"));
+        rt.set_context(Some(context(120_000)));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        let a = live(&e);
+        assert_eq!(a.context, Some(context(120_000)));
+        assert_eq!(a.context.and_then(|c| c.percent()), Some(60));
+
+        rt.set_context(Some(context(170_000)));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        let a = live(&e);
+        assert_eq!(a.context, Some(context(170_000)));
+        assert!(a.context.is_some_and(|c| c.is_near_compaction(0.9)));
+
+        // The agent compacted: the level falls, and the row follows it down.
+        rt.set_context(Some(context(45_000)));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).context, Some(context(45_000)));
+    }
+
+    /// A harness that meters no window leaves the row blank — never 0%, which
+    /// would read as an agent running on an empty context.
+    #[test]
+    fn a_harness_that_meters_no_window_leaves_the_context_blank() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = Meter::saying(tokens(100, 10), Some("gpt-5.6-terra"));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        let a = live(&e);
+        assert_eq!(a.tokens, Some(tokens(100, 10)), "spend is still recorded");
+        assert_eq!(a.context, None, "and fullness honestly is not");
+    }
+
+    /// The last level survives the close, for `record_tokens`'s reason: an
+    /// attempt can end by being orphaned, and the reading it had is a better
+    /// answer than none — it is also the one that says *why* it stalled.
+    #[test]
+    fn an_orphaned_attempt_keeps_the_last_level_it_was_seen_at() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = Meter::saying(tokens(500, 50), Some("claude-opus-5"));
+        rt.set_context(Some(context(190_000)));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        let a = task.attempts.last().unwrap();
+        assert_eq!(a.outcome, Some(Outcome::Orphaned));
+        assert_eq!(a.context, Some(context(190_000)));
     }
 
     // ---- the status-only fast path --------------------------------------

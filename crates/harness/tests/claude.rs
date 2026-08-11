@@ -236,6 +236,69 @@ async fn happy_path_normalizes_events_and_accounts_for_subagents() {
     );
 }
 
+/// Context fullness over the control channel (gh#271): polled while the turn
+/// is live, reported when the level moves, and silent once the turn is over.
+#[tokio::test]
+async fn context_fullness_is_polled_while_the_turn_runs_and_never_after_it() {
+    let (controls, _steer, _token) = controls("A");
+    let harness = harness().with_context_poll(common::scaled(Duration::from_millis(20)));
+    let events = run_to_end(&harness, request("scenario:context"), controls).await;
+
+    let levels: Vec<comet_proto::ContextUsage> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextUsage(usage) => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        levels.len(),
+        2,
+        "two readings moved and the third repeated itself: {levels:?}"
+    );
+    assert_eq!(levels[0].used_tokens, 120_000);
+    assert_eq!(levels[0].percent(), Some(60));
+    assert_eq!(levels[1].percent(), Some(85));
+    // Past the CLI's own auto-compact threshold, though short of any 90% rule
+    // — the harness's number wins over a ratio we picked.
+    assert!(levels[1].is_near_compaction(0.9));
+    assert_eq!(levels[1].compact_at_tokens, Some(167_000));
+
+    // The safety property: the fourth reply lands after the result frame, and
+    // a journal whose last event is not a `Done` reads as a run that died.
+    assert!(
+        matches!(events.last(), Some(AgentEvent::Done { .. })),
+        "a late reading must not follow the Done: {:?}",
+        events.last()
+    );
+}
+
+/// A CLI that will not answer the question costs the run nothing: no error, no
+/// event, no stall. (An older CLI, or a `--remote` session with no callback.)
+#[tokio::test]
+async fn a_cli_that_cannot_report_context_usage_still_finishes_its_run() {
+    let (controls, _steer, _token) = controls("A");
+    let harness = harness().with_context_poll(common::scaled(Duration::from_millis(20)));
+    let events = run_to_end(&harness, request("scenario:context-unsupported"), controls).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextUsage(_))),
+        "an error reply is not a reading"
+    );
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: Some("fine without it".into()),
+            error: None,
+            session_id: Some("sess-ctx-no".into()),
+        })
+    );
+}
+
 #[tokio::test]
 async fn ask_user_question_round_trips_through_the_control_channel() {
     // The questions must reach the ENGINE's input bridge (`request_input`) —
@@ -426,4 +489,88 @@ async fn missing_binary_is_not_installed() {
         .err()
         .expect("spawn fails");
     assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
+}
+
+/// Real-CLI proof of the context poll (gh#271): run a turn long enough to
+/// outlast a poll interval and check the level that comes back is the CLI's
+/// own — a window it named, a `/context` percentage, and the auto-compact
+/// threshold to count down to. The fake CLI proves the plumbing; only this
+/// proves the control-request subtype and the reply's field names are the ones
+/// the installed binary actually speaks.
+///
+/// Ignored by default: needs an installed, authenticated `claude` CLI and
+/// spends real tokens.
+/// Run with: `cargo test -p comet-harness --test claude -- --ignored`
+#[tokio::test]
+#[ignore = "requires installed+authenticated claude CLI; spends tokens"]
+async fn real_claude_answers_the_context_poll_mid_turn() {
+    // The steering mailbox stays OPEN for the whole run, which is how the
+    // engine runs it — and it has to: closing it shuts the child's stdin, and
+    // stdin is the same channel the poll is written to. So the events are read
+    // up to the turn's `Done` rather than to end of stream.
+    let (controls, _steer, _token) = controls("A");
+    // Fast enough that a short turn is still polled two or three times.
+    let harness = ClaudeHarness::new().with_context_poll(Duration::from_secs(2));
+    let mut request = request("Run `sleep 6` with the Bash tool, then reply DONE.");
+    request.model = Some("haiku".into());
+    request.cwd = std::env::temp_dir().display().to_string();
+
+    let mut stream = match harness.run(request, controls).await {
+        Ok(stream) => stream,
+        Err(HarnessError::NotInstalled(_)) => {
+            eprintln!("skipping: claude CLI not installed on this device");
+            return;
+        }
+        Err(err) => panic!("claude run failed to start: {err}"),
+    };
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let drain = async {
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let done = matches!(ev, AgentEvent::Done { .. });
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(common::scaled(Duration::from_secs(120)), drain)
+        .await
+        .expect("the turn finishes");
+
+    // An unauthenticated box cannot answer anything; say so rather than fail
+    // on a question that was never asked.
+    if !events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    }) {
+        eprintln!("skipping: the claude CLI could not take a turn: {events:?}");
+        return;
+    }
+
+    let levels: Vec<comet_proto::ContextUsage> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextUsage(usage) => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    let level = *levels.first().expect("the CLI answered a poll");
+    assert!(level.max_tokens >= 100_000, "a real window: {level:?}");
+    assert!(level.used_tokens > 0, "a loaded session is never empty");
+    assert!(level.used_tokens <= level.max_tokens, "{level:?}");
+    assert!(level.percent().is_some());
+    // The CLI's own auto-compact point, which is the number the board counts
+    // down to. (Absent only if the operator turned auto-compaction off.)
+    assert!(
+        level.compact_at_tokens.is_none_or(|at| at <= level.max_tokens),
+        "{level:?}"
+    );
+    // …and never after the turn ended.
+    assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
 }

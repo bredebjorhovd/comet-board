@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use comet_board::evidence::RanCommand;
-use comet_proto::{AgentEvent, TokenUsage, ToolCall};
+use comet_proto::{AgentEvent, ContextUsage, TokenUsage, ToolCall};
 
 /// How much of a chat's assistant text [`RunJournal::final_text`] keeps.
 ///
@@ -222,6 +222,48 @@ impl RunJournal {
             }
         }
         Ok(reported.then_some(out))
+    }
+
+    /// How full the chat's context window was the last time a harness said
+    /// (gh#271).
+    ///
+    /// **The last reading wins — never a sum.** Fullness is a level, and the
+    /// journal holds every reading a run reported; adding them would produce a
+    /// number many times the window. That is the whole reason it is not a
+    /// [`TokenUsage`] bucket, and the reason this scan looks so unlike
+    /// [`tokens`](Self::tokens) two functions up.
+    ///
+    /// `None` is "nothing was ever reported": a journal that predates gh#271,
+    /// a harness that meters no window (opencode), a Claude CLI too old to
+    /// answer `get_context_usage`. The board leaves the attempt's columns NULL
+    /// for all of them, and the page renders a blank rather than a 0% that
+    /// would read as an empty context.
+    ///
+    /// Tag-filtered before parsing, like every other scan here: this is read
+    /// on every reconcile of a live attempt, and a long run's journal is
+    /// mostly text deltas.
+    pub fn context(&self, chat_id: &str) -> Result<Option<ContextUsage>, JournalError> {
+        const CONTEXT_TAG: &str = r#""type":"contextUsage""#;
+        let path = self.path_for(chat_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut last = None;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.contains(CONTEXT_TAG) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<JournalLine>(&line) else {
+                continue;
+            };
+            if let AgentEvent::ContextUsage(usage) = parsed.event {
+                last = Some(usage);
+            }
+        }
+        Ok(last)
     }
 
     /// Every shell command this chat's runs executed, paired with how it
@@ -518,6 +560,51 @@ mod tests {
             None,
             "a harness that meters nothing is not a harness that spent nothing"
         );
+    }
+
+    /// Fullness is a level: the newest reading is the answer, and the older
+    /// ones are history — never addends. (Summing the three below would say a
+    /// window twice its own size was full, which is the mistake this scan
+    /// exists to not make.)
+    #[test]
+    fn the_context_reading_is_the_last_one_and_never_a_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.context("never-ran").unwrap(), None);
+        journal.append("chat-1", &started("claude-opus-5")).unwrap();
+        for used in [40_000, 120_000, 170_000] {
+            journal
+                .append(
+                    "chat-1",
+                    &AgentEvent::ContextUsage(ContextUsage {
+                        used_tokens: used,
+                        max_tokens: 200_000,
+                        compact_at_tokens: Some(167_000),
+                    }),
+                )
+                .unwrap();
+        }
+        journal.append("chat-1", &usage(1, 1)).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+
+        let ctx = journal.context("chat-1").unwrap().expect("reported");
+        assert_eq!(ctx.used_tokens, 170_000);
+        assert_eq!(ctx.percent(), Some(85));
+        assert!(ctx.is_near_compaction(0.9), "past the CLI's own threshold");
+        // The spend scan is untouched by any of it — two meters, one journal.
+        assert_eq!(journal.tokens("chat-1").unwrap().unwrap().usage.total(), 13);
+    }
+
+    /// A chat whose harness never metered a window says nothing, rather than
+    /// saying 0% — which would read as an empty context, not a silent one.
+    #[test]
+    fn a_chat_whose_harness_meters_no_window_reports_no_fullness() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &started("mock")).unwrap();
+        journal.append("chat-1", &usage(5, 5)).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(journal.context("chat-1").unwrap(), None);
     }
 
     /// The scan filters lines by tag before parsing them. A transcript that

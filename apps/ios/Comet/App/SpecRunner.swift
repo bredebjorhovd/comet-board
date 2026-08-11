@@ -141,6 +141,10 @@ enum SpecRunner {
             var landingHeadline: String
             var landingSegments: [LandingSegment]
             var landingInFlightNote: String?
+            /// gh#271. The other meter's gate: a window nothing reported has
+            /// no share to draw, and `0 of 0` would read as no pressure
+            /// rather than as no measurements.
+            var contextReported: Bool
         }
     }
 
@@ -210,6 +214,9 @@ enum SpecRunner {
             expect(s.landing.segments, c.expect.landingSegments, "\(what): landing segments")
             expect(s.landing.inFlightNote, c.expect.landingInFlightNote,
                    "\(what): in-flight note")
+            // gh#271: the context half is gated on having been measured.
+            expect(s.contextReported, c.expect.contextReported,
+                   "\(what): context reported")
             // 24 slots exist even before anything has run in them.
             expect(s.hourOfDay.count, 24, "\(what): hour slots")
         }

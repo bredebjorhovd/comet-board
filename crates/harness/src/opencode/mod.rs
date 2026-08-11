@@ -26,6 +26,14 @@
 //!   every `permission.asked` is auto-allowed.
 //! - `COMET_BOARD_CHAT_ID` rides the child env (the board-provenance
 //!   convention; see [`crate::RunControls::chat_id`]).
+//! - Context fullness ([`comet_proto::ContextUsage`], gh#271) is **not
+//!   reported here**, deliberately. The SSE stream volunteers no window: an
+//!   assistant `message.updated` carries the message's `tokens`, and the
+//!   window they fill lives in the provider catalog (`/config/providers` →
+//!   `model.limit.context`), which this adapter does not read. A fullness
+//!   with a denominator we inferred rather than were told is exactly the
+//!   number this signal exists to not be, so the harness stays silent and the
+//!   board renders the absence — see `ContextUsage::max_tokens`.
 
 mod catalog;
 mod client;

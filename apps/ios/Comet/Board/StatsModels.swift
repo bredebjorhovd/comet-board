@@ -223,6 +223,26 @@ struct Friction: Decodable, Hashable {
     }
 }
 
+/// How close a window's attempts came to filling their context windows
+/// (gh#271) — how much of what an agent could hold the work actually needed.
+///
+/// Three small numbers rather than a distribution, on purpose: the question is
+/// whether attempts on this board routinely run out of context, which is a
+/// fact about how the work is *shaped* and shows up nowhere in the spend.
+/// Mirrors `stats::ContextPressure`.
+struct ContextPressure: Decodable, Hashable {
+    /// Attempts whose harness reported a window at all — the coverage for this
+    /// half of the screen. The two below are shares of THIS, never of the
+    /// window: one of the three harnesses meters no context at all.
+    var attemptsReported: Int = 0
+    /// …of which this many were last seen at or past the point their harness
+    /// compacts (or 90% of the window, for a harness that names no point).
+    var nearCompaction: Int = 0
+    /// The fullest any one attempt was last seen, `0...100`. `nil` when
+    /// nothing reported — never `0`, which would read as agents running empty.
+    var peakPercent: Int?
+}
+
 // MARK: - Spend (gh#182)
 //
 // The board counts tokens; these are what it costs. Two facts, kept apart on
@@ -416,10 +436,25 @@ struct BoardStats: Decodable, Hashable {
     /// facts.
     var spend: BoardSpend?
 
+    /// How close this window's attempts ran to filling their agents' context
+    /// windows (gh#271) — the other meter, and the one the spend cannot stand
+    /// in for: a compacting agent and a comfortable one cost about the same.
+    ///
+    /// Optional for `hoursByWorkspace`'s reason: a board older than the field
+    /// answers without it, and an absent block must degrade to "nothing
+    /// reported" rather than make the whole screen unreadable.
+    var context: ContextPressure?
+
     /// Whether any attempt in the window reported tokens — the gate the token
     /// half of the screen renders behind. A wall of zeroes would say the work
     /// was free rather than that it was never metered.
     var hasTokens: Bool { attemptsWithTokens > 0 }
+
+    /// Did anything in this window report a context window at all? The gate
+    /// the context line renders behind. `0 of 0` would read as a board with no
+    /// context pressure rather than one with no measurements.
+    /// Mirrors `stats::ContextPressure::is_reported`.
+    var contextReported: Bool { (context?.attemptsReported ?? 0) > 0 }
 
     /// Is there a priced figure to show? False covers both halves of "no": no
     /// rates at all, and rates that matched none of the models this window ran.

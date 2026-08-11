@@ -275,6 +275,28 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         .position(|e| matches!(e, AgentEvent::Done { .. }))
         .expect("done emitted");
     assert!(usage_pos < done_pos);
+
+    // Fullness is NOT held for the turn's end (gh#271): each snapshot that
+    // moves the level is reported while the turn is still running, and the
+    // straggler that arrives after `turn/completed` is dropped — a run journal
+    // ending on anything but a `Done` reads as a run that died mid-stream.
+    let levels: Vec<comet_proto::ContextUsage> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextUsage(usage) => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(levels.len(), 2, "one per move, none after Done: {levels:?}");
+    assert_eq!(levels[0].used_tokens, 250_000);
+    assert_eq!(levels[0].max_tokens, 272_000);
+    assert_eq!(levels[0].percent(), Some(92));
+    // Codex names no compaction point, so a ratio is all there is to judge on.
+    assert!(levels[0].is_near_compaction(0.9));
+    assert_eq!(levels[0].compact_at_tokens, None);
+    // …and after the compaction the level is back down.
+    assert_eq!(levels[1].percent(), Some(0));
+
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {

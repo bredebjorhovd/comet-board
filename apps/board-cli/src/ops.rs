@@ -262,6 +262,12 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
             (None, false) => "  (no route)".to_string(),
             _ => String::new(),
         };
+        // How full the live agent's window is, in the same words the two
+        // viewports use (gh#271) — and only once there is something to say.
+        let extra = match comet_proto::view::board::context_note(r.context) {
+            Some(note) => format!("{extra}  ({note})"),
+            None => extra,
+        };
         println!(
             "{:<8} {:<24} {:<10} {}{}",
             r.state,
@@ -1747,6 +1753,7 @@ mod tests {
             dispatched_by_verified: false,
             billed_to: None,
             max_duration_secs: None,
+            context: None,
         }
     }
 

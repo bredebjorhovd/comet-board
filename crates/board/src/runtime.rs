@@ -558,6 +558,23 @@ pub trait Runtime {
         Ok(None)
     }
 
+    /// How full the chat's context window was when a harness last said
+    /// (gh#271) — off the same run journal, and read on the same reconcile.
+    ///
+    /// A **level, not a total**: the last reading is the answer and readings
+    /// are never summed, which is why this is its own call rather than a field
+    /// on [`RunTokens`]. What it buys the board is the one thing spend cannot
+    /// say — that an attempt is about to lose the context it is working from.
+    ///
+    /// `None` is "nothing reported": a harness that meters no window, a CLI
+    /// too old to answer, an attempt that predates this. Default `Ok(None)`
+    /// for [`Runtime::run_tokens`]'s reason — a runtime that cannot answer
+    /// costs the page a signal it already renders as absent.
+    fn run_context(&self, chat_id: &str) -> anyhow::Result<Option<comet_proto::ContextUsage>> {
+        let _ = chat_id;
+        Ok(None)
+    }
+
     /// Every shell command this chat's runs executed, and whether it exited
     /// non-zero — off the same journal as [`Runtime::run_tokens`] (§gh#183).
     ///

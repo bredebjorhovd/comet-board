@@ -489,8 +489,10 @@ impl Normalizer {
                 vec![usage, done]
             }
 
-            // Control frames are handled by the run loop, not normalized.
-            Frame::ControlRequest(_) | Frame::Other => Vec::new(),
+            // Control frames are handled by the run loop, not normalized: it
+            // owns the request ids it issued, and a reply is only meaningful
+            // beside the question (gh#271).
+            Frame::ControlRequest(_) | Frame::ControlResponse(_) | Frame::Other => Vec::new(),
         }
     }
 }

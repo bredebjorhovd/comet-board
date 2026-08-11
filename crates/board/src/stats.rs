@@ -192,6 +192,12 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
     // it actually ran, never at a board-wide average. Not on `Stats` itself —
     // it is arithmetic on the way to a figure, not a fact a page renders.
     let mut tokens_by_account_model: BTreeMap<(String, String), TokenUsage> = BTreeMap::new();
+    // Context fullness (gh#271), summed on the same terms as the tokens and
+    // for a different question: how close this window's attempts ran to the
+    // limit of what their agents could hold. Never averaged — a mean of a
+    // level says nothing, and the two figures that matter are how many got
+    // close and how close the closest got.
+    let mut context = comet_proto::view::stats::ContextPressure::default();
     // The window cut five ways (gh#227), keyed on the axis and the row. One
     // pass over the attempts fills all five, because every one of them is
     // already on the row: which model, which harness, which space, which
@@ -268,6 +274,19 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
                 .entry((payer, model))
                 .or_default()
                 .add(usage);
+        }
+        // …and how full its window was when anybody last looked (gh#271). The
+        // reading is the *last* one the attempt reported, so for a finished
+        // attempt this is where it ended up — which is the number that says
+        // whether the work was shaped to fit one agent's context.
+        if let Some(ctx) = a.context
+            && let Some(percent) = ctx.percent()
+        {
+            context.attempts_reported += 1;
+            if ctx.is_near_compaction(comet_proto::view::board::CONTEXT_NEAR_COMPACTION) {
+                context.near_compaction += 1;
+            }
+            context.peak_percent = Some(context.peak_percent.unwrap_or(0).max(percent));
         }
         if let Some(start) = started_local(a) {
             use chrono::Timelike as _;
@@ -415,6 +434,7 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         tokens_by_model,
         tokens_by_runtime,
         tokens_by_account,
+        context,
     }
 }
 
@@ -503,6 +523,22 @@ pub fn print(s: &Stats) {
         );
     } else {
         println!("  no attempt in this window reported token usage");
+    }
+    // The other meter (gh#271), and the one thing the tokens above cannot say:
+    // whether the work is shaped to fit inside one agent's context. Silent
+    // when nothing reported — unlike the tokens, which say so out loud,
+    // because a board of harnesses that meter no window would repeat that
+    // sentence for ever.
+    if s.context.is_reported() {
+        let peak = s
+            .context
+            .peak_percent
+            .map(|p| format!(", fullest {p}%"))
+            .unwrap_or_default();
+        println!(
+            "  {}/{} attempt(s) that reported context ended near their compaction point{peak}",
+            s.context.near_compaction, s.context.attempts_reported,
+        );
     }
     // What that cost, at list price (gh#182) — and, when the rates could not
     // price everything, what the figure leaves out. Never a bare total: a
@@ -1048,6 +1084,52 @@ mod tests {
         );
         // Nothing ran at all is a different fact, and has no share.
         assert_eq!(gather(&[], None).token_coverage, None);
+    }
+
+    // -- context fullness (gh#271) -----------------------------------------
+
+    /// The page's second meter, on the first one's terms: the share is over
+    /// the attempts that reported a window, never over the window, because a
+    /// board running one harness that meters nothing would otherwise look like
+    /// a board with no context pressure.
+    #[test]
+    fn the_context_line_counts_only_the_attempts_that_reported_a_window() {
+        let full = |used: u64, at: Option<u64>| comet_proto::ContextUsage {
+            used_tokens: used,
+            max_tokens: 200_000,
+            compact_at_tokens: at,
+        };
+        // Past the harness's own threshold…
+        let mut compacting = attempt(60, 5, Some(Outcome::Done), None);
+        compacting.context = Some(full(180_000, Some(167_000)));
+        // …past 90% with no threshold named (a codex attempt)…
+        let mut ratio = attempt(55, 5, Some(Outcome::Done), None);
+        ratio.context = Some(full(185_000, None));
+        // …comfortable…
+        let mut roomy = attempt(50, 5, Some(Outcome::Done), None);
+        roomy.context = Some(full(30_000, Some(167_000)));
+        // …and one whose harness metered no window at all.
+        let silent = attempt(40, 5, Some(Outcome::Done), None);
+
+        let s = gather(&[task("t1", vec![compacting, ratio, roomy, silent])], None);
+        assert!(s.context.is_reported());
+        assert_eq!(s.context.attempts_reported, 3, "the silent one is not one");
+        assert_eq!(s.context.near_compaction, 2);
+        assert_eq!(s.context.peak_percent, Some(93));
+        assert_eq!(s.attempts, 4, "and all four are still dispatches");
+    }
+
+    /// A board whose harnesses meter no window says nothing rather than
+    /// reporting no pressure — the two are not the same claim.
+    #[test]
+    fn a_window_nobody_measured_reports_no_pressure_rather_than_none_found() {
+        let s = gather(
+            &[task("t1", vec![attempt(60, 5, Some(Outcome::Done), None)])],
+            None,
+        );
+        assert!(!s.context.is_reported());
+        assert_eq!(s.context.peak_percent, None, "never Some(0)");
+        assert_eq!(s.context.near_compaction, 0);
     }
 
     #[test]

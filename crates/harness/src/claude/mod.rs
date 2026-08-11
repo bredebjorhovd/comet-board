@@ -92,7 +92,18 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// How often a live turn is asked how full its context window is.
+    context_poll: Duration,
 }
+
+/// How often [`AgentEvent::ContextUsage`] is refreshed during a turn (gh#271).
+///
+/// Coarse on purpose. Fullness moves at the pace of tool results and model
+/// replies, not of token deltas, and the reading is a warning sign to watch —
+/// not a gauge to animate. Thirty seconds bounds how stale the last figure
+/// before a turn ends can be, at a cost of one control round-trip a minute or
+/// two per running agent.
+const CONTEXT_POLL: Duration = Duration::from_secs(30);
 
 impl Default for ClaudeHarness {
     fn default() -> Self {
@@ -100,6 +111,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            context_poll: CONTEXT_POLL,
         }
     }
 }
@@ -119,6 +131,13 @@ impl ClaudeHarness {
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
+        self
+    }
+
+    /// How often a live turn is polled for context fullness (gh#271).
+    /// Production runs on [`CONTEXT_POLL`]; tests wind it down.
+    pub fn with_context_poll(mut self, every: Duration) -> Self {
+        self.context_poll = every;
         self
     }
 
@@ -312,6 +331,7 @@ impl Harness for ClaudeHarness {
             reasoning: request.reasoning,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            context_poll: self.context_poll,
             stderr_tail,
         }));
 
@@ -435,9 +455,15 @@ struct Session {
     reasoning: Option<ReasoningLevel>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    context_poll: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
 }
+
+/// Prefix of the request ids the context poll issues. The control channel is
+/// request_id-multiplexed and the interrupt uses it too, so a reply is only
+/// ours if it carries an id we minted.
+const CONTEXT_REQUEST_PREFIX: &str = "ctx_";
 
 /// The per-run event loop: one task multiplexing stdout frames, the steering
 /// mailbox, the interrupt token, and consumer liveness.
@@ -451,6 +477,7 @@ async fn run_session(session: Session) {
         reasoning,
         interrupt_grace,
         kill_grace,
+        context_poll,
         stderr_tail,
     } = session;
     let RunControls {
@@ -474,6 +501,23 @@ async fn run_session(session: Session) {
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Context fullness (gh#271): polled while a turn is live, and only then.
+    // `turn_live` is the whole safety property — a reading that lands after
+    // the turn's `Done` would leave a non-`Done` event at the tail of the run
+    // journal, which every reader of that journal takes for a run that died
+    // mid-stream (`RunJournal::stale_sessions`, `Runtime::last_run_end`).
+    let mut turn_live = true;
+    let mut context_seq = 0u64;
+    let mut last_context: Option<comet_proto::ContextUsage> = None;
+    // First tick after a full interval, not at once: a poll issued before the
+    // CLI has read the prompt measures the session's floor, and the question
+    // worth asking is what the *turn* is doing to the window.
+    let mut context_ticks =
+        tokio::time::interval_at(tokio::time::Instant::now() + context_poll, context_poll);
+    // Answering a poll costs the CLI a walk of its own context; a run that
+    // stalls the loop should skip the missed ticks, not fire a burst of them.
+    context_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     'main: loop {
         tokio::select! {
             line = stdout_lines.next_line() => match line {
@@ -493,12 +537,34 @@ async fn run_session(session: Session) {
                         handle_control_request(req, &request_input, &stdin_tx);
                         continue;
                     }
+                    if let Frame::ControlResponse(resp) = frame {
+                        // Our own poll's reply, and nobody else's: the channel
+                        // is request_id-multiplexed and the interrupt rides it
+                        // too. A reply that lands after the turn ended is
+                        // remembered but not emitted — see `turn_live`.
+                        if let Some(usage) = context_usage_reply(&resp) {
+                            let changed = last_context != Some(usage);
+                            last_context = Some(usage);
+                            if turn_live
+                                && changed
+                                && event_tx
+                                    .send(Ok(AgentEvent::ContextUsage(usage)))
+                                    .await
+                                    .is_err()
+                            {
+                                break 'main;
+                            }
+                        }
+                        continue;
+                    }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
                         }
                         if is_done {
+                            // Nothing more may be emitted for this turn.
+                            turn_live = false;
                             any_done = true;
                             if interrupted {
                                 done_after_interrupt = true;
@@ -518,6 +584,9 @@ async fn run_session(session: Session) {
                 Some(msg) => {
                     let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
                     let _ = stdin_tx.send(StdinMsg::Line(line));
+                    // A steer after a finished turn starts another one, and
+                    // the fullness it inherits is the interesting one.
+                    turn_live = true;
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.
@@ -553,6 +622,15 @@ async fn run_session(session: Session) {
                         send_signal(pid, Signal::Kill);
                     }));
                 }
+            },
+
+            // Ask how full the window is (gh#271).
+            _ = context_ticks.tick(), if turn_live && !interrupted => {
+                context_seq += 1;
+                let line = wire::context_usage_request_line(
+                    &format!("{CONTEXT_REQUEST_PREFIX}{context_seq}"),
+                );
+                let _ = stdin_tx.send(StdinMsg::Line(line));
             },
 
             _ = event_tx.closed() => break 'main,
@@ -627,6 +705,36 @@ fn send_signal(pid: u32, signal: Signal) {
 #[cfg(not(unix))]
 fn send_signal(_pid: u32, _signal: Signal) {
     // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+}
+
+/// Decode a `control_response` into a context-fullness reading, if it is an
+/// answer to one of our polls (gh#271).
+///
+/// Everything that is not — another request's reply, an error subtype (an
+/// older CLI, or a `--remote` session where the callback is not registered),
+/// a payload with no window in it — is `None` and stays quiet in the run. A
+/// harness that cannot answer the question costs the board a signal it renders
+/// as absent; it must never cost it a run.
+fn context_usage_reply(resp: &wire::ControlResponseFrame) -> Option<comet_proto::ContextUsage> {
+    let body = &resp.response;
+    if !body.request_id.starts_with(CONTEXT_REQUEST_PREFIX) {
+        return None;
+    }
+    if body.subtype != "success" {
+        tracing::debug!(
+            target: "comet_harness::claude",
+            "context usage unavailable: {}", body.error.as_deref().unwrap_or("(no reason given)")
+        );
+        return None;
+    }
+    let usage = wire::parse_context_usage(&body.response);
+    if usage.is_none() {
+        tracing::debug!(
+            target: "comet_harness::claude",
+            "context usage reply carried no window; ignored"
+        );
+    }
+    usage
 }
 
 type RequestInputFn = Box<

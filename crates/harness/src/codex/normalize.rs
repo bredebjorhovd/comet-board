@@ -93,6 +93,48 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
     }))
 }
 
+/// `thread/tokenUsage/updated` → how full the window is (gh#271).
+///
+/// The same notification [`usage_event`] reads, asked a different question —
+/// and the reason the intermediate snapshots are worth more than the one that
+/// survives to `turn/completed`. Codex volunteers `modelContextWindow`, so no
+/// polling is needed on this harness at all.
+///
+/// **`last`, not `total`.** `total` is the thread's spend, which passes the
+/// window many times over on a long session and would show as 400% full.
+/// `last` is the most recent request: its `inputTokens` *is* the conversation
+/// as the model saw it (prompt, tools, every prior turn), and the output
+/// joins it in the next one — so input + output is what occupies the window
+/// now. `totalTokens` is that sum when the server sends it.
+///
+/// `None` when the window is absent (`modelContextWindow` is nullable, and a
+/// third-party provider may not state one): a fullness with no denominator is
+/// not a reading, and the board renders the absence rather than a guess.
+pub(crate) fn context_event(params: &Value) -> Option<comet_proto::ContextUsage> {
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let window = field(usage, &["modelContextWindow", "model_context_window"])
+        .and_then(Value::as_u64)
+        .filter(|w| *w > 0)?;
+    let last = usage.get("last")?;
+    let count = |keys: &[&str]| {
+        field(last, keys)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    };
+    let used = match count(&["totalTokens", "total_tokens"]) {
+        0 => count(&["inputTokens", "input_tokens"]) + count(&["outputTokens", "output_tokens"]),
+        total => total,
+    };
+    Some(comet_proto::ContextUsage {
+        used_tokens: used,
+        max_tokens: window,
+        // Codex does not auto-compact on a threshold it will name; it fails
+        // the turn with `contextWindowExceeded`. Reporting a made-up point to
+        // count down to would be worse than reporting none.
+        compact_at_tokens: None,
+    })
+}
+
 /// Tool-shaped Codex items must always close the lifecycle they open: started
 /// opens the ToolCall, completed refreshes its metadata and resolves the same
 /// stable id (port of codex.ts `toolLifecycle`).
@@ -374,6 +416,56 @@ mod tests {
             panic!("expected a usage event");
         };
         assert_eq!(usage.input_tokens, 0);
+    }
+
+    /// The same notification, asked how full the window is (gh#271). `last`
+    /// is the reading: `total` is the thread's spend, which on a long session
+    /// runs to several times the window.
+    #[test]
+    fn fullness_is_the_last_request_against_the_window_never_the_thread_total() {
+        let ctx = context_event(&json!({"tokenUsage": {
+            "modelContextWindow": 272_000,
+            "last": {"inputTokens": 130_000, "cachedInputTokens": 120_000,
+                     "outputTokens": 6_000, "totalTokens": 136_000},
+            "total": {"inputTokens": 2_000_000, "outputTokens": 90_000,
+                      "totalTokens": 2_090_000},
+        }}))
+        .expect("a reading");
+        assert_eq!(ctx.used_tokens, 136_000);
+        assert_eq!(ctx.max_tokens, 272_000);
+        assert_eq!(ctx.percent(), Some(50));
+        // Codex names no auto-compact point; it fails the turn instead.
+        assert_eq!(ctx.compact_at_tokens, None);
+        assert_eq!(ctx.until_compact(), None);
+        // Snake case, and `totalTokens` absent: input + output is the sum.
+        let ctx = context_event(&json!({"token_usage": {
+            "model_context_window": 100,
+            "last": {"input_tokens": 30, "output_tokens": 10},
+        }}))
+        .expect("a reading");
+        assert_eq!(ctx.used_tokens, 40);
+        assert_eq!(ctx.percent(), Some(40));
+    }
+
+    /// No window, no reading — never a percentage against a denominator
+    /// nobody supplied. (`modelContextWindow` is nullable on the wire; a
+    /// third-party provider may not state one.)
+    #[test]
+    fn a_thread_with_no_stated_window_reports_no_fullness() {
+        assert_eq!(
+            context_event(&json!({"tokenUsage": {"last": {"totalTokens": 500}}})),
+            None
+        );
+        assert_eq!(
+            context_event(&json!({"tokenUsage": {
+                "modelContextWindow": null, "last": {"totalTokens": 500},
+            }})),
+            None
+        );
+        assert_eq!(context_event(&json!({})), None);
+        // And the spend event is unaffected either way — the two readings are
+        // taken off the same notification but answer different questions.
+        assert!(usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 5}}})).is_some());
     }
 
     #[test]

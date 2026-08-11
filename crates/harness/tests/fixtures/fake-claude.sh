@@ -65,6 +65,44 @@ case "$first" in
   esac
   ;;
 
+*scenario:context-unsupported*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-ctx-no"}'
+  read -r ctx0 || exit 1
+  id=$(printf '%s\n' "$ctx0" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  # What an older CLI (or a remote thin client) answers: no callback for it.
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$id\",\"error\":\"get_context_usage is not supported in this context\"}}"
+  emit '{"type":"result","subtype":"success","result":"fine without it","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ctx-no"}'
+  ;;
+
+*scenario:context*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-ctx"}'
+  # The harness polls the control channel for context fullness (gh#271).
+  read -r ctx0 || exit 1
+  case "$ctx0" in
+  *'"subtype":"get_context_usage"'*)
+    id=$(printf '%s\n' "$ctx0" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+    emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{\"totalTokens\":120000,\"maxTokens\":200000,\"rawMaxTokens\":200000,\"percentage\":60,\"autoCompactThreshold\":167000,\"isAutoCompactEnabled\":true}}}"
+    ;;
+  *)
+    emit '{"type":"result","subtype":"error_during_execution","errors":["expected a get_context_usage control request"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ctx"}'
+    exit 0
+    ;;
+  esac
+  # A second poll, further along — the level moved, so it is reported again.
+  read -r ctx1 || exit 1
+  id=$(printf '%s\n' "$ctx1" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{\"totalTokens\":170000,\"maxTokens\":200000,\"rawMaxTokens\":200000,\"percentage\":85,\"autoCompactThreshold\":167000,\"isAutoCompactEnabled\":true}}}"
+  # …and a third, unchanged: a level that did not move is not news.
+  read -r ctx2 || exit 1
+  id=$(printf '%s\n' "$ctx2" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{\"totalTokens\":170000,\"maxTokens\":200000,\"rawMaxTokens\":200000,\"percentage\":85,\"autoCompactThreshold\":167000,\"isAutoCompactEnabled\":true}}}"
+  emit '{"type":"result","subtype":"success","result":"full","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ctx"}'
+  # A reply that lands AFTER the turn ended (a poll in flight when the result
+  # frame went out). It must never reach the stream: a run journal whose last
+  # event is not a `Done` reads as a run that died mid-stream.
+  emit '{"type":"control_response","response":{"subtype":"success","request_id":"ctx_99","response":{"totalTokens":199000,"maxTokens":200000,"rawMaxTokens":200000,"percentage":100,"autoCompactThreshold":167000,"isAutoCompactEnabled":true}}}'
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
