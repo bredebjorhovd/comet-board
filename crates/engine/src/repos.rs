@@ -96,29 +96,13 @@ fn redacted_command(args: &[&str]) -> String {
     let mut out = String::from("git");
     for arg in args {
         out.push(' ');
-        out.push_str(&redact_url_password(arg));
+        out.push_str(&loggable_url(arg));
     }
     out
 }
 
 /// `scheme://user:secret@host/…` → `scheme://user:***@host/…`. Anything that is
 /// not a URL with a password comes back untouched.
-fn redact_url_password(arg: &str) -> String {
-    let Some((scheme, rest)) = arg.split_once("://") else {
-        return arg.to_string();
-    };
-    let Some((userinfo, host)) = rest.split_once('@') else {
-        return arg.to_string();
-    };
-    // An `@` after the first `/` is part of the path, not userinfo.
-    if userinfo.contains('/') {
-        return arg.to_string();
-    }
-    match userinfo.split_once(':') {
-        Some((user, _)) => format!("{scheme}://{user}:***@{host}"),
-        None => arg.to_string(),
-    }
-}
 
 struct ReposInner {
     data_dir: PathBuf,
@@ -388,36 +372,36 @@ impl Repos {
         self.to_repo(&abs).await
     }
 
-    /// `git clone <url>` under `{data_dir}/repos`. (Named `clone_repo` to keep
-    /// `Clone::clone` unambiguous on the service handle.)
-    pub async fn clone_repo(&self, url: &str) -> Result<Repo, EngineError> {
-        let trimmed = url.trim().trim_end_matches('/');
-        let name = trimmed
-            .trim_end_matches(".git")
-            .rsplit(['/', ':'])
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("repo")
-            .to_string();
-        let repos_dir = self.inner.data_dir.join("repos");
-        let target = repos_dir.join(&name);
-        if target.exists() {
-            return Err(EngineError::Other(format!(
-                "Already exists: {}",
-                target.display()
-            )));
-        }
-        std::fs::create_dir_all(&repos_dir)?;
-        self.git(&["clone", trimmed, &target.to_string_lossy()], None)
-            .await?;
-        self.register(&target.to_string_lossy())?;
-        self.to_repo(&target).await
+    /// `git clone` into `{data_dir}/repos/<name>` — the `CloneRepo` verb.
+    /// (Named `clone_repo` to keep `Clone::clone` unambiguous on the service
+    /// handle.)
+    ///
+    /// It carries a credential like every other authenticated git operation the
+    /// board performs (gh#316). It used to be the one clone path that carried
+    /// nothing, which left it authenticating with whatever the *target device's*
+    /// ambient git config happened to provide: a `gh` login somebody set up by
+    /// hand, or — on a box provisioned an hour ago — nothing at all. A private
+    /// repo the board can plainly see then failed on a machine's incidental
+    /// configuration, and the operator was told `fatal:` and no more.
+    ///
+    /// So the caller names the URLs and the credential exactly as
+    /// [`Repos::clone_to`] takes them; the only thing this adds is where the
+    /// checkout goes.
+    pub async fn clone_repo(
+        &self,
+        url: &str,
+        canonical_url: &str,
+        env: &[(String, String)],
+    ) -> Result<Repo, EngineError> {
+        let target = self.clone_root().join(repo_name_from_url(canonical_url));
+        self.clone_to(url, canonical_url, &target, env).await
     }
 
     /// Clone `url` to an exact path, authenticating with `env`, and leave the
     /// checkout's `origin` set to `canonical_url` (gh#97).
     ///
-    /// Three things [`Repos::clone_repo`] does not do, each for a reason:
+    /// Three things that are true of every clone, and were written down here
+    /// first because onboarding is what needed them:
     ///
     /// - **The caller names the path.** Onboarding clones where the operator
     ///   works, not into the data dir, because the route's `repo =` points at
@@ -451,12 +435,31 @@ impl Repos {
             std::fs::create_dir_all(parent)?;
         }
         let target_str = target.to_string_lossy().to_string();
+        // Said out loud, on the device doing it (gh#316): the failure that took
+        // three watchers and a live reproduction to diagnose was invisible
+        // because nothing on either side ever recorded which URL was tried, with
+        // what credential, or what git said back.
+        tracing::info!(
+            url = %loggable_url(url),
+            target = %target.display(),
+            // Which of the two failures this is going to be, before it is one:
+            // a repo the board authenticated for, or one it did not.
+            credentialed = env.iter().any(|(k, _)| k == "GIT_ASKPASS"),
+            "clone: starting"
+        );
         if let Err(err) = self.git_env(&["clone", url, &target_str], None, env).await {
+            tracing::warn!(
+                url = %loggable_url(url),
+                target = %target.display(),
+                error = %err,
+                "clone failed"
+            );
             // A half-written clone is worse than none: it would read as an
             // existing checkout on the next attempt and be *reused*.
             let _ = std::fs::remove_dir_all(target);
             return Err(err);
         }
+        tracing::info!(url = %loggable_url(url), target = %target.display(), "clone: done");
         // Best-effort: a checkout that clones but will not answer `remote
         // set-url` is still a working checkout, and failing the onboard over the
         // cosmetics of its remote would be the wrong trade.
@@ -1109,6 +1112,48 @@ pub fn worktree_branch_from_title(title: &str) -> String {
     format!("comet/{}", if slug.is_empty() { "update" } else { slug })
 }
 
+/// The folder a clone URL should land in — the last path segment, minus `.git`.
+/// `git@github.com:o/r.git` and `https://github.com/o/r/` both give `r`.
+fn repo_name_from_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit(['/', ':'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("repo")
+        .to_string()
+}
+
+/// A URL safe to write to a log.
+///
+/// The board's own clone URL carries `x-access-token@`, which is a username and
+/// not a secret — but a URL that reaches this from elsewhere may carry
+/// `user:password@`, and a log line is exactly the place a password outlives the
+/// process that used it. Userinfo with a password in it is replaced whole;
+/// a bare username is kept, because it is half of what makes a log line worth
+/// having.
+fn loggable_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    let redacted = match authority.rsplit_once('@') {
+        Some((userinfo, host)) if userinfo.contains(':') => {
+            let user = userinfo.split_once(':').map(|(u, _)| u).unwrap_or("");
+            format!("{user}:***@{host}")
+        }
+        _ => authority.to_string(),
+    };
+    match path {
+        Some(path) => format!("{scheme}://{redacted}/{path}"),
+        None => format!("{scheme}://{redacted}"),
+    }
+}
+
 /// Absolute form of a possibly-relative path (no filesystem access).
 fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -1153,12 +1198,54 @@ mod tests {
         // Not userinfo: an `@` in the path, and an SSH remote's `user@host`
         // (no scheme, so nothing to mistake for a password either way).
         assert_eq!(
-            redact_url_password("https://github.com/o/r/blob/main/a@b"),
+            loggable_url("https://github.com/o/r/blob/main/a@b"),
             "https://github.com/o/r/blob/main/a@b"
         );
         assert_eq!(
-            redact_url_password("git@github.com:o/r.git"),
+            loggable_url("git@github.com:o/r.git"),
             "git@github.com:o/r.git"
         );
+    }
+
+    #[test]
+    fn a_clone_url_names_the_folder_it_lands_in() {
+        for (url, name) in [
+            (
+                "https://github.com/bredebjorhovd/itsm-agent.git",
+                "itsm-agent",
+            ),
+            ("https://github.com/bredebjorhovd/itsm-agent/", "itsm-agent"),
+            ("git@github.com:bredebjorhovd/itsm-agent.git", "itsm-agent"),
+            ("file:///srv/mirrors/thing", "thing"),
+            ("", "repo"),
+        ] {
+            assert_eq!(repo_name_from_url(url), name, "{url}");
+        }
+    }
+
+    /// A log line is exactly the place a credential outlives the process that
+    /// used it (gh#316). The board's own clone URL carries a username and no
+    /// password, and that username is worth having in the log; a URL that
+    /// arrived from somewhere else may carry both.
+    #[test]
+    fn a_logged_url_keeps_the_username_and_loses_the_password() {
+        assert_eq!(
+            loggable_url("https://x-access-token@github.com/o/r.git"),
+            "https://x-access-token@github.com/o/r.git"
+        );
+        assert_eq!(
+            loggable_url("https://someone:ghp_secret@github.com/o/r.git"),
+            "https://someone:***@github.com/o/r.git"
+        );
+        assert_eq!(
+            loggable_url("https://x-access-token:ghs_secret@github.com"),
+            "https://x-access-token:***@github.com"
+        );
+        // Nothing to redact, and nothing rewritten either.
+        assert_eq!(
+            loggable_url("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(loggable_url("file:///srv/thing"), "file:///srv/thing");
     }
 }
