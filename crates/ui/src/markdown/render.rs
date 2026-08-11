@@ -480,30 +480,25 @@ pub struct FlatText {
     pub code_ranges: Vec<Range<usize>>,
 }
 
-/// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
-/// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
-/// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
-/// Light mode inverts: the pale violet-300 would vanish on white, so the text
-/// deepens to violet-600 and the wash runs slightly stronger over the bright
-/// surface (see [`Theme::light`] — the same "darker accents on white" rule).
+/// Inline-code copy: `--text`, the plain foreground (window.md claim D6). It
+/// was violet from round 9 on ("a nice purple"), and the canvas took that back:
+/// the four status hues mean state (gh#173) and a code span is not one, so a
+/// span that borrows a hue reads as a status it does not have. Monochrome in
+/// both themes — the wash alone marks the span.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
-    if theme.light {
-        crate::theme::oklch(0.541, 0.281, 293.009) // violet-600
-    } else {
-        crate::theme::oklch(0.811, 0.111, 293.571) // violet-300
-    }
+    theme.text
 }
+/// The wash under it: `--chip`, the same translucent bed every chip, badge and
+/// key cap sits on (claim D6, `tokens.md`). Translucent on purpose — inline
+/// code lands on the card and inside a bubble, and it composites on both.
 pub fn inline_code_wash(theme: &Theme) -> Hsla {
-    if theme.light {
-        crate::theme::oklch(0.702, 0.183, 293.541).opacity(0.14) // violet-400/14 over white
-    } else {
-        crate::theme::oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400/12
-    }
+    theme.chip
 }
-/// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
-/// x extends 2px past the glyphs, y insets 2px from the 22px line box).
-pub const INLINE_CODE_RADIUS: f32 = 4.5;
-pub const INLINE_CODE_PAD_X: f32 = 2.0;
+/// Rounded-wash geometry, from the canvas's `padding:2px 5px;border-radius:6px`
+/// (claim D6): x extends 5px past the glyphs, y insets 2px from the 22px line
+/// box (the canvas's 2px vertical pad around a 12px em box lands there).
+pub const INLINE_CODE_RADIUS: f32 = Theme::RADIUS_CHIP;
+pub const INLINE_CODE_PAD_X: f32 = 5.0;
 pub const INLINE_CODE_INSET_Y: f32 = 2.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
@@ -551,8 +546,10 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // theme underlines in the text color; indigo is reserved for primary
         // actions).
         let is_link = run.style.link.is_some();
-        // Inline code reads violet (see `inline_code_text`); everything else
-        // stays the monochrome foreground.
+        // Inline code is monochrome too (see `inline_code_text`) — the wash is
+        // what marks the span. Its mono face is set above; the canvas's 12px
+        // is NOT reachable here, because a `TextRun` carries a font but no
+        // size — one shaped block is one size (see `window.md`'s deviation).
         let color = if run.style.code {
             inline_code_text(theme)
         } else {
@@ -1245,8 +1242,9 @@ mod tests {
         );
         // Adjacent code runs merge into ONE wash box; separated ones don't.
         assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
-        // Code text is the violet tint; the square run background is gone
-        // (the rounded wash is painted by the canvas underlay instead).
+        // Code text is the plain foreground — same as the prose around it
+        // (claim D6). The square run background is gone (the rounded wash is
+        // painted by the canvas underlay instead).
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.text);
@@ -1268,13 +1266,16 @@ mod tests {
     #[test]
     fn light_mode_deepens_code_accents() {
         // Round 2 light mode: the pale pastels tuned for the #060606 panel wash
-        // out on white, so inline code and the syntax palette deepen while dark
-        // keeps the glowing tones.
+        // out on white, so the syntax palette deepens while dark keeps the
+        // glowing tones. Inline code left the palette entirely (claim D6).
         let dark = Theme::dark();
         let light = Theme::light();
-        // Inline code: violet-600 text on white, dark keeps violet-300.
-        assert!(inline_code_text(&light).l < inline_code_text(&dark).l);
-        assert!(inline_code_wash(&light).a > inline_code_wash(&dark).a);
+        // Inline code no longer accents at all (claim D6): `--text` copy on the
+        // `--chip` bed, whichever way the theme runs.
+        assert_eq!(inline_code_text(&light), light.text);
+        assert_eq!(inline_code_text(&dark), dark.text);
+        assert_eq!(inline_code_wash(&light), light.chip);
+        assert_eq!(inline_code_wash(&dark), dark.chip);
         // Syntax tokens: every colored class deepens in light; comments stay
         // the theme's faint neutral in both.
         for class in [

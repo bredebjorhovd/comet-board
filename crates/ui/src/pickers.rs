@@ -1520,7 +1520,7 @@ impl Pickers {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(8.0))
+            .px(px(6.0))
             .rounded(px(Theme::RADIUS_CHIP))
             .text_size(px(Theme::TEXT_DENSE))
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -1560,7 +1560,7 @@ impl Pickers {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(8.0))
+            .px(px(6.0))
             .text_size(px(Theme::TEXT_DENSE))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text_subtle)
@@ -1572,10 +1572,12 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The composer footer row (t3code BranchToolbar): checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
-    /// existing session both sides are read-only labels ("Worktree" /
-    /// "Local checkout" + the chat's branch).
+    /// The composer footer row (window.md claim D8.7, t3code BranchToolbar):
+    /// checkout-kind on the left behind a folder icon, the ref right-aligned
+    /// behind a branch icon with a chevron after it. On an existing session
+    /// the checkout side is a read-only label ("Worktree" / "Local checkout").
+    /// A non-git space keeps the left side and drops the ref: there is no
+    /// branch to name, but the row still says where the run will land.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -1591,26 +1593,40 @@ impl Pickers {
                 .and_then(|_| state.selected_chat_row().cloned());
             (space, session)
         };
-        if !space.git_detected {
-            return None;
-        }
         let new_chat = session.is_none();
 
         // Refs feed both modes (draft labels, mid-session switch list) —
-        // eager + idempotent.
+        // eager + idempotent. Self-guarding on `git_detected`, so the non-git
+        // row below costs no RPC.
         self.ensure_refs(false, cx);
 
         // Symmetric: the container's 8px gap sits above the toolbar; bleeding
         // 8 of the container's 16px bottom padding (mb -8) leaves 8 below —
-        // equal air on both sides of the row.
+        // equal air on both sides of the row. The canvas pads the row 0×6 and
+        // its spans have no bed of their own; here the sides are hover
+        // targets, so their 6px lives on the chip and the row keeps none —
+        // the labels land on the canvas's x either way.
         let row = div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .gap(px(8.0))
-            .px(px(10.0))
             .mb(px(-8.0));
+
+        // A plain folder has no branch and no worktree to offer. Say where the
+        // run lands and stop — inventing a ref for a non-repo would be worse
+        // than the missing row this replaces.
+        if !space.git_detected {
+            return Some(
+                row.child(Self::footer_label(
+                    crate::icons::FOLDER,
+                    SharedString::from("Local checkout"),
+                    &theme,
+                ))
+                .into_any_element(),
+            );
+        }
 
         // The ref side is LIVE in both modes: draft pick on a new chat,
         // checkout switch on an existing session (t3code keeps its branch
