@@ -125,6 +125,15 @@ nearly verbatim — it never depended on herdr:
   repo does not have. A retry neither fetches nor moves anything — an existing
   branch is re-opened on its own commits (`git worktree prune` first, so a
   hand-deleted checkout is a retry rather than a failure).
+  A base that names a branch is also **said in the brief** (gh#284,
+  `dispatch::pr_base`): opening the pull request is the agent's job and `gh pr
+  create` targets the repo default unasked, so a route based on `release-1.x`
+  used to open a request to merge the release branch into `main`. The line is
+  appended after interpolation, so a route's own `prompt` gets it too. Only the
+  default is silent — `origin/HEAD` is what `gh` would have picked, and `HEAD`
+  names a branch this side cannot know. Making it mechanical instead (the `gh`
+  shim splicing `--base` into a bare `gh pr create`) is deliberately not done:
+  it is the shim growing opinions about argv to cover what the brief states.
 - `crates/board/src/review.rs` — review delivery (§review-delivery): herdr-board's
   `review.rs` minus the wake latch and busy-check, delivering over the
   command ledger via `Runtime::prompt`. See §review-delivery for what was dropped

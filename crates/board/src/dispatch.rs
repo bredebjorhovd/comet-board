@@ -54,7 +54,11 @@ pub fn prompt_vars<'a>(
 /// spec, after this string is built. [`DispatchSpec::prompt_at`] resolves it
 /// once the checkout exists; `interpolate` leaves unknown keys visible rather
 /// than blanking them, so the seam is legible in between.
-pub fn resolve_prompt(route: &Route, task: &Task, branch: &str) -> String {
+///
+/// `base` is the dispatch's [`DispatchSpec::base`], and it is appended to the
+/// brief rather than interpolated into it — see [`pr_base`] for why the agent
+/// has to be told, and why the line lands on a route's own `prompt` too.
+pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str) -> String {
     let vars = prompt_vars(task, branch, &route.workspace);
     let template = route.prompt.clone().unwrap_or_else(|| {
         // A route with no prompt still needs to say something useful.
@@ -66,7 +70,74 @@ pub fn resolve_prompt(route: &Route, task: &Task, branch: &str) -> String {
          Commit and push your work, and open a pull request when done."
             .to_string()
     });
-    interpolate(&template, &vars)
+    let mut prompt = interpolate(&template, &vars);
+    if let Some(base) = pr_base(base) {
+        prompt.push_str(&pr_base_line(base));
+    }
+    prompt
+}
+
+/// The branch a dispatch's pull request must name, or `None` when the repo's
+/// own default is already the right answer (gh#284).
+///
+/// The `base` key decided one thing and told nobody: where
+/// `Repos::create_worktree_on` cuts the branch. Opening the pull request is
+/// the agent's job, and `gh pr create` with no `--base` targets the repo
+/// default — so a route branching from `release-1.x` produced a request to
+/// merge `release-1.x` *into `main`*, carrying every commit the release branch
+/// was ahead by. The brief is where that gets fixed, because the brief is the
+/// only channel the board has to the thing doing the creating.
+///
+/// Which spellings mean "the repo default", and so say nothing:
+///
+/// - `origin/HEAD`, the default — the remote's default branch, which is
+///   exactly what `gh pr create` picks unasked;
+/// - `HEAD` and empty — the space folder's current checkout, the opt-out for a
+///   repo with no remote. The board cannot name that branch from here (it is
+///   whatever ran in that folder last, which is the reason `origin/HEAD` is
+///   the default in the first place), and a guess in the brief would be worse
+///   than the silence: `gh`'s own default is at least right about the repo.
+///
+/// Anything else names a branch, and `origin/` is stripped: `--base
+/// origin/release-1.x` is not a base GitHub accepts.
+///
+/// Brief-only is the first cut, and deliberately so. The board could make this
+/// mechanical instead — the `gh` shim ([`crate::git_credentials`]) already
+/// wraps every `gh` an agent runs, and could splice `--base` into a bare `gh
+/// pr create` — but that is the shim growing opinions about argv (which
+/// subcommand, which existing flag wins, what `--repo` elsewhere means) to
+/// cover a case the brief states plainly. Worth doing when a told agent is
+/// observed getting it wrong; not before.
+///
+/// The other half of "not before" is being able to *see* it go wrong, and the
+/// board cannot yet: nothing it stores about a linked pull request records
+/// which branch that request targets. Once the sync carries the PR's own
+/// `base` ref, comparing it against this is the check worth having — and the
+/// row should say the two disagree rather than quietly following the request,
+/// because a request opened against the wrong branch is not a base the
+/// operator changed their mind about.
+pub fn pr_base(base: &str) -> Option<&str> {
+    match base.trim() {
+        "" | "HEAD" | "origin/HEAD" => None,
+        other => Some(other.strip_prefix("origin/").unwrap_or(other)),
+    }
+}
+
+/// The sentence [`resolve_prompt`] appends when [`pr_base`] names a branch.
+///
+/// Appended after interpolation, so it reaches a route's custom `prompt` too:
+/// a template is somebody's wording for the *task*, and where the pull request
+/// goes is a fact about the dispatch that the same somebody has no way to know
+/// when they write the template. It names the flag rather than the intent
+/// because the failure mode is an agent that opens the request correctly-minded
+/// and forgets the argument.
+fn pr_base_line(base: &str) -> String {
+    format!(
+        "\n\nOpen your pull request against `{base}`, not the repo's default \
+         branch: `gh pr create --base {base}`. Your branch was cut from \
+         `{base}`, so a request that targets anything else carries commits \
+         that are not yours."
+    )
 }
 
 /// Resolve the branch name for an attempt.
@@ -370,6 +441,7 @@ pub fn build_spec(
     // rather than at commit time because that is when the dispatcher is known:
     // the agent that does the committing knows nothing about who released it.
     let git_author = by_user.and_then(|u| cfg.git_author_for(u));
+    let base = cfg.base(route).to_string();
     Ok(DispatchSpec {
         identifier: task.identifier.clone(),
         title: task.title.clone(),
@@ -378,9 +450,9 @@ pub fn build_spec(
         push_repo,
         git_author,
         repo_path,
-        prompt: resolve_prompt(route, task, &branch),
+        prompt: resolve_prompt(route, task, &branch, &base),
         branch,
-        base: cfg.base(route).to_string(),
+        base,
         worktree: true,
         harness,
         model: overrides.model.clone(),
@@ -858,6 +930,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_route.base, "release");
+    }
+
+    /// gh#284: which spellings of `base` name a branch the agent has to be
+    /// told about, and which are the repo's own default under another name.
+    #[test]
+    fn only_a_named_base_is_a_pull_request_base() {
+        assert_eq!(pr_base("origin/HEAD"), None);
+        assert_eq!(pr_base("HEAD"), None);
+        assert_eq!(pr_base(""), None);
+        assert_eq!(pr_base("  "), None);
+        // `--base origin/release-1.x` is not a base GitHub accepts.
+        assert_eq!(pr_base("origin/release-1.x"), Some("release-1.x"));
+        assert_eq!(pr_base("release-1.x"), Some("release-1.x"));
+        assert_eq!(pr_base(" develop "), Some("develop"));
+    }
+
+    /// gh#284: the whole point. A route branching from a release branch used
+    /// to say nothing about it, and `gh pr create` targets the repo default
+    /// unasked — a request to merge someone else's commits into `main`.
+    #[test]
+    fn a_brief_on_a_non_default_base_names_the_pull_request_base() {
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [defaults]
+            base = "origin/release-1.x"
+            "#,
+        )
+        .unwrap();
+        let spec = build_spec(
+            &cfg,
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            spec.prompt.contains("gh pr create --base release-1.x"),
+            "brief must name the base: {}",
+            spec.prompt
+        );
+        // The stripped name, never the remote-qualified one.
+        assert!(!spec.prompt.contains("origin/release-1.x"));
+        // And it is an addition, not a replacement.
+        assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
+    }
+
+    /// The default base *is* what `gh pr create` picks on its own, so saying
+    /// so would be a line of brief spent on nothing.
+    #[test]
+    fn a_brief_on_the_repo_default_says_nothing_about_a_base() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(!spec.prompt.contains("--base"));
+    }
+
+    /// A route's own `prompt` is somebody's wording for the task; where the
+    /// pull request goes is a fact about the dispatch they could not have
+    /// known when they wrote it. So the line lands on custom briefs too.
+    #[test]
+    fn a_custom_brief_still_learns_its_base() {
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [defaults]
+            base = "develop"
+            "#,
+        )
+        .unwrap();
+        let mut r = route();
+        r.prompt = Some("Do {identifier}, please.".into());
+        let spec = build_spec(
+            &cfg,
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(spec.prompt.starts_with("Do gh#7, please."));
+        assert!(spec.prompt.contains("gh pr create --base develop"));
     }
 
     #[test]

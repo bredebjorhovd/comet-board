@@ -210,6 +210,10 @@ pub struct DispatchSpec {
     /// what an agent starts on is the remote's tip and not whatever the space
     /// folder happened to be sitting on. `HEAD` is the local-checkout opt-out.
     /// Ignored on a retry, which reuses the previous attempt's branch as-is.
+    ///
+    /// When it names a branch, the [`prompt`](Self::prompt) names it too: the
+    /// agent opens the pull request, and one that was never told targets the
+    /// repo default (gh#284). See [`crate::dispatch::pr_base`].
     pub base: String,
     /// Whether to run in a fresh worktree (the default) or the repo root.
     pub worktree: bool,
