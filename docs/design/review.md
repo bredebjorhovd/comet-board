@@ -35,6 +35,12 @@ Captures: `screenshots/review-{dark,light}-{before,after}.png`, plus
 exits (gh#311) are `screenshots/gh311-review-tab-{dark,light}.png` and
 `gh311-review-closed-dark.png` — the same window one click of the tab's ✕ later.
 
+The state *before* any of that is over in a blink against a local board, so it
+is photographed by holding the read open — `COMET_REVIEW_HOLD_MS=9000
+scripts/review-demo.sh` waits that long before issuing it, the same dev knob
+`COMET_MOTION_SCALE` is for the tweens. Captures:
+`screenshots/gh341-review-loading-{dark,light}.png`.
+
 ## A. The route's frame
 
 - **A1** The review is the CARD and the authoring session is the narrow column
@@ -247,6 +253,20 @@ other difference from the list is a bug.
   rail is off (`rail_visible` gates on the column's width, not the window's).
   What this pass takes from I is the column's card, its header, and the delivery
   preview at its foot.
+
+- **The card has a loading state, and it is the app's own wave** (gh#341). The
+  canvas has none because a canvas is already loaded. A review is read off the
+  attempt's checkout and three GitHub endpoints, so opening one is a real wait,
+  and every other wait in this app is said in one vocabulary: the comet pulse
+  (`loaders::comet_loader`, the wave the boot splash and the terminal viewport
+  pulse), centred in the card, with `Reading the review…` in 12px `--subtle`
+  under it at `SPACE_MD`. Cells are 8px, which puts the row at 56 across — the
+  splash's mark is 64 tall and this is the same gesture one step quieter,
+  because a card about to fill is not a window that is empty. The two other
+  nothings keep their sentences and are deliberately *not* this: a read that
+  came back with no review says "No review for this task.", and a route that
+  outlived its panel falls back to the chat route (`render_review_route`).
+  Neither is a wait.
 
 - **The host line stays, under the diff strip.** One 11px `--faint` sentence
   naming the device the review was read from. The canvas has none because a
