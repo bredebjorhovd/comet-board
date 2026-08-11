@@ -36,7 +36,7 @@ use crate::notify::{self, Signal, Stopped, Webhook};
 use crate::overrun;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Commits, Evidence, Verdict, Why};
-use crate::sources::github::{Github, HttpRest, PullRequest, Rest, pr_matches_branch};
+use crate::sources::github::{Github, HttpRest, MergeStatus, PullRequest, Rest, pr_matches_branch};
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -63,7 +63,27 @@ impl Rest for Box<dyn Rest> {
     fn put(&self, path: &str, body: &Value) -> Result<Value> {
         (**self).put(path, body)
     }
+    // Forwarded rather than left to the default, which would call `put` and
+    // invent the 200 the inner client was answering for itself.
+    fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        (**self).put_reply(path, body)
+    }
 }
+
+/// How long the board waits between asking whether an in-flight merge is done.
+///
+/// GitHub's own advice for the asynchronous merge, and the reason it is a
+/// second rather than the poll interval: this is a person standing in front of
+/// a confirmation they just gave.
+const MERGE_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many of those to spend before answering "still merging".
+///
+/// A stack merge is documented as taking up to a few minutes, and this is
+/// nowhere near that on purpose. The board is not the only thing watching — the
+/// sync loop sees the merge on its next pass either way — so the budget is set
+/// by how long a keypress may block, not by how long GitHub may take.
+const MERGE_POLL_TRIES: usize = 20;
 
 /// Health of one upstream source, rendered in the board header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3723,6 +3743,19 @@ impl SyncEngine {
     }
 
     /// Merge the pull request on a task, if it has one.
+    ///
+    /// Asynchronous end to end (gh#290): the submission comes back `pending` and
+    /// the board waits out [`MERGE_POLL_TRIES`] of it before answering. What it
+    /// answers is what actually happened — merged, queued, or still running —
+    /// because merging a layer of a stack merges every layer beneath it as one
+    /// group, and three pull requests take longer than one.
+    ///
+    /// The row is only marked merged when GitHub says `merged`. A merge that
+    /// entered the queue, or that is still running when the wait is over, leaves
+    /// the row where it is: `link_pull_requests` reads `merged` off every pull
+    /// request it polls and calls the same [`SyncEngine::finish_on_merge`] this
+    /// does, so a merge that lands a minute later lands on the board too,
+    /// without a marker column holding a fact GitHub is already answering.
     pub fn merge_pull_request(&self, task: &Task) -> Result<String> {
         let Some(number) = task.pr_number else {
             anyhow::bail!("{} has no pull request", task.identifier);
@@ -3739,9 +3772,20 @@ impl SyncEngine {
                 anyhow::anyhow!("cannot tell which repo {} belongs to", task.identifier)
             })?;
 
-        gh.merge_pr(&repo, number)?;
-        self.log
-            .info(format!("merged {repo}#{number} for {}", task.identifier));
+        let submitted = gh.merge_pr(&repo, number)?;
+        let status =
+            gh.await_merge(&repo, number, submitted, MERGE_POLL_EVERY, MERGE_POLL_TRIES)?;
+        self.log.info(format!(
+            "{repo}#{number} for {}: {}",
+            task.identifier,
+            status.note()
+        ));
+        if status != MergeStatus::Merged {
+            // Nothing landed, so nothing on the row may say it did. The next
+            // poll is what turns a queued or still-running merge into a done
+            // row — and it is the same path a merge made on the web takes.
+            return Ok(format!("{repo}#{number} is {}", status.note()));
+        }
 
         // Reflect it immediately rather than waiting for a poll: the operator
         // just pressed the key and needs the row to move.
@@ -7670,6 +7714,44 @@ max_duration = "{max_duration}"
                 .iter()
                 .any(|w| w.kind == "close"),
             "merging finished the work; the ticket is what is left"
+        );
+    }
+
+    /// The merge queue accepted the stack; nothing has landed yet. A row marked
+    /// done here would be the board claiming a merge the queue can still reject
+    /// (gh#290) — so it stays in review, and the poll that sees the merge is
+    /// what moves it, exactly as for a merge made on the web.
+    #[test]
+    fn a_queued_merge_leaves_the_row_where_it_is() {
+        let e = engine_with(
+            None,
+            Some(Github::new(Box::new(FixtureRest::new(vec![(
+                "PUT /repos/o/r/pulls/87/merge-async".into(),
+                json!({ "status": "enqueued" }),
+            )])) as Box<dyn Rest>)),
+        );
+        seed_gh(&e);
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/87"),
+            Some(87),
+            true,
+        )
+        .unwrap();
+        e.rederive_all().unwrap();
+
+        let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        let said = e.merge_pull_request(&task).unwrap();
+        assert!(said.contains("merge queue"), "{said}");
+
+        let after = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert!(after.pr_open, "the pull request has not merged");
+        assert!(!after.pr_merged);
+        assert_eq!(after.state, BoardState::Review);
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "and nothing was written back about work that has not landed",
         );
     }
 

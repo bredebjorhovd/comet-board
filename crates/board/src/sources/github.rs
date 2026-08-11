@@ -55,6 +55,22 @@ pub trait Rest {
     fn patch(&self, path: &str, body: &Value) -> Result<Value>;
     /// PUT with a JSON body (merging a pull request).
     fn put(&self, path: &str, body: &Value) -> Result<Value>;
+
+    /// PUT that hands back the status alongside the body.
+    ///
+    /// The asynchronous merge endpoint is the one place where the status code
+    /// is part of the *answer* rather than a verdict on the call: 202 means the
+    /// merge is running, 200 that it was already done, 409 that somebody else's
+    /// submission is in flight, 400 that the pull request was not in a state to
+    /// merge — and the last two carry GitHub's reason in a body that
+    /// [`HttpRest::interpret`] would throw away for an `HTTP 400` with no words
+    /// in it (gh#290).
+    ///
+    /// Defaulted to [`Rest::put`] with a 200, so a fake that only cares about
+    /// what the board *wrote* stays three lines long.
+    fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        self.put(path, body).map(|v| (200, v))
+    }
 }
 
 /// One authorized round trip, already carrying whichever bearer the caller
@@ -166,6 +182,17 @@ impl HttpRest {
     }
 
     fn request(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        let reply = self.round_trip(method, path, body)?;
+        Self::interpret(reply, path, &self.auth)
+    }
+
+    /// One call, with the re-mint retry, and no verdict on what came back.
+    fn round_trip(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Reply> {
         // A 401 against an App is usually a token that went stale under us — an
         // installation token lives an hour and the world can change inside it.
         // So: drop what we cached, mint once more, and try again. Exactly once.
@@ -184,16 +211,27 @@ impl HttpRest {
                 re_minted = true;
                 continue;
             }
-            return Self::interpret(reply, path, &self.auth);
+            return Ok(reply);
+        }
+    }
+
+    /// The failures that mean the same thing at every endpoint: the credential
+    /// was refused, or GitHub is not answering this board for a while. No
+    /// caller gets to read these as data, whatever it asked for.
+    fn credential_failure(status: u16, auth: &TokenProvider) -> Option<anyhow::Error> {
+        match status {
+            403 | 429 => Some(anyhow!("github rate limited ({status})")),
+            401 => Some(anyhow!(
+                "github rejected the credential (401) — {}",
+                auth.hint()
+            )),
+            _ => None,
         }
     }
 
     fn interpret(reply: Reply, path: &str, auth: &TokenProvider) -> Result<Value> {
-        if reply.status == 403 || reply.status == 429 {
-            bail!("github rate limited ({})", reply.status);
-        }
-        if reply.status == 401 {
-            bail!("github rejected the credential (401) — {}", auth.hint());
+        if let Some(e) = Self::credential_failure(reply.status, auth) {
+            return Err(e);
         }
         if !(200..300).contains(&reply.status) {
             bail!("github HTTP {} for {path}", reply.status);
@@ -217,6 +255,14 @@ impl Rest for HttpRest {
 
     fn put(&self, path: &str, body: &Value) -> Result<Value> {
         self.request(reqwest::Method::PUT, path, Some(body))
+    }
+
+    fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        let reply = self.round_trip(reqwest::Method::PUT, path, Some(body))?;
+        match Self::credential_failure(reply.status, &self.auth) {
+            Some(e) => Err(e),
+            None => Ok((reply.status, reply.body)),
+        }
     }
 }
 
@@ -410,6 +456,38 @@ pub struct RepoFacts {
     /// Issues can be switched off on a repo, and then polling it is polling
     /// nothing. Worth a line in the report rather than a silent empty board.
     pub has_issues: bool,
+}
+
+/// Where an asynchronous merge got to (gh#290).
+///
+/// GitHub's `status` field, minus `failed` — a failed merge is an `Err`, because
+/// every caller that would have to remember to check for it is a caller that
+/// will eventually forget, and the failure is the one outcome that must not read
+/// as "the board asked and all is well".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeStatus {
+    /// Running in the background. The uuid is what [`Github::merge_result`]
+    /// polls; it is the only status that carries one.
+    Pending(String),
+    /// On the base branch. For a stack that means every layer up to and
+    /// including the one asked for.
+    Merged,
+    /// Handed to the base branch's merge queue — accepted, not landed. The
+    /// queue can still reject it, so this is not a merge and the board does not
+    /// record one.
+    Enqueued,
+}
+
+impl MergeStatus {
+    /// What the board tells a reader, in the reader's terms rather than
+    /// GitHub's field names.
+    pub fn note(&self) -> &'static str {
+        match self {
+            MergeStatus::Pending(_) => "still merging",
+            MergeStatus::Merged => "merged",
+            MergeStatus::Enqueued => "in the merge queue",
+        }
+    }
 }
 
 /// One GitHub account, as much of it as `[users]` needs (gh#162).
@@ -658,26 +736,98 @@ impl<T: Rest> Github<T> {
             .map(str::to_string)
     }
 
-    /// Merge a pull request.
+    /// Ask GitHub to merge a pull request, and answer with where that got to.
     ///
     /// Only ever from an explicit keypress with a confirmation — this is the
     /// one action the board takes that cannot be undone from the board.
-    pub fn merge_pr(&self, repo: &str, number: i64) -> Result<()> {
-        let r = self.rest.put(
-            &format!("/repos/{repo}/pulls/{number}/merge"),
+    ///
+    /// The *asynchronous* endpoint, which is the only one that can merge a
+    /// stacked pull request at all (gh#290). The legacy `PUT .../merge` this
+    /// replaces refuses a layer of a stack outright, so a board on it would ship
+    /// a merge key that errors on exactly the pull requests the stacking work
+    /// produces. The asynchronous contract is different in kind, not just in
+    /// path: submitting checks only that the pull request is open and not a
+    /// draft, the branch protection rules are evaluated later when the merge
+    /// actually executes, and merging a layer merges — or queues — every layer
+    /// beneath it as one atomic group.
+    ///
+    /// So the answer is a *status*, not a success: [`MergeStatus::Pending`] is
+    /// the ordinary case and means the work is still running under a uuid the
+    /// caller polls with [`Github::merge_result`].
+    ///
+    /// The `X-GitHub-Api-Version` the transport stamps is deliberately not
+    /// bumped for this. A new endpoint is a non-breaking addition and GitHub
+    /// serves those on every supported version; the dated versions exist for
+    /// changes that would break a caller. If that ever stops holding, it shows
+    /// up here as a 404 on a path that plainly exists — worth knowing before
+    /// going looking for a mistyped route.
+    pub fn merge_pr(&self, repo: &str, number: i64) -> Result<MergeStatus> {
+        let (status, body) = self.rest.put_reply(
+            &format!("/repos/{repo}/pulls/{number}/merge-async"),
+            // Deliberate, not incidental (gh#290): a squash of a mid-stack layer
+            // rewrites the commits every layer above it is built on, and the
+            // stack does not survive it. Whoever makes the merge method
+            // configurable owes this line an answer for the stacked case —
+            // squashing a *whole* stack in one operation may be legitimate,
+            // squashing a layer under other layers is not.
+            //
+            // `merge_action` is left off on purpose: GitHub's own default picks
+            // between a direct merge and the base branch's merge queue, and it
+            // knows which of the two the repository is set up for. The one
+            // known edge of leaving it off is that a merge method is not
+            // supported on a queued merge, so a repository whose default routes
+            // into the queue may refuse this body — and the refusal arrives
+            // with GitHub's own words rather than as a bare status, which is
+            // what [`Rest::put_reply`] exists for.
             &serde_json::json!({ "merge_method": "merge" }),
         )?;
-        // GitHub answers 200 with `merged: false` when it declines — a dirty
-        // mergeable_state, a required check, a review still outstanding.
-        if r.get("merged").and_then(Value::as_bool) == Some(false) {
-            bail!(
-                "github refused the merge: {}",
-                r.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("no reason given")
-            );
+        parse_merge_status(status, &body)
+    }
+
+    /// Where an in-flight merge got to, by the uuid its submission returned.
+    ///
+    /// GitHub keeps the result for 24 hours and then answers 404 for the uuid,
+    /// which surfaces here as an error: a merge whose result has expired is one
+    /// the board must not narrate either way.
+    pub fn merge_result(&self, repo: &str, number: i64, uuid: &str) -> Result<MergeStatus> {
+        let body = self
+            .rest
+            .get(&format!("/repos/{repo}/pulls/{number}/merge-async/{uuid}"))?;
+        parse_merge_status(200, &body)
+    }
+
+    /// Poll an in-flight merge until GitHub stops saying `pending`.
+    ///
+    /// A stack merge is several pull requests and GitHub documents it as taking
+    /// up to a few minutes, so `tries` is a budget rather than a guarantee:
+    /// running out of it returns the [`MergeStatus::Pending`] it came in with,
+    /// and that is a truthful answer. The caller is not the last thing watching
+    /// — the sync loop reads `merged` off the pulls it polls anyway, and closes
+    /// the ticket from there whoever pressed the key.
+    ///
+    /// `every` is a parameter because a test that sleeps a real second per poll
+    /// is a test nobody runs.
+    pub fn await_merge(
+        &self,
+        repo: &str,
+        number: i64,
+        status: MergeStatus,
+        every: std::time::Duration,
+        tries: usize,
+    ) -> Result<MergeStatus> {
+        let MergeStatus::Pending(uuid) = &status else {
+            return Ok(status);
+        };
+        for _ in 0..tries {
+            if !every.is_zero() {
+                std::thread::sleep(every);
+            }
+            match self.merge_result(repo, number, uuid)? {
+                MergeStatus::Pending(_) => continue,
+                settled => return Ok(settled),
+            }
         }
-        Ok(())
+        Ok(status)
     }
 
     /// Close on done. Without this, `d mark done` moves the row and the next
@@ -909,6 +1059,51 @@ fn parse_stack(v: Option<&Value>) -> Option<PrStack> {
     })
 }
 
+/// Read an asynchronous merge's answer, whichever of its four shapes came back
+/// (gh#290).
+///
+/// The status code and the body are both consulted because GitHub says it in
+/// both: a 202 carries `pending` with the uuid to poll, a 200 can be `merged` or
+/// `enqueued`, and a 400 or 409 is a refusal whose *reason* is in the body and
+/// nowhere else. An answer this cannot read at all is an error rather than an
+/// optimistic success — the whole point of the endpoint is that submitting it is
+/// not the same as merging.
+fn parse_merge_status(status: u16, body: &Value) -> Result<MergeStatus> {
+    let details = body.get("details");
+    let message = |fallback: &str| {
+        details
+            .and_then(|d| d.get("message"))
+            .or_else(|| body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    match body.get("status").and_then(Value::as_str) {
+        Some("merged") => return Ok(MergeStatus::Merged),
+        Some("enqueued") => return Ok(MergeStatus::Enqueued),
+        Some("pending") => {
+            // The uuid is the whole handle on an in-flight merge. Without it
+            // there is nothing to poll and nothing to report, and pretending
+            // otherwise would leave a merge running that the board has claimed.
+            let uuid = details
+                .and_then(|d| d.get("uuid"))
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| anyhow!("github accepted the merge but named no uuid to poll"))?;
+            return Ok(MergeStatus::Pending(uuid.to_string()));
+        }
+        Some("failed") => bail!("github refused the merge: {}", message("no reason given")),
+        _ => {}
+    }
+    if (200..300).contains(&status) {
+        bail!("github answered the merge with no status (HTTP {status})");
+    }
+    bail!(
+        "github refused the merge (HTTP {status}): {}",
+        message("no reason given")
+    );
+}
+
 /// Does this PR belong to that attempt? Branch match is the primary link
 /// (impl spec §4.2); a PR URL recorded on the Linear issue is the other.
 pub fn pr_matches_branch(pr: &PullRequest, branch: &str) -> bool {
@@ -975,7 +1170,18 @@ impl Rest for FixtureRest {
         self.wrote
             .borrow_mut()
             .push(("PUT".into(), path.into(), body.clone()));
-        Ok(serde_json::json!({ "merged": true }))
+        // Scriptable under `PUT <path>`, the way `post` is, because the
+        // asynchronous merge answers a *status* and a test about a merge that
+        // is still running has to be able to say so. A merge that landed
+        // outright is the default, so a test that only cares that the board
+        // pressed the button writes no route at all.
+        let key = format!("PUT {path}");
+        Ok(self
+            .routes
+            .iter()
+            .find(|(p, _)| key.starts_with(p.as_str()))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| serde_json::json!({ "status": "merged" })))
     }
 }
 
@@ -1373,20 +1579,109 @@ mod tests {
         assert_eq!(w[0].2["state"], "closed");
     }
 
+    /// The headline of gh#290: the legacy synchronous endpoint cannot merge a
+    /// stacked pull request at all, so the board does not call it.
     #[test]
-    fn merging_puts_to_the_merge_endpoint() {
+    fn merging_puts_to_the_asynchronous_endpoint() {
         let g = Github::new(FixtureRest::new(vec![]));
-        g.merge_pr("o/r", 508).unwrap();
+        assert_eq!(g.merge_pr("o/r", 508).unwrap(), MergeStatus::Merged);
         let w = g.rest.wrote.borrow();
         assert_eq!(w[0].0, "PUT");
-        assert_eq!(w[0].1, "/repos/o/r/pulls/508/merge");
+        assert_eq!(w[0].1, "/repos/o/r/pulls/508/merge-async");
     }
 
+    /// Load-bearing, and the reason it is asserted rather than left to the
+    /// reader: squashing a layer of a stack rewrites the commits every layer
+    /// above it is built on. Whoever makes the merge method configurable has to
+    /// come through this test.
+    #[test]
+    fn the_merge_method_is_merge_because_a_squash_destroys_a_stack() {
+        let g = Github::new(FixtureRest::new(vec![]));
+        g.merge_pr("o/r", 508).unwrap();
+        assert_eq!(g.rest.wrote.borrow()[0].2["merge_method"], "merge");
+    }
+
+    /// The ordinary case: GitHub takes the submission and does the work in the
+    /// background, and the board polls the uuid until it stops saying pending.
+    #[test]
+    fn a_pending_merge_is_polled_until_it_settles() {
+        let g = Github::new(FixtureRest::new(vec![
+            (
+                "PUT /repos/o/r/pulls/508/merge-async".into(),
+                json!({ "status": "pending", "details": { "uuid": "u-1" } }),
+            ),
+            (
+                "/repos/o/r/pulls/508/merge-async/u-1".into(),
+                json!({ "status": "merged", "details": { "sha": "deadbee" } }),
+            ),
+        ]));
+        let submitted = g.merge_pr("o/r", 508).unwrap();
+        assert_eq!(submitted, MergeStatus::Pending("u-1".into()));
+        let settled = g
+            .await_merge("o/r", 508, submitted, std::time::Duration::ZERO, 3)
+            .unwrap();
+        assert_eq!(settled, MergeStatus::Merged);
+        assert_eq!(
+            g.rest.asked.borrow().as_slice(),
+            ["/repos/o/r/pulls/508/merge-async/u-1"],
+            "polled by uuid, once, because the first answer was final",
+        );
+    }
+
+    /// A merge still running when the budget runs out is still running. The
+    /// board says so rather than rounding it up to a merge — the sync loop's
+    /// own poll is what records it when it lands.
+    #[test]
+    fn a_merge_that_outlasts_the_budget_is_still_pending() {
+        let g = Github::new(FixtureRest::new(vec![
+            (
+                "PUT /repos/o/r/pulls/508/merge-async".into(),
+                json!({ "status": "pending", "details": { "uuid": "u-1" } }),
+            ),
+            (
+                "/repos/o/r/pulls/508/merge-async/u-1".into(),
+                json!({ "status": "pending", "details": { "uuid": "u-1" } }),
+            ),
+        ]));
+        let submitted = g.merge_pr("o/r", 508).unwrap();
+        let after = g
+            .await_merge("o/r", 508, submitted, std::time::Duration::ZERO, 2)
+            .unwrap();
+        assert_eq!(after, MergeStatus::Pending("u-1".into()));
+        assert_eq!(g.rest.asked.borrow().len(), 2, "it spent its budget");
+    }
+
+    /// The merge queue accepted the stack; nothing has landed. The two are
+    /// different answers and the board keeps them apart.
+    #[test]
+    fn a_queued_merge_is_not_a_merged_one() {
+        let g = Github::new(FixtureRest::new(vec![(
+            "PUT /repos/o/r/pulls/508/merge-async".into(),
+            json!({ "status": "enqueued", "details": { "message": "added to the queue" } }),
+        )]));
+        assert_eq!(g.merge_pr("o/r", 508).unwrap(), MergeStatus::Enqueued);
+    }
+
+    /// GitHub declines in the body — a required check, a review outstanding, a
+    /// pull request that turned out to be a draft.
     #[test]
     fn a_refused_merge_is_an_error_not_a_success() {
-        // GitHub answers 200 with merged:false when a check or review blocks it.
-        struct Refuses;
-        impl Rest for Refuses {
+        let g = Github::new(FixtureRest::new(vec![(
+            "PUT /repos/o/r/pulls/508/merge-async".into(),
+            json!({ "status": "failed",
+                    "details": { "message": "required status check is pending" } }),
+        )]));
+        let err = g.merge_pr("o/r", 508).unwrap_err().to_string();
+        assert!(err.contains("required status check"), "{err}");
+    }
+
+    /// A refusal that arrives as a status code still has to arrive with its
+    /// reason. `github HTTP 409` tells an operator nothing about the merge
+    /// somebody else already has in flight.
+    #[test]
+    fn a_refusal_carries_githubs_words_and_not_just_its_status() {
+        struct Conflicts;
+        impl Rest for Conflicts {
             fn get(&self, _: &str) -> Result<Value> {
                 Ok(Value::Null)
             }
@@ -1397,12 +1692,33 @@ mod tests {
                 Ok(Value::Null)
             }
             fn put(&self, _: &str, _: &Value) -> Result<Value> {
-                Ok(json!({ "merged": false, "message": "required status check is pending" }))
+                unreachable!("the merge reads the status alongside the body")
+            }
+            fn put_reply(&self, _: &str, _: &Value) -> Result<(u16, Value)> {
+                Ok((
+                    409,
+                    json!({ "message": "a merge request is already enqueued" }),
+                ))
             }
         }
-        let g = Github::new(Refuses);
-        let err = g.merge_pr("o/r", 508).unwrap_err().to_string();
-        assert!(err.contains("required status check"), "{err}");
+        let err = Github::new(Conflicts)
+            .merge_pr("o/r", 508)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already enqueued"), "{err}");
+        assert!(err.contains("409"), "{err}");
+    }
+
+    /// An answer in a shape the board cannot read is not a merge. The endpoint
+    /// exists precisely because submitting is not landing, and a parser that
+    /// shrugged would undo that.
+    #[test]
+    fn an_unreadable_answer_is_never_read_as_a_merge() {
+        let g = Github::new(FixtureRest::new(vec![(
+            "PUT /repos/o/r/pulls/508/merge-async".into(),
+            json!({ "ok": true }),
+        )]));
+        assert!(g.merge_pr("o/r", 508).is_err());
     }
 
     fn reviewed_pr() -> Github<FixtureRest> {
