@@ -25,7 +25,9 @@
   - system/api_retry: error categories authentication_failed|oauth_org_not_allowed|billing_error|
     rate_limit|overloaded|invalid_request|model_not_found|max_output_tokens|server_error|unknown
   - stream_event: raw API deltas (content_block_delta -> text_delta/thinking_delta); has
-    parent_tool_use_id (subagent frames non-null -> filter)
+    parent_tool_use_id (non-null = a subagent's nested transcript: kept OUT of the parent's
+    parts, but not dropped — deltas/tool_results beat as empty ReasoningDelta liveness and
+    subagent tool_use blocks become SubagentActivity steps on the Task row; gh#280)
   - assistant / user messages (tool_use / tool_result blocks), rate_limit_event
   - result: subtype success|error_*, usage, session_id (last line)
 - Control channel (bidirectional control_request/control_response, request_id-multiplexed):

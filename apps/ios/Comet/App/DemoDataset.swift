@@ -727,6 +727,8 @@ final class DemoDataset {
                     // point of rendering it differently.
                     .tool(id: "skill1", call: RenderToolCall(tag: "skill", fields: ["name": "comet-board", "args": "list --state ready"]), isError: false, resolved: true),
                     .tool(id: "tool2", call: RenderToolCall(tag: "editFile", fields: ["path": "Comet/Transcript/Veil.swift"]), isError: false, resolved: true),
+                    // A subagent still working: unresolved, and counting (gh#280).
+                    .tool(id: "task1", call: RenderToolCall(tag: "task", fields: ["description": "map the veil call sites", "subagentType": "Explore", "steps": Int64(12)]), isError: false, resolved: false),
                     .tool(id: "tool3", call: RenderToolCall(tag: "exec", fields: ["command": "xcodebuild -scheme Comet build"]), isError: false, resolved: true),
                     .text(id: "t1", text: """
                     Implementation lands in `Veil.swift`:

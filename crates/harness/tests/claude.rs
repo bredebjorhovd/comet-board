@@ -109,7 +109,7 @@ async fn run_to_end(
 }
 
 #[tokio::test]
-async fn happy_path_normalizes_events_and_filters_subagents() {
+async fn happy_path_normalizes_events_and_accounts_for_subagents() {
     let (controls, _steer, _token) = controls("A");
     let events = run_to_end(&harness(), request("scenario:happy"), controls).await;
 
@@ -141,7 +141,7 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
         text: "Hello".into()
     }));
 
-    // Subagent frames (parent_tool_use_id set) are filtered out entirely.
+    // Subagent frames never become parent transcript content…
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -155,6 +155,34 @@ async fn happy_path_normalizes_events_and_filters_subagents() {
             AgentEvent::ToolCall { id, .. } | AgentEvent::ToolResult { id, .. } if id == "sub-tool"
         )),
         "subagent tool frames leaked: {events:?}"
+    );
+    // …but they are no longer silence (gh#280). The delegation is a named row,
+    // the subagent's tool call is a counted step against it, and its token
+    // stream beats as liveness the engine can see.
+    assert!(events.contains(&AgentEvent::ToolCall {
+        id: "sub-1".into(),
+        call: ToolCall::Task {
+            description: "scan the tree".into(),
+            subagent_type: Some("Explore".into()),
+            steps: 0,
+        },
+    }));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::SubagentActivity { parent_tool_use_id } if parent_tool_use_id == "sub-1"
+            ))
+            .count(),
+        1,
+        "one step per subagent tool call: {events:?}"
+    );
+    assert!(
+        events.contains(&AgentEvent::ReasoningDelta {
+            text: String::new()
+        }),
+        "subagent stream produced no liveness: {events:?}"
     );
 
     // Typed tool decoding: Bash -> Exec, mcp__server__tool -> Mcp.

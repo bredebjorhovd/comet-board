@@ -530,6 +530,16 @@ async fn event_reader(
             let props = value.get("properties").cloned().unwrap_or(Value::Null);
             // Events naming a session belong to ours alone (the instance
             // stream carries every session the server hosts).
+            //
+            // KNOWN BLIND SPOT (gh#280 fixed claude's half): opencode runs a
+            // `task` subagent in a CHILD session with its own id, so its
+            // events are dropped here — the same silence claude had. It is not
+            // fixed the same way because this stream is shared: an unknown
+            // sessionID may be our subagent OR another chat on the same
+            // server, and beating liveness for someone else's run would be
+            // worse than beating none. Attributing children needs the
+            // `parentID` a `session.updated` carries, verified against a live
+            // server.
             if let Some(sid) = props.get("sessionID").and_then(Value::as_str)
                 && sid != session_id
             {

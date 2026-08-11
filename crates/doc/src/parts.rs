@@ -108,7 +108,20 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
                 } if pid == id => Some(c),
                 _ => None,
             }) {
+                // A re-emitted call refreshes the row — but progress already
+                // counted against it is not part of what the harness re-sent,
+                // and a Task that fell back to "0 steps" mid-run would read as
+                // a subagent that had done nothing (gh#280).
+                let counted = match (&*existing, call) {
+                    (ToolCall::Task { steps, .. }, ToolCall::Task { steps: fresh, .. }) => {
+                        (*steps).max(*fresh)
+                    }
+                    _ => 0,
+                };
                 *existing = call.clone();
+                if let ToolCall::Task { steps, .. } = existing {
+                    *steps = counted;
+                }
             } else {
                 out.push(MessagePart::Tool {
                     id: id.clone(),
@@ -130,6 +143,24 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
                 {
                     *e = *is_error;
                     *resolved = true;
+                }
+            }
+        }
+        // One step a subagent took, counted onto the Task row that launched it
+        // (gh#280). Counted whether or not the row has resolved: a background
+        // Task returns its result the moment it is launched and keeps working
+        // long after, which is precisely when the transcript looks finished
+        // and is not.
+        AgentEvent::SubagentActivity { parent_tool_use_id } => {
+            for p in out.iter_mut() {
+                if let MessagePart::Tool {
+                    id,
+                    call: ToolCall::Task { steps, .. },
+                    ..
+                } = p
+                    && id == parent_tool_use_id
+                {
+                    *steps = steps.saturating_add(1);
                 }
             }
         }
@@ -184,7 +215,8 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
 /// Keeps: command / path / pattern / url / query / todo items / server+tool
-/// names / skill name+args.
+/// names / skill name+args / task description+agent+steps (the delegated
+/// *prompt* is never decoded in the first place, so there is nothing to strip).
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
@@ -337,6 +369,76 @@ mod tests {
         let once = fold_event_into_parts(&[], &call);
         let twice = fold_event_into_parts(&once, &call);
         assert_eq!(once, twice);
+    }
+
+    fn task_call(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            call: ToolCall::Task {
+                description: "map the normalizer".into(),
+                subagent_type: Some("Explore".into()),
+                steps: 0,
+            },
+        }
+    }
+
+    fn steps_of(part: &MessagePart) -> u32 {
+        match part {
+            MessagePart::Tool {
+                call: ToolCall::Task { steps, .. },
+                ..
+            } => *steps,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_activity_counts_steps_on_its_task_row() {
+        let mut parts = fold_event_into_parts(&[], &task_call("toolu_1"));
+        // A second delegation must not collect the first one's steps.
+        parts = fold_event_into_parts(&parts, &task_call("toolu_2"));
+        for _ in 0..3 {
+            parts = fold_event_into_parts(
+                &parts,
+                &AgentEvent::SubagentActivity {
+                    parent_tool_use_id: "toolu_1".into(),
+                },
+            );
+        }
+        assert_eq!(steps_of(&parts[0]), 3);
+        assert_eq!(steps_of(&parts[1]), 0);
+
+        // A background Task resolves the moment it is launched and keeps
+        // working — its steps must keep counting after the row resolved.
+        parts = fold_event_into_parts(
+            &parts,
+            &AgentEvent::ToolResult {
+                id: "toolu_1".into(),
+                is_error: false,
+            },
+        );
+        parts = fold_event_into_parts(
+            &parts,
+            &AgentEvent::SubagentActivity {
+                parent_tool_use_id: "toolu_1".into(),
+            },
+        );
+        assert_eq!(steps_of(&parts[0]), 4);
+
+        // A re-emitted call refreshes the row without losing its progress.
+        parts = fold_event_into_parts(&parts, &task_call("toolu_1"));
+        assert_eq!(steps_of(&parts[0]), 4);
+
+        // Activity for a Task this segment never saw (a background subagent
+        // still working after its turn's parts were finalized) folds to
+        // nothing rather than inventing a row.
+        let orphan = fold_event_into_parts(
+            &[],
+            &AgentEvent::SubagentActivity {
+                parent_tool_use_id: "toolu_9".into(),
+            },
+        );
+        assert!(orphan.is_empty());
     }
 
     #[test]

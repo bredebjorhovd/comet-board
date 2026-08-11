@@ -179,11 +179,44 @@ pub enum ToolCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<String>,
     },
+    /// Work the agent handed to a SUBAGENT (Claude's `Task` / `Agent` tool).
+    ///
+    /// Split out of [`ToolCall::Unknown`] for the reason gh#280 exists: a
+    /// subagent's own transcript is deliberately not folded into its parent's
+    /// (it runs concurrently with the parent's text and would split it around
+    /// phantom calls), so this row is the ONLY account the reader gets of work
+    /// that can run for minutes. `Tool  Task` with the input stripped said
+    /// nothing at all — not what was delegated, not that anything was
+    /// happening.
+    ///
+    /// A viewport too old to know this variant degrades it to an empty part,
+    /// the same way [`ToolCall::Skill`] does.
+    Task {
+        /// The short label the caller gave the delegated work.
+        description: String,
+        /// Which agent type was asked for (`Explore`, `general-purpose`, …),
+        /// when the call named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_type: Option<String>,
+        /// Steps the subagent has taken so far — one per tool call it makes.
+        ///
+        /// Progress rather than input, and it lives ON the call because the
+        /// call is the whole doc-resident record of the delegation: counting
+        /// here reaches every viewport through the part map they already
+        /// decode, and an old one just ignores a field it does not know.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        steps: u32,
+    },
     Unknown {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -324,6 +357,21 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         is_error: bool,
+    },
+    /// One step taken by a subagent, attributed to the [`ToolCall::Task`] that
+    /// launched it (gh#280).
+    ///
+    /// A subagent's frames are not folded into the parent transcript — they
+    /// would split the parent's contiguous text around calls it never made —
+    /// so without this the busiest minutes of a run produce no events at all,
+    /// and working is indistinguishable from wedged. This is the countable
+    /// half of the signal (the subagent's token stream contributes only empty
+    /// [`AgentEvent::ReasoningDelta`] heartbeats); it folds to a step count on
+    /// the Task part.
+    #[serde(rename_all = "camelCase")]
+    SubagentActivity {
+        /// The parent's tool_use id — the id of the Task part to count against.
+        parent_tool_use_id: String,
     },
     /// What one *turn* spent, in [`TokenUsage`]'s four buckets. A harness
     /// passthrough (never persisted into docs); the run journal keeps it, and

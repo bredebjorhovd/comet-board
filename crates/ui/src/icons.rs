@@ -112,6 +112,9 @@ icon_assets![
     // ports) — the skill-invocation landmark (gh#134); the embedded set has no
     // magic-stick.
     (MAGIC_STICK, "magic-stick"),
+    // Hand-drawn pair of figures in the Solar Linear style — the delegated-work
+    // chip (gh#280); the embedded set has no users glyph.
+    (USERS_GROUP, "users-group"),
     (CLOSE_CIRCLE, "close-circle"),
     // Hand-drawn info glyph in the Solar Linear style (like the terminal/
     // plus/return ports) — the embedded set has no info-circle.
