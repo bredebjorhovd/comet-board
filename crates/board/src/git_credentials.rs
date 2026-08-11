@@ -268,10 +268,26 @@ pub fn install_askpass_shim(_dir: &Path, _board_exe: &Path) -> Result<PathBuf> {
 /// mint itself, for the price of one `fork`.
 ///
 /// Called the way git calls it: the prompt as the single argument.
+///
+/// This is also the barrier that makes the `git push` after it safe (gh#301).
+/// [`install_shim`] closes its own handle before this can run, but on Linux one
+/// writer is still out of its reach: a *sibling thread* that forks while that
+/// handle is open hands the child a copy of it, and the copy lives until that
+/// child's own `exec` — `O_CLOEXEC` closes it then, not sooner. An engine
+/// dispatching agents forks constantly, so between installing a shim and
+/// exec'ing it there can be a descheduled child holding the shim's inode open
+/// for writing, and the kernel answers the exec with `ETXTBSY`. No write-side
+/// ordering can prevent that: any file this process creates is a file some
+/// concurrent fork can inherit a handle to.
+///
+/// What is true is that the state is *transient by construction* — it ends at
+/// the child's exec, with nothing else on the box able to reopen the shim for
+/// writing — so the answer is to wait it out, bounded, and then let a real
+/// failure through. A successful exec proves the inode has no writers, which is
+/// why this being the last thing before a push is what keeps `git`'s own exec of
+/// the same file (which nothing can retry) off the same race.
 pub fn verify_askpass(askpass: &Path) -> Result<()> {
-    let out = std::process::Command::new(askpass)
-        .arg("Username for 'https://github.com': ")
-        .output()
+    let out = run_askpass(askpass, "Username for 'https://github.com': ")
         .with_context(|| format!("running the askpass helper at {}", askpass.display()))?;
     let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() {
@@ -290,6 +306,56 @@ pub fn verify_askpass(askpass: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// How long [`verify_askpass`] will wait out an `ETXTBSY` before reporting it.
+///
+/// Generous next to what it waits for (a forked child that has not reached its
+/// `exec` yet — microseconds, or a scheduler quantum on a loaded CI box) and
+/// small next to the push it precedes. A wait that ends is the point: a
+/// permissions bug that no amount of waiting fixes has to still be an error.
+const EXEC_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run the shim the way git runs it, waiting out `ETXTBSY` (see
+/// [`verify_askpass`] for why that is a wait and not a retry-around-a-defect).
+///
+/// Nothing else is waited on. No such file, not executable, exec'd and exited
+/// non-zero for a reason of its own — each is answered immediately, because none
+/// of them is transient and reporting them is what the check is for.
+fn run_askpass(askpass: &Path, prompt: &str) -> std::io::Result<std::process::Output> {
+    let mut waited = std::time::Duration::ZERO;
+    let mut nap = std::time::Duration::from_millis(1);
+    loop {
+        let attempt = std::process::Command::new(askpass).arg(prompt).output();
+        let busy = match &attempt {
+            // The shim itself could not be exec'd.
+            Err(e) => e.kind() == std::io::ErrorKind::ExecutableFileBusy,
+            // The shim ran, and the `exec` *inside* it could not be: the same
+            // refusal one level down, on the `comet-board` the shim reaches.
+            // A payload install writes that binary and the engine dispatches
+            // through it, so it is the same window as the shim's own.
+            Ok(out) => !out.status.success() && exec_said_busy(&out.stderr),
+        };
+        if !busy || waited >= EXEC_BUSY_BUDGET {
+            return attempt;
+        }
+        std::thread::sleep(nap);
+        waited += nap;
+        nap = (nap * 2).min(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Did a shell report `ETXTBSY` for the thing it was asked to `exec`?
+///
+/// A shell has only its exit status (126, mostly) and this line of stderr to say
+/// it with, so the message is what there is to read. Under a locale that
+/// translates `strerror` this stops recognising it, and the failure is then
+/// reported rather than waited out — the same behaviour as before gh#301, which
+/// is the right way for a heuristic like this to degrade.
+fn exec_said_busy(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("text file busy")
 }
 
 // ---------------------------------------------------------------------------
@@ -342,9 +408,25 @@ pub fn install_gh_shim(dir: &Path, board_exe: &Path, gh: &Path) -> Result<PathBu
 /// Written through a temporary file and renamed into place: the shim can be
 /// executing (some other run's `gh pr list`, some other run's push) while this
 /// rewrites it, and a rename swaps the name rather than the open file.
+///
+/// Every caller execs what this returns, so the write is ordered for that and
+/// not just for durability (gh#301). By the time this function returns:
+///
+/// - the file is already mode `0o755`, because the mode is asked for at `open`
+///   and confirmed on the open handle rather than chmod'd onto a path
+///   afterwards — a shim that is briefly `0o644` is a shim some other run can
+///   fail to exec;
+/// - its contents are on disk, `sync_all`'d before the rename rather than left
+///   for the page cache to flush under a name somebody is already exec'ing;
+/// - and **the writable handle is closed**, before the rename and so before the
+///   path this answers with exists at all. A handle open for writing on the
+///   shim's inode is precisely what makes an exec of it fail `ETXTBSY`, so it
+///   must not outlive this function. See [`verify_askpass`] for the one writer
+///   this ordering cannot reach.
 #[cfg(unix)]
 fn install_shim(dir: &Path, name: &str, script: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = dir.join(name);
     // Unchanged is the common case (one shim per device, rewritten per
@@ -354,12 +436,35 @@ fn install_shim(dir: &Path, name: &str, script: &str) -> Result<PathBuf> {
         return Ok(path);
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Per-process temp name: two engines (or two runs starting together) must
-    // not rename each other's half-written file into place.
-    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, script).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("making {} executable", tmp.display()))?;
+    // A temp name of this call's own: two engines (or two runs starting
+    // together) must not rename each other's half-written file into place, and
+    // the pid alone is not enough for that — one engine dispatching two agents
+    // at once installs from two threads with the same pid, and `create_new`
+    // below would then fail one of the dispatches rather than let it through.
+    static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{name}.{}.{nth}.tmp", std::process::id()));
+    // Only reachable through a recycled pid, after a run that died between the
+    // create and the rename — but a leftover would then refuse every install on
+    // this box until somebody swept the directory by hand.
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.write_all(script.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        // `mode` above is narrowed by the umask; this is on the handle, so
+        // there is no window in which the name exists at another mode.
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("making {} executable", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing {}", tmp.display()))?;
+        // Dropped here, deliberately and before the rename below.
+    }
     std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
     Ok(path)
 }
@@ -618,6 +723,131 @@ mod tests {
             .expect_err("a helper answering rubbish verified")
             .to_string();
         assert!(err.contains("\"hello\""), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gh#301, the write side: an installed shim is exec'able *as installed*,
+    /// with no second step to wait for. Everything here holds the moment
+    /// `install_askpass_shim` returns, because the next thing every caller does
+    /// is exec what it returned.
+    #[test]
+    #[cfg(unix)]
+    fn the_shim_is_complete_and_executable_the_moment_it_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("shim-write");
+        let bin = dir.join("bin");
+        let board = dir.join("comet-board");
+        let shim = install_askpass_shim(&bin, &board).expect("shim installed");
+
+        let mode = std::fs::metadata(&shim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the shim is not executable as installed");
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            askpass_shim_script(&board),
+            "the shim's contents are not all there"
+        );
+
+        // Rewritten in place, which is what every dispatch does, and with the
+        // same guarantees the second time — including no temp file left in a
+        // directory that goes on an agent's PATH.
+        let moved = dir.join("elsewhere").join("comet-board");
+        let again = install_askpass_shim(&bin, &moved).expect("shim reinstalled");
+        assert_eq!(again, shim);
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            askpass_shim_script(&moved)
+        );
+        let left: Vec<_> = std::fs::read_dir(&bin)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != ASKPASS_SHIM)
+            .collect();
+        assert!(left.is_empty(), "temp files left beside the shim: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gh#301, the exec side. The write side cannot close a handle a sibling
+    /// thread's fork already copied, so the check waits that handle out instead
+    /// of failing the run for it.
+    ///
+    /// The writer here is deliberate rather than raced: a `File` open for
+    /// writing on the shim, closed shortly after. On Linux that is exactly what
+    /// CI hit — the exec is refused with `ETXTBSY` until the handle goes — and
+    /// the assertion is that the check answers by waiting. macOS does not refuse
+    /// the exec at all, which is why this only ever failed on CI, and there the
+    /// test asserts the harmless half: an open handle is not an error either.
+    #[test]
+    #[cfg(unix)]
+    fn the_check_waits_out_a_shim_that_something_still_has_open_for_writing() {
+        let dir = scratch("shim-busy");
+        let board = dir.join("comet-board");
+        std::fs::write(&board, "#!/bin/sh\necho x-access-token\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
+
+        // No truncate: the script stays as installed, and all this does is put
+        // a writer on its inode.
+        let held = std::fs::OpenOptions::new().write(true).open(&shim).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+
+        verify_askpass(&shim).expect("the check gave up on a handle that was about to close");
+        releaser.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the shell says when the `exec` inside the shim is the refused one,
+    /// against what a helper failing for its own reasons says. Only the first
+    /// is worth waiting on, and nothing else may be mistaken for it.
+    #[test]
+    fn a_shell_reporting_etxtbsy_is_told_from_a_helper_that_simply_failed() {
+        // dash and bash, both of which the shim can be run by.
+        assert!(exec_said_busy(
+            b"/state/bin/comet-board: 6: exec: /state/bin/comet-board: Text file busy\n"
+        ));
+        assert!(exec_said_busy(
+            b"sh: line 6: /state/bin/comet-board: Text file busy\n"
+        ));
+        // Not this — the gh#233 shape, which has to stay an error.
+        assert!(!exec_said_busy(b"sh: 1: comet-board: not found\n"));
+        assert!(!exec_said_busy(b"unknown subcommand: git-askpass\n"));
+        assert!(!exec_said_busy(b""));
+    }
+
+    /// And the wait ends. A dispatch must not hang behind a shim that is busy
+    /// for a reason no waiting will fix; [`EXEC_BUSY_BUDGET`] is what bounds it.
+    ///
+    /// Linux only: it is the only platform that refuses the exec, so it is the
+    /// only one with anything to bound.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_shim_that_stays_busy_is_reported_rather_than_waited_on_forever() {
+        let dir = scratch("shim-busy-forever");
+        let board = dir.join("comet-board");
+        std::fs::write(&board, "#!/bin/sh\necho x-access-token\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
+        let _held = std::fs::OpenOptions::new().write(true).open(&shim).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = verify_askpass(&shim)
+            .expect_err("a permanently busy shim verified")
+            .to_string();
+        assert!(err.contains("running the askpass helper"), "{err}");
+        assert!(
+            start.elapsed() < EXEC_BUSY_BUDGET * 10,
+            "the check waited {:?}, well past its budget",
+            start.elapsed()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
