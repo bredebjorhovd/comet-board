@@ -6,7 +6,7 @@ use crate::config::{Credentials, Paths};
 use crate::db::UpsertTask;
 use crate::model::{PrStack, Source, UpstreamState};
 use crate::sources::github_app::{HttpAppApi, TokenProvider};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
 pub const API: &str = "https://api.github.com";
@@ -218,25 +218,109 @@ impl HttpRest {
     /// The failures that mean the same thing at every endpoint: the credential
     /// was refused, or GitHub is not answering this board for a while. No
     /// caller gets to read these as data, whatever it asked for.
-    fn credential_failure(status: u16, auth: &TokenProvider) -> Option<anyhow::Error> {
+    fn credential_failure(
+        status: u16,
+        body: &Value,
+        auth: &TokenProvider,
+    ) -> Option<anyhow::Error> {
         match status {
-            403 | 429 => Some(anyhow!("github rate limited ({status})")),
+            // GitHub spends 403 on two unrelated things: a rate limit, and a
+            // permission it will not grant this credential at all ("Resource
+            // not accessible by integration"). Only the body tells them apart,
+            // so a board that named every 403 a rate limit sent whoever read it
+            // to wait out a clock that was never running (gh#338).
+            403 | 429 => Some(match github_reason(body) {
+                Some(why) => anyhow!("github refused the call ({status}): {why}"),
+                None => anyhow!("github rate limited ({status})"),
+            }),
             401 => Some(anyhow!(
-                "github rejected the credential (401) — {}",
-                auth.hint()
+                "github rejected the credential (401) — {}{}",
+                auth.hint(),
+                trailing(body)
             )),
             _ => None,
         }
     }
 
     fn interpret(reply: Reply, path: &str, auth: &TokenProvider) -> Result<Value> {
-        if let Some(e) = Self::credential_failure(reply.status, auth) {
+        if let Some(e) = Self::credential_failure(reply.status, &reply.body, auth) {
             return Err(e);
         }
         if !(200..300).contains(&reply.status) {
-            bail!("github HTTP {} for {path}", reply.status);
+            return Err(refusal(reply.status, path, &reply.body));
         }
         Ok(reply.body)
+    }
+}
+
+/// GitHub's own words for a refusal, dug out of the body it sends with one.
+///
+/// Every REST error carries a `message`, and a 422 usually carries an `errors`
+/// array naming the field that was unprocessable — which for a review is the
+/// whole diagnosis, because `Validation Failed` on its own does not tell an
+/// empty body apart from a pull request this identity is not allowed to review
+/// (gh#338). Entries arrive as objects, and occasionally as bare strings; both
+/// are rendered, because a body nobody can read is the thing being fixed here.
+///
+/// `None` when the body says nothing usable — a 204, an array, a page of HTML
+/// from something in front of GitHub. The caller then reports the bare status,
+/// which is what it always did.
+pub fn github_reason(body: &Value) -> Option<String> {
+    let said = body.get("message").and_then(words);
+    let errors: Vec<String> = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|es| es.iter().filter_map(one_error).collect())
+        .unwrap_or_default();
+    match (said, errors.is_empty()) {
+        (Some(m), true) => Some(m.to_string()),
+        (Some(m), false) => Some(format!("{m} — {}", errors.join("; "))),
+        (None, false) => Some(errors.join("; ")),
+        (None, true) => None,
+    }
+}
+
+/// One entry of GitHub's `errors` array, as a sentence.
+///
+/// The field is kept alongside the reason rather than dropped: `user_id` is
+/// what says a refusal is about *who* is reviewing, and `body` is what says it
+/// is about what they wrote. `code` stands in when there is no `message` — a
+/// bare `missing_field` is thin, but it is a fact, and it beats silence.
+fn one_error(e: &Value) -> Option<String> {
+    if let Some(s) = e.as_str() {
+        return Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    }
+    let field = e.get("field").and_then(words);
+    let said = e
+        .get("message")
+        .and_then(words)
+        .or_else(|| e.get("code").and_then(words));
+    match (field, said) {
+        (Some(f), Some(m)) => Some(format!("{f}: {m}")),
+        (None, Some(m)) => Some(m.to_string()),
+        (Some(f), None) => Some(f.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn words(v: &Value) -> Option<&str> {
+    v.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// GitHub's reason as a suffix, or nothing at all — for the messages that
+/// already say their own piece and only want to append what GitHub said.
+fn trailing(body: &Value) -> String {
+    github_reason(body).map_or_else(String::new, |why| format!(" ({why})"))
+}
+
+/// A refused call, carrying whatever GitHub said about it.
+///
+/// The status stays in the message and stays first: `doctor` reads `404` out of
+/// it, and an operator scanning a log reads the number before the sentence.
+pub fn refusal(status: u16, path: &str, body: &Value) -> anyhow::Error {
+    match github_reason(body) {
+        Some(why) => anyhow!("github HTTP {status} for {path}: {why}"),
+        None => anyhow!("github HTTP {status} for {path}"),
     }
 }
 
@@ -259,7 +343,7 @@ impl Rest for HttpRest {
 
     fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
         let reply = self.round_trip(reqwest::Method::PUT, path, Some(body))?;
-        match Self::credential_failure(reply.status, &self.auth) {
+        match Self::credential_failure(reply.status, &reply.body, &self.auth) {
             Some(e) => Err(e),
             None => Ok((reply.status, reply.body)),
         }
@@ -690,11 +774,21 @@ impl<T: Rest> Github<T> {
     /// answered without one — the caller's fallback is documented at
     /// [`crate::verdict::POSTED_MARK`], and it is a fallback rather than a
     /// failure because the review itself did land.
+    ///
+    /// A refusal names the verdict that was refused. GitHub answers 422 to more
+    /// than one thing here — a body it will not take, and an identity that may
+    /// not cast this verdict on this pull request — and which verdict was being
+    /// submitted is half of telling those apart, since a board App reviewing a
+    /// pull request its own App opened may `COMMENT` on it but not approve it
+    /// (gh#338). GitHub's own words arrive with it, from [`refusal`].
     pub fn post_review(&self, repo: &str, number: i64, event: &str, body: &str) -> Result<i64> {
-        let r = self.rest.post(
-            &format!("/repos/{repo}/pulls/{number}/reviews"),
-            &serde_json::json!({ "event": event, "body": body }),
-        )?;
+        let r = self
+            .rest
+            .post(
+                &format!("/repos/{repo}/pulls/{number}/reviews"),
+                &serde_json::json!({ "event": event, "body": body }),
+            )
+            .with_context(|| format!("submitting the {event} verdict on {repo}#{number}"))?;
         Ok(r.get("id").and_then(Value::as_i64).unwrap_or_default())
     }
 
@@ -1192,6 +1286,10 @@ impl Rest for FixtureRest {
 struct ScriptedTransport {
     /// One status per call, in order; the last repeats once exhausted.
     statuses: Vec<u16>,
+    /// What every answer carries. Empty by default, because most of these
+    /// tests are about the status; a body is what the reason tests need
+    /// (gh#338), since GitHub's words only exist there.
+    body: Value,
     /// `(path, bearer)` for every call made.
     seen: std::cell::RefCell<Vec<(String, Option<String>)>>,
 }
@@ -1199,8 +1297,13 @@ struct ScriptedTransport {
 #[cfg(test)]
 impl ScriptedTransport {
     fn new(statuses: &[u16]) -> ScriptedTransport {
+        Self::saying(statuses, serde_json::json!([]))
+    }
+
+    fn saying(statuses: &[u16], body: Value) -> ScriptedTransport {
         ScriptedTransport {
             statuses: statuses.to_vec(),
+            body,
             seen: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -1226,7 +1329,7 @@ impl Transport for std::rc::Rc<ScriptedTransport> {
             .unwrap_or(&200);
         Ok(Reply {
             status,
-            body: serde_json::json!([]),
+            body: self.body.clone(),
         })
     }
 }
@@ -1240,6 +1343,12 @@ mod auth_tests {
     fn scripted(statuses: &[u16], auth: TokenProvider) -> (HttpRest, Rc<ScriptedTransport>) {
         let t = Rc::new(ScriptedTransport::new(statuses));
         (HttpRest::over(Box::new(t.clone()), auth), t)
+    }
+
+    /// As [`scripted`], with the body GitHub sends alongside the status.
+    fn saying(statuses: &[u16], body: Value, auth: TokenProvider) -> HttpRest {
+        let t = Rc::new(ScriptedTransport::saying(statuses, body));
+        HttpRest::over(Box::new(t), auth)
     }
 
     #[test]
@@ -1323,6 +1432,137 @@ mod auth_tests {
         let (rest, _) = scripted(&[403], TokenProvider::Static("ghp_x".into()));
         let err = rest.get("/repos/o/r/issues").unwrap_err().to_string();
         assert!(err.contains("rate limited"), "{err}");
+    }
+
+    /// gh#338. The bug this whole change exists for: a write refused with a 422
+    /// used to arrive as `github HTTP 422 for <path>` and nothing else, so the
+    /// one sentence GitHub sent explaining itself was read off the wire and
+    /// dropped on the floor.
+    #[test]
+    fn a_refused_write_carries_the_words_github_sent_with_it() {
+        let rest = saying(
+            &[422],
+            serde_json::json!({
+                "message": "Validation Failed",
+                "errors": [{
+                    "resource": "PullRequestReview",
+                    "code": "custom",
+                    "field": "user_id",
+                    "message": "Can not approve your own pull request"
+                }]
+            }),
+            TokenProvider::Static("ghp_x".into()),
+        );
+        let err = rest
+            .post("/repos/o/r/pulls/5/reviews", &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("422"), "{err}");
+        assert!(err.contains("Validation Failed"), "{err}");
+        // The field is the diagnosis. `Validation Failed` alone does not tell a
+        // body GitHub will not take apart from an identity that may not cast
+        // this verdict, and those want opposite fixes.
+        assert!(err.contains("user_id"), "{err}");
+        assert!(err.contains("approve your own pull request"), "{err}");
+    }
+
+    /// Every write verb, not just the one the merge work happened to need.
+    #[test]
+    fn the_reason_survives_on_post_patch_and_put_alike() {
+        for verb in ["post", "patch", "put"] {
+            let rest = saying(
+                &[422],
+                serde_json::json!({ "message": "Validation Failed" }),
+                TokenProvider::Static("ghp_x".into()),
+            );
+            let body = serde_json::json!({});
+            let err = match verb {
+                "post" => rest.post("/repos/o/r/issues", &body),
+                "patch" => rest.patch("/repos/o/r/issues/1", &body),
+                _ => rest.put("/repos/o/r/pulls/1/merge", &body),
+            }
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("Validation Failed"), "{verb}: {err}");
+        }
+    }
+
+    /// A body with nothing to say leaves the message exactly as it always was.
+    #[test]
+    fn a_refusal_with_no_words_in_it_still_names_the_status_and_the_path() {
+        let (rest, _) = scripted(&[404], TokenProvider::Static("ghp_x".into()));
+        let err = rest.get("/repos/o/r/issues").unwrap_err().to_string();
+        assert_eq!(err, "github HTTP 404 for /repos/o/r/issues");
+    }
+
+    /// GitHub spends 403 on a permission it will not grant as well as on a rate
+    /// limit, and calling the first one the second sends whoever reads it to
+    /// wait out a clock that is not running.
+    #[test]
+    fn a_403_that_is_a_missing_permission_does_not_claim_to_be_a_rate_limit() {
+        let rest = saying(
+            &[403],
+            serde_json::json!({ "message": "Resource not accessible by integration" }),
+            TokenProvider::Static("ghp_x".into()),
+        );
+        let err = rest
+            .post("/repos/o/r/pulls/5/reviews", &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not accessible by integration"), "{err}");
+        assert!(!err.contains("rate limited"), "{err}");
+    }
+
+    /// The credential hint is what an operator acts on, so GitHub's words are
+    /// appended to it rather than in place of it.
+    #[test]
+    fn a_401_keeps_its_hint_and_gains_githubs_words() {
+        let rest = saying(
+            &[401],
+            serde_json::json!({ "message": "Bad credentials" }),
+            TokenProvider::Static("ghp_x".into()),
+        );
+        let err = rest.get("/repos/o/r/issues").unwrap_err().to_string();
+        assert!(err.contains("GITHUB_TOKEN"), "{err}");
+        assert!(err.contains("Bad credentials"), "{err}");
+    }
+
+    #[test]
+    fn errors_come_out_readable_whatever_shape_github_sent_them_in() {
+        // A bare string entry, which GitHub still uses in places.
+        assert_eq!(
+            github_reason(&serde_json::json!({ "errors": ["body is too long"] })).as_deref(),
+            Some("body is too long")
+        );
+        // No message on the entry — the code is thin, but it is a fact.
+        assert_eq!(
+            github_reason(&serde_json::json!({
+                "message": "Validation Failed",
+                "errors": [{ "field": "body", "code": "missing_field" }]
+            }))
+            .as_deref(),
+            Some("Validation Failed — body: missing_field")
+        );
+        // Several at once, all of them kept.
+        assert_eq!(
+            github_reason(&serde_json::json!({
+                "errors": [
+                    { "field": "event", "message": "is invalid" },
+                    { "field": "body", "message": "is too long" }
+                ]
+            }))
+            .as_deref(),
+            Some("event: is invalid; body: is too long")
+        );
+        // Nothing usable: a 204, a list, an empty message, HTML from a proxy.
+        for empty in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({ "documentation_url": "https://docs.github.com" }),
+            serde_json::json!({ "message": "   " }),
+        ] {
+            assert_eq!(github_reason(&empty), None, "{empty}");
+        }
     }
 }
 
@@ -1707,6 +1947,46 @@ mod tests {
             .to_string();
         assert!(err.contains("already enqueued"), "{err}");
         assert!(err.contains("409"), "{err}");
+    }
+
+    /// gh#338. A verdict written in the review window and refused has to say
+    /// which verdict, on which pull request, and why — the whole reason the
+    /// review screen exists is to deliver one of these.
+    #[test]
+    fn a_refused_verdict_names_the_verdict_the_pull_request_and_githubs_reason() {
+        struct Refuses;
+        impl Rest for Refuses {
+            fn get(&self, _: &str) -> Result<Value> {
+                Ok(Value::Null)
+            }
+            fn post(&self, path: &str, _: &Value) -> Result<Value> {
+                Err(refusal(
+                    422,
+                    path,
+                    &json!({
+                        "message": "Validation Failed",
+                        "errors": [{ "field": "user_id",
+                                     "message": "Can not approve your own pull request" }]
+                    }),
+                ))
+            }
+            fn patch(&self, _: &str, _: &Value) -> Result<Value> {
+                Ok(Value::Null)
+            }
+            fn put(&self, _: &str, _: &Value) -> Result<Value> {
+                Ok(Value::Null)
+            }
+        }
+        let err = Github::new(Refuses)
+            .post_review("o/r", 508, "APPROVE", "looks good")
+            .unwrap_err();
+        // The alternate form, because that is what the RPC layer sends to the
+        // review window: the context and the cause, on one line.
+        let err = format!("{err:#}");
+        assert!(err.contains("APPROVE"), "{err}");
+        assert!(err.contains("o/r#508"), "{err}");
+        assert!(err.contains("422"), "{err}");
+        assert!(err.contains("approve your own pull request"), "{err}");
     }
 
     /// An answer in a shape the board cannot read is not a merge. The endpoint
