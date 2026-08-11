@@ -138,7 +138,7 @@ struct StatsView: View {
             }
         }
         .padding(2)
-        .background(whiteAlpha(0.02), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
         .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(Theme.border, lineWidth: 1))
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
@@ -503,7 +503,7 @@ struct StatsView: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     // round-ok: a bar's round cap, on a 5pt-tall track
-                    Capsule().fill(whiteAlpha(0.05))
+                    Capsule().fill(Theme.surfaceRaised)
                     // round-ok: the same bar, filled to its fraction
                     Capsule()
                         .fill(Theme.accent.opacity(0.55))

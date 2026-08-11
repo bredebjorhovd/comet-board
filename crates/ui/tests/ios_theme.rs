@@ -7,15 +7,24 @@
 //! `boardStateColor` said amber and `ChatIndicator.dotColor` said pink, one
 //! screen apart, months after the desktop had settled that argument.
 //!
-//! So this file reads the Swift as text and holds dark plus the shared scales to
-//! Rust, while holding light to the supplied iOS reference. Eight checks,
+//! So this file reads the Swift as text and holds it to two things: the table
+//! in `docs/design/tokens.md`, and this crate's own [`Theme`]. Ten checks,
 //! mirroring `text_tones.rs` and `scale.rs` for the other viewport:
 //!
+//! 0. **The hand-ported table is the table** (gh#279,
+//!    `ios_canvas_tokens_are_the_values_tokens_md_declares`). The phone's
+//!    third declaration of the palette lives in `Theme/DesignCanvas.swift`
+//!    under the canvas's own variable names, and this reads `tokens.md`'s
+//!    cells against it — both variants, every row, in both directions (a
+//!    variable the doc declares and Swift has not; a variable Swift declares
+//!    and the doc does not). It is the check the other parity test cannot
+//!    make: that one holds the phone to the DESKTOP, which is a second port of
+//!    the same table and could in principle drift with it.
 //! 1. **Parity, in both variants.** Shared dark paint and the radii/type scale
-//!    stay equal to [`Theme::dark`]; phone-specific dark values remain pinned
-//!    to the supplied iOS design. Light paint stays equal to the exact
-//!    neutral, status and Claude variables in `Comet iOS.dc.html`, which
-//!    deliberately differ from [`Theme::light`]
+//!    stay equal to [`Theme::dark`], and since gh#279 the surfaces stay equal
+//!    to [`Theme::light`] too — the two viewports are two spendings of one
+//!    palette. Two exceptions are named where they are: the light half of
+//!    `surface`, and the light status ramp's anchors
 //!    (`ios_theme_declares_the_shared_system_and_ios_reference`).
 //! 2. **Every paint token declares both variants**
 //!    (`every_paint_token_answers_for_both_variants`), hatch `one-tone-ok:`.
@@ -36,19 +45,26 @@
 //!    (`bundle_style_dependency_is_explicit`).
 //! 8. **The activation observer has a bounded lifetime**
 //!    (`window_scheme_observer_has_a_bounded_lifetime`).
+//! 9. **No view outside `Theme/` names a colour** (gh#279,
+//!    `no_view_outside_the_theme_names_a_colour`), hatch `paint-ok:`. The rule
+//!    the token port is for: forty call sites reached for `whiteAlpha(a)` with
+//!    twelve different alphas, which is gh#172's "a dozen unnamed greys" one
+//!    level down.
 //!
 //! Why here and not in the phone's own harness: `SpecRunner` needs a simulator,
 //! so it runs when somebody remembers to run it and never in CI (see
-//! `apps/ios/README.md`). These four rules are pure text scans, so putting them
-//! in `cargo test` closes that gap for this class of drift — a PR that lets the
+//! `apps/ios/README.md`). These rules are pure text scans, so putting them in
+//! `cargo test` closes that gap for this class of drift — a PR that lets the
 //! phone slip off the system fails on the same runner that builds the desktop.
+//! What no scan can check is what the paint LOOKS like; that is
+//! `scripts/ios-theme-shots.sh` and the claims in `docs/design/ios.md`.
 //!
 //! It lives in `comet-ui` rather than `comet-proto` because it needs both ends:
 //! the status ramp from `comet_proto::view::status`, and `Theme::RADIUS_*` /
 //! `Theme::TEXT_*` / shared parts of `Theme::dark()` from here.
 
 use comet_proto::view::status;
-use comet_ui::theme::{Theme, grey, ink, neutral, oklch, wash, white_alpha};
+use comet_ui::theme::{Theme, grey, hex, ink, neutral, oklch, wash, white_alpha};
 use gpui::{Hsla, Rgba};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -63,6 +79,18 @@ fn ios_root() -> PathBuf {
 
 fn theme_swift() -> String {
     std::fs::read_to_string(ios_root().join("Theme/Theme.swift")).expect("read Theme.swift")
+}
+
+/// The phone's transcription of the canvas table (gh#279).
+fn canvas_swift() -> String {
+    std::fs::read_to_string(ios_root().join("Theme/DesignCanvas.swift"))
+        .expect("read DesignCanvas.swift")
+}
+
+/// The table itself — the doc all three declarations are reconciled against.
+fn tokens_md() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/tokens.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 fn appearance_swift() -> String {
@@ -120,11 +148,56 @@ fn unclosed(expr: &str) -> bool {
 }
 
 /// A bare number declaration (`static let radiusChip: CGFloat = 6`).
+///
+/// A declaration that forwards to the canvas (`= DesignCanvas.statusL`) is
+/// followed there, so the status anchors are read where they are transcribed
+/// rather than being restated for the test's benefit.
 fn number(src: &str, name: &str) -> f32 {
     let raw = declaration(src, name);
+    if let Some(forwarded) = raw.strip_prefix("DesignCanvas.") {
+        return number(&canvas_swift(), forwarded);
+    }
     raw.parse().unwrap_or_else(|_| {
         panic!("Theme.swift's `{name}` is `{raw}`, which is not a plain number")
     })
+}
+
+// ---------------------------------------------------------------------------
+// The canvas table, as Swift (gh#279)
+// ---------------------------------------------------------------------------
+
+/// The `dark:` and `light:` expressions of a `DesignCanvas` variable —
+/// `CanvasToken(dark: …, light: …)` or `CanvasShadow(dark: …, light: …, …)`.
+fn canvas_halves(src: &str, name: &str) -> (String, String) {
+    let raw = declaration(src, name);
+    // The four status variables are declared through `ramp(hue)` — one hue at
+    // the two anchors — which is the canvas's own `oklch(L C H)` written once
+    // instead of eight times.
+    if let Some(hue) = call_body(&raw, "ramp") {
+        return (
+            format!("oklch(statusL, statusC, {hue})"),
+            format!("oklch(statusLLight, statusCLight, {hue})"),
+        );
+    }
+    let body = call_body(&raw, "CanvasToken")
+        .or_else(|| call_body(&raw, "CanvasShadow"))
+        .unwrap_or_else(|| {
+            panic!("DesignCanvas.{name} is `{raw}`, not a CanvasToken/CanvasShadow pair")
+        });
+    let args = split_args(&body);
+    let arg = |label: &str| -> String {
+        args.iter()
+            .find_map(|a| a.trim().strip_prefix(label).map(|v| v.trim().to_string()))
+            .unwrap_or_else(|| panic!("DesignCanvas.{name} has no `{label}` argument"))
+    };
+    (arg("dark:"), arg("light:"))
+}
+
+/// One half of a canvas variable, as paint.
+fn canvas_paint(name: &str, light: bool) -> Hsla {
+    let src = canvas_swift();
+    let (d, l) = canvas_halves(&src, name);
+    paint(&src, if light { &l } else { &d })
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +216,20 @@ fn variants(src: &str, name: &str) -> Option<(String, String)> {
 }
 
 fn split_variants(raw: &str) -> Option<(String, String)> {
+    // `DesignCanvas.raised.color` — a whole canvas variable spent under a name
+    // for its job. The two halves are named so `paint` can resolve each in the
+    // file that transcribes it (gh#279).
+    if let Some(name) = raw
+        .trim()
+        .strip_prefix("DesignCanvas.")
+        .and_then(|r| r.strip_suffix(".color"))
+        && !name.contains('(')
+    {
+        return Some((
+            format!("DesignCanvas.{name}.dark"),
+            format!("DesignCanvas.{name}.light"),
+        ));
+    }
     if let Some(hue) = call_body(raw, "ramp") {
         return Some((
             format!("oklch(statusL, statusC, {hue})"),
@@ -211,6 +298,17 @@ fn top_level_comma(args: &str) -> Option<usize> {
 /// bare identifiers resolve against the numbers it declares above them.
 fn paint(src: &str, expr: &str) -> Hsla {
     let expr = expr.trim();
+    // A reference into the canvas table resolves in the file that transcribes
+    // it, not in the one that spends it.
+    if let Some(rest) = expr.strip_prefix("DesignCanvas.") {
+        if let Some(name) = rest.strip_suffix(".dark") {
+            return canvas_paint(name, false);
+        }
+        if let Some(name) = rest.strip_suffix(".light") {
+            return canvas_paint(name, true);
+        }
+        panic!("`{expr}` names no half of a canvas variable — say `.dark` or `.light`");
+    }
     // A trailing `.opacity(a)` applies to whatever it is hung off — but only
     // when it is the OUTERMOST call, not an alpha inside an argument.
     if let Some(at) = expr.rfind(".opacity(")
@@ -255,15 +353,6 @@ fn paint(src: &str, expr: &str) -> Hsla {
     panic!(
         "Theme.swift paints `{expr}`, which this test cannot evaluate — teach it the constructor or use one it knows"
     );
-}
-
-fn hex(rgb: u32) -> Hsla {
-    Hsla::from(Rgba {
-        r: ((rgb >> 16) & 0xff) as f32 / 255.0,
-        g: ((rgb >> 8) & 0xff) as f32 / 255.0,
-        b: (rgb & 0xff) as f32 / 255.0,
-        a: 1.0,
-    })
 }
 
 fn black_alpha(alpha: f32) -> Hsla {
@@ -348,30 +437,48 @@ fn ios_theme_declares_the_shared_system_and_ios_reference() {
     );
     check("textFigure", number(&src, "textFigure"), Theme::TEXT_FIGURE);
 
-    // Paint is compared as COLOUR, not spelling. Shared dark tokens stay on
-    // the desktop system; the four values gh#258 deliberately retuned only for
-    // the desktop stay pinned to the phone's established dark reference.
-    // Light is the supplied iOS reference's own table — not a derivation of
-    // the desktop-light palette.
+    // Paint is compared as COLOUR, not spelling.
+    //
+    // Since gh#279 the phone spends the SAME canvas table the desktop does, so
+    // almost every surface token below is written against a `Theme` field in
+    // both variants rather than against a restated literal: the two viewports
+    // are two spendings of one palette, and that is the claim worth failing
+    // on. Four of these used to be phone-only dark values and were derived
+    // rather than transcribed — `--raised` at `neutral(0.235)` painted #202020
+    // against the canvas's #161616 — which is gh#274's bug on this side.
+    //
+    // The exceptions are named where they are: the light half of `surface`
+    // (the phone draws one page tone, `--card`, where the desktop has a shell
+    // beside a panel) and the light status ramp (the canvas anchors it at
+    // L 0.52 / C 0.16, where the desktop's light theme wants 0.55 / 0.14).
     let dark = Theme::dark();
+    let light = Theme::light();
     for (name, want_dark, want_light) in [
         // --text / --muted / --subtle / --faint
-        ("text", dark.text, hex(0x171717)),
-        ("textMuted", dark.text_muted, hex(0x545454)),
-        ("textSubtle", dark.text_subtle, hex(0x6b6b6b)),
-        ("textFaint", dark.text_faint, hex(0x8a8a8a)),
-        // --card / --raised / --sel / --selcard / --chip
-        ("bg", grey(6), hex(0xffffff)),
-        ("surface", dark.surface, hex(0xffffff)),
-        ("surfaceRaised", neutral(0.235), hex(0xf4f4f7)),
-        ("sheetPanel", grey(0x14), hex(0xf4f4f7)),
-        ("card", white_alpha(0.045), hex(0xffffff)),
-        ("elementHover", wash(0.07), black_alpha(0.05)),
-        ("elementActive", wash(0.10), hex(0xeeeef2)),
-        // --line / --line2
-        ("border", dark.border, hex(0xe4e4e8)),
-        ("borderStrong", white_alpha(0.14), hex(0xd6d6dc)),
-        ("separator", white_alpha(0.06), hex(0xe4e4e8)),
+        ("text", dark.text, light.text),
+        ("textMuted", dark.text_muted, light.text_muted),
+        ("textSubtle", dark.text_subtle, light.text_subtle),
+        ("textFaint", dark.text_faint, light.text_faint),
+        // --card / --shell / --raised / --sel / --selcard / --hover / --chip
+        ("bg", dark.bg, light.bg),
+        // ...and the one token whose halves come from two variables.
+        ("surface", dark.surface, light.bg),
+        ("surfaceRaised", dark.surface_raised, light.surface_raised),
+        ("sheetPanel", dark.bg, light.bg),
+        ("card", dark.surface_raised, light.surface_raised),
+        ("rowSelected", dark.row_selected, light.row_selected),
+        (
+            "elementActive",
+            dark.row_selected_card,
+            light.row_selected_card,
+        ),
+        ("elementHover", dark.element_hover, light.element_hover),
+        ("chip", dark.chip, light.chip),
+        // --line / --line2 / --sellift
+        ("border", dark.border, light.border),
+        ("borderStrong", dark.border_strong, light.border_strong),
+        ("separator", dark.border, light.border),
+        ("rowEdge", dark.row_edge, light.row_edge),
         // --review / --blocked / --working / --settled
         ("accent", dark.accent, oklch(0.52, 0.16, status::REVIEW)),
         ("danger", dark.danger, oklch(0.52, 0.16, status::BLOCKED)),
@@ -394,7 +501,7 @@ fn ios_theme_declares_the_shared_system_and_ios_reference() {
             oklch(0.52, 0.16, status::SETTLED),
         ),
         // --claude
-        ("claudeBrand", hex(0xd97757), hex(0xc15f3c)),
+        ("claudeBrand", dark.claude, light.claude),
     ] {
         let Some((dark_expr, light_expr)) = variants(&src, name) else {
             wrong.push(format!(
@@ -426,6 +533,322 @@ fn ios_theme_declares_the_shared_system_and_ios_reference() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The phone against the table it was ported from (gh#279)
+// ---------------------------------------------------------------------------
+
+/// One colour literal lifted out of a `tokens.md` cell.
+fn doc_colour(value: &str) -> Option<Hsla> {
+    let v = value.trim();
+    if let Some(h) = v.strip_prefix('#') {
+        let n = u32::from_str_radix(h, 16).ok()?;
+        return Some(hex(n));
+    }
+    if let Some(args) = v.strip_prefix("rgba(").and_then(|r| r.strip_suffix(')')) {
+        let n: Vec<f32> = args
+            .split(',')
+            .map(|p| p.trim().parse().unwrap_or(f32::NAN))
+            .collect();
+        if n.len() != 4 || n.iter().any(|x| x.is_nan()) {
+            return None;
+        }
+        return Some(Hsla::from(Rgba {
+            r: n[0] / 255.0,
+            g: n[1] / 255.0,
+            b: n[2] / 255.0,
+            a: n[3],
+        }));
+    }
+    if let Some(args) = v.strip_prefix("oklch(").and_then(|r| r.strip_suffix(')')) {
+        let n: Vec<f32> = args
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        return (n.len() == 3).then(|| oklch(n[0], n[1], n[2]));
+    }
+    None
+}
+
+/// Every colour literal in a cell, left to right — a shadow value carries one
+/// or two, and which is which is decided per token below.
+fn doc_colours(value: &str) -> Vec<Hsla> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while !rest.is_empty() {
+        let next = ["#", "rgba(", "oklch("]
+            .iter()
+            .filter_map(|p| rest.find(p).map(|at| (at, *p)))
+            .min();
+        let Some((at, prefix)) = next else { break };
+        let tail = &rest[at..];
+        let end = if prefix == "#" {
+            tail[1..]
+                .find(|c: char| !c.is_ascii_hexdigit())
+                .map_or(tail.len(), |i| i + 1)
+        } else {
+            tail.find(')').map_or(tail.len(), |i| i + 1)
+        };
+        if let Some(c) = doc_colour(&tail[..end]) {
+            out.push(c);
+        }
+        rest = &tail[end..];
+    }
+    out
+}
+
+/// The canvas variables `docs/design/tokens.md` declares, as
+/// `(--name, dark cell, light cell)`.
+fn tokens_md_table() -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for line in tokens_md().lines() {
+        let line = line.trim();
+        if !line.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<String> = line
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim().trim_matches('`').trim().to_string())
+            .collect();
+        // A variable, not the `| --- |` rule under a header row.
+        if cells.len() < 3 || !cells[0].starts_with("--") || cells[0].chars().all(|c| c == '-') {
+            continue;
+        }
+        // A cell holding two comma-separated values keeps its backticks
+        // inside; strip only the outer pair, which `trim_matches` did.
+        out.push((cells[0].clone(), cells[1].clone(), cells[2].clone()));
+    }
+    assert!(
+        out.len() >= 18,
+        "tokens.md parsed as {} rows — the table's shape changed and this reader did not",
+        out.len()
+    );
+    out
+}
+
+/// **The acceptance check for gh#279**: every value the phone hand-ported is
+/// the value `docs/design/tokens.md` declares, in both variants.
+///
+/// The phone cannot reference `crates/ui/src/theme.rs` — no Rust runs on the
+/// device — so the palette is typed in twice whatever anyone does about it.
+/// What makes a hand-port survivable is that the ported values are NAMED, in
+/// the canvas's own names, in one file: `DesignCanvas.swift` transcribes
+/// `--raised` as `raised`, and this test reads the doc's cell and the Swift
+/// expression and compares the COLOURS. A typo, a dropped digit or a
+/// re-derived grey fails here rather than in a screenshot three surfaces later.
+///
+/// This is the check `ios_theme_declares_the_shared_system_and_ios_reference`
+/// cannot make: that one holds the phone to the DESKTOP, which is a second
+/// port of the same table and could in principle drift with it. This one holds
+/// the phone to the table.
+#[test]
+fn ios_canvas_tokens_are_the_values_tokens_md_declares() {
+    let src = canvas_swift();
+    let mut wrong = Vec::new();
+    let mut seen = Vec::new();
+
+    // `--name` in the doc, `DesignCanvas.<swift>` in the phone. The two
+    // colour-only sections plus the borrowed mark map one-to-one; the shadow
+    // rows carry their colours inside a CSS value and are taken apart below.
+    let direct = [
+        ("--card", "card"),
+        ("--shell", "shell"),
+        ("--raised", "raised"),
+        ("--sel", "sel"),
+        ("--selcard", "selcard"),
+        ("--chip", "chip"),
+        ("--line", "line"),
+        ("--line2", "line2"),
+        ("--text", "text"),
+        ("--muted", "muted"),
+        ("--subtle", "subtle"),
+        ("--faint", "faint"),
+        ("--blocked", "blocked"),
+        ("--working", "working"),
+        ("--review", "review"),
+        ("--settled", "settled"),
+        ("--claude", "claude"),
+    ];
+
+    for (var, dark_cell, light_cell) in tokens_md_table() {
+        seen.push(var.clone());
+        /// One half of one variable against one cell of the table.
+        fn compare(
+            var: &str,
+            swift: &str,
+            light: bool,
+            want: Option<Hsla>,
+            what: &str,
+        ) -> Option<String> {
+            let Some(want) = want else {
+                return Some(format!("  {var}: cannot read `{what}` as a colour"));
+            };
+            let got = canvas_paint(swift, light);
+            (got != want).then(|| {
+                let scheme = if light { "light" } else { "dark" };
+                format!(
+                    "  {var} ({scheme}): DesignCanvas.{swift} = {got:?}, tokens.md says `{what}` = {want:?}"
+                )
+            })
+        }
+        let check = |swift: &str, light: bool, want: Option<Hsla>, what: &str| {
+            compare(&var, swift, light, want, what)
+        };
+
+        if let Some((_, swift)) = direct.iter().find(|(name, _)| *name == var) {
+            // `--hover` is the palette's one DELIBERATE deviation and is
+            // handled below rather than here.
+            wrong.extend(check(swift, false, doc_colour(&dark_cell), &dark_cell));
+            wrong.extend(check(swift, true, doc_colour(&light_cell), &light_cell));
+            continue;
+        }
+
+        match var.as_str() {
+            // Same alpha, same neutral, one step off pure — see `tokens.md`'s
+            // "Deliberate deviations", and `theme.rs`'s half of the same
+            // assertion. Checked as an ALPHA rather than a colour so the
+            // deviation cannot quietly grow into a second one.
+            "--hover" => {
+                let want_alpha = doc_colour(&dark_cell).map(|c| c.a);
+                let got = canvas_paint("hover", false);
+                if want_alpha != Some(got.a) {
+                    wrong.push(format!(
+                        "  --hover (dark): alpha {} where tokens.md says {want_alpha:?}",
+                        got.a
+                    ));
+                }
+                if got != wash(got.a) {
+                    wrong.push(
+                        "  --hover (dark): no longer soft-white — the deviation tokens.md \
+                         records is `wash(a)`, not some third neutral"
+                            .into(),
+                    );
+                }
+                wrong.extend(check("hover", true, doc_colour(&light_cell), &light_cell));
+            }
+            // `none` in dark; `0 1px 2px rgba(0,0,0,.05)` in light.
+            "--lift" => {
+                wrong.extend(check("lift", false, Some(transparent()), "none"));
+                let light = doc_colours(&light_cell);
+                wrong.extend(check("lift", true, light.first().copied(), &light_cell));
+            }
+            // The ring, then light's second layer.
+            "--sellift" => {
+                let d = doc_colours(&dark_cell);
+                wrong.extend(check("sellift", false, d.first().copied(), &dark_cell));
+                wrong.extend(check(
+                    "selliftShadow",
+                    false,
+                    Some(transparent()),
+                    "no dark shadow",
+                ));
+                let l = doc_colours(&light_cell);
+                wrong.extend(check("sellift", true, l.first().copied(), &light_cell));
+                wrong.extend(check("selliftShadow", true, l.get(1).copied(), &light_cell));
+            }
+            // The key layer, then the ambient one.
+            "--cardshadow" => {
+                wrong.extend(check("cardshadow", false, Some(transparent()), "none"));
+                wrong.extend(check(
+                    "cardshadowAmbient",
+                    false,
+                    Some(transparent()),
+                    "none",
+                ));
+                let l = doc_colours(&light_cell);
+                wrong.extend(check("cardshadow", true, l.first().copied(), &light_cell));
+                wrong.extend(check(
+                    "cardshadowAmbient",
+                    true,
+                    l.get(1).copied(),
+                    &light_cell,
+                ));
+            }
+            _ => wrong.push(format!(
+                "  {var}: tokens.md declares it and DesignCanvas.swift has no answer for it"
+            )),
+        }
+    }
+
+    // …and the other direction: a variable the phone declares that the table
+    // does not. `noShadow` is this file's own name for `none` and is exempt.
+    for line in src.lines() {
+        let Some(rest) = line.trim().strip_prefix("static let ") else {
+            continue;
+        };
+        let name = rest.split(['=', ':']).next().unwrap_or("").trim();
+        if name.is_empty() || name == "noShadow" {
+            continue;
+        }
+        let raw = declaration(&src, name);
+        if !(raw.starts_with("CanvasToken(") || raw.starts_with("CanvasShadow(")) {
+            continue; // an anchor, a hue or a tint percentage — checked elsewhere
+        }
+        let known = direct.iter().any(|(_, swift)| *swift == name)
+            || [
+                "hover",
+                "lift",
+                "sellift",
+                "selliftShadow",
+                "cardshadow",
+                "cardshadowAmbient",
+            ]
+            .contains(&name);
+        if !known {
+            wrong.push(format!(
+                "  DesignCanvas.{name}: a variable the phone declares that tokens.md does not. \
+                 Add it to the table or spend an existing one"
+            ));
+        }
+    }
+
+    // The four anchors and four hues, which the table states as `oklch(L C H)`
+    // rather than as rows of their own.
+    let mut anchor = |what: &str, got: f32, want: f32| {
+        if (got - want).abs() > f32::EPSILON {
+            wrong.push(format!(
+                "  {what}: DesignCanvas says {got}, the ramp says {want}"
+            ));
+        }
+    };
+    anchor("statusL", number(&src, "statusL"), status::L);
+    anchor("statusC", number(&src, "statusC"), status::C);
+    anchor("statusLLight", number(&src, "statusLLight"), 0.52);
+    anchor("statusCLight", number(&src, "statusCLight"), 0.16);
+    anchor("hueBlocked", number(&src, "hueBlocked"), status::BLOCKED);
+    anchor("hueWorking", number(&src, "hueWorking"), status::WORKING);
+    anchor("hueReview", number(&src, "hueReview"), status::REVIEW);
+    anchor("hueSettled", number(&src, "hueSettled"), status::SETTLED);
+
+    // `--desk` is the fake desktop the canvas draws BEHIND the window so the
+    // corner radius reads. tokens.md says in as many words that it must not
+    // acquire a counterpart; a phone has no desktop at all.
+    assert!(
+        !src.contains("static let desk"),
+        "DesignCanvas.swift grew a `--desk` — tokens.md forbids it a counterpart"
+    );
+
+    assert!(
+        wrong.is_empty(),
+        "{} value(s) where the phone's hand-ported table has drifted from \
+         docs/design/tokens.md. The doc is the source of truth for all three \
+         declarations (this one, crates/ui/src/theme.rs, and the canvases in \
+         docs/design/canvas/); fix the Swift, or change the doc and the other \
+         two with it:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    assert!(
+        seen.iter().any(|v| v == "--card"),
+        "tokens.md's surfaces table was not read at all"
+    );
+}
+
+/// Fully transparent — what `none` means once it is a paint.
+fn transparent() -> Hsla {
+    black_alpha(0.0)
+}
+
 /// Every colour token answers for both schemes (gh#257).
 ///
 /// The whole design of the phone's light mode is that a token knows its two
@@ -453,6 +876,8 @@ fn every_paint_token_answers_for_both_variants() {
         // Only the paint: a token whose value is a number is a layout constant,
         // and layout does not change with the light (see the file header).
         let raw = declaration(&src, name);
+        // A canvas variable spent as paint always ends `.color`; a
+        // `DesignCanvas.statusL` forwards a NUMBER and is layout, not paint.
         let is_paint = [
             "themed(",
             "ramp(",
@@ -463,9 +888,11 @@ fn every_paint_token_answers_for_both_variants() {
             "ink(",
             "wash(",
             "Color(",
+            "hex(",
         ]
         .iter()
-        .any(|c| raw.starts_with(c));
+        .any(|c| raw.starts_with(c))
+            || (raw.starts_with("DesignCanvas.") && raw.ends_with(".color"));
         if !is_paint || exempt(&lines, ix, "one-tone-ok:") {
             continue;
         }
@@ -487,6 +914,68 @@ fn every_paint_token_answers_for_both_variants() {
          declares that job. If the colour really \
          is one colour in both (a brand mark is), say so with a \
          `one-tone-ok: <reason>` comment:",
+    );
+}
+
+/// No view outside `Theme/` names a colour (gh#279).
+///
+/// The rule the token port is FOR. Before it, forty call sites across fifteen
+/// files reached for `whiteAlpha(a)` with twelve different alphas — 0.02,
+/// 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10 — which
+/// is gh#172's "a dozen unnamed greys" one level down: a dozen unnamed
+/// SURFACES, none of them in the canvas, several a percent apart and reading
+/// as noise rather than as levels. The canvas declares four translucent beds
+/// and the phone now spends exactly those (`chip`, `elementHover`,
+/// `elementActive`, plus the opaque `surfaceRaised`).
+///
+/// `Theme/` is exempt because that is where paint is MADE: `DesignCanvas.swift`
+/// transcribes the table and `Theme.swift` maps it onto jobs. Everything else
+/// asks for a job by name.
+#[test]
+fn no_view_outside_the_theme_names_a_colour() {
+    let mut violations = Vec::new();
+    for file in swift_sources() {
+        if rel(&file).starts_with("Theme") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&file).expect("read source");
+        let lines: Vec<&str> = body.lines().collect();
+        for (ix, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || exempt(&lines, ix, "paint-ok:") {
+                continue;
+            }
+            for maker in [
+                "whiteAlpha(",
+                "wash(",
+                "hex(0x",
+                "grey(",
+                "neutral(",
+                "oklch(",
+                "Color.white",
+                "Color.black",
+                "Color(red:",
+                "UIColor(red:",
+            ] {
+                if line.contains(maker) {
+                    violations.push(Violation {
+                        file: rel(&file),
+                        line: ix + 1,
+                        text: line.trim().to_string(),
+                        why: maker.trim_end_matches(['(', ':']).to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    report(
+        violations,
+        "colour(s) mixed outside Theme/. A view asks for a job — Theme.chip, \
+         Theme.elementHover, Theme.surfaceRaised, Theme.border — and \
+         Theme.swift says which canvas variable answers it. If a screen really \
+         does need paint no token names, add the token (and the canvas \
+         variable behind it) rather than the literal; a genuine one-off says \
+         so with a `paint-ok: <reason>` comment:",
     );
 }
 

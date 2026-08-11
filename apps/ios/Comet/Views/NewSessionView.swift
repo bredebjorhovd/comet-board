@@ -171,7 +171,7 @@ struct NewSessionView: View {
                 }
                 .padding(.horizontal, 13)
                 .frame(height: 36)
-                .background(whiteAlpha(0.10), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             .buttonStyle(ChipPressButtonStyle())
 
@@ -202,7 +202,7 @@ struct NewSessionView: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 36)
-            .background(whiteAlpha(0.10), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+            .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
         }
         .buttonStyle(ChipPressButtonStyle())
     }
@@ -465,7 +465,7 @@ struct ModelPickerSheet: View {
             }
             .padding(.horizontal, 14)
             .frame(height: 36)
-            .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .background(selected ? Theme.elementActive : Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
         }
         .buttonStyle(.plain)
     }

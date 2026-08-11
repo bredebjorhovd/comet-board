@@ -1,50 +1,57 @@
-// Monochrome theme, in two variants. Dark and the shared scales are a direct
-// port of crates/ui/src/theme.rs; light is the supplied iOS reference's palette.
+// Monochrome theme, in two variants — **what each surface is FOR**, answered
+// with the design canvas's own variables.
 //
-// Colors are computed from the same oklch definitions the desktop app uses
-// (Björn Ottosson's OKLab matrices, the ones CSS Color 4 specifies), so every
-// surface and accent lands on identical sRGB values. **Numbers drive layout,
-// colors are paint**: layout constants are plain numbers and never depend on
-// which color is painted.
+// The values are not here. They are in `DesignCanvas.swift`, transcribed from
+// `docs/design/canvas/comet-ios.dc.html` under the canvas's own names, and
+// this file is the one place that decides which canvas variable answers which
+// job: `Theme.surfaceRaised` is `--raised`, one line, and a reader can check
+// that mapping against `docs/design/tokens.md` without reading a colour
+// literal. **Numbers drive layout, colors are paint**: the radii, type sizes
+// and spacing below are plain numbers, shared with the desktop, and never
+// depend on which colour is painted.
 //
-// # Light is a design, not an inversion (gh#257)
+// # One source of truth, hand-ported once (gh#279)
 //
-// Every paint token below is declared with `themed(dark:light:)`, which builds
-// one `Color` that resolves against the trait collection it is drawn into. The
-// consequence is the point: **no view asks which scheme it is in.** The 400-odd
-// call sites across this app were written against `Theme.text` and
-// `whiteAlpha(0.06)` and they are unchanged — a token knowing its own two
-// values is what keeps `if colorScheme == .light` from spreading through the
-// screens, which is how a light theme rots into a per-view opinion.
+// The phone cannot reference `crates/ui/src/theme.rs`, so the palette exists
+// here a second time whether anyone likes it or not. What gh#279 changed is
+// that it exists ONCE on this side too. Before it, each token carried its own
+// pair of literals and four of the dark ones had been *derived* rather than
+// transcribed — `neutral(0.235)` painted #202020 where the canvas draws
+// #161616 for `--raised`, and `grey(6)` painted #060606 for a `--card` the
+// canvas draws at #070707. That is gh#274's bug, one viewport later and one
+// row down: a ramp re-derives on every read, so what ships is whatever the
+// oklch round-trip produces rather than what anyone chose.
+//
+// `crates/ui/tests/ios_theme.rs` now reads `docs/design/tokens.md` and holds
+// `DesignCanvas.swift` to it, value for value, in both variants — so the doc,
+// the desktop and the phone are three declarations of one table with a test
+// between them.
 //
 // ## Where the light numbers come from
 //
-// **The design doc for this phone, `Comet iOS.dc.html`, and not the desktop's
-// `Theme::light()`.** The two disagree, and the disagreement is deliberate on
-// the doc's side: it draws phone screens, so it declares a phone's surface
-// system rather than a shell-beside-a-panel one. Every light value below is
-// transcribed from its `.cw[data-theme="light"]` block, named in the comment
-// that carries it, and asserted against that same table by
-// `crates/ui/tests/ios_theme.rs`:
+// **The canvas for this phone, and not the desktop's `Theme::light()`.** The
+// two disagree, and the disagreement is deliberate on the canvas's side: it
+// draws phone screens, so it declares a phone's surface system rather than a
+// shell-beside-a-panel one. The page is white and elevation is a TINT DOWN
+// from it (`--raised`), the hairlines are opaque hexes rather than a
+// translucent ink, and the status ramp sits at L 0.52 / C 0.16 rather than the
+// desktop light theme's 0.55 / 0.14.
 //
-//     --card #ffffff   --raised #f4f4f7   --sel #ffffff   --selcard #eeeef2
-//     --chip rgba(0,0,0,.05)   --line #e4e4e8   --line2 #d6d6dc
-//     --text #171717   --muted #545454   --subtle #6b6b6b   --faint #8a8a8a
-//     --blocked/working/review/settled  oklch(0.52 0.16 <hue>)
-//     --claude #c15f3c
+// The phone spends the table on nine jobs where the canvas declares four
+// variables, and exactly one token takes its two halves from two different
+// variables — `surface`, which says why at its declaration. Everything else
+// is a whole variable under a name for its job.
 //
-// So: the page is white and elevation is a TINT DOWN from it (`--raised`), the
-// hairlines are opaque hexes rather than a translucent ink, and the status ramp
-// sits at L 0.52 / C 0.16 rather than the desktop light theme's 0.55 / 0.14.
-// **Dark is untouched and still the desktop's**, number for number — the phone
-// and the laptop agree about dark, and about the whole of the scale, the radii
-// and the four contrast steps. What the phone now owns alone is which paint
-// those steps land on when the lights are on.
+// A handful of tokens have no counterpart in the canvas, because the screens
+// it draws never show them: `accentStrong` (no filled accent button), the
+// three `*Text` foregrounds, the inline-code violet and the three syntax
+// tones. Each says at its declaration where its value came from instead.
 //
-// A handful of tokens have no counterpart in the doc, because the screens it
-// draws never show them: `accentStrong` (no filled accent button), the three
-// `*Text` foregrounds, the inline-code violet and the three syntax tones. Each
-// says at its declaration where its light value came from instead.
+// Every paint token is built through `themed(dark:light:)` — one `Color` that
+// resolves against the trait collection it is drawn into. The consequence is
+// the point: **no view asks which scheme it is in**, and **no view names a
+// colour**. A screen that reached past `Theme` would be picking paint, which
+// is the habit the system exists to end.
 //
 // The phone owns one more thing the desktop does not: `Appearance.swift` maps a
 // stored preference onto the window. Its stored default is System, but the
@@ -155,49 +162,67 @@ enum Status {
 
 enum Theme {
     // ---- paint: neutral surfaces ----
-    // Dark's are achromatic (oklch chroma 0), sampled from the original app;
-    // light's are the reference's hexes, which carry their own faint blue in
-    // the last digit (`#f4f4f7`, `#e4e4e8`) — a pure grey beside white makes
-    // the white read yellow, and the doc's surfaces already account for it.
+    // Every one of these is a canvas variable under a name that says what it is
+    // FOR. `DesignCanvas` holds the values; this is the only file that decides which
+    // variable answers which job, and the mapping is one line long each so a
+    // reader can check it against `docs/design/tokens.md` at a glance.
     /// The reading page: the transcript, the composer behind it, sign-in, the
-    /// new-session canvas. Dark's sampled #060606; light's `--card`.
-    static let bg = themed(dark: grey(6), light: hex(0xFFFFFF))
-    /// The page every LIST scrolls over — Home, Board, Stats. Dark walks UP
-    /// from `bg` to reach it (#0d0d0d, the desktop's shell). Light does not
-    /// walk anywhere: the reference gives a phone screen ONE page tone
-    /// (`--card`), because there is no panel beside it to be a step away from.
-    static let surface = themed(dark: grey(13), light: hex(0xFFFFFF))
-    /// Raised surface: a stats bar's track, a tool card in the transcript, the
-    /// plate behind a swipe action. Light TINTS DOWN from the white page
-    /// (`--raised`) rather than up — up is where a track painted at half alpha
-    /// over the page it would have matched goes invisible.
-    static let surfaceRaised = themed(dark: neutral(0.235), light: hex(0xF4F4F7))
-    /// The page a sheet presents on. Between `bg` and `surfaceRaised` in dark;
-    /// `--raised` in light, so the white cards on it read as the raised object.
-    /// It shares a tone with `surfaceRaised` there, the way `card` and the
-    /// shell share one in the desktop's dark: two jobs, one answer.
-    static let sheetPanel = themed(dark: grey(0x14), light: hex(0xF4F4F7))
-    /// A grouped card ON `sheetPanel` — a translucent lift in dark, the white
-    /// object (`--sel`) in light. Never darker than the bed it sits on.
-    static let card = themed(dark: Color.white.opacity(0.045), light: hex(0xFFFFFF))
-    /// Pressed wash for interactive rows and the fill behind a chip — the
-    /// desktop's `element_hover`, which on a touch screen is what a finger
-    /// holds down rather than what a pointer rests on. `--chip` in both: white
-    /// at 7% over dark, black at 5% over light.
-    static let elementHover = themed(dark: wash(0.07), light: Color.black.opacity(0.05))
-    /// Active/selected row. Dark keeps the app's existing pressed wash; light
-    /// uses the reference's exact `--selcard`, including its faint blue tint.
-    static let elementActive = themed(dark: wash(0.10), light: hex(0xEEEEF2))
+    /// new-session canvas. `--card`, which on a phone is the page itself.
+    static let bg = DesignCanvas.card.color
+    /// The page every LIST scrolls over — Home, Board, Stats.
+    ///
+    /// **The one token whose two halves come from different variables.** Dark
+    /// walks up to `--shell`, the ground the desktop's panel floats on. Light
+    /// does not walk anywhere: the canvas gives a phone screen ONE page tone,
+    /// and it draws `--card` for it, because there is no panel beside it to be
+    /// a step away from. Painting light's `--shell` here would put a grey band
+    /// under a white list for no reason a phone can see.
+    static let surface = themed(dark: DesignCanvas.shell.dark, light: DesignCanvas.card.light)
+    /// Raised surface — `--raised`: a stats bar's track, a tool card in the
+    /// transcript, the plate behind a swipe action, a message bubble. Light
+    /// TINTS DOWN from the white page rather than up; up is where a track
+    /// painted over the page it would have matched goes invisible.
+    static let surfaceRaised = DesignCanvas.raised.color
+    /// The page a sheet presents on — `--card`, the same page tone as `bg`,
+    /// which is what the canvas's review sheet paints. It keeps its own name
+    /// because it is a different job with a different neighbour: what sits ON
+    /// it is `card`, and the pair has to step the right way.
+    static let sheetPanel = DesignCanvas.card.color
+    /// A grouped card ON `sheetPanel` — `--raised`, a step up from the page in
+    /// dark and a tint down from it in light, exactly as the canvas's "Asked
+    /// for" band and composer bed are drawn.
+    static let card = DesignCanvas.raised.color
+    /// A SELECTED row on the page — `--sel`. Light lifts it to white, dark
+    /// steps it up from the card; either way it wears `rowEdge`.
+    static let rowSelected = DesignCanvas.sel.color
+    /// The same row inside a card — `--selcard`. Identical to `rowSelected` in
+    /// dark; in light it steps DOWN, because the card is already white.
+    static let elementActive = DesignCanvas.selcard.color
+    /// The wash a row takes while a finger is on it — `--hover`, which on a
+    /// touch screen is what is held down rather than what a pointer rests on.
+    static let elementHover = DesignCanvas.hover.color
+    /// The translucent bed a chip, badge or key cap sits on — `--chip`.
+    ///
+    /// Separate from `elementHover`, which it was folded into until gh#279.
+    /// One wash cannot be both: a chip lands on the page, on `--raised` and
+    /// inside a selected row, and the alpha that reads on all three is not the
+    /// alpha a press wants (gh#274 made the same split on the desktop).
+    static let chip = DesignCanvas.chip.color
     /// Hairline border — `--line`. Translucent white over dark; an OPAQUE hex
     /// over light, because a hairline is the one thing that must not fade into
     /// the paper it is drawn on.
-    static let border = themed(dark: Color.white.opacity(0.08), light: hex(0xE4E4E8))
+    static let border = DesignCanvas.line.color
     /// Stronger border for focused/raised edges — `--line2`.
-    static let borderStrong = themed(dark: Color.white.opacity(0.14), light: hex(0xD6D6DC))
+    static let borderStrong = DesignCanvas.line2.color
     /// The hairline BETWEEN rows inside a grouped card, where `border` draws
-    /// the card's own edge. Quieter than `border` in dark; in light the
-    /// reference has two line tones and this is the lighter of them.
-    static let separator = themed(dark: Color.white.opacity(0.06), light: hex(0xE4E4E8))
+    /// the card's own edge. The canvas draws ONE hairline tone and uses it for
+    /// both, so this is `--line` too — the name survives because the job does.
+    static let separator = DesignCanvas.line.color
+    /// The 1px ring a selected row wears — `--sellift`.
+    ///
+    /// Stroked INSIDE the row's own shape, never hung behind it as a shadow: a
+    /// drop shadow behind a translucent fill shows through as a plate.
+    static let rowEdge = DesignCanvas.sellift.color
 
     // ---- paint: text — four tones, never multiplied (gh#172) ----
     // The same four contrast steps in both variants — 17.0 / 8.5 / 5.2 / 3.6 on
@@ -208,15 +233,15 @@ enum Theme {
     // (`#EAEAEA` where the canvas draws `#EDEDED`); the desktop theme had the
     // same bug on the same four values, which is what a shared ramp buys you.
     /// Headings, titles, the selected row. ~17.0:1 on `bg` — `--text`.
-    static let text = themed(dark: hex(0xEDEDED), light: hex(0x171717))
+    static let text = DesignCanvas.text.color
     /// Body copy and unselected rows — the default reading tone. ~8.5:1.
-    static let textMuted = themed(dark: hex(0xA8A8A8), light: hex(0x545454))
+    static let textMuted = DesignCanvas.muted.color
     /// Labels, metadata, captions, timestamps, sublines. ~5.2:1 — still AA body
     /// text, which the `.opacity(0.5)` sublines this token replaces were not.
-    static let textSubtle = themed(dark: hex(0x808080), light: hex(0x6B6B6B))
+    static let textSubtle = DesignCanvas.subtle.color
     /// Disabled controls and placeholders, and nothing else. ~3.6:1 — the
     /// floor, so anything a user is meant to READ sits at `textSubtle` or up.
-    static let textFaint = themed(dark: hex(0x666666), light: hex(0x8A8A8A))
+    static let textFaint = DesignCanvas.faint.color
 
     // ---- the status ramp: four hues, one L, one C (gh#173) ----
     // The four HUES are anchored in `comet_proto::view::status`, because the
@@ -229,29 +254,45 @@ enum Theme {
     /// The lightness every status hue is anchored to on a dark surface. One
     /// number, so "how loud is this state" is decided by the state and never by
     /// its hue.
-    static let statusL: Double = 0.74
-    /// The same anchor on the reference's white page: darker, so the hues keep
+    static let statusL: Double = DesignCanvas.statusL
+    /// The same anchor on the canvas's white page: darker, so the hues keep
     /// contrast, and carrying `statusCLight` with it.
-    static let statusLLight: Double = 0.52
+    static let statusLLight: Double = DesignCanvas.statusLLight
     /// The chroma every status hue carries on a dark surface.
-    static let statusC: Double = 0.14
+    static let statusC: Double = DesignCanvas.statusC
     /// The same on light. A touch more, because a hue loses saturation to the
     /// eye as it darkens and the four have to stay as distinct from each other
     /// as they are in dark.
-    static let statusCLight: Double = 0.16
+    static let statusCLight: Double = DesignCanvas.statusCLight
     /// Blocked · failed · errored.
-    static let hueBlocked: Double = 25
+    static let hueBlocked: Double = DesignCanvas.hueBlocked
     /// Working — an agent is running.
-    static let hueWorking: Double = 75
+    static let hueWorking: Double = DesignCanvas.hueWorking
     /// Review · a question · links · focus.
-    static let hueReview: Double = 265
+    static let hueReview: Double = DesignCanvas.hueReview
     /// Settled · seen · online.
-    static let hueSettled: Double = 160
+    static let hueSettled: Double = DesignCanvas.hueSettled
 
     /// A status hue at whichever anchor the surface under it calls for.
     static func ramp(_ hue: Double) -> Color {
-        themed(dark: oklch(statusL, statusC, hue), light: oklch(statusLLight, statusCLight, hue))
+        DesignCanvas.ramp(hue).color
     }
+
+    // ---- how much of a status hue a tint carries ----
+    // The canvas mixes its status hues into transparency at four named
+    // strengths (`color-mix(in srgb, var(--x) N%, transparent)`). Those
+    // percentages are part of the spec, so they are named once here rather
+    // than typed at each of the two dozen call sites that spend them.
+    /// A chip's fill — `12%`.
+    static let statusChipTint: Double = DesignCanvas.statusChipTint
+    /// A count pill's and a badge's fill — `14%`.
+    static let statusBadgeTint: Double = DesignCanvas.statusBadgeTint
+    /// A warning card's border — `32%`.
+    static let statusBorderTint: Double = DesignCanvas.statusBorderTint
+    /// A warning card's header bed — `9%`.
+    static let statusHeaderTint: Double = DesignCanvas.statusHeaderTint
+    /// The divider under that header — `22%`.
+    static let statusDividerTint: Double = DesignCanvas.statusDividerTint
 
     /// Accent — indigo, `Status.review`'s hue: review, a question, links,
     /// focus, selection tint.
@@ -312,7 +353,7 @@ enum Theme {
     /// run is doing. `--claude` in both: the brand's own #D97757 on dark, and
     /// the reference's darker mix of it on white, where #D97757 carries barely
     /// 2.6:1 against the page.
-    static let claudeBrand = themed(dark: hex(0xD97757), light: hex(0xC15F3C))
+    static let claudeBrand = DesignCanvas.claude.color
 
     // ---- paint: markdown inline code (violet family) ----
     // The reference draws no rendered markdown, so this pair and the three
@@ -424,16 +465,38 @@ extension Theme {
     }
 }
 
-// MARK: - The two variants
+// MARK: - Selection, as the canvas draws it
 
-extension Theme {
-    /// What a `whiteAlpha` overlay's alpha becomes when it is made of black
-    /// instead. Set by the one value the reference declares for this job:
-    /// `--chip` is white at 7% in dark and black at 5% in light, so 5/7. Every
-    /// other translucent call site rides the same ratio rather than being
-    /// retuned one at a time — an overlay reads heavier as ink on paper than as
-    /// light on near-black, and by the same factor throughout.
-    static let lightInkScale: Double = 5.0 / 7.0
+extension View {
+    /// A canvas shadow token, painted. Dark declares `none` for all three, so
+    /// its ink is fully transparent and this draws nothing — which is the
+    /// declaration, not a special case.
+    func canvasShadow(_ shadow: CanvasShadow) -> some View {
+        self.shadow(color: shadow.color, radius: shadow.radius, x: 0, y: shadow.y)
+    }
+
+    /// A selected row, as `--sel` + `--sellift`.
+    ///
+    /// The whole of the canvas's selection idiom in one modifier, so no screen
+    /// gets to spell it a fourth way: the row takes `rowSelected`, and the ring
+    /// is STROKED INSIDE its own shape rather than hung behind it — a drop
+    /// shadow behind a translucent fill shows through as a plate. Light carries
+    /// `--sellift`'s second layer as a real shadow beneath.
+    ///
+    /// `card: true` swaps the fill for `--selcard`, which is the same tone in
+    /// dark and a step DOWN in light, for a row selected inside a card rather
+    /// than on the page.
+    func selectedRow(_ selected: Bool,
+                     cornerRadius: CGFloat = Theme.radiusCard,
+                     card: Bool = false) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius)
+        return self
+            .background(selected ? (card ? Theme.elementActive : Theme.rowSelected) : .clear,
+                        in: shape)
+            .overlay(shape.strokeBorder(selected ? Theme.rowEdge : .clear, lineWidth: 1))
+            .canvasShadow(selected ? DesignCanvas.selliftShadow
+                                   : DesignCanvas.noShadow)
+    }
 }
 
 /// One token, two values — resolved against the trait collection it is drawn
@@ -444,58 +507,41 @@ extension Theme {
 /// alternative — a `@Environment(\.colorScheme)` read at the call site — puts
 /// the design system's decisions in the views, where the two halves drift and
 /// nothing can check them; `crates/ui/tests/ios_theme.rs` reads the `dark:` and
-/// `light:` arguments below and holds dark to `crates/ui/src/theme.rs` and
-/// light to the reference's own table.
+/// `light:` arguments of every token and holds dark to `crates/ui/src/theme.rs`
+/// and the whole canvas table to `docs/design/tokens.md`.
 func themed(dark: Color, light: Color) -> Color {
     Color(UIColor { traits in
         UIColor(traits.userInterfaceStyle == .light ? light : dark)
     })
 }
 
-// MARK: - Color primitives (ported from theme.rs)
+// MARK: - Colour primitives
+//
+// The three notations the canvas writes its variables in, and nothing else.
+// They exist so `DesignCanvas.swift` can transcribe rather than convert: a
+// `#161616` in the canvas is `hex(0x161616)` here, an `rgba(255,255,255,.08)`
+// is `Color.white.opacity(0.08)`, an `oklch(0.74 0.14 25)` is `oklch(...)`.
+//
+// gh#279 removed the two that were CONVERSIONS — `neutral(L)`, which derived a
+// grey from a lightness and landed near the canvas's number instead of on it,
+// and `whiteAlpha(a)`, the generalised overlay that let forty call sites each
+// invent their own bed. What replaced them is `DesignCanvas` plus the named
+// `Theme` tokens that spend it.
 
-/// A neutral (chroma 0) oklch tone. Chroma 0 means r == g == b exactly. The
-/// DARK primitive — light's neutrals are `cool`.
-func neutral(_ lightness: Double) -> Color {
-    let v = Double(oklchToSrgb(l: lightness, c: 0, hDeg: 0)[0])
-    return Color(red: v, green: v, blue: v)
-}
-
-/// An exact sRGB colour from a 24-bit hex literal — how the reference declares
-/// every one of its light surfaces, hairlines and text tones, so this is how
-/// they are transcribed.
+/// An exact sRGB colour from a 24-bit hex literal — how the canvas declares
+/// every surface, hairline and text tone it does not write in `oklch`.
 func hex(_ rgb: UInt32) -> Color {
     Color(red: Double((rgb >> 16) & 0xFF) / 255.0,
           green: Double((rgb >> 8) & 0xFF) / 255.0,
           blue: Double(rgb & 0xFF) / 255.0)
 }
 
-/// The translucent-overlay primitive, in whichever ink the surface calls for:
-/// white at low alpha over dark, black at `Theme.lightInkScale` of that alpha
-/// over light — the reference's `--chip`, generalised.
-///
-/// Dynamic rather than dark-only because it is the one primitive the SCREENS
-/// call — chips, card fills and pressed states all reach for it directly, and
-/// rewriting those two dozen call sites into paired tokens would have bought
-/// nothing the resolution below does not. The two places where an overlay is
-/// the wrong answer in light are the two hairline tokens, which the reference
-/// declares as opaque hexes and `Theme` therefore declares in full.
-func whiteAlpha(_ alpha: Double) -> Color {
-    themed(dark: Color.white.opacity(alpha),
-           light: Color.black.opacity(alpha * Theme.lightInkScale))
-}
-
 /// Interactive-state wash: translucent soft-white rather than pure white, so a
-/// press fades from the surface's own tone instead of flashing. The DARK
-/// primitive — light presses are `ink` (see `Theme.elementHover`).
+/// press fades from the surface's own tone instead of flashing. `--hover`'s
+/// deliberate deviation, and the only place it is spent — see
+/// `DesignCanvas.hover`.
 func wash(_ alpha: Double) -> Color {
     Color(red: 0.92, green: 0.92, blue: 0.92).opacity(alpha)
-}
-
-/// An exact achromatic tone from an 8-bit channel value (`grey(13)` ≡ #0d0d0d).
-func grey(_ value: UInt8) -> Color {
-    let v = Double(value) / 255.0
-    return Color(red: v, green: v, blue: v)
 }
 
 /// oklch (CSS notation: L 0..1, C, H degrees) → sRGB Color.

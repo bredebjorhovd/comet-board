@@ -44,7 +44,7 @@ private enum ReviewMetrics {
     static let chipHeight: CGFloat = 22
     static let chipPadding: CGFloat = 8
     static let chipDot: CGFloat = 5
-    static let chipTint: Double = 0.12
+    static let chipTint: Double = Theme.statusChipTint
     static let chipGap: CGFloat = 6
     /// The gutter between a status letter and a path, and between a path and
     /// its counts. One number, so a claim's matched files and the unclaimed set
@@ -154,7 +154,7 @@ struct ReviewScreen: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     verdictStrip(review)
-                    band { askedFor(review) }
+                    band(raised: true) { askedFor(review) }
                     band { effects(review) }
                     claims(review)
                     if !review.evidence.checks.isEmpty || review.evidence.commands > 0 {
@@ -178,7 +178,7 @@ struct ReviewScreen: View {
         HStack(alignment: .top, spacing: Theme.spaceSM) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(review.brief.title)
-                    .font(Theme.sans(Theme.textTitle, weight: .medium))
+                    .font(Theme.sans(Theme.textTitle, weight: .semibold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -190,11 +190,11 @@ struct ReviewScreen: View {
             Spacer(minLength: Theme.spaceXS)
             if let pill = reviewTurnPill(state: review.state, answered: receipt != nil) {
                 Text(pill.label)
-                    .font(Theme.sans(Theme.textCaption))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.status(pill.status))
                     .padding(.horizontal, Theme.spaceSM)
                     .padding(.vertical, 1)
-                    .background(Theme.status(pill.status).opacity(0.14),
+                    .background(Theme.status(pill.status).opacity(Theme.statusBadgeTint),
                                 in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
         }
@@ -221,7 +221,7 @@ struct ReviewScreen: View {
         }
         .padding(.horizontal, Theme.spaceLG)
         .padding(.vertical, Theme.spaceMD)
-        .background(verdict.tone.loud ? Theme.danger.opacity(0.09) : Color.clear)
+        .background(verdict.tone.loud ? Theme.danger.opacity(Theme.statusHeaderTint) : Color.clear)
         .overlay(alignment: .bottom) { hairline }
     }
 
@@ -441,7 +441,7 @@ struct ReviewScreen: View {
         }
         .buttonStyle(.plain)
         .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard)
-            .strokeBorder(mark == .contradicted ? Theme.danger.opacity(0.32) : Theme.border,
+            .strokeBorder(mark == .contradicted ? Theme.danger.opacity(Theme.statusBorderTint) : Theme.border,
                           lineWidth: 1))
     }
 
@@ -565,7 +565,13 @@ struct ReviewScreen: View {
             .padding(.horizontal, Theme.spaceMD)
             .padding(.vertical, Theme.spaceSM + 1)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.danger.opacity(0.09))
+            .background(Theme.danger.opacity(Theme.statusHeaderTint))
+            // ios.md D4.2: the header's own divider, at the canvas's 22% —
+            // heavier than `--line`, because it separates the warning from
+            // the evidence rather than one piece of evidence from the next.
+            Rectangle()
+                .fill(Theme.danger.opacity(Theme.statusDividerTint))
+                .frame(height: 1)
             ForEach(Array(review.unclaimed.enumerated()), id: \.offset) { index, file in
                 if index > 0 {
                     Rectangle().fill(Theme.border).frame(height: 1)
@@ -577,7 +583,7 @@ struct ReviewScreen: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: Theme.radiusCard))
         .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard)
-            .strokeBorder(Theme.danger.opacity(0.32), lineWidth: 1))
+            .strokeBorder(Theme.danger.opacity(Theme.statusBorderTint), lineWidth: 1))
     }
 
     @ViewBuilder
@@ -724,7 +730,7 @@ struct ReviewScreen: View {
 
     private func buttonBackground(filled: Bool, ready: Bool) -> Color {
         guard filled else { return .clear }
-        return ready ? Theme.text : whiteAlpha(0.08)
+        return ready ? Theme.text : Theme.chip
     }
 
     private func send(_ kind: VerdictKind, target: ReviewTarget) {
@@ -747,11 +753,18 @@ struct ReviewScreen: View {
 
     /// A band: one section, padded, with the hairline that separates it from
     /// the next.
-    private func band<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    ///
+    /// `raised` is the canvas's `--raised` fill, and exactly one band on this
+    /// screen wears it — "Asked for" (ios.md D2.1). It is the one thing here
+    /// the agent did not write, so it reads as a quotation rather than as
+    /// another of the screen's own sections.
+    private func band<Content: View>(raised: Bool = false,
+                                     @ViewBuilder _ content: () -> Content) -> some View {
         content()
             .padding(.horizontal, Theme.spaceLG)
             .padding(.vertical, Theme.spaceMD)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(raised ? Theme.surfaceRaised : Color.clear)
             .overlay(alignment: .bottom) { hairline }
     }
 
@@ -880,7 +893,7 @@ struct ReviewChipView: View {
         switch chip.ground {
         case .settled: return Theme.settled.opacity(ReviewMetrics.chipTint)
         case .working: return Theme.warning.opacity(ReviewMetrics.chipTint)
-        case .neutral, .unknown: return whiteAlpha(0.07)
+        case .neutral, .unknown: return Theme.chip
         }
     }
 }

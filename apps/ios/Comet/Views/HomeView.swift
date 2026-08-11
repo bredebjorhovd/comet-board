@@ -149,13 +149,13 @@ struct HomeView: View {
                 } label: {
                     SpaceRow(space: space)
                 }
-                .buttonStyle(PressWashButtonStyle())
+                .buttonStyle(SelectRowButtonStyle())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
             }
         } header: {
-            sectionHeader("Spaces")
+            sectionHeader("Spaces", count: model.spaces.count)
         }
     }
 
@@ -166,9 +166,11 @@ struct HomeView: View {
     /// same full rows in both lists. A chat lives in exactly one of them —
     /// Active while it runs, here when it is idle.
     private var sessionsSection: some View {
-        Section {
-            let held = Set(model.activeRowPlacements.map(\.chatId))
-            let chats = model.overviewChats.filter { !held.contains($0.id) }
+        // Hoisted out of the content builder so the header can count them —
+        // "Sessions 3" is a claim about the rows below it (ios.md B5.1).
+        let held = Set(model.activeRowPlacements.map(\.chatId))
+        let chats = model.overviewChats.filter { !held.contains($0.id) }
+        return Section {
             if chats.isEmpty {
                 // Say where they went rather than leaving a gap under a header
                 // that the list above just proved is busy.
@@ -185,7 +187,7 @@ struct HomeView: View {
                 } label: {
                     ChatRow(chat: chat, showLocation: true)
                 }
-                .buttonStyle(PressWashButtonStyle())
+                .buttonStyle(SelectRowButtonStyle(cornerRadius: Theme.radiusRow))
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -200,16 +202,26 @@ struct HomeView: View {
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
         } header: {
-            sectionHeader("Sessions")
+            sectionHeader("Sessions", count: chats.count)
         }
     }
 
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(Theme.sans(Theme.textCaption, weight: .medium))
-            .foregroundStyle(Theme.textSubtle)
-            .textCase(nil)
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
+    /// A Home section header (ios.md B4.2 / B5.1): the name left, the count
+    /// right. Both `--subtle` — on Home a section is a LABEL above rows that
+    /// can each be read alone, where on the board the section is the structure
+    /// and its header takes `--text`.
+    private func sectionHeader(_ title: String, count: Int) -> some View {
+        HStack(spacing: 0) {
+            Text(title)
+                .font(Theme.sans(Theme.textDense, weight: .medium))
+                .foregroundStyle(Theme.textSubtle)
+            Spacer(minLength: 8)
+            Text("\(count)")
+                .font(Theme.sans(Theme.textDense))
+                .foregroundStyle(Theme.textSubtle)
+        }
+        .textCase(nil)
+        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
     }
 }
 
@@ -224,16 +236,21 @@ struct SpaceRow: View {
     static let qualifierMax: CGFloat = 132
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             // Leading 6pt aggregate dot — position stable, most-urgent member.
             let agg = model.spaceIndicator(space.id)
             // round-ok: a status dot — the space's aggregate
             Circle()
-                .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
+                .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? Theme.textFaint) : Theme.textFaint)
                 .frame(width: 6, height: 6)
-            Image(systemName: "folder")
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.textMuted)
+            // ios.md B4.5: the icon says whether this is a repo or a plain
+            // folder. The canvas draws the GitHub mark, which needs a remote
+            // HOST — and the workspace doc carries `gitDetected` and nothing
+            // about where the remote points, so drawing a vendor's mark here
+            // would be asserting a fact nobody sent us.
+            LineIconView(space.gitDetected ? .gitBranch : .folder,
+                         size: 17,
+                         color: online ? Theme.textMuted : Theme.textSubtle)
             // Unique within its device's spaces (gh#138): a repo slug names a
             // repo, and one machine can hold a checkout AND a worktree of it.
             //
@@ -246,14 +263,18 @@ struct SpaceRow: View {
             let title = model.spaceTitlesById[space.id]
                 ?? SpaceTitle(base: space.displayName, qualifier: nil)
             Text(title.base)
-                .font(Theme.sans(Theme.textBody, weight: .medium))
-                .foregroundStyle(Theme.text)
+                .font(Theme.sans(Theme.textTitle, weight: .medium))
+                .foregroundStyle(online ? Theme.text : Theme.textMuted)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .layoutPriority(1)
+                // Above the qualifier, not level with it: at `textTitle` the
+                // two together outrun a 393pt row, and losing the tail of the
+                // BASE is what gh#144 was about — two checkouts of one repo
+                // reading `comet-na…` again.
+                .layoutPriority(2)
             if let qualifier = title.qualifier {
                 Text("· \(qualifier)")
-                    .font(Theme.sans(Theme.textCaption))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textSubtle)
                     .lineLimit(1)
                     // Capped, as the sidebar caps it, and ranked with the base
@@ -277,7 +298,7 @@ struct SpaceRow: View {
             // twice.
             if let running = runningLabel(model.spaceRunning(space.id)) {
                 Text(running)
-                    .font(Theme.sans(Theme.textCaption))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(Theme.textSubtle)
                     .lineLimit(1)
             }
@@ -287,20 +308,23 @@ struct SpaceRow: View {
             // off the row is a warning nobody sees.
             deviceTag.layoutPriority(1)
             Image(systemName: "chevron.right")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Theme.textFaint)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
-        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusCard))
     }
 
+    private var online: Bool { model.deviceOnline(space.deviceId) }
+
     private var deviceTag: some View {
-        let online = model.deviceOnline(space.deviceId)
         let name = model.deviceName(space.deviceId)
+        // ios.md B4.6: an offline host is `--blocked`, not `--working`. It is
+        // not a slow thing, it is a thing that cannot be driven at all.
         return Text(online ? "@ \(name)" : "@ \(name) · offline")
             .font(Theme.sans(Theme.textDense))
-            .foregroundStyle(online ? Theme.textSubtle : Theme.warning)
+            .foregroundStyle(online ? Theme.textSubtle : Theme.status(.blocked))
             .lineLimit(1)
     }
 }
@@ -325,6 +349,15 @@ struct ChatRow: View {
 
     private var subline: Color { Theme.textSubtle }
 
+    /// Whether line 3 has anything to say (ios.md B5.4). The canvas draws the
+    /// third session in its list with no harness and no branch and no third
+    /// line at all — a two-line row, its title one tone down, which is what a
+    /// chat that never became work looks like.
+    private var hasSubline: Bool {
+        chat.config?.harness != nil
+            || !(chat.branch?.trimmingCharacters(in: .whitespaces) ?? "").isEmpty
+    }
+
     var body: some View {
         let indicator = model.indicator(for: chat)
         VStack(alignment: .leading, spacing: 2) {
@@ -333,7 +366,7 @@ struct ChatRow: View {
                 StatusRail(indicator: indicator)
                 if showLocation {
                     Text(location)
-                        .font(Theme.sans(Theme.textCaption))
+                        .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(subline)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -342,39 +375,44 @@ struct ChatRow: View {
                     Spacer(minLength: 4)
                 }
                 Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                    .font(Theme.sans(Theme.textCaption))
+                    .font(Theme.sans(Theme.textDense))
                     .foregroundStyle(subline)
                     .fixedSize()
             }
 
             // Line 2: the session title.
+            // ios.md B5.3 / Deviations: the row title is `textProse`. On a
+            // phone the list IS the reading surface, and this is the one line
+            // of the row a thumb is aiming at.
             Text(chat.displayTitle)
-                .font(Theme.sans(Theme.textBody))
-                .foregroundStyle(Theme.text)
+                .font(Theme.sans(Theme.textProse))
+                .foregroundStyle(hasSubline ? Theme.text : Theme.textMuted)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, Self.indent)
 
             // Line 3: harness brand mark, then the branch when the engine
-            // stamped one.
-            HStack(spacing: 4) {
-                if let harness = chat.config?.harness {
-                    HarnessBadge(harness: harness, size: 11, neutral: subline)
+            // stamped one — and nothing at all when there is neither.
+            if hasSubline {
+                HStack(spacing: 5) {
+                    if let harness = chat.config?.harness {
+                        HarnessBadge(harness: harness, size: 11, neutral: subline)
+                    }
+                    if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
+                        LineIconView(.gitBranch, size: 11, color: subline)
+                        Text(branch)
+                            .font(Theme.sans(Theme.textDense))
+                            .foregroundStyle(subline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    Spacer(minLength: 0)
                 }
-                if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
-                    LineIconView(.gitBranch, size: 11, color: subline)
-                    Text(branch)
-                        .font(Theme.sans(Theme.textCaption))
-                        .foregroundStyle(subline)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                Spacer(minLength: 0)
+                .padding(.leading, Self.indent)
             }
-            .padding(.leading, Self.indent)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
         .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
     }
 

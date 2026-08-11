@@ -25,7 +25,7 @@ struct SheetCard<Content: View>: View {
         }
         .background(SheetStyle.cardFill, in: RoundedRectangle(cornerRadius: SheetStyle.cardRadius))
         .overlay(RoundedRectangle(cornerRadius: SheetStyle.cardRadius)
-            .strokeBorder(whiteAlpha(0.06), lineWidth: 1))
+            .strokeBorder(Theme.border, lineWidth: 1))
     }
 }
 
@@ -140,7 +140,7 @@ struct SheetLabel: View {
 struct SheetRowButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .background(configuration.isPressed ? whiteAlpha(0.06) : .clear)
+            .background(configuration.isPressed ? Theme.elementHover : .clear)
     }
 }
 
@@ -157,7 +157,7 @@ struct SheetPrimaryButton: View {
                 .foregroundStyle(enabled ? Theme.bg : Theme.textFaint)
                 .frame(maxWidth: .infinity)
                 .frame(height: 50)
-                .background(enabled ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.08)),
+                .background(enabled ? AnyShapeStyle(Theme.text) : AnyShapeStyle(Theme.chip),
                             in: RoundedRectangle(cornerRadius: Theme.radiusRow))
         }
         .buttonStyle(.plain)
@@ -165,8 +165,9 @@ struct SheetPrimaryButton: View {
     }
 }
 
-/// Pressed-state wash for tappable rows and chips — the desktop's
-/// `element_hover` (white 6%) translated to touch. Fades out on release.
+/// Pressed-state wash for tappable rows — the canvas's `--hover`, which on a
+/// touch screen is what a finger holds down rather than what a pointer rests
+/// on. Fades out on release.
 struct PressWashButtonStyle: ButtonStyle {
     var cornerRadius: CGFloat = Theme.radiusRow
 
@@ -178,12 +179,71 @@ struct PressWashButtonStyle: ButtonStyle {
     }
 }
 
-/// Capsule variant for chips: deepens the existing fill while pressed.
-struct ChipPressButtonStyle: ButtonStyle {
+/// A row that lights the way the canvas draws a selected one — `--sel` (or
+/// `--selcard` inside a card) under the `--sellift` ring (ios.md B2.5 / B4.7 /
+/// C4.7).
+///
+/// **A phone has no resting selection**, which is why this is a press style and
+/// not a `selected: Bool`. The desktop keeps a cursor row because a pointer can
+/// hover somewhere it has not committed to; here a tap IS the commit, and what
+/// the row does in the instant before the push is the only selected state that
+/// exists. So the canvas's lit row is drawn at the moment it is being chosen
+/// rather than for as long as it stays chosen.
+///
+/// `PressWashButtonStyle` remains for rows the canvas never lights — sheet
+/// rows, chips, pickers — where `--hover` is the whole of the feedback.
+struct SelectRowButtonStyle: ButtonStyle {
+    var cornerRadius: CGFloat = Theme.radiusCard
+    /// The row sits inside a card, so it takes `--selcard` rather than `--sel`.
+    var card = false
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .overlay(RoundedRectangle(cornerRadius: Theme.radiusChip)
-                .fill(configuration.isPressed ? whiteAlpha(0.06) : .clear))
+            .selectedRow(configuration.isPressed, cornerRadius: cornerRadius, card: card)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+extension ButtonStyle where Self == SelectRowButtonStyle {
+    /// A board row, which the canvas lights full-bleed and un-rounded: the
+    /// section is the card, and a row inside it is a line (ios.md C4.1).
+    static var fullBleedSelect: SelectRowButtonStyle {
+        // scale-ok: full bleed is the absence of a radius, not a fourth step.
+        SelectRowButtonStyle(cornerRadius: 0, card: true)
+    }
+}
+
+extension ButtonStyle where Self == PressWashButtonStyle {
+    /// The same wash on a row that runs edge to edge — a board row, which the
+    /// canvas draws as a line in a ledger rather than as a card (ios.md C4.1).
+    ///
+    static var fullBleedPressWash: PressWashButtonStyle {
+        // scale-ok: the absence of a radius is not a fourth step on the
+        // scale, and it is spelled once, here, rather than at the call site.
+        PressWashButtonStyle(cornerRadius: 0)
+    }
+}
+
+/// Chip press feedback: deepens the existing fill while pressed, in the chip's
+/// own shape — a rounded `radiusChip` box by default, and a pill for the two
+/// chips the canvas draws as pills (a board row's verb, ios.md C4.6).
+struct ChipPressButtonStyle: ButtonStyle {
+    enum Shape {
+        case chip, capsule
+    }
+
+    var shape: Shape = .chip
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .overlay {
+                let wash = configuration.isPressed ? Theme.elementHover : Color.clear
+                switch shape {
+                // round-ok: the pill variant of a chip's own press feedback
+                case .capsule: Capsule().fill(wash)
+                case .chip: RoundedRectangle(cornerRadius: Theme.radiusChip).fill(wash)
+                }
+            }
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

@@ -63,9 +63,9 @@ struct ComposerShell<Chips: View>: View {
                     .padding(.trailing, 7)
             }
         }
-        .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
         .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: Theme.radiusCard))
-        .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(Theme.border, lineWidth: 1))
         // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
         .padding(.horizontal, focused ? 10 : 16)
         .motionAnimation(Motion.resize, value: focused)
@@ -114,7 +114,7 @@ struct ComposerShell<Chips: View>: View {
                 }
             }
             .frame(width: 36, height: 36)
-            .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.10)),
+            .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(Theme.chip),
                         in: sendShape)
             .contentShape(sendShape)
         }
@@ -207,7 +207,7 @@ struct QuestionPanel: View {
                         .foregroundStyle(Theme.textMuted)
                         .padding(.horizontal, 6)
                         .frame(height: 20)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
             }
 
@@ -229,7 +229,7 @@ struct QuestionPanel: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Rectangle().fill(whiteAlpha(0.06)).frame(height: 1)
+                Rectangle().fill(Theme.border).frame(height: 1)
                 TextField("Or type your own answer", text: Binding(
                     get: { typed[question.id] ?? "" },
                     set: { typed[question.id] = $0 }
@@ -262,7 +262,7 @@ struct QuestionPanel: View {
         }
         .padding(16)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
-        .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusCard).strokeBorder(Theme.border, lineWidth: 1))
         .padding(.horizontal, 12)
         .transition(.opacity)
     }
@@ -286,15 +286,15 @@ struct QuestionPanel: View {
                         .font(Theme.sans(Theme.textCaption))
                         .foregroundStyle(Theme.textMuted)
                         .frame(width: 22, height: 22)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(isPicked ? whiteAlpha(0.09) : whiteAlpha(0.025),
+            .background(isPicked ? Theme.elementActive : Theme.chip,
                         in: RoundedRectangle(cornerRadius: Theme.radiusRow))
             .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow)
-                .strokeBorder(isPicked ? whiteAlpha(0.16) : .clear, lineWidth: 1))
+                .strokeBorder(isPicked ? Theme.borderStrong : .clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }

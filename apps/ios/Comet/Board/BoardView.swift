@@ -59,7 +59,9 @@ struct BoardView: View {
                                                  onCancel: { cancel(row) })
                                     .listRowBackground(Color.clear)
                                     .listRowSeparator(.hidden)
-                                    .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                                    // ios.md C4.1: full-bleed. The section is
+                                    // the card; a row inside it is a line.
+                                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                             }
                         }
                     }
@@ -116,6 +118,10 @@ struct BoardView: View {
                                  afterDetail { path.append(.chat(chatId)) }
                              },
                              openReview: row.openReview)
+                // ios.md D1.1: the canvas draws a grabber at the top of this
+                // sheet. It is system chrome here rather than a drawn bar —
+                // asking for it is how a phone says "this drags away".
+                .presentationDragIndicator(.visible)
         }
         .overlay(alignment: .bottom) {
             if let notice {
@@ -224,13 +230,13 @@ struct BoardView: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: folded ? "chevron.right" : "chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Theme.textFaint)
                 Text(group.label)
-                    .font(Theme.sans(Theme.textCaption, weight: .medium))
+                    .font(Theme.sans(Theme.textDense, weight: .medium))
                     .foregroundStyle(group.route == nil
                         ? Theme.textFaint
-                        : Theme.textMuted)
+                        : Theme.textSubtle)
                 Text("\(group.rows.count)")
                     .font(Theme.mono(Theme.textCaption))
                     .foregroundStyle(Theme.textFaint)
@@ -250,12 +256,15 @@ struct BoardView: View {
             Text(state.glyph)
                 .font(Theme.mono(Theme.textCaption))
                 .foregroundStyle(boardStateColor(state))
-            Text(state.label)
-                .font(Theme.sans(Theme.textCaption, weight: .medium))
-                .foregroundStyle(Theme.textSubtle)
+            // ios.md C2.2: `--text`, not `--subtle`. On the board the
+            // section IS the structure; on Home a section header labels rows
+            // that can each be read alone.
+            Text(state.sectionTitle)
+                .font(Theme.sans(Theme.textDense, weight: .semibold))
+                .foregroundStyle(Theme.text)
             Text("\(count)")
                 .font(Theme.mono(Theme.textCaption))
-                .foregroundStyle(Theme.textFaint)
+                .foregroundStyle(Theme.textSubtle)
             Spacer(minLength: 0)
         }
         .textCase(nil)
@@ -342,8 +351,9 @@ struct BoardTaskRowView: View {
                 }
 
                 // Line 2: the issue title.
+                // ios.md C4.4 / Deviations: prose size, as on Home.
                 Text(row.title)
-                    .font(Theme.sans(Theme.textBody))
+                    .font(Theme.sans(Theme.textProse))
                     .foregroundStyle(row.boardState == .done ? Theme.textMuted : Theme.text)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -353,7 +363,7 @@ struct BoardTaskRowView: View {
                 HStack(spacing: 6) {
                     if !detail.text.isEmpty {
                         Text(detail.text)
-                            .font(Theme.sans(Theme.textCaption))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(subline)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -362,7 +372,7 @@ struct BoardTaskRowView: View {
                         // True of an attempt for its whole life, so it rides
                         // beside the state's own facts rather than inside them.
                         Text(billing)
-                            .font(Theme.sans(Theme.textCaption))
+                            .font(Theme.sans(Theme.textDense))
                             .foregroundStyle(Theme.warning)
                             .lineLimit(1)
                     }
@@ -371,11 +381,12 @@ struct BoardTaskRowView: View {
                 }
                 .padding(.leading, 18)
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 20)
             .padding(.vertical, 6)
-            .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(PressWashButtonStyle())
+        .buttonStyle(.fullBleedSelect)
         .contextMenu {
             if row.boardState.holdsPane {
                 Button("End this attempt", systemImage: "stop.circle", role: .destructive,
@@ -406,14 +417,18 @@ struct BoardTaskRowView: View {
 
     private func chip(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
+            // round-ok: the board row's verb chip, which the canvas draws
+            // as a pill (ios.md C4.6) — the one thumb target on the row, and
+            // the shape is what makes it read as one rather than as a label.
             Text(title)
-                .font(Theme.sans(Theme.textCaption, weight: .medium))
+                .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.text)
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 11)
                 .padding(.vertical, 4)
-                .background(whiteAlpha(0.07), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                // round-ok: the verb pill (ios.md C4.6)
+                .background(Theme.chip, in: Capsule())
         }
-        .buttonStyle(ChipPressButtonStyle())
+        .buttonStyle(ChipPressButtonStyle(shape: .capsule))
     }
 }
 

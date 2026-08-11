@@ -44,7 +44,7 @@ struct NeedsYouSection: View {
                 } label: {
                     NeedRowView(need: need)
                 }
-                .buttonStyle(PressWashButtonStyle())
+                .buttonStyle(SelectRowButtonStyle())
                 // A chat asking you something is a chat you are looking at, so
                 // the pin is offered here too (gh#166) — an orchestrator is
                 // usually pinned in the middle of the work that made you want
@@ -63,16 +63,18 @@ struct NeedsYouSection: View {
     private func header(count: Int) -> some View {
         HStack(spacing: 6) {
             Text(needsYouTitle)
-                .font(Theme.sans(Theme.textCaption, weight: .medium))
+                .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.textSubtle)
             // The count is the header's whole answer: how many things want me.
             if count > 0 {
+                // round-ok: a count pill — the canvas draws it fully round
                 Text("\(count)")
                     .font(Theme.mono(Theme.textCaption, weight: .medium))
                     .foregroundStyle(Theme.accent)
-                    .padding(.horizontal, 5)
+                    .padding(.horizontal, 6)
                     .padding(.vertical, 1)
-                    .background(Theme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                    // round-ok: a count pill (ios.md B2.1)
+                    .background(Theme.accent.opacity(Theme.statusBadgeTint), in: Capsule())
             }
             Spacer(minLength: 0)
         }
@@ -116,9 +118,9 @@ struct NeedRowView: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 7)
-        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusCard))
     }
 }
 
@@ -138,7 +140,7 @@ struct OrchestratorSlotSection: View {
                 } label: {
                     OrchestratorSlotView(slot: slot)
                 }
-                .buttonStyle(PressWashButtonStyle())
+                .buttonStyle(SelectRowButtonStyle())
                 // The kill switch, and on the phone the ONLY one (gh#144).
                 // This slot is often the only row a pinned chat has — its
                 // session ends and its space shelf may never have listed it —
@@ -196,12 +198,14 @@ struct OrchestratorSlotView: View {
             // Words on the right: "new" while something is unread, the time it
             // last spoke otherwise.
             if slot.unseen {
+                // round-ok: a badge — the canvas draws it fully round
                 Text("new")
                     .font(Theme.sans(Theme.textCaption, weight: .medium))
                     .foregroundStyle(Theme.status(.settled))
-                    .padding(.horizontal, 5)
+                    .padding(.horizontal, 7)
                     .padding(.vertical, 1)
-                    .background(Theme.status(.settled).opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                    // round-ok: the unread badge (ios.md B3.3)
+                    .background(Theme.status(.settled).opacity(Theme.statusBadgeTint), in: Capsule())
             } else if let lastAt = slot.lastAt {
                 Text(relativeTime(lastAt))
                     .font(Theme.sans(Theme.textCaption))
@@ -209,8 +213,8 @@ struct OrchestratorSlotView: View {
                     .fixedSize()
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, 9)
         .padding(.vertical, 7)
-        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .contentShape(RoundedRectangle(cornerRadius: Theme.radiusCard))
     }
 }

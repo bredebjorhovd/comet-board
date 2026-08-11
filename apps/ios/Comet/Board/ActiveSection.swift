@@ -82,7 +82,7 @@ struct ActiveSection: View {
                     .foregroundStyle(Theme.dangerText)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Theme.danger.opacity(0.14),
+                    .background(Theme.danger.opacity(Theme.statusBadgeTint),
                                 in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             Spacer(minLength: 0)

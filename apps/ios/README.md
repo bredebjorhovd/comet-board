@@ -191,8 +191,19 @@ looks like, so:
 
 ```sh
 scripts/ios-theme-shots.sh docs/screenshots "iPhone 15 Pro"
-                                     # Home + Board, both variants, 393x852
+             # Home + Board + the review sheet, both variants, 393x852
 ```
+
+The claims those six are read against are **`docs/design/ios.md`** — the
+canvas's screens as numbered yes-or-no statements, the same shape as
+`docs/design/window.md` for the desktop. It also says which claims `simctl`
+cannot reach (anything behind a touch) and are checked by hand instead.
+
+The palette itself is not in that file. `Theme/DesignCanvas.swift` transcribes
+`docs/design/tokens.md` under the canvas's own variable names, `Theme.swift`
+says which variable answers which job, and
+`crates/ui/tests/ios_theme.rs` reads the doc against the Swift so a drifting
+value fails in `cargo test` rather than in a screenshot (gh#279).
 
 **`Comet/Info.plist` still carries `UIUserInterfaceStyle = Dark`.** That key
 forces every window in the app and beats the device setting, so while it is
