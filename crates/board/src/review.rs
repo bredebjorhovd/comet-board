@@ -212,11 +212,14 @@ pub fn plan_delivery(
     // one that landed — four PRs times three endpoints, per merge, all of them
     // answering `NothingNew`.
     //
-    // Imperfect on purpose, and safe because it is: a comment that shares its
-    // poll window with a retarget is not consumed here, so it is still above
-    // its watermark and still delivered — by the next tick that finds the pull
-    // request moved with its base standing still. The trade is a rare, delayed
-    // delivery against a common, certain cost.
+    // Imperfect on purpose, and the imperfection is a delay rather than a loss:
+    // a comment that shares its poll window with a retarget is not fetched, but
+    // it is not consumed either, so it is still above its watermark. It does not
+    // arrive on the next tick — `updated_at` is advanced to the retarget's own
+    // stamp, so the gate above answers `Unchanged` until *something else moves
+    // the pull request*, and the first tick after that delivers it. Leaving the
+    // stamp behind instead would fetch one tick later and pay the very calls
+    // this gate exists to remove. §gh#288 states the residual risk in full.
     //
     // Never on first sight: an unknown base differs from every real one, and
     // skipping the first look would leave the floor unapplied and hand the
@@ -689,8 +692,9 @@ pub(crate) mod tests {
 
     /// The accepted imperfection: a comment that lands inside the same poll
     /// window as the retarget is not fetched then — but it was never consumed,
-    /// so it is still above its watermark, and the next thing that moves the
-    /// pull request delivers it.
+    /// so it is still above its watermark. Not the next *tick*: the retarget
+    /// advanced `updated_at`, so what recovers it is the next *event* on the
+    /// pull request, which is why the clock below steps to one.
     #[test]
     fn a_comment_that_shares_a_window_with_a_retarget_is_delivered_late_not_lost() {
         let mut state = seen("2026-07-28T11:00:00Z");
@@ -721,6 +725,19 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(d, Decision::Retargeted);
         assert_eq!(state.issue, 0, "unasked is not consumed");
+
+        // Every following tick over a pull request nothing else has touched is
+        // `Unchanged` — the delay is until the next *event*, not the next tick,
+        // and saying otherwise would be softer than this is.
+        let d = plan_delivery(
+            &mut state,
+            "2026-07-28T11:30:00Z",
+            "board/gh-287",
+            FLOOR,
+            || panic!("the retarget's stamp was recorded; this is the ordinary gate"),
+        )
+        .unwrap();
+        assert_eq!(d, Decision::Unchanged);
 
         // The next move of the pull request — with the base standing still —
         // hands it over.
