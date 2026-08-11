@@ -153,7 +153,7 @@ struct BoardDetailSheet: View {
                             .foregroundStyle(Theme.textMuted)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
-                            .background(whiteAlpha(0.07), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                            .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                     }
                 }
                 .padding(.top, 2)

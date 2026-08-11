@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Home and Board, in both variants, at the phone's own size (gh#257).
+# Every screen the canvas draws, in both variants, at the phone's own size.
 #
-# The theme has two variants now, and the half a text scan cannot check is what
-# the paint LOOKS like: `crates/ui/tests/ios_theme.rs` proves dark/shared scales
-# match the desktop and light matches the iOS reference; this proves somebody
-# looked at the result. Four screenshots, one command, no Xcode window.
+# The canvas (`docs/design/canvas/comet-ios.dc.html`) draws three: Home, Board
+# and the review sheet. This photographs all three in dark and in light, which
+# is six screenshots, one command, no Xcode window.
+#
+# The half a text scan cannot check is what the paint LOOKS like:
+# `crates/ui/tests/ios_theme.rs` proves the ported table equals
+# `docs/design/tokens.md` and that no view mixes its own colour; these prove
+# somebody looked at the result. The claims they are read against are
+# `docs/design/ios.md` — and the ones marked [manual] there are not in these
+# files, because `simctl` has no touch input and cannot hold a row down.
 #
 # The variant is passed as a launch arg (`-theme light`) rather than by flipping
 # the simulator's own appearance, for a reason worth knowing: `Info.plist` still
@@ -14,10 +20,17 @@
 # `xcrun simctl ui <sim> appearance light` would produce four DARK screenshots
 # and look like a bug in the theme. See `Comet/Theme/Appearance.swift`.
 #
-# The four land in docs/screenshots/ by default, where the desktop's live —
+# The six land in docs/screenshots/ by default, where the desktop's live —
 # they are the evidence for the PR, so they are meant to be committed. Captures
-# stage under /tmp and are copied there only after all four prove they are the
+# stage under /tmp and are copied there only after all six prove they are the
 # required 1179x2556 pixels (393x852pt at 3x).
+#
+# If the named simulator does not exist, create it — the size is the contract,
+# not the name, and a newer iPhone is a DIFFERENT canvas:
+#
+#   xcrun simctl create 'iPhone 15 Pro' \
+#     com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro \
+#     "$(xcrun simctl list runtimes | awk '/iOS/ { print $NF; exit }')"
 #
 # Usage: scripts/ios-theme-shots.sh [outdir] [simulator name]
 # Env:   COMET_SPEC_SIM (default "iPhone 15 Pro" — 393x852pt)
@@ -100,6 +113,10 @@ shot() {
 for theme in dark light; do
   shot home "$theme"
   shot board "$theme" -route board
+  # The third screen the canvas draws. `-sheet review` opens the first
+  # reviewable row's panel, preferring one parked in `review` — the state the
+  # canvas draws — over any other ended attempt.
+  shot review "$theme" -route board -sheet review
 done
 
 xcrun simctl terminate "$SIM" "$APP_ID" >/dev/null 2>&1 || true

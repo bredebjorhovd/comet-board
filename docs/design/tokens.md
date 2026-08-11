@@ -6,11 +6,19 @@ field that paints it. Reconciled for gh#274.
 The canvases are in `canvas/`. All five declare the same table, so this is one
 palette, not five — see `canvas/README.md`.
 
-Per-surface specs: `window.md` (gh#275), `stats.md` (gh#278).
+Per-surface specs: `window.md` (gh#275), `stats.md` (gh#278), `settings.md`
+(gh#277), `ios.md` (gh#279).
 
-Locked by `every_canvas_token_is_the_value_the_canvas_declares` in `theme.rs`.
-Change a value here and that test fails, which is the point: the last redesign
-pass drifted because nothing compared the two.
+Locked from both ends. `every_canvas_token_is_the_value_the_canvas_declares` in
+`theme.rs` holds the desktop to it; `ios_canvas_tokens_are_the_values_tokens_md_declares`
+in `crates/ui/tests/ios_theme.rs` reads THIS FILE and holds the phone's
+hand-port (`apps/ios/Comet/Theme/DesignCanvas.swift`) to it, row for row, in
+both variants. Change a value here and both tests fail, which is the point: the
+last redesign pass drifted because nothing compared the declarations.
+
+So there are three declarations of this table — the canvases in `canvas/`,
+`crates/ui/src/theme.rs`, and `DesignCanvas.swift` — and this file is the one
+they are all measured against.
 
 ## Surfaces
 

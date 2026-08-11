@@ -375,7 +375,7 @@ struct ToolGroupView: View {
                         .foregroundStyle(Theme.textMuted)
                         .rotationEffect(.degrees(open ? 90 : 0))
                         .frame(width: 18, height: 18)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                     Text(toolGroupSummary(tools))
                         .font(Theme.sans(Theme.textDense))
                         .foregroundStyle(Theme.textMuted)
@@ -410,7 +410,7 @@ struct ToolChipRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.textMuted)
                     .frame(width: 18, height: 18)
-                    .background(whiteAlpha(0.08), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                    .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 Text(tool.call.chipLabel)
                     .font(Theme.sans(Theme.textDense, weight: .medium))
                     .foregroundStyle(tool.isError ? Theme.danger : Theme.textMuted)
@@ -423,8 +423,8 @@ struct ToolChipRow: View {
             }
             .padding(.horizontal, 8)
             .frame(height: 30)
-            .background(whiteAlpha(0.03), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
-            .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+            .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(Theme.border, lineWidth: 1))
             .padding(.leading, 12)
         }
         .frame(height: 38)
@@ -442,7 +442,7 @@ struct ErrorChipView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.dangerText)
                 .frame(width: 20, height: 20)
-                .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                .background(Theme.danger.opacity(Theme.statusChipTint), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             Text("Error")
                 .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.text)
@@ -480,7 +480,7 @@ struct SkillChipView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(tint)
                 .frame(width: 22, height: 22)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                .background(tint.opacity(Theme.statusBadgeTint), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             // The name leads with its slash: `/comet-board` is what both the
             // operator and the agent call it.
             Text("/" + name)
@@ -520,7 +520,7 @@ struct InputChipView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 20, height: 20)
-                .background(whiteAlpha(0.09), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                .background(Theme.elementActive, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             Text("Question")
                 .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(Theme.text)
@@ -532,7 +532,7 @@ struct InputChipView: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 34)
-        .background(whiteAlpha(0.045), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
-        .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+        .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+        .overlay(RoundedRectangle(cornerRadius: Theme.radiusRow).strokeBorder(Theme.border, lineWidth: 1))
     }
 }

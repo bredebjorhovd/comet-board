@@ -246,7 +246,7 @@ struct NewSpaceSheet: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 44)
-        .background(whiteAlpha(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
     }
 
     /// Two boards in one org is rare and unguessable, so it is the one case the
@@ -267,7 +267,7 @@ struct NewSpaceSheet: View {
                                 // round-ok: a presence dot
                                 Circle()
                                     .fill(model.deviceOnline(candidate.deviceId)
-                                        ? Theme.status(.settled) : whiteAlpha(0.18))
+                                        ? Theme.status(.settled) : Theme.textFaint)
                                     .frame(width: 6, height: 6)
                                 Text(model.deviceName(candidate.deviceId))
                                     .font(Theme.sans(Theme.textBody, weight: .medium))
@@ -275,7 +275,7 @@ struct NewSpaceSheet: View {
                             }
                             .padding(.horizontal, 14)
                             .frame(height: 34)
-                            .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05),
+                            .background(selected ? Theme.elementActive : Theme.chip,
                                         in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                         }
                         .buttonStyle(.plain)
@@ -539,7 +539,7 @@ struct FolderBrowser: View {
                             // round-ok: a presence dot
                             Circle()
                                 .fill(model.deviceOnline(device.id)
-                                    ? Theme.status(.settled) : whiteAlpha(0.18))
+                                    ? Theme.status(.settled) : Theme.textFaint)
                                 .frame(width: 6, height: 6)
                             Text(device.name)
                                 .font(Theme.sans(Theme.textBody, weight: .medium))
@@ -547,7 +547,7 @@ struct FolderBrowser: View {
                         }
                         .padding(.horizontal, 14)
                         .frame(height: 36)
-                        .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+                        .background(selected ? Theme.elementActive : Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusRow))
                     }
                     .buttonStyle(.plain)
                 }
@@ -567,7 +567,7 @@ struct FolderBrowser: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(listing?.parent == nil ? Theme.textFaint : Theme.text)
                     .frame(width: 32, height: 32)
-                    .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                    .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
             }
             .buttonStyle(.plain)
             .disabled(listing?.parent == nil)
@@ -649,7 +649,7 @@ struct FolderBrowser: View {
                         .foregroundStyle(Theme.accent)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(Theme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                        .background(Theme.accent.opacity(Theme.statusChipTint), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
                 }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 12, weight: .semibold))

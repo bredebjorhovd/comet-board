@@ -9,10 +9,16 @@ import SwiftUI
 
 enum GradientSpin {
     // GSPIN_ROW_TINTS: row0 cool blue, row1 amber, row2 pink.
+    //
+    // Not theme paint, and marked so on each line: this is a drawn ASSET
+    // shared with the desktop — the exact three tints in
+    // `crates/ui/src/loaders.rs`, which is what makes the two spinners the
+    // same animation rather than two animations of the same shape. The design
+    // canvas does not declare them because the canvas cannot draw motion.
     static let rowTints: [Color] = [
-        Color(red: 0xB6 / 255, green: 0xD3 / 255, blue: 0xEF / 255),
-        Color(red: 0xED / 255, green: 0xB1 / 255, blue: 0x85 / 255),
-        Color(red: 0xF8 / 255, green: 0x88 / 255, blue: 0xA0 / 255),
+        Color(red: 0xB6 / 255, green: 0xD3 / 255, blue: 0xEF / 255),  // paint-ok: gspin asset
+        Color(red: 0xED / 255, green: 0xB1 / 255, blue: 0x85 / 255),  // paint-ok: gspin asset
+        Color(red: 0xF8 / 255, green: 0x88 / 255, blue: 0xA0 / 255),  // paint-ok: gspin asset
     ]
     static let dim = 0.1
 
@@ -135,7 +141,7 @@ extension ChatIndicator {
     /// its dot is a hairline. The two dimming opacities that propped up the
     /// old pink and emerald retired with the anchor.
     var dotColor: Color {
-        Status.ofChat(self).map(Theme.status) ?? whiteAlpha(0.14)
+        Status.ofChat(self).map(Theme.status) ?? Theme.textFaint
     }
 }
 

@@ -47,6 +47,9 @@ enum BoardState: String, CaseIterable, Hashable {
         }
     }
 
+    /// The PUBLISHED spelling — `BLOCKED`, `DONE TODAY`. The TUI, the CLI, the
+    /// desktop and this app all say it, and a contract is not something one
+    /// viewport edits.
     var label: String {
         switch self {
         case .blocked: return "BLOCKED"
@@ -56,6 +59,23 @@ enum BoardState: String, CaseIterable, Hashable {
         case .failed: return "FAILED"
         // The header says "DONE today" and it means it — see `sections`.
         case .done: return "DONE TODAY"
+        }
+    }
+
+    /// A section header's words on THIS surface — a port of the desktop
+    /// panel's `section_title` (gh#176), which the phone never got.
+    ///
+    /// Caps are a typographic choice, not part of the vocabulary, and the
+    /// canvas has stopped making it: a header shouting in a grey slab was loud
+    /// without being clear. Same words, sentence case (ios.md C2.1).
+    var sectionTitle: String {
+        switch self {
+        case .blocked: return "Blocked"
+        case .working: return "Working"
+        case .ready: return "Ready"
+        case .review: return "Review"
+        case .failed: return "Failed"
+        case .done: return "Done today"
         }
     }
 
