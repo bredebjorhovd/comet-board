@@ -522,7 +522,8 @@ enum RoutesCommand {
         /// Route number, as printed by `routes list` (1-based).
         route: usize,
         /// One of: name, workspace, repo, runtime, account, branch_template,
-        /// base, max_concurrent, max_duration, billing_guard.
+        /// base, max_concurrent, max_duration, max_tool_failures,
+        /// max_tool_calls, archive_chats, billing_guard.
         key: String,
         /// The new value. Omit with `--unset` to remove the key, which falls
         /// the route back to `[defaults]`.
@@ -535,7 +536,8 @@ enum RoutesCommand {
     Defaults {
         /// One of: max_concurrent_per_workspace, branch_template, base,
         /// notify, notify_dispatcher, orchestrator_chat, new_source,
-        /// max_duration, billing_guard.
+        /// max_duration, max_tool_failures, max_tool_calls, retain_worktrees,
+        /// retain_build_output, archive_chats, billing_guard.
         key: String,
         value: Option<String>,
         #[arg(long, conflicts_with = "value")]

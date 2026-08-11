@@ -140,6 +140,12 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
             name: "Ana Ruiz".into(),
             email: "22494697+ana@users.noreply.github.com".into(),
         }),
+        // The route's turn guardrails ride the spec (gh#270) and are stamped
+        // on the chat, where the engine's run loop reads them.
+        turn_limits: comet_proto::TurnLimits {
+            tool_failures: Some(9),
+            tool_calls: Some(900),
+        },
         prompt: "do the thing".into(),
     };
     let rt = runtime.clone();
@@ -263,6 +269,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         account: Some("ffffffffffffffff".into()),
         push_repo: None,
         git_author: None,
+        turn_limits: Default::default(),
         prompt: "should never be sent".into(),
     };
     let err = tokio::task::spawn_blocking(move || rt.dispatch(&bogus))

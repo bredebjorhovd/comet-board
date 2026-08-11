@@ -42,6 +42,7 @@ pub mod runtime;
 pub mod settled;
 pub mod skill;
 pub mod sources;
+pub mod spin;
 pub mod stats;
 pub mod sync;
 pub mod verdict;

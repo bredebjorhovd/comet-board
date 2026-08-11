@@ -422,6 +422,7 @@ async fn chat_config_selects_the_run_harness() {
                 account: None,
                 push_repo: None,
                 git_author: None,
+                turn_limits: Default::default(),
             }),
             None,
         )

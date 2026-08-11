@@ -457,6 +457,10 @@ pub fn build_spec(
         harness,
         model: overrides.model.clone(),
         account: effective_account(route, overrides).map(str::to_string),
+        // What the engine's run loop will hold this attempt's turns to
+        // (gh#270). Resolved here because the route is here — the loop that
+        // enforces it sees events, not config.
+        turn_limits: cfg.turn_limits(Some(route)),
     })
 }
 
@@ -698,6 +702,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.push_repo, None);
+    }
+
+    /// gh#270: the guardrails the engine's run loop enforces are resolved from
+    /// the route *here*, because that loop sees events and has no board to ask.
+    #[test]
+    fn a_dispatch_carries_its_routes_turn_guardrails() {
+        let mut cfg = RoutingConfig::default();
+        let mut r = route();
+        r.max_tool_failures = Some("25".into());
+        cfg.defaults.max_tool_calls = "off".into();
+        let spec = build_spec(
+            &cfg,
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.turn_limits.tool_failures, Some(25));
+        assert_eq!(spec.turn_limits.tool_calls, None);
     }
 
     /// gh#107: the teammate who released the work is the author of what comes
