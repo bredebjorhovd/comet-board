@@ -520,7 +520,12 @@ impl Render for RoutingPage {
             // then a description of a file rather than of the board.
             for (ix, problem) in config.routing.problems.iter().enumerate() {
                 column = column.child(
-                    widgets::warning_strip(&theme, problem.clone()).id(("routing-problem", ix)),
+                    widgets::warning_strip(&theme, problem.clone())
+                        // The strip carries no margin of its own (gh#277): a
+                        // section stacks it on the section's own gap, and a
+                        // page that appends one to a gapless column says so.
+                        .mt(px(widgets::HEADER_GAP))
+                        .id(("routing-problem", ix)),
                 );
             }
 

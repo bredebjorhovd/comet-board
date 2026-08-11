@@ -50,7 +50,7 @@ impl gpui::Render for AppearancePage {
         let theme = Theme::of(cx).clone();
         let choice = self.choice;
 
-        let rows = ThemeChoice::ALL.into_iter().map(|option| {
+        let rows = ThemeChoice::ALL.into_iter().enumerate().map(|(ix, option)| {
             let selected = option == choice;
             let (title, description) = option.describe();
             div()
@@ -58,10 +58,14 @@ impl gpui::Render for AppearancePage {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(14.0))
-                .px(px(20.0))
+                .gap(px(widgets::ROW_GAP))
+                .px(px(widgets::ROW_PAD_X))
                 .py(px(16.0))
                 .min_h(px(72.0))
+                // Every card in settings separates its rows with a hairline
+                // (`docs/design/settings.md` J3) — without it the two options
+                // read as one block with a tint floating in it.
+                .when(ix > 0, |el| el.border_t_1().border_color(theme.border))
                 .cursor_pointer()
                 // The chosen theme is a selected row in a card that is WHITE
                 // in one of the two options this page offers: it steps down
