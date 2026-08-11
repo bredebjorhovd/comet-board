@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::config::GithubAuth;
@@ -592,11 +592,15 @@ impl HttpAppApi {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("Authorization", format!("Bearer {jwt}"))
             .send()?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("github HTTP {status} for {path}");
+        let status = resp.status().as_u16();
+        // The body first, then the verdict: a refusal here is the App's own
+        // credential being turned away, and "github HTTP 422" tells whoever
+        // installed it nothing about which half of the key is wrong (gh#338).
+        let body: Value = resp.json().unwrap_or(Value::Null);
+        if !(200..300).contains(&status) {
+            return Err(crate::sources::github::refusal(status, path, &body));
         }
-        Ok(resp.json().unwrap_or(Value::Null))
+        Ok(body)
     }
 }
 
@@ -770,7 +774,7 @@ impl AppApi for Rc<FakeAppApi> {
                     .collect(),
             ));
         }
-        bail!("no fake for GET {path}")
+        anyhow::bail!("no fake for GET {path}")
     }
 
     fn post(&self, path: &str, _bearer: &str) -> Result<Value> {
