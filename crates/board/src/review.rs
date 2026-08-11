@@ -41,11 +41,13 @@
 //!
 //! What else survives unchanged: the `updated_at` gate (the PR list already
 //! says whether anything happened, so the steady state costs no comment
-//! fetches), the first-sight floor (never deliver a PR's back catalogue), the
-//! actionability filter (the board's own writeback comments, empty approvals),
-//! and the author check — the chat must still exist and its cwd must still be
-//! the attempt's checkout, because delivering somebody else's review into an
-//! unrelated session is worse than not delivering.
+//! fetches — with the base folded into it, §gh#288, so a stack retargeting
+//! itself is not mistaken for news), the first-sight floor (never deliver a
+//! PR's back catalogue), the actionability filter (the board's own writeback
+//! comments, empty approvals), and the author check — the chat must still
+//! exist and its cwd must still be the attempt's checkout, because delivering
+//! somebody else's review into an unrelated session is worse than not
+//! delivering.
 
 use crate::db::Db;
 use crate::model::{Attempt, BoardState, Task};
@@ -79,6 +81,20 @@ pub struct Delivered {
     /// already reports this.
     #[serde(default)]
     pub updated_at: String,
+    /// The branch the pull request merged into when those watermarks were
+    /// computed (§gh#288).
+    ///
+    /// The other half of the poll-cost gate above. When a stack's lower layer
+    /// merges, GitHub retargets every pull request above it, and each retarget
+    /// bumps `updated_at` with nothing on any comment endpoint to show for it —
+    /// so `updated_at` alone answers "did anything happen?" with yes for a
+    /// five-PR stack's worth of pure waste. Recorded here, a move in the base
+    /// accounts for the move in the timestamp.
+    ///
+    /// Empty means unknown rather than "no base": state written before this
+    /// field existed, which is why the first tick after an upgrade fetches.
+    #[serde(default)]
+    pub base_ref: String,
     /// Whether a missing chat has already been logged, so a task whose chat the
     /// operator archived does not write the same line every 30 seconds.
     #[serde(default)]
@@ -124,6 +140,11 @@ pub enum Decision {
     /// Nothing has happened on the pull request since the last look. Costs no
     /// GitHub call at all.
     Unchanged,
+    /// The pull request moved, and a retarget accounts for it: the base branch
+    /// is not the one the watermarks were computed against, which is what a
+    /// lower layer of a stack merging does to every layer above it. Costs no
+    /// GitHub call either (§gh#288).
+    Retargeted,
     /// Nothing above the watermark is worth telling anyone about.
     NothingNew,
     /// Queue these into the authoring chat.
@@ -172,6 +193,7 @@ pub(crate) fn is_the_boards_own(body: &str) -> bool {
 pub fn plan_delivery(
     state: &mut Delivered,
     pr_updated_at: &str,
+    pr_base_ref: &str,
     floor: &str,
     fetch: impl FnOnce() -> Result<Vec<Feedback>>,
 ) -> Result<Decision> {
@@ -183,6 +205,35 @@ pub fn plan_delivery(
     }
 
     let first_sight = state.first_sight();
+
+    // The same gate, with the base folded in (§gh#288). A retarget is the one
+    // thing that moves `updated_at` while leaving all three comment endpoints
+    // exactly as they were, and a merged stack does it to every layer above the
+    // one that landed — four PRs times three endpoints, per merge, all of them
+    // answering `NothingNew`.
+    //
+    // Imperfect on purpose, and the imperfection is a delay rather than a loss:
+    // a comment that shares its poll window with a retarget is not fetched, but
+    // it is not consumed either, so it is still above its watermark. It does not
+    // arrive on the next tick — `updated_at` is advanced to the retarget's own
+    // stamp, so the gate above answers `Unchanged` until *something else moves
+    // the pull request*, and the first tick after that delivers it. Leaving the
+    // stamp behind instead would fetch one tick later and pay the very calls
+    // this gate exists to remove. §gh#288 states the residual risk in full.
+    //
+    // Never on first sight: an unknown base differs from every real one, and
+    // skipping the first look would leave the floor unapplied and hand the
+    // agent the whole back catalogue the next time anything moved.
+    let retargeted = !first_sight
+        && !state.base_ref.is_empty()
+        && !pr_base_ref.is_empty()
+        && state.base_ref != pr_base_ref;
+    if retargeted {
+        state.base_ref = pr_base_ref.to_string();
+        state.updated_at = pr_updated_at.to_string();
+        return Ok(Decision::Retargeted);
+    }
+
     let feedback = fetch()?;
     let fresh: Vec<Feedback> = feedback
         .iter()
@@ -199,6 +250,7 @@ pub fn plan_delivery(
         state.record(f);
     }
     state.updated_at = pr_updated_at.to_string();
+    state.base_ref = pr_base_ref.to_string();
 
     if fresh.is_empty() {
         return Ok(Decision::NothingNew);
@@ -413,7 +465,7 @@ impl SyncEngine {
             .clone()
             .unwrap_or_else(|| attempt.started_at.clone());
 
-        let decision = plan_delivery(&mut state, &pr.updated_at, &floor, || {
+        let decision = plan_delivery(&mut state, &pr.updated_at, &pr.base_ref, &floor, || {
             gh.pr_feedback(&pr.repo, pr.number)
         })?;
 
@@ -434,6 +486,14 @@ impl SyncEngine {
                 task.identifier,
                 items.len(),
                 pr.url
+            ));
+        }
+        if decision == Decision::Retargeted {
+            // Said once per retarget, so an operator watching a stack land can
+            // see why a moved pull request asked GitHub nothing.
+            self.log.info(format!(
+                "{}: {} was retargeted onto {} — nothing to fetch",
+                task.identifier, pr.url, pr.base_ref
             ));
         }
         store(&self.db, &task.id, &state)?;
@@ -479,19 +539,29 @@ pub(crate) mod tests {
 
     const FLOOR: &str = "2026-07-28T10:00:00Z";
 
+    /// The base a pull request outside a stack keeps for its whole life, so a
+    /// test that is not about retargeting never has to mention one.
+    const BASE: &str = "main";
+
     fn plan(state: &mut Delivered, updated_at: &str, items: Vec<Feedback>) -> Decision {
-        plan_delivery(state, updated_at, FLOOR, || Ok(items)).unwrap()
+        plan_delivery(state, updated_at, BASE, FLOOR, || Ok(items)).unwrap()
+    }
+
+    /// A pull request the board has already looked at once, watermarks and all.
+    fn seen(updated_at: &str) -> Delivered {
+        Delivered {
+            updated_at: updated_at.into(),
+            base_ref: BASE.into(),
+            ..Default::default()
+        }
     }
 
     /// The steady state, and the one that has to be free: the pull request has
     /// not moved, so none of the three comment endpoints is asked at all.
     #[test]
     fn an_unchanged_pull_request_costs_no_api_call() {
-        let mut state = Delivered {
-            updated_at: "2026-07-28T11:00:00Z".into(),
-            ..Default::default()
-        };
-        let decision = plan_delivery(&mut state, "2026-07-28T11:00:00Z", FLOOR, || {
+        let mut state = seen("2026-07-28T11:00:00Z");
+        let decision = plan_delivery(&mut state, "2026-07-28T11:00:00Z", BASE, FLOOR, || {
             panic!("nothing moved on the PR; there is nothing to ask about")
         })
         .unwrap();
@@ -500,10 +570,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_changes_requested_review_is_delivered_and_watermarked() {
-        let mut state = Delivered {
-            updated_at: "2026-07-28T11:00:00Z".into(),
-            ..Default::default()
-        };
+        let mut state = seen("2026-07-28T11:00:00Z");
         let d = plan(
             &mut state,
             "2026-07-28T11:30:00Z",
@@ -529,10 +596,7 @@ pub(crate) mod tests {
     /// single bounce and the convergence.
     #[test]
     fn an_agents_own_reply_is_relayed_once_and_never_twice() {
-        let mut state = Delivered {
-            updated_at: "2026-07-28T11:00:00Z".into(),
-            ..Default::default()
-        };
+        let mut state = seen("2026-07-28T11:00:00Z");
         // The orchestrator asks for changes.
         let d = plan(
             &mut state,
@@ -562,7 +626,7 @@ pub(crate) mod tests {
 
         // The relay provokes no new PR comment, so the chain is over: the PR
         // has not moved, and even when it moves again the reply cannot return.
-        let d = plan_delivery(&mut state, "2026-07-28T11:40:00Z", FLOOR, || {
+        let d = plan_delivery(&mut state, "2026-07-28T11:40:00Z", BASE, FLOOR, || {
             panic!("unchanged PR; not asked")
         })
         .unwrap();
@@ -591,6 +655,151 @@ pub(crate) mod tests {
             )],
         );
         assert!(matches!(d, Decision::Deliver(items) if items.len() == 1));
+    }
+
+    /// What a stack does to this gate (§gh#288): the layer below merges,
+    /// GitHub retargets this pull request onto it, `updated_at` moves, and
+    /// there is nothing on any of the three endpoints to show for it.
+    #[test]
+    fn a_retarget_moves_the_timestamp_and_costs_no_api_call() {
+        let mut state = Delivered {
+            updated_at: "2026-07-28T11:00:00Z".into(),
+            base_ref: "board/gh-287".into(),
+            ..Default::default()
+        };
+        let d = plan_delivery(&mut state, "2026-07-28T11:30:00Z", "main", FLOOR, || {
+            panic!("a retarget is not news; there is nothing to ask about")
+        })
+        .unwrap();
+        assert_eq!(d, Decision::Retargeted);
+        // Both halves of the gate move, or the next tick pays the cost anyway.
+        assert_eq!(state.updated_at, "2026-07-28T11:30:00Z");
+        assert_eq!(state.base_ref, "main");
+
+        // And the pull request is still watched: a real review on the new base
+        // is fetched and delivered.
+        let d = plan_delivery(&mut state, "2026-07-28T11:40:00Z", "main", FLOOR, || {
+            Ok(vec![verdict(
+                900,
+                "changes_requested",
+                "Rebase left a stray import.",
+                "2026-07-28T11:40:00Z",
+            )])
+        })
+        .unwrap();
+        assert!(matches!(d, Decision::Deliver(items) if items.len() == 1));
+    }
+
+    /// The accepted imperfection: a comment that lands inside the same poll
+    /// window as the retarget is not fetched then — but it was never consumed,
+    /// so it is still above its watermark. Not the next *tick*: the retarget
+    /// advanced `updated_at`, so what recovers it is the next *event* on the
+    /// pull request, which is why the clock below steps to one.
+    #[test]
+    fn a_comment_that_shares_a_window_with_a_retarget_is_delivered_late_not_lost() {
+        let mut state = seen("2026-07-28T11:00:00Z");
+        let comment = feedback(
+            FeedbackKind::Issue,
+            41,
+            "This one broke the build.",
+            "2026-07-28T11:29:00Z",
+        );
+
+        let d = plan(&mut state, "2026-07-28T11:30:00Z", vec![comment.clone()]);
+        assert_eq!(
+            d,
+            Decision::Deliver(vec![comment.clone()]),
+            "no stack, no gate"
+        );
+
+        // The same window, on a stacked pull request that was retargeted: not
+        // asked, so nothing is consumed.
+        let mut state = seen("2026-07-28T11:00:00Z");
+        let d = plan_delivery(
+            &mut state,
+            "2026-07-28T11:30:00Z",
+            "board/gh-287",
+            FLOOR,
+            || Ok(vec![comment.clone()]),
+        )
+        .unwrap();
+        assert_eq!(d, Decision::Retargeted);
+        assert_eq!(state.issue, 0, "unasked is not consumed");
+
+        // Every following tick over a pull request nothing else has touched is
+        // `Unchanged` — the delay is until the next *event*, not the next tick,
+        // and saying otherwise would be softer than this is.
+        let d = plan_delivery(
+            &mut state,
+            "2026-07-28T11:30:00Z",
+            "board/gh-287",
+            FLOOR,
+            || panic!("the retarget's stamp was recorded; this is the ordinary gate"),
+        )
+        .unwrap();
+        assert_eq!(d, Decision::Unchanged);
+
+        // The next move of the pull request — with the base standing still —
+        // hands it over.
+        let d = plan_delivery(
+            &mut state,
+            "2026-07-28T12:00:00Z",
+            "board/gh-287",
+            FLOOR,
+            || Ok(vec![comment.clone()]),
+        )
+        .unwrap();
+        assert_eq!(d, Decision::Deliver(vec![comment]));
+    }
+
+    /// State written before the base was folded in (§gh#288) knows no base at
+    /// all. Unknown is not "changed": the first tick after the upgrade fetches
+    /// as it always did, and records the base it compared nothing against.
+    #[test]
+    fn a_record_from_before_the_base_was_stored_is_not_read_as_a_retarget() {
+        let mut state = Delivered {
+            updated_at: "2026-07-28T11:00:00Z".into(),
+            ..Default::default()
+        };
+        assert!(state.base_ref.is_empty());
+        let d = plan(
+            &mut state,
+            "2026-07-28T11:30:00Z",
+            vec![feedback(
+                FeedbackKind::Issue,
+                41,
+                "Still wrong on the retry path.",
+                "2026-07-28T11:30:00Z",
+            )],
+        );
+        assert!(matches!(d, Decision::Deliver(items) if items.len() == 1));
+        assert_eq!(state.base_ref, BASE, "and the gate is armed from here on");
+    }
+
+    /// First sight has no base to compare against either — and skipping it
+    /// would be worse than unthrifty: the floor applies only on first sight, so
+    /// a skipped first look would hand the agent the whole back catalogue the
+    /// next time anything moved.
+    #[test]
+    fn the_first_look_at_a_pull_request_is_never_a_retarget() {
+        let mut state = Delivered::default();
+        let d = plan_delivery(
+            &mut state,
+            "2026-07-28T12:00:00Z",
+            "board/gh-287",
+            FLOOR,
+            || {
+                Ok(vec![feedback(
+                    FeedbackKind::Issue,
+                    10,
+                    "Opened the PR.",
+                    "2026-07-28T09:30:00Z",
+                )])
+            },
+        )
+        .unwrap();
+        assert_eq!(d, Decision::NothingNew, "asked, and floored");
+        assert_eq!(state.issue, 10, "consumed, so it can never come back");
     }
 
     /// First sight must not hand an agent the pull request's whole back
@@ -1061,6 +1270,46 @@ pub(crate) mod tests {
         // And a second cycle over an unchanged pull request asks nothing at all.
         e.deliver_reviews(&runtime, &[pull("board/gh-13")]);
         assert_eq!(rest.asked.borrow().len(), 3, "the updated_at gate held");
+    }
+
+    /// The stack case end to end (§gh#288): the layer below lands, GitHub
+    /// retargets this pull request, and the cycle that sees it asks nothing.
+    /// Repeat that per layer per merge and it is the whole saving.
+    #[test]
+    fn a_retargeted_pull_request_asks_github_nothing() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![
+            (
+                "/repos/o/r/issues/14/comments".into(),
+                serde_json::json!([]),
+            ),
+            ("/repos/o/r/pulls/14/comments".into(), serde_json::json!([])),
+            ("/repos/o/r/pulls/14/reviews".into(), serde_json::json!([])),
+        ]));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        // One look, on a pull request stacked on the layer below.
+        let mut pr = pull("board/gh-13");
+        pr.base_ref = "board/gh-12".into();
+        e.deliver_reviews(&runtime, std::slice::from_ref(&pr));
+        assert_eq!(rest.asked.borrow().len(), 3);
+        assert_eq!(state_of(&e).base_ref, "board/gh-12");
+
+        // gh#12 merges. GitHub retargets this one onto main and stamps it.
+        pr.base_ref = "main".into();
+        pr.updated_at = "2026-07-28T12:00:00Z".into();
+        e.deliver_reviews(&runtime, std::slice::from_ref(&pr));
+        assert_eq!(
+            rest.asked.borrow().len(),
+            3,
+            "a retarget is not news: {:?}",
+            rest.asked.borrow()
+        );
+        let state = state_of(&e);
+        assert_eq!(state.updated_at, "2026-07-28T12:00:00Z");
+        assert_eq!(state.base_ref, "main");
+        assert!(runtime.prompts.borrow().is_empty());
     }
 
     /// The whole point: a review lands, and the chat that wrote the pull
