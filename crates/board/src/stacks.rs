@@ -28,6 +28,11 @@
 //!   claim about *merging* it, which is [`landing`]'s business and lives on the
 //!   row rather than in the settle.
 //!
+//! The other half of this file is the *authoring* side (gh#287): the branch
+//! convention an agent-written stack has to follow for its layers to reach the
+//! board as one attempt's work rather than as strangers, and the block of brief
+//! that tells a dispatched agent to write one. See [`layer_branch`].
+//!
 //! [`landing`]: comet_proto::view::board::landing
 
 use std::collections::HashMap;
@@ -121,6 +126,135 @@ fn stack_key(task: &Task) -> Option<StackKey> {
         .map(str::to_string)
         .or_else(|| crate::model::pr_repo(task.pr_url.as_deref()?))?;
     Some((repo, number))
+}
+
+// ---- authoring a stack (gh#287) -----------------------------------------
+
+/// The branch an attempt's `layer`-th stack layer must be called: layer 1 is
+/// the attempt branch itself, and every layer above it is that name with `-2`,
+/// `-3`, … on the end.
+///
+/// The board names one branch per attempt ([`crate::dispatch::resolve_branch`])
+/// and links a pull request to a task by that name
+/// (`pr_matches_branch`). An agent that decomposes its task into a stack
+/// creates branches the board never named, and unless their names *say* whose
+/// they are, every layer above the first arrives as a pull request belonging to
+/// nobody — imported as a row of its own, dispatchable, reviewed by no chat.
+/// So the names are a convention rather than the agent's choice, and
+/// [`stack_brief`] states it as one.
+///
+/// **Not `board/gh-12-widget/2`**, which is what this issue was filed asking
+/// for and which git cannot store: a ref is a path, so `refs/heads/…/widget`
+/// being a file forbids `refs/heads/…/widget/2` from being a directory. The
+/// bottom layer *is* the attempt branch — that is the whole point of the
+/// convention — so a separator that nests is the one shape unavailable. A
+/// suffix on the last segment is the next most legible thing, and it sorts
+/// beside its own stack in every branch listing.
+///
+/// Layer numbering starts at 1 so that it reads as GitHub's own `position`,
+/// which also counts the bottom as 1.
+pub fn layer_branch(attempt_branch: &str, layer: i64) -> String {
+    match layer {
+        ..=1 => attempt_branch.to_string(),
+        n => format!("{attempt_branch}-{n}"),
+    }
+}
+
+/// Which layer of the stack cut from `attempt_branch` this head ref is: `Some(1)`
+/// for the attempt branch itself, `Some(n)` for `<attempt branch>-n`, `None` for
+/// a branch that is nothing to do with it.
+///
+/// Deliberately strict about the suffix — digits only, no leading zero, never
+/// below 2 — because the cost of a false positive is a real pull request
+/// swallowed into somebody else's attempt. `board/gh-28-x` and `board/gh-28-x-2`
+/// are both branches the board itself can name (the second for issue 28 of a
+/// repo called `x-2`), and the only reason that pair is safe is that linking is
+/// scoped to one repository first: two repos are never each other's layers.
+/// Callers that reach beyond one repo must keep that scope.
+pub fn layer_of(head_ref: &str, attempt_branch: &str) -> Option<i64> {
+    if attempt_branch.is_empty() || head_ref.is_empty() {
+        return None;
+    }
+    if head_ref == attempt_branch {
+        return Some(1);
+    }
+    let suffix = head_ref.strip_prefix(attempt_branch)?.strip_prefix('-')?;
+    if suffix.starts_with('0') || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok().filter(|n| *n >= 2)
+}
+
+/// The block [`crate::dispatch::resolve_prompt`] appends when a dispatch asks
+/// for a stack — the only channel the board has to the thing doing the writing.
+///
+/// It is appended rather than interpolated for [`crate::dispatch::pr_base`]'s
+/// reason: a route's own `prompt` is somebody's wording for the *task*, and
+/// whether this particular release wants layers is a fact about the dispatch
+/// that the same somebody could not have known when they wrote the template.
+///
+/// What it has to carry, and why each part is in it:
+///
+/// - **The convention, as a requirement.** [`layer_branch`] is what makes the
+///   layers this attempt's; an agent that names them anything else has produced
+///   work the board cannot attribute, and no later poll repairs it.
+/// - **The non-interactive flags, spelled out.** `gh stack submit` opens an
+///   editor and creates *drafts* unless told otherwise, and a stack of drafts
+///   is a stack nobody reviews. The upstream skill's own rule is to never rely
+///   on TTY detection, and this is that rule with our two flags named.
+/// - **The install.** The extension is box-level (`~/.local/share/gh/…`), not
+///   per-run, so a fresh box has not got it and the failure is a bare `unknown
+///   command "stack" for "gh"` halfway through a task. gh#324 measured that
+///   `gh extension install` succeeds through the board's `gh` shim on the
+///   minted installation token, so the agent can repair it in place — which is
+///   the difference between a box-level prerequisite and a dispatch that dies.
+/// - **A floor.** Two layers is the smallest thing that is a stack; below that
+///   the ceremony buys nothing and one pull request is the honest shape.
+///
+/// `base` is [`crate::dispatch::pr_base`]'s answer: the branch the *stack*
+/// lands on, or `None` when the repo's own default is already right. Only the
+/// bottom layer has a base to argue about — GitHub bases every layer above it
+/// on the layer below and retargets them as the stack merges.
+pub fn stack_brief(branch: &str, base: Option<&str>) -> String {
+    let init = match base {
+        Some(base) => format!("gh stack init {branch} --base {base}"),
+        None => format!("gh stack init {branch}"),
+    };
+    let second = layer_branch(branch, 2);
+    let third = layer_branch(branch, 3);
+    format!(
+        "\n\nThis dispatch asks for a **stacked** pull request: decompose the work \
+         into layers and open one pull request per layer, with GitHub's `gh stack` \
+         extension. Design the stack before you write any of it — one dependent \
+         concern per layer, foundations at the bottom and the code that needs them \
+         above. If the work does not honestly split into at least two layers, open \
+         one ordinary pull request and say in its description why it did not.\
+         \n\nThe layer branch names are the board's, not yours: layer 1 is `{branch}` \
+         — the branch you are standing on, never renamed and never replaced — and \
+         every layer above it is `{second}`, `{third}`, and so on in order. That \
+         naming is how the board knows the layers are one attempt's work; a layer \
+         branched under any other name arrives as a pull request belonging to \
+         nobody.\
+         \n\n```\
+         \n{init}  # adopt the branch you are on as layer 1\
+         \n# write and commit layer 1\
+         \ngh stack add {second}  # cut the next layer at HEAD\
+         \n# write and commit layer 2, and so on\
+         \ngh stack submit --auto --open  # push every branch, open every pull request\
+         \ngh stack view --json  # confirm what GitHub now holds\
+         \n```\
+         \n\nPass the non-interactive flags every time: `--auto --open` on `submit` \
+         (bare `submit` opens an editor, and without `--open` every layer arrives \
+         as a draft nobody reviews) and `--json` on `view`. After changing a layer, \
+         replay the ones above it with `gh stack rebase --upstack`; `gh stack sync` \
+         catches the stack up with the trunk. Exit code 3 is a rebase conflict — \
+         resolve it and continue, do not start over. Do not merge the stack: \
+         `gh stack merge` is the operator's, the same way `gh pr merge` is.\
+         \n\nIf `gh` answers `unknown command \"stack\"`, this box has never \
+         installed the extension: run `gh extension install github/gh-stack` once \
+         — it installs for the whole box and your GitHub credential is the \
+         board's, so it needs no login of yours — and carry on."
+    )
 }
 
 #[cfg(test)]
@@ -451,5 +585,92 @@ mod tests {
             2,
             "the linear row's PR is in the same repo, and so in the same stack",
         );
+    }
+
+    // ---- authoring (gh#287) ---------------------------------------------
+
+    /// The bottom layer is the attempt branch itself, unchanged. Everything
+    /// hangs off that: the board named it, the dispatcher recorded it, and the
+    /// pull request link keys on it.
+    #[test]
+    fn the_bottom_layer_is_the_branch_the_board_already_named() {
+        assert_eq!(layer_branch("board/gh-12-widget", 1), "board/gh-12-widget");
+        assert_eq!(
+            layer_of("board/gh-12-widget", "board/gh-12-widget"),
+            Some(1)
+        );
+    }
+
+    /// A suffix, not a path segment: `refs/heads/board/gh-12-widget` is a file,
+    /// so git will not also let it be a directory holding `2`. The convention
+    /// the issue asked for is the one shape that cannot be stored.
+    #[test]
+    fn layers_suffix_the_branch_rather_than_nesting_under_it() {
+        assert_eq!(
+            layer_branch("board/gh-12-widget", 2),
+            "board/gh-12-widget-2"
+        );
+        assert_eq!(
+            layer_branch("board/gh-12-widget", 5),
+            "board/gh-12-widget-5"
+        );
+        assert_eq!(
+            layer_of("board/gh-12-widget-5", "board/gh-12-widget"),
+            Some(5)
+        );
+    }
+
+    /// The strictness is the point: everything that is not the convention is
+    /// somebody else's branch, and swallowing one into this attempt would hide
+    /// a real pull request behind a coincidence.
+    #[test]
+    fn nothing_but_the_convention_reads_as_a_layer() {
+        let base = "board/gh-12-widget";
+        for other in [
+            "board/gh-12-widget-",    // no number
+            "board/gh-12-widget-0",   // no layer 0
+            "board/gh-12-widget-1",   // layer 1 is the branch itself
+            "board/gh-12-widget-02",  // a padded number is not our spelling
+            "board/gh-12-widget-2b",  // digits only
+            "board/gh-12-widget/2",   // the shape git cannot store
+            "board/gh-12-widget-two", //
+            "board/gh-12-widgetry-2", // a different branch that starts the same
+            "board/gh-120-widget-2",  //
+        ] {
+            assert_eq!(layer_of(other, base), None, "{other} is not a layer");
+        }
+        assert_eq!(layer_of("", base), None);
+        assert_eq!(
+            layer_of(base, ""),
+            None,
+            "every branch would be a layer of it"
+        );
+    }
+
+    /// The brief has to be usable without a lookup: the exact branch names, the
+    /// exact flags, and the one command that repairs a box that has never
+    /// installed the extension.
+    #[test]
+    fn the_brief_names_the_branches_the_flags_and_the_install() {
+        let brief = stack_brief("board/gh-12-widget", None);
+        assert!(brief.contains("gh stack init board/gh-12-widget "));
+        assert!(brief.contains("gh stack add board/gh-12-widget-2"));
+        assert!(brief.contains("board/gh-12-widget-3"));
+        assert!(brief.contains("--auto --open"));
+        assert!(brief.contains("view --json"));
+        assert!(brief.contains("gh extension install github/gh-stack"));
+        assert!(
+            !brief.contains("--base"),
+            "the repo default needs no --base, and naming one would be a guess",
+        );
+    }
+
+    /// A dispatch that was cut from something other than the repo default says
+    /// so once, on the only layer that has a base of its own.
+    #[test]
+    fn a_named_base_reaches_the_bottom_layer_only() {
+        let brief = stack_brief("board/gh-12-widget", Some("release-1.x"));
+        assert!(brief.contains("gh stack init board/gh-12-widget --base release-1.x"));
+        assert_eq!(brief.matches("--base").count(), 1);
     }
 }

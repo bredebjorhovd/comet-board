@@ -710,6 +710,10 @@ pub struct DispatchOpts<'a> {
     /// one-live-attempt rule. Ordinary dispatches send `false` and are refused
     /// on a live attempt.
     pub replace: bool,
+    /// `--stack`: ask the agent to decompose the task into a stack of layered
+    /// pull requests (gh#287). Adds a block to the brief and nothing else — the
+    /// layers are the agent's to design and `gh stack`'s to create.
+    pub stack: bool,
 }
 
 /// Whether `retry` on a row in this state has to replace a live attempt.
@@ -1047,6 +1051,9 @@ fn dispatch_params(task_id: &str, opts: DispatchOpts<'_>) -> serde_json::Value {
     }
     if opts.replace {
         object.insert("replace".into(), serde_json::Value::Bool(true));
+    }
+    if opts.stack {
+        object.insert("stack".into(), serde_json::Value::Bool(true));
     }
     params
 }
@@ -2043,6 +2050,7 @@ mod tests {
                     onto: None,
                     base: None,
                     replace: true,
+                    stack: false,
                 }
             ),
             serde_json::json!({
@@ -2053,6 +2061,18 @@ mod tests {
                 "account": "slot-a",
                 "replace": true,
             })
+        );
+        // gh#287: asked for, and only then — an engine that does not know the
+        // key is sent nothing to ignore.
+        assert_eq!(
+            dispatch_params(
+                "gh:o/r#1",
+                DispatchOpts {
+                    stack: true,
+                    ..DispatchOpts::default()
+                }
+            ),
+            serde_json::json!({ "taskId": "gh:o/r#1", "via": null, "stack": true })
         );
     }
 

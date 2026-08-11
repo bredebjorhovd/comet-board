@@ -119,6 +119,14 @@ are leaving it running — going quiet leaves a human to notice. Work you releas
 records this chat, so its settles and blocks reach you as prompts whether or not
 you are waiting; that is a reason to wait less, not a reason to say nothing.
 
+**Ask for layers when the work has them.** `dispatch --stack` tells the agent to
+decompose its task into a stack of pull requests, one dependent concern per
+layer, so review happens in parallel instead of against one wall of diff. Pass
+it when the layers are already visible in the ticket — not on the chance that
+the agent will find some. Feedback on the bottom layer reaches its chat as
+usual; feedback on the layers above it does not yet, so a stacked task is one
+you read rather than one you relay.
+
 **Review what comes back.** A task in `review` keeps its chat, and comments on
 its pull request are delivered back into it — so say what is wrong *on the pull
 request*, where the agent that wrote it is still sitting with the whole task in

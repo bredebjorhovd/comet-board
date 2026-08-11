@@ -328,6 +328,11 @@ struct DispatchTaskParams {
     /// attempt.
     #[serde(default)]
     replace: bool,
+    /// Ask the agent to decompose this task into a stack of layered pull
+    /// requests (gh#287). Off by default, and a caller that does not know the
+    /// key sends nothing — the brief is the only thing it changes.
+    #[serde(default)]
+    stack: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1685,6 +1690,7 @@ impl RpcService for EngineRpc {
                     model: p.model,
                     account: p.account,
                     bill: p.bill,
+                    stack: p.stack,
                     base: p.base,
                     onto: p.onto,
                 };

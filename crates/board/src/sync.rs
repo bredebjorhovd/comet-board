@@ -870,14 +870,12 @@ impl SyncEngine {
             // Linear identifiers are globally unique, so Linear rows need no
             // such scoping.
             let own_repo = crate::model::gh_repo(&task.id);
-            let Some(pr) = pulls.iter().find(|p| {
-                own_repo.is_none_or(|r| p.repo == r)
-                    && branches.iter().any(|b| pr_matches_branch(p, b))
-            }) else {
+            let Some(link) = link_for(pulls, &branches, own_repo) else {
                 continue;
             };
+            let pr = link.pr;
             self.db
-                .set_pr(&task.id, Some(&pr.url), Some(pr.number), pr.open)?;
+                .set_pr(&task.id, Some(&pr.url), Some(pr.number), link.open)?;
             // A Linear issue's PR is topologically a PR like any other, and 7/9
             // reads the base off the task row whichever source put it there.
             self.db
@@ -889,10 +887,15 @@ impl SyncEngine {
             // and the review writeback kept asserting it, which is what
             // pulled hand-closed tickets back (herdr-board AGE-21/22). The
             // idempotency key stops the next poll re-sending it.
-            if pr.merged && !task.pr_merged && !task.state.is_terminal() {
+            //
+            // For a stack it is the *stack* that has to have merged (gh#287):
+            // the bottom layer merges first and merging it finishes nothing,
+            // and a task closed on it would close its issue and let the GC take
+            // the checkout the layers above are still being written in.
+            if link.merged && !task.pr_merged && !task.state.is_terminal() {
                 self.finish_on_merge(&task, &pr.repo, pr.number)?;
             }
-            self.db.set_pr_merged(&task.id, pr.merged)?;
+            self.db.set_pr_merged(&task.id, link.merged)?;
             if check_mergeable
                 && pr.open
                 && let Some(gh) = gh
@@ -3956,6 +3959,92 @@ fn dispatch_billing_suffix(payload: &Value) -> String {
     }
 }
 
+/// Which pull request a task links to, and what the rest of its stack says
+/// about the state of the work (gh#287).
+#[derive(Debug)]
+struct Linked<'a> {
+    /// The pull request the row points at: the *bottom* layer, which for an
+    /// unstacked attempt is the only one there is. It is the branch the board
+    /// named and recorded on the attempt, so it is the one every other part of
+    /// the board can recognise — `authoring_attempt` (review delivery) and
+    /// `adopt` both match a pull request to an attempt by that exact name.
+    pr: &'a PullRequest,
+    /// Is any layer still open? The attempt's work is not over while one is:
+    /// the GC holds a checkout for an open pull request, and a stack whose
+    /// bottom merged first would otherwise let go of the worktree the layers
+    /// above are still being written in.
+    open: bool,
+    /// Have *all* the layers landed? False while one is open, and false for a
+    /// stack that has none — a pull request closed without merging is not a
+    /// merge, whether it stood alone or held up four others.
+    merged: bool,
+}
+
+/// The pull requests among `pulls` that belong to a task with these attempt
+/// `branches`, resolved into the one the row links to and the verdict of the
+/// stack around it.
+///
+/// `own_repo` is the repository a GitHub task owns, and it is the scope: branch
+/// names are not unique across repositories — `gh#2` in two repos both branch to
+/// `board/gh-2` — so matching on the branch alone attached another repo's merged
+/// pull request to this task and derived it straight to review (herdr-board
+/// AGE-20). `None` for a Linear task, whose identifier is globally unique and
+/// whose pull request is honoured in whichever repo it turns up in.
+///
+/// Ordering is (layer, then newest first), so the link is the bottom layer, and
+/// within one branch the most recent pull request on it — a branch whose first
+/// request was closed and reopened as a second links to the second, which is
+/// what the poll's own ordering already gave in practice.
+fn link_for<'a>(
+    pulls: &'a [PullRequest],
+    branches: &[String],
+    own_repo: Option<&str>,
+) -> Option<Linked<'a>> {
+    let mut matched: Vec<(i64, &PullRequest)> = pulls
+        .iter()
+        .filter(|p| own_repo.is_none_or(|r| p.repo == r))
+        .filter_map(|p| Some((layer_for(p, branches)?, p)))
+        .collect();
+    matched.sort_by_key(|(layer, p)| (*layer, std::cmp::Reverse(p.number)));
+    // One representative per branch: the newest request on it. Without this a
+    // layer that was opened, closed and reopened would be counted twice, and
+    // the stale half would hold `merged` down forever.
+    let mut layers: Vec<&PullRequest> = Vec::new();
+    for (_, pr) in matched {
+        if !layers.iter().any(|seen| seen.head_ref == pr.head_ref) {
+            layers.push(pr);
+        }
+    }
+    let pr = *layers.first()?;
+    let open = layers.iter().any(|p| p.open);
+    // Something landed and nothing is still open. A layer closed *without*
+    // merging counts as neither: it is work the agent withdrew, and holding
+    // `merged` down on it would leave a stack that can never read as finished.
+    let merged = layers.iter().any(|p| p.merged) && !open;
+    Some(Linked { pr, open, merged })
+}
+
+/// Which layer of a task's stack this pull request is, if it is one of theirs:
+/// 1 for a request on an attempt branch itself, `n` for the `n`th layer of a
+/// stack cut from one (gh#287), `None` for a stranger.
+fn layer_for(pr: &PullRequest, branches: &[String]) -> Option<i64> {
+    branches
+        .iter()
+        .filter_map(|branch| {
+            if pr_matches_branch(pr, branch) {
+                Some(1)
+            } else if pr.stack.is_some() {
+                // Only a request GitHub itself calls stacked may be read into
+                // an attempt on the strength of its name — see
+                // `AttemptBranches::claims_as_layer`.
+                crate::stacks::layer_of(&pr.head_ref, branch)
+            } else {
+                None
+            }
+        })
+        .min()
+}
+
 /// The branches the board has dispatched onto, and where.
 ///
 /// A branch name alone is not an identity: the board watches several repos and
@@ -3977,6 +4066,29 @@ impl AttemptBranches {
                 .in_repo
                 .get(&pr.repo)
                 .is_some_and(|branches| branches.contains(&pr.head_ref))
+            || self.claims_as_layer(pr)
+    }
+
+    /// The same question for a layer of an agent-authored stack (gh#287): the
+    /// branch was cut *from* an attempt branch and named for it, so the pull
+    /// request on it is that attempt's work even though the board never named
+    /// the branch. Without this every layer above the first arrives as a row of
+    /// its own — dispatchable, reviewed by nobody, and duplicating work that is
+    /// already on the board.
+    ///
+    /// Gated on the pull request carrying GitHub's own `stack` object, which is
+    /// the difference between a layer and a branch that merely reads like one.
+    /// A scan rather than a lookup, so it runs only for the handful of pull
+    /// requests that say they are stacked.
+    fn claims_as_layer(&self, pr: &PullRequest) -> bool {
+        if pr.stack.is_none() {
+            return false;
+        }
+        let in_repo = self.in_repo.get(&pr.repo).into_iter().flatten();
+        self.anywhere
+            .iter()
+            .chain(in_repo)
+            .any(|branch| crate::stacks::layer_of(&pr.head_ref, branch).is_some())
     }
 }
 
@@ -6878,6 +6990,115 @@ max_duration = "{max_duration}"
         let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
         assert_eq!(task.pr_base_ref.as_deref(), Some("main"));
         assert_eq!(task.pr_stack, None);
+    }
+
+    // ---- an agent-authored stack (gh#287) --------------------------------
+
+    /// One layer of a stack an agent wrote for its own task, as the poll sees
+    /// it. `position` 1 is the attempt branch itself.
+    fn layer_pr(number: i64, head_ref: &str, position: i64, merged: bool) -> PullRequest {
+        PullRequest {
+            repo: "o/r".into(),
+            number,
+            title: format!("layer {position}"),
+            body: None,
+            url: format!("https://github.com/o/r/pull/{number}"),
+            head_ref: head_ref.into(),
+            base_ref: "main".into(),
+            head_repo: None,
+            base_sha: None,
+            open: !merged,
+            merged,
+            draft: false,
+            stack: Some(crate::model::PrStack {
+                number: 4,
+                size: Some(2),
+                position: Some(position),
+                base_ref: Some("main".into()),
+            }),
+            updated_at: crate::db::now(),
+        }
+    }
+
+    /// The layers above the first are branches the board never named, and the
+    /// naming convention is the only thing that says whose they are. Without it
+    /// each one is imported as a row of its own — dispatchable, and reviewed by
+    /// nobody.
+    #[test]
+    fn the_upper_layers_of_a_stack_are_the_attempts_work_and_not_rows_of_their_own() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+
+        let bottom = layer_pr(291, "board/lin-142", 1, false);
+        let top = layer_pr(292, "board/lin-142-2", 2, false);
+        let branches = e.attempt_branches();
+        assert!(!e.should_import_pull_request_row(&branches, &bottom));
+        assert!(!e.should_import_pull_request_row(&branches, &top));
+
+        e.link_pull_requests(&[top.clone(), bottom.clone()])
+            .unwrap();
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        // The row points at the bottom whichever order the poll returned them:
+        // it is the branch the board named and the attempt recorded, and the
+        // one review delivery can match an attempt to.
+        assert_eq!(task.pr_number, Some(291));
+        assert!(task.pr_open);
+    }
+
+    /// A branch that merely reads like a layer is not one. GitHub's own `stack`
+    /// object is what separates the two, and without it the pull request stays
+    /// a row of its own rather than being swallowed by an attempt.
+    #[test]
+    fn a_branch_that_only_looks_like_a_layer_is_still_a_row_of_its_own() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+
+        let mut unstacked = layer_pr(292, "board/lin-142-2", 2, false);
+        unstacked.stack = None;
+        assert!(e.should_import_pull_request_row(&e.attempt_branches(), &unstacked));
+
+        e.link_pull_requests(std::slice::from_ref(&unstacked))
+            .unwrap();
+        assert!(!e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_open);
+    }
+
+    /// The bottom of a stack merges first, and merging it finishes nothing. A
+    /// task closed on it would close its issue and let the GC take the checkout
+    /// the layers above are still being written in.
+    #[test]
+    fn a_bottom_layer_that_merges_first_does_not_finish_the_task() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+
+        let bottom = layer_pr(291, "board/lin-142", 1, true);
+        let top = layer_pr(292, "board/lin-142-2", 2, false);
+        e.link_pull_requests(&[bottom, top]).unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert!(!task.pr_merged, "one layer of two is not a merged stack");
+        assert!(task.pr_open, "the work is not over while a layer is open");
+        assert!(!task.local_done);
+    }
+
+    /// And when the last of them lands, the whole thing has: the row merges,
+    /// exactly as a single pull request's does.
+    #[test]
+    fn the_task_finishes_when_the_whole_stack_has_merged() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+
+        let bottom = layer_pr(291, "board/lin-142", 1, true);
+        let top = layer_pr(292, "board/lin-142-2", 2, true);
+        e.link_pull_requests(&[bottom, top]).unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert!(task.pr_merged);
+        assert!(!task.pr_open);
+        assert!(task.local_done, "the merge finished the task");
     }
 
     #[derive(Clone)]

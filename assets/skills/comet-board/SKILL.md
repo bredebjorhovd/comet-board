@@ -109,6 +109,7 @@ knowing it is being read.
 **Releasing and waiting:**
 
 ```bash
+comet-board dispatch --task gh:owner/repo#14 [--account <slot>] [--runtime ..] [--model ..] [--stack]
 comet-board dispatch --task gh:owner/repo#14 [--account <slot>] [--runtime ..] [--model ..]
 comet-board dispatch --task gh:owner/repo#15 --onto gh#14   # stack it on #14's branch
 comet-board retry    --task gh:owner/repo#14   # blocked → replace; failed/ready → dispatch
@@ -136,6 +137,14 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
   parent refuses rather than cutting from trunk. `--base <branch>` is the same
   for a branch no board task holds; passing both is refused.
 - Cancel ends the attempt, not the issue; the row returns to ready.
+- **`--stack`** asks the agent to decompose its task into a stack of layered
+  pull requests (`gh stack`), one dependent concern per layer, reviewed in
+  parallel instead of as one wall of diff. Off unless asked for, and *ask* is
+  the word: five pull requests where one was expected is a surprise, so pass it
+  when the work is plainly several stacked concerns and the person who wrote
+  the ticket would recognise the layers. Nothing else changes — layer 1 is the
+  attempt's own branch, and the layers above it are that name with `-2`, `-3`
+  on the end, which is how the board knows they are one attempt's work.
 - After releasing work, wait for it or say plainly you're leaving it running.
   Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
   default) — and is the first addressee, so what reaches you does not also
@@ -163,8 +172,8 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | verb | flags | what it is for |
 | --- | --- | --- |
 | `list` | `--state`, `--source`, `--json` | List what is on the board. `--json` for orchestrating agents |
-| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--onto`, `--base` | Release a task into a coding-agent chat |
-| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
+| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--onto`, `--base` | Release a task into a coding-agent chat |
+| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
 | `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
