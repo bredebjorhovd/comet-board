@@ -233,6 +233,11 @@ const ROUTE_KEYS: &[(&str, Kind)] = &[
     ("base", Kind::Str),
     ("max_concurrent", Kind::Int),
     ("max_duration", Kind::Str),
+    // The turn guardrails (gh#270). Strings, not integers, because `off` is a
+    // value they both take — and the one somebody reaches for at 02:00 when a
+    // route's work legitimately fails more than the board expects.
+    ("max_tool_failures", Kind::Str),
+    ("max_tool_calls", Kind::Str),
     ("archive_chats", Kind::Str),
     ("billing_guard", Kind::Str),
 ];
@@ -250,6 +255,8 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("orchestrator_chat", Kind::Str),
     ("new_source", Kind::Str),
     ("max_duration", Kind::Str),
+    ("max_tool_failures", Kind::Str),
+    ("max_tool_calls", Kind::Str),
     // All three retentions (gh#72, gh#139, gh#186): the shelf and the disk fill
     // up on a box nobody has a shell on, which is the box where this surface is
     // the only way to say how long they may. The build output is the one that

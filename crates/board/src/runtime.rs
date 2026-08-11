@@ -241,6 +241,22 @@ pub struct DispatchSpec {
     /// attributes to the teammate. `None` — an operator the map does not name,
     /// or a board that keeps no map — authors as the box, as it always did.
     pub git_author: Option<comet_proto::GitAuthor>,
+    /// The turn-level guardrails this attempt's runs are held to (gh#270) —
+    /// the route's `max_tool_failures` / `max_tool_calls`, resolved here and
+    /// stamped on the chat by the executor.
+    ///
+    /// Resolved at dispatch, unlike the wall-clock cap, because the enforcer is
+    /// somewhere else: the duration cap is decided by the board loop on its own
+    /// interval, where the config is in hand, and this is decided inside the
+    /// engine's run loop from the events going past — which has no board to
+    /// ask. So the answer travels with the chat, exactly as `push_repo` and
+    /// `git_author` do.
+    ///
+    /// [`comet_proto::TurnLimits::default`] — both halves unbounded — is what a
+    /// runtime that predates the field sends, and what a chat nobody dispatched
+    /// carries.
+    #[serde(default)]
+    pub turn_limits: comet_proto::TurnLimits,
     /// The brief: task title, body, links, and the board conventions
     /// (commit as you go, open a PR, `comet-board list --json` to poll).
     /// `{worktree}` may still be unresolved — see [`DispatchSpec::prompt_at`].
@@ -711,6 +727,7 @@ mod tests {
             account: None,
             push_repo: None,
             git_author: None,
+            turn_limits: Default::default(),
             prompt: String::new(),
         }
     }

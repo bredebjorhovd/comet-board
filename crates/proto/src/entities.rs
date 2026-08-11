@@ -121,6 +121,51 @@ pub struct ChatConfig {
     /// by the same person as the first commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_author: Option<GitAuthor>,
+    /// The turn-level guardrails this chat's runs are held to (comet-board's
+    /// `spin`, gh#270) — how many failing tool calls in a row, and how many
+    /// tool calls in one turn, before the board steers the agent and then
+    /// stops it.
+    ///
+    /// On the chat for the same reason `push_repo` and `git_author` are: the
+    /// board resolves them from the route that released the attempt, and every
+    /// later turn in the chat — a steer, a review comment answered next week —
+    /// is the same agent under the same policy.
+    ///
+    /// [`TurnLimits::default`] is *off*, which is every chat a person opened:
+    /// a guardrail is something a board arms for work nobody is watching, not
+    /// a thing to impose on somebody sitting at their own session.
+    #[serde(default, skip_serializing_if = "TurnLimits::is_off")]
+    pub turn_limits: TurnLimits,
+}
+
+/// How much a single turn may spin before the board intervenes (gh#270).
+///
+/// Two numbers, both `None` = unbounded, and both counted **per turn** — the
+/// unit that starts over each time a turn ends:
+///
+/// - [`tool_failures`](Self::tool_failures): failing tool calls in a row.
+/// - [`tool_calls`](Self::tool_calls): tool calls in one turn, whether they
+///   fail or not.
+///
+/// Plain data on the wire; the counting and the escalation are
+/// `comet_board::spin`'s, which is where the numbers come from too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_failures: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u32>,
+}
+
+impl TurnLimits {
+    /// Nothing to enforce — the default, and every chat the board did not
+    /// dispatch. Named so the field serializes away entirely on a chat that
+    /// has none, which keeps the workspace doc's chat rows byte-identical to
+    /// what viewports older than gh#270 wrote.
+    pub fn is_off(&self) -> bool {
+        self.tool_failures.is_none() && self.tool_calls.is_none()
+    }
 }
 
 /// A git author: the two fields `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` carry

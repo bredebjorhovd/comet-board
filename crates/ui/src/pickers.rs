@@ -113,6 +113,9 @@ impl ResolvedRunConfig {
             // with the device's own git, not with the board's App (gh#68).
             push_repo: None,
             git_author: None,
+            // …and the turn guardrails are the board's too (gh#270): a chat
+            // somebody is sitting in front of is not one that needs watching.
+            turn_limits: Default::default(),
         })
     }
 }

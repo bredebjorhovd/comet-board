@@ -1644,6 +1644,7 @@ mod tests {
             account: None,
             push_repo: None,
             git_author: None,
+            turn_limits: Default::default(),
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -1671,6 +1672,7 @@ mod tests {
                 account: None,
                 push_repo: None,
                 git_author: None,
+                turn_limits: Default::default(),
             },
         );
     }

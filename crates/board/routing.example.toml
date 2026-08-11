@@ -78,6 +78,36 @@ runtime = "codex"
 # runtime = "claude-code"
 # max_duration = "6h"
 
+# `max_tool_failures` and `max_tool_calls` are the *turn*-level guardrails, and
+# they catch what `max_duration` cannot: the run that is failing at full speed.
+# An agent retrying the same broken command, or making tool calls without end,
+# spends two hours' worth of tokens in the first ten minutes — and the wall
+# clock charges for all of it before it steps in.
+#
+# `max_tool_failures` counts tool calls that fail *in a row* inside one turn.
+# The same call failing that many times gets one message into the chat naming
+# what is looping — most loops are recoverable, and an interrupt throws away a
+# worktree's worth of context — and at twice that many the board ends the run.
+# Assorted calls failing get twice the rope; a single call that lands clears the
+# count entirely. `max_tool_calls` is the same ladder on sheer volume, for the
+# turn that never fails and never finishes.
+#
+# A stopped run is a *block*, not a lost attempt: the chat keeps the whole task,
+# the dispatching agent and the orchestrator are told as they are about any
+# other block, and retry-or-cancel is yours.
+#
+# Per route because what counts as a normal number of failures is a property of
+# the work — a repo whose suite is flaky under load fails a lot without being
+# stuck, and a route that edits config files does not fail at all.
+#
+# [[route]]
+# match = { gh_repo = "acme/flaky-under-load" }
+# workspace = "platform"
+# repo = "~/code/platform"
+# runtime = "claude-code"
+# max_tool_failures = "40"
+# max_tool_calls = "off"
+
 # `billing_guard` decides what the board does when a dispatch would spend
 # somebody else's subscription — the teammate presses enter, the route's account
 # (or the box's own login) pays, and before gh#101 nobody was told either way.
@@ -113,6 +143,13 @@ max_concurrent_per_workspace = 3
 # until somebody looked. `off` (or `0`) removes the cap, which is that old
 # behaviour said out loud.
 max_duration = "2h"
+# The turn guardrails, for routes that do not set their own (see the per-route
+# note above). Ten failing tool calls in a row is not a technique — nothing
+# legitimate reaches it, because a single call that lands resets the count — and
+# two thousand tool calls is far past any turn that is getting somewhere. Both
+# take `off` (or `0`).
+max_tool_failures = "10"
+max_tool_calls = "2000"
 # What to do about a dispatch that charges somebody else: warn, require-own, or
 # off. See the per-route note above for what each one does.
 billing_guard = "warn"

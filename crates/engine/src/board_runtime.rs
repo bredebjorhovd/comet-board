@@ -125,6 +125,10 @@ impl Runtime for CometRuntime {
             // again: that later fix should be by the same person as the first
             // commit, not by whoever the box is.
             git_author: spec.git_author.clone(),
+            // And what its turns may spend before the run loop steps in
+            // (gh#270). Same reasoning a third time: a later turn in this chat
+            // is the same unattended agent, working under the same policy.
+            turn_limits: spec.turn_limits,
         };
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;

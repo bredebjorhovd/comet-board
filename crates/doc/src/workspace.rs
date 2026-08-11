@@ -730,6 +730,7 @@ mod tests {
                 account: None,
                 push_repo: None,
                 git_author: None,
+                turn_limits: Default::default(),
             }),
             last_message_preview: None,
             last_message_at: None,
@@ -796,6 +797,12 @@ mod tests {
             // dispatched agent silently loses its push credentials (gh#68).
             push_repo: Some("Florin-AS/tripletex-mcp".into()),
             git_author: None,
+            // Same argument for the turn guardrails (gh#270): a model change
+            // that dropped them would leave the run loop watching nothing.
+            turn_limits: comet_proto::TurnLimits {
+                tool_failures: Some(10),
+                tool_calls: Some(2000),
+            },
         };
         assert!(ws.set_chat_config("chat-1", &config).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");

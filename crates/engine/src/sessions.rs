@@ -844,6 +844,20 @@ impl Inner {
         creds
     }
 
+    /// The turn-level guardrails this chat's runs are held to (gh#270).
+    ///
+    /// Read off the chat row for the reason the account and the credential are:
+    /// the board resolved them from the route that released the attempt, and a
+    /// steer arriving mid-turn must not be able to change what the run is held
+    /// to. A chat nobody dispatched — and every chat that predates the field —
+    /// carries [`comet_proto::TurnLimits::default`], which is off.
+    fn turn_limits(&self, chat_id: &str) -> comet_proto::TurnLimits {
+        self.workspace()
+            .and_then(|ws| ws.chat_config(chat_id))
+            .map(|c| c.turn_limits)
+            .unwrap_or_default()
+    }
+
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
@@ -1142,9 +1156,25 @@ async fn drive_run(
     const STALL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
     let mut saw_any_event = false;
     let mut stall_at = tokio::time::Instant::now() + STALL;
-    // Set by tier 1 so the failed-resume retry below cannot mistake the
-    // synthesized errored `Done` for a rejected `--resume` id.
+    // Set by tier 1 — and by the turn guardrails below — so the failed-resume
+    // retry cannot mistake a `Done` this task synthesized for a rejected
+    // `--resume` id, and re-dispatch the run it just ended.
     let mut stall_killed = false;
+    // TURN GUARDRAILS (gh#270), the fast counterpart to the stall watchdog and
+    // to the board's wall clock. Both of those catch a run that has stopped
+    // producing or has simply gone on too long; neither catches the run that is
+    // producing at full speed and getting nowhere — the same failing command
+    // retried forever, or tool calls without end. That is the one failure mode
+    // an unattended dispatch has no defence against, and it spends the whole
+    // wall-clock budget in a fraction of the time.
+    //
+    // The counting and the escalation are `comet_board::spin`'s (a pure
+    // decision over the normalized event stream); this loop is where the two
+    // rungs are *actuated*, because it is the only place that can do either —
+    // it owns the run's steering mailbox and its interrupt token. Off unless
+    // the chat carries limits, which means off for every chat the board did
+    // not dispatch.
+    let mut spin = comet_board::spin::Watch::new(inner.turn_limits(&chat_id));
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -1292,6 +1322,98 @@ async fn drive_run(
         // per long turn observed) — the touch above already did their job.
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
+        }
+
+        // Turn guardrails (gh#270): has this turn started spinning? The event
+        // is still processed normally either way — a breach is something the
+        // run does *in addition to* what it was already doing, never a reason
+        // to drop the frame that revealed it.
+        if let Some(verdict) = spin.observe(&event) {
+            match verdict.rung {
+                // Soft rung: one message into the chat, at the harness's own
+                // steering boundary. Most loops are recoverable, and an
+                // interrupt throws away a worktree's worth of context — so the
+                // agent is told what the board can see and given the chance to
+                // change approach, or to stop and say it is blocked.
+                //
+                // Spawned rather than awaited: it writes the user entry through
+                // the same doc this task is streaming into, and the run loop
+                // must not stall behind it. A harness that cannot be steered
+                // (or a mailbox mid-teardown) reports `NotSteerable`, which is
+                // logged and nothing else — the hard rung below is what still
+                // bounds that run.
+                comet_board::spin::Rung::Steer => {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        reason = %verdict.reason.sentence(),
+                        "turn guardrail: steering a run that looks stuck"
+                    );
+                    let engine = SessionsEngine {
+                        inner: inner.clone(),
+                    };
+                    let chat = chat_id.clone();
+                    let text = verdict.steer_text();
+                    tokio::spawn(async move {
+                        match engine.steer(&chat, &text, None).await {
+                            Ok(SteerOutcome::Accepted) => {}
+                            Ok(SteerOutcome::NotSteerable) => tracing::warn!(
+                                chat = %chat,
+                                "turn guardrail: no steerable run to warn; \
+                                 the run will be stopped if it keeps going"
+                            ),
+                            Err(err) => tracing::warn!(
+                                chat = %chat, error = %err,
+                                "turn guardrail: delivering the warning failed"
+                            ),
+                        }
+                    });
+                }
+                // Hard rung: end the run. The child is released the way the
+                // stall watchdog releases it, and the terminal pair is queued
+                // through the engine channel rather than synthesized here — so
+                // the loop's own `Done` handling finalizes the segment, resolves
+                // dangling input chips and settles the status exactly as it does
+                // for every other ending.
+                //
+                // `Errored`, not `Interrupted`: this is a run that stopped
+                // badly, and the board's reconcile reads that off the journal as
+                // a *block* — the attempt keeps its chat, its context and its
+                // slot, the dispatching agent and the orchestrator are told, and
+                // retry-or-cancel is the operator's call. Which is the whole
+                // point of stopping it early rather than at the wall clock.
+                comet_board::spin::Rung::Stop => {
+                    let message = verdict.stop_text();
+                    // Same flag the stall watchdog sets, for the same reason:
+                    // the failed-resume retry below must never read a `Done`
+                    // *we* synthesized as a `--resume` id the harness rejected,
+                    // which would re-dispatch the very run this just stopped.
+                    stall_killed = true;
+                    tracing::warn!(
+                        chat = %chat_id,
+                        reason = %verdict.reason.sentence(),
+                        "turn guardrail: ending a looping run"
+                    );
+                    if let Some((token, engine_tx)) = lock(&inner.runs)
+                        .get(&chat_id)
+                        .filter(|h| h.run_id == run_id)
+                        .map(|h| (h.interrupt_token.clone(), h.engine_tx.clone()))
+                    {
+                        token.cancel();
+                        // A visible error part first: the transcript has to say
+                        // why this stopped, and the `Done` alone leaves an
+                        // aborted-looking entry with no explanation in it.
+                        let _ = engine_tx.send(AgentEvent::Error {
+                            message: message.clone(),
+                        });
+                        let _ = engine_tx.send(AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(message),
+                            session_id: None,
+                        });
+                    }
+                }
+            }
         }
 
         // Failed-resume fallback: an engine-injected `--resume` naming a session

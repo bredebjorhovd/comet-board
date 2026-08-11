@@ -496,6 +496,39 @@ pub fn doctor(
                     },
                 });
 
+                // And the same argument for the *turn* guardrails (gh#270),
+                // which catch what the wall clock cannot: `off` and "never
+                // heard of it" look identical from the board, and one of them
+                // means a run on this route can fail at full speed for as long
+                // as the cap above allows.
+                let limits = cfg.turn_limits(Some(r));
+                let inherited = r.max_tool_failures.is_none() && r.max_tool_calls.is_none();
+                checks.push(Check {
+                    name: format!("route {name}: turn guardrails"),
+                    ok: true,
+                    detail: match (limits.tool_failures, limits.tool_calls) {
+                        (None, None) => {
+                            "off — a run here can retry a failing call for as long as its \
+                             duration cap allows"
+                                .into()
+                        }
+                        (failures, calls) => {
+                            let mut parts = Vec::new();
+                            if let Some(n) = failures {
+                                parts.push(format!("{n} failures in a row"));
+                            }
+                            if let Some(n) = calls {
+                                parts.push(format!("{n} tool calls per turn"));
+                            }
+                            format!(
+                                "{}{}",
+                                parts.join(", "),
+                                if inherited { " (from [defaults])" } else { "" }
+                            )
+                        }
+                    },
+                });
+
                 // Only when the route names one: a board on one person's
                 // laptop has no accounts to check and should not be told about
                 // a feature it is not using (gh#59).

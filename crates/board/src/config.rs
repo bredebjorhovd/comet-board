@@ -442,6 +442,29 @@ pub fn parse_max_duration(s: &str) -> std::result::Result<Option<u64>, String> {
     }
 }
 
+/// Parse a `max_tool_failures` / `max_tool_calls` value into a per-turn count
+/// (gh#270).
+///
+/// `Ok(None)` is *no guardrail*, said out loud — `off`, `none`, `never` or `0`.
+/// An unparseable value is an `Err` for [`parse_max_duration`]'s reason: a typo
+/// and "unlimited" look identical from the board, and only one of them is what
+/// anybody meant. Anything below `floor` is raised to it — a cap that fires
+/// before an agent has finished orienting would steer every run on the route,
+/// which is how a guardrail gets turned off for good.
+pub fn parse_turn_limit(s: &str, floor: u32) -> std::result::Result<Option<u32>, String> {
+    let t = s.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "never") {
+        return Ok(None);
+    }
+    match t.parse::<u32>() {
+        Ok(0) => Ok(None),
+        Ok(n) => Ok(Some(n.max(floor))),
+        Err(_) => Err(format!(
+            "`{s}` is not a count; write it like `10`, `2000`, or `off`"
+        )),
+    }
+}
+
 /// Parse a `retain_worktrees` value into a retention window in seconds (gh#72).
 ///
 /// `Ok(None)` is *keep forever*, said out loud — `off`, `none`, `never` or `0`
@@ -652,6 +675,40 @@ pub struct Defaults {
     /// spelling of what every board did before this existed.
     #[serde(default = "default_max_duration")]
     pub max_duration: String,
+    /// How many tool calls may fail *in a row* inside one turn before the board
+    /// steers the agent, and then — at twice that — ends the run (gh#270).
+    /// Overridden per route.
+    ///
+    /// The cap `max_duration` cannot be: an agent retrying the same failing
+    /// command spends two hours' worth of tokens in the first ten minutes and
+    /// the wall clock charges for all of it. Ten by default — high enough that
+    /// a flaky test suite retried a few times is untouched, low enough that
+    /// nothing legitimate reaches it, because ten failures in a row with
+    /// nothing landing in between is not a technique.
+    ///
+    /// Counted per turn, and cleared outright by a single tool call that
+    /// succeeds — so it can only ever fire on a run where nothing is landing.
+    /// See [`crate::spin`], which also spends the doubling: this is the count
+    /// for the *same* call failing, and assorted calls failing get twice the
+    /// rope. `off` (or `0`) removes it, which is the honest spelling of what
+    /// every board did before this existed.
+    #[serde(default = "default_max_tool_failures")]
+    pub max_tool_failures: String,
+    /// How many tool calls one turn may make before the board steers, and then
+    /// — at twice that — ends the run (gh#270). Overridden per route.
+    ///
+    /// The other half of a loop: a run that never fails and never finishes,
+    /// re-reading the same file or re-planning the same step. Named for what it
+    /// counts rather than for ForgeCode's `max_requests_per_turn`, whose figure
+    /// this approximates — comet watches the harness from outside and sees tool
+    /// calls, not the model requests behind them.
+    ///
+    /// Two thousand by default. That is far past any turn that is getting
+    /// somewhere — most long dispatches make a few hundred — and far short of
+    /// what a spinning agent reaches inside its wall clock. `off` (or `0`)
+    /// removes it.
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: String,
     /// How long a finished attempt's checkout is kept before the board deletes
     /// it and its local branch (gh#72). The clock starts when the attempt is
     /// closed *and* its task has left the board — merged, closed upstream, or
@@ -836,6 +893,14 @@ fn default_max_duration() -> String {
     "2h".into()
 }
 
+fn default_max_tool_failures() -> String {
+    "10".into()
+}
+
+fn default_max_tool_calls() -> String {
+    "2000".into()
+}
+
 fn default_retain_worktrees() -> String {
     "7d".into()
 }
@@ -880,6 +945,8 @@ impl Default for Defaults {
             orchestrator_chat: None,
             new_source: default_new_source(),
             max_duration: default_max_duration(),
+            max_tool_failures: default_max_tool_failures(),
+            max_tool_calls: default_max_tool_calls(),
             retain_worktrees: default_retain_worktrees(),
             retain_build_output: default_retain_build_output(),
             archive_chats: default_archive_chats(),
@@ -1109,6 +1176,22 @@ pub struct Route {
     /// looks.
     #[serde(default)]
     pub max_duration: Option<String>,
+    /// Per-route override of `defaults.max_tool_failures` (gh#270) — how many
+    /// tool calls may fail in a row before this route's runs are steered and
+    /// then stopped, e.g. `"20"`, or `"off"` for none.
+    ///
+    /// Per route for [`Route::max_duration`]'s reason, and one more: what
+    /// counts as a normal number of failures is a property of the *work*. A
+    /// route pointed at a repo whose test suite is flaky under load fails a lot
+    /// without being stuck, and a route that edits config files does not fail
+    /// at all — one number for both has to be set by the noisier one, which
+    /// leaves the quiet route unguarded.
+    #[serde(default)]
+    pub max_tool_failures: Option<String>,
+    /// Per-route override of `defaults.max_tool_calls` (gh#270) — how many tool
+    /// calls one turn on this route may make, e.g. `"5000"`, or `"off"`.
+    #[serde(default)]
+    pub max_tool_calls: Option<String>,
     /// Per-route override of `defaults.archive_chats` (gh#139) — how long this
     /// route's finished chats stay on their space's shelf, e.g. `"30d"`, or
     /// `"off"` to keep them there.
@@ -1274,6 +1357,26 @@ impl RoutingConfig {
                     r.display_name()
                 ));
             }
+            // And here a typo reads as "unbounded" (gh#270) — a route somebody
+            // deliberately tightened, silently running without a guardrail.
+            if let Some(f) = &r.max_tool_failures
+                && let Err(e) = parse_turn_limit(f, crate::spin::MIN_TOOL_FAILURES)
+            {
+                out.push(format!(
+                    "route {} ({}) has max_tool_failures {e}",
+                    i + 1,
+                    r.display_name()
+                ));
+            }
+            if let Some(c) = &r.max_tool_calls
+                && let Err(e) = parse_turn_limit(c, crate::spin::MIN_TOOL_CALLS)
+            {
+                out.push(format!(
+                    "route {} ({}) has max_tool_calls {e}",
+                    i + 1,
+                    r.display_name()
+                ));
+            }
             // A typo here reads as "keep every chat forever" (gh#139), which
             // is the shelf silting up again behind a key somebody did set.
             if let Some(a) = &r.archive_chats
@@ -1303,6 +1406,16 @@ impl RoutingConfig {
         }
         if let Err(e) = crate::billing::parse_guard_mode(&self.defaults.billing_guard) {
             out.push(format!("[defaults] billing_guard {e}"));
+        }
+        if let Err(e) = parse_turn_limit(
+            &self.defaults.max_tool_failures,
+            crate::spin::MIN_TOOL_FAILURES,
+        ) {
+            out.push(format!("[defaults] max_tool_failures {e}"));
+        }
+        if let Err(e) = parse_turn_limit(&self.defaults.max_tool_calls, crate::spin::MIN_TOOL_CALLS)
+        {
+            out.push(format!("[defaults] max_tool_calls {e}"));
         }
         // Same reasoning as the cap above: an unparseable retention would read
         // as `off` on a board nobody told, and the checkouts would pile up
@@ -1466,6 +1579,47 @@ impl RoutingConfig {
         // default cap is the honest answer rather than none at all.
         parse_max_duration(raw)
             .unwrap_or_else(|_| parse_max_duration(&default_max_duration()).ok().flatten())
+    }
+
+    /// The turn-level guardrails for attempts on a route (gh#270) — the
+    /// route's own `max_tool_failures` / `max_tool_calls`, else the
+    /// `[defaults]` pair. Either half `None` is that half unbounded.
+    ///
+    /// `route` is an `Option` for [`Self::max_duration_secs`]'s reason: no
+    /// route means the board-wide answer rather than none at all, so deleting
+    /// a route is not the way to escape the guard. Unlike the duration cap
+    /// these are resolved once, at dispatch, and ride the chat — the engine
+    /// enforces them inside the run loop, where there is no board to ask.
+    pub fn turn_limits(&self, route: Option<&Route>) -> comet_proto::TurnLimits {
+        let raw =
+            |own: Option<&str>, fallback: &str| -> String { own.unwrap_or(fallback).to_string() };
+        let failures = raw(
+            route.and_then(|r| r.max_tool_failures.as_deref()),
+            &self.defaults.max_tool_failures,
+        );
+        let calls = raw(
+            route.and_then(|r| r.max_tool_calls.as_deref()),
+            &self.defaults.max_tool_calls,
+        );
+        // Validation has already refused an unparseable value; a config that
+        // reached here with one is one `load_or_default` fell back on, so the
+        // shipped default is the honest answer — never "unbounded", which is
+        // the one wrong way to fail.
+        comet_proto::TurnLimits {
+            tool_failures: parse_turn_limit(&failures, crate::spin::MIN_TOOL_FAILURES)
+                .unwrap_or_else(|_| {
+                    parse_turn_limit(&default_max_tool_failures(), crate::spin::MIN_TOOL_FAILURES)
+                        .ok()
+                        .flatten()
+                }),
+            tool_calls: parse_turn_limit(&calls, crate::spin::MIN_TOOL_CALLS).unwrap_or_else(
+                |_| {
+                    parse_turn_limit(&default_max_tool_calls(), crate::spin::MIN_TOOL_CALLS)
+                        .ok()
+                        .flatten()
+                },
+            ),
+        }
     }
 
     /// What this route does about a cross-billed dispatch — the route's own
@@ -2292,6 +2446,103 @@ runtime = "claude"
                 .unwrap_err()
                 .to_string()
                 .contains("[defaults] max_duration")
+        );
+    }
+
+    // ---- the turn guardrails (gh#270) ------------------------------------
+
+    #[test]
+    fn a_board_that_says_nothing_still_guards_a_spinning_turn() {
+        // Both halves have to be real numbers by default, for the reason the
+        // duration cap does: before this, nothing bounded a run that was
+        // failing at full speed, and it spent the whole two hours doing it.
+        let limits = RoutingConfig::default().turn_limits(None);
+        assert_eq!(limits.tool_failures, Some(10));
+        assert_eq!(limits.tool_calls, Some(2000));
+    }
+
+    #[test]
+    fn a_route_sets_its_own_guardrails_over_the_defaults() {
+        // What counts as a normal number of failures is a property of the
+        // work — a route whose suite is flaky under load fails a lot without
+        // being stuck.
+        let c = github(
+            r#"
+[defaults]
+max_tool_failures = "10"
+max_tool_calls = "2000"
+
+[[route]]
+match = { label = "flaky" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+max_tool_failures = "40"
+
+[[route]]
+match = { label = "quiet" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+max_tool_calls = "off"
+"#,
+        );
+        let flaky = c.turn_limits(Some(&c.routes[0]));
+        assert_eq!(flaky.tool_failures, Some(40));
+        // The half it did not override still comes from `[defaults]`.
+        assert_eq!(flaky.tool_calls, Some(2000));
+        let quiet = c.turn_limits(Some(&c.routes[1]));
+        assert_eq!(quiet.tool_failures, Some(10));
+        assert_eq!(quiet.tool_calls, None);
+        // A route deleted from under a live attempt falls back to the
+        // defaults, never to unbounded.
+        assert_eq!(c.turn_limits(None).tool_failures, Some(10));
+    }
+
+    #[test]
+    fn off_is_how_a_guardrail_is_removed() {
+        for spelling in ["off", "OFF", "none", "never", "0"] {
+            let c = github(&format!(
+                "[defaults]\nmax_tool_failures = \"{spelling}\"\nmax_tool_calls = \"{spelling}\"\n"
+            ));
+            assert!(c.turn_limits(None).is_off(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_guardrail_too_tight_to_be_useful_is_raised_to_its_floor() {
+        // A cap of one would steer the first run whose grep missed.
+        assert_eq!(
+            parse_turn_limit("1", crate::spin::MIN_TOOL_FAILURES),
+            Ok(Some(3))
+        );
+        assert_eq!(
+            parse_turn_limit("12", crate::spin::MIN_TOOL_FAILURES),
+            Ok(Some(12))
+        );
+        assert_eq!(
+            parse_turn_limit("4", crate::spin::MIN_TOOL_CALLS),
+            Ok(Some(50))
+        );
+    }
+
+    #[test]
+    fn a_mistyped_guardrail_is_refused_rather_than_read_as_unbounded() {
+        let c: RoutingConfig = toml::from_str(
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"w\"\nrepo = \"/tmp\"\n\
+             runtime = \"claude\"\nmax_tool_failures = \"a few\"\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("max_tool_failures"), "{err}");
+        assert!(err.contains("a few"), "it names the offender: {err}");
+
+        let c: RoutingConfig = toml::from_str("[defaults]\nmax_tool_calls = \"lots\"\n").unwrap();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("[defaults] max_tool_calls")
         );
     }
 

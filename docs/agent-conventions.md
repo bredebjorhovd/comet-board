@@ -334,6 +334,20 @@ so in the PR description rather than spending the remaining minutes on another
 lap. Finishing inside the grace settles the attempt `done` on your artifacts as
 normal — the cap only takes what nothing else has closed.
 
+**And by how much a turn spins.** The clock is not the only bound: the board
+also counts, per turn, how many tool calls fail *in a row* and how many you make
+at all (`max_tool_failures`, ten by default; `max_tool_calls`, two thousand).
+Reach the first number and a message arrives in your chat naming exactly what
+has been failing; reach twice it and the run is ended with an error. A single
+call that succeeds clears the failure count outright, so this can only ever fire
+on a run where nothing is landing — which is to say, it fires on a loop and on
+nothing else. Being stopped this way is not a lost attempt: the chat keeps the
+whole task and the board tells whoever dispatched you that you are blocked. But
+you get a far better outcome by saying it yourself. If the same command has
+failed ten times, it is not going to work the eleventh: commit what you have,
+open a pull request or comment saying precisely what you are stuck on, and let a
+human decide. That is a *good* result. Another lap is not.
+
 **Your build output goes as soon as your run ends.** `target/`, `node_modules/`,
 `.next/` and `.turbo/` inside your checkout are swept once your attempt closes —
 not when the task leaves the board, and not when your pull request merges
