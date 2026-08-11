@@ -102,6 +102,7 @@ use comet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
+use crate::loaders;
 use crate::motion;
 use crate::popover;
 use crate::state::AppState;
@@ -215,6 +216,33 @@ const FACT_GLYPH: f32 = 12.0;
 /// A verdict control in the bar (review.md H4).
 const VERDICT_H: f32 = 28.0;
 const VERDICT_PX: f32 = 11.0;
+
+/// One cell of the loading wave (gh#341). Eight puts the row at 56px across —
+/// the boot splash's mark is 64 tall, and this is the same gesture one step
+/// quieter, because a card that is about to fill is not a window that is empty.
+const LOADER_CELL: f32 = 8.0;
+
+/// What the card says while it is still reading. One sentence, kept from before
+/// the wave was under it: the shimmer says a wait is happening and this says
+/// whose.
+const LOADING_LINE: &str = "Reading the review…";
+
+/// Dev/measurement knob (`COMET_REVIEW_HOLD_MS`, default unset): holds the
+/// review's read for this many milliseconds before it is issued, so the loading
+/// state can be photographed rather than raced — the same job
+/// [`motion::speed_scale`] does for the tweens. Read once; never set in
+/// production. Capped at ten seconds so a typo cannot wedge the card.
+fn loading_hold() -> Option<std::time::Duration> {
+    static HOLD: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    (*HOLD.get_or_init(|| {
+        std::env::var("COMET_REVIEW_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms.min(10_000))
+    }))
+    .map(std::time::Duration::from_millis)
+}
 
 /// What the review card asks the shell to do, because it cannot do it itself.
 ///
@@ -389,7 +417,11 @@ impl ReviewPanel {
         let task_id = self.task_id.clone();
         let attempt = self.attempt;
         self.error = None;
+        let hold = loading_hold();
         self.task = Some(cx.spawn(async move |this, cx| {
+            if let Some(hold) = hold {
+                cx.background_executor().timer(hold).await;
+            }
             let mut last: Option<String> = None;
             for candidate in candidates {
                 let mut params = serde_json::json!({ "taskId": task_id });
@@ -2037,6 +2069,36 @@ impl ReviewPanel {
             )))
             .into_any_element()
     }
+
+    /// The card while the review is still being assembled (gh#341).
+    ///
+    /// A review is read off the attempt's checkout and three GitHub endpoints,
+    /// so this is a real wait and not a frame's flicker — and a real wait in
+    /// this app is said in this app's own vocabulary. That is
+    /// [`loaders::comet_loader`], the wave the boot splash and the terminal
+    /// viewport already pulse; the review route was the one surface that opened
+    /// with a bare sentence instead.
+    ///
+    /// The sentence stays under it. A loader alone says something is happening
+    /// but not what, and "reading" is the honest verb here — the board is doing
+    /// the reading, and the reader is being told whose work they are waiting on.
+    fn render_loading(theme: &Theme) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(Theme::SPACE_MD))
+            .child(loaders::comet_loader("review-loading", theme, LOADER_CELL))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(LOADING_LINE)),
+            )
+            .into_any_element()
+    }
 }
 
 impl gpui::EventEmitter<ReviewEvent> for ReviewPanel {}
@@ -2065,14 +2127,18 @@ impl Render for ReviewPanel {
             return message(theme.warning, error);
         }
         let Some(review) = self.review.clone() else {
-            return message(
-                theme.text_subtle,
-                SharedString::from(if self.loaded {
-                    "No review for this task."
-                } else {
-                    "Reading the review…"
-                }),
-            );
+            // Two different nothings, and only one of them is a wait. An answer
+            // that came back empty is a fact, and facts are sentences on this
+            // screen; a review that has not arrived yet is a wait, and a wait
+            // gets the app's own wave (gh#341).
+            return if self.loaded {
+                message(
+                    theme.text_subtle,
+                    SharedString::from("No review for this task."),
+                )
+            } else {
+                Self::render_loading(&theme)
+            };
         };
 
         let header = self.render_header(&review, &theme, cx);
