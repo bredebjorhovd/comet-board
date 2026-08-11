@@ -1103,6 +1103,30 @@ impl Shell {
         cx.notify();
     }
 
+    /// The board toggle as the whole app means it — what `mod-shift-b` does and
+    /// what the titlebar's checklist button does, in one place because the
+    /// strip is drawn on the review route too now (gh#311) and the two must not
+    /// be two answers to one gesture.
+    ///
+    /// Called directly rather than by dispatching [`ToggleBoard`] from the
+    /// button: an action dispatched out of a click listener is routed through
+    /// the focus chain, and a click on the titlebar can leave nothing focused —
+    /// which is a button that silently does nothing (seen while photographing
+    /// this issue).
+    pub(super) fn toggle_board_from_route(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.route {
+            Route::Chat => self.toggle_board(window, cx),
+            // The board is where a review is opened from, so the same gesture
+            // is the way back to it: leave the route, then open the dock on the
+            // session the review was of.
+            Route::Review { .. } => {
+                self.close_review(cx);
+                self.toggle_board(window, cx);
+            }
+            Route::Settings(_) => {}
+        }
+    }
+
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
@@ -1351,16 +1375,53 @@ impl Shell {
         }
     }
 
+    /// Leave a review by selecting another session's tab (gh#311).
+    ///
+    /// `active_chat` is set here rather than waited for, exactly as
+    /// [`Self::read_the_diff`] does: [`Self::close_review`] records the route
+    /// history entry off it, and the observation that normally updates it has
+    /// not run yet inside this update — so without this the Back target would
+    /// be the session you just left rather than the one you just picked.
+    pub(super) fn leave_review_for(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+            self.state
+                .update(cx, |s, cx| s.select_chat(Some(chat_id.clone()), cx));
+        }
+        self.active_chat = chat_id;
+        self.close_review(cx);
+    }
+
     /// Leave a review for the session it was about. The panel is dropped: a
     /// review is a snapshot of a diff and a run journal, and the next visit
     /// should re-read both rather than show what the box said last time.
-    fn close_review(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_review(&mut self, cx: &mut Context<Self>) {
         self.review = None;
         self.review_events = None;
         self.review_observation = None;
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
+    }
+
+    /// Whether something open on top of the page owns the keyboard: a menu, a
+    /// dialog, the add-space palette, or the board dock.
+    ///
+    /// `esc` belongs to the innermost thing that is open, and a route is the
+    /// outermost thing there is — so the route's own escape hatch (gh#311) asks
+    /// this first. The surfaces that handle the key themselves stop its
+    /// propagation and never reach the root listener; this covers the ones that
+    /// do not, where closing the route out from under an open dialog would be
+    /// the wrong answer to one keypress.
+    fn overlay_open(&self) -> bool {
+        self.chat_menu.is_some()
+            || self.rename_dialog.is_some()
+            || self.delete_confirm.is_some()
+            || self.space_menu.is_some()
+            || self.rename_space_dialog.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.add_space.is_some()
+            || self.user_menu_open
+            || self.board_open
     }
 
     // ---- back/forward (route history) ----
@@ -1958,25 +2019,23 @@ impl Shell {
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
-            Route::Chat => self.render_session_tab_strip(cx),
-            // The review route deliberately draws no tab strip: switching
-            // sessions out from under a review would leave the card describing
-            // one attempt and the column beside it holding another. Back is the
-            // way out, and it is already in the control cluster.
-            Route::Settings(_) | Route::Review { .. } => {
+            // The review route draws the strip too, with the review's own tab
+            // leading it (gh#311): the hazard this route used to avoid —
+            // switching sessions out from under a review, leaving the card
+            // describing one attempt and the column beside it holding another —
+            // is gone now that selecting another tab LEAVES the review rather
+            // than re-pointing the column under it.
+            Route::Chat | Route::Review { .. } => self.render_session_tab_strip(cx),
+            Route::Settings(_) => {
                 let theme = Theme::of(cx).clone();
                 // Settings says so where the tab strip would be
                 // (`docs/design/settings.md` A3): one word, 13px/500 `--muted`,
-                // at the same x=172 the tabs start at. The review route names
-                // itself in the card's own header instead, so it draws nothing
-                // here.
-                let label = matches!(self.route, Route::Settings(_)).then(|| {
-                    div()
-                        .text_size(px(Theme::TEXT_BODY))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Settings"))
-                });
+                // at the same x=172 the tabs start at.
+                let label = div()
+                    .text_size(px(Theme::TEXT_BODY))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Settings"));
                 let inner = div()
                     .size_full()
                     .flex()
@@ -1984,7 +2043,7 @@ impl Shell {
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
                     .pr(px(Theme::SPACE_LG))
-                    .children(label);
+                    .child(label);
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
@@ -4239,6 +4298,25 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
             .on_drag_move(cx.listener(Self::on_review_session_drag))
+            // `esc` leaves a review (gh#311). The board panel says "esc close"
+            // in its own footer and the review must not be the one surface in
+            // this app where the key does nothing — a route you can only leave
+            // by knowing a shortcut is a room without a door.
+            //
+            // A raw key rather than a binding: `escape` is deliberately unbound
+            // in the composer keymaps, so it arrives here having passed every
+            // surface that wanted it first (each of those stops propagation),
+            // and a global keybinding would take it from all of them.
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && !event.keystroke.modifiers.modified()
+                    && matches!(this.route, Route::Review { .. })
+                    && !this.overlay_open()
+                {
+                    cx.stop_propagation();
+                    this.close_review(cx);
+                }
+            }))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
             // no-ops (comet __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
@@ -4255,17 +4333,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleBoard, window, cx| {
-                match this.route {
-                    Route::Chat => this.toggle_board(window, cx),
-                    // The board is where a review is opened from, so the same
-                    // key is the way back to it: leave the route, then open the
-                    // dock on the session the review was of.
-                    Route::Review { .. } => {
-                        this.close_review(cx);
-                        this.toggle_board(window, cx);
-                    }
-                    Route::Settings(_) => {}
-                }
+                this.toggle_board_from_route(window, cx)
             }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
                 if this.add_space.is_some() {

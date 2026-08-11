@@ -34,6 +34,12 @@ token means the field in `Theme`, never a literal at the call site.
   `--subtle`).
 - **B8** A 24px "+" sits after the last tab.
 - **B9** A 24px panel-toggle icon sits at the far right of the titlebar.
+- **B10** The strip carries REVIEW tabs as well as chats (gh#311). Source for
+  this one is `canvas/comet-review-window.dc.html:44`: on the review route a tab
+  in B4–B7's shape leads the strip — dot in `--review`, titled
+  `Review · <identifier>`, selected paint, the 18px close — and the space's
+  chats sit beside it drawn unselected, because the review is what is selected.
+  Closing that tab, or clicking one of the chats, leaves the review route.
 
 ## C. Sidebar (256px, 8px side padding)
 
