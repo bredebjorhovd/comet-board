@@ -122,6 +122,22 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         tokio::runtime::Handle::current(),
     ));
 
+    // What the box user's own instruction files say before any of this
+    // (gh#272). A dispatch naming no account writes into the CLI's own config
+    // dir, and the only reason this test does not is that the mock harness
+    // reads no such file — asserted after the dispatch, because the day that
+    // stops being true is the day a test edits somebody's `~/.claude`.
+    let untouched: Vec<(std::path::PathBuf, Option<String>)> =
+        [HarnessId::ClaudeCode, HarnessId::Codex]
+            .into_iter()
+            .filter_map(|h| comet_board::conventions::user_config_dir(h).map(|d| (h, d)))
+            .filter_map(|(h, d)| comet_board::conventions::path_in(&d, h))
+            .map(|p| {
+                let before = std::fs::read_to_string(&p).ok();
+                (p, before)
+            })
+            .collect();
+
     // ── dispatch ────────────────────────────────────────────────────────────
     let spec = DispatchSpec {
         identifier: "gh#1".into(),
@@ -146,6 +162,10 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
             tool_failures: Some(9),
             tool_calls: Some(900),
         },
+        // On, as a real route's dispatch is (gh#272). The mock harness reads
+        // no instruction file, so this one writes nothing — which is also what
+        // keeps the test off the box user's own `~/.claude`.
+        agent_instructions: true,
         prompt: "do the thing".into(),
     };
     let rt = runtime.clone();
@@ -153,6 +173,15 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         .await
         .unwrap()
         .expect("dispatch succeeds");
+
+    for (path, before) in &untouched {
+        assert_eq!(
+            &std::fs::read_to_string(path).ok(),
+            before,
+            "a mock dispatch must not write into {}",
+            path.display()
+        );
+    }
 
     // The checkout is a fresh worktree on exactly the spec's branch.
     assert_ne!(handle.cwd, repo.to_string_lossy());
@@ -270,6 +299,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         push_repo: None,
         git_author: None,
         turn_limits: Default::default(),
+        agent_instructions: true,
         prompt: "should never be sent".into(),
     };
     let err = tokio::task::spawn_blocking(move || rt.dispatch(&bogus))

@@ -17,6 +17,14 @@
 //!   the user-level copy at all.
 //! - `comet-board doctor` — says when what the agents see is not this binary's.
 //!
+//! Its sibling is [`crate::conventions`] (gh#272), which writes a much shorter
+//! block into the *instruction* file each runtime reads without being asked —
+//! `CLAUDE.md`, `AGENTS.md`. The split is what each channel costs: a skill is
+//! read when the agent judges it relevant, an instruction file is in context on
+//! every turn. So this stays the deep reference and that carries only what has
+//! to be true before anything is invoked — and, for Codex, which can invoke no
+//! skill at all, this text appended to it.
+//!
 //! Claude Code discovers `<config dir>/skills/<name>/SKILL.md`, and
 //! `CLAUDE_CONFIG_DIR` relocates that whole tree — which is the same variable
 //! the engine stamps on a dispatched child, so "install into a config dir" is

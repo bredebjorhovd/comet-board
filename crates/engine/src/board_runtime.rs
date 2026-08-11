@@ -100,10 +100,44 @@ impl Runtime for CometRuntime {
         // not is a row somebody has to clean up, and the operator finds out
         // either way. Materializing now also means the dir is seeded before
         // the brief is queued, so the run never races the seeding.
-        if let Some(account) = spec.account.as_deref() {
-            self.accounts
-                .materialize(spec.harness, account)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let config_dir = match spec.account.as_deref() {
+            Some(account) => Some(
+                self.accounts
+                    .materialize(spec.harness, account)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            ),
+            // No account named: the child inherits the CLI's own config dir,
+            // which on a single-login box is every dispatch there is. That dir
+            // is the box user's `~/.claude` / `~/.codex`, so the write into it
+            // has to be the marker-managed kind — and it is (gh#272).
+            None => self.accounts.default_config_dir(spec.harness),
+        };
+
+        // The board's conventions in the file this runtime reads without being
+        // asked (gh#272). Beside the skill for Claude, and instead of it for
+        // Codex, which has no skill mechanism and until now learned the board
+        // "by other means" — that is, not at all.
+        //
+        // Before the chat exists, like the materialize above, so the brief is
+        // never queued against a config dir the run would reach first. Never
+        // fatal: an attempt that can run is worth more than a file that could
+        // not be written, and the brief itself still carries the essentials.
+        if let Some(dir) = &config_dir {
+            match comet_board::conventions::apply(dir, spec.harness, spec.agent_instructions) {
+                Ok(Some(outcome)) if outcome.changed => {
+                    tracing::info!(
+                        path = %outcome.path.display(),
+                        enabled = spec.agent_instructions,
+                        "board conventions written into the runtime's instruction file"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    dir = %dir.display(),
+                    error = %err,
+                    "could not write the board conventions into the instruction file"
+                ),
+            }
         }
 
         let chat_id = crate::new_id();

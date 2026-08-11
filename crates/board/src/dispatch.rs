@@ -461,6 +461,10 @@ pub fn build_spec(
         // (gh#270). Resolved here because the route is here — the loop that
         // enforces it sees events, not config.
         turn_limits: cfg.turn_limits(Some(route)),
+        // And whether its runtime is handed the board's conventions in the file
+        // it reads on its own (gh#272) — same reasoning again: the executor
+        // writes the file, and the executor has no `routing.toml`.
+        agent_instructions: cfg.agent_instructions(Some(route)),
     })
 }
 
@@ -723,6 +727,30 @@ mod tests {
         .unwrap();
         assert_eq!(spec.turn_limits.tool_failures, Some(25));
         assert_eq!(spec.turn_limits.tool_calls, None);
+    }
+
+    /// gh#272: and so is whether its runtime is handed the conventions, for
+    /// the same reason — the executor writes the file beside the config dir it
+    /// materialized, with no `routing.toml` anywhere near it.
+    #[test]
+    fn a_dispatch_carries_whether_its_runtime_is_handed_the_conventions() {
+        let cfg = RoutingConfig::default();
+        let spec = |r: &crate::config::Route| {
+            build_spec(
+                &cfg,
+                r,
+                &task(),
+                &space(),
+                &DispatchOverrides::default(),
+                None,
+            )
+            .unwrap()
+            .agent_instructions
+        };
+        assert!(spec(&route()), "on unless somebody says otherwise");
+        let mut opted_out = route();
+        opted_out.agent_instructions = Some(false);
+        assert!(!spec(&opted_out));
     }
 
     /// gh#107: the teammate who released the work is the author of what comes

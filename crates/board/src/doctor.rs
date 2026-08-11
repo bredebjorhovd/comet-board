@@ -9,6 +9,7 @@
 //! pidfiles) have no equivalent and are gone.
 
 use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
+use crate::conventions;
 use crate::db::Db;
 use crate::gc;
 use crate::git_credentials;
@@ -18,7 +19,7 @@ use crate::skill;
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
 use comet_proto::view::board::RuntimeOption;
-use comet_proto::{AgentAccount, EdgeHealth, Space};
+use comet_proto::{AgentAccount, EdgeHealth, HarnessId, Space};
 use std::path::{Path, PathBuf};
 
 pub struct Check {
@@ -225,6 +226,20 @@ pub fn doctor(
         routing.as_ref().ok(),
         engine.peers.as_ref(),
     ));
+
+    // Read before the match takes ownership of `routing`: the instruction-file
+    // check runs last, long after `cfg` is gone, and "no block anywhere" reads
+    // as broken until you know the routes asked for none (gh#272).
+    let instructions_policy = routing.as_ref().ok().map(|cfg| {
+        (
+            cfg.agent_instructions(None),
+            cfg.routes
+                .iter()
+                .filter(|r| cfg.agent_instructions(Some(r)))
+                .count(),
+            cfg.routes.len(),
+        )
+    });
 
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
@@ -555,6 +570,12 @@ pub fn doctor(
         &skill::user_config_dir(),
         &crate::config::agent_account_dirs(),
     ));
+    // And what they are handed without asking for it (gh#272) — the same
+    // question one file over, for the channel Codex has and skills are not.
+    checks.push(agent_instructions_check(
+        &instruction_dirs(&crate::config::agent_account_dirs()),
+        instructions_policy,
+    ));
 
     Ok(checks)
 }
@@ -824,6 +845,98 @@ fn agent_skill_check(user_dir: &Path, slot_dirs: &[PathBuf]) -> Check {
             ok: false,
             detail: format!("{}: {e}{slots}", path.display()),
         },
+    }
+}
+
+/// Every config dir on this box that a dispatch would write an instruction file
+/// into (gh#272): the two CLIs' own dirs, plus each materialized account slot.
+///
+/// A slot dir is named by its id and nothing else, so which of the two files
+/// belongs in it is read off the credential the CLI left there
+/// ([`conventions::slot_harness`]); a slot that has never been materialized is
+/// skipped rather than guessed at, which is also what keeps a Codex slot from
+/// being reported as a Claude dir missing its `CLAUDE.md`.
+///
+/// A CLI's own dir counts only once it exists — a box with no `codex` installed
+/// would otherwise carry a permanent "one file without a block" for a runtime it
+/// cannot dispatch to at all.
+fn instruction_dirs(slot_dirs: &[PathBuf]) -> Vec<(HarnessId, PathBuf)> {
+    let mut dirs: Vec<(HarnessId, PathBuf)> = [HarnessId::ClaudeCode, HarnessId::Codex]
+        .into_iter()
+        .filter_map(|h| conventions::user_config_dir(h).map(|d| (h, d)))
+        .filter(|(_, d)| d.is_dir())
+        .collect();
+    dirs.extend(
+        slot_dirs
+            .iter()
+            .filter_map(|d| conventions::slot_harness(d).map(|h| (h, d.clone()))),
+    );
+    dirs
+}
+
+/// What the agents on this box are told about the board *without asking*
+/// (gh#272) — the marker-managed block in each runtime's instruction file.
+///
+/// Reported, and failed on exactly one thing: a file this cannot safely touch.
+/// A missing block is not a fault — the next dispatch on a route that wants one
+/// writes it, and on a board that has turned them off there should be none — and
+/// a stale one is not either, for [`agent_skill_check`]'s reason: it repairs
+/// itself the next time anything dispatches through that dir. What does not
+/// repair itself is a file whose markers are broken or which cannot be read,
+/// because the writer refuses both rather than guess where a block ends.
+fn agent_instructions_check(
+    dirs: &[(HarnessId, PathBuf)],
+    policy: Option<(bool, usize, usize)>,
+) -> Check {
+    let name = "agent instructions".to_string();
+    let policy = match policy {
+        None => String::new(),
+        Some((_, on, total)) if total > 0 => format!(", on for {on} of {total} route(s)"),
+        Some((default_on, _, _)) => {
+            format!(", {} by default", if default_on { "on" } else { "off" })
+        }
+    };
+    let (mut current, mut stale, mut absent) = (0usize, 0usize, 0usize);
+    let mut trouble: Vec<String> = Vec::new();
+    for (harness, dir) in dirs {
+        let path = match conventions::path_in(dir, *harness) {
+            Some(p) => p,
+            None => continue,
+        };
+        match conventions::status_of(dir, *harness) {
+            conventions::State::Current => current += 1,
+            conventions::State::Stale { .. } => stale += 1,
+            conventions::State::Absent => absent += 1,
+            conventions::State::Malformed => trouble.push(format!(
+                "{} has one conventions marker without the other — repair or remove them \
+                 by hand; nothing will write over it",
+                path.display()
+            )),
+            conventions::State::Unreadable(e) => trouble.push(format!("{}: {e}", path.display())),
+        }
+    }
+    if !trouble.is_empty() {
+        return Check {
+            name,
+            ok: false,
+            detail: trouble.join(" · "),
+        };
+    }
+    let counted = current + stale + absent;
+    Check {
+        name,
+        ok: true,
+        detail: format!(
+            "{current} of {counted} instruction file(s) carry v{}{}{policy}",
+            conventions::VERSION,
+            match (stale, absent) {
+                (0, 0) => String::new(),
+                (0, a) => format!(" ({a} without a block)"),
+                (s, 0) => format!(" ({s} behind — the next dispatch rewrites them)"),
+                (s, a) =>
+                    format!(" ({s} behind — the next dispatch rewrites them; {a} without a block)"),
+            },
+        ),
     }
 }
 
@@ -4597,6 +4710,45 @@ mod tests {
             "{}",
             c.detail
         );
+    }
+
+    /// gh#272: a missing block is a fact, not a fault — the next dispatch on a
+    /// route that wants one writes it, and a board with them turned off should
+    /// have none at all. The one thing that does not fix itself is a file this
+    /// refuses to touch.
+    #[test]
+    fn instruction_files_are_reported_and_only_a_broken_one_fails() {
+        let written = tempfile::tempdir().unwrap();
+        conventions::install_into(written.path(), HarnessId::Codex).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let dirs = [
+            (HarnessId::Codex, written.path().to_path_buf()),
+            (HarnessId::ClaudeCode, empty.path().to_path_buf()),
+        ];
+
+        let c = agent_instructions_check(&dirs, Some((true, 2, 3)));
+        assert!(c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("1 of 2 instruction file(s)"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("1 without a block"), "{}", c.detail);
+        assert!(c.detail.contains("on for 2 of 3 route(s)"), "{}", c.detail);
+
+        // A board with no routes at all still says what it would do.
+        let c = agent_instructions_check(&dirs, Some((false, 0, 0)));
+        assert!(c.detail.contains("off by default"), "{}", c.detail);
+
+        // Half a marker pair: nothing will write over it, so somebody has to.
+        std::fs::write(
+            conventions::path_in(empty.path(), HarnessId::ClaudeCode).unwrap(),
+            format!("{}\nhalf a block\n", conventions::BEGIN),
+        )
+        .unwrap();
+        let c = agent_instructions_check(&dirs, None);
+        assert!(!c.ok);
+        assert!(c.detail.contains("CLAUDE.md"), "{}", c.detail);
     }
 
     /// These checks read the provider, never the wire. Answering at all would
