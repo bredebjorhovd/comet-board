@@ -137,7 +137,10 @@ nearly verbatim — it never depended on herdr:
 - `crates/board/src/review.rs` — review delivery (§review-delivery): herdr-board's
   `review.rs` minus the wake latch and busy-check, delivering over the
   command ledger via `Runtime::prompt`. See §review-delivery for what was dropped
-  and why the loop still converges.
+  and why the loop still converges, and §gh#289 for where one-PR-one-chat stops
+  being enough — a `changes requested` on a layer of a stack is a fact about every
+  layer above it, so `address` resolves any layer to its chat and the layers on
+  top get a notice and a row that says they are about to be rebased.
 - `crates/board/src/notify.rs` — **new** (gh#71): who gets told what when a
   dispatched attempt blocks or settles, and the wording each of the three
   audiences gets. The effects are in `sync.rs` (`announce`, `wake_dispatcher`,

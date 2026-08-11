@@ -72,6 +72,7 @@ impl Stacks {
                 position: task.pr_stack.as_ref().and_then(|s| s.position),
                 open: task.pr_open,
                 mergeable: task.pr_mergeable.clone(),
+                changes_requested: task.pr_changes_requested.is_some(),
             });
         }
         for chain in layers.values_mut() {
@@ -102,7 +103,11 @@ impl Stacks {
     /// "2 of 2" about it would merge on the strength of it.
     pub fn row_stack(&self, task: &Task) -> Option<RowStack> {
         let stack = task.pr_stack.as_ref()?;
-        let layers = self.layers.get(&stack_key(task)?).cloned().unwrap_or_default();
+        let layers = self
+            .layers
+            .get(&stack_key(task)?)
+            .cloned()
+            .unwrap_or_default();
         Some(RowStack {
             number: stack.number,
             position: stack.position,
@@ -126,6 +131,178 @@ fn stack_key(task: &Task) -> Option<StackKey> {
         .map(str::to_string)
         .or_else(|| crate::model::pr_repo(task.pr_url.as_deref()?))?;
     Some((repo, number))
+}
+
+// ---- addressing the other layers (gh#289) -------------------------------
+
+/// One layer of a stack, as the layers around it need to see it.
+///
+/// Enough to *word* a fact about a neighbour without holding the neighbour's
+/// whole task: which row it is (so a surface can navigate, and delivery can
+/// resolve a chat), what it prints as, and its pull request. Not the branch —
+/// the branch that matters for a rebase is the one GitHub reports on the pull
+/// request, and the board's record of it goes stale exactly when a parent merges
+/// (gh#285).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependent {
+    pub id: String,
+    pub identifier: String,
+    pub pr_number: Option<i64>,
+    /// The pull request is still open. A layer that has landed is nobody's
+    /// parent any more — GitHub retargets its children onto its own base — so
+    /// this is what stops a merged layer holding the chain above it hostage.
+    pub open: bool,
+    /// The review that last asked this layer to change (gh#289).
+    pub changes_requested: Option<i64>,
+}
+
+/// Which rows are stacked on which, and so who else a fact about one row is a
+/// fact about (gh#289).
+///
+/// [`Stacks`] answers what a row should *say* about its siblings — position,
+/// size, the AND that decides whether merging it lands anything. This answers
+/// the other question a stack raises, and the one propagation needs: given
+/// something that just happened to one layer, which other layers is it about?
+///
+/// **Direction is the whole design.** Dependency points one way, so this does
+/// too. `changes requested` on layer 2 genuinely invalidates layers 3..N: their
+/// base is about to be rewritten, and when layer 2 force-pushes its fix GitHub
+/// replays their commits on top of it, so their diffs move under both their
+/// authors and their reviewers with no explanation in either place. `changes
+/// requested` on layer 3 invalidates **nothing** about layer 2 — it is still
+/// correct, still mergeable, still reviewable — so nothing goes down.
+///
+/// **Two edges, unioned**, because a stack reaches the board two ways and the
+/// dependency is real either way:
+///
+/// - GitHub's own stack object (gh#282), grouped into chains by [`Stacks`]. Each
+///   layer is stacked on the one below it.
+/// - [`Attempt::stacked_on`](crate::model::Attempt::stacked_on) (gh#285) — a
+///   dispatch the board cut from a sibling's branch. GitHub is never told that
+///   is a stack, so its `stack` object is absent and the grouping above finds
+///   nothing; the edge is no less real, and the child's diff no less dependent.
+///
+/// Where both speak, GitHub's wins: it is the topology the rebase will actually
+/// follow.
+#[derive(Debug, Default)]
+pub struct Dependents {
+    /// child id → the id of the layer it is stacked on.
+    parent: HashMap<String, String>,
+    /// parent id → the ids stacked directly on it. A `Vec` because two dispatches
+    /// can be cut from one sibling: that is a fan rather than a chain, and both
+    /// of them are dependents.
+    children: HashMap<String, Vec<String>>,
+    /// Every row in an edge, by id.
+    rows: HashMap<String, Dependent>,
+}
+
+impl Dependents {
+    /// Index one board's worth of tasks.
+    pub fn of(tasks: &[Task]) -> Self {
+        let mut me = Dependents::default();
+        for task in tasks {
+            me.rows.insert(
+                task.id.clone(),
+                Dependent {
+                    id: task.id.clone(),
+                    identifier: task.identifier.clone(),
+                    pr_number: task.pr_number,
+                    open: task.pr_open,
+                    changes_requested: task.pr_changes_requested,
+                },
+            );
+        }
+
+        // The dispatched edge first, so GitHub's own topology overwrites it
+        // where the two disagree.
+        let mut owner: HashMap<i64, &str> = HashMap::new();
+        for task in tasks {
+            for attempt in &task.attempts {
+                owner.insert(attempt.id, task.id.as_str());
+            }
+        }
+        for task in tasks {
+            // Newest attempt wins: a retry cut from somewhere else is where this
+            // row's branch stands now.
+            for attempt in &task.attempts {
+                let Some(on) = attempt.stacked_on.and_then(|id| owner.get(&id)) else {
+                    continue;
+                };
+                if *on != task.id {
+                    me.parent.insert(task.id.clone(), on.to_string());
+                }
+            }
+        }
+
+        for chain in Stacks::of(tasks).layers.into_values() {
+            for pair in chain.windows(2) {
+                me.parent.insert(pair[1].id.clone(), pair[0].id.clone());
+            }
+        }
+
+        for (child, parent) in &me.parent {
+            me.children
+                .entry(parent.clone())
+                .or_default()
+                .push(child.clone());
+        }
+        // Stable order, so a fan-out addresses its dependents the same way twice
+        // and a log line does not reshuffle between cycles.
+        for kids in me.children.values_mut() {
+            kids.sort();
+        }
+        me
+    }
+
+    /// Every layer stacked on `id`, transitively, nearest first.
+    ///
+    /// Nearest first because that is the order a rebase reaches them in, and the
+    /// order a reader would name them. Transitive because the invalidation is:
+    /// rewriting layer 2 moves layer 3, which moves layer 4, and a notice that
+    /// stopped at the direct child would leave every layer above it wondering
+    /// why its diff moved — the bug this exists to close, one layer up.
+    pub fn above(&self, id: &str) -> Vec<&Dependent> {
+        let mut out: Vec<&Dependent> = Vec::new();
+        let mut queue: Vec<&str> = vec![id];
+        // A malformed edge — two rows each recorded as the other's parent — must
+        // cost a short answer, never a hung sync cycle. There cannot be more
+        // layers than there are rows.
+        while let Some(next) = queue.pop() {
+            if out.len() > self.rows.len() {
+                break;
+            }
+            for child in self.children.get(next).into_iter().flatten() {
+                if out.iter().any(|d| d.id == *child) {
+                    continue;
+                }
+                if let Some(row) = self.rows.get(child) {
+                    out.push(row);
+                    queue.push(child);
+                }
+            }
+        }
+        out
+    }
+
+    /// The nearest layer below `id` that has been asked to change and is still
+    /// open, if there is one.
+    ///
+    /// Walks down rather than checking only the direct parent, because a merged
+    /// layer is not in the way: GitHub retargets its children onto its own base,
+    /// so the layer that will actually rebase this one is the nearest open one
+    /// underneath.
+    pub fn changes_below(&self, id: &str) -> Option<&Dependent> {
+        let mut at = id;
+        for _ in 0..=self.rows.len() {
+            let parent = self.parent.get(at)?;
+            let row = self.rows.get(parent.as_str())?;
+            if row.open && row.changes_requested.is_some() {
+                return Some(row);
+            }
+            at = parent.as_str();
+        }
+        None
+    }
 }
 
 // ---- authoring a stack (gh#287) -----------------------------------------
@@ -301,6 +478,7 @@ mod tests {
                 position: Some(position),
                 base_ref: Some("main".into()),
             }),
+            pr_changes_requested: None,
             updated_at: crate::db::now(),
             synced_at: crate::db::now(),
             attempts: vec![],
@@ -320,12 +498,14 @@ mod tests {
     /// same join `rows::board_rows` makes.
     fn row_of(tasks: &[Task], index: usize) -> TaskRow {
         let stacks = Stacks::of(tasks);
+        let deps = Dependents::of(tasks);
         let task = &tasks[index];
         let mut row = crate::rows::task_row(
             task,
             None,
             &crate::config::RoutingConfig::default(),
             stacks.row_stack(task),
+            deps.changes_below(&task.id).and_then(|d| d.pr_number),
         );
         // `task_row` fills this itself; asserted here so a change to one is a
         // change to both.
@@ -361,7 +541,11 @@ mod tests {
         tasks.push(layer("other/repo", 4, 1, 1, "main", Some("dirty")));
         let row = row_of(&tasks, 2);
         let stack = row.stack.as_ref().unwrap();
-        assert_eq!(stack.layers.len(), 3, "the other repo's stack 7 is not ours");
+        assert_eq!(
+            stack.layers.len(),
+            3,
+            "the other repo's stack 7 is not ours"
+        );
         assert!(landing(&row).ready(), "and cannot make this one wait");
     }
 
@@ -563,7 +747,10 @@ mod tests {
         let stack = row.stack.as_ref().unwrap();
         assert_eq!(stack.size, Some(3), "GitHub's count, not ours");
         assert_eq!(stack.layers.len(), 1);
-        assert_eq!(comet_proto::view::board::stack_note(&row).as_deref(), Some("3 of 3"));
+        assert_eq!(
+            comet_proto::view::board::stack_note(&row).as_deref(),
+            Some("3 of 3")
+        );
         // Nothing below it is known, so nothing below it is claimed. The layers
         // the board cannot see are exactly the ones it must not vouch for —
         // `below` is empty here only because the map is, and GitHub's position
@@ -585,6 +772,201 @@ mod tests {
             2,
             "the linear row's PR is in the same repo, and so in the same stack",
         );
+    }
+
+    // ---- addressing the other layers (gh#289) ---------------------------
+
+    /// One attempt of `task`, optionally cut from another attempt's branch.
+    fn cut_from(id: i64, task: &str, stacked_on: Option<i64>) -> crate::model::Attempt {
+        crate::model::Attempt {
+            id,
+            task_id: task.into(),
+            stacked_on,
+            ..crate::model::tests::blank_attempt()
+        }
+    }
+
+    /// The headline edge, and the direction it points. A review of the bottom
+    /// layer is a fact about every layer on top of it — nearest first, because
+    /// that is the order a replay reaches them in — and about nothing underneath.
+    #[test]
+    fn the_layers_above_are_the_dependents_and_nothing_propagates_down() {
+        let tasks = three_layers([Some("clean"); 3]);
+        let deps = Dependents::of(&tasks);
+        let above =
+            |id: &str| -> Vec<Option<i64>> { deps.above(id).iter().map(|d| d.pr_number).collect() };
+        assert_eq!(above("gh:o/r!11"), vec![Some(12), Some(13)]);
+        assert_eq!(above("gh:o/r!12"), vec![Some(13)]);
+        // Changes requested on the top layer invalidates nothing below it: those
+        // layers are still correct, still mergeable, still reviewable.
+        assert!(above("gh:o/r!13").is_empty());
+    }
+
+    /// The transitive half, stated on its own because stopping at the direct
+    /// child is the bug one layer up: rewriting layer 1 moves layer 2, which
+    /// moves layer 3, and layer 3 would be left wondering why its diff moved.
+    #[test]
+    fn a_dependents_own_dependents_are_dependents_too() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        // Strip GitHub's stack object, so the chain is only the dispatched edge
+        // — pairwise, and it has to be walked to reach the top.
+        for (i, task) in tasks.iter_mut().enumerate() {
+            task.pr_stack = None;
+            let id = i as i64 + 1;
+            task.attempts = vec![cut_from(id, &task.id.clone(), (id > 1).then_some(id - 1))];
+        }
+        let deps = Dependents::of(&tasks);
+        assert_eq!(
+            deps.above("gh:o/r!11")
+                .iter()
+                .map(|d| d.pr_number)
+                .collect::<Vec<_>>(),
+            vec![Some(12), Some(13)],
+        );
+    }
+
+    /// The edge GitHub was never told about (gh#285). `dispatch --onto` sets a
+    /// base and nothing else; there is no `stack` object to group on, and the
+    /// child's diff is no less dependent for it.
+    #[test]
+    fn a_dispatch_cut_from_a_sibling_is_a_dependency_github_never_heard_of() {
+        let mut parent = layer("o/r", 11, 1, 1, "main", Some("clean"));
+        parent.pr_stack = None;
+        parent.attempts = vec![cut_from(1, "gh:o/r!11", None)];
+        let mut child = layer("o/r", 12, 1, 1, "board/gh-11-lexer", Some("clean"));
+        child.pr_stack = None;
+        child.attempts = vec![cut_from(2, "gh:o/r!12", Some(1))];
+
+        let tasks = vec![parent, child];
+        assert!(
+            Stacks::of(&tasks).row_stack(&tasks[1]).is_none(),
+            "GitHub calls neither of these a stack",
+        );
+        let deps = Dependents::of(&tasks);
+        assert_eq!(deps.above("gh:o/r!11").len(), 1, "and it is still an edge");
+        assert!(deps.above("gh:o/r!12").is_empty());
+    }
+
+    /// An attempt cut from another attempt of the *same* task is a retry, not a
+    /// stack: a row that depended on itself would be told about its own reviews.
+    #[test]
+    fn a_row_is_never_stacked_on_itself() {
+        let mut task = layer("o/r", 11, 1, 1, "main", Some("clean"));
+        task.pr_stack = None;
+        task.attempts = vec![
+            cut_from(1, "gh:o/r!11", None),
+            cut_from(2, "gh:o/r!11", Some(1)),
+        ];
+        assert!(Dependents::of(&[task]).above("gh:o/r!11").is_empty());
+    }
+
+    /// What a row underneath has to be for this row to be waiting on it: open,
+    /// and asked to change. Two layers down still counts — the whole chain
+    /// replays.
+    #[test]
+    fn the_nearest_open_layer_asked_to_change_is_what_a_row_waits_on() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[0].pr_changes_requested = Some(900);
+        let deps = Dependents::of(&tasks);
+        assert!(
+            deps.changes_below("gh:o/r!11").is_none(),
+            "nothing is below the bottom layer",
+        );
+        assert_eq!(deps.changes_below("gh:o/r!12").unwrap().pr_number, Some(11));
+        assert_eq!(
+            deps.changes_below("gh:o/r!13").unwrap().pr_number,
+            Some(11),
+            "two layers down and still the thing that moves this one",
+        );
+
+        // The nearest of two, because that is the branch this row's base
+        // actually is.
+        tasks[1].pr_changes_requested = Some(901);
+        let deps = Dependents::of(&tasks);
+        assert_eq!(deps.changes_below("gh:o/r!13").unwrap().pr_number, Some(12));
+    }
+
+    /// A layer that landed is nobody's obstacle — GitHub retargets its children
+    /// onto its own base — so the walk goes past it to whatever is still open.
+    /// The same rule `landing` keeps for a merged parent.
+    #[test]
+    fn a_layer_that_landed_stops_holding_the_chain_above_it() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[0].pr_changes_requested = Some(900);
+        tasks[0].pr_open = false;
+        tasks[0].pr_merged = true;
+        let deps = Dependents::of(&tasks);
+        assert!(
+            deps.changes_below("gh:o/r!12").is_none(),
+            "whatever was asked of it, it is not going to be replayed",
+        );
+
+        // …and the layer above the merged one is read past, not stopped at.
+        tasks[1].pr_changes_requested = Some(901);
+        let deps = Dependents::of(&tasks);
+        assert_eq!(deps.changes_below("gh:o/r!13").unwrap().pr_number, Some(12));
+    }
+
+    /// The whole point of the issue, as the row says it: a layer that GitHub
+    /// calls `clean` is not reviewable while the branch under it is about to be
+    /// rewritten — and the answer outranks `clean`, because `clean` is the one
+    /// answer that gets somebody to press merge.
+    #[test]
+    fn a_layer_over_a_parent_asked_to_change_is_not_reviewable() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[0].pr_changes_requested = Some(900);
+
+        let top = row_of(&tasks, 2);
+        assert_eq!(landing(&top), Landing::ChangesBelow(11));
+        assert_eq!(top.landing.as_deref(), Some("changes-below"));
+        assert_eq!(
+            landing_note(&top).as_deref(),
+            Some("PR #11 below was asked to change · this rebases under it"),
+        );
+        // And the other place a reader is about to do something irreversible.
+        assert!(
+            merge_confirmation(&top)
+                .ends_with("PR #11 below was asked to change · this rebases under it"),
+            "{}",
+            merge_confirmation(&top),
+        );
+
+        // The layer that was asked to change is not waiting on itself, and says
+        // exactly what it said before.
+        let bottom = row_of(&tasks, 0);
+        assert_eq!(bottom.changes_below, None);
+        assert_eq!(landing(&bottom), Landing::Ready { below: 0 });
+    }
+
+    /// The map marks the layer the stack is waiting on, so a surface with the
+    /// chain in hand does not have to join the fact back on per layer.
+    #[test]
+    fn the_map_marks_the_layer_that_was_asked_to_change() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[1].pr_changes_requested = Some(900);
+        let stack = row_of(&tasks, 2).stack.unwrap();
+        assert_eq!(
+            stack
+                .layers
+                .iter()
+                .map(|l| l.changes_requested)
+                .collect::<Vec<_>>(),
+            vec![false, true, false],
+        );
+    }
+
+    /// A closed pull request's reader is not warned that a diff is about to
+    /// move: there is no diff of theirs left to read. The same rule
+    /// `pr_mergeable` keeps on the row.
+    #[test]
+    fn a_closed_layer_carries_no_warning_about_its_parent() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[0].pr_changes_requested = Some(900);
+        tasks[1].pr_open = false;
+        tasks[1].pr_merged = true;
+        let middle = row_of(&tasks, 1);
+        assert_eq!(middle.changes_below, None);
+        assert_eq!(middle.landing, None);
     }
 
     // ---- authoring (gh#287) ---------------------------------------------

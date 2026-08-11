@@ -14,7 +14,7 @@ use comet_proto::view::board::RowStack;
 use crate::config::{Route, RoutingConfig};
 use crate::db::Db;
 use crate::model::{BoardState, Task, UpstreamState};
-use crate::stacks::Stacks;
+use crate::stacks::{Dependents, Stacks};
 use crate::sync::route_context;
 
 /// The row shape itself lives in proto (`comet_proto::view::board`) so the
@@ -51,14 +51,16 @@ pub fn task_detail(task: &Task) -> TaskDetail {
 /// whole config rather than only the route because the wall-clock cap is a
 /// route-then-`[defaults]` resolution, and half of it is not on the route.
 ///
-/// `stack` is passed in rather than looked up, for the same reason the route is:
-/// it is a fact about this task's *neighbours* (gh#283), and a function handed
-/// one task cannot find them. [`board_rows`] holds the index that can.
+/// `stack` and `changes_below` are passed in rather than looked up, for the same
+/// reason the route is: they are facts about this task's *neighbours* (gh#283,
+/// gh#289), and a function handed one task cannot find them. [`board_rows`] holds
+/// the indexes that can.
 pub fn task_row(
     task: &Task,
     route: Option<&Route>,
     cfg: &RoutingConfig,
     stack: Option<RowStack>,
+    changes_below: Option<i64>,
 ) -> TaskRow {
     let live = task.live_attempt();
     let last = task.attempts.last();
@@ -96,6 +98,9 @@ pub fn task_row(
         // and "ready to land" on a row that has already landed is a claim about
         // a button nobody can press.
         pr_mergeable: task.pr_mergeable.clone().filter(|_| task.pr_open),
+        // Only while this pull request is open, on `pr_mergeable`'s terms: a
+        // reader is not warned that a closed request's diff is about to move.
+        changes_below: changes_below.filter(|_| task.pr_open),
         // Filled below, from the row itself.
         landing: None,
         stack,
@@ -160,12 +165,19 @@ pub fn task_row(
 pub fn board_rows(db: &Db, cfg: &RoutingConfig) -> anyhow::Result<Vec<TaskRow>> {
     let tasks = db.load_tasks()?;
     // Built once for the whole board: a stack's members are other rows, and
-    // asking per row would be a scan per row (gh#283).
+    // asking per row would be a scan per row (gh#283, gh#289).
     let stacks = Stacks::of(&tasks);
+    let deps = Dependents::of(&tasks);
     let mut rows: Vec<TaskRow> = Vec::new();
     for task in &tasks {
         let route = cfg.resolve(&route_context(task));
-        rows.push(task_row(task, route, cfg, stacks.row_stack(task)));
+        rows.push(task_row(
+            task,
+            route,
+            cfg,
+            stacks.row_stack(task),
+            deps.changes_below(&task.id).and_then(|d| d.pr_number),
+        ));
     }
     rows.sort_by_key(|r| {
         BoardState::SECTION_ORDER

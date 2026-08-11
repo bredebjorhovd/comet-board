@@ -282,6 +282,16 @@ pub struct StackLayer {
     /// land" can be made without a second lookup — and so a map can mark the
     /// layer that is stuck.
     pub mergeable: Option<String>,
+    /// A reviewer asked this layer to change, and nothing has said otherwise
+    /// since (gh#289).
+    ///
+    /// The other fact about a layer that is a fact about every layer above it:
+    /// when this one pushes its fix, GitHub replays theirs on top of it. Carried
+    /// beside [`mergeable`](Self::mergeable) because it is read the same way —
+    /// ANDed down the chain by [`landing`] — and so a map can mark the layer the
+    /// stack is waiting on rather than only counting it.
+    #[serde(default)]
+    pub changes_requested: bool,
 }
 
 /// A row's place in a stacked pull request, and the map of its siblings
@@ -327,6 +337,19 @@ impl RowStack {
     pub fn below(&self, id: &str) -> &[StackLayer] {
         match self.layers.iter().position(|layer| layer.id == id) {
             Some(i) => &self.layers[..i],
+            None => &[],
+        }
+    }
+
+    /// The layers on top of `id`, nearest first — the ones a change to that row
+    /// moves the ground under (gh#289).
+    ///
+    /// [`below`](Self::below)'s mirror, and the direction propagation runs in:
+    /// merging looks down, feedback fans up. Nearest first rather than bottom
+    /// first, because the nearest layer is the one whose base moves.
+    pub fn above(&self, id: &str) -> &[StackLayer] {
+        match self.layers.iter().position(|layer| layer.id == id) {
+            Some(i) => &self.layers[i + 1..],
             None => &[],
         }
     }
@@ -392,9 +415,26 @@ pub struct TaskRow {
     /// asking; this is the raw fact it is derived from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_mergeable: Option<String>,
+    /// A layer below this one has been asked to change (gh#289) — the pull
+    /// request number of the nearest such layer, or absent when none has.
+    ///
+    /// The one fact about a stack that is not about merging: this pull request
+    /// may be perfectly clean and still be unreviewable, because the branch
+    /// underneath it is about to be rewritten and GitHub will replay these
+    /// commits on top of the new one. A human who reads the diff now is reading
+    /// a diff that is going to move, and the worse outcome is that they approve
+    /// it. So [`landing`] answers with it before it answers anything else, and
+    /// the row leaves the review section while it stands.
+    ///
+    /// Derived board-side rather than read off [`stack`](Self::stack), because
+    /// the dependency edge is wider than GitHub's own stack object: a layer the
+    /// board dispatched onto a sibling's branch (gh#285) is stacked on it
+    /// whether or not GitHub was told so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_below: Option<i64>,
     /// Whether this pull request can land, with the layers below it taken into
-    /// account: `ready`, `waiting-on-stack`, `not-clean` — or absent, meaning
-    /// nobody has asked GitHub yet (gh#283).
+    /// account: `ready`, `waiting-on-stack`, `not-clean`, `changes-below` — or
+    /// absent, meaning nobody has asked GitHub yet (gh#283).
     ///
     /// The verdict rather than its parts, because the AND across a stack is the
     /// one thing every reader of this contract would otherwise have to
@@ -716,7 +756,10 @@ fn on_board(rows: &[TaskRow], now: DateTime<Utc>) -> impl Iterator<Item = &TaskR
 /// row closed yesterday is left out, and it is the same reason `no route` is
 /// skipped on a board where everything routes.
 pub fn filter_cycle(rows: &[TaskRow], now: DateTime<Utc>) -> Vec<Filter> {
-    let mut out: Vec<Filter> = routes_present(rows, now).into_iter().map(Filter::Route).collect();
+    let mut out: Vec<Filter> = routes_present(rows, now)
+        .into_iter()
+        .map(Filter::Route)
+        .collect();
     if on_board(rows, now).any(|row| row.route.is_none()) {
         out.push(Filter::NoRoute);
     }
@@ -834,8 +877,7 @@ pub fn grouped_sections<'a>(
 /// filter chip already says.
 pub fn group_headers_shown(filter: &Filter, groups: &[SectionGroup]) -> bool {
     groups.len() > 1
-        || (matches!(filter, Filter::All)
-            && groups.first().is_some_and(|g| g.route.is_none()))
+        || (matches!(filter, Filter::All) && groups.first().is_some_and(|g| g.route.is_none()))
 }
 
 /// Was this task closed today, in the operator's own timezone?
@@ -925,11 +967,17 @@ struct MetaField {
 
 impl MetaField {
     fn cell(text: impl Into<String>, width: usize) -> Self {
-        Self { text: text.into(), cell: Some(width) }
+        Self {
+            text: text.into(),
+            cell: Some(width),
+        }
     }
 
     fn flow(text: impl Into<String>) -> Self {
-        Self { text: text.into(), cell: None }
+        Self {
+            text: text.into(),
+            cell: None,
+        }
     }
 }
 
@@ -974,9 +1022,7 @@ fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> V
                 .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
                 // Never negative: a clock skew must not render as a count-up
                 // from the future.
-                .map(|start| {
-                    format_elapsed((now - start.with_timezone(&Utc)).num_seconds().max(0))
-                })
+                .map(|start| format_elapsed((now - start.with_timezone(&Utc)).num_seconds().max(0)))
                 .unwrap_or_default();
             vec![
                 MetaField::cell(row.runtime.as_deref().unwrap_or(""), RUNTIME_CELL),
@@ -987,6 +1033,15 @@ fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> V
                 // one of them is about to have its context compacted away
                 // (gh#271). Quiet until there is something to say.
                 MetaField::flow(context_note(row.context).unwrap_or_default()),
+                // A layer waiting on the one below it (gh#289) is `blocked` with
+                // no agent in it and no clock to run, so without this it is a row
+                // in the loudest section of the board saying nothing at all about
+                // why it is there. On a `working` layer it is the same fact and
+                // still worth reading: the ground under this branch is moving.
+                MetaField::flow(match row.changes_below {
+                    Some(_) => landing_note(row).unwrap_or_default(),
+                    None => String::new(),
+                }),
             ]
         }
         BoardState::Failed => vec![MetaField::flow("pane exited without completing")],
@@ -1124,6 +1179,10 @@ pub enum Landing<'a> {
     /// GitHub objects to this pull request itself, in its own vocabulary:
     /// `behind`, `dirty`, `blocked`, `unstable`, `draft`.
     NotClean(&'a str),
+    /// A layer below has been asked to change (gh#289), naming its pull request.
+    /// Nothing about *this* pull request is wrong; the ground under it is moving,
+    /// so neither its diff nor GitHub's verdict on it is worth acting on yet.
+    ChangesBelow(i64),
     /// Nobody has asked GitHub. Mergeability costs a call per open PR and rides
     /// the full sweep, so this is the ordinary state of a freshly-seen row.
     Unknown,
@@ -1137,6 +1196,7 @@ impl Landing<'_> {
             Landing::Ready { .. } => Some("ready"),
             Landing::CleanAgainstBase { .. } => Some("waiting-on-stack"),
             Landing::NotClean(_) => Some("not-clean"),
+            Landing::ChangesBelow(_) => Some("changes-below"),
             Landing::Unknown => None,
         }
     }
@@ -1155,6 +1215,15 @@ impl Landing<'_> {
 /// viewports call it for the words. A caller holding a row that came off the
 /// wire can call it too — it reads nothing but the row.
 pub fn landing(row: &TaskRow) -> Landing<'_> {
+    // Ahead of GitHub's own answer, and ahead of "nobody has asked": a layer
+    // below that has been asked to change is going to be rewritten, and every
+    // fact about this pull request measured against the branch underneath it —
+    // `mergeable_state` included — is about to be measured against a different
+    // branch. Saying `clean` here is the one answer that gets somebody to press
+    // merge, or worse, to approve (gh#289).
+    if let Some(number) = row.changes_below {
+        return Landing::ChangesBelow(number);
+    }
     let Some(state) = row.pr_mergeable.as_deref().filter(|s| !s.is_empty()) else {
         return Landing::Unknown;
     };
@@ -1172,7 +1241,9 @@ pub fn landing(row: &TaskRow) -> Landing<'_> {
         .iter()
         .find(|l| l.mergeable.as_deref().is_some_and(|m| m != MERGEABLE_CLEAN))
     {
-        return Landing::CleanAgainstBase { blocker: Some(blocker) };
+        return Landing::CleanAgainstBase {
+            blocker: Some(blocker),
+        };
     }
     if below.iter().any(|l| l.mergeable.is_none()) {
         return Landing::CleanAgainstBase { blocker: None };
@@ -1223,10 +1294,18 @@ pub fn landing_note(row: &TaskRow) -> Option<String> {
         Landing::Unknown => return None,
         Landing::Ready { below: 0 } => "ready to land".to_string(),
         Landing::Ready { below } => format!("ready to land with {below} below"),
-        Landing::CleanAgainstBase { blocker: Some(layer) } => {
+        Landing::CleanAgainstBase {
+            blocker: Some(layer),
+        } => {
             format!("clean against {base} · waiting on {}", layer_name(layer))
         }
         Landing::CleanAgainstBase { blocker: None } => format!("clean against {base}"),
+        // Not "waiting on", which is what a dirty parent earns: this one is
+        // going to be *rebased*, and the word has to say that the diff moves
+        // rather than that a merge is queued behind something.
+        Landing::ChangesBelow(number) => {
+            format!("PR #{number} below was asked to change · this rebases under it")
+        }
         Landing::NotClean(state) => match state {
             "behind" => format!("behind {base}"),
             "dirty" => format!("conflicts with {base}"),
@@ -1733,7 +1812,9 @@ pub fn primary_action(row: &TaskRow) -> Option<RowAction> {
         BoardState::Review => RowAction::OpenPr,
         BoardState::Done => return None,
     };
-    row_actions(row).into_iter().find(|action| *action == wanted)
+    row_actions(row)
+        .into_iter()
+        .find(|action| *action == wanted)
 }
 
 /// The rest — the verbs a surface may keep behind a hover or a long press.
@@ -2387,12 +2468,19 @@ pub fn board_dispatched(rows: &[TaskRow]) -> bool {
 /// A candidate is ruled out by its `WatchBoard` stream ending without ever
 /// delivering a frame — the engine refuses the subscription outright when it
 /// hosts no board, so "said nothing at all" IS the answer.
-pub fn host_candidates(devices: &[crate::Device], local_device_id: Option<&str>) -> Vec<Option<String>> {
+pub fn host_candidates(
+    devices: &[crate::Device],
+    local_device_id: Option<&str>,
+) -> Vec<Option<String>> {
     let mut others: Vec<&crate::Device> = devices
         .iter()
         .filter(|d| Some(d.id.as_str()) != local_device_id)
         .collect();
-    others.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+    others.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     std::iter::once(None)
         .chain(others.into_iter().map(|d| Some(d.id.clone())))
         .collect()
@@ -2421,7 +2509,9 @@ mod tests {
     use crate::view::board::{Filter, TaskRow};
 
     fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z").unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     fn row(id: &str, state: BoardState) -> TaskRow {
@@ -2444,6 +2534,7 @@ mod tests {
             pr_number: None,
             pr_base_ref: None,
             pr_mergeable: None,
+            changes_below: None,
             landing: None,
             stack: None,
             branch: Some("board/gh-x".into()),
@@ -2528,7 +2619,10 @@ mod tests {
         rows[1].route = Some("itsm-agent".into());
         rows[2].route = Some("itsm-agent".into());
         rows[3].route = Some("tally".into());
-        assert_eq!(routes_present(&rows, now()), vec!["itsm-agent", "offhand", "tally"]);
+        assert_eq!(
+            routes_present(&rows, now()),
+            vec!["itsm-agent", "offhand", "tally"]
+        );
         assert_eq!(
             filter_cycle(&rows, now()),
             vec![
@@ -2558,7 +2652,10 @@ mod tests {
     #[test]
     fn no_route_is_skipped_when_everything_routes() {
         let rows = vec![row("a", BoardState::Ready)];
-        assert_eq!(filter_cycle(&rows, now()), vec![Filter::Route("offhand".into())]);
+        assert_eq!(
+            filter_cycle(&rows, now()),
+            vec![Filter::Route("offhand".into())]
+        );
     }
 
     #[test]
@@ -2582,7 +2679,10 @@ mod tests {
         assert!(Filter::Text("gh#a".into()).matches(&rows[0]));
         assert!(Filter::Text("task b".into()).matches(&rows[1]));
         assert!(Filter::Text("offhand".into()).matches(&rows[0]));
-        assert!(Filter::Text("no route".into()).matches(&rows[1]), "`/no route` must reach the group");
+        assert!(
+            Filter::Text("no route".into()).matches(&rows[1]),
+            "`/no route` must reach the group"
+        );
         assert!(!Filter::Text("zzz".into()).matches(&rows[0]));
         // An empty query is the whole board, not nothing.
         assert!(Filter::Text("".into()).matches(&rows[0]));
@@ -2683,7 +2783,10 @@ mod tests {
         assert!(!group_starts_collapsed(&Filter::NoRoute, None));
         // `/` matching an unrouted title: a search that hides its own match
         // reads as no match at all.
-        assert!(!group_starts_collapsed(&Filter::Text("signicat".into()), None));
+        assert!(!group_starts_collapsed(
+            &Filter::Text("signicat".into()),
+            None
+        ));
         // And the lone group under that filter needs no header repeating what
         // the filter chip already says.
         let mut unrouted = vec![row("u", BoardState::Ready)];
@@ -2723,11 +2826,17 @@ mod tests {
     #[test]
     fn dispatch_evidence_is_any_attempt_on_record_not_a_live_chat() {
         let mut rows = vec![row("a", BoardState::Ready), row("b", BoardState::Done)];
-        assert!(!board_dispatched(&rows), "a board that only collected rows is furniture");
+        assert!(
+            !board_dispatched(&rows),
+            "a board that only collected rows is furniture"
+        );
         // The box between dispatches: nothing live, history on record.
         rows[1].attempts = 3;
         assert!(board_dispatched(&rows));
-        assert!(!board_dispatched(&[]), "an empty board proves nothing either way");
+        assert!(
+            !board_dispatched(&[]),
+            "an empty board proves nothing either way"
+        );
     }
 
     #[test]
@@ -2760,6 +2869,7 @@ mod tests {
                     position: Some(p),
                     open: true,
                     mergeable: Some("clean".into()),
+                    changes_requested: false,
                 })
                 .collect(),
         });
@@ -2799,7 +2909,10 @@ mod tests {
     fn an_unpolled_review_row_still_says_it_is_waiting_on_you() {
         let mut r = stacked("s", 2, 3, "board/gh-11-lexer");
         r.pr_mergeable = None;
-        assert_eq!(row_metadata(&r, false, 80, now()), "PR #12 · 2 of 3 · waiting on you");
+        assert_eq!(
+            row_metadata(&r, false, 80, now()),
+            "PR #12 · 2 of 3 · waiting on you"
+        );
         assert_eq!(landing(&r), Landing::Unknown);
         assert_eq!(landing_note(&r), None);
     }
@@ -2809,13 +2922,101 @@ mod tests {
     #[test]
     fn an_unstacked_row_adds_nothing_to_the_wire() {
         let wire = serde_json::to_string(&row("r", BoardState::Review)).unwrap();
-        for field in ["stack", "landing", "pr_mergeable", "pr_base_ref"] {
+        for field in [
+            "stack",
+            "landing",
+            "pr_mergeable",
+            "pr_base_ref",
+            "changes_below",
+        ] {
             assert!(!wire.contains(field), "{field} in {wire}");
         }
         // And an old client's row still parses: every one of them defaults.
         let back: TaskRow = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.stack, None);
         assert_eq!(back.landing, None);
+        assert_eq!(back.changes_below, None);
+    }
+
+    /// The direction propagation runs in (gh#289): `below` is what merging takes
+    /// with it, `above` is what a rewrite moves — nearest first, because that is
+    /// the order a replay reaches them in.
+    #[test]
+    fn above_mirrors_below_from_the_other_end_of_the_chain() {
+        let stack = stacked("s", 1, 3, "main").stack.unwrap();
+        let numbers = |ls: &[StackLayer]| ls.iter().filter_map(|l| l.pr_number).collect::<Vec<_>>();
+        assert_eq!(numbers(stack.above("l1")), vec![12, 13]);
+        assert_eq!(numbers(stack.above("l2")), vec![13]);
+        assert!(stack.above("l3").is_empty());
+        assert!(stack.above("nobody-here").is_empty());
+    }
+
+    /// gh#289's headline, as the row words it. A layer GitHub calls `clean` is
+    /// not reviewable while the branch under it is about to be rewritten, and the
+    /// answer has to outrank `clean` — that is the one answer that gets somebody
+    /// to press merge, or worse, to approve a diff that then moves.
+    #[test]
+    fn a_layer_over_a_request_for_changes_says_so_before_it_says_clean() {
+        let mut r = stacked("s", 3, 3, "board/gh-12-parser");
+        assert_eq!(landing(&r), Landing::Ready { below: 2 }, "clean, before");
+        r.changes_below = Some(11);
+
+        assert_eq!(landing(&r), Landing::ChangesBelow(11));
+        assert_eq!(landing(&r).as_str(), Some("changes-below"));
+        assert!(!landing(&r).ready());
+        assert_eq!(
+            landing_note(&r).as_deref(),
+            Some("PR #11 below was asked to change · this rebases under it"),
+        );
+        // The review row carries it where the landing verdict already went…
+        assert_eq!(
+            row_metadata(&r, false, 120, now()),
+            "PR #13 · 3 of 3 · PR #11 below was asked to change · this rebases under it",
+        );
+        // …and so does the last screen before something irreversible.
+        assert!(
+            merge_confirmation(&r)
+                .ends_with("PR #11 below was asked to change · this rebases under it"),
+            "{}",
+            merge_confirmation(&r),
+        );
+
+        // Unknown mergeability does not mask it: not having asked GitHub whether
+        // this layer is clean says nothing about the branch under it.
+        r.pr_mergeable = None;
+        assert_eq!(landing(&r), Landing::ChangesBelow(11));
+    }
+
+    /// The row it lands on has no agent in it and no clock to run, so without a
+    /// word of its own it would sit in the loudest section of the board saying
+    /// nothing at all (gh#289).
+    #[test]
+    fn a_layer_held_up_by_the_one_below_says_why_from_the_blocked_section() {
+        let mut r = stacked("s", 3, 3, "board/gh-12-parser");
+        r.state = BoardState::Blocked.as_str().into();
+        r.changes_below = Some(11);
+        let line = row_metadata(&r, false, 120, now());
+        assert!(
+            line.contains("PR #11 below was asked to change"),
+            "a blocked layer says what it is waiting on: {line}"
+        );
+
+        // And a working layer, which is informed rather than stopped, reads the
+        // same fact beside its clock.
+        r.state = BoardState::Working.as_str().into();
+        r.started_at = Some("2026-08-01T11:59:30Z".into());
+        let line = row_metadata(&r, false, 120, now());
+        assert!(line.contains("30s"), "{line}");
+        assert!(line.contains("PR #11 below was asked to change"), "{line}");
+
+        // A blocked row with nothing below it is exactly what it was.
+        r.state = BoardState::Blocked.as_str().into();
+        r.changes_below = None;
+        assert!(
+            !row_metadata(&r, false, 120, now()).contains("below"),
+            "{}",
+            row_metadata(&r, false, 120, now()),
+        );
     }
 
     #[test]
@@ -2931,14 +3132,20 @@ mod tests {
         assert_eq!(row_metadata_line(&done, false, now()), "ws:offhand");
         // A ready row with nothing to say says nothing — the whole reason the
         // second line could go.
-        assert_eq!(row_metadata_line(&row("r", BoardState::Ready), false, now()), "");
+        assert_eq!(
+            row_metadata_line(&row("r", BoardState::Ready), false, now()),
+            ""
+        );
         // The billing note is still last, and still separated.
         let mut billed = row("b", BoardState::Working);
         billed.started_at = Some("2026-08-01T11:59:30Z".into());
         billed.billed_to = Some("someone@else.example".into());
         billed.dispatched_by_user = Some("brede@tally.no".into());
         let line = row_metadata_line(&billed, false, now());
-        assert!(line.ends_with(&bills_label("someone@else.example")), "{line}");
+        assert!(
+            line.ends_with(&bills_label("someone@else.example")),
+            "{line}"
+        );
     }
 
     #[test]
@@ -3033,7 +3240,10 @@ mod tests {
         let rows = vec![live, orphan, settled, ready];
         let agents = agent_rows(&rows, &[chat("chat-live", None)], &[], now());
         assert_eq!(
-            agents.iter().map(|a| a.task_id.as_str()).collect::<Vec<_>>(),
+            agents
+                .iter()
+                .map(|a| a.task_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["live"]
         );
     }
@@ -3052,13 +3262,22 @@ mod tests {
         let mut stale = row("stale", BoardState::Working);
         stale.chat_id = Some("c4".into());
 
-        let chats = vec![chat("c1", None), chat("c2", None), chat("c3", None), chat("c4", None)];
+        let chats = vec![
+            chat("c1", None),
+            chat("c2", None),
+            chat("c3", None),
+            chat("c4", None),
+        ];
         let sessions = vec![
             session("c1", crate::SessionStatus::AwaitingInput, 0),
             session("c2", crate::SessionStatus::Errored, 0),
             // Older than the staleness window: a crashed backend must not leave
             // an eternal spinner in the sidebar.
-            session("c4", crate::SessionStatus::Working, crate::view::SESSION_STALE_MS + 1_000),
+            session(
+                "c4",
+                crate::SessionStatus::Working,
+                crate::view::SESSION_STALE_MS + 1_000,
+            ),
         ];
         let agents = agent_rows(&[asking, died, no_session, stale], &chats, &sessions, now());
         let state = |id: &str| {
@@ -3090,7 +3309,12 @@ mod tests {
         let mut died = row("died", BoardState::Working);
         died.chat_id = Some("c4".into());
 
-        let chats = vec![chat("c1", None), chat("c2", None), chat("c3", None), chat("c4", None)];
+        let chats = vec![
+            chat("c1", None),
+            chat("c2", None),
+            chat("c3", None),
+            chat("c4", None),
+        ];
         let sessions = vec![
             session("c1", crate::SessionStatus::Working, 0),
             session("c2", crate::SessionStatus::Working, 0),
@@ -3099,7 +3323,10 @@ mod tests {
         ];
         let agents = agent_rows(&[fast, slow, asking, died], &chats, &sessions, now());
         assert_eq!(
-            agents.iter().map(|a| a.task_id.as_str()).collect::<Vec<_>>(),
+            agents
+                .iter()
+                .map(|a| a.task_id.as_str())
+                .collect::<Vec<_>>(),
             // A question, then a dead run, then the longest-running worker.
             vec!["ask", "died", "slow", "fast"]
         );
@@ -3115,14 +3342,20 @@ mod tests {
         r.started_at = Some("2026-08-01T10:10:00Z".into()); // 1h50m
         r.max_duration_secs = Some(7200);
         let agents = agent_rows(&[r.clone()], &[chat("c1", None)], &[], now());
-        assert_eq!(agents[0].elapsed_label(now()).as_deref(), Some("1h50m / 2h"));
+        assert_eq!(
+            agents[0].elapsed_label(now()).as_deref(),
+            Some("1h50m / 2h")
+        );
         assert!(!agents[0].over_cap(now()));
 
         // Past the cap: gh#70's clock is about to end it, and the row says so.
         let mut over = r.clone();
         over.started_at = Some("2026-08-01T09:00:00Z".into()); // 3h
         let agents = agent_rows(&[over], &[chat("c1", None)], &[], now());
-        assert_eq!(agents[0].elapsed_label(now()).as_deref(), Some("3h00m / 2h"));
+        assert_eq!(
+            agents[0].elapsed_label(now()).as_deref(),
+            Some("3h00m / 2h")
+        );
         assert!(agents[0].over_cap(now()));
 
         // An uncapped route says only how long it has been.
@@ -3172,14 +3405,29 @@ mod tests {
     /// the board cannot report, and it shows anyway.
     #[test]
     fn a_working_chat_with_no_attempt_is_a_running_row() {
-        let chats = vec![chat("orchestrator", None), chat("adhoc", None), chat("idle", None)];
+        let chats = vec![
+            chat("orchestrator", None),
+            chat("adhoc", None),
+            chat("idle", None),
+        ];
         let sessions = vec![
-            started("orchestrator", crate::SessionStatus::Working, "2026-08-01T11:30:00Z"),
-            started("adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
+            started(
+                "orchestrator",
+                crate::SessionStatus::Working,
+                "2026-08-01T11:30:00Z",
+            ),
+            started(
+                "adhoc",
+                crate::SessionStatus::AwaitingInput,
+                "2026-08-01T11:58:00Z",
+            ),
         ];
         let running = running_rows(&[], &chats, &sessions, None, now());
         assert_eq!(
-            running.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
+            running
+                .iter()
+                .map(|r| r.chat_id.as_str())
+                .collect::<Vec<_>>(),
             // Blocked floats; the idle chat is not a run at all.
             vec!["adhoc", "orchestrator"]
         );
@@ -3201,13 +3449,20 @@ mod tests {
         ];
         let sessions = vec![
             // A crashed backend must not leave an eternal row here either.
-            session("stale", crate::SessionStatus::Working, crate::view::SESSION_STALE_MS + 1_000),
+            session(
+                "stale",
+                crate::SessionStatus::Working,
+                crate::view::SESSION_STALE_MS + 1_000,
+            ),
             session("errored", crate::SessionStatus::Errored, 0),
             session("archived", crate::SessionStatus::Working, 0),
         ];
         let running = running_rows(&[], &chats, &sessions, None, now());
         assert_eq!(
-            running.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
+            running
+                .iter()
+                .map(|r| r.chat_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["archived"],
             "archiving is a decision about a finished chat, not about a live run"
         );
@@ -3270,7 +3525,11 @@ mod tests {
         };
         let chats = vec![chat("named", None), untitled];
         let sessions = vec![
-            started("named", crate::SessionStatus::AwaitingInput, "2026-08-01T11:00:00Z"),
+            started(
+                "named",
+                crate::SessionStatus::AwaitingInput,
+                "2026-08-01T11:00:00Z",
+            ),
             // No `started_at`: the row draws without a counter rather than
             // counting up from the epoch.
             session("blank", crate::SessionStatus::Working, 0),
@@ -3328,8 +3587,16 @@ mod tests {
         ];
         let sessions = vec![
             session("c-attempt", crate::SessionStatus::Working, 0),
-            started("c-adhoc", crate::SessionStatus::AwaitingInput, "2026-08-01T11:58:00Z"),
-            started("c-orch", crate::SessionStatus::Working, "2026-08-01T09:00:00Z"), // 3h
+            started(
+                "c-adhoc",
+                crate::SessionStatus::AwaitingInput,
+                "2026-08-01T11:58:00Z",
+            ),
+            started(
+                "c-orch",
+                crate::SessionStatus::Working,
+                "2026-08-01T09:00:00Z",
+            ), // 3h
         ];
         let active = active_rows(&[attempt], &chats, &sessions, None, now());
         assert_eq!(
@@ -3363,7 +3630,12 @@ mod tests {
 
     // ---- whose subscription (gh#101) ------------------------------------
 
-    fn login(id: &str, email: &str, harness: crate::HarnessId, active: bool) -> crate::AgentAccount {
+    fn login(
+        id: &str,
+        email: &str,
+        harness: crate::HarnessId,
+        active: bool,
+    ) -> crate::AgentAccount {
         crate::AgentAccount {
             id: id.into(),
             harness,
@@ -3506,7 +3778,10 @@ mod tests {
         );
         // The sweep walks the list once and then stops: a board that is
         // nowhere must read as "nowhere", not loop forever.
-        assert_eq!(next_host_candidate(&candidates, None), Some(Some("box".into())));
+        assert_eq!(
+            next_host_candidate(&candidates, None),
+            Some(Some("box".into()))
+        );
         assert_eq!(
             next_host_candidate(&candidates, Some("box")),
             Some(Some("phone".into()))

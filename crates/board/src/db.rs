@@ -169,6 +169,14 @@ impl Db {
               pr_stack_size      INTEGER,
               pr_stack_position  INTEGER,
               pr_stack_base_ref  TEXT,
+              -- The id of the review that last asked this PR to change, and
+              -- which nothing has withdrawn since (gh#289). NULL is "not under
+              -- review changes" — never asked, or asked and since approved.
+              -- Stored flat beside the topology above because it is read the
+              -- same way: the layers on top of this one derive their own state
+              -- from it, and a per-row `meta` lookup on every board read is the
+              -- shape that would make that expensive.
+              pr_changes_requested INTEGER,
               updated_at   TEXT NOT NULL,
               synced_at    TEXT NOT NULL
             );
@@ -397,6 +405,12 @@ impl Db {
                 ("pr_stack_size", "INTEGER"),
                 ("pr_stack_position", "INTEGER"),
                 ("pr_stack_base_ref", "TEXT"),
+                // gh#289. NULL on every row that came before, which is what
+                // they are: no review of theirs was ever fanned out, and
+                // backfilling would mean asking GitHub for the review history
+                // of every open pull request on the board to answer a question
+                // the next poll answers for free.
+                ("pr_changes_requested", "INTEGER"),
                 ("upstream", "TEXT NOT NULL DEFAULT 'unstarted'"),
             ],
         )?;
@@ -758,6 +772,22 @@ impl Db {
         Ok(())
     }
 
+    /// Record that a reviewer asked this pull request to change, or that nothing
+    /// is outstanding on it any more (gh#289).
+    ///
+    /// The projection of [`crate::review::Delivered::changes_requested`] onto
+    /// the row, written by [`crate::review::store`] and by nothing else, so the
+    /// two cannot come to disagree about what a reviewer last said. The record
+    /// is the source; this column is what the rows and the state derivation read
+    /// without a `meta` lookup each.
+    pub fn set_pr_changes_requested(&self, task_id: &str, review_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET pr_changes_requested = ?2 WHERE id = ?1",
+            params![task_id, review_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_pr_merged(&self, task_id: &str, merged: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET pr_merged = ?2 WHERE id = ?1",
@@ -791,7 +821,7 @@ impl Db {
                     local_done, pr_url, pr_number, pr_open, pr_merged,
                     pr_mergeable, updated_at, synced_at,
                     pr_base_ref, pr_stack_number, pr_stack_size,
-                    pr_stack_position, pr_stack_base_ref
+                    pr_stack_position, pr_stack_base_ref, pr_changes_requested
              FROM tasks",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -831,6 +861,7 @@ impl Db {
                         base_ref: r.get(25)?,
                     }),
                 },
+                pr_changes_requested: r.get(26)?,
                 attempts: Vec::new(),
             })
         })?;

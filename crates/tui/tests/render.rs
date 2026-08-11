@@ -2249,6 +2249,7 @@ fn board_row(
         pr_number: Some(9),
         pr_base_ref: None,
         pr_mergeable: None,
+        changes_below: None,
         landing: None,
         stack: None,
         branch: Some("board/gh-x".into()),
@@ -2578,6 +2579,7 @@ fn a_stacked_row_says_which_layer_it_is_and_what_clean_meant() {
             position: Some(p),
             open: true,
             mergeable: Some(state.into()),
+            changes_requested: false,
         })
         .collect();
     let mut row = board_row("2", BoardState::Review);

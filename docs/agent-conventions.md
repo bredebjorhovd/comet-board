@@ -133,12 +133,23 @@ that pull request against *its own base*, which mid-stack is the layer below —
 land". Read `landing` instead: `ready` (this and every open layer below it can
 merge, and merging it lands them all), `waiting-on-stack` (clean against its own
 base only), `not-clean` (GitHub objects to this pull request itself — see
-`pr_mergeable` for how), or absent, meaning nobody has asked yet. Absent is
-common: mergeability costs a call per open pull request and rides the full
-sweep. It never means ready.
+`pr_mergeable` for how), `changes-below` (a layer *underneath* this one was asked
+to change, so this branch is about to be rebased under it — `changes_below` names
+that pull request), or absent, meaning nobody has asked yet. Absent is common:
+mergeability costs a call per open pull request and rides the full sweep. It never
+means ready.
 
-States: `blocked` (agent waiting on input) → `working` → `ready` (nothing
-running) → `review` (finished or PR open) → `failed` → `done` (issue closed).
+`changes-below` outranks all of the others, including `clean`: nothing about this
+pull request is wrong, but GitHub is about to replay its commits onto a rewritten
+base, so neither its diff nor its `mergeable_state` is worth acting on. **Do not
+review, approve or merge a `changes-below` row**, and do not send its agent to
+rebase — the replay is GitHub's to do when the layer below repushes. Such a row
+derives to `blocked` rather than `review` while the request stands, and returns to
+`review` by itself once the layer below is approved, merged or closed.
+
+States: `blocked` (agent waiting on input, or a layer waiting on the one below
+it) → `working` → `ready` (nothing running) → `review` (finished or PR open) →
+`failed` → `done` (issue closed).
 Note `done` means the *issue* is closed; an agent that finished with a PR open
 is this board's `review`.
 
