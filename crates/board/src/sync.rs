@@ -34,6 +34,7 @@ use crate::log::Logger;
 use crate::model::*;
 use crate::notify::{self, Signal, Stopped, Webhook};
 use crate::overrun;
+use crate::rebased;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Commits, Evidence, Verdict, Why};
 use crate::sources::github::{Github, HttpRest, MergeStatus, PullRequest, Rest, pr_matches_branch};
@@ -179,6 +180,18 @@ pub mod meta {
     /// the log says it once rather than every cycle.
     pub fn unpushed_noted(attempt: i64) -> String {
         format!("unpushed:{attempt}")
+    }
+    /// When an attempt's checkout was first kept for a layer stacked on it
+    /// (gh#286) — the same once-per-attempt discipline, for the same reason.
+    pub fn dependents_noted(attempt: i64) -> String {
+        format!("dependents:{attempt}")
+    }
+    /// The head origin held when the board told an attempt its branch had been
+    /// rewritten under it (gh#286). Holds the sha rather than a timestamp: it
+    /// is both the "said already" mark and the thing a *second* rewrite is
+    /// recognised against.
+    pub fn rewritten_noted(attempt: i64) -> String {
+        format!("rewritten:{attempt}")
     }
 }
 
@@ -372,6 +385,11 @@ impl SyncEngine {
         // attempt's leavings, and a box that reclaimed the checkout while
         // keeping the chat forever would have tidied half the mess (gh#139).
         self.archive_chats(runtime);
+        // And the checkouts nobody is reclaiming, because they are stacked on a
+        // layer that has just landed: GitHub rewrote their branches on the
+        // server and this box holds the history from before it (gh#286). On the
+        // interval, after the poll that would have seen the merge.
+        self.note_rewritten_branches(runtime);
         self.drain_writebacks();
         self.db.meta_set(meta::LAST_SYNC, &crate::db::now())?;
         Ok(pulls)
@@ -1021,6 +1039,107 @@ impl SyncEngine {
         false
     }
 
+    /// The commit every measurement of this attempt's branch is taken from
+    /// (gh#286): the stamp while it still describes the branch, and the fork
+    /// point when the history has been rewritten under it.
+    ///
+    /// `base_sha` is stamped once, from the checkout's HEAD at dispatch, and it
+    /// is right for as long as nothing rewrites that branch. A stacked layer is
+    /// where something does: the layer below lands, GitHub rebases this one
+    /// server-side, and the next `gh stack sync` or `git pull --rebase` in the
+    /// checkout moves the local branch off the stamp. From that moment
+    /// `<stamp>..HEAD` is not this attempt's work — it is the layer below's
+    /// commits plus this one's, and every reader of it (the settle's commit
+    /// count, the review's changed files, the claims' remainder) is being told
+    /// the child wrote the parent's diff.
+    ///
+    /// So the stamp is checked rather than trusted, and re-stamped from the
+    /// checkout when it fails: an ancestry test says whether the branch still
+    /// starts there, and a merge base against the branch's *current* base says
+    /// where it starts now. See [`crate::rebased`] for why that evidence and
+    /// never the observed retarget — a pull request moved on GitHub says
+    /// nothing about a local branch that has not moved.
+    ///
+    /// `None` where there is nothing honest to measure from: no stamp recorded
+    /// (attempts from before the column existed), or a rewritten branch whose
+    /// footing cannot be recovered. Callers keep whatever weaker fallback they
+    /// had for that case — never the stale stamp.
+    pub fn attempt_base(&self, attempt: &Attempt) -> Option<String> {
+        let stamp = attempt.base_sha.as_deref()?;
+        let worktree = attempt.worktree.as_deref()?;
+        if !std::path::Path::new(worktree).exists() {
+            // Nothing to check it against. The stamp is the record of what the
+            // dispatch cut from, and the callers that need a checkout are
+            // already refusing.
+            return Some(stamp.to_string());
+        }
+        let on_head = git_ok(worktree, &["merge-base", "--is-ancestor", stamp, "HEAD"]);
+        if on_head {
+            return Some(stamp.to_string());
+        }
+        let fork = self.fork_point(worktree, attempt);
+        match rebased::footing(stamp, on_head, fork.as_deref()) {
+            rebased::Footing::Stands => Some(stamp.to_string()),
+            rebased::Footing::Refooted(fork) => {
+                if let Err(e) = self.db.set_attempt_base_sha(attempt.id, &fork) {
+                    self.log
+                        .warn(format!("re-stamping attempt {}: {e:#}", attempt.id));
+                }
+                self.log.info(format!(
+                    "attempt {}: {} was rebased under its recorded base {} — \
+                     measuring from {fork} instead",
+                    attempt.id,
+                    attempt.branch.as_deref().unwrap_or("its branch"),
+                    &stamp[..stamp.len().min(12)],
+                ));
+                Some(fork)
+            }
+            rebased::Footing::Adrift => {
+                self.log.info(format!(
+                    "attempt {}: base {} is no longer on {}, and no base branch \
+                     names where it starts now",
+                    attempt.id,
+                    &stamp[..stamp.len().min(12)],
+                    attempt.branch.as_deref().unwrap_or("its branch"),
+                ));
+                None
+            }
+        }
+    }
+
+    /// Where git says this branch forks from the base it is on *now*.
+    ///
+    /// Three candidates, freshest first, and each one is a remote-tracking ref
+    /// because a local branch of the same name is exactly the stale answer
+    /// gh#67 refused at dispatch:
+    ///
+    /// 1. the base GitHub last reported for the pull request — the retarget, if
+    ///    one has happened;
+    /// 2. the branch of the attempt this one was stacked on (gh#285), which is
+    ///    the answer while the layer below is still open;
+    /// 3. `origin/HEAD`, the trunk, for everything that is not in a stack.
+    fn fork_point(&self, worktree: &str, attempt: &Attempt) -> Option<String> {
+        let task = self.db.get_task(&attempt.task_id).ok().flatten();
+        let parent_branch = attempt
+            .stacked_on
+            .and_then(|id| self.db.get_attempt(id).ok().flatten())
+            .and_then(|parent| parent.branch);
+        let candidates = task
+            .and_then(|t| t.pr_base_ref)
+            .into_iter()
+            .chain(parent_branch)
+            .map(|b| format!("origin/{b}"))
+            .chain(std::iter::once("origin/HEAD".to_string()));
+        for base in candidates {
+            if let Some(fork) =
+                git_out(worktree, &["merge-base", &base, "HEAD"]).filter(|sha| !sha.is_empty())
+            {
+                return Some(fork);
+            }
+        }
+        None
+    }
+
     /// What this attempt's commits amount to (gh#69): nothing, work only its
     /// own box can see, or work on origin.
     ///
@@ -1029,7 +1148,10 @@ impl SyncEngine {
     /// settle may call it reviewable. `ask_github` allows the second, remote
     /// tier of that check; see [`SyncEngine::commits_are_on_origin`].
     pub fn attempt_commits(&self, task: &Task, attempt: &Attempt, ask_github: bool) -> Commits {
-        if !self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref()) {
+        if !self.attempt_has_commits(
+            attempt.worktree.as_deref(),
+            self.attempt_base(attempt).as_deref(),
+        ) {
             return Commits::None;
         }
         if self.commits_are_on_origin(task, attempt, ask_github) {
@@ -1442,7 +1564,10 @@ impl SyncEngine {
         if !std::path::Path::new(worktree).exists() {
             return None;
         }
-        let base = attempt.base_sha.as_deref()?;
+        // The base as the checkout has it now, not merely as it was stamped:
+        // a branch rebased under its stamp (gh#286) would otherwise be
+        // rendered as having changed everything the layer below it changed.
+        let base = self.attempt_base(attempt)?;
         let range = format!("{base}..HEAD");
         // `--no-renames`, deliberately: to a reviewer a rename is two paths
         // that both changed, and a claim naming only the old one has not
@@ -1461,7 +1586,7 @@ impl SyncEngine {
         if let Some(diff) = &unified {
             crate::claims::attach_symbols(&mut changed, diff);
         }
-        let effects = self.branch_effects(worktree, base, &changed, unified.as_deref());
+        let effects = self.branch_effects(worktree, &base, &changed, unified.as_deref());
         Some((changed, effects))
     }
 
@@ -1733,7 +1858,7 @@ impl SyncEngine {
     /// count is the honest rendering of a count that was never taken.
     fn count_call_sites(&self, attempt: &Attempt, review: &mut crate::claims::AttemptReview) {
         let (Some(worktree), Some(base)) =
-            (attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+            (attempt.worktree.as_deref(), self.attempt_base(attempt))
         else {
             return;
         };
@@ -1747,7 +1872,7 @@ impl SyncEngine {
                 };
                 claim.call_sites.push(crate::effects::CallSites {
                     now: crate::effects::count_call_sites(&symbol, &now),
-                    before: git_grep(worktree, &symbol, base)
+                    before: git_grep(worktree, &symbol, &base)
                         .map(|before| crate::effects::count_call_sites(&symbol, &before)),
                     symbol,
                 });
@@ -2050,6 +2175,10 @@ impl SyncEngine {
                 return;
             }
         };
+        // Who is standing on whose branch (gh#286). Built once from the whole
+        // board, because no amount of looking at one attempt finds the layer
+        // dispatched off it.
+        let dependents = rebased::Dependents::of(&tasks);
         for task in &tasks {
             for attempt in &task.attempts {
                 if !attempt.board_managed
@@ -2062,7 +2191,10 @@ impl SyncEngine {
                     .collectable_at
                     .as_deref()
                     .map(|t| secs_since(t, now).unwrap_or(0));
-                let standing = gc::standing(task, attempt);
+                let standing = gc::standing(task, attempt, &dependents);
+                if standing == gc::Standing::Held && dependents.holds(attempt.id) {
+                    self.note_held_by_dependents(task, attempt, &dependents);
+                }
                 if let Err(e) = match gc::decide(standing, spent, retain) {
                     gc::Verdict::Keep => Ok(()),
                     gc::Verdict::Mark => self.mark_collectable(task, attempt, retain),
@@ -2076,6 +2208,38 @@ impl SyncEngine {
                 }
             }
         }
+    }
+
+    /// Say, once, that a checkout is being kept for somebody else's sake
+    /// (gh#286) — the answer to "why is this branch still here a month later",
+    /// which is otherwise a silence the operator has to reconstruct from the
+    /// stacking edge by hand.
+    fn note_held_by_dependents(
+        &self,
+        task: &Task,
+        attempt: &Attempt,
+        dependents: &rebased::Dependents,
+    ) {
+        let key = meta::dependents_noted(attempt.id);
+        if matches!(self.db.meta_get(&key), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.db.meta_set(&key, &crate::db::now());
+        let holders = dependents
+            .holders(attempt.id)
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.log.info(format!(
+            "{}: keeping {} — attempt {} was cut from it and still holds a checkout",
+            task.identifier,
+            attempt
+                .branch
+                .as_deref()
+                .unwrap_or("the attempt's own branch"),
+            holders,
+        ));
     }
 
     /// Start the retention clock, and say so — the one warning anybody gets
@@ -2274,6 +2438,186 @@ impl SyncEngine {
         Ok(())
     }
 
+    // ---- surviving the parent's merge (gh#286) ---------------------------
+
+    /// Tell a stacked layer, once, that GitHub has rewritten its branch out
+    /// from under this checkout.
+    ///
+    /// When a layer lands, GitHub rebases every layer above it and retargets
+    /// their pull requests — on the server, in a repository this box polls. The
+    /// checkout does not move ([`crate::rebased`] says why the board leaves it
+    /// alone rather than rebasing it), so the agent still standing in it holds
+    /// the pre-rebase history, and its next `git push` is a force-push that
+    /// puts the old commits back over GitHub's work and undoes the rebase for
+    /// the whole stack above it.
+    ///
+    /// The board cannot stop that push. What it can do is be the one party that
+    /// *knows*, and say so where it lands: a prompt into the authoring chat
+    /// while that chat is still the checkout's, and a log line either way.
+    ///
+    /// Three things keep it cheap, in the order they apply:
+    ///
+    /// - **Only stacked attempts are looked at at all.** `stacked_on` is the
+    ///   whole population; an ordinary dispatch pays one field read.
+    /// - **Only after the layer below has landed** ([`rebased::parent_landed`]),
+    ///   which is the only thing that makes GitHub rewrite a branch.
+    /// - **The remote-tracking ref first, GitHub second.** The free answer is
+    ///   often enough — anything that fetched in that checkout has already
+    ///   brought the rewrite down — and the API call is made only when it is
+    ///   not, and only until the notice has been given once.
+    ///
+    /// One notice per rewrite, keyed on the head origin held when it was given:
+    /// an agent told the same thing every cycle learns to skip the message, and
+    /// a *second* rewrite is a different sha and says so again.
+    ///
+    /// With no runtime there is nobody to tell, and the sweep does not run: a
+    /// read-only caller must not consume the one notice an agent gets.
+    fn note_rewritten_branches(&self, runtime: Option<&dyn Runtime>) {
+        let Some(runtime) = runtime else {
+            return;
+        };
+        let tasks = match self.db.load_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .error(format!("rewritten branches: reading the board: {e}"));
+                return;
+            }
+        };
+        // Every attempt on the board, so a child can find the run it was cut
+        // from — and the task that run belongs to, which is what says whether
+        // it has landed.
+        let parents: HashMap<i64, (&Task, &Attempt)> = tasks
+            .iter()
+            .flat_map(|t| t.attempts.iter().map(move |a| (a.id, (t, a))))
+            .collect();
+        for task in &tasks {
+            for attempt in &task.attempts {
+                let Some(parent_id) = attempt.stacked_on else {
+                    continue;
+                };
+                if !attempt.board_managed || attempt.collected_at.is_some() {
+                    continue;
+                }
+                let (Some(worktree), Some(branch)) =
+                    (attempt.worktree.as_deref(), attempt.branch.as_deref())
+                else {
+                    continue;
+                };
+                if !std::path::Path::new(worktree).exists() {
+                    continue;
+                }
+                let Some((parent_task, parent)) = parents.get(&parent_id) else {
+                    continue;
+                };
+                if !rebased::parent_landed(
+                    parent_task.pr_merged,
+                    task.pr_base_ref.as_deref(),
+                    parent.branch.as_deref(),
+                ) {
+                    continue;
+                }
+                let Some(local) = git_out(worktree, &["rev-parse", "HEAD"]) else {
+                    continue;
+                };
+                let Some(remote) = self.origin_head_of(worktree, task, attempt, branch) else {
+                    continue;
+                };
+                let standing = rebased::against_origin(&local, &remote, |a, b| {
+                    git_ok(worktree, &["merge-base", "--is-ancestor", a, b])
+                });
+                if standing == rebased::Remote::Rewritten {
+                    self.note_rewritten(runtime, task, attempt, branch, &remote);
+                }
+            }
+        }
+    }
+
+    /// What origin holds for this attempt's branch: the remote-tracking ref if
+    /// the checkout has one that has moved, else GitHub asked directly — and
+    /// that only while the notice has not been given, which is what bounds the
+    /// calls to one per rewrite rather than one per cycle.
+    fn origin_head_of(
+        &self,
+        worktree: &str,
+        task: &Task,
+        attempt: &Attempt,
+        branch: &str,
+    ) -> Option<String> {
+        let tracking = git_out(
+            worktree,
+            &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+        )
+        .filter(|head| !head.is_empty());
+        // A tracking ref that has not been fetched since the last push reads as
+        // level with HEAD, which is no answer at all — the GitHub tier below is
+        // what settles that case.
+        if let Some(head) = tracking
+            && git_out(worktree, &["rev-parse", "HEAD"]).as_deref() != Some(head.as_str())
+        {
+            return Some(head);
+        }
+        if matches!(
+            self.db.meta_get(&meta::rewritten_noted(attempt.id)),
+            Ok(Some(_))
+        ) {
+            return None;
+        }
+        let gh = self.github.as_ref()?;
+        let repo = crate::model::gh_repo(&task.id)
+            .map(str::to_string)
+            .or_else(|| task.pr_url.as_deref().and_then(crate::model::pr_repo))
+            .or_else(|| crate::git_credentials::repo_for_checkout(worktree))?;
+        gh.branch_head(&repo, branch)
+    }
+
+    /// Say it: into the chat that is still standing in the checkout, and into
+    /// the log whether or not there was one to reach.
+    fn note_rewritten(
+        &self,
+        runtime: &dyn Runtime,
+        task: &Task,
+        attempt: &Attempt,
+        branch: &str,
+        remote_head: &str,
+    ) {
+        let key = meta::rewritten_noted(attempt.id);
+        if matches!(self.db.meta_get(&key), Ok(Some(said)) if said == remote_head) {
+            return;
+        }
+        let _ = self.db.meta_set(&key, remote_head);
+        self.log.info(format!(
+            "{}: {branch} has been rewritten on origin ({}) — the checkout {} still \
+             holds the history from before it, and a push from there would force it back",
+            task.identifier,
+            &remote_head[..remote_head.len().min(12)],
+            attempt.worktree.as_deref().unwrap_or("(none)"),
+        ));
+        // The same authorship test review delivery applies: the chat is this
+        // attempt's only while it is still standing where the work is.
+        let Some(chat) = attempt.pane_id.as_deref() else {
+            return;
+        };
+        let reachable = runtime.chat_alive(chat).unwrap_or(false)
+            && crate::review::still_the_authors_checkout(
+                runtime.chat_cwd(chat).unwrap_or(None).as_deref(),
+                attempt,
+            );
+        if !reachable {
+            return;
+        }
+        let notice = rebased::rewritten_notice(branch, task.pr_base_ref.as_deref());
+        match runtime.prompt(chat, &notice) {
+            Ok(()) => self.log.info(format!(
+                "{}: told chat {chat} that {branch} was rebased on origin",
+                task.identifier
+            )),
+            Err(e) => self.log.warn(format!(
+                "{}: could not tell chat {chat} about the rebase of {branch}: {e}",
+                task.identifier
+            )),
+        }
+    }
     // ---- clearing the shelf (gh#139) -------------------------------------
 
     /// Archive the chat of every attempt nobody is coming back to, once it has
@@ -2326,6 +2670,9 @@ impl SyncEngine {
                 return;
             }
         };
+        // The same hold the checkouts get (gh#286): a parent whose layer is
+        // still being written is not a finished conversation either.
+        let dependents = rebased::Dependents::of(&tasks);
         for task in &tasks {
             // Per route, resolved now rather than stamped at dispatch: the
             // window is a property of the shelf the chat sits on, and an
@@ -2347,7 +2694,7 @@ impl SyncEngine {
                     .chat_archivable_at
                     .as_deref()
                     .map(|t| secs_since(t, now).unwrap_or(0));
-                let standing = gc::chat_standing(task, attempt, orchestrator);
+                let standing = gc::chat_standing(task, attempt, orchestrator, &dependents);
                 if let Err(e) = match gc::decide(standing, spent, window) {
                     gc::Verdict::Keep => Ok(()),
                     gc::Verdict::Mark => self.mark_chat_archivable(task, attempt, window),
@@ -2509,7 +2856,10 @@ impl SyncEngine {
         let mut pr_url = task.pr_url.clone().filter(|_| pr_open);
         if !pr_open
             && ask_github
-            && self.attempt_has_commits(attempt.worktree.as_deref(), attempt.base_sha.as_deref())
+            && self.attempt_has_commits(
+                attempt.worktree.as_deref(),
+                self.attempt_base(attempt).as_deref(),
+            )
             && let Some(url) = self.recheck_pull_request(task, attempt)
         {
             pr_open = true;
@@ -9255,6 +9605,50 @@ max_duration = "{max_duration}"
         assert!(row.cache_swept_at.is_none());
     }
 
+    /// gh#286 through the sweep: the parent's issue is closed and its pull
+    /// request is merged, so its checkout is nobody's — except that the layer
+    /// dispatched off its branch is still standing on it. Collecting deletes
+    /// the local branch, which is the only remaining name for the history the
+    /// child sits on, so the clock does not even start.
+    #[test]
+    fn a_stacked_child_defers_the_collection_of_the_parents_checkout() {
+        let e = engine(None);
+        let parent = spent_attempt(&e);
+        seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Started);
+        let child = dispatch(&e, "linear:LIN-143", "chat-10");
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET stacked_on = ?2 WHERE id = ?1",
+                rusqlite::params![child, parent],
+            )
+            .unwrap();
+        e.db.set_attempt_worktree(child, "/wt/board-lin-143")
+            .unwrap();
+        let gc = Collector::default();
+
+        e.collect_worktrees(Some(&gc));
+        assert!(
+            attempt_row(&e, parent).collectable_at.is_none(),
+            "held for the layer above, so the retention clock never starts",
+        );
+        // Even a mark left from before the child existed is cleared, and a
+        // month of wall time collects nothing.
+        age_mark(&e, parent, 30 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty());
+        assert!(attempt_row(&e, parent).collectable_at.is_none());
+
+        // The child's own checkout is reclaimed — by its own standing, on its
+        // own clock — and the branch under it is free to go with the next
+        // sweep, on the full window.
+        e.db.set_attempt_collected(child).unwrap();
+        e.collect_worktrees(Some(&gc));
+        assert!(gc.reclaimed.borrow().is_empty(), "one cycle to mark");
+        assert!(attempt_row(&e, parent).collectable_at.is_some());
+        age_mark(&e, parent, 7 * 86_400);
+        e.collect_worktrees(Some(&gc));
+        assert_eq!(gc.reclaimed.borrow().len(), 1);
+    }
     // ---- clearing the shelf (gh#139) -------------------------------------
 
     /// A runtime that records what the shelf sweep asked it to archive, and
@@ -10241,5 +10635,303 @@ max_duration = "{max_duration}"
         assert!(attempt.claims_error.is_none());
         assert_eq!(attempt.claims.len(), 1);
         assert!(attempt.claims_at.is_some());
+    }
+
+    // ---- surviving the parent's merge (gh#286) ---------------------------
+
+    /// A checkout laid out the way a two-layer stack's is: trunk with the
+    /// operator's own unpushed commit under it, a parent branch with the layer
+    /// below's commit, and a child branch cut from the parent.
+    ///
+    /// Returns the checkout, the parent's tip (which is what the child's
+    /// dispatch stamps as its base) and the branch names.
+    struct Stacked {
+        work: std::path::PathBuf,
+        parent_tip: String,
+    }
+
+    impl Stacked {
+        const PARENT: &'static str = "board/gh-11-parent";
+        const CHILD: &'static str = "board/gh-12-child";
+
+        fn cut() -> Stacked {
+            let work = repo_ahead_of_its_remote();
+            git_in(&work, &["checkout", "-b", Stacked::PARENT]);
+            std::fs::write(work.join("parent.rs"), "the layer below").unwrap();
+            git_in(&work, &["add", "."]);
+            git_in(&work, &["commit", "-m", "the parent's work"]);
+            let parent_tip = Stacked::sha(&work, "HEAD");
+            git_in(&work, &["checkout", "-b", Stacked::CHILD]);
+            std::fs::write(work.join("child.rs"), "the layer above").unwrap();
+            git_in(&work, &["add", "."]);
+            git_in(&work, &["commit", "-m", "the child's work"]);
+            Stacked { work, parent_tip }
+        }
+
+        fn sha(work: &std::path::Path, rev: &str) -> String {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(work)
+                    .args(["rev-parse", rev])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        }
+
+        /// What GitHub does when the layer below lands: the parent's content
+        /// arrives on trunk under a different commit, trunk carries on moving
+        /// under everybody else's merges, and the child is rebased onto it.
+        /// The rebase itself is done here in the checkout, which is what `gh
+        /// stack sync` or `git pull --rebase` does when the agent runs it.
+        fn parent_lands_and_the_child_is_rebased(&self) -> String {
+            git_in(&self.work, &["checkout", "main"]);
+            git_in(&self.work, &["merge", "--squash", Stacked::PARENT]);
+            git_in(
+                &self.work,
+                &["commit", "-m", "the parent, squashed onto trunk"],
+            );
+            std::fs::write(self.work.join("somebody-else.rs"), "an unrelated merge").unwrap();
+            git_in(&self.work, &["add", "."]);
+            git_in(&self.work, &["commit", "-m", "somebody else's work"]);
+            git_in(&self.work, &["push", "origin", "main"]);
+            let trunk = Stacked::sha(&self.work, "HEAD");
+            git_in(&self.work, &["checkout", Stacked::CHILD]);
+            git_in(
+                &self.work,
+                &["rebase", "--onto", "main", Stacked::PARENT, Stacked::CHILD],
+            );
+            trunk
+        }
+
+        fn path(&self) -> String {
+            self.work.to_string_lossy().into_owned()
+        }
+    }
+
+    /// Give the engine a child attempt in that checkout, stamped the way a
+    /// stacked dispatch stamps one: the parent's tip is the base.
+    fn stacked_child(e: &SyncEngine, s: &Stacked) -> i64 {
+        seed(e, "gh:o/r#12", "gh#12", UpstreamState::Started);
+        let a = dispatch(e, "gh:o/r#12", "chat-12");
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET branch = ?2 WHERE id = ?1",
+                rusqlite::params![a, Stacked::CHILD],
+            )
+            .unwrap();
+        e.db.set_attempt_worktree(a, &s.path()).unwrap();
+        e.db.set_attempt_base_sha(a, &s.parent_tip).unwrap();
+        a
+    }
+
+    /// The headline of consequence 1: while nothing has moved the branch, the
+    /// stamp is exactly right and is left alone — and the moment the checkout
+    /// is rebased out from under it, everything measures from where the branch
+    /// starts *now* instead of attributing the layer below to this attempt.
+    #[test]
+    fn a_rebased_branch_is_re_footed_and_stops_counting_the_layer_below() {
+        let s = Stacked::cut();
+        let e = engine(None);
+        let a = stacked_child(&e, &s);
+        let attempt = |e: &SyncEngine| e.db.get_attempt(a).unwrap().unwrap();
+
+        // Before anything moves: the stamp stands, and the child's diff is the
+        // child's one file.
+        assert_eq!(
+            e.attempt_base(&attempt(&e)).as_deref(),
+            Some(s.parent_tip.as_str())
+        );
+        let (changed, _) = e.branch_facts(&attempt(&e)).unwrap();
+        assert_eq!(
+            changed.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            ["child.rs"],
+        );
+
+        // The parent lands, GitHub rebases, and the agent brings the checkout
+        // across. The stamp is now a commit on no branch at all.
+        let trunk = s.parent_lands_and_the_child_is_rebased();
+        e.db.set_pr_topology("gh:o/r#12", Some("main"), None)
+            .unwrap();
+
+        assert_eq!(
+            e.attempt_base(&attempt(&e)).as_deref(),
+            Some(trunk.as_str()),
+            "the fork point against the base the request now targets"
+        );
+        // …and it is written back, so every later reader gets it for free.
+        assert_eq!(attempt(&e).base_sha.as_deref(), Some(trunk.as_str()));
+
+        // The bug this closes, pinned: measured from the stale stamp the
+        // child's branch reads as three commits touching everything trunk has
+        // moved by since it was cut.
+        let range = format!("{}..HEAD", s.parent_tip);
+        assert_eq!(
+            git_out(&s.path(), &["rev-list", "--count", &range]).as_deref(),
+            Some("3"),
+        );
+        assert!(
+            git_out(&s.path(), &["diff", "--name-only", &range])
+                .unwrap()
+                .contains("somebody-else.rs"),
+            "the stamp measures everybody else's merges as this attempt's work",
+        );
+        let (changed, _) = e.branch_facts(&attempt(&e)).unwrap();
+        assert_eq!(
+            changed.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            ["child.rs"],
+            "and the re-footed base is still only this layer's work",
+        );
+        // The settle's commit count agrees: one commit, not two.
+        assert!(e.attempt_has_commits(Some(&s.path()), e.attempt_base(&attempt(&e)).as_deref()));
+        std::fs::remove_dir_all(s.work.parent().unwrap()).ok();
+    }
+
+    /// A runtime that answers the two questions the rewrite notice asks — is
+    /// the chat alive, and is it still standing in the checkout — and records
+    /// what it was told to say.
+    struct InTheCheckout {
+        cwd: Option<String>,
+        alive: bool,
+        said: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl InTheCheckout {
+        fn at(cwd: &str) -> InTheCheckout {
+            InTheCheckout {
+                cwd: Some(cwd.to_string()),
+                alive: true,
+                said: Default::default(),
+            }
+        }
+        fn said(&self) -> Vec<(String, String)> {
+            self.said.lock().unwrap().clone()
+        }
+    }
+
+    impl Runtime for InTheCheckout {
+        fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            unreachable!("noticing a rebase never dispatches")
+        }
+        fn prompt(&self, chat: &str, text: &str) -> anyhow::Result<()> {
+            self.said
+                .lock()
+                .unwrap()
+                .push((chat.to_string(), text.to_string()));
+            Ok(())
+        }
+        fn cancel(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+            Ok(None)
+        }
+        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(self.alive)
+        }
+        fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.cwd.clone())
+        }
+        fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+            Ok(None)
+        }
+    }
+
+    /// Point the child's remote-tracking ref at the rebased history GitHub
+    /// wrote, which is what a fetch in that checkout would have done.
+    fn origin_rebased_the_child(s: &Stacked) -> String {
+        git_in(&s.work, &["checkout", "-b", "as-github-holds-it", "main"]);
+        std::fs::write(s.work.join("child.rs"), "the layer above").unwrap();
+        git_in(&s.work, &["add", "."]);
+        git_in(&s.work, &["commit", "-m", "the child's work, rebased"]);
+        let rewritten = Stacked::sha(&s.work, "HEAD");
+        git_in(&s.work, &["checkout", Stacked::CHILD]);
+        git_in(
+            &s.work,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{}", Stacked::CHILD),
+                &rewritten,
+            ],
+        );
+        rewritten
+    }
+
+    /// Consequence 2: the checkout did not move, so the agent standing in it
+    /// is one `git push` away from putting the pre-rebase history back over
+    /// GitHub's work. The board cannot stop that push; it can be the one party
+    /// that knows, and it says so where the agent will read it.
+    #[test]
+    fn an_agent_whose_branch_was_rewritten_on_origin_is_told_once() {
+        let s = Stacked::cut();
+        let e = engine(None);
+        // The parent, and the child cut from it.
+        seed(&e, "gh:o/r#11", "gh#11", UpstreamState::Terminal);
+        let parent = dispatch(&e, "gh:o/r#11", "chat-11");
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET branch = ?2 WHERE id = ?1",
+                rusqlite::params![parent, Stacked::PARENT],
+            )
+            .unwrap();
+        let child = stacked_child(&e, &s);
+        e.db.conn
+            .execute(
+                "UPDATE attempts SET stacked_on = ?2 WHERE id = ?1",
+                rusqlite::params![child, parent],
+            )
+            .unwrap();
+
+        // Trunk moves and GitHub rewrites the child's branch. The checkout
+        // stays exactly where it was.
+        s.parent_lands_and_the_child_is_rebased();
+        git_in(&s.work, &["reset", "--hard", "ORIG_HEAD"]);
+        let rewritten = origin_rebased_the_child(&s);
+        // What the board has seen so far: the child still targets the parent's
+        // branch, and the parent's request is still open.
+        e.db.set_pr_topology("gh:o/r#12", Some(Stacked::PARENT), None)
+            .unwrap();
+
+        let rt = InTheCheckout::at(&s.path());
+        // Nothing has landed as far as the board knows, so nothing is said —
+        // and no branch on the box is compared against origin for it.
+        e.note_rewritten_branches(Some(&rt));
+        assert!(rt.said().is_empty(), "no landing, no rewrite to report");
+
+        // The poll catches up: the parent merged, and the child was retargeted
+        // onto trunk in the same motion.
+        e.db.set_pr_merged("gh:o/r#11", true).unwrap();
+        e.db.set_pr_topology("gh:o/r#12", Some("main"), None)
+            .unwrap();
+        e.note_rewritten_branches(Some(&rt));
+        let said = rt.said();
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].0, "chat-12");
+        assert!(said[0].1.contains(Stacked::CHILD));
+        assert!(said[0].1.contains("git rebase origin/main"));
+
+        // Once. An agent told the same thing every cycle learns to skip it.
+        e.note_rewritten_branches(Some(&rt));
+        assert_eq!(rt.said().len(), 1);
+        assert_eq!(
+            e.db.meta_get(&meta::rewritten_noted(child))
+                .unwrap()
+                .as_deref(),
+            Some(rewritten.as_str()),
+            "and what was said about is on the record",
+        );
+        std::fs::remove_dir_all(s.work.parent().unwrap()).ok();
+    }
+
+    /// A read-only caller must not consume the one notice the agent gets, and
+    /// an unstacked attempt is never looked at in the first place.
+    #[test]
+    fn nothing_is_consumed_without_a_runtime_to_tell() {
+        let e = engine(None);
+        e.note_rewritten_branches(None);
+        assert!(e.db.meta_get(&meta::rewritten_noted(1)).unwrap().is_none());
     }
 }

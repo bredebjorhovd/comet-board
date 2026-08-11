@@ -12,7 +12,7 @@
 //! checkout, or an engine:
 //!
 //! - [`standing`] — whose the checkout is: a live attempt's, a task that is not
-//!   finished with it, or nobody's.
+//!   finished with it, a layer stacked on top of it (gh#286), or nobody's.
 //! - [`decide`] — what to do about it now, given how long it has been nobody's.
 //!
 //! An attempt leaves three things behind, and gh#139 and gh#186 added the last
@@ -31,6 +31,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::model::{Attempt, Task};
+use crate::rebased::Dependents;
 
 /// Total checkout bytes past which `doctor` calls the worktree root a problem.
 ///
@@ -120,7 +121,8 @@ pub enum Verdict {
     Collect,
 }
 
-/// Whose the checkout of `attempt` is, given the task it belongs to.
+/// Whose the checkout of `attempt` is, given the task it belongs to and who
+/// else on the board is standing on its branch.
 ///
 /// Read off the facts rather than off `task.state`: the rendered state is
 /// derived, and a sweep that keyed on it would depend on having re-derived
@@ -128,14 +130,22 @@ pub enum Verdict {
 /// what "left the board" means, and an open pull request outranks both — review
 /// delivery still compares a chat's cwd against this checkout
 /// ([`crate::review`]), and a reviewer may yet check the branch out by hand.
-pub fn standing(task: &Task, attempt: &Attempt) -> Standing {
+///
+/// So does a **dependent** (gh#286). Collecting deletes the checkout *and its
+/// local branch*, and a stacked parent goes [`Standing::Spent`] the moment its
+/// pull request merges — while the child cut from it is very often still being
+/// written. Nothing is lost when that happens (the commits stay reachable from
+/// the child), but the branch is the only remaining name for the history the
+/// child sits on, and deleting a name somebody is still using is what
+/// `pr_open` already defers for.
+pub fn standing(task: &Task, attempt: &Attempt, dependents: &Dependents) -> Standing {
     // Retries reuse the branch, and git allows a branch in one worktree only —
     // so a task's live attempt is very likely sitting in *this* directory. Any
     // live attempt on the task makes every one of its checkouts untouchable.
     if attempt.outcome.is_none() || task.live_attempt().is_some() {
         return Standing::Live;
     }
-    if task.pr_open {
+    if dependents.holds(attempt.id) || task.pr_open {
         return Standing::Held;
     }
     if task.upstream.is_final() || task.local_done {
@@ -164,14 +174,24 @@ pub fn standing(task: &Task, attempt: &Attempt) -> Standing {
 ///
 /// Hand-made chats need no rule: the sweep walks attempts, and a chat nobody
 /// dispatched has none.
-pub fn chat_standing(task: &Task, attempt: &Attempt, orchestrator: Option<&str>) -> Standing {
+///
+/// The dependent hold (gh#286) carries here with everything else, because it is
+/// the same rule: a parent whose child is still building on its branch is not a
+/// finished conversation either — that chat is where a question about the layer
+/// below gets asked, and where 8/9's review feedback fans out from.
+pub fn chat_standing(
+    task: &Task,
+    attempt: &Attempt,
+    orchestrator: Option<&str>,
+    dependents: &Dependents,
+) -> Standing {
     let Some(chat) = attempt.pane_id.as_deref() else {
         return Standing::Held;
     };
     if orchestrator.is_some_and(|pinned| pinned == chat) {
         return Standing::Held;
     }
-    standing(task, attempt)
+    standing(task, attempt, dependents)
 }
 
 /// Whose the *build output* inside an attempt's checkout is (gh#186) — the same
@@ -196,7 +216,9 @@ pub fn chat_standing(task: &Task, attempt: &Attempt, orchestrator: Option<&str>)
 /// attempt for the chance of saving one `cargo build`.
 ///
 /// Never [`Standing::Held`]: there is no third state to be in. A cache is either
-/// in use or regenerable.
+/// in use or regenerable. A dependent layer does not hold one either (gh#286) —
+/// what a child stands on is the parent's *history*, and no part of that is in
+/// `target/`.
 pub fn cache_standing(task: &Task, attempt: &Attempt) -> Standing {
     if attempt.outcome.is_none() || task.live_attempt().is_some() {
         return Standing::Live;
@@ -541,7 +563,10 @@ mod tests {
     fn a_live_attempt_is_untouchable() {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, None)];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Live);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Live
+        );
     }
 
     /// A retry lands on the previous attempt's commits in the same branch, so
@@ -550,7 +575,10 @@ mod tests {
     fn a_closed_attempt_beside_a_live_retry_is_untouchable() {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, Some(Outcome::Failed)), attempt(2, None)];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Live);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Live
+        );
     }
 
     #[test]
@@ -558,7 +586,10 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.pr_open = true;
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Held);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Held
+        );
     }
 
     /// The retry case stated as a rule: a failed attempt on an issue that is
@@ -567,7 +598,10 @@ mod tests {
     fn a_failed_attempt_on_an_open_issue_keeps_its_checkout() {
         let mut t = task(UpstreamState::Started);
         t.attempts = vec![attempt(1, Some(Outcome::Failed))];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Held);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Held
+        );
     }
 
     #[test]
@@ -580,17 +614,69 @@ mod tests {
         ] {
             let mut t = task(UpstreamState::Terminal);
             t.attempts = vec![attempt(1, Some(outcome))];
-            assert_eq!(standing(&t, &t.attempts[0]), Standing::Spent, "{outcome:?}");
+            assert_eq!(
+                standing(&t, &t.attempts[0], &Dependents::default()),
+                Standing::Spent,
+                "{outcome:?}"
+            );
         }
         // Deleted upstream counts too — `gone` is final.
         let mut t = task(UpstreamState::Gone);
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Spent);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Spent
+        );
         // And so does the operator saying so on an issue still open upstream.
         let mut t = task(UpstreamState::Started);
         t.local_done = true;
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Spent);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Spent
+        );
+    }
+
+    /// gh#286's third consequence, as the sweep sees it: the parent merged and
+    /// left the board, so its checkout is nobody's — except that the layer
+    /// dispatched off its branch is still standing on it. Collecting deletes
+    /// the local branch, which is the only remaining name for the history the
+    /// child sits on.
+    #[test]
+    fn a_dependent_layer_holds_the_parents_checkout() {
+        let mut parent = task(UpstreamState::Terminal);
+        parent.attempts = vec![attempt(1, Some(Outcome::Done))];
+        let mut child_task = task(UpstreamState::Started);
+        child_task.id = "gh:o/r#8".into();
+        let mut child = attempt(2, None);
+        child.task_id = "gh:o/r#8".into();
+        child.stacked_on = Some(1);
+        child_task.attempts = vec![child];
+
+        let held = Dependents::of(&[parent.clone(), child_task.clone()]);
+        assert_eq!(
+            standing(&parent, &parent.attempts[0], &held),
+            Standing::Held
+        );
+        // The chat goes with it, for the same reason and by the same rule.
+        assert_eq!(
+            chat_standing(&parent, &parent.attempts[0], None, &held),
+            Standing::Held
+        );
+        // Without the edge — the ordinary unstacked dispatch — it is spent,
+        // which is what this defers and nothing more.
+        assert_eq!(
+            standing(&parent, &parent.attempts[0], &Dependents::default()),
+            Standing::Spent
+        );
+
+        // The child's own checkout reclaimed is what frees the parent's.
+        child_task.attempts[0].collected_at = Some("2026-08-11T00:00:00Z".into());
+        let freed = Dependents::of(&[parent.clone(), child_task]);
+        assert_eq!(
+            standing(&parent, &parent.attempts[0], &freed),
+            Standing::Spent
+        );
     }
 
     #[test]
@@ -641,8 +727,8 @@ mod tests {
                     t.pr_open = pr_open;
                     t.attempts = vec![attempt(1, outcome)];
                     assert_eq!(
-                        chat_standing(&t, &t.attempts[0], None),
-                        standing(&t, &t.attempts[0]),
+                        chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+                        standing(&t, &t.attempts[0], &Dependents::default()),
                         "{upstream:?} {outcome:?} pr_open={pr_open}"
                     );
                 }
@@ -659,7 +745,10 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.pr_open = true;
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
-        assert_eq!(chat_standing(&t, &t.attempts[0], None), Standing::Held);
+        assert_eq!(
+            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            Standing::Held
+        );
     }
 
     /// A blocked agent is a live attempt — outcome still open — so the chat
@@ -668,7 +757,10 @@ mod tests {
     fn a_blocked_attempts_chat_is_never_archived() {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, None)];
-        assert_eq!(chat_standing(&t, &t.attempts[0], None), Standing::Live);
+        assert_eq!(
+            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            Standing::Live
+        );
     }
 
     /// The pinned orchestrator hears about every settle on the board, so it is
@@ -679,12 +771,17 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], Some("chat-1")),
+            chat_standing(&t, &t.attempts[0], Some("chat-1"), &Dependents::default()),
             Standing::Held
         );
         // Somebody else's pin leaves this chat exactly as spent as it was.
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], Some("chat-other")),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                Some("chat-other"),
+                &Dependents::default()
+            ),
             Standing::Spent
         );
     }
@@ -697,7 +794,10 @@ mod tests {
         let mut a = attempt(1, Some(Outcome::Done));
         a.pane_id = None;
         t.attempts = vec![a];
-        assert_eq!(chat_standing(&t, &t.attempts[0], None), Standing::Held);
+        assert_eq!(
+            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            Standing::Held
+        );
     }
 
     // ---- the build output's standing (gh#186) -----------------------------
@@ -711,7 +811,10 @@ mod tests {
         let mut t = task(UpstreamState::Started);
         t.pr_open = true;
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
-        assert_eq!(standing(&t, &t.attempts[0]), Standing::Held);
+        assert_eq!(
+            standing(&t, &t.attempts[0], &Dependents::default()),
+            Standing::Held
+        );
         assert_eq!(cache_standing(&t, &t.attempts[0]), Standing::Spent);
     }
 
