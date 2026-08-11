@@ -1141,6 +1141,7 @@ pub(crate) mod tests {
         .unwrap();
         let a =
             e.db.insert_attempt(&crate::db::NewAttempt {
+                stacked_on: None,
                 task_id: "gh:o/r#13".into(),
                 pane_id: None,
                 workspace: "offhand".into(),

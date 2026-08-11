@@ -62,7 +62,10 @@ enum Msg {
     Dispatch {
         task_id: String,
         origin: DispatchOrigin,
-        overrides: DispatchOverrides,
+        /// Boxed because this is the only variant carrying one: every message
+        /// on the channel costs the widest variant, and the overrides are a
+        /// dozen optional strings that only a dispatch has.
+        overrides: Box<DispatchOverrides>,
         /// End the task's live attempt and release a fresh one — the blocked
         /// row's Retry (gh#49), the deliberate exception to the one-live-attempt
         /// rule. Plain dispatches send `false` and are refused on a live attempt.
@@ -291,7 +294,7 @@ impl BoardService {
             .send(Msg::Dispatch {
                 task_id: task_id.to_string(),
                 origin,
-                overrides,
+                overrides: Box::new(overrides),
                 replace,
                 reply,
             })
@@ -706,6 +709,29 @@ fn handle_dispatch(
             task.identifier, attempt.id
         ));
     }
+    // What this dispatch is cut from, when it is cut from a sibling (gh#285).
+    // Resolved here, with the refusals: a `--onto` naming no task, no attempt
+    // or no branch is a dispatch that cannot happen, and finding that out after
+    // a worktree and a chat exist costs the operator the cleanup.
+    //
+    // From here the release is an ordinary one with an explicit base — the
+    // parent's branch is what `build_spec` reads, and everything downstream of
+    // it (the fetch, the cut, the `--base` line in the brief) is the same code
+    // a route's own `base` key goes through.
+    let parent = comet_board::dispatch::stack_parent_for(&engine.db, &task.id, overrides)?;
+    let overrides = &match &parent {
+        Some(parent) => DispatchOverrides {
+            base: Some(parent.branch.clone()),
+            ..overrides.clone()
+        },
+        None => overrides.clone(),
+    };
+    if let Some(parent) = &parent {
+        engine.log.info(format!(
+            "{} stacks on {} (attempt {}) — cutting from {}",
+            task.identifier, parent.identifier, parent.attempt, parent.branch
+        ));
+    }
     let route = route_for(&engine.cfg, &task)?;
     check_capacity(&engine.db, &engine.cfg, route)?;
     // Whose subscription this run spends, and the route's guard on it (gh#101).
@@ -765,6 +791,28 @@ fn handle_dispatch(
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
 
+    // A base only decides anything when the branch is *cut*: an existing branch
+    // is reused as-is and never re-pointed, because a retry has to land on the
+    // previous attempt's commits rather than rebase them onto a newer base
+    // (`Repos::create_worktree_on`). So a dispatch that names a base for a
+    // branch the task already holds gets the old branch and its old starting
+    // point, and it says so rather than letting the operator read the base back
+    // off their own command. Said, not refused: the usual case is a retry of an
+    // already-stacked task, where the branch is on the right parent already,
+    // and refusing that would make a stacked task un-retryable.
+    if overrides.base.is_some()
+        && let Some(held) = task
+            .attempts
+            .iter()
+            .find(|a| a.branch.as_deref() == Some(spec.branch.as_str()))
+    {
+        engine.log.warn(format!(
+            "{}: {} already exists from attempt {} — it is reused as it stands, \
+             so `{}` is not what this dispatch is cut from",
+            task.identifier, spec.branch, held.id, spec.base,
+        ));
+    }
+
     // Can that harness start on the device the work is going to (gh#187)?
     //
     // Here, with the cap and the billing guard, and for their reason: this is a
@@ -800,6 +848,12 @@ fn handle_dispatch(
     // The duplicate-dispatch guard: a second concurrent dispatch fails on the
     // partial unique index here, before a worktree or chat exists.
     let attempt_id = engine.db.insert_attempt(&NewAttempt {
+        // The stacking edge (gh#285), written with the insert because it is
+        // known before anything is created — and as the parent *attempt*, not
+        // its branch: the branch is deleted when the parent merges, and the
+        // dependents (collecting a parent whose child still builds on it,
+        // fanning feedback down a chain) are asking about the run.
+        stacked_on: parent.as_ref().map(|p| p.attempt),
         task_id: task.id.clone(),
         pane_id: None,
         workspace: route.workspace.clone(),
@@ -1194,6 +1248,7 @@ mod tests {
         let db = Db::open(&paths.db()).unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
+                stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,
                 workspace: "offhand".into(),
@@ -1218,6 +1273,7 @@ mod tests {
         let db = Db::open(&paths.db()).unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
+                stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,
                 workspace: workspace.into(),
@@ -1496,6 +1552,7 @@ runtime = "mock"
                     model: Some("gpt-5.2".into()),
                     account: None,
                     bill: None,
+                    ..DispatchOverrides::default()
                 },
             )
             .await
@@ -2047,6 +2104,7 @@ billing_guard = "{mode}"
                     model: None,
                     account: None,
                     bill: None,
+                    ..DispatchOverrides::default()
                 },
             )
             .await
@@ -2535,6 +2593,115 @@ max_concurrent_per_workspace = 1
             .unwrap();
         db.set_attempt_base_sha(attempt, &base).unwrap();
         dir
+    }
+
+    /// gh#285: the unit of stacking. Task B is dispatched onto task A's branch
+    /// — the checkout is cut from it, the pull request will target it, and the
+    /// child's row records *which attempt* it came off, not just the name of a
+    /// branch that disappears when A merges.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_can_be_stacked_onto_a_siblings_attempt() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#12", "gh#12");
+        seed_task(&paths, "gh:owner/widget#13", "gh#13");
+        // The parent: an attempt holding the branch the follow-up cuts from.
+        let parent_attempt = {
+            let db = Db::open(&paths.db()).unwrap();
+            let id = db
+                .insert_attempt(&NewAttempt {
+                    stacked_on: None,
+                    task_id: "gh:owner/widget#12".into(),
+                    pane_id: None,
+                    workspace: "widget".into(),
+                    runtime: "claude-code".into(),
+                    worktree: None,
+                    repo_path: None,
+                    branch: Some("board/gh-12-widget".into()),
+                    dispatched_by: None,
+                    dispatched_by_pane: None,
+                    base_sha: None,
+                    account: None,
+                    dispatched_by_device: None,
+                    dispatched_by_user: None,
+                    dispatched_by_verified: false,
+                    billed_to: None,
+                })
+                .unwrap();
+            db.set_attempt_pane(id, "chat-12").unwrap();
+            id
+        };
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#13",
+                DispatchOrigin::default(),
+                DispatchOverrides {
+                    onto: Some("gh#12".into()),
+                    ..DispatchOverrides::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The checkout is cut from the parent's branch, and the brief tells the
+        // agent to open its request there — a request against trunk would carry
+        // the parent's commits (gh#284).
+        let specs = runtime.dispatched.lock().unwrap();
+        assert_eq!(specs[0].base, "board/gh-12-widget");
+        assert!(
+            specs[0]
+                .prompt
+                .contains("gh pr create --base board/gh-12-widget"),
+            "{}",
+            specs[0].prompt
+        );
+        drop(specs);
+
+        // …and the edge is on the child's row, as an attempt id.
+        let db = Db::open(&paths.db()).unwrap();
+        let child = db.get_task("gh:owner/widget#13").unwrap().unwrap();
+        let live = child.live_attempt().expect("live attempt");
+        assert_eq!(live.stacked_on, Some(parent_attempt));
+        // An ordinary dispatch stacks on nothing and says so.
+        let parent = db.get_task("gh:owner/widget#12").unwrap().unwrap();
+        assert_eq!(parent.live_attempt().unwrap().stacked_on, None);
+
+        service.shutdown();
+    }
+
+    /// The refusals arrive before anything is created: no attempt row, no
+    /// worktree, no chat for a dispatch that could not have been cut.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unstackable_parent_refuses_before_the_attempt_row() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#13", "gh#13");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#13",
+                DispatchOrigin::default(),
+                DispatchOverrides {
+                    onto: Some("gh#12".into()),
+                    ..DispatchOverrides::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a task on the board"), "{err}");
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#13").unwrap().unwrap();
+        assert_eq!(task.attempt_count(), 0, "nothing was created");
+
+        service.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread")]

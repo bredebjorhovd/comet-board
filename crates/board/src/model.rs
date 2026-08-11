@@ -415,6 +415,20 @@ pub struct Attempt {
     /// the agent's output; commits before it are the operator's own unpushed
     /// work, which must not be mistaken for the agent having finished.
     pub base_sha: Option<String>,
+    /// The attempt this one's branch was cut from, when it was dispatched onto
+    /// a sibling rather than onto trunk (gh#285) — the stacking edge itself.
+    ///
+    /// An attempt id and not the base branch string, because the branch is the
+    /// part that stops being true: a parent that merges has its branch deleted,
+    /// and a child looking for its parent by branch equality then finds
+    /// nothing. What the dependents want to know is *which run* this was cut
+    /// from — collecting a parent's checkout while a child still builds on it,
+    /// and fanning review feedback down a chain, are both questions about the
+    /// attempt.
+    ///
+    /// `None` is an ordinary dispatch off the route's `base`, which is nearly
+    /// all of them, and every attempt from before stacking existed.
+    pub stacked_on: Option<i64>,
     /// Whether herdr has ever reported this attempt's pane as `working`. An
     /// agent that was never seen working cannot have finished, which is what
     /// stops a freshly-started `idle` agent from being reaped before its
@@ -680,6 +694,7 @@ pub(crate) mod tests {
             dispatched_by: None,
             dispatched_by_pane: None,
             base_sha: None,
+            stacked_on: None,
             saw_working: true,
             settled_at: None,
             reopened: 0,

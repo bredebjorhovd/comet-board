@@ -787,6 +787,7 @@ impl SyncEngine {
                 .and_then(|author| author.worktree.clone());
 
             let attempt_id = self.db.insert_adopted_attempt(&NewAttempt {
+                stacked_on: None,
                 task_id: task_id.clone(),
                 pane_id: author_chat_id.clone(),
                 workspace: candidate.workspace.clone(),
@@ -4380,6 +4381,7 @@ mod tests {
     fn dispatch(e: &SyncEngine, task: &str, chat_id: &str) -> i64 {
         let a =
             e.db.insert_attempt(&crate::db::NewAttempt {
+                stacked_on: None,
                 task_id: task.into(),
                 pane_id: None,
                 workspace: "offhand".into(),
@@ -4404,6 +4406,7 @@ mod tests {
     /// An attempt on a named branch, for the tests that care which one.
     fn dispatch_on(e: &SyncEngine, task: &str, branch: &str) -> i64 {
         e.db.insert_attempt(&crate::db::NewAttempt {
+            stacked_on: None,
             task_id: task.into(),
             pane_id: None,
             workspace: "offhand".into(),
@@ -5368,6 +5371,7 @@ mod tests {
     fn dispatch_via(e: &SyncEngine, task: &str, chat_id: &str, parent: &str) -> i64 {
         let a =
             e.db.insert_attempt(&crate::db::NewAttempt {
+                stacked_on: None,
                 task_id: task.into(),
                 pane_id: None,
                 workspace: "offhand".into(),

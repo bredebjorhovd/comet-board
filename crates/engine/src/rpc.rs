@@ -308,6 +308,21 @@ struct DispatchTaskParams {
     /// theirs. Ignored entirely under `warn` and `off`.
     #[serde(default)]
     bill: Option<String>,
+    /// Stack this release onto another task: cut it from the branch that task's
+    /// attempt holds, and target its pull request there (gh#285). A task id or
+    /// the identifier printed on the board.
+    ///
+    /// The gesture, and the one of this pair a frontend should send: a task is
+    /// what the operator is looking at, the branch is an implementation detail
+    /// of the attempt on it, and only this spelling records which attempt the
+    /// child was cut from.
+    #[serde(default)]
+    onto: Option<String>,
+    /// Cut this release from that branch instead of the route's `base`, and
+    /// target its pull request there (gh#285) — the escape hatch for a branch
+    /// no task on the board holds. Naming both this and `onto` is refused.
+    #[serde(default)]
+    base: Option<String>,
     /// End the task's live attempt and release a fresh one — the blocked row's
     /// Retry (gh#49). Off for ordinary dispatches, which are refused on a live
     /// attempt.
@@ -1670,6 +1685,8 @@ impl RpcService for EngineRpc {
                     model: p.model,
                     account: p.account,
                     bill: p.bill,
+                    base: p.base,
+                    onto: p.onto,
                 };
                 let origin = self
                     .dispatch_origin(caller, p.via, p.via_device, p.via_user)
