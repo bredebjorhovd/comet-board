@@ -1923,6 +1923,39 @@ mod tests {
         );
     }
 
+    /// The sidebar is glass where the canvas is flat `--shell`, and that is a
+    /// decision rather than a drift (gh#275, decided 2026-08-11). Asserted so
+    /// it cannot quietly become one — in either direction.
+    ///
+    /// On macOS the sidebar takes a vibrancy scrim, so its painted tone depends
+    /// on the desktop behind it and CANNOT be checked against a canvas by
+    /// sampling a screenshot. Off macOS `GLASS_ALPHA` is 1.0 and the fallback
+    /// is flat `surface`, where the canvas holds exactly.
+    #[test]
+    fn the_sidebar_is_glass_and_the_canvas_cannot_say_so() {
+        for t in [Theme::dark(), Theme::light()] {
+            let glass = t.glass();
+            if Theme::GLASS_ALPHA < 1.0 {
+                assert!(
+                    glass.a < 1.0,
+                    "the sidebar stopped being translucent (light={})",
+                    t.light
+                );
+                // It is NOT the flat shell — that is the whole deviation.
+                assert_ne!(glass, t.surface, "glass collapsed onto --shell");
+            } else {
+                // Off macOS there is no scrim, and the canvas is exact.
+                assert_eq!(glass, t.surface, "the no-glass fallback must be --shell");
+            }
+        }
+        // The light scrim carries the reference's own `--shell` tone, so a
+        // wallpaper cannot tint it (gh#177). Plain white at 80% could.
+        let l = Theme::light().glass();
+        if Theme::GLASS_ALPHA < 1.0 {
+            assert_eq!(l, hex(Theme::LIGHT_SHELL).opacity(0.93));
+        }
+    }
+
     /// The four dark greys are TRANSCRIBED, not generated — the gh#274 bug.
     /// A `neutral(L)` ramp put every one of them a point or three under the
     /// design's number, and `text` three points under is visible on a title.
