@@ -473,6 +473,9 @@ pub struct Shell {
     /// The live review card's event subscription (§gh#238's `Read the diff`).
     /// Replaced with the panel, so a dropped card's subscription goes with it.
     review_events: Option<Subscription>,
+    /// Repaints the shell when the review card's state moves — see
+    /// [`Shell::render_delivery_preview`].
+    review_observation: Option<Subscription>,
     /// Chat outlet vs settings pages vs one attempt's review.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -722,6 +725,7 @@ impl Shell {
             board_open: std::env::var("COMET_OPEN_BOARD").is_ok_and(|v| v == "1"),
             review: None,
             review_events: None,
+            review_observation: None,
             route,
             nav,
             devices_page: None,
@@ -1201,19 +1205,18 @@ impl Shell {
         cx.notify();
     }
 
-    /// The review route's seam (gh#180). Measured from the LEFT edge like the
-    /// sidebar's, because the column being dragged is on the left here — the
-    /// whole point of the inversion.
+    /// The review route's seam (gh#180). Measured from the RIGHT edge like the
+    /// changes pane's, because the session column sits in the dock's slot
+    /// (gh#276) and it is that card's left edge you drag.
     fn on_review_session_drag(
         &mut self,
         event: &gpui::DragMoveEvent<ReviewSessionResize>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Window x, less everything left of the column: the sidebar's tweened
-        // width and the inset card's own left gutter.
-        let x = f32::from(event.event.position.x) - self.sidebar_target() - Theme::SPACE_SM;
-        self.settings.review_session_width = x.clamp(REVIEW_SESSION_MIN, REVIEW_SESSION_MAX);
+        let viewport = f32::from(window.viewport_size().width);
+        let width = viewport - f32::from(event.event.position.x);
+        self.settings.review_session_width = width.clamp(REVIEW_SESSION_MIN, REVIEW_SESSION_MAX);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -1315,6 +1318,11 @@ impl Shell {
                 ReviewEvent::ReadTheDiff { chat_id } => this.read_the_diff(chat_id.clone(), cx),
             },
         ));
+        // The delivery preview is drawn by the SHELL, in the session column
+        // (gh#276), out of the panel's own state — so the shell has to repaint
+        // when that state moves, or the preview would stop following the
+        // sentence being typed the moment it left the card.
+        self.review_observation = Some(cx.observe(&panel, |_: &mut Shell, _, cx| cx.notify()));
         self.review = Some(panel);
     }
 
@@ -1349,6 +1357,7 @@ impl Shell {
     fn close_review(&mut self, cx: &mut Context<Self>) {
         self.review = None;
         self.review_events = None;
+        self.review_observation = None;
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
@@ -2872,22 +2881,37 @@ impl Shell {
     /// Everywhere else the conversation is the content and a diff sits in a
     /// dock beside it. Reviewing inverts that, because reviewing inverts what
     /// you are doing: the changes are what you came to read and the chat is the
-    /// reference you consult about them. So the session becomes the narrow
-    /// column — on the LEFT, where it says the true thing about the mechanism,
-    /// that you write here and it lands over there — and the review takes the
-    /// card.
-    ///
-    /// The session column keeps its composer, because the most useful thing a
-    /// reviewer can do with an unclaimed change is ask the agent that made it,
-    /// and it drops the terminal dock, which has no room to be anything but a
-    /// letterbox at this width.
+    /// reference you consult about them. So the review takes the card, and the
+    /// session becomes the narrow column in the dock's own slot on the right
+    /// (gh#276) — the reference goes where every other reference in this app
+    /// goes, and the two are separate inset cards with a seam between them
+    /// rather than one card split by a hairline.
     fn render_review_route(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
         let Some(panel) = self.review.clone() else {
             // Only reachable if the route outlived its panel; the chat route is
             // the honest fallback rather than an empty card.
             return self.render_conversation(true, cx);
         };
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .child(panel)
+            .into_any_element()
+    }
+
+    /// The authoring session, as the review route's right-hand card
+    /// (review.md I).
+    ///
+    /// It keeps its composer, because the most useful thing a reviewer can do
+    /// with an unclaimed change is ask the agent that made it, and it drops the
+    /// terminal dock, which has no room to be anything but a letterbox at this
+    /// width. Above the composer sits the delivery preview — the payload is a
+    /// message that will arrive in *this* column, and this is where the canvas
+    /// shows it waiting.
+    fn render_review_session(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
         let width = self
             .settings
             .review_session_width
@@ -2902,7 +2926,6 @@ impl Shell {
             div()
                 .flex_1()
                 .min_w_0()
-                .h_full()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2918,6 +2941,7 @@ impl Shell {
                 )
                 .into_any_element()
         };
+        // The seam is on this card's LEFT now, so that is the edge that drags.
         let handle = self
             .resize_handle(
                 "review-session-resize",
@@ -2928,35 +2952,117 @@ impl Shell {
             .absolute()
             .top_0()
             .bottom_0()
-            .right(px(-2.0));
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
+            .left(px(0.0));
+        let card = div()
+            .size_full()
             .flex()
-            .flex_row()
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(width))
-                    .h_full()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .child(session)
-                    .child(handle),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(panel),
-            )
+            .flex_col()
+            .rounded(px(Theme::RADIUS_CARD))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg)
+            .overflow_hidden()
+            .children(self.render_review_session_header(&theme, cx))
+            .child(session);
+        div()
+            .flex_none()
+            .w(px(width))
+            .h_full()
+            .relative()
+            .overflow_hidden()
+            .pb(px(Theme::SPACE_SM))
+            .pr(px(Theme::SPACE_SM))
+            .child(card)
+            .child(handle)
             .into_any_element()
+    }
+
+    /// The verdict payload, drawn at the bottom of the session column
+    /// (review.md I4) and composed by the review card itself, so the two
+    /// cannot disagree about what is about to be sent.
+    ///
+    /// `None` off the review route, and on a review with no pull request to
+    /// post to — there is no payload, and a dashed empty card promising one
+    /// would be a promise about nothing.
+    fn render_delivery_preview(&self, theme: &Theme, cx: &App) -> Option<AnyElement> {
+        if !matches!(self.route, Route::Review { .. }) {
+            return None;
+        }
+        self.review.as_ref()?.read(cx).delivery_preview(theme, cx)
+    }
+
+    /// The session card's header (review.md I1): whose session this is, and
+    /// whether anything is happening in it.
+    ///
+    /// Absent when the chat is gone — there is no session to name, and a header
+    /// over the "the session that wrote this is gone" line would be a frame
+    /// around an absence.
+    fn render_review_session_header(
+        &self,
+        theme: &Theme,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let chat = state.selected_chat_row()?;
+        let now = Utc::now();
+        let status = comet_proto::view::display_status(chat, state.session_for(&chat.id), now);
+        // The same dot the sidebar and the tabs paint: one ramp, so a working
+        // session is one colour wherever it is drawn.
+        let dot = crate::shell::spaces::status_dot_color(status, theme);
+        // The branch is what the review talks about; the title is what the
+        // sidebar calls it. This column belongs to the review, so it leads with
+        // the branch and falls back to the title only where there is none.
+        let name = chat
+            .branch
+            .clone()
+            .filter(|branch| !branch.is_empty())
+            .or_else(|| chat.title.clone())
+            .unwrap_or_else(|| "Session".to_string());
+        // What the session is doing, and since when. One word each, and the
+        // one that matters is `waiting` — a session that has asked the reviewer
+        // something is the reason to look at this column at all.
+        let word = match status {
+            comet_proto::ChatIndicator::Working => "working",
+            comet_proto::ChatIndicator::AwaitingInput => "waiting",
+            comet_proto::ChatIndicator::Errored => "errored",
+            comet_proto::ChatIndicator::Completed | comet_proto::ChatIndicator::Idle => "idle",
+        };
+        let elapsed = match chat.last_message_at {
+            Some(at) => format!("{word} · {}", format_time_ago(at, now)),
+            None => word.to_string(),
+        };
+        Some(
+            div()
+                .flex_none()
+                .h(px(40.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
+                .px(px(14.0))
+                .border_b_1()
+                .border_color(theme.border)
+                // round-ok: the status dot every chat row wears, at its size.
+                .child(div().flex_none().size(px(5.0)).rounded_full().bg(dot))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(Theme::TEXT_BODY))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(SharedString::from(name)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(elapsed)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The conversation column: transcript (or one of the two canvases), the
@@ -3137,6 +3243,9 @@ impl Shell {
             // conversation region, ABOVE the terminal dock (comet __root.tsx:
             // the terminal panel sits below the whole conversation column).
             .child(status)
+            // On the review route, the payload waits above the composer in the
+            // column it will be delivered into (review.md I4).
+            .children(self.render_delivery_preview(theme, cx))
             .when(has_spaces, |el| el.child(self.composer.clone()))
             .when(with_terminal, |el| {
                 el.child(self.render_terminal_container(cx))
@@ -4190,8 +4299,14 @@ impl Render for Shell {
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
+                // The review route fills the same slot with the authoring
+                // session (gh#276): the reference goes where every other
+                // reference in this app goes.
+                let on_review = matches!(self.route, Route::Review { .. });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
+                } else if on_review {
+                    self.render_review_session(cx)
                 } else {
                     Empty.into_any_element()
                 };
@@ -4236,7 +4351,7 @@ impl Render for Shell {
                 // pane is closed, but the SEAM between the two inset cards
                 // when it's open — a full gutter there read double-wide next
                 // to the two borders it separates (user report).
-                let right_gap = if on_chat && self.right_slot_open(cx) {
+                let right_gap = if (on_chat && self.right_slot_open(cx)) || on_review {
                     4.0
                 } else {
                     8.0

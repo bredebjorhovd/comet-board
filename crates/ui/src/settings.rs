@@ -42,7 +42,9 @@ pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 /// own reference.
 pub const REVIEW_SESSION_MIN: f32 = 320.0;
 pub const REVIEW_SESSION_MAX: f32 = 620.0;
-pub const REVIEW_SESSION_DEFAULT: f32 = 420.0;
+/// The canvas's own width for this column (gh#276, review.md A5), gutters
+/// included.
+pub const REVIEW_SESSION_DEFAULT: f32 = 380.0;
 
 /// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
 /// viewport-relative cap applies at runtime; the absolute cap here only heals
