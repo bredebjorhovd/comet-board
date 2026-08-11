@@ -480,6 +480,14 @@ pub struct Theme {
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
+    /// The bed a chip, badge or key cap sits on — the reference's `--chip`.
+    /// TRANSLUCENT, unlike every other surface here, and that is the point: a
+    /// chip lands on the card, on `--raised`, and inside a selected row, and
+    /// the design draws the same 7% wash in all three. An opaque tone would be
+    /// right on exactly one of those beds and a patch on the other two.
+    /// Distinct from [`Self::element_hover`], which is weaker and means a
+    /// pointer is over something rather than that this is a thing.
+    pub chip: Hsla,
 
     // ---- paint: text (four tones, never multiplied — see the module docs) ----
     /// Headings, titles, the selected row. ~16.9:1 on [`Self::bg`].
@@ -508,6 +516,13 @@ pub struct Theme {
     /// Settled — emerald, [`Status::Settled`]'s hue: finished chats, an online
     /// device, an active account.
     pub settled: Hsla,
+
+    // ---- paint: borrowed marks ----
+    /// Anthropic's orange, for the Claude mark alone — the reference's
+    /// `--claude`. Deliberately outside the status ramp: it identifies a
+    /// vendor, and the four hues mean state (gh#173). Nothing else may paint
+    /// with it, or the app grows a fifth status nobody declared.
+    pub claude: Hsla,
 
     // ---- fonts ----
     /// UI font family (bundling of Geist lands with asset work; until then the
@@ -653,6 +668,30 @@ impl Theme {
     pub const LIGHT_TEXT_MUTED: u32 = 0x545454;
     pub const LIGHT_TEXT_SUBTLE: u32 = 0x6b6b6b;
     pub const LIGHT_TEXT_FAINT: u32 = 0x8a8a8a;
+    /// Dark text, muted, subtle, faint — the design files' own four greys,
+    /// transcribed, exactly as the light four above are.
+    ///
+    /// These were a `neutral(L)` ramp until gh#274, and every one of them
+    /// landed a point or three under the number the design draws (`#eaeaea`
+    /// for `#ededed`, and so on down). A ramp is the wrong instrument here:
+    /// it re-derives on every read, so the value the app paints is whatever
+    /// the oklch round-trip happens to produce rather than the value anyone
+    /// chose. The light side never had the bug because it was transcribed.
+    pub const DARK_TEXT: u32 = 0xededed;
+    pub const DARK_TEXT_MUTED: u32 = 0xa8a8a8;
+    pub const DARK_TEXT_SUBTLE: u32 = 0x808080;
+    pub const DARK_TEXT_FAINT: u32 = 0x666666;
+
+    /// `--chip`'s alpha in dark, and in light where it darkens instead — the
+    /// bed a chip, badge or key cap sits on.
+    const CHIP_ALPHA: f32 = 0.07;
+    /// The same in light (`rgba(0,0,0,.05)`).
+    const CHIP_ALPHA_LIGHT: f32 = 0.05;
+
+    /// `--claude` — Anthropic's orange, dark and light. The one borrowed mark
+    /// in the palette; see [`Self::claude`].
+    pub const DARK_CLAUDE: u32 = 0xd97757;
+    pub const LIGHT_CLAUDE: u32 = 0xc15f3c;
 
     // ---- hover is tone, selection is a surface with an edge (gh#175/gh#258) ----
     /// The hover wash's alpha — the reference's `--hover`. Over `--shell` it
@@ -758,16 +797,18 @@ impl Theme {
             row_edge: white_alpha(Self::SELECT_EDGE),
             border: white_alpha(0.08),
             border_strong: white_alpha(0.13),
-            text: neutral(0.938),        // #ebebeb — 16.9:1 on bg
-            text_muted: neutral(0.728),  // #a7a7a7 —  8.4:1
-            text_subtle: neutral(0.598), // #7f7f7f —  5.1:1
-            text_faint: neutral(0.508),  // #656565 —  3.5:1
+            chip: white_alpha(Self::CHIP_ALPHA),
+            text: hex(Self::DARK_TEXT),         // #ededed — 17.0:1 on bg
+            text_muted: hex(Self::DARK_TEXT_MUTED), // #a8a8a8 —  8.5:1
+            text_subtle: hex(Self::DARK_TEXT_SUBTLE), // #808080 —  5.2:1
+            text_faint: hex(Self::DARK_TEXT_FAINT), // #666666 —  3.6:1
             // The status ramp — one lightness, one chroma, four hues.
             accent: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_REVIEW),
             accent_strong: oklch(0.62, 0.19, Self::HUE_REVIEW),
             danger: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_BLOCKED),
             warning: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_WORKING),
             settled: oklch(Self::STATUS_L, Self::STATUS_C, Self::HUE_SETTLED),
+            claude: hex(Self::DARK_CLAUDE),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -819,6 +860,7 @@ impl Theme {
             // job is to be seen cannot also be translucent.
             border: hex(Self::LIGHT_LINE),
             border_strong: hex(Self::LIGHT_LINE_STRONG),
+            chip: ink(Self::CHIP_ALPHA_LIGHT),
             // Flat greys — 17.9 / 7.6 / 5.3 / 3.5 on the white page, and every
             // one of them still clears its floor on the ground and in a card.
             text: hex(Self::LIGHT_TEXT),
@@ -844,6 +886,7 @@ impl Theme {
                 Self::STATUS_C_LIGHT,
                 Self::HUE_SETTLED,
             ),
+            claude: hex(Self::LIGHT_CLAUDE),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -1804,6 +1847,95 @@ mod tests {
             full.windows(2).all(|p| p[0] < p[1]),
             "the scale is not ordered: {full:?}"
         );
+    }
+
+    /// Every token the five design canvases declare, against what the theme
+    /// paints — the whole table in one place, so a drifting value fails here
+    /// and not in a screenshot three surfaces later (gh#274).
+    ///
+    /// The canvases are vendored at `docs/design/canvas/`, and all five carry
+    /// the SAME table: the three desktop ones are byte-identical in their
+    /// `.cw` blocks, review drops `--desk`, and iOS drops the four shell-only
+    /// vars. So there is one palette to check, not five.
+    #[test]
+    fn every_canvas_token_is_the_value_the_canvas_declares() {
+        // --- dark ---
+        let d = Theme::dark();
+        for (name, got, want) in [
+            ("--card", d.bg, Theme::DARK_PANEL),
+            ("--shell", d.surface, Theme::DARK_SHELL),
+            ("--raised", d.surface_raised, Theme::DARK_RAISED),
+            ("--sel", d.row_selected, Theme::DARK_SELECTED),
+            ("--selcard", d.row_selected_card, Theme::DARK_SELECTED),
+            ("--text", d.text, Theme::DARK_TEXT),
+            ("--muted", d.text_muted, Theme::DARK_TEXT_MUTED),
+            ("--subtle", d.text_subtle, Theme::DARK_TEXT_SUBTLE),
+            ("--faint", d.text_faint, Theme::DARK_TEXT_FAINT),
+            ("--claude", d.claude, Theme::DARK_CLAUDE),
+        ] {
+            assert_eq!(got, hex(want), "dark {name} is not the canvas value");
+        }
+        // The translucent four, by alpha over white.
+        assert_eq!(d.border, white_alpha(0.08), "dark --line");
+        assert_eq!(d.border_strong, white_alpha(0.13), "dark --line2");
+        // `--hover` is the one DELIBERATE deviation: the canvas draws pure
+        // white at 5%, the app paints soft-white (L 0.92) at the same alpha,
+        // because a hover over the glass sidebar flashed dark mid-fade when it
+        // rested on pure white. Same alpha, same neutral, one step off pure —
+        // asserted so the deviation stays a decision and not a drift.
+        assert_eq!(d.element_hover, wash(0.05), "dark --hover");
+        assert_eq!(d.element_hover.a, 0.05, "dark --hover alpha");
+        assert_eq!(d.chip, white_alpha(0.07), "dark --chip");
+        assert_eq!(d.row_edge, white_alpha(0.13), "dark --sellift ring");
+
+        // --- light ---
+        let l = Theme::light();
+        for (name, got, want) in [
+            ("--card", l.bg, Theme::LIGHT_PANEL),
+            ("--shell", l.surface, Theme::LIGHT_SHELL),
+            ("--raised", l.surface_raised, Theme::LIGHT_RAISED),
+            ("--sel", l.row_selected, Theme::LIGHT_SELECTED),
+            ("--selcard", l.row_selected_card, Theme::LIGHT_SELECTED_CARD),
+            ("--line", l.border, Theme::LIGHT_LINE),
+            ("--line2", l.border_strong, Theme::LIGHT_LINE_STRONG),
+            ("--text", l.text, Theme::LIGHT_TEXT),
+            ("--muted", l.text_muted, Theme::LIGHT_TEXT_MUTED),
+            ("--subtle", l.text_subtle, Theme::LIGHT_TEXT_SUBTLE),
+            ("--faint", l.text_faint, Theme::LIGHT_TEXT_FAINT),
+            ("--claude", l.claude, Theme::LIGHT_CLAUDE),
+        ] {
+            assert_eq!(got, hex(want), "light {name} is not the canvas value");
+        }
+        assert_eq!(l.element_hover, ink(0.025), "light --hover");
+        assert_eq!(l.chip, ink(0.05), "light --chip");
+
+        // --- the status ramp, both variants ---
+        assert_eq!((Theme::STATUS_L, Theme::STATUS_C), (0.74, 0.14));
+        assert_eq!((Theme::STATUS_L_LIGHT, Theme::STATUS_C_LIGHT), (0.52, 0.16));
+        assert_eq!(
+            [
+                Theme::HUE_BLOCKED,
+                Theme::HUE_WORKING,
+                Theme::HUE_REVIEW,
+                Theme::HUE_SETTLED,
+            ],
+            [25.0, 75.0, 265.0, 160.0]
+        );
+    }
+
+    /// The four dark greys are TRANSCRIBED, not generated — the gh#274 bug.
+    /// A `neutral(L)` ramp put every one of them a point or three under the
+    /// design's number, and `text` three points under is visible on a title.
+    #[test]
+    fn dark_text_greys_are_transcribed_not_ramped() {
+        let t = Theme::dark();
+        assert_eq!(t.text, hex(0xededed));
+        assert_eq!(t.text_muted, hex(0xa8a8a8));
+        assert_eq!(t.text_subtle, hex(0x808080));
+        assert_eq!(t.text_faint, hex(0x666666));
+        // What the old ramp produced, so the regression is named: re-deriving
+        // `text` from oklch lightness lands on #eaeaea, not #ededed.
+        assert_ne!(t.text, neutral(0.938), "the ramp is back");
     }
 
     // ---- light variant ----

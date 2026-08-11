@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist.ttf');font-weight:100 900;font-style:normal;font-display:block}
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist-Medium.ttf');font-weight:500;font-style:normal;font-display:block}
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist-SemiBold.ttf');font-weight:600;font-style:normal;font-display:block}
+@font-face{font-family:'Geist Mono';src:url('crates/ui/assets/fonts/GeistMono.ttf');font-weight:100 900;font-style:normal;font-display:block}
+.cw{
+--shell:#0d0d0d;--card:#070707;--raised:#161616;--sel:#191919;--selcard:#191919;
+--hover:rgba(255,255,255,.05);--chip:rgba(255,255,255,.07);
+--line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.13);
+--text:#ededed;--muted:#a8a8a8;--subtle:#808080;--faint:#666666;
+--blocked:oklch(0.74 0.14 25);--working:oklch(0.74 0.14 75);--review:oklch(0.74 0.14 265);--settled:oklch(0.74 0.14 160);
+--lift:none;--sellift:0 0 0 1px rgba(255,255,255,.13);
+--cardshadow:none;--claude:#D97757;
+}
+.cw[data-theme="light"]{
+--shell:#e9e9ec;--card:#ffffff;--raised:#f4f4f7;--sel:#ffffff;--selcard:#eeeef2;
+--hover:rgba(0,0,0,.025);--chip:rgba(0,0,0,.05);
+--line:#e4e4e8;--line2:#d6d6dc;
+--text:#171717;--muted:#545454;--subtle:#6b6b6b;--faint:#8a8a8a;
+--blocked:oklch(0.52 0.16 25);--working:oklch(0.52 0.16 75);--review:oklch(0.52 0.16 265);--settled:oklch(0.52 0.16 160);
+--lift:0 1px 2px rgba(0,0,0,.05);--sellift:0 0 0 1px #dcdce2, 0 1px 2px rgba(0,0,0,.06);
+--cardshadow:0 1px 2px rgba(0,0,0,.04),0 10px 30px -18px rgba(0,0,0,.18);--claude:#c15f3c;
+}
+</style>
+</helmet>
+
+<div class="cw" data-theme="{{ themeAttr }}" style="width:1320px;height:880px;border-radius:12px;overflow:hidden;position:relative;background:var(--shell);color:var(--text);font-family:Geist,system-ui,sans-serif;font-size:13px;-webkit-font-smoothing:antialiased">
+
+  <div style="position:absolute;top:0;bottom:0;left:0;width:256px;border-right:1px solid var(--line)"></div>
+
+  <div style="position:absolute;inset:0;display:flex;flex-direction:column">
+
+    <div style="height:38px;flex:none;display:flex;align-items:center;padding-top:2px;padding-left:172px;padding-right:16px;gap:4px">
+      <div style="width:150px;height:28px;flex:none;display:flex;align-items:center;gap:7px;padding-left:9px;padding-right:5px;border-radius:10px;font-size:12px;background:var(--sel);box-shadow:var(--sellift);color:var(--text)">
+        <span style="width:5px;height:5px;border-radius:9999px;background:var(--review);flex:none"></span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Review · gh#138</span>
+        <span style="width:18px;height:18px;flex:none;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="m4.75 4.75 6.5 6.5m0-6.5-6.5 6.5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"></path></svg></span>
+      </div>
+      <div style="width:150px;height:28px;flex:none;display:flex;align-items:center;gap:7px;padding-left:9px;padding-right:5px;border-radius:10px;font-size:12px;color:var(--subtle)">
+        <span style="width:5px;height:5px;border-radius:9999px;background:var(--working);flex:none"></span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Desktop and iOS…</span>
+      </div>
+      <div style="flex:1"></div>
+    </div>
+
+    <div style="flex:1;min-height:0;display:flex;flex-direction:row">
+
+      <!-- SIDEBAR -->
+      <div style="width:256px;flex:none;height:100%;display:flex;flex-direction:column;padding:0 8px;box-sizing:border-box;overflow:hidden">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 8px 6px">
+          <div style="font-size:11px;font-weight:600;color:var(--subtle)">Needs you</div>
+          <div style="font-size:11px;font-weight:500;color:var(--subtle)">2</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px">
+          <div style="display:flex;flex-direction:column;gap:2px;border-radius:10px;padding:6px 9px;background:var(--sel);box-shadow:var(--sellift)">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span style="width:9px;flex:none;font-size:10px;color:var(--review);text-align:center">✓</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:18px;color:var(--text)">gh#138 · comet-board</span>
+            </div>
+            <div style="padding-left:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:15px;color:var(--subtle)">PR #212 waiting on you</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px;border-radius:10px;padding:6px 9px">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span style="width:9px;flex:none;font-size:10px;color:var(--blocked);text-align:center">✕</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:18px;color:var(--muted)">gh#131 · comet-board</span>
+            </div>
+            <div style="padding-left:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:15px;color:var(--subtle)">Pane exited without completing</div>
+          </div>
+        </div>
+
+        <div style="height:1px;background:var(--line);margin:12px 8px 0"></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 8px 6px">
+          <div style="font-size:11px;font-weight:600;color:var(--subtle)">Spaces</div>
+          <div style="width:20px;height:20px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3.25v9.5M3.25 8h9.5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"></path></svg></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px">
+          <div style="display:flex;align-items:center;gap:8px;border-radius:10px;padding:6px 9px">
+            <span style="flex:none;color:var(--muted);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></span>
+            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:18px;font-weight:500;color:var(--text)">comet-board</span>
+            <span style="flex:none;font-size:12px;color:var(--subtle)">main</span>
+            <span style="flex:1"></span>
+            <span style="flex:none;display:flex;align-items:center;gap:5px;font-size:12px;color:var(--subtle)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--blocked)"></span>3 running</span>
+            <span style="width:16px;height:16px;flex:none;display:flex;align-items:center;justify-content:center;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;border-radius:10px;padding:6px 9px">
+            <span style="flex:none;color:var(--subtle);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></span>
+            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:18px;font-weight:500;color:var(--muted)">attn</span>
+            <span style="flex:none;font-size:12px;color:var(--subtle)">wt/review</span>
+            <span style="flex:1"></span>
+            <span style="width:16px;height:16px;flex:none;display:flex;align-items:center;justify-content:center;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+          </div>
+        </div>
+        <div style="flex:1"></div>
+        <div style="height:1px;background:var(--line);margin:0 8px"></div>
+        <div style="flex:none;border-radius:10px;padding:8px 9px;display:flex;align-items:center;gap:10px;margin:8px 0">
+          <div style="width:26px;height:26px;flex:none;border-radius:9999px;background:var(--text);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:var(--card)">B</div>
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+            <div style="font-size:13px;line-height:18px;font-weight:500;color:var(--text)">Brede Bjørhovd</div>
+            <div style="font-size:11px;line-height:15px;color:var(--subtle)">Alpha</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- REVIEW -->
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:14px;margin:0 4px 8px 8px;box-shadow:var(--cardshadow)">
+
+        <div style="flex:none;padding:12px 16px 10px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;align-items:center;gap:9px">
+            <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle);flex:none">gh#138</span>
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:600;letter-spacing:-.01em;color:var(--text)">Active owns a chat's row while its session is live</span>
+            <span style="flex:none;padding:1px 8px;border-radius:6px;font-size:11px;color:var(--review);background:color-mix(in srgb,var(--review) 14%,transparent)">Waiting on you</span>
+            <span style="width:24px;height:24px;flex:none;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 12a10 10 0 1 1-20.001 0A10 10 0 0 1 22 12Z"></path><path d="M16 12c0 1.313-.104 2.614-.305 3.827c-.2 1.213-.495 2.315-.867 3.244c-.371.929-.812 1.665-1.297 2.168c-.486.502-1.006.761-1.531.761s-1.045-.259-1.53-.761c-.486-.503-.927-1.24-1.298-2.168c-.372-.929-.667-2.03-.868-3.244A23.6 23.6 0 0 1 8 12c0-1.313.103-2.614.304-3.827s.496-2.315.868-3.244c.371-.929.812-1.665 1.297-2.168C10.955 2.26 11.475 2 12 2s1.045.259 1.53.761c.486.503.927 1.24 1.298 2.168c.372.929.667 2.03.867 3.244C15.897 9.386 16 10.687 16 12Z"></path><path stroke-linecap="round" d="M2 12h20"></path></g></svg></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;font-size:12px;color:var(--subtle);flex-wrap:wrap">
+            <span style="display:flex;align-items:center;gap:6px"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>PR #212</span>
+            <span style="color:var(--faint)">·</span>
+            <span style="display:flex;align-items:center;gap:6px"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="6.5" cy="5.5" r="2.25"></circle><circle cx="6.5" cy="18.5" r="2.25"></circle><circle cx="17.5" cy="7.5" r="2.25"></circle><path d="M6.5 7.75v8.5"></path><path d="M17.5 9.75c0 2.9-2.6 4.35-6.2 4.72c-1.9.2-3.3.9-4 2.03"></path></g></svg>board/gh-138 → main</span>
+            <span style="color:var(--faint)">·</span>
+            <span style="display:flex;align-items:center;gap:6px"><span style="color:var(--claude);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 256 257" fill="currentColor"><path d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"></path></svg></span>claude-opus-5 · 41m</span>
+          </div>
+        </div>
+
+        <div style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column">
+
+          <div style="flex:none;padding:11px 16px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;gap:10px;background:var(--raised)">
+            <span style="flex:none;font-size:11px;font-weight:600;color:var(--subtle);width:62px;padding-top:2px">Asked for</span>
+            <span style="flex:1;min-width:0;font-size:13px;line-height:20px;color:var(--muted)">Active should own a chat's row while its session is live, and the tree should show it when idle — one derivation, so the two surfaces can never disagree.</span>
+          </div>
+
+          <div style="flex:none;padding:11px 16px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;gap:10px">
+            <span style="flex:none;font-size:11px;font-weight:600;color:var(--subtle);width:62px;padding-top:3px">Effects</span>
+            <span style="flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:6px 8px">
+              <span style="display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);font-size:12px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Tests 41 → 47, all passing</span>
+              <span style="display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);font-size:12px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Public API unchanged</span>
+              <span style="display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);font-size:12px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Schema unchanged</span>
+              <span style="display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);font-size:12px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>No config keys added</span>
+              <span style="display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--working) 12%,transparent);font-size:12px;color:var(--working)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--working)"></span>1 dependency added</span>
+            </span>
+          </div>
+
+          <div style="flex:none;padding:11px 16px 4px;display:flex;align-items:center;gap:10px">
+            <span style="font-size:12px;font-weight:600;color:var(--text)">What it says it did</span>
+            <span style="font-size:12px;color:var(--subtle)">3 claims</span>
+            <span style="flex:1"></span>
+            <span style="font-size:11px;color:var(--faint)">evidence gathered by the board, not the agent</span>
+          </div>
+
+          <div style="flex:none;padding:0 16px;display:flex;flex-direction:column;gap:8px">
+            <div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;gap:10px;align-items:flex-start">
+              <span style="flex:none;width:14px;padding-top:2px;font-size:11px;color:var(--settled);text-align:center">✓</span>
+              <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                <span style="font-size:13px;line-height:19px;color:var(--text)">A live chat's row is drawn by Active and never by the spaces tree.</span>
+                <span style="display:flex;flex-wrap:wrap;gap:5px 7px">
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:color-mix(in srgb,var(--settled) 12%,transparent);font-size:11px;color:var(--settled);display:flex;align-items:center">4 new tests pass</span>
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:var(--chip);font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle);display:flex;align-items:center">shell/spaces.rs</span>
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:var(--chip);font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle);display:flex;align-items:center">view/spaces.rs</span>
+                </span>
+              </span>
+            </div>
+
+            <div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;gap:10px;align-items:flex-start">
+              <span style="flex:none;width:14px;padding-top:2px;font-size:11px;color:var(--settled);text-align:center">✓</span>
+              <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                <span style="font-size:13px;line-height:19px;color:var(--text)">Both surfaces read one derivation per frame, so they cannot disagree.</span>
+                <span style="display:flex;flex-wrap:wrap;gap:5px 7px">
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:color-mix(in srgb,var(--settled) 12%,transparent);font-size:11px;color:var(--settled);display:flex;align-items:center">1 call site, was 2</span>
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:var(--chip);font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle);display:flex;align-items:center">active_placements</span>
+                </span>
+              </span>
+            </div>
+
+            <div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;gap:10px;align-items:flex-start">
+              <span style="flex:none;width:14px;padding-top:2px;font-size:11px;color:var(--subtle);text-align:center">·</span>
+              <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                <span style="font-size:13px;line-height:19px;color:var(--muted)">An expanded space says so when Active holds every one of its rows.</span>
+                <span style="display:flex;flex-wrap:wrap;gap:5px 7px">
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:color-mix(in srgb,var(--working) 12%,transparent);font-size:11px;color:var(--working);display:flex;align-items:center">no test covers this</span>
+                  <span style="height:20px;padding:0 7px;border-radius:6px;background:var(--chip);font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle);display:flex;align-items:center">shelf_note</span>
+                </span>
+              </span>
+            </div>
+          </div>
+
+          <div style="flex:none;margin:14px 16px 0;border:1px solid color-mix(in srgb,var(--blocked) 32%,transparent);border-radius:10px;overflow:hidden">
+            <div style="padding:9px 12px;display:flex;align-items:center;gap:8px;background:color-mix(in srgb,var(--blocked) 9%,transparent);border-bottom:1px solid color-mix(in srgb,var(--blocked) 22%,transparent)">
+              <span style="display:flex;flex:none;color:var(--blocked)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><g fill="none"><path stroke="currentColor" stroke-width="1.5" d="M5.312 10.762C8.23 5.587 9.689 3 12 3s3.77 2.587 6.688 7.762l.364.644c2.425 4.3 3.638 6.45 2.542 8.022S17.786 21 12.364 21h-.728c-5.422 0-8.134 0-9.23-1.572s.117-3.722 2.542-8.022z"></path><path stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="M12 8v5"></path><circle cx="12" cy="16" r="1" fill="currentColor"></circle></g></svg></span>
+              <span style="font-size:12px;font-weight:600;color:var(--blocked)">2 changes no claim accounts for</span>
+              <span style="flex:1"></span>
+              <span style="font-size:11px;color:var(--blocked);opacity:.75">this is where drift hides</span>
+            </div>
+            <div style="padding:9px 12px;display:flex;align-items:center;gap:10px;font-size:12px">
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;color:var(--muted)">Cargo.toml</span>
+              <span style="flex:none;color:var(--subtle)">added <span style="font-family:'Geist Mono',monospace;color:var(--muted)">itertools 0.13</span></span>
+              <span style="flex:none;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);display:flex;align-items:center;color:var(--text)">Show</span>
+            </div>
+            <div style="padding:9px 12px;display:flex;align-items:center;gap:10px;font-size:12px;border-top:1px solid var(--line)">
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;color:var(--muted)">shell.rs · right_target()</span>
+              <span style="flex:none;color:var(--subtle)">+6 −4, unmentioned</span>
+              <span style="flex:none;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);display:flex;align-items:center;color:var(--text)">Show</span>
+            </div>
+          </div>
+
+          <div style="flex:none;margin:12px 16px 0;padding:9px 12px;border:1px solid var(--line);border-radius:10px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--subtle)">
+            <span style="flex:1;min-width:0">3 files changed <span style="font-family:'Geist Mono',monospace;color:var(--settled)">+117</span> <span style="font-family:'Geist Mono',monospace;color:var(--blocked)">−33</span></span>
+            <span style="flex:none;height:22px;padding:0 8px;border-radius:6px;background:var(--chip);display:flex;align-items:center;color:var(--text)">Read the diff</span>
+          </div>
+        </div>
+
+        <div style="flex:none;border-top:1px solid var(--line);padding:12px 16px;display:flex;flex-direction:column;gap:10px;background:var(--raised)">
+          <div style="border:1px solid var(--line2);border-radius:10px;background:var(--card);padding:9px 12px;font-size:13px;line-height:20px;color:var(--text);min-height:42px">The split reads right. Why does this need itertools — and is the shelf note actually covered?</div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="flex:1;min-width:0;font-size:12px;line-height:17px;color:var(--subtle)">Delivered into <span style="color:var(--muted)">board/gh-138</span> once, with both unclaimed changes attached.</span>
+            <span style="flex:none;height:28px;padding:0 11px;border-radius:6px;display:flex;align-items:center;font-size:12px;color:var(--muted)">Comment</span>
+            <span style="flex:none;height:28px;padding:0 11px;border-radius:6px;display:flex;align-items:center;font-size:12px;color:var(--settled)">Approve</span>
+            <span style="flex:none;height:28px;padding:0 12px;border-radius:6px;display:flex;align-items:center;font-size:12px;font-weight:500;background:var(--text);color:var(--card)">Request changes</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- AUTHORING CHAT -->
+      <div style="width:380px;flex:none;height:100%;box-sizing:border-box;padding:0 8px 8px 0">
+        <div style="height:100%;border-radius:14px;border:1px solid var(--line);background:var(--card);box-shadow:var(--cardshadow);overflow:hidden;display:flex;flex-direction:column">
+          <div style="height:40px;flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--line)">
+            <span style="width:5px;height:5px;border-radius:9999px;background:var(--faint);flex:none"></span>
+            <span style="font-size:13px;font-weight:600;color:var(--text)">board/gh-138</span>
+            <span style="flex:1"></span>
+            <span style="font-size:12px;color:var(--subtle)">idle · 41m</span>
+          </div>
+
+          <div style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;padding:0 14px;-webkit-mask-image:linear-gradient(to bottom,transparent,#000 44px);mask-image:linear-gradient(to bottom,transparent,#000 44px)">
+            <div style="flex:none;padding-bottom:10px;font-size:13px;line-height:20px;color:var(--muted)">The shelf and Active both call <span style="font-family:'Geist Mono',monospace;font-size:12px;background:var(--chip);padding:1px 4px;border-radius:6px">visible_chats()</span> and filter it themselves, which is why a chat can satisfy both filters on the same frame. Three call sites total.</div>
+            <div style="flex:none;display:flex;justify-content:flex-end;padding-bottom:14px">
+              <div style="max-width:86%;background:var(--raised);box-shadow:var(--sellift);border-radius:14px;padding:9px 13px;font-size:13px;line-height:20px;color:var(--text)">Right. Don't add a flag to the chat — derive placement once and hand it down.</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:8px;padding-bottom:12px">
+              <span style="width:18px;height:18px;flex:none;border-radius:6px;background:var(--chip);display:flex;align-items:center;justify-content:center;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+              <span style="font-size:12px;color:var(--subtle)">Ran 6 commands · read 4 files</span>
+            </div>
+            <div style="flex:none;padding-bottom:12px;font-size:13px;line-height:20px;color:var(--muted)">Agreed — a flag would let the two lists drift again the moment one of them forgot to check it. Placement becomes a value the sidebar computes once per frame.</div>
+            <div style="flex:none;display:flex;justify-content:flex-end;padding-bottom:14px">
+              <div style="max-width:86%;background:var(--raised);box-shadow:var(--sellift);border-radius:14px;padding:9px 13px;font-size:13px;line-height:20px;color:var(--text)">Both lists showed the same chat when it went idle mid-frame. Active should own the row while the session is live.</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:8px;padding-bottom:12px">
+              <span style="width:18px;height:18px;flex:none;border-radius:6px;background:var(--chip);display:flex;align-items:center;justify-content:center;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+              <span style="font-size:12px;color:var(--subtle)">Ran 12 commands · read 9 files · edited 3</span>
+            </div>
+            <div style="flex:none;padding-bottom:10px;font-size:13px;line-height:20px;color:var(--muted)">Both lists were deriving placement from <span style="font-family:'Geist Mono',monospace;font-size:12px;background:var(--chip);padding:1px 4px;border-radius:6px">state.chats</span> separately, so a chat that settled between the sidebar pass and the shelf pass was drawn twice. The derivation moves up into <span style="font-family:'Geist Mono',monospace;font-size:12px;background:var(--chip);padding:1px 4px;border-radius:6px">render_chat_sidebar</span> and both readers take the result:</div>
+            <div style="flex:none;margin-bottom:12px;border:1px solid var(--line);border-radius:10px;background:var(--raised);padding:8px 11px;font-family:'Geist Mono',monospace;font-size:11.5px;line-height:18px;color:var(--muted);white-space:pre;overflow:hidden">let active = self.board.read(cx)
+    .active(cx, active_now);
+let placements = active_placements(
+    &amp;active, &amp;state.chats);</div>
+            <div style="flex:none;padding-bottom:12px;font-size:13px;line-height:20px;color:var(--muted)">Pushed. <span style="font-family:'Geist Mono',monospace;font-size:12px;background:var(--chip);padding:1px 4px;border-radius:6px">active_placements</span> is derived once per frame and both surfaces read it, so the shelf and Active can't disagree. PR #212 is up.</div>
+          </div>
+
+          <div style="flex:none;margin:0 12px 12px;border:1px dashed var(--line2);border-radius:10px;overflow:hidden">
+            <div style="padding:8px 12px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;background:var(--raised)">
+              <span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"></circle><path stroke-linecap="round" d="M12 17v-6"></path><path stroke-linecap="round" d="M12 7.5h.01"></path></g></svg></span>
+              <span style="font-size:12px;font-weight:500;color:var(--muted)">Will be delivered on submit</span>
+            </div>
+            <div style="padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11px;line-height:17px;color:var(--subtle);white-space:pre-wrap;max-height:196px;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 72%,transparent);mask-image:linear-gradient(to bottom,#000 72%,transparent)">comet-board: your pull request has been reviewed.
+
+  gh#138 · Active owns a chat's row while its session is live
+  https://github.com/bredebjorhovd/comet-board/pull/212
+
+[review · changes requested]
+The split reads right. Why does this need itertools — and is the shelf note actually covered?
+
+[unclaimed] Cargo.toml — added itertools 0.13
+[unclaimed] shell.rs · right_target() — +6 −4, unmentioned
+
+The pull request is still open and you are still in the checkout you wrote it in. Address the feedback there, commit, and push to the same branch.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="position:absolute;top:0;left:0;height:38px;display:flex;align-items:center;padding:2px 10px 0;gap:2px">
+    <div style="width:78px;flex:none;display:flex;align-items:center;gap:8px;padding-left:4px">
+      <span style="width:12px;height:12px;border-radius:9999px;background:#ff5f57"></span>
+      <span style="width:12px;height:12px;border-radius:9999px;background:#febc2e"></span>
+      <span style="width:12px;height:12px;border-radius:9999px;background:#28c840"></span>
+    </div>
+    <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 11c0-3.771 0-5.657 1.172-6.828S6.229 3 10 3h4c3.771 0 5.657 0 6.828 1.172S22 7.229 22 11v2c0 3.771 0 5.657-1.172 6.828S17.771 21 14 21h-4c-3.771 0-5.657 0-6.828-1.172S2 16.771 2 13z"></path><path stroke-linecap="round" d="M9 21V3"></path></g></svg></div>
+    <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20 12H4m0 0l6-6m-6 6l6 6"></path></svg></div>
+    <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 12h16m0 0l-6-6m6 6l-6 6"></path></svg></div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1320,&quot;height&quot;:880},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;dark&quot;,&quot;tsType&quot;:&quot;'dark'|'light'&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    return { themeAttr: this.props.theme ?? 'dark' };
+  }
+}
+</script>
+</body>
+</html>
