@@ -344,6 +344,93 @@ pub fn routing_gap(cfg: &RoutingConfig, slug: &str) -> Option<Missing> {
     crate::adopt::missing_for(cfg, slug)
 }
 
+// ---- the half-onboarded route (gh#342) ----------------------------------
+
+/// How to repair a route whose space does not exist.
+///
+/// The state is reachable and nothing used to name the way out of it: a repo
+/// cloned by a verb that only clones (`CloneRepo` registers a checkout and
+/// stops there), a space somebody deleted out from under a route that still
+/// names it, a `workspace =` typed by hand. What all three leave behind is
+/// identical — a route pointing at a workspace that does not exist, on which
+/// nothing can be dispatched — and `onboard` is the verb that repairs it,
+/// precisely because it is idempotent: it reuses the checkout, creates the
+/// missing space, and writes nothing to `routing.toml` for a repo that is
+/// already routed.
+///
+/// Two things stop that from being a sentence anyone could have written once
+/// and pasted:
+///
+/// - **The space `onboard` makes is named after the checkout's folder.** A
+///   route asking for any other name would still not match the space it just
+///   created, so when the two disagree the repair is a rename, not a re-run.
+/// - **`onboard` needs a repo to name.** A route matching a Linear team carries
+///   none, so the checkout's own `origin` is asked before giving up — and a
+///   checkout with no GitHub remote leaves nothing for `onboard` to resolve.
+///
+/// `checkout` is whether the route's `repo =` is a git checkout, and `remote_of`
+/// resolves that path to its `origin` — injected for the reason
+/// [`crate::adopt::detect`] injects its probe, so the whole decision is testable
+/// without a checkout on disk. Production callers pass
+/// [`crate::adopt::git_remote`].
+pub fn missing_space_repair<F>(
+    route: &crate::config::Route,
+    checkout: bool,
+    clone_root: &Path,
+    remote_of: F,
+) -> String
+where
+    F: Fn(&Path) -> Option<String>,
+{
+    let repo = route.repo_path();
+    let shown = crate::config::shorten_home(&repo);
+    // What the route says it is, and failing that what the checkout says it is.
+    let slug = route.match_.gh_repo.clone().or_else(|| {
+        checkout
+            .then(|| remote_of(&repo))
+            .flatten()
+            .as_deref()
+            .and_then(crate::adopt::github_slug)
+    });
+    let Some(slug) = slug else {
+        return format!(
+            "nothing here names a GitHub repo — `onboard` has nothing to resolve, so \
+             make a comet space for {shown} on this device, or point `workspace =` at \
+             a space that exists"
+        );
+    };
+    // The name a created space would get. Onboarding names spaces after the
+    // folder, never after the route, so a route asking for something else would
+    // fail this check again on the space it had just been told to make.
+    let folder = repo
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !folder.eq_ignore_ascii_case(&route.workspace) {
+        return format!(
+            "`comet-board onboard {slug}` would name its space `{folder}` after the \
+             checkout's folder, and this route asks for `{}` — set `workspace = \
+             \"{folder}\"` here, or make a space named `{}` yourself",
+            route.workspace, route.workspace
+        );
+    }
+    // `--dir` only when the checkout is somewhere onboarding would not have put
+    // it: a repair line carrying a redundant flag reads as a flag that matters.
+    let dir = if repo == clone_root.join(repo_name(&slug)) {
+        String::new()
+    } else {
+        format!(" --dir {shown}")
+    };
+    if checkout {
+        format!(
+            "the checkout is there but nothing made it a space: `comet-board onboard \
+             {slug}{dir}` makes one, reuses the clone, and leaves the route alone"
+        )
+    } else {
+        format!("`comet-board onboard {slug}{dir}` clones it and makes the space")
+    }
+}
+
 // ---- the picker's list --------------------------------------------------
 
 /// One repo an "Onboard a repo…" picker can offer: what the App can see,
@@ -706,6 +793,102 @@ mod tests {
         let notes = done.notes().join(" | ");
         assert!(notes.contains("archived"), "{notes}");
         assert!(notes.contains("issues are disabled"), "{notes}");
+    }
+
+    fn route(workspace: &str, repo: &str, gh_repo: Option<&str>) -> crate::config::Route {
+        let mut r: crate::config::Route = toml::from_str(&format!(
+            "workspace = \"{workspace}\"\nrepo = \"{repo}\"\nruntime = \"claude-code\"\n"
+        ))
+        .unwrap();
+        r.match_.gh_repo = gh_repo.map(str::to_string);
+        r
+    }
+
+    /// gh#342: a route pointing at a space that does not exist is a row nothing
+    /// can be dispatched on, and the one verb that repairs it has to be named
+    /// where the failure is read.
+    #[test]
+    fn a_route_with_no_space_is_repaired_by_re_running_onboard() {
+        let root = Path::new("/box/.comet-native/repos");
+        let no_remote = |_: &Path| None;
+
+        // The live shape (gh#342): cloned where onboarding would have put it,
+        // routed, and never made into a space. No `--dir` — the path is the
+        // default one, and a flag that changes nothing reads as one that does.
+        let r = route(
+            "itsm-agent",
+            "/box/.comet-native/repos/itsm-agent",
+            Some("b/itsm-agent"),
+        );
+        let fix = missing_space_repair(&r, true, root, no_remote);
+        assert!(fix.contains("comet-board onboard b/itsm-agent"), "{fix}");
+        assert!(!fix.contains("--dir"), "{fix}");
+        // Says it will not touch the route: the repo is already routed, and an
+        // operator who fears a second [[route]] will not run the repair.
+        assert!(fix.contains("leaves the route alone"), "{fix}");
+
+        // A checkout somewhere the operator chose has to carry the flag, or the
+        // repair clones a second copy into the data dir.
+        let r = route("board", "/box/dev/board", Some("b/board"));
+        let fix = missing_space_repair(&r, true, root, no_remote);
+        assert!(
+            fix.contains("onboard b/board --dir /box/dev/board"),
+            "{fix}"
+        );
+
+        // No checkout either: the same verb does both halves.
+        let fix = missing_space_repair(&r, false, root, no_remote);
+        assert!(fix.contains("clones it and makes the space"), "{fix}");
+    }
+
+    /// The route names no repo — a Linear team's does not — so the checkout is
+    /// asked instead, and a checkout that cannot answer means `onboard` is not
+    /// the repair at all.
+    #[test]
+    fn a_route_that_names_no_repo_asks_the_checkout_and_then_gives_up() {
+        let root = Path::new("/box/.comet-native/repos");
+        let r = route("board", "/box/dev/board", None);
+
+        let fix = missing_space_repair(&r, true, root, |_| {
+            Some("git@github.com:b/board.git".to_string())
+        });
+        assert!(
+            fix.contains("onboard b/board --dir /box/dev/board"),
+            "{fix}"
+        );
+
+        // A remote that names no GitHub repo, and a path that is not a checkout
+        // at all, are the same answer: there is nothing for `onboard` to
+        // resolve, so the repair is a space made by hand.
+        for (checkout, remote) in [(true, Some("git@git.sr.ht:~x/board")), (false, None)] {
+            let fix = missing_space_repair(&r, checkout, root, |_| remote.map(str::to_string));
+            assert!(fix.contains("make a comet space"), "{fix}");
+            assert!(fix.contains("/box/dev/board"), "{fix}");
+            // No command to offer: naming one that cannot resolve the repo
+            // sends the operator to run it and read a second failure.
+            assert!(!fix.contains("comet-board onboard"), "{fix}");
+        }
+    }
+
+    /// Onboarding names a space after the checkout's folder, so a route asking
+    /// for another name would fail this check again on the space it had just
+    /// been told to make. Say the rename instead.
+    #[test]
+    fn a_route_whose_workspace_is_not_the_folder_is_told_to_rename_not_to_re_run() {
+        let root = Path::new("/box/.comet-native/repos");
+        let r = route("Tally", "/box/dev/tally-backend", Some("b/tally-backend"));
+        let fix = missing_space_repair(&r, true, root, |_| None);
+        assert!(
+            fix.contains("would name its space `tally-backend`"),
+            "{fix}"
+        );
+        assert!(fix.contains("workspace = \"tally-backend\""), "{fix}");
+        assert!(fix.contains("`Tally`"), "{fix}");
+
+        // Casing is not a mismatch — it is not one for the check this repairs.
+        let r = route("Tally", "/box/dev/tally", Some("b/tally"));
+        let fix = missing_space_repair(&r, true, root, |_| None);
+        assert!(fix.contains("makes one"), "{fix}");
     }
 
     fn space(id: &str, path: &str, git: bool) -> comet_proto::Space {

@@ -112,6 +112,18 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
+/// Where a clone the engine makes for itself lands — `{data_dir}/repos`, and
+/// the parent an onboarding clone uses when it was given no `--dir`.
+///
+/// `Repos::clone_root` is the same path read from inside the engine, off the
+/// data dir it was constructed with. This is it from outside, for the code that
+/// has to *say* where a checkout would go — the repair line a route with no
+/// space carries (gh#342) has to name the `--dir` only when the path is not
+/// this one.
+pub fn clone_root() -> PathBuf {
+    data_dir().join("repos")
+}
+
 /// The per-slot agent config dirs a dispatch runs under — `{data_dir}/accounts/*`
 /// (gh#59), one per agent-account slot that has ever been materialized.
 ///

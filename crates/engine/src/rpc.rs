@@ -1029,6 +1029,12 @@ impl EngineRpc {
     /// moment git asks. Anything else — a `file://` origin, somebody's GitLab
     /// mirror — is cloned as it was named and authenticates as it always did,
     /// since the board has no credential to lend it.
+    ///
+    /// **This is a clone, not an onboarding** (gh#342). It leaves a checkout and
+    /// a registered repo, and no space and no route — which is a perfectly good
+    /// state for a repo somebody wants to read, and a half-onboarded one for a
+    /// repo they wanted on the board. [`Self::onboard_repo`] is the verb that
+    /// does all three; the desktop's repo picker sends that one.
     async fn clone_repo(&self, url: &str) -> Result<comet_proto::Repo, RpcError> {
         let urls = comet_board::git_credentials::clone_urls(url);
         // No board on this device is not a refusal here: a public repo (or one
