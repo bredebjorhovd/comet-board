@@ -421,6 +421,12 @@ pub fn doctor(
             for r in &cfg.routes {
                 let name = r.display_name().to_string();
 
+                // Read before the space check as well as after it: whether the
+                // checkout is there is half of what repairs a missing space
+                // (gh#342), and asking the disk twice could answer twice.
+                let repo = r.repo_path();
+                let repo_ok = repo.join(".git").exists();
+
                 checks.push(match spaces {
                     // Route checks must not fail nineteen times over one dead
                     // engine; the engine check above is the loud one.
@@ -442,22 +448,27 @@ pub fn doctor(
                             detail: if ws_ok {
                                 format!("`{}` exists", r.workspace)
                             } else {
+                                // The state, then the repair — the way every
+                                // other failing line here reads (gh#342). A
+                                // route with no space is a row nothing can be
+                                // dispatched on, and it used to be reported
+                                // with no hint that one verb fixes it.
                                 format!(
-                                    "no comet space named `{}` (have: {})",
+                                    "no comet space named `{}` ({}) — {}",
                                     r.workspace,
-                                    spaces
-                                        .iter()
-                                        .map(Space::display_name)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
+                                    have_phrase(spaces),
+                                    crate::onboard::missing_space_repair(
+                                        r,
+                                        repo_ok,
+                                        &crate::config::clone_root(),
+                                        |p| crate::adopt::git_remote(&p.to_string_lossy()),
+                                    )
                                 )
                             },
                         }
                     }
                 });
 
-                let repo = r.repo_path();
-                let repo_ok = repo.join(".git").exists();
                 checks.push(Check {
                     name: format!("route {name}: repo"),
                     ok: repo_ok,
@@ -583,6 +594,26 @@ pub fn doctor(
     checks.push(gh_stack_check(gh_extensions()));
 
     Ok(checks)
+}
+
+/// The spaces this device does have, for a route that names one it does not.
+///
+/// An empty list is spelled out rather than left as the empty half of `have: `
+/// (gh#342), which is what the report printed on a box holding no spaces at all
+/// — a different diagnosis from "the wrong one exists" and worth reading as one:
+/// nothing here is a workspace yet.
+fn have_phrase(spaces: &[Space]) -> String {
+    if spaces.is_empty() {
+        return "this device has no spaces at all".to_string();
+    }
+    format!(
+        "have: {}",
+        spaces
+            .iter()
+            .map(Space::display_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Can a dispatch on this box ask for a stack (gh#287)?
@@ -3446,6 +3477,43 @@ mod tests {
             .unwrap();
         assert!(!c.ok);
         assert!(c.detail.contains("no comet space named"), "{}", c.detail);
+        // An empty space list is said in words, not as the empty half of
+        // `(have: )` — which is what a box holding no spaces printed (gh#342).
+        assert!(c.detail.contains("no spaces at all"), "{}", c.detail);
+    }
+
+    /// gh#342: the failing line names the repair, the way every other failing
+    /// line here does. The state was reachable — a clone with no space, a space
+    /// somebody deleted — and nothing said that one idempotent verb fixes it.
+    #[test]
+    fn a_route_with_no_space_is_told_which_verb_repairs_it() {
+        let (d, p) = tmp();
+        let repo = d.path().join("repos").join("itsm-agent");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(
+            p.routing(),
+            format!(
+                "[github]\nrepos = [\"b/itsm-agent\"]\n\n\
+                 [[route]]\nmatch = {{ gh_repo = \"b/itsm-agent\" }}\n\
+                 workspace = \"itsm-agent\"\nrepo = \"{}\"\nruntime = \"claude-code\"\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "route itsm-agent: space")
+            .unwrap();
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("comet-board onboard b/itsm-agent"),
+            "{}",
+            c.detail
+        );
+        // The checkout is there, so the repair says so — an operator who thinks
+        // this re-clones will not run it.
+        assert!(c.detail.contains("reuses the clone"), "{}", c.detail);
     }
 
     /// `doctor` says which harnesses this box can start, and why the rest

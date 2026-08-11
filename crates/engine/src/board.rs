@@ -764,7 +764,7 @@ fn handle_dispatch(
     }
     let billed_to = billing.as_ref().and_then(|b| b.billed_to.clone());
     let cross_billed = billing.as_ref().is_some_and(|b| b.cross_billed());
-    let space = spaces
+    let found = spaces
         .borrow()
         .iter()
         .find(|s| space_matches(s.name.as_deref(), &s.path, &route.workspace))
@@ -772,13 +772,27 @@ fn handle_dispatch(
             id: s.id.clone(),
             device_id: s.device_id.clone(),
             path: s.path.clone(),
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no comet space named `{}` — the route exists, the space does not",
-                route.workspace
+        });
+    // The refusal is built outside the borrow above: composing it asks the
+    // checkout for its `origin`, which is a subprocess, and the space list is
+    // not a thing to hold shut while git thinks.
+    let Some(space) = found else {
+        // And what repairs it (gh#342). This is where the half-onboarded repo
+        // is actually met — `doctor` says the same sentence, but only to
+        // somebody who thought to run it, and the operator who just tried to
+        // release work is holding the failure right now.
+        let repo = route.repo_path();
+        anyhow::bail!(
+            "no comet space named `{}` — the route exists, the space does not: {}",
+            route.workspace,
+            comet_board::onboard::missing_space_repair(
+                route,
+                repo.join(".git").exists(),
+                &comet_board::config::clone_root(),
+                |p| comet_board::adopt::git_remote(&p.to_string_lossy()),
             )
-        })?;
+        );
+    };
     // Who released this, at the strongest form the transport allowed (gh#161):
     // the identity the edge verified for a relayed dispatch, the frontend's
     // claim for one issued on the box. Resolved once and used three times
