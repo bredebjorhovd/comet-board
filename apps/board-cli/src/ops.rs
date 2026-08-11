@@ -268,6 +268,20 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
             Some(note) => format!("{extra}  ({note})"),
             None => extra,
         };
+        // Which layer of a stack this is, and what merging it would really do
+        // (gh#283). Only for stacked rows: for a standalone pull request
+        // `mergeable_state` says what it appears to say, and the printed list
+        // has never carried it. For a layer it does not — `clean` there is
+        // clean against the layer below — so the row that would mislead is
+        // exactly the row that speaks up. `--json` carries `landing` for all.
+        let extra = match (
+            comet_proto::view::board::stack_note(r),
+            comet_proto::view::board::landing_note(r),
+        ) {
+            (Some(stack), Some(landing)) => format!("{extra}  ({stack}, {landing})"),
+            (Some(stack), None) => format!("{extra}  ({stack})"),
+            (None, _) => extra,
+        };
         println!(
             "{:<8} {:<24} {:<10} {}{}",
             r.state,
@@ -1748,6 +1762,10 @@ mod tests {
             review_chat_id: None,
             pr_url: None,
             pr_number: None,
+            pr_base_ref: None,
+            pr_mergeable: None,
+            landing: None,
+            stack: None,
             branch: None,
             dispatched_by: None,
             dispatched_by_chat: None,

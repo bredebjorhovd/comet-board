@@ -9,9 +9,12 @@
 //! values *are* chat ids now, and a contract that lies about what its ids
 //! address is worse than one that renames.
 
+use comet_proto::view::board::RowStack;
+
 use crate::config::{Route, RoutingConfig};
 use crate::db::Db;
 use crate::model::{BoardState, Task, UpstreamState};
+use crate::stacks::Stacks;
 use crate::sync::route_context;
 
 /// The row shape itself lives in proto (`comet_proto::view::board`) so the
@@ -47,12 +50,21 @@ pub fn task_detail(task: &Task) -> TaskDetail {
 /// and the surrounding function is filtering and database wiring. Takes the
 /// whole config rather than only the route because the wall-clock cap is a
 /// route-then-`[defaults]` resolution, and half of it is not on the route.
-pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> TaskRow {
+///
+/// `stack` is passed in rather than looked up, for the same reason the route is:
+/// it is a fact about this task's *neighbours* (gh#283), and a function handed
+/// one task cannot find them. [`board_rows`] holds the index that can.
+pub fn task_row(
+    task: &Task,
+    route: Option<&Route>,
+    cfg: &RoutingConfig,
+    stack: Option<RowStack>,
+) -> TaskRow {
     let live = task.live_attempt();
     let last = task.attempts.last();
     let closed = task.last_closed_attempt();
     let gone = task.upstream == UpstreamState::Gone;
-    TaskRow {
+    let mut row = TaskRow {
         id: task.id.clone(),
         identifier: task.identifier.clone(),
         title: task.title.clone(),
@@ -75,6 +87,18 @@ pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> Task
         review_chat_id: last.and_then(|a| a.pane_id.clone()),
         pr_url: task.pr_url.clone(),
         pr_number: task.pr_number,
+        // The topology 1/9 started storing (gh#282), and the flat fact it makes
+        // readable: `clean` is measured against `pr_base_ref`, which mid-stack
+        // is the layer below rather than trunk.
+        pr_base_ref: task.pr_base_ref.clone(),
+        // Only while the pull request is open. Mergeability is polled for open
+        // PRs alone, so on a merged or closed one it is whatever it last said —
+        // and "ready to land" on a row that has already landed is a claim about
+        // a button nobody can press.
+        pr_mergeable: task.pr_mergeable.clone().filter(|_| task.pr_open),
+        // Filled below, from the row itself.
+        landing: None,
+        stack,
         branch: live.or(last).and_then(|a| a.branch.clone()),
         dispatched_by: live.or(last).and_then(|a| a.dispatched_by.clone()),
         dispatched_by_chat: live.or(last).and_then(|a| a.dispatched_by_pane.clone()),
@@ -120,16 +144,28 @@ pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> Task
         // describe the work. A finished attempt's last reading stays on its
         // row in the database for the stats page; it is not row furniture.
         context: live.and_then(|a| a.context),
-    }
+    };
+    // The verdict, from the row that was just built — one implementation of the
+    // AND across a stack, shared with both viewports (gh#283). Every reader of
+    // this contract would otherwise have to write it, and a reader who skipped
+    // it would believe a mid-stack `clean`.
+    row.landing = comet_proto::view::board::landing(&row)
+        .as_str()
+        .map(str::to_string);
+    row
 }
 
 /// Every task as a row, in board order — what `WatchBoard` streams and what
 /// `list` prints. Board order, so every reader agrees on what is most urgent.
 pub fn board_rows(db: &Db, cfg: &RoutingConfig) -> anyhow::Result<Vec<TaskRow>> {
+    let tasks = db.load_tasks()?;
+    // Built once for the whole board: a stack's members are other rows, and
+    // asking per row would be a scan per row (gh#283).
+    let stacks = Stacks::of(&tasks);
     let mut rows: Vec<TaskRow> = Vec::new();
-    for task in db.load_tasks()? {
-        let route = cfg.resolve(&route_context(&task));
-        rows.push(task_row(&task, route, cfg));
+    for task in &tasks {
+        let route = cfg.resolve(&route_context(task));
+        rows.push(task_row(task, route, cfg, stacks.row_stack(task)));
     }
     rows.sort_by_key(|r| {
         BoardState::SECTION_ORDER

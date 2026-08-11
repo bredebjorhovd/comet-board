@@ -357,6 +357,21 @@ impl Task {
 /// on them.
 pub use comet_proto::view::board::{gh_repo, gh_repo_name};
 
+/// The `owner/repo` a pull request URL names —
+/// `https://github.com/Florin-AS/tally/pull/507` → `Florin-AS/tally`.
+///
+/// The answer for a row whose *id* names no repository: a Linear issue with a
+/// linked pull request. Everything that scopes work to a repository — merging
+/// it, grouping its stack (gh#283) — needs one, and the pull request's own URL
+/// is the only place such a row carries it.
+pub fn pr_repo(url: &str) -> Option<String> {
+    let rest = url.split("github.com/").nth(1)?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|p| !p.is_empty())?;
+    let repo = parts.next().filter(|p| !p.is_empty())?;
+    Some(format!("{owner}/{repo}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct Attempt {
     pub id: i64,

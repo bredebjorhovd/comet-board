@@ -3734,12 +3734,7 @@ impl SyncEngine {
         // a task whose PR was linked by branch.
         let repo = split_gh_task_id(&task.id)
             .map(|(r, _)| r)
-            .or_else(|| {
-                let url = task.pr_url.as_deref()?;
-                let rest = url.split("github.com/").nth(1)?;
-                let mut parts = rest.split('/');
-                Some(format!("{}/{}", parts.next()?, parts.next()?))
-            })
+            .or_else(|| crate::model::pr_repo(task.pr_url.as_deref()?))
             .ok_or_else(|| {
                 anyhow::anyhow!("cannot tell which repo {} belongs to", task.identifier)
             })?;

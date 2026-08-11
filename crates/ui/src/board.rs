@@ -3691,6 +3691,95 @@ impl BoardPanel {
             .into_any_element()
     }
 
+    /// The stack map: every layer of this row's stack, bottom first, each one a
+    /// door to the sibling that carries it (gh#283).
+    ///
+    /// GitHub's stack map, board-side. Without it a five-layer stack is five
+    /// unrelated rows in five different sections of the board, and reading the
+    /// one in front of you tells you nothing about the four whose merge state
+    /// decides whether this one can land.
+    ///
+    /// The chips carry what the row already knows about each layer, so nothing
+    /// here waits on a fetch: the layer you are on is accented, one GitHub
+    /// objects to is drawn in the failed colour, and one that has already
+    /// landed is muted — it is history in the chain rather than an obstacle.
+    fn render_stack_map(
+        &self,
+        row: &TaskRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let layers = board::stack_map(row);
+        if layers.is_empty() {
+            return None;
+        }
+        let here = row.id.clone();
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.0))
+                .children(layers.iter().enumerate().map(|(ix, layer)| {
+                    let current = layer.id == here;
+                    let stuck = layer
+                        .mergeable
+                        .as_deref()
+                        .is_some_and(|state| state != "clean");
+                    let colour = if current {
+                        theme.accent
+                    } else if !layer.open {
+                        theme.text_faint
+                    } else if stuck {
+                        state_color(BoardState::Failed, theme)
+                    } else {
+                        theme.text_muted
+                    };
+                    let label = match layer.pr_number {
+                        Some(n) => format!("#{n}"),
+                        None => layer.identifier.clone(),
+                    };
+                    let target = layer.id.clone();
+                    div()
+                        .id(SharedString::from(format!("board-peek-layer-{}", layer.id)))
+                        .flex_none()
+                        .px(px(6.0))
+                        .h(px(18.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .bg(theme.wash(if current { 0.16 } else { 0.08 }))
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(colour)
+                        .hover(|s| s.bg(theme.wash(0.18)))
+                        // Bottom first, left to right, and the arrow says which
+                        // way the chain merges rather than leaving a row of
+                        // chips to be read as a set.
+                        .child(SharedString::from(if ix == 0 {
+                            label
+                        } else {
+                            format!("↑ {label}")
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            // A layer GitHub named but the board does not hold
+                            // — a stack reaching into a repo nobody polls — is
+                            // not on the board to open. Leave the peek where it
+                            // is rather than blanking it.
+                            if this.model.task(&target).is_some() {
+                                this.model.selected = Some(target.clone());
+                                this.open_peek(cx);
+                                cx.notify();
+                            }
+                        }))
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// The peek panel: the selected row, in full (gh#132).
     ///
     /// What the list cannot say, said once and where you asked for it — the
@@ -3767,18 +3856,27 @@ impl BoardPanel {
             .text_color(theme.text)
             .child(SharedString::from(row.title.clone()));
 
-        let facts: Vec<AnyElement> = [board::placement_line(&row), board::history_line(&row, now)]
-            .into_iter()
-            .flatten()
-            .map(|line| {
-                div()
-                    .flex_none()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(line))
-                    .into_any_element()
-            })
-            .collect();
+        let facts: Vec<AnyElement> = [
+            board::placement_line(&row),
+            // Where this layer sits and where the chain lands (gh#283). Above
+            // the history, because it is a fact about the work in front of you
+            // rather than about what has been tried on it.
+            board::stack_line(&row),
+            board::history_line(&row, now),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|line| {
+            div()
+                .flex_none()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(theme.text_subtle)
+                .child(SharedString::from(line))
+                .into_any_element()
+        })
+        .collect();
+
+        let stack_map = self.render_stack_map(&row, &theme, cx);
 
         // The issue's own labels — the one thing on the row the list has never
         // had room for at all.
@@ -3919,6 +4017,7 @@ impl BoardPanel {
             .child(heading)
             .child(title)
             .children(facts)
+            .children(stack_map)
             .children(labels)
             // The body is the only part that can outgrow the panel, so it is
             // the only part that scrolls — bounded here rather than on the card
@@ -4154,6 +4253,10 @@ mod tests {
             review_chat_id: None,
             pr_url: None,
             pr_number: None,
+            pr_base_ref: None,
+            pr_mergeable: None,
+            landing: None,
+            stack: None,
             branch: Some("board/gh-x".into()),
             dispatched_by: None,
             dispatched_by_chat: None,
