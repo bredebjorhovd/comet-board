@@ -200,18 +200,23 @@ enum Theme {
     static let separator = themed(dark: Color.white.opacity(0.06), light: hex(0xE4E4E8))
 
     // ---- paint: text — four tones, never multiplied (gh#172) ----
-    // The same four contrast steps in both variants — 16.9 / 8.4 / 5.1 / 3.5 on
+    // The same four contrast steps in both variants — 17.0 / 8.5 / 5.2 / 3.6 on
     // `bg` — measured against each variant's own page rather than inverted.
-    /// Headings, titles, the selected row. ~16.9:1 on `bg` — `--text`.
-    static let text = themed(dark: neutral(0.938), light: hex(0x171717))
-    /// Body copy and unselected rows — the default reading tone. ~8.4:1.
-    static let textMuted = themed(dark: neutral(0.728), light: hex(0x545454))
-    /// Labels, metadata, captions, timestamps, sublines. ~5.1:1 — still AA body
+    //
+    // Both sides are TRANSCRIBED hexes. The dark four were a `neutral(L)` oklch
+    // ramp until gh#274 and landed a point or three under the design's numbers
+    // (`#EAEAEA` where the canvas draws `#EDEDED`); the desktop theme had the
+    // same bug on the same four values, which is what a shared ramp buys you.
+    /// Headings, titles, the selected row. ~17.0:1 on `bg` — `--text`.
+    static let text = themed(dark: hex(0xEDEDED), light: hex(0x171717))
+    /// Body copy and unselected rows — the default reading tone. ~8.5:1.
+    static let textMuted = themed(dark: hex(0xA8A8A8), light: hex(0x545454))
+    /// Labels, metadata, captions, timestamps, sublines. ~5.2:1 — still AA body
     /// text, which the `.opacity(0.5)` sublines this token replaces were not.
-    static let textSubtle = themed(dark: neutral(0.598), light: hex(0x6B6B6B))
-    /// Disabled controls and placeholders, and nothing else. ~3.5:1 — the
+    static let textSubtle = themed(dark: hex(0x808080), light: hex(0x6B6B6B))
+    /// Disabled controls and placeholders, and nothing else. ~3.6:1 — the
     /// floor, so anything a user is meant to READ sits at `textSubtle` or up.
-    static let textFaint = themed(dark: neutral(0.508), light: hex(0x8A8A8A))
+    static let textFaint = themed(dark: hex(0x666666), light: hex(0x8A8A8A))
 
     // ---- the status ramp: four hues, one L, one C (gh#173) ----
     // The four HUES are anchored in `comet_proto::view::status`, because the

@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<style>
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist.ttf');font-weight:100 900;font-style:normal;font-display:block}
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist-Medium.ttf');font-weight:500;font-style:normal;font-display:block}
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist-SemiBold.ttf');font-weight:600;font-style:normal;font-display:block}
+@font-face{font-family:'Geist Mono';src:url('crates/ui/assets/fonts/GeistMono.ttf');font-weight:100 900;font-style:normal;font-display:block}
+body{margin:0;background:#0a0a0a}
+a{color:#8f97ff;text-decoration:none}
+a:hover{color:#8f97ff;text-decoration:underline}
+.cw{
+--card:#070707;--raised:#161616;--sel:#191919;--selcard:#191919;
+--chip:rgba(255,255,255,.07);--line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.13);
+--text:#ededed;--muted:#a8a8a8;--subtle:#808080;--faint:#666666;
+--blocked:oklch(0.74 0.14 25);--working:oklch(0.74 0.14 75);--review:oklch(0.74 0.14 265);--settled:oklch(0.74 0.14 160);
+--lift:none;--sellift:0 0 0 1px rgba(255,255,255,.13);--claude:#D97757;
+}
+.cw[data-theme="light"]{
+--card:#ffffff;--raised:#f4f4f7;--sel:#ffffff;--selcard:#eeeef2;
+--chip:rgba(0,0,0,.05);--line:#e4e4e8;--line2:#d6d6dc;
+--text:#171717;--muted:#545454;--subtle:#6b6b6b;--faint:#8a8a8a;
+--blocked:oklch(0.52 0.16 25);--working:oklch(0.52 0.16 75);--review:oklch(0.52 0.16 265);--settled:oklch(0.52 0.16 160);
+--lift:0 1px 2px rgba(0,0,0,.05);--sellift:0 0 0 1px #dcdce2, 0 1px 2px rgba(0,0,0,.06);--claude:#c15f3c;
+}
+.scr{width:100%;height:100%;box-sizing:border-box;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;font-size:15px;-webkit-font-smoothing:antialiased}
+</style>
+</helmet>
+
+<div style="font-family:Geist,system-ui,sans-serif;background:#0a0a0a;color:#ededed;padding:56px 56px 96px;display:flex;flex-direction:column;gap:36px;-webkit-font-smoothing:antialiased;min-width:1560px;box-sizing:border-box">
+
+  <div style="display:flex;flex-direction:column;gap:10px;max-width:900px">
+    <div style="font-family:'Geist Mono',monospace;font-size:12px;letter-spacing:.08em;color:#808080">COMET-BOARD · IOS · REDESIGN</div>
+    <div style="font-size:30px;line-height:36px;font-weight:600;letter-spacing:-.02em">The phone, brought level</div>
+    <div style="font-size:14.5px;line-height:23px;color:#a8a8a8;text-wrap:pretty"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#ededed">Theme.swift</span> is a direct port of <span style="font-family:'Geist Mono',monospace;font-size:13px;color:#ededed">theme.rs</span> — the same greys, the same five status hues, the same opacity multipliers — and it is <span style="color:#ededed">always dark</span>, with no light variant to invert. It also adds a violet family for inline code and three syntax tones, so the phone carries nine hues where the system needs four. Same four greys, same status ramp and the same three radii land here, and light mode arrives for the first time.</div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;max-width:1180px">
+    <div style="border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:16px 18px"><div style="font-size:13px;font-weight:600;margin-bottom:6px">Washes drifted from the desktop</div><div style="font-size:13px;line-height:20px;color:#a8a8a8">iOS uses <span style="font-family:'Geist Mono',monospace;font-size:12px">0.06</span> hover and <span style="font-family:'Geist Mono',monospace;font-size:12px">0.10</span> active where the desktop uses <span style="font-family:'Geist Mono',monospace;font-size:12px">0.14</span> and <span style="font-family:'Geist Mono',monospace;font-size:12px">0.16</span>. Two ports of one file already disagree about how loud a selection is.</div></div>
+    <div style="border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:16px 18px"><div style="font-size:13px;font-weight:600;margin-bottom:6px">The row splits, the order holds</div><div style="font-size:13px;line-height:20px;color:#a8a8a8">393pt cannot hold id, title, space, fact and a verb on one line. The desktop's two columns become a fixed meta line under the title — same fields, same order, still a column you can scan.</div></div>
+    <div style="border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:16px 18px"><div style="font-size:13px;font-weight:600;margin-bottom:6px">Review is the phone's best screen</div><div style="font-size:13px;line-height:20px;color:#a8a8a8">Claims and effects read fine in a narrow column; a diff never does. The surface that stopped being about code is the one that ports to a phone without apology.</div></div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;color:#808080">DARK</span><span style="flex:1;max-width:420px;height:1px;background:rgba(255,255,255,.12)"></span></div>
+    <div style="display:flex;gap:40px;align-items:flex-start">
+
+      <x-import component-from-global-scope="IOSDevice" from="./ios-frame.jsx" dark="{{ true }}" hint-size="393px,852px">
+        <div class="cw" data-theme="dark" style="width:100%;height:100%;box-sizing:border-box;padding-top:56px;padding-bottom:26px;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased">
+          <div style="flex:none;padding:2px 16px 8px;display:flex;align-items:center;gap:16px">
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="19" height="19" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"><path stroke-linejoin="round" d="M2 5.5L3.214 7L7.5 3M2 12.5L3.214 14L7.5 10M2 19.5L3.214 21L7.5 17"></path><path d="M22 19H12m10-7H12m10-7H12"></path></g></svg></span>
+            <span style="flex:1"></span>
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M8 3.25v9.5M3.25 8h9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path></svg></span>
+            <span style="flex:none;width:26px;height:26px;border-radius:9999px;background:var(--text);color:var(--card);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600">B</span>
+          </div>
+          <div style="flex:1;min-height:0;overflow:hidden;padding:0 16px;display:flex;flex-direction:column;gap:6px">
+            <div style="display:flex;align-items:center;gap:7px;padding:8px 4px 4px"><span style="font-size:12px;font-weight:500;color:var(--subtle)">Needs you</span><span style="padding:1px 6px;border-radius:9999px;background:color-mix(in srgb,var(--review) 14%,transparent);font-family:'Geist Mono',monospace;font-size:11px;font-weight:500;color:var(--review)">2</span></div>
+            <div style="border-radius:14px;background:var(--raised);box-shadow:var(--sellift);padding:11px 13px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-size:11px;color:var(--review);text-align:center">?</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;color:var(--text)">gh#144 · comet-board</span></div>
+              <div style="padding-left:18px;font-size:11px;line-height:16px;color:var(--subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Which branch should the retry target?</div>
+            </div>
+            <div style="border-radius:14px;padding:11px 13px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-size:11px;color:var(--blocked);text-align:center">✕</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;color:var(--text)">gh#131 · comet-board</span></div>
+              <div style="padding-left:18px;font-size:11px;line-height:16px;color:var(--subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Pane exited without completing</div>
+            </div>
+
+            <div style="height:1px;background:var(--line);margin:10px 4px 0"></div>
+            <div style="border-radius:14px;padding:7px 9px;display:flex;align-items:flex-start;gap:8px;margin-top:4px">
+              <span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;line-height:16px;color:var(--review);text-align:center">◆</span>
+              <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+                <span style="font-size:13px;font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Orchestrator</span>
+                <span style="font-size:11px;line-height:16px;color:var(--text);opacity:.72;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">gh#144 is blocked on a branch question; two settled since 09:00.</span>
+              </span>
+              <span style="flex:none;padding:1px 7px;border-radius:9999px;background:color-mix(in srgb,var(--settled) 14%,transparent);font-size:11px;font-weight:500;color:var(--settled)">new</span>
+            </div>
+            <div style="height:1px;background:var(--line);margin:10px 4px 0"></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 4px 4px"><span style="font-size:12px;font-weight:500;color:var(--subtle)">Spaces</span><span style="font-size:12px;color:var(--subtle)">2</span></div>
+            <div style="border-radius:14px;background:var(--sel);box-shadow:var(--sellift);padding:11px 13px;display:flex;align-items:center;gap:10px">
+              <span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--blocked)"></span>
+              <span style="flex:none;color:var(--muted);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></span>
+              <span style="flex:none;white-space:nowrap;font-size:15px;font-weight:500;color:var(--text)">comet-board</span>
+              <span style="flex:1"></span>
+              <span style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">3 running</span>
+              <span style="flex:none;font-size:12px;color:var(--subtle)">@ Tokenmaxxer9000</span>
+              <span style="flex:none;display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 4px 4px"><span style="font-size:12px;font-weight:500;color:var(--subtle)">Sessions</span><span style="font-size:12px;color:var(--subtle)">3</span></div>
+            <div style="display:flex;flex-direction:column;gap:2px">
+              <div style="border-radius:12px;padding:7px 9px;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--blocked)"></span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">comet-board · Tokenmaxxer9000</span><span style="flex:none;font-size:12px;color:var(--subtle)">18m</span></div>
+                <div style="padding-left:14px;font-size:14px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Board CLI drifts from the engine</div>
+                <div style="padding-left:14px;display:flex;align-items:center;gap:5px;color:var(--subtle)"><span style="display:flex;color:var(--claude)"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 256 257" fill="currentColor"><path d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"></path></svg></span><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="6.5" cy="5.5" r="2.25"></circle><circle cx="6.5" cy="18.5" r="2.25"></circle><circle cx="17.5" cy="7.5" r="2.25"></circle><path d="M6.5 7.75v8.5"></path><path d="M17.5 9.75c0 2.9-2.6 4.35-6.2 4.72c-1.9.2-3.3.9-4 2.03"></path></g></svg><span style="font-size:12px">board/gh-144</span></div>
+              </div>
+              <div style="border-radius:12px;padding:7px 9px;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--working)"></span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">comet-board · Tokenmaxxer9000</span><span style="flex:none;font-size:12px;color:var(--subtle)">9m</span></div>
+                <div style="padding-left:14px;font-size:14px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Throughput page: chart glyph</div>
+                <div style="padding-left:14px;display:flex;align-items:center;gap:5px;color:var(--subtle)"><span style="display:flex;color:var(--claude)"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 256 257" fill="currentColor"><path d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"></path></svg></span><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="6.5" cy="5.5" r="2.25"></circle><circle cx="6.5" cy="18.5" r="2.25"></circle><circle cx="17.5" cy="7.5" r="2.25"></circle><path d="M6.5 7.75v8.5"></path><path d="M17.5 9.75c0 2.9-2.6 4.35-6.2 4.72c-1.9.2-3.3.9-4 2.03"></path></g></svg><span style="font-size:12px">board/gh-143</span></div>
+              </div>
+              <div style="border-radius:12px;padding:7px 9px;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--faint)"></span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">attn · Tokenmaxxer9000</span><span style="flex:none;font-size:12px;color:var(--subtle)">3h</span></div>
+                <div style="padding-left:14px;font-size:14px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Quick idea review</div>
+              </div>
+            </div>
+            <div style="border-radius:14px;padding:11px 13px;display:flex;align-items:center;gap:10px">
+              <span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--faint)"></span>
+              <span style="flex:none;color:var(--subtle);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></span>
+              <span style="flex:none;white-space:nowrap;font-size:15px;font-weight:500;color:var(--muted)">attn</span>
+              <span style="flex:none;font-size:12px;color:var(--subtle)">· wt/review</span>
+              <span style="flex:1"></span>
+              <span style="flex:none;font-size:12px;color:var(--blocked)">@ Mac mini · offline</span>
+              <span style="flex:none;display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+            </div>
+          </div>
+
+        </div>
+      </x-import>
+
+      <x-import component-from-global-scope="IOSDevice" from="./ios-frame.jsx" dark="{{ true }}" hint-size="393px,852px">
+        <div class="cw" data-theme="dark" style="width:100%;height:100%;box-sizing:border-box;padding-top:56px;padding-bottom:26px;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased">
+          <div style="flex:none;padding:0 16px 10px;display:flex;align-items:center;gap:10px">
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m15 5l-6 7l6 7"></path></svg></span>
+            <span style="flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:1px">
+              <span style="font-size:13px;font-weight:500;color:var(--text)">Board</span>
+              <span style="font-size:11px;color:var(--subtle)">on Tokenmaxxer9000</span>
+            </span>
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3.5 3.5v14.25a2.75 2.75 0 0 0 2.75 2.75H20.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M8 16.5v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M12 16.5v-8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M16 16.5v-5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path></svg></span>
+          </div>
+          <div style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column">
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--blocked)">▲</span><span style="font-size:12px;font-weight:600;color:var(--text)">Blocked</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">1</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--blocked)">▲</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #144</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">18m</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Board CLI drifts from the engine on a partial upgrade</div>
+              <div style="padding-left:18px;display:flex;align-items:center;gap:7px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">claude · comet-board</span><span style="flex:none;padding:4px 11px;border-radius:9999px;background:var(--chip);font-size:12px;font-weight:500;color:var(--text)">Retry</span></div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="font-size:12px;font-weight:600;color:var(--text)">Working</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">3</span></div>
+            <div style="flex:none;display:flex;align-items:center;gap:6px;padding:2px 20px 0"><span style="display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 9l-7 6l-7-6"></path></svg></span><span style="font-size:12px;font-weight:500;color:var(--subtle)">comet-board</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">2</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px;background:var(--selcard);box-shadow:var(--sellift)">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #143</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">9m04s</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Throughput page: chart glyph and token tally</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">claude · comet-board</div>
+            </div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #139</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">41m18s</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Skill install writes into ~/.claude/skills on dispatch</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">codex · comet-board</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:6px;padding:2px 20px 0"><span style="display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 9l-7 6l-7-6"></path></svg></span><span style="font-size:12px;font-weight:500;color:var(--subtle)">tally</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">1</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">tally #218</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;font-weight:600;color:var(--working)">1h07m</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Reconcile settle events back onto the Linear issue</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">claude · tally-web</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--review)">✓</span><span style="font-size:12px;font-weight:600;color:var(--text)">Review</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">2</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--review)">✓</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #138</span><span style="flex:1"></span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Active owns a chat's row while its session is live</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">PR #212 · comet-board</div>
+            </div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--review)">✓</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #134</span><span style="flex:1"></span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Skill invocation landmark in the transcript</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">no PR · comet-board</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">▸</span><span style="font-size:12px;font-weight:600;color:var(--text)">Ready</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">6</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">▸</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #151</span><span style="flex:1"></span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Orchestrator brief: report cap warnings inline</div>
+              <div style="padding-left:18px;display:flex;align-items:center;gap:7px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">comet-board</span><span style="flex:none;padding:4px 11px;border-radius:9999px;background:var(--chip);font-size:12px;font-weight:500;color:var(--text)">Dispatch</span></div>
+            </div>
+          </div>
+        </div>
+      </x-import>
+
+      <x-import component-from-global-scope="IOSDevice" from="./ios-frame.jsx" dark="{{ true }}" hint-size="393px,852px">
+        <div class="cw" data-theme="dark" style="width:100%;height:100%;box-sizing:border-box;padding-top:56px;padding-bottom:26px;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased">
+          <div style="flex:none;display:flex;justify-content:center;padding:2px 0 8px"><span style="width:36px;height:5px;border-radius:9999px;background:var(--line2)"></span></div>
+          <div style="flex:none;padding:0 16px 10px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--line)">
+            <span style="flex:1;min-width:0;display:flex;flex-direction:column">
+              <span style="font-size:16px;font-weight:600;letter-spacing:-.01em;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Active owns a chat's row</span>
+              <span style="font-size:12px;color:var(--subtle)">gh#138 · PR #212 · comet-board</span>
+            </span>
+            <span style="flex:none;padding:2px 8px;border-radius:6px;font-size:12px;color:var(--review);background:color-mix(in srgb,var(--review) 14%,transparent)">Waiting</span>
+          </div>
+          <div style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column">
+            <div style="flex:none;padding:11px 16px;border-bottom:1px solid var(--line);background:var(--raised);display:flex;flex-direction:column;gap:4px">
+              <span style="font-size:12px;font-weight:600;color:var(--subtle)">Asked for</span>
+              <span style="font-size:14px;line-height:20px;color:var(--muted)">Active should own a chat's row while its session is live, and the tree should show it when idle.</span>
+            </div>
+            <div style="flex:none;padding:11px 16px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:7px">
+              <span style="font-size:12px;font-weight:600;color:var(--subtle)">Effects</span>
+              <span style="display:flex;flex-wrap:wrap;gap:6px">
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:13px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Tests 41 → 47</span>
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:13px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>API unchanged</span>
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:13px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Schema unchanged</span>
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:color-mix(in srgb,var(--working) 12%,transparent);font-size:13px;color:var(--working)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--working)"></span>1 dependency</span>
+              </span>
+            </div>
+            <div style="flex:none;padding:11px 16px 4px;display:flex;align-items:center;gap:9px"><span style="font-size:13px;font-weight:600;color:var(--text)">What it says it did</span><span style="font-size:13px;color:var(--subtle)">3 claims</span></div>
+            <div style="flex:none;padding:0 16px;display:flex;flex-direction:column;gap:7px">
+              <div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:9px;align-items:flex-start">
+                <span style="flex:none;width:12px;padding-top:2px;font-size:12px;color:var(--settled);text-align:center">✓</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <span style="font-size:14px;line-height:20px;color:var(--text)">A live chat's row is drawn by Active, never by the tree.</span>
+                  <span style="display:flex;flex-wrap:wrap;gap:5px"><span style="height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--settled) 12%,transparent);font-size:12px;color:var(--settled);display:flex;align-items:center">4 new tests pass</span></span>
+                </span>
+              </div>
+              <div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:9px;align-items:flex-start">
+                <span style="flex:none;width:12px;padding-top:2px;font-size:12px;color:var(--settled);text-align:center">✓</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <span style="font-size:14px;line-height:20px;color:var(--text)">Both surfaces read one derivation per frame.</span>
+                  <span style="display:flex;flex-wrap:wrap;gap:5px"><span style="height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--settled) 12%,transparent);font-size:12px;color:var(--settled);display:flex;align-items:center">1 call site, was 2</span></span>
+                </span>
+              </div>
+              <div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:9px;align-items:flex-start">
+                <span style="flex:none;width:12px;padding-top:2px;font-size:12px;color:var(--subtle);text-align:center">·</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <span style="font-size:14px;line-height:20px;color:var(--muted)">An expanded space says so when Active holds every row.</span>
+                  <span style="display:flex;flex-wrap:wrap;gap:5px"><span style="height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--working) 12%,transparent);font-size:12px;color:var(--working);display:flex;align-items:center">no test covers this</span></span>
+                </span>
+              </div>
+            </div>
+            <div style="flex:none;margin:12px 16px 0;border:1px solid color-mix(in srgb,var(--blocked) 32%,transparent);border-radius:12px;overflow:hidden">
+              <div style="padding:9px 12px;display:flex;align-items:center;gap:8px;background:color-mix(in srgb,var(--blocked) 9%,transparent);border-bottom:1px solid color-mix(in srgb,var(--blocked) 22%,transparent)">
+                <span style="display:flex;flex:none;color:var(--blocked)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><g fill="none"><path stroke="currentColor" stroke-width="1.5" d="M5.312 10.762C8.23 5.587 9.689 3 12 3s3.77 2.587 6.688 7.762l.364.644c2.425 4.3 3.638 6.45 2.542 8.022S17.786 21 12.364 21h-.728c-5.422 0-8.134 0-9.23-1.572s.117-3.722 2.542-8.022z"></path><path stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="M12 8v5"></path><circle cx="12" cy="16" r="1" fill="currentColor"></circle></g></svg></span>
+                <span style="font-size:13px;font-weight:600;color:var(--blocked)">2 changes no claim accounts for</span>
+              </div>
+              <div style="padding:9px 12px;display:flex;align-items:center;gap:9px;font-size:13px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;color:var(--muted)">Cargo.toml</span><span style="flex:none;color:var(--subtle)">itertools 0.13</span></div>
+              <div style="padding:9px 12px;display:flex;align-items:center;gap:9px;font-size:13px;border-top:1px solid var(--line)"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;color:var(--muted)">shell.rs · right_target()</span><span style="flex:none;color:var(--subtle)">+6 −4</span></div>
+            </div>
+          </div>
+          <div style="flex:none;border-top:1px solid var(--line);background:var(--raised);padding:11px 16px;display:flex;flex-direction:column;gap:9px">
+            <div style="border:1px solid var(--line2);border-radius:12px;background:var(--card);padding:9px 12px;font-size:14px;line-height:20px;color:var(--text)">Why does this need itertools?</div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="flex:1;min-width:0;font-size:12px;color:var(--subtle)">Delivered into board/gh-138 once.</span>
+              <span style="flex:none;height:32px;padding:0 12px;border-radius:8px;display:flex;align-items:center;font-size:13px;color:var(--settled)">Approve</span>
+              <span style="flex:none;height:32px;padding:0 13px;border-radius:8px;display:flex;align-items:center;font-size:13px;font-weight:500;background:var(--text);color:var(--card)">Request changes</span>
+            </div>
+          </div>
+        </div>
+      </x-import>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;color:#808080">LIGHT — NEW ON THE PHONE</span><span style="flex:1;max-width:420px;height:1px;background:rgba(255,255,255,.12)"></span></div>
+    <div style="display:flex;gap:40px;align-items:flex-start">
+
+      <x-import component-from-global-scope="IOSDevice" from="./ios-frame.jsx" hint-size="393px,852px">
+        <div class="cw" data-theme="light" style="width:100%;height:100%;box-sizing:border-box;padding-top:56px;padding-bottom:26px;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased">
+          <div style="flex:none;padding:2px 16px 8px;display:flex;align-items:center;gap:16px">
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="19" height="19" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"><path stroke-linejoin="round" d="M2 5.5L3.214 7L7.5 3M2 12.5L3.214 14L7.5 10M2 19.5L3.214 21L7.5 17"></path><path d="M22 19H12m10-7H12m10-7H12"></path></g></svg></span>
+            <span style="flex:1"></span>
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M8 3.25v9.5M3.25 8h9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path></svg></span>
+            <span style="flex:none;width:26px;height:26px;border-radius:9999px;background:var(--text);color:var(--card);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600">B</span>
+          </div>
+          <div style="flex:1;min-height:0;overflow:hidden;padding:0 16px;display:flex;flex-direction:column;gap:6px">
+            <div style="display:flex;align-items:center;gap:7px;padding:8px 4px 4px"><span style="font-size:12px;font-weight:500;color:var(--subtle)">Needs you</span><span style="padding:1px 6px;border-radius:9999px;background:color-mix(in srgb,var(--review) 14%,transparent);font-family:'Geist Mono',monospace;font-size:11px;font-weight:500;color:var(--review)">2</span></div>
+            <div style="border-radius:14px;background:var(--raised);box-shadow:var(--sellift);padding:11px 13px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-size:11px;color:var(--review);text-align:center">?</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;color:var(--text)">gh#144 · comet-board</span></div>
+              <div style="padding-left:18px;font-size:11px;line-height:16px;color:var(--subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Which branch should the retry target?</div>
+            </div>
+            <div style="border-radius:14px;padding:11px 13px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-size:11px;color:var(--blocked);text-align:center">✕</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;color:var(--text)">gh#131 · comet-board</span></div>
+              <div style="padding-left:18px;font-size:11px;line-height:16px;color:var(--subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Pane exited without completing</div>
+            </div>
+            <div style="height:1px;background:var(--line);margin:10px 4px 0"></div>
+            <div style="border-radius:14px;padding:7px 9px;display:flex;align-items:flex-start;gap:8px;margin-top:4px">
+              <span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;line-height:16px;color:var(--review);text-align:center">◆</span>
+              <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+                <span style="font-size:13px;font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Orchestrator</span>
+                <span style="font-size:11px;line-height:16px;color:var(--text);opacity:.72;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">gh#144 is blocked on a branch question; two settled since 09:00.</span>
+              </span>
+              <span style="flex:none;padding:1px 7px;border-radius:9999px;background:color-mix(in srgb,var(--settled) 14%,transparent);font-size:11px;font-weight:500;color:var(--settled)">new</span>
+            </div>
+            <div style="height:1px;background:var(--line);margin:10px 4px 0"></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 4px 4px"><span style="font-size:12px;font-weight:500;color:var(--subtle)">Spaces</span><span style="font-size:12px;color:var(--subtle)">2</span></div>
+            <div style="border-radius:14px;background:var(--sel);box-shadow:var(--sellift);padding:11px 13px;display:flex;align-items:center;gap:10px">
+              <span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--blocked)"></span>
+              <span style="flex:none;color:var(--muted);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></span>
+              <span style="flex:none;white-space:nowrap;font-size:15px;font-weight:500;color:var(--text)">comet-board</span>
+              <span style="flex:1"></span>
+              <span style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">3 running</span>
+              <span style="flex:none;font-size:12px;color:var(--subtle)">@ Tokenmaxxer9000</span>
+              <span style="flex:none;display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 4px 4px"><span style="font-size:12px;font-weight:500;color:var(--subtle)">Sessions</span><span style="font-size:12px;color:var(--subtle)">3</span></div>
+            <div style="display:flex;flex-direction:column;gap:2px">
+              <div style="border-radius:12px;padding:7px 9px;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--blocked)"></span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">comet-board · Tokenmaxxer9000</span><span style="flex:none;font-size:12px;color:var(--subtle)">18m</span></div>
+                <div style="padding-left:14px;font-size:14px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Board CLI drifts from the engine</div>
+                <div style="padding-left:14px;display:flex;align-items:center;gap:5px;color:var(--subtle)"><span style="display:flex;color:var(--claude)"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 256 257" fill="currentColor"><path d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"></path></svg></span><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="6.5" cy="5.5" r="2.25"></circle><circle cx="6.5" cy="18.5" r="2.25"></circle><circle cx="17.5" cy="7.5" r="2.25"></circle><path d="M6.5 7.75v8.5"></path><path d="M17.5 9.75c0 2.9-2.6 4.35-6.2 4.72c-1.9.2-3.3.9-4 2.03"></path></g></svg><span style="font-size:12px">board/gh-144</span></div>
+              </div>
+              <div style="border-radius:12px;padding:7px 9px;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--working)"></span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">comet-board · Tokenmaxxer9000</span><span style="flex:none;font-size:12px;color:var(--subtle)">9m</span></div>
+                <div style="padding-left:14px;font-size:14px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Throughput page: chart glyph</div>
+                <div style="padding-left:14px;display:flex;align-items:center;gap:5px;color:var(--subtle)"><span style="display:flex;color:var(--claude)"><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 256 257" fill="currentColor"><path d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"></path></svg></span><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="6.5" cy="5.5" r="2.25"></circle><circle cx="6.5" cy="18.5" r="2.25"></circle><circle cx="17.5" cy="7.5" r="2.25"></circle><path d="M6.5 7.75v8.5"></path><path d="M17.5 9.75c0 2.9-2.6 4.35-6.2 4.72c-1.9.2-3.3.9-4 2.03"></path></g></svg><span style="font-size:12px">board/gh-143</span></div>
+              </div>
+              <div style="border-radius:12px;padding:7px 9px;display:flex;flex-direction:column;gap:2px">
+                <div style="display:flex;align-items:center;gap:8px"><span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--faint)"></span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">attn · Tokenmaxxer9000</span><span style="flex:none;font-size:12px;color:var(--subtle)">3h</span></div>
+                <div style="padding-left:14px;font-size:14px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Quick idea review</div>
+              </div>
+            </div>
+            <div style="border-radius:14px;padding:11px 13px;display:flex;align-items:center;gap:10px">
+              <span style="width:6px;height:6px;border-radius:9999px;flex:none;background:var(--faint)"></span>
+              <span style="flex:none;color:var(--subtle);display:flex"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg></span>
+              <span style="flex:none;white-space:nowrap;font-size:15px;font-weight:500;color:var(--muted)">attn</span>
+              <span style="flex:none;font-size:12px;color:var(--subtle)">· wt/review</span>
+              <span style="flex:1"></span>
+              <span style="flex:none;font-size:12px;color:var(--blocked)">@ Mac mini · offline</span>
+              <span style="flex:none;display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m9 5l6 7l-6 7"></path></svg></span>
+            </div>
+          </div>
+
+        </div>
+      </x-import>
+
+      <x-import component-from-global-scope="IOSDevice" from="./ios-frame.jsx" hint-size="393px,852px">
+        <div class="cw" data-theme="light" style="width:100%;height:100%;box-sizing:border-box;padding-top:56px;padding-bottom:26px;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased">
+          <div style="flex:none;padding:0 16px 10px;display:flex;align-items:center;gap:10px">
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m15 5l-6 7l6 7"></path></svg></span>
+            <span style="flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:1px">
+              <span style="font-size:13px;font-weight:500;color:var(--text)">Board</span>
+              <span style="font-size:11px;color:var(--subtle)">on Tokenmaxxer9000</span>
+            </span>
+            <span style="flex:none;display:flex;color:var(--muted)"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3.5 3.5v14.25a2.75 2.75 0 0 0 2.75 2.75H20.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M8 16.5v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M12 16.5v-8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M16 16.5v-5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path></svg></span>
+          </div>
+          <div style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column">
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--blocked)">▲</span><span style="font-size:12px;font-weight:600;color:var(--text)">Blocked</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">1</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--blocked)">▲</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #144</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">18m</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Board CLI drifts from the engine on a partial upgrade</div>
+              <div style="padding-left:18px;display:flex;align-items:center;gap:7px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">claude · comet-board</span><span style="flex:none;padding:4px 11px;border-radius:9999px;background:var(--chip);font-size:12px;font-weight:500;color:var(--text)">Retry</span></div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="font-size:12px;font-weight:600;color:var(--text)">Working</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">3</span></div>
+            <div style="flex:none;display:flex;align-items:center;gap:6px;padding:2px 20px 0"><span style="display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 9l-7 6l-7-6"></path></svg></span><span style="font-size:12px;font-weight:500;color:var(--subtle)">comet-board</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">2</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px;background:var(--selcard);box-shadow:var(--sellift)">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #143</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">9m04s</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Throughput page: chart glyph and token tally</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">claude · comet-board</div>
+            </div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #139</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">41m18s</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Skill install writes into ~/.claude/skills on dispatch</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">codex · comet-board</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:6px;padding:2px 20px 0"><span style="display:flex;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m19 9l-7 6l-7-6"></path></svg></span><span style="font-size:12px;font-weight:500;color:var(--subtle)">tally</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">1</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--working)">●</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">tally #218</span><span style="flex:1"></span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;font-weight:600;color:var(--working)">1h07m</span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Reconcile settle events back onto the Linear issue</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">claude · tally-web</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--review)">✓</span><span style="font-size:12px;font-weight:600;color:var(--text)">Review</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">2</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--review)">✓</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #138</span><span style="flex:1"></span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Active owns a chat's row while its session is live</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">PR #212 · comet-board</div>
+            </div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--review)">✓</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #134</span><span style="flex:1"></span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Skill invocation landmark in the transcript</div>
+              <div style="padding-left:18px;font-size:12px;color:var(--subtle)">no PR · comet-board</div>
+            </div>
+            <div style="flex:none;display:flex;align-items:center;gap:7px;padding:10px 16px 3px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">▸</span><span style="font-size:12px;font-weight:600;color:var(--text)">Ready</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">6</span></div>
+            <div style="flex:none;padding:6px 20px;display:flex;flex-direction:column;gap:3px">
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:10px;flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--subtle)">▸</span><span style="flex:none;font-family:'Geist Mono',monospace;font-size:11px;color:var(--muted)">comet-board #151</span><span style="flex:1"></span></div>
+              <div style="padding-left:18px;font-size:14px;color:var(--text);line-height:19px">Orchestrator brief: report cap warnings inline</div>
+              <div style="padding-left:18px;display:flex;align-items:center;gap:7px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--subtle)">comet-board</span><span style="flex:none;padding:4px 11px;border-radius:9999px;background:var(--chip);font-size:12px;font-weight:500;color:var(--text)">Dispatch</span></div>
+            </div>
+          </div>
+        </div>
+      </x-import>
+
+      <x-import component-from-global-scope="IOSDevice" from="./ios-frame.jsx" hint-size="393px,852px">
+        <div class="cw" data-theme="light" style="width:100%;height:100%;box-sizing:border-box;padding-top:56px;padding-bottom:26px;display:flex;flex-direction:column;background:var(--card);color:var(--text);font-family:Geist,system-ui,sans-serif;-webkit-font-smoothing:antialiased">
+          <div style="flex:none;display:flex;justify-content:center;padding:2px 0 8px"><span style="width:36px;height:5px;border-radius:9999px;background:var(--line2)"></span></div>
+          <div style="flex:none;padding:0 16px 10px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--line)">
+            <span style="flex:1;min-width:0;display:flex;flex-direction:column">
+              <span style="font-size:16px;font-weight:600;letter-spacing:-.01em;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Active owns a chat's row</span>
+              <span style="font-size:12px;color:var(--subtle)">gh#138 · PR #212 · comet-board</span>
+            </span>
+            <span style="flex:none;padding:2px 8px;border-radius:6px;font-size:12px;color:var(--review);background:color-mix(in srgb,var(--review) 14%,transparent)">Waiting</span>
+          </div>
+          <div style="flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column">
+            <div style="flex:none;padding:11px 16px;border-bottom:1px solid var(--line);background:var(--raised);display:flex;flex-direction:column;gap:4px">
+              <span style="font-size:12px;font-weight:600;color:var(--subtle)">Asked for</span>
+              <span style="font-size:14px;line-height:20px;color:var(--muted)">Active should own a chat's row while its session is live, and the tree should show it when idle.</span>
+            </div>
+            <div style="flex:none;padding:11px 16px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:7px">
+              <span style="font-size:12px;font-weight:600;color:var(--subtle)">Effects</span>
+              <span style="display:flex;flex-wrap:wrap;gap:6px">
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:13px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Tests 41 → 47</span>
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:13px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>API unchanged</span>
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:13px;color:var(--muted)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--settled)"></span>Schema unchanged</span>
+                <span style="display:flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:6px;background:color-mix(in srgb,var(--working) 12%,transparent);font-size:13px;color:var(--working)"><span style="width:5px;height:5px;border-radius:9999px;background:var(--working)"></span>1 dependency</span>
+              </span>
+            </div>
+            <div style="flex:none;padding:11px 16px 4px;display:flex;align-items:center;gap:9px"><span style="font-size:13px;font-weight:600;color:var(--text)">What it says it did</span><span style="font-size:13px;color:var(--subtle)">3 claims</span></div>
+            <div style="flex:none;padding:0 16px;display:flex;flex-direction:column;gap:7px">
+              <div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:9px;align-items:flex-start">
+                <span style="flex:none;width:12px;padding-top:2px;font-size:12px;color:var(--settled);text-align:center">✓</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <span style="font-size:14px;line-height:20px;color:var(--text)">A live chat's row is drawn by Active, never by the tree.</span>
+                  <span style="display:flex;flex-wrap:wrap;gap:5px"><span style="height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--settled) 12%,transparent);font-size:12px;color:var(--settled);display:flex;align-items:center">4 new tests pass</span></span>
+                </span>
+              </div>
+              <div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:9px;align-items:flex-start">
+                <span style="flex:none;width:12px;padding-top:2px;font-size:12px;color:var(--settled);text-align:center">✓</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <span style="font-size:14px;line-height:20px;color:var(--text)">Both surfaces read one derivation per frame.</span>
+                  <span style="display:flex;flex-wrap:wrap;gap:5px"><span style="height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--settled) 12%,transparent);font-size:12px;color:var(--settled);display:flex;align-items:center">1 call site, was 2</span></span>
+                </span>
+              </div>
+              <div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:9px;align-items:flex-start">
+                <span style="flex:none;width:12px;padding-top:2px;font-size:12px;color:var(--subtle);text-align:center">·</span>
+                <span style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <span style="font-size:14px;line-height:20px;color:var(--muted)">An expanded space says so when Active holds every row.</span>
+                  <span style="display:flex;flex-wrap:wrap;gap:5px"><span style="height:22px;padding:0 8px;border-radius:6px;background:color-mix(in srgb,var(--working) 12%,transparent);font-size:12px;color:var(--working);display:flex;align-items:center">no test covers this</span></span>
+                </span>
+              </div>
+            </div>
+            <div style="flex:none;margin:12px 16px 0;border:1px solid color-mix(in srgb,var(--blocked) 32%,transparent);border-radius:12px;overflow:hidden">
+              <div style="padding:9px 12px;display:flex;align-items:center;gap:8px;background:color-mix(in srgb,var(--blocked) 9%,transparent);border-bottom:1px solid color-mix(in srgb,var(--blocked) 22%,transparent)">
+                <span style="display:flex;flex:none;color:var(--blocked)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><g fill="none"><path stroke="currentColor" stroke-width="1.5" d="M5.312 10.762C8.23 5.587 9.689 3 12 3s3.77 2.587 6.688 7.762l.364.644c2.425 4.3 3.638 6.45 2.542 8.022S17.786 21 12.364 21h-.728c-5.422 0-8.134 0-9.23-1.572s.117-3.722 2.542-8.022z"></path><path stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="M12 8v5"></path><circle cx="12" cy="16" r="1" fill="currentColor"></circle></g></svg></span>
+                <span style="font-size:13px;font-weight:600;color:var(--blocked)">2 changes no claim accounts for</span>
+              </div>
+              <div style="padding:9px 12px;display:flex;align-items:center;gap:9px;font-size:13px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;color:var(--muted)">Cargo.toml</span><span style="flex:none;color:var(--subtle)">itertools 0.13</span></div>
+              <div style="padding:9px 12px;display:flex;align-items:center;gap:9px;font-size:13px;border-top:1px solid var(--line)"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;color:var(--muted)">shell.rs · right_target()</span><span style="flex:none;color:var(--subtle)">+6 −4</span></div>
+            </div>
+          </div>
+          <div style="flex:none;border-top:1px solid var(--line);background:var(--raised);padding:11px 16px;display:flex;flex-direction:column;gap:9px">
+            <div style="border:1px solid var(--line2);border-radius:12px;background:var(--card);padding:9px 12px;font-size:14px;line-height:20px;color:var(--text)">Why does this need itertools?</div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="flex:1;min-width:0;font-size:12px;color:var(--subtle)">Delivered into board/gh-138 once.</span>
+              <span style="flex:none;height:32px;padding:0 12px;border-radius:8px;display:flex;align-items:center;font-size:13px;color:var(--settled)">Approve</span>
+              <span style="flex:none;height:32px;padding:0 13px;border-radius:8px;display:flex;align-items:center;font-size:13px;font-weight:500;background:var(--text);color:var(--card)">Request changes</span>
+            </div>
+          </div>
+        </div>
+      </x-import>
+    </div>
+  </div>
+
+</div>
+
+</x-dc>
+</body>
+</html>
