@@ -111,6 +111,23 @@ token means the field in `Theme`, never a literal at the call site.
   the left with a folder icon, the branch on the right with a branch icon and a
   chevron.
 
+### D deviations
+
+Two, both from gh#297.
+
+- **D6's 12px does not land; everything else in D6 does.** Inline code paints
+  the mono face, `--text` copy, the `--chip` bed, padding 2×5 and radius 6 — but
+  at the paragraph's 14px, not 12. A paragraph is shaped as ONE run list and
+  gpui's `TextRun` carries a font but no size (`shape_text` takes a single
+  `font_size` for the whole block), so a 12px span inside a 14px line would mean
+  splitting every paragraph into separate elements and losing the wrap. The size
+  was never what the gap was about: the span read as a status hue, and it no
+  longer does.
+- **D8.7 on a non-git space shows the left side only.** The canvas's space is a
+  repo; a plain folder has no branch and no worktree to offer, so the row keeps
+  the checkout label and drops the ref rather than naming a branch that does not
+  exist.
+
 ## E. Board panel (520px)
 
 - **E1** Width 520, padding 0/8/8/0, and the card is radius 14, `--card`,
