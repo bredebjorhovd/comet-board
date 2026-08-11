@@ -650,6 +650,7 @@ mod tests {
             pr_mergeable: None,
             pr_base_ref: None,
             pr_stack: None,
+            pr_changes_requested: None,
             updated_at: crate::db::now(),
             synced_at: String::new(),
             attempts,

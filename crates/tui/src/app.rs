@@ -4425,6 +4425,7 @@ mod tests {
             pr_number: None,
             pr_base_ref: None,
             pr_mergeable: None,
+            changes_below: None,
             landing: None,
             stack: None,
             branch: Some("board/gh-x".into()),
@@ -4523,6 +4524,7 @@ mod tests {
                 position: Some(p),
                 open: true,
                 mergeable: Some("clean".into()),
+                changes_requested: false,
             })
             .collect();
         (1..=3)

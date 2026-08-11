@@ -427,6 +427,20 @@ impl SyncEngine {
             // makes this verdict arrive once rather than once from here and
             // again from the poll that finds it.
             state.review = state.review.max(review_id);
+            // The standing verdict, so that a `changes requested` written here
+            // reaches the layers stacked on this one through the same fan-out as
+            // one noticed on GitHub (§gh#289). Without this the watermark above
+            // would be doing its job too well: the id is consumed the moment it
+            // is posted, so the inbound path can never read the review back and
+            // would never learn that anything was asked.
+            state.changes_requested = match kind {
+                VerdictKind::ChangesRequested => Some(review_id),
+                // An approval withdraws whatever was outstanding, which is what
+                // takes the rows above this one back out of waiting.
+                VerdictKind::Approve => None,
+                // A comment says nothing about whether an objection stands.
+                VerdictKind::Comment => state.changes_requested,
+            };
             state.submissions.push(Submission {
                 fingerprint: print.clone(),
                 review_id,
@@ -437,6 +451,17 @@ impl SyncEngine {
                 state.submissions.drain(..drop);
             }
             crate::review::store(&self.db, &task.id, &state)?;
+            // A `changes requested` takes the layers stacked on this one out of
+            // `review`, and an approval puts them back (§gh#289). A reviewer who
+            // just pressed the button should see that on the board now rather
+            // than on the next poll — and a derivation that fails is a log line,
+            // not a failed submission: the review is already on GitHub.
+            if let Err(e) = self.rederive_all() {
+                self.log.warn(format!(
+                    "rederiving after a verdict on {}: {e}",
+                    task.identifier
+                ));
+            }
             self.log.info(format!(
                 "{}: posted a `{}` review on {repo}#{number}",
                 task.identifier,
@@ -1011,6 +1036,98 @@ mod tests {
             runtime.prompts.borrow().len(),
             1,
             "delivered once, from the review window — not again from the poll"
+        );
+    }
+
+    /// The other side of that watermark, and why §gh#289 could not simply read
+    /// the reviews endpoint: a verdict written here is consumed the moment it is
+    /// posted, so the inbound pass never sees it and would never learn to tell
+    /// the layers stacked on this one. The *standing* verdict is what closes
+    /// that — recorded here, fanned out there, one path for both sources.
+    #[test]
+    fn a_verdict_written_here_reaches_the_layers_stacked_on_it() {
+        let mut routes = fixture();
+        routes.extend([
+            (
+                "/repos/o/r/issues/14/comments".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "/repos/o/r/pulls/14/comments".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "/repos/o/r/pulls/14/reviews".to_string(),
+                serde_json::json!([{ "id": POSTED_ID, "state": "CHANGES_REQUESTED",
+                                     "body": "Fix the gate.\n\n— written in comet-board's \
+                                              review window.",
+                                     "submitted_at": "2999-01-01T00:00:00Z",
+                                     "user": { "login": "b" } }]),
+            ),
+            (
+                "/repos/o/r/issues/15/comments".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "/repos/o/r/pulls/15/comments".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "/repos/o/r/pulls/15/reviews".to_string(),
+                serde_json::json!([]),
+            ),
+        ]);
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(routes));
+        let e = engine(rest.clone());
+        seed_with_a_remainder(&e);
+        crate::review::tests::seed_stacked_child(&e, "chat-2");
+        let runtime =
+            FakeRuntime::holding_each(&[("chat-1", "/wt/gh-13-1"), ("chat-2", "/wt/gh-20-1")]);
+
+        e.submit_verdict(
+            Some(&runtime),
+            "gh:o/r#13",
+            None,
+            VerdictKind::ChangesRequested,
+            "Fix the gate.",
+        )
+        .unwrap();
+        assert!(runtime.said_to("chat-1").is_some(), "the author, from here");
+        assert_eq!(
+            state_of(&e).changes_requested,
+            Some(POSTED_ID),
+            "and the standing verdict, so the fan-out has something to run off",
+        );
+
+        // The next sync cycle's pass fans it up the stack, without reading the
+        // review it can never read.
+        e.deliver_reviews(&runtime, &crate::review::tests::stacked_pulls());
+        assert!(
+            runtime
+                .said_to("chat-2")
+                .unwrap()
+                .contains("the layer below yours was asked to change"),
+            "{:?}",
+            runtime.said_to("chat-2"),
+        );
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            crate::model::BoardState::Blocked,
+        );
+
+        // An approval withdraws it, and the layer above is reviewable again.
+        e.submit_verdict(
+            Some(&runtime),
+            "gh:o/r#13",
+            None,
+            VerdictKind::Approve,
+            "Better.",
+        )
+        .unwrap();
+        assert_eq!(state_of(&e).changes_requested, None);
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            crate::model::BoardState::Review,
         );
     }
 

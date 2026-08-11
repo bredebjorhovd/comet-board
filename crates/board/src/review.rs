@@ -39,6 +39,38 @@
 //!    the watermark consumes the reply in the same cycle that relays it, so
 //!    the chain only continues if the agent writes on the PR again.
 //!
+//! ## Where one PR → one chat stops being enough (§gh#289)
+//!
+//! The contract above is one pull request, one authoring attempt, one chat. In a
+//! stack that is incomplete: `changes requested` on layer 2 is not only about
+//! layer 2, because layers 3..N are built on code that is now wrong. Layer 2's
+//! agent gets the review and starts fixing; when it force-pushes, GitHub replays
+//! every layer above it on the new base — so their diffs move under their authors
+//! *and* under their reviewers, with no explanation in either place.
+//!
+//! So this module addresses the other layers too, in one direction only:
+//! [`Dependents`] is the edge, and it points up. Each dependent gets a *notice*
+//! and never the review body ([`compose_notice`]) — the review is not theirs to
+//! answer, and pasting it into their chats is how five agents end up editing one
+//! branch. Two more things follow, and both are about the human rather than the
+//! agent:
+//!
+//! - **The row leaves review.** A diff that is about to be rebased is not
+//!   reviewable in good faith, and the bad outcome is not wasted reading, it is
+//!   an approval that outlives the diff it was given to. That derives from
+//!   [`Delivered::changes_requested`] through the task row — see
+//!   [`crate::model::derive_state`].
+//! - **An undeliverable notice is still delivered.** A reaped child chat means
+//!   there is no agent to tell; it does not mean there is nobody to tell. The row
+//!   carries the fact either way, worded by
+//!   [`comet_proto::view::board::landing_note`], because the review screen is
+//!   where the person who was about to read that diff is looking.
+//!
+//! Approvals do not fan out. An N-layer stack would generate O(N²) notices over
+//! its life, every one of them "somebody below you is fine" and none of them
+//! actionable; what a child needs to hear is that its parent *merged*, and
+//! §gh#288 and gh#286 own that.
+//!
 //! What else survives unchanged: the `updated_at` gate (the PR list already
 //! says whether anything happened, so the steady state costs no comment
 //! fetches — with the base folded into it, §gh#288, so a stack retargeting
@@ -53,9 +85,11 @@ use crate::db::Db;
 use crate::model::{Attempt, BoardState, Task};
 use crate::runtime::Runtime;
 use crate::sources::github::{Feedback, FeedbackKind, Github, PullRequest, Rest};
+use crate::stacks::Dependents;
 use crate::sync::SyncEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// What the board has already delivered for one pull request.
 ///
@@ -99,6 +133,30 @@ pub struct Delivered {
     /// operator archived does not write the same line every 30 seconds.
     #[serde(default)]
     pub noted_gone: bool,
+    /// The review that last asked this pull request to change, and which nothing
+    /// has withdrawn since (§gh#289). `None` is "nothing outstanding" — never
+    /// asked, or asked and since approved.
+    ///
+    /// Computed off the *fetched* feedback rather than the delivered subset,
+    /// because an approval with nothing written in it is not worth an agent's
+    /// attention ([`is_actionable`] drops it) and is still the thing that says
+    /// the objection is over. Kept here rather than only on the row for the
+    /// reason the watermarks are: it is what GitHub last said about this pull
+    /// request, next to the ids it was read from — and it is what the fan-out
+    /// below is watermarked against. [`store`] mirrors it onto the task row,
+    /// where the state derivation and every board read can see it for free.
+    #[serde(default)]
+    pub changes_requested: Option<i64>,
+    /// Per dependent layer, the id of the last review of *this* pull request
+    /// fanned out to it (§gh#289).
+    ///
+    /// Per edge rather than one watermark for the whole fan, so the answer to
+    /// "has this layer been told?" is a fact about that layer: a dependent whose
+    /// chat was unreachable this cycle is retried, and a layer dispatched onto
+    /// this branch after the review landed still hears about it. One watermark
+    /// would call the whole fan done on the strength of the first success.
+    #[serde(default)]
+    pub fanned_out: BTreeMap<String, i64>,
     /// Verdicts submitted from the review window (§gh#239), oldest first.
     ///
     /// Outbound work in an inbound record on purpose: it is the same fact about
@@ -131,6 +189,28 @@ impl Delivered {
     /// Have we never looked at this pull request before?
     fn first_sight(&self) -> bool {
         self.updated_at.is_empty()
+    }
+
+    /// Adopt whatever verdict this batch of feedback ends on (§gh#289).
+    ///
+    /// Only `changes_requested` and `approved` count. A `commented` review says
+    /// nothing about whether the objection stands — GitHub's own review decision
+    /// treats it the same way — and swallowing an outstanding request because
+    /// somebody wrote a paragraph afterwards is the failure this whole file is
+    /// about, one layer up.
+    ///
+    /// A batch with no verdict in it leaves the standing one alone: nothing was
+    /// said, so nothing changed. Read off the raw fetch and not off the delivered
+    /// subset, because an approval with no prose interrupts nobody and is still
+    /// what ends the objection.
+    fn record_verdict(&mut self, feedback: &[Feedback]) {
+        let Some(last) = feedback.iter().rfind(|f| {
+            f.kind == FeedbackKind::Review
+                && matches!(f.state.as_deref(), Some("changes_requested" | "approved"))
+        }) else {
+            return;
+        };
+        self.changes_requested = last.requests_changes().then_some(last.id);
     }
 }
 
@@ -249,6 +329,11 @@ pub fn plan_delivery(
     for f in &feedback {
         state.record(f);
     }
+    // The verdict is not a message, so the floor and the actionability filter
+    // above have no business in it: a `changes requested` that predates the
+    // attempt's end is still outstanding, and an approval nobody wrote a word in
+    // still withdraws one (§gh#289).
+    state.record_verdict(&feedback);
     state.updated_at = pr_updated_at.to_string();
     state.base_ref = pr_base_ref.to_string();
 
@@ -297,6 +382,50 @@ pub fn still_the_authors_checkout(chat_cwd: Option<&str>, attempt: &Attempt) -> 
         }
         _ => true,
     }
+}
+
+/// One layer of a stack, resolved to somewhere the board can deliver (§gh#289).
+///
+/// The mechanism, rather than a special case for children: "address layer N of
+/// this stack" is one question, asked of the layer that was reviewed and of every
+/// layer built on it in exactly the same words. Whatever the review surface turns
+/// out to want (#281), it wants this and not a bespoke notice path.
+#[derive(Debug, Clone, Copy)]
+pub struct Addressed<'a> {
+    /// The attempt that wrote the pull request — the branch is the proof.
+    pub attempt: &'a Attempt,
+    /// Its chat, verified alive and still standing in the attempt's checkout.
+    pub chat_id: &'a str,
+}
+
+/// Where a row's pull request can be reached, if it can be.
+///
+/// `Ok(None)` is a settled fact: nobody dispatched this pull request, or the chat
+/// that wrote it is gone, or it has been re-pointed at another checkout. An `Err`
+/// is the runtime failing to answer, which is not the same thing — the caller
+/// leaves its state unwritten and the next cycle asks again.
+///
+/// The whole author check in one place, so the fan-out cannot drift from the
+/// delivery it is a fan-out of. A server-side rebase does not move a chat out of
+/// its checkout: [`still_the_authors_checkout`] compares a filesystem path, not a
+/// ref.
+pub fn address<'a>(
+    runtime: &dyn Runtime,
+    task: &'a Task,
+    pr: &PullRequest,
+) -> Result<Option<Addressed<'a>>> {
+    let Some(attempt) = authoring_attempt(task, pr) else {
+        return Ok(None);
+    };
+    let Some(chat_id) = attempt.pane_id.as_deref() else {
+        return Ok(None);
+    };
+    if !runtime.chat_alive(chat_id)?
+        || !still_the_authors_checkout(runtime.chat_cwd(chat_id)?.as_deref(), attempt)
+    {
+        return Ok(None);
+    }
+    Ok(Some(Addressed { attempt, chat_id }))
 }
 
 /// How every delivery into an authoring chat opens: who is talking, which task,
@@ -364,6 +493,48 @@ pub fn compose(task: &Task, pr: &PullRequest, items: &[Feedback]) -> String {
     s
 }
 
+/// What a dependent layer is told when the layer below it is asked to change
+/// (§gh#289).
+///
+/// **A notice, not the review.** The review below is not this agent's to answer:
+/// it is about code on another branch, and an agent handed somebody else's
+/// feedback either edits a branch that is not its own or replies on a pull
+/// request that is not its own. What it needs is the one fact its own chat cannot
+/// see — that the ground under its branch is about to move, and why the diff it
+/// is looking at will not be the diff that lands.
+///
+/// It opens in [`reviewed_header`]'s register but deliberately not with its
+/// sentence: "your pull request has been reviewed" would be false, and an agent
+/// that reads it as true goes looking for feedback that is not there.
+pub fn compose_notice(
+    task: &Task,
+    pr: &PullRequest,
+    below: &Task,
+    below_pr: &PullRequest,
+) -> String {
+    format!(
+        "comet-board: the layer below yours was asked to change.\n\n  \
+         {below_id} · {title}\n  {below_url} · {below_branch}\n\n\
+         Your own pull request — {mine} · PR #{number} on {branch} — is stacked on \
+         {below_branch}. When its author pushes the fix, GitHub replays your commits \
+         on top of the new one: your diff moves, and so does whatever a reviewer of \
+         yours has already read.\n\n\
+         Nothing on your branch is wrong and there is nothing here to fix. The review \
+         below is not yours to answer — do not write on {below_url}, do not touch \
+         {below_branch}, and do not rebase ahead of it; the replay is GitHub's to do. \
+         If you are mid-task, carry on and commit as you go: a replay carries \
+         committed work across, and uncommitted work in your worktree is yours to \
+         keep safe.\n",
+        below_id = below.identifier,
+        title = below.title,
+        below_url = below_pr.url,
+        below_branch = below_pr.head_ref,
+        mine = task.identifier,
+        number = pr.number,
+        branch = pr.head_ref,
+    )
+}
+
 /// Load a task's delivery state. A missing or unreadable value starts over,
 /// which costs one round of re-consumption and never a wrong delivery.
 pub(crate) fn load(db: &Db, task_id: &str) -> Delivered {
@@ -374,11 +545,19 @@ pub(crate) fn load(db: &Db, task_id: &str) -> Delivered {
         .unwrap_or_default()
 }
 
+/// Persist a task's delivery state — and mirror the one field of it that other
+/// rows read onto the task row (§gh#289).
+///
+/// Every writer of [`Delivered`] goes through here, which is what stops the record
+/// and the column disagreeing about what a reviewer last said. The record is the
+/// source; the column exists so the state derivation and every board read can see
+/// it without a `meta` lookup per row.
 pub(crate) fn store(db: &Db, task_id: &str, state: &Delivered) -> Result<()> {
     db.meta_set(
         &crate::sync::meta::reviews_for(task_id),
         &serde_json::to_string(state)?,
     )?;
+    db.set_pr_changes_requested(task_id, state.changes_requested)?;
     Ok(())
 }
 
@@ -408,11 +587,27 @@ impl SyncEngine {
                 return;
             }
         };
-        for task in tasks {
-            if let Err(e) = self.deliver_review_for(gh, runtime, pulls, &task) {
-                self.log
-                    .warn(format!("delivering review for {}: {e}", task.identifier));
+        // The dependency edges, once for the whole board: the layers built on a
+        // row are other rows, and asking per task would be a scan per task
+        // (§gh#289).
+        let deps = Dependents::of(&tasks);
+        let mut verdicts_moved = false;
+        for task in &tasks {
+            match self.deliver_review_for(gh, runtime, pulls, &tasks, &deps, task) {
+                Ok(moved) => verdicts_moved |= moved,
+                Err(e) => self
+                    .log
+                    .warn(format!("delivering review for {}: {e}", task.identifier)),
             }
+        }
+        // A standing `changes requested` is what takes the layers above it out of
+        // `review` (§gh#289), and this pass runs *after* the cycle has already
+        // derived every row. Without this the rows above would sit in `review`
+        // for one more poll interval — reviewable-looking for exactly as long as
+        // it takes somebody to open one.
+        if verdicts_moved && let Err(e) = self.rederive_all() {
+            self.log
+                .warn(format!("rederiving after a review verdict moved: {e}"));
         }
     }
 
@@ -421,43 +616,54 @@ impl SyncEngine {
         gh: &Github<Box<dyn Rest>>,
         runtime: &dyn Runtime,
         pulls: &[PullRequest],
+        tasks: &[Task],
+        deps: &Dependents,
         task: &Task,
-    ) -> Result<()> {
-        // `review` is the whole precondition: finished work with an open pull
-        // request, whose chat nothing has disposed of yet.
+    ) -> Result<bool> {
+        // The fan-out first, and on a gate of its own: it is about the layers
+        // *above* this row, so whether this row is still in `review` and whether
+        // its own chat is still there have no bearing on it (§gh#289). Costs no
+        // GitHub call — the standing verdict is already on the row — and nothing
+        // at all for the overwhelming majority of rows, which have no outstanding
+        // request and no dependents.
+        if task.pr_changes_requested.is_some() {
+            self.fan_out_changes(runtime, pulls, tasks, deps, task)?;
+        }
+
+        // `review` is the whole precondition for the rest: finished work with an
+        // open pull request, whose chat nothing has disposed of yet.
         if task.state != BoardState::Review || !task.pr_open {
-            return Ok(());
+            return Ok(false);
         }
         let Some(pr) = pull_request_for(task, pulls) else {
-            return Ok(());
+            return Ok(false);
         };
-        let Some(attempt) = authoring_attempt(task, pr) else {
-            return Ok(());
-        };
-        let Some(chat_id) = attempt.pane_id.as_deref() else {
-            return Ok(());
-        };
+        // A pull request nobody dispatched has no author sitting in a chat, and
+        // no chat to have lost: it is not the gone case below, it is a row this
+        // whole path has nothing to say about.
+        if authoring_attempt(task, pr).is_none() {
+            return Ok(false);
+        }
         let mut state = load(&self.db, &task.id);
 
         // A task whose chat is gone is skipped quietly. There is nothing to
         // deliver to and nothing to do about it — re-dispatching would be a
-        // second agent on work that is already written. A runtime error here
-        // propagates instead: not knowing is not the same as gone, and the
-        // next cycle asks again.
-        let gone = !runtime.chat_alive(chat_id)?
-            || !still_the_authors_checkout(runtime.chat_cwd(chat_id)?.as_deref(), attempt);
-        if gone {
+        // second agent on work that is already written. A runtime error inside
+        // `address` propagates instead: not knowing is not the same as gone, and
+        // the next cycle asks again.
+        let Some(author) = address(runtime, task, pr)? else {
             if !state.noted_gone {
                 self.log.info(format!(
-                    "{}: chat {chat_id} no longer holds the agent that wrote {} — \
+                    "{}: no live chat still holds the agent that wrote {} — \
                      review comments will not be delivered",
                     task.identifier, pr.url
                 ));
                 state.noted_gone = true;
                 store(&self.db, &task.id, &state)?;
             }
-            return Ok(());
-        }
+            return Ok(false);
+        };
+        let (attempt, chat_id) = (author.attempt, author.chat_id);
         state.noted_gone = false;
 
         let floor = attempt
@@ -479,7 +685,7 @@ impl SyncEngine {
                     task.identifier,
                     items.len()
                 ));
-                return Ok(());
+                return Ok(false);
             }
             self.log.info(format!(
                 "{}: delivered {} review comment(s) on {} into chat {chat_id}",
@@ -497,6 +703,113 @@ impl SyncEngine {
             ));
         }
         store(&self.db, &task.id, &state)?;
+        // A verdict this cycle's own fetch discovered fans out in this cycle.
+        // The gate at the top read the row as the cycle loaded it, which cannot
+        // know what the fetch has since found — and a stack should not wait a
+        // poll interval to hear that its foundation is moving.
+        let moved = state.changes_requested != task.pr_changes_requested;
+        if moved && state.changes_requested.is_some() {
+            self.fan_out_changes(runtime, pulls, tasks, deps, task)?;
+        }
+        Ok(moved)
+    }
+
+    /// Tell every layer built on this pull request that it has been asked to
+    /// change (§gh#289).
+    ///
+    /// Runs off the standing verdict rather than off a review just read, so the
+    /// two ways a `changes requested` reaches the board — noticed on GitHub by
+    /// the pass above, or written in the review window (§gh#239) — fan out
+    /// through one path. Costs no GitHub call: everything it needs is the pull
+    /// requests the cycle already polled and the rows already loaded.
+    ///
+    /// A dependent the board cannot reach is not a dependent the board says
+    /// nothing about. The notice into its chat is one of two deliveries; the
+    /// other is the row itself, which carries the fact for the human who was
+    /// about to review that diff whether or not an agent is still sitting in it.
+    /// So an unreachable chat is recorded as told — the row has it — and a chat
+    /// the *ledger* refused is not, because that is a failure to retry.
+    fn fan_out_changes(
+        &self,
+        runtime: &dyn Runtime,
+        pulls: &[PullRequest],
+        tasks: &[Task],
+        deps: &Dependents,
+        task: &Task,
+    ) -> Result<()> {
+        if !task.pr_open {
+            return Ok(());
+        }
+        let above = deps.above(&task.id);
+        if above.is_empty() {
+            return Ok(());
+        }
+        let mut state = load(&self.db, &task.id);
+        let Some(review_id) = state.changes_requested else {
+            return Ok(());
+        };
+        let Some(pr) = pull_request_for(task, pulls) else {
+            return Ok(());
+        };
+        let mut told = 0;
+        let mut recorded = 0;
+        for dep in above {
+            if state
+                .fanned_out
+                .get(&dep.id)
+                .is_some_and(|at| *at >= review_id)
+            {
+                continue;
+            }
+            // A layer that has landed or been withdrawn is not going to be
+            // replayed on anything. Recorded as told rather than skipped, so it
+            // is not reconsidered every cycle for the rest of its life.
+            let Some(child) = tasks.iter().find(|t| t.id == dep.id).filter(|t| t.pr_open) else {
+                state.fanned_out.insert(dep.id.clone(), review_id);
+                recorded += 1;
+                continue;
+            };
+            let Some(child_pr) = pull_request_for(child, pulls) else {
+                state.fanned_out.insert(dep.id.clone(), review_id);
+                recorded += 1;
+                continue;
+            };
+            match address(runtime, child, child_pr)? {
+                Some(at) => {
+                    let text = compose_notice(child, child_pr, task, pr);
+                    if let Err(e) = runtime.prompt(at.chat_id, &text) {
+                        // Nothing arrived, so nothing is recorded: the next cycle
+                        // tries this dependent again, and the ones already told
+                        // are not told twice.
+                        self.log.warn(format!(
+                            "{}: could not tell {} that {} was asked to change: {e}",
+                            task.identifier, child.identifier, pr.url
+                        ));
+                        continue;
+                    }
+                    told += 1;
+                }
+                None => self.log.info(format!(
+                    "{}: {} is stacked on {} and has no live chat to tell — the row \
+                     carries it instead",
+                    task.identifier, child.identifier, pr.url
+                )),
+            }
+            state.fanned_out.insert(dep.id.clone(), review_id);
+            recorded += 1;
+        }
+        if told > 0 {
+            self.log.info(format!(
+                "{}: told {told} layer(s) above it that {} was asked to change",
+                task.identifier, pr.url
+            ));
+        }
+        // Nothing new to remember means nothing to write: a stack sitting on a
+        // standing request is the steady state, and it should cost this pass no
+        // rows at all.
+        if recorded > 0 {
+            store(&self.db, &task.id, &state)?;
+        }
         Ok(())
     }
 }
@@ -930,6 +1243,7 @@ pub(crate) mod tests {
             pr_mergeable: None,
             pr_base_ref: None,
             pr_stack: None,
+            pr_changes_requested: None,
             updated_at: "t".into(),
             synced_at: "t".into(),
             attempts: vec![],
@@ -1028,6 +1342,12 @@ pub(crate) mod tests {
     pub(crate) struct FakeRuntime {
         pub(crate) alive: bool,
         pub(crate) cwd: Option<String>,
+        /// Per-chat cwds, for a test with more than one chat in it — a stack has
+        /// a chat and a checkout per layer, and one shared cwd would fail every
+        /// layer's author check but the first.
+        pub(crate) cwds: std::collections::HashMap<String, String>,
+        /// Chats that are gone while the rest are not.
+        pub(crate) reaped: std::collections::HashSet<String>,
         pub(crate) prompts: std::cell::RefCell<Vec<(String, String)>>,
         pub(crate) prompt_fails: bool,
     }
@@ -1037,6 +1357,8 @@ pub(crate) mod tests {
             FakeRuntime {
                 alive: true,
                 cwd: Some(cwd.into()),
+                cwds: Default::default(),
+                reaped: Default::default(),
                 prompts: Default::default(),
                 prompt_fails: false,
             }
@@ -1046,9 +1368,31 @@ pub(crate) mod tests {
             FakeRuntime {
                 alive: false,
                 cwd: None,
+                cwds: Default::default(),
+                reaped: Default::default(),
                 prompts: Default::default(),
                 prompt_fails: false,
             }
+        }
+
+        /// Every chat in its own checkout, keyed by chat id.
+        pub(crate) fn holding_each(cwds: &[(&str, &str)]) -> FakeRuntime {
+            FakeRuntime {
+                cwds: cwds
+                    .iter()
+                    .map(|(c, w)| (c.to_string(), w.to_string()))
+                    .collect(),
+                ..FakeRuntime::holding("/nowhere")
+            }
+        }
+
+        /// What one chat was queued with, if it was queued at all.
+        pub(crate) fn said_to(&self, chat: &str) -> Option<String> {
+            self.prompts
+                .borrow()
+                .iter()
+                .find(|(c, _)| c == chat)
+                .map(|(_, t)| t.clone())
         }
     }
 
@@ -1071,11 +1415,11 @@ pub(crate) mod tests {
         fn session(&self, _chat_id: &str) -> Result<Option<Session>> {
             Ok(None)
         }
-        fn chat_alive(&self, _chat_id: &str) -> Result<bool> {
-            Ok(self.alive)
+        fn chat_alive(&self, chat_id: &str) -> Result<bool> {
+            Ok(self.alive && !self.reaped.contains(chat_id))
         }
-        fn chat_cwd(&self, _chat_id: &str) -> Result<Option<String>> {
-            Ok(self.cwd.clone())
+        fn chat_cwd(&self, chat_id: &str) -> Result<Option<String>> {
+            Ok(self.cwds.get(chat_id).cloned().or_else(|| self.cwd.clone()))
         }
         fn last_run_end(&self, _chat_id: &str) -> Result<Option<crate::runtime::RunEnd>> {
             Ok(None)
@@ -1378,6 +1722,416 @@ pub(crate) mod tests {
 
         e.deliver_reviews(&FakeRuntime::holding("/wt/gh-13-1"), &[pr]);
         assert!(rest.asked.borrow().is_empty());
+    }
+
+    // ---- the fan-out down the stack (§gh#289) ----------------------------
+
+    /// gh#20's pull request, stacked on gh#13's branch: layer 2 of the pair the
+    /// tests below fan out along.
+    pub(crate) fn child_pull() -> PullRequest {
+        PullRequest {
+            number: 15,
+            url: "https://github.com/o/r/pull/15".into(),
+            title: "Emit what the parser reads".into(),
+            base_ref: "board/gh-13".into(),
+            ..pull("board/gh-20")
+        }
+    }
+
+    /// A second dispatched row whose branch was cut from gh#13's attempt — the
+    /// edge GitHub is never told about (gh#285), and the one this fan-out has to
+    /// work along whether or not there is a `stack` object anywhere.
+    pub(crate) fn seed_stacked_child(e: &SyncEngine, chat: &str) {
+        let parent = e.db.attempts_for("gh:o/r#13").unwrap()[0].id;
+        e.db.upsert_task(&crate::db::UpsertTask {
+            id: "gh:o/r#20".into(),
+            source: Source::Github,
+            source_id: "n20".into(),
+            identifier: "gh#20".into(),
+            title: "Emit what the parser reads".into(),
+            body: None,
+            url: "https://github.com/o/r/issues/20".into(),
+            labels: vec![],
+            source_state: Some("open".into()),
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Unstarted,
+            updated_at: crate::db::now(),
+        })
+        .unwrap();
+        let a =
+            e.db.insert_attempt(&crate::db::NewAttempt {
+                stacked_on: Some(parent),
+                task_id: "gh:o/r#20".into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: Some("/wt/gh-20-1".into()),
+                branch: Some("board/gh-20".into()),
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        e.db.set_attempt_pane(a, chat).unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        e.db.set_pr(
+            "gh:o/r#20",
+            Some("https://github.com/o/r/pull/15"),
+            Some(15),
+            true,
+        )
+        .unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Review,
+        );
+    }
+
+    /// Both layers of the pair, as the sync cycle hands them over.
+    pub(crate) fn stacked_pulls() -> Vec<PullRequest> {
+        vec![pull("board/gh-13"), child_pull()]
+    }
+
+    pub(crate) fn runtime_for_the_pair() -> FakeRuntime {
+        FakeRuntime::holding_each(&[("chat-1", "/wt/gh-13-1"), ("chat-2", "/wt/gh-20-1")])
+    }
+
+    /// The headline. `changes requested` on the lower layer reaches the agent
+    /// that wrote it *and* the agent standing on top of it — the second one with
+    /// a notice rather than the review, because the review is not its to answer.
+    #[test]
+    fn changes_requested_on_a_layer_reaches_the_layer_above_it() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        let runtime = runtime_for_the_pair();
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+
+        // The author got the review, as it always did.
+        let review = runtime.said_to("chat-1").expect("the author was told");
+        assert!(
+            review.contains("Split the watermark per endpoint."),
+            "{review}"
+        );
+
+        // The layer above got a notice: what happened, where, and what it does
+        // to this branch — and not one word of the review body.
+        let notice = runtime.said_to("chat-2").expect("the layer above was told");
+        assert!(
+            notice.contains("the layer below yours was asked to change"),
+            "{notice}"
+        );
+        assert!(notice.contains("gh#13"), "it names the row below: {notice}");
+        assert!(
+            notice.contains("board/gh-13"),
+            "and the branch that will move: {notice}"
+        );
+        assert!(
+            notice.contains("PR #15"),
+            "and this agent's own pull request: {notice}"
+        );
+        assert!(
+            !notice.contains("Split the watermark per endpoint."),
+            "the review below is not this agent's to answer: {notice}"
+        );
+
+        // Recorded on the layer that was reviewed, per edge.
+        let state = state_of(&e);
+        assert_eq!(state.changes_requested, Some(900));
+        assert_eq!(state.fanned_out.get("gh:o/r#20"), Some(&900));
+        // …and standing on its row, which is what the layers above derive from.
+        let below = e.db.get_task("gh:o/r#13").unwrap().unwrap();
+        assert_eq!(below.pr_changes_requested, Some(900));
+        assert_eq!(
+            e.db.get_task("gh:o/r#20")
+                .unwrap()
+                .unwrap()
+                .pr_changes_requested,
+            None,
+            "the fact belongs to the layer that was asked, not to its dependents",
+        );
+    }
+
+    /// The `hold` half of the answer: the layer above leaves the review section
+    /// in the same cycle, because a diff that is about to be replayed is not
+    /// reviewable in good faith — and this pass runs after the cycle's own
+    /// derivation, so it has to redo it.
+    #[test]
+    fn the_layer_above_comes_out_of_review_in_the_same_cycle() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+
+        e.deliver_reviews(&runtime_for_the_pair(), &stacked_pulls());
+
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Blocked,
+            "the layer above is waiting on the one below, not waiting on a human",
+        );
+        assert_eq!(
+            e.db.get_task("gh:o/r#13").unwrap().unwrap().state,
+            BoardState::Review,
+            "the layer that was reviewed is exactly where it was",
+        );
+
+        // And the row says why, in the words both viewports already render.
+        let rows = crate::rows::board_rows(&e.db, &e.cfg).unwrap();
+        let child = rows.iter().find(|r| r.id == "gh:o/r#20").unwrap();
+        assert_eq!(child.changes_below, Some(14));
+        assert_eq!(child.landing.as_deref(), Some("changes-below"));
+        assert_eq!(
+            comet_proto::view::board::landing_note(child).as_deref(),
+            Some("PR #14 below was asked to change · this rebases under it"),
+        );
+    }
+
+    /// One review, one notice per layer. The watermark is what makes the second
+    /// cycle silent — and the `updated_at` gate means it costs no call either.
+    #[test]
+    fn one_review_fans_out_once() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        let runtime = runtime_for_the_pair();
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+        assert_eq!(runtime.prompts.borrow().len(), 2);
+        let asked = rest.asked.borrow().len();
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+        assert_eq!(
+            runtime.prompts.borrow().len(),
+            2,
+            "the same review must not arrive twice anywhere: {:?}",
+            runtime
+                .prompts
+                .borrow()
+                .iter()
+                .map(|(c, _)| c.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(rest.asked.borrow().len(), asked, "and asks nothing again");
+    }
+
+    /// A dependent whose chat has been reaped is not a dependent nobody is told
+    /// about. There is no agent to inform; the human about to review that diff is
+    /// still there, and the row is the surface they are looking at.
+    #[test]
+    fn a_dependent_with_no_chat_left_is_told_on_its_row() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        let mut runtime = runtime_for_the_pair();
+        runtime.reaped.insert("chat-2".into());
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+
+        assert!(runtime.said_to("chat-2").is_none(), "there is nobody there");
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Blocked,
+            "and the row carries it anyway — silence here is the original bug, \
+             one layer down",
+        );
+        // Recorded as told, so it is not reconsidered every thirty seconds for
+        // the rest of the pull request's life.
+        assert_eq!(state_of(&e).fanned_out.get("gh:o/r#20"), Some(&900));
+    }
+
+    /// A dependent the *ledger* refused is a different case: that is a failure
+    /// with a retry in it, so nothing is recorded and the next cycle tries again.
+    #[test]
+    fn a_notice_the_ledger_refused_is_retried_rather_than_recorded() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        let mut runtime = runtime_for_the_pair();
+        runtime.prompt_fails = true;
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+        assert!(state_of(&e).fanned_out.is_empty());
+
+        // The author's own delivery failed too, so the review is refetched and
+        // both halves are tried again.
+        runtime.prompt_fails = false;
+        e.deliver_reviews(&runtime, &stacked_pulls());
+        assert!(runtime.said_to("chat-2").is_some(), "the retry told it");
+        assert_eq!(state_of(&e).fanned_out.get("gh:o/r#20"), Some(&900));
+    }
+
+    /// Direction. A review of the *upper* layer says nothing about the layer
+    /// holding it up: that one is still correct, still mergeable, still
+    /// reviewable, and telling its agent would be noise it cannot act on.
+    #[test]
+    fn nothing_fans_downwards() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![
+            (
+                "/repos/o/r/issues/15/comments".into(),
+                serde_json::json!([]),
+            ),
+            ("/repos/o/r/pulls/15/comments".into(), serde_json::json!([])),
+            (
+                "/repos/o/r/pulls/15/reviews".into(),
+                serde_json::json!([{ "id": 900, "state": "CHANGES_REQUESTED",
+                                     "body": "The emitter drops empty groups.",
+                                     "submitted_at": "2999-01-01T00:00:00Z",
+                                     "user": { "login": "b" } }]),
+            ),
+            (
+                "/repos/o/r/issues/14/comments".into(),
+                serde_json::json!([]),
+            ),
+            ("/repos/o/r/pulls/14/comments".into(), serde_json::json!([])),
+            ("/repos/o/r/pulls/14/reviews".into(), serde_json::json!([])),
+        ]));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        let runtime = runtime_for_the_pair();
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+
+        assert!(
+            runtime.said_to("chat-2").unwrap().contains("empty groups"),
+            "the reviewed layer's own author is told, as ever",
+        );
+        assert!(
+            runtime.said_to("chat-1").is_none(),
+            "and the layer below hears nothing: nothing about it changed",
+        );
+        assert_eq!(
+            e.db.get_task("gh:o/r#13").unwrap().unwrap().state,
+            BoardState::Review,
+        );
+    }
+
+    /// An approval fans out to nobody. An N-layer stack would generate O(N²)
+    /// notices over its life, every one of them "somebody below you is fine" and
+    /// none of them actionable.
+    #[test]
+    fn an_approval_does_not_fan_out() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![
+            (
+                "/repos/o/r/issues/14/comments".into(),
+                serde_json::json!([]),
+            ),
+            ("/repos/o/r/pulls/14/comments".into(), serde_json::json!([])),
+            (
+                "/repos/o/r/pulls/14/reviews".into(),
+                serde_json::json!([{ "id": 900, "state": "APPROVED",
+                                     "body": "Good — merge it.",
+                                     "submitted_at": "2999-01-01T00:00:00Z",
+                                     "user": { "login": "b" } }]),
+            ),
+        ]));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        let runtime = runtime_for_the_pair();
+
+        e.deliver_reviews(&runtime, &stacked_pulls());
+
+        assert!(runtime.said_to("chat-1").is_some(), "the author hears it");
+        assert!(runtime.said_to("chat-2").is_none(), "and nobody else does");
+        assert_eq!(state_of(&e).changes_requested, None);
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Review,
+            "the layer above is still reviewable",
+        );
+    }
+
+    /// The verdict is the *last* one, and only the two that mean anything count.
+    /// An approval withdraws the objection — including one with nothing written
+    /// in it, which interrupts nobody and still ends the wait — and a comment
+    /// leaves it exactly where it was.
+    #[test]
+    fn an_approval_withdraws_a_standing_request_and_a_comment_does_not() {
+        let asked = verdict(
+            900,
+            "changes_requested",
+            "Split the watermark.",
+            "2026-07-28T11:30:00Z",
+        );
+        let mut state = seen("2026-07-28T11:00:00Z");
+        plan(&mut state, "2026-07-28T11:30:00Z", vec![asked.clone()]);
+        assert_eq!(state.changes_requested, Some(900));
+
+        // A `commented` review says nothing about whether the objection stands.
+        let mut standing = state.clone();
+        plan(
+            &mut standing,
+            "2026-07-28T11:40:00Z",
+            vec![verdict(
+                901,
+                "commented",
+                "One more thought.",
+                "2026-07-28T11:40:00Z",
+            )],
+        );
+        assert_eq!(standing.changes_requested, Some(900));
+
+        // Nor does an ordinary comment, or a batch with no verdict in it at all.
+        let mut standing = state.clone();
+        plan(
+            &mut standing,
+            "2026-07-28T11:40:00Z",
+            vec![feedback(
+                FeedbackKind::Issue,
+                42,
+                "Fixed in abc123.",
+                "2026-07-28T11:40:00Z",
+            )],
+        );
+        assert_eq!(standing.changes_requested, Some(900));
+
+        // An approval does, prose or no prose.
+        let mut withdrawn = state.clone();
+        plan(
+            &mut withdrawn,
+            "2026-07-28T11:50:00Z",
+            vec![verdict(902, "approved", "", "2026-07-28T11:50:00Z")],
+        );
+        assert_eq!(withdrawn.changes_requested, None);
+    }
+
+    /// The verdict is not a message, so the two filters delivery applies have no
+    /// business in it: a `changes requested` older than the attempt's end is below
+    /// the first-sight floor and still outstanding.
+    #[test]
+    fn a_request_below_the_first_sight_floor_is_still_outstanding() {
+        let mut state = Delivered::default();
+        let d = plan(
+            &mut state,
+            "2026-07-28T12:00:00Z",
+            vec![verdict(
+                900,
+                "changes_requested",
+                "Not quite.",
+                "2026-07-28T09:30:00Z",
+            )],
+        );
+        assert_eq!(d, Decision::NothingNew, "nobody is handed a back catalogue");
+        assert_eq!(
+            state.changes_requested,
+            Some(900),
+            "and the layers above are still standing on a branch that will move",
+        );
     }
 
     #[test]

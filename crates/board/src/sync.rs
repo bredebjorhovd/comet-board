@@ -3708,8 +3708,17 @@ impl SyncEngine {
     /// `override_status` lets a caller (and the tests) supply chat statuses
     /// directly; otherwise the value stored on the attempt is used.
     pub fn rederive_with(&self, override_status: &HashMap<String, AgentStatus>) -> Result<()> {
-        for task in self.db.load_tasks()? {
-            let state = derive_state(derivation_for(&task, override_status));
+        let tasks = self.db.load_tasks()?;
+        // Built once for the whole board, exactly as `board_rows` builds it: the
+        // layer below a row is another row, and asking per task would be a scan
+        // per task (gh#289).
+        let deps = crate::stacks::Dependents::of(&tasks);
+        for task in tasks {
+            let state = derive_state(derivation_for(
+                &task,
+                override_status,
+                deps.changes_below(&task.id).is_some(),
+            ));
             if state != task.state {
                 self.log
                     .info(format!("{}: {} → {}", task.identifier, task.state, state));
@@ -4223,7 +4232,16 @@ impl SyncEngine {
 /// writing it asks the same question the loop does, rather than a second
 /// approximation of it. `override_status` supplies statuses by chat id; empty
 /// means "use what reconciliation last stored on the attempt".
-pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus>) -> Derivation {
+///
+/// `changes_below` is the one fact in here that is not on the task's own rows —
+/// whether a layer underneath it has been asked to change (gh#289) — so a caller
+/// with one task and no board around it passes `false` and gets the answer this
+/// row would have had before stacks existed.
+pub fn derivation_for(
+    task: &Task,
+    override_status: &HashMap<String, AgentStatus>,
+    changes_below: bool,
+) -> Derivation {
     let live = task.live_attempt().map(|a| {
         a.pane_id
             .as_deref()
@@ -4237,6 +4255,7 @@ pub fn derivation_for(task: &Task, override_status: &HashMap<String, AgentStatus
         live,
         last_outcome,
         open_pr: task.pr_open,
+        changes_below,
         local_done: task.local_done,
     }
 }

@@ -1781,6 +1781,7 @@ mod tests {
             pr_number: None,
             pr_base_ref: None,
             pr_mergeable: None,
+            changes_below: None,
             landing: None,
             stack: None,
             branch: None,
