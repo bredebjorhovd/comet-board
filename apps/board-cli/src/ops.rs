@@ -1362,11 +1362,17 @@ pub async fn onboard(
     slug: &str,
     dir: Option<&str>,
     labels: Option<&[String]>,
+    force: bool,
 ) -> Result<Onboarded> {
+    // `force` only ever sent when it was asked for: the default shape is the
+    // one every board that predates gh#343 already understands.
     let mut params = serde_json::json!({ "slug": slug });
     if let Some(object) = params.as_object_mut() {
         if let Some(dir) = dir {
             object.insert("dir".into(), serde_json::json!(dir));
+        }
+        if force {
+            object.insert("force".into(), serde_json::json!(true));
         }
         // Absent and `[]` are different instructions — see `label_filter`.
         if let Some(labels) = labels {

@@ -85,6 +85,16 @@ use crate::workspace_host::WorkspaceHost;
 
 use comet_board::dispatch::{DispatchOrigin, DispatchOverrides, VerifiedCaller};
 
+/// How long one peer gets to say what its board polls, before a repo is written
+/// into this board's config (gh#343).
+///
+/// Per device rather than across the sweep, because the sweep is concurrent: a
+/// phone that is asleep — which on this fleet is a phone, essentially always —
+/// costs the write this much wall clock and costs the box's answer nothing.
+/// Short on purpose: somebody is waiting on an `onboard`, and a peer that has
+/// not answered in five seconds is one this write proceeds without.
+const PEER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
@@ -104,10 +114,18 @@ enum BoardConfigWrite {
     /// Write the `[[route]]` + `[github] repos` halves a repo is missing, with
     /// the same writer `comet-board adopt` uses. `labels` narrows what the repo
     /// contributes (`Some([])` is "every open issue, said out loud").
+    ///
+    /// `force` writes a repo another board on this account already polls
+    /// (gh#343). Refused by default, because that pair of boards races every
+    /// issue in it and the race is invisible until two pull requests appear on
+    /// one ticket; allowed on request, because two boards over one repo is a
+    /// legitimate choice on a board where nobody dispatches.
     Adopt {
         slug: String,
         #[serde(default)]
         labels: Option<Vec<String>>,
+        #[serde(default)]
+        force: bool,
     },
     /// Stop offering a repo — you are only reading it.
     Ignore { slug: String },
@@ -149,6 +167,11 @@ struct OnboardParams {
     /// absent keeps `[github] labels`.
     #[serde(default)]
     labels: Option<Vec<String>>,
+    /// Onboard a repo another board on this account already polls (gh#343).
+    /// Refused by default — see [`BoardConfigWrite::Adopt`], which refuses the
+    /// same thing at the same moment for the same reason.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -726,6 +749,96 @@ impl EngineRpc {
         }
     }
 
+    /// The other boards on this account and what they poll, asked by the host
+    /// that is about to write a repo into its own config (gh#343).
+    ///
+    /// `doctor`'s sweep, moved to the moment it can still prevent something.
+    /// One [`methods::READ_BOARD_CONFIG`] per registered device — the same call
+    /// `doctor` and the settings page read a remote `routing.toml` with, so
+    /// what comes back is what that board actually polls rather than what this
+    /// one believes about it — and the answers are read by
+    /// [`comet_board::doctor::peer_board`], the same reader, so the check that
+    /// refuses and the check that reports cannot disagree.
+    ///
+    /// Only the boards that *answered* come back. A device that refused hosts
+    /// none; a device that could not be reached is silently absent, and
+    /// deliberately so: this list is used to refuse, and refusing on a peer
+    /// nobody could ask would block every add on the account for as long as
+    /// somebody's laptop is shut. The unasked are logged here and named by
+    /// `doctor`, which is the surface that can afford to be uncertain out loud.
+    ///
+    /// Three things this does not do, each a hazard of calling out from inside
+    /// a handler: it holds no `watch` borrow across the await (that would stall
+    /// every workspace subscriber), it fans out concurrently under one deadline
+    /// rather than sequentially (a sleeping phone must not eat the budget the
+    /// box needed), and it asks a method that never fans out itself — so no
+    /// peer can answer this by asking us back.
+    async fn peer_boards(&self) -> Vec<comet_board::doctor::PeerBoard> {
+        let local = self.doc_host.device_id().to_string();
+        let devices: Vec<comet_proto::Device> = self
+            .workspace
+            .devices()
+            .into_iter()
+            .filter(|d| d.id != local)
+            .collect();
+        let asks = devices.into_iter().map(|device| async move {
+            let name = if device.name.is_empty() {
+                device.id.clone()
+            } else {
+                device.name.clone()
+            };
+            let answer = tokio::time::timeout(
+                PEER_SWEEP_BUDGET,
+                self.forward(
+                    &device.id,
+                    methods::READ_BOARD_CONFIG,
+                    serde_json::json!({}),
+                ),
+            )
+            .await;
+            match answer {
+                Ok(Ok(RpcReply::Value(reply))) => {
+                    Some(comet_board::doctor::peer_board(name, &reply))
+                }
+                // Its own answer: no board over there, nothing to collide with.
+                Ok(Err(RpcError::Refused(_) | RpcError::UnknownMethod(_))) => None,
+                // Nobody was asked. A board there is invisible from here, and
+                // this write goes ahead rather than waiting on a dark device.
+                Ok(Err(err)) => {
+                    tracing::warn!(device = %name, error = %err, "board sweep: device not asked");
+                    None
+                }
+                Ok(Ok(RpcReply::Stream(_))) => None,
+                Err(_) => {
+                    tracing::warn!(device = %name, "board sweep: device timed out");
+                    None
+                }
+            }
+        });
+        futures::future::join_all(asks)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Refuse a repo another board on this account already polls (gh#343),
+    /// unless the caller said `force`.
+    ///
+    /// Before the write and before anything on the disk, which is the whole
+    /// change: the same collision found afterwards has already cost a duplicate
+    /// attempt.
+    async fn refuse_if_polled_elsewhere(&self, slug: &str, force: bool) -> anyhow::Result<()> {
+        if force {
+            return Ok(());
+        }
+        if let Some(refusal) = comet_board::doctor::already_polled(slug, &self.peer_boards().await)
+        {
+            anyhow::bail!(refusal);
+        }
+        Ok(())
+    }
+
     // ---- the routing surface (gh#75) ----
 
     /// The reply both config methods answer with: the file, and the repos on
@@ -811,7 +924,16 @@ impl EngineRpc {
                 adopt::ignore(&paths.routing(), &slug)?;
                 comet_board::routes::read(paths)
             }
-            BoardConfigWrite::Adopt { slug, labels } => {
+            BoardConfigWrite::Adopt {
+                slug,
+                labels,
+                force,
+            } => {
+                // Before the file is even read: a repo another board on this
+                // account polls is refused here rather than found by `doctor`
+                // afterwards, when the cheapest thing it can have cost is two
+                // agents on one ticket (gh#343).
+                self.refuse_if_polled_elsewhere(&slug, force).await?;
                 // The offer has to be current: adopting a repo the board is
                 // already watching would write a second route for it, and
                 // `adopt_with` computes its insertion point from a config it
@@ -901,6 +1023,15 @@ impl EngineRpc {
         // GitHub's casing from here on: `routing.toml` should spell the repo the
         // way the repo is spelled.
         let slug = facts.slug.clone();
+
+        // ── is somebody else already polling it? (gh#343) ──
+        //
+        // After the resolution, so a repo that does not exist still fails on
+        // the sentence about the repo, and before the clone, so a refusal
+        // leaves nothing on the disk behind it. Both halves of "fails cheapest
+        // first" still hold: this costs one relayed read per device, and only
+        // on an account that has a second device at all.
+        self.refuse_if_polled_elsewhere(&slug, p.force).await?;
 
         // ── the clone ──
         let target = checkout_path(p.dir.as_deref(), &slug, &self.repos.clone_root())?;

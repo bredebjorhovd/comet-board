@@ -219,11 +219,20 @@ pub mod methods {
     /// leaves the previous contents in `routing.toml.bak`. An edit that would
     /// break the config is refused, naming what it would have broken, and the
     /// file is untouched.
+    ///
+    /// `adopt` additionally asks the other devices on the account what *they*
+    /// poll, and refuses a repo one of them already does (gh#343). `force:
+    /// true` writes it anyway — two boards over one repo is a choice on a board
+    /// where nobody dispatches, and a race everywhere else.
     pub const WRITE_BOARD_CONFIG: &str = "WriteBoardConfig";
     /// Put a repo the board has never seen on the board, in one call (gh#97):
     /// resolve it against the board's GitHub credential, clone it on *this*
     /// device with that credential, create the space, and adopt it. Params:
-    /// `{slug, dir?, labels?}` → `Onboarded`.
+    /// `{slug, dir?, labels?, force?}` → `Onboarded`.
+    ///
+    /// A repo another board on this account already polls is refused between
+    /// the resolution and the clone, so nothing is left on the disk by a
+    /// refusal (gh#343); `force: true` onboards it anyway.
     ///
     /// Forwardable, and that is the whole point: the clone, the space and the
     /// config all belong to the board's host, and the person onboarding a repo
