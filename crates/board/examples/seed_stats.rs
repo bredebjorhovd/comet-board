@@ -108,6 +108,7 @@ fn main() -> Result<()> {
         })?;
 
         let attempt = db.insert_attempt(&NewAttempt {
+            stacked_on: None,
             task_id: task_id.clone(),
             pane_id: None,
             workspace: seed.workspace.into(),

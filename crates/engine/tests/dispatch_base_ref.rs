@@ -200,6 +200,61 @@ async fn an_unreachable_origin_refuses_rather_than_going_stale() {
     );
 }
 
+/// gh#285: the base a *stacked* dispatch is given is another attempt's branch,
+/// and this path needs no new machinery for it — a sibling's branch on origin is
+/// fetched and cut from exactly like a release branch.
+///
+/// The condition that matters is the other half: the parent has to have pushed.
+/// An unpushed parent branch is not on origin, the fetch fails, and the dispatch
+/// refuses rather than falling back to trunk — which would hand the operator a
+/// "stacked" layer whose diff is the whole feature. The refusal names the case.
+#[tokio::test]
+async fn a_stacked_base_is_cut_from_the_parents_pushed_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (origin, clone) = origin_and_clone(tmp.path()).await;
+    let repos = repos(tmp.path());
+
+    // The parent attempt's branch, as it looks once that agent has pushed.
+    let parent = repos
+        .create_worktree_on(&clone, "board/gh-12-widget", "origin/HEAD")
+        .await
+        .expect("the parent's own dispatch");
+    let parent_tip = commit(Path::new(&parent.path), "the parent's work").await;
+    git(Path::new(&parent.path), &["push", "-u", "origin", "HEAD"]).await;
+    // …and trunk moves on underneath it, so cutting from the wrong place would
+    // show.
+    commit(&origin, "unrelated trunk work").await;
+
+    let child = repos
+        .create_worktree_on(&clone, "board/gh-13-widget", "board/gh-12-widget")
+        .await
+        .expect("a dispatch cut from a sibling's branch");
+    assert_eq!(
+        head(Path::new(&child.path)).await,
+        parent_tip,
+        "the child starts at the parent's tip, not at trunk"
+    );
+
+    // The parent that has not pushed: refused, and told why.
+    let unpushed = repos
+        .create_worktree_on(&clone, "board/gh-14-widget", "origin/HEAD")
+        .await
+        .expect("a third dispatch");
+    commit(Path::new(&unpushed.path), "work nobody has seen").await;
+    let err = repos
+        .create_worktree_on(&clone, "board/gh-15-widget", "board/gh-14-widget")
+        .await
+        .expect_err("an unpushed parent branch cannot be stacked on")
+        .to_string();
+    assert!(err.contains("has not pushed it yet"), "{err}");
+    assert!(
+        !tmp.path()
+            .join("worktrees/widget/board-gh-15-widget")
+            .exists(),
+        "a refused dispatch cuts nothing"
+    );
+}
+
 /// `base = "HEAD"` is the opt-out — the pre-gh#67 behaviour, for a repo with no
 /// remote at all. It must not touch the network, and a repo with no origin must
 /// still dispatch under it.

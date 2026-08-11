@@ -3968,6 +3968,7 @@ mod tests {
         .unwrap();
         let a = db
             .insert_attempt(&crate::db::NewAttempt {
+                stacked_on: None,
                 task_id: "linear:LIN-142".into(),
                 pane_id: None,
                 workspace: "offhand".into(),

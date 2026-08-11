@@ -23,7 +23,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
-     context_used_tokens, context_max_tokens, context_compact_at_tokens";
+     context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -106,6 +106,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
                     .map(|at| at as u64),
             }),
         },
+        stacked_on: r.get(48)?,
     })
 }
 
@@ -328,7 +329,16 @@ impl Db {
               -- reclaims the checkout (gh#72) and the run journal can be
               -- compacted, while the review outlives both.
               changed_files TEXT,
-              run_evidence TEXT
+              run_evidence TEXT,
+              -- The attempt this one's branch was cut from, when it was
+              -- dispatched onto a sibling instead of onto trunk (gh#285). An
+              -- attempt id rather than the base branch name, because the branch
+              -- is the part that stops being true — a merged parent has its
+              -- branch deleted, and a child that looked for its parent by
+              -- branch equality would then find nothing. NULL is an ordinary
+              -- dispatch off the route's `base`, and every row from before
+              -- stacking existed.
+              stacked_on INTEGER REFERENCES attempts(id)
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -525,6 +535,14 @@ impl Db {
                 // Direct Comet chats can author reviewable PRs too. Existing
                 // attempts were created by Board dispatch and remain managed.
                 ("board_managed", "INTEGER NOT NULL DEFAULT 1"),
+                // The stacking edge (gh#285). NULL on every row that came
+                // before, which is what they are: nothing could be dispatched
+                // onto a sibling then, so every one of them was cut from its
+                // route's `base`. Added without the REFERENCES the fresh schema
+                // carries — `ALTER TABLE ADD COLUMN` cannot take one — which
+                // costs nothing here: the id is written by the same dispatch
+                // that read it, and nothing deletes attempt rows.
+                ("stacked_on", "INTEGER"),
             ],
         )?;
         self.add_missing_columns(
@@ -865,8 +883,8 @@ impl Db {
                 dispatched_by, dispatched_by_pane, started_at, base_sha, account,
                 repo_path,
                 dispatched_by_device, dispatched_by_user, dispatched_by_verified,
-                billed_to, board_managed)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                billed_to, board_managed, stacked_on)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -884,7 +902,8 @@ impl Db {
                 a.dispatched_by_user,
                 a.dispatched_by_verified as i64,
                 a.billed_to,
-                board_managed as i64
+                board_managed as i64,
+                a.stacked_on
             ],
         );
         match res {
@@ -1703,6 +1722,12 @@ pub struct NewAttempt {
     /// by the engine at dispatch, because which logins a device has saved is
     /// engine knowledge; `None` when it could not name one.
     pub billed_to: Option<String>,
+    /// The attempt whose branch this one was cut from (gh#285) — set only for
+    /// a dispatch that stacked onto a sibling. Written with the insert rather
+    /// than as a later update, unlike the worktree and the chat: the parent is
+    /// decided *before* anything is created, so a row that exists at all knows
+    /// what it was cut from.
+    pub stacked_on: Option<i64>,
 }
 
 pub struct NewWriteback {
@@ -1760,6 +1785,7 @@ mod tests {
 
     fn attempt(task: &str) -> NewAttempt {
         NewAttempt {
+            stacked_on: None,
             task_id: task.into(),
             pane_id: None,
             workspace: "offhand".into(),
@@ -1785,6 +1811,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed(&db, "linear:LIN-142");
         db.insert_attempt(&NewAttempt {
+            stacked_on: None,
             dispatched_by_device: Some("laptop-ana".into()),
             dispatched_by_user: Some("ana@example.com".into()),
             dispatched_by_verified: false,
