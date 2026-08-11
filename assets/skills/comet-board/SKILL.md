@@ -172,10 +172,8 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | verb | flags | what it is for |
 | --- | --- | --- |
 | `list` | `--state`, `--source`, `--json` | List what is on the board. `--json` for orchestrating agents |
-| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack` | Release a task into a coding-agent chat |
-| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack` | Release a task again — the desktop panel's Retry, from a shell |
-| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--onto`, `--base` | Release a task into a coding-agent chat |
-| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
+| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--onto`, `--base` | Release a task into a coding-agent chat |
+| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
 | `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
