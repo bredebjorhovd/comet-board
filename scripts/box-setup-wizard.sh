@@ -212,6 +212,19 @@ say "gh's device flow prints a code; open the URL on your laptop."
 gh auth status >/dev/null 2>&1 || gh auth login --hostname github.com --git-protocol https --web
 [ -d "$HOME/comet-board" ] || gh repo clone bredebjorhovd/comet-board "$HOME/comet-board"
 say "${GREEN}✓${RESET} repo at ~/comet-board"
+say ""
+say "And the stacked-pull-request extension (gh#287). It installs into gh's"
+say "data dir — box-level, shared by every agent slot, not per dispatch — so a"
+say "\`comet-board dispatch --stack\` on a box without it dies mid-task on"
+say "\`unknown command \"stack\"\`. One command, once, here:"
+if gh extension list 2>/dev/null | grep -q gh-stack; then
+  say "${GREEN}✓${RESET} gh-stack already installed"
+elif gh extension install github/gh-stack >/dev/null 2>&1; then
+  say "${GREEN}✓${RESET} gh-stack installed"
+else
+  SKIPPED+=("gh-stack extension (install it with: gh extension install github/gh-stack)")
+  warn "gh-stack install failed — \`comet-board doctor\` reports it, and a dispatched agent can install it itself"
+fi
 
 # ── 3 ──────────────────────────────────────────────────────────────────
 stage "Git identity — whose name the agents commit under"

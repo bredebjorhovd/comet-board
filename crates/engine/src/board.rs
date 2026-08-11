@@ -1496,6 +1496,7 @@ runtime = "mock"
                     model: Some("gpt-5.2".into()),
                     account: None,
                     bill: None,
+                    stack: false,
                 },
             )
             .await
@@ -2047,6 +2048,7 @@ billing_guard = "{mode}"
                     model: None,
                     account: None,
                     bill: None,
+                    stack: false,
                 },
             )
             .await

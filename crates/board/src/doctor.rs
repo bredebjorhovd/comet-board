@@ -576,8 +576,64 @@ pub fn doctor(
         &instruction_dirs(&crate::config::agent_account_dirs()),
         instructions_policy,
     ));
+    // And the one *tool* a dispatch can ask an agent for that this box may not
+    // have (gh#287). Beside the two above because it is the same question again
+    // — what can an agent here actually do — asked of the machine rather than
+    // of a config dir.
+    checks.push(gh_stack_check(gh_extensions()));
 
     Ok(checks)
+}
+
+/// Can a dispatch on this box ask for a stack (gh#287)?
+///
+/// `gh stack` is a `gh` *extension*, and it installs into the XDG data dir
+/// (`~/.local/share/gh/extensions/`) — box-level and shared by every slot,
+/// never per-run: `GH_CONFIG_DIR`, which is the only gh path the engine
+/// relocates, does not move it. So this is a property of the machine, and the
+/// first box that has never had the one command run on it is where a
+/// `dispatch --stack` finds out, halfway through a task, with `unknown command
+/// "stack" for "gh"`.
+///
+/// **It never fails the report.** Nothing in `routing.toml` says whether this
+/// box stacks — the ask is per dispatch (`--stack`) — so an absent extension is
+/// not a broken board, it is a fact about what one flag would do here. And the
+/// brief tells the agent how to repair it in place: gh#324 measured that `gh
+/// extension install` succeeds through the board's own `gh` shim on the minted
+/// installation token, needing no login of anybody's. This line is so that
+/// nobody has to discover any of that from a dead run.
+///
+/// `extensions` is what `gh extension list` printed, or `None` when `gh` could
+/// not be run at all — which is worth saying plainly rather than reporting as
+/// "not installed", the same distinction gh#155 drew for an unreachable device.
+fn gh_stack_check(extensions: Option<String>) -> Check {
+    let name = "gh stack".to_string();
+    let detail = match &extensions {
+        Some(list) if list.contains("gh-stack") => {
+            "installed — `dispatch --stack` can ask an agent for layered pull requests".to_string()
+        }
+        Some(_) => "not installed — `gh extension install github/gh-stack` (box-level, one \
+                    command); until then a `dispatch --stack` agent installs it itself on \
+                    the board's own credential"
+            .to_string(),
+        None => "not checked — `gh` could not be run from this shell".to_string(),
+    };
+    Check {
+        name,
+        ok: true,
+        detail,
+    }
+}
+
+/// What `gh extension list` says, or `None` when `gh` is not here to ask.
+fn gh_extensions() -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .args(["extension", "list"])
+        .output()
+        .ok()?;
+    // A box with no extensions at all exits non-zero on some versions and
+    // prints nothing on others; both are "gh answered, and it has none".
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Is the board CLI the one the engine beside it shipped with (gh#156)?
@@ -4749,6 +4805,38 @@ mod tests {
         let c = agent_instructions_check(&dirs, None);
         assert!(!c.ok);
         assert!(c.detail.contains("CLAUDE.md"), "{}", c.detail);
+    }
+
+    /// gh#287: the extension is box-level, and whether this box wants it is not
+    /// written anywhere — so the line reports, and never reddens a report over
+    /// a capability nothing here may ever ask for. The three answers are
+    /// distinct on purpose: a box that has it, a box that has not, and a shell
+    /// that could not ask.
+    #[test]
+    fn the_gh_stack_line_reports_and_never_fails() {
+        let installed = gh_stack_check(Some(
+            "gh stack\tgithub/gh-stack\tv0.1.0\ngh co\tgithub/gh-co\tv1\n".into(),
+        ));
+        assert!(installed.ok);
+        assert!(
+            installed.detail.starts_with("installed"),
+            "{}",
+            installed.detail
+        );
+
+        let missing = gh_stack_check(Some("gh co\tgithub/gh-co\tv1\n".into()));
+        assert!(missing.ok, "an absent extension is not a broken board");
+        assert!(
+            missing
+                .detail
+                .contains("gh extension install github/gh-stack"),
+            "{}",
+            missing.detail
+        );
+
+        let no_gh = gh_stack_check(None);
+        assert!(no_gh.ok);
+        assert!(no_gh.detail.contains("not checked"), "{}", no_gh.detail);
     }
 
     /// These checks read the provider, never the wire. Answering at all would

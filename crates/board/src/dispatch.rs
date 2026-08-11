@@ -58,7 +58,11 @@ pub fn prompt_vars<'a>(
 /// `base` is the dispatch's [`DispatchSpec::base`], and it is appended to the
 /// brief rather than interpolated into it — see [`pr_base`] for why the agent
 /// has to be told, and why the line lands on a route's own `prompt` too.
-pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str) -> String {
+///
+/// `stack` is [`DispatchOverrides::stack`], and it is appended last for the
+/// same reason and one more: [`crate::stacks::stack_brief`] answers the base
+/// sentence above it, so it has to come after the sentence it answers.
+pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str, stack: bool) -> String {
     let vars = prompt_vars(task, branch, &route.workspace);
     let template = route.prompt.clone().unwrap_or_else(|| {
         // A route with no prompt still needs to say something useful.
@@ -73,6 +77,9 @@ pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str) -> S
     let mut prompt = interpolate(&template, &vars);
     if let Some(base) = pr_base(base) {
         prompt.push_str(&pr_base_line(base));
+    }
+    if stack {
+        prompt.push_str(&crate::stacks::stack_brief(branch, pr_base(base)));
     }
     prompt
 }
@@ -450,7 +457,7 @@ pub fn build_spec(
         push_repo,
         git_author,
         repo_path,
-        prompt: resolve_prompt(route, task, &branch, &base),
+        prompt: resolve_prompt(route, task, &branch, &base, overrides.stack),
         branch,
         base,
         worktree: true,
@@ -514,6 +521,17 @@ pub struct DispatchOverrides {
     /// id. Either way it has to name the account actually billed, or it is a
     /// typo rather than consent (see [`crate::billing::acknowledges`]).
     pub bill: Option<String>,
+    /// `--stack`: decompose this task into a stack of layered pull requests
+    /// (gh#287). All it does is add [`crate::stacks::stack_brief`] to the
+    /// brief — the layers are the agent's to design and `gh stack`'s to create.
+    ///
+    /// Per dispatch rather than per route, and off by default, because an agent
+    /// deciding on its own to open five pull requests where one was expected is
+    /// a surprise worth opting into, and because how many concerns a task holds
+    /// is a property of the *work* rather than of the class of work a route
+    /// describes. A size threshold could come later; it would need a board that
+    /// has watched this work first.
+    pub stack: bool,
 }
 
 impl DispatchOverrides {
@@ -619,6 +637,44 @@ mod tests {
             device_id: "dev-1".into(),
             path: "/home/x/dev/widget".into(),
         }
+    }
+
+    /// gh#287. The flag's whole effect is the brief: the layers are the agent's
+    /// to design, and the branch names in front of it are the board's.
+    #[test]
+    fn a_dispatch_that_asks_for_a_stack_says_so_in_the_brief() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides {
+                stack: true,
+                ..DispatchOverrides::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(spec.prompt.contains("gh stack init board/gh-7-widget"));
+        assert!(spec.prompt.contains("gh stack add board/gh-7-widget-2"));
+        // And the task's own brief is still in front of it.
+        assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
+    }
+
+    /// And an ordinary dispatch pays nothing for the feature — not a sentence,
+    /// which is the point of asking rather than of a threshold.
+    #[test]
+    fn an_ordinary_dispatch_never_mentions_stacks() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(!spec.prompt.contains("gh stack"));
     }
 
     #[test]
@@ -815,6 +871,7 @@ mod tests {
             model: None,
             account: None,
             bill: None,
+            stack: false,
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -837,6 +894,7 @@ mod tests {
             model: Some("sonnet-4".into()),
             account: None,
             bill: None,
+            stack: false,
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -859,6 +917,7 @@ mod tests {
             model: None,
             account: None,
             bill: None,
+            stack: false,
         };
         let err = build_spec(
             &RoutingConfig::default(),

@@ -157,6 +157,19 @@ is this board's `review`.
   box lists but cannot start — its CLI is not installed, or it is signed out —
   is refused the same way, saying which of the two is wrong;
   `comet-board doctor` names the harnesses that box can actually run.
+- **Ask for a stack when the work is one**, with `dispatch --stack` (gh#287).
+  The agent then decomposes its task into layered pull requests with GitHub's
+  `gh stack` — one dependent concern per layer, foundations at the bottom —
+  and each layer is reviewed on its own instead of as one wall of diff. Off
+  unless asked for, on purpose: an agent opening five pull requests where one
+  was expected is a surprise, so pass it when the work is plainly several
+  stacked concerns and not on the chance that it might be. It changes the
+  brief and nothing else. The layers are the attempt's own branch and that
+  name with `-2`, `-3` on the end — that naming is how the board tells they
+  are one attempt's work rather than pull requests belonging to nobody — and
+  the row stays one row, linked to the bottom layer, `merged` only once the
+  whole stack has landed. Feedback on the upper layers does not reach the
+  agent's chat yet; only the bottom layer's does.
 - **Accounts are the operator's choice, not yours.** `routing.toml` decides
   which teammate's Claude/Codex subscription a route's work is billed to.
   `dispatch --account <id>` overrides it; do not pass it unless you were told

@@ -134,6 +134,17 @@ enum Command {
         /// `warn` and `off` it changes nothing but which slot is picked.
         #[arg(long)]
         bill: Option<String>,
+        /// Ask for a stack: have the agent decompose the task into layered
+        /// pull requests with `gh stack` (gh#287), one dependent concern per
+        /// layer, reviewed in parallel instead of as one wall of diff.
+        ///
+        /// Off unless asked for. Layer 1 is the attempt's own branch and the
+        /// ones above it are that name with `-2`, `-3` on the end, which is how
+        /// the board tells they are one attempt's work. Needs the `gh-stack`
+        /// extension on the dispatching box; the brief tells the agent how to
+        /// install it if it is missing.
+        #[arg(long)]
+        stack: bool,
     },
     /// Release a task again — the desktop panel's Retry, from a shell.
     ///
@@ -168,6 +179,12 @@ enum Command {
         /// `warn` and `off` it changes nothing but which slot is picked.
         #[arg(long)]
         bill: Option<String>,
+        /// Ask for a stack on this attempt — see `dispatch --stack` (gh#287).
+        /// Per attempt, not remembered from the last one: a retry is a fresh
+        /// brief, and the shape the first attempt was asked for is often
+        /// exactly what is being reconsidered.
+        #[arg(long)]
+        stack: bool,
     },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
@@ -693,6 +710,7 @@ fn main() -> Result<()> {
             model,
             account,
             bill,
+            stack,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -701,6 +719,7 @@ fn main() -> Result<()> {
                 model: model.as_deref(),
                 account: account.as_deref(),
                 bill: bill.as_deref(),
+                stack,
                 // Filled in from the engine below — this shell has no way to
                 // know who is signed in without asking.
                 via_user: None,
@@ -736,6 +755,7 @@ fn main() -> Result<()> {
             model,
             account,
             bill,
+            stack,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -744,6 +764,7 @@ fn main() -> Result<()> {
                 model: model.as_deref(),
                 account: account.as_deref(),
                 bill: bill.as_deref(),
+                stack,
                 // `replace` is not set here: `retry` reads the row and decides,
                 // because ending a live attempt is not something a verb should
                 // do without looking at what it is ending.
