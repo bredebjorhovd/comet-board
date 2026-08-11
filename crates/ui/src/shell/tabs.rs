@@ -1,9 +1,9 @@
 //! The session tab strip — replaces the chat header (feature spec: spaces
 //! overhaul). Every non-archived session of the selected space is a tab:
-//! agent brand icon + title + a trailing slot that shows the status dot at
-//! rest and swaps to a close button on hover. `+` at the end opens the
-//! new-session canvas (the tab materializes on first send). The strip inherits
-//! the old header's titlebar duties: 44px tall, drag region, animated
+//! a leading 5px status dot + title, and — on the SELECTED tab only — a
+//! trailing close button (`docs/design/window.md` claims B6/B7). `+` at the end
+//! opens the new-session canvas (the tab materializes on first send). The strip
+//! inherits the old header's titlebar duties: drag region, animated
 //! window-controls inset, and the toggle-changes button (git spaces only).
 //!
 //! Since gh#124 the strip is IN-SPACE NAVIGATION, not a session switcher: the
@@ -23,8 +23,17 @@ use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use crate::theme::Bed;
 use comet_proto::ChatIndicator;
 
-/// Fixed tab width (terminal tabs use 118; session titles get a bit more).
-pub(super) const SESSION_TAB_WIDTH: f32 = 140.0;
+/// Fixed tab width — the canvas draws a 150×28 tab
+/// (`docs/design/canvas/comet-window.dc.html:46`, claim B4).
+pub(super) const SESSION_TAB_WIDTH: f32 = 150.0;
+/// The status dot leading a tab, and the slot the Working spinner shares with
+/// it — the same 5px the sidebar's chat rows use (`spaces.rs::status_rail`).
+/// `Theme` names no dot diameter; the sidebar inlines this number too.
+const TAB_DOT: f32 = 5.0;
+/// The selected tab's close button (canvas line 49: an 18px box, radius 6,
+/// `--subtle`, holding an 11px glyph).
+const TAB_CLOSE: f32 = 18.0;
+const TAB_CLOSE_GLYPH: f32 = 11.0;
 /// Flex gap between tabs — part of the drop-index slot width.
 const TAB_GAP: f32 = 4.0;
 /// Width of the overflow edge fades. Wide enough that per-glyph fade steps
@@ -44,13 +53,15 @@ struct TabDragPayload {
     space: String,
     from: usize,
     title: SharedString,
-    brand: Option<(&'static str, Option<gpui::Hsla>)>,
+    dot: gpui::Hsla,
 }
 
-/// The floating tab rendered at the cursor while dragging.
+/// The floating tab rendered at the cursor while dragging — a copy of the tab,
+/// so it leads with the same status dot (the ghost never animates: a spinner
+/// under the cursor is motion about the drag, not about the run).
 struct TabGhost {
     title: SharedString,
-    brand: Option<(&'static str, Option<gpui::Hsla>)>,
+    dot: gpui::Hsla,
 }
 
 impl Render for TabGhost {
@@ -70,14 +81,14 @@ impl Render for TabGhost {
             .text_size(px(Theme::TEXT_DENSE))
             .text_color(theme.text)
             .opacity(0.85)
-            .when_some(self.brand, |el, (path, tint)| {
-                el.child(
-                    icon(path)
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(tint.unwrap_or(theme.text_muted)),
-                )
-            })
+            .child(
+                div()
+                    .size(px(TAB_DOT))
+                    // round-ok: status dot
+                    .rounded_full()
+                    .flex_none()
+                    .bg(self.dot),
+            )
             .child(div().truncate().child(self.title.clone()))
     }
 }
@@ -199,7 +210,10 @@ impl Shell {
             .as_deref()
             .map(|space| self.tab_ids(space, cx))
             .unwrap_or_default();
-        let tabs: Vec<(String, SharedString, Option<comet_proto::HarnessId>, ChatIndicator)> = {
+        // No harness mark on a tab: the canvas leads with the status dot and
+        // nothing else (claim B6). The harness still identifies the run in the
+        // sidebar's chat rows.
+        let tabs: Vec<(String, SharedString, ChatIndicator)> = {
             let state = self.state.read(cx);
             order
                 .iter()
@@ -210,7 +224,6 @@ impl Shell {
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )),
-                        chat.config.as_ref().map(|c| c.harness),
                         state.display_status_for(chat, now),
                     ))
                 })
@@ -246,12 +259,12 @@ impl Shell {
         let tab_elements: Vec<AnyElement> = tabs
             .into_iter()
             .enumerate()
-            .map(|(ix, (id, title, harness, status))| {
+            .map(|(ix, (id, title, status))| {
                 let is_selected = selected.as_deref() == Some(id.as_str());
                 let is_hovered = hovered.as_deref() == Some(id.as_str());
-                // Hover state lives in Shell (the trailing slot swaps dot ↔
-                // close), so the wash snaps off it too — gpui allows only one
-                // `on_hover` per element, and the state listener wins.
+                // Hover state lives in Shell, so the wash snaps off it — gpui
+                // allows only one `on_hover` per element, and the state
+                // listener wins.
                 // Three tones, three states: the selected tab reads as a
                 // title, hover lifts to body, the rest sit at label weight.
                 // The surface comes from the app's row helper — a tab is a
@@ -271,20 +284,49 @@ impl Shell {
                 } else {
                     (theme.text_subtle, paint.rest)
                 };
-                let brand = harness.map(crate::pickers::harness_brand_icon);
                 let select_id = id.clone();
                 let close_id = id.clone();
                 let middle_id = id.clone();
                 let hover_id = id.clone();
                 let drag_space = space_id.clone().unwrap_or_default();
+                // The dot LEADS the tab (claim B6, canvas line 47) and is the
+                // only status colour on it — the title stays a text tone. It is
+                // the sidebar's chat-row rail exactly: a 5px slot, and Working
+                // animates in it (the miniaturized gradient spinner) instead of
+                // sitting still.
+                let dot = spaces::status_dot_color(status, &theme);
+                let leading: AnyElement = if status == ChatIndicator::Working {
+                    div()
+                        .w(px(TAB_DOT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(loaders::mini_gradient_spinner(
+                            format!("tab-working-{id}"),
+                            2.0,
+                        ))
+                        .into_any_element()
+                } else {
+                    div()
+                        .size(px(TAB_DOT))
+                        // round-ok: status dot
+                        .rounded_full()
+                        .flex_none()
+                        .bg(dot)
+                        .into_any_element()
+                };
+                // Only the SELECTED tab carries a close button (claim B7), and
+                // it carries it at rest — not on hover. An unselected tab is
+                // closed by selecting it first, or by middle-click.
                 // NB: no `.occlude()` on the close button — the TAB already
                 // occludes (for the titlebar drag region), and an occluding
                 // child would block the tab's own hover hit-test: a flicker
                 // loop (user-reported). `stop_propagation` on click is enough.
-                let trailing: AnyElement = if is_hovered {
+                let trailing: Option<AnyElement> = is_selected.then(|| {
                     div()
                         .id(SharedString::from(format!("session-tab-close-{id}")))
-                        .size(px(20.0))
+                        .size(px(TAB_CLOSE))
                         .flex_none()
                         .flex()
                         .items_center()
@@ -297,34 +339,11 @@ impl Shell {
                         }))
                         .child(
                             icon(icons::CLOSE)
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
+                                .size(px(TAB_CLOSE_GLYPH))
+                                .text_color(theme.text_subtle),
                         )
                         .into_any_element()
-                } else {
-                    // Working animates (the sidebar's miniaturized gradient
-                    // spinner) instead of a static dot; every other non-idle
-                    // status stays a dot.
-                    let dot = spaces::status_dot_color(status, &theme);
-                    div()
-                        .size(px(20.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(status == ChatIndicator::Working, |el| {
-                            el.child(loaders::mini_gradient_spinner(
-                                format!("tab-working-{id}"),
-                                2.0,
-                            ))
-                        })
-                        .when(
-                            !matches!(status, ChatIndicator::Idle | ChatIndicator::Working),
-                            // round-ok: status dot
-                            |el| el.child(div().size(px(6.0)).rounded_full().bg(dot)),
-                        )
-                        .into_any_element()
-                };
+                });
                 let tab_el = div()
                     .id(SharedString::from(format!("session-tab-{id}")))
                     .w(px(SESSION_TAB_WIDTH))
@@ -350,9 +369,9 @@ impl Shell {
                     // drag-region carve-out and lets the strip scroll.
                     .block_mouse_except_scroll()
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    // Track hover in Shell state: the trailing slot flips
-                    // between dot and close button (hover_blend only fades
-                    // colors; child swaps need real state).
+                    // Track hover in Shell state: the tab's three tones are
+                    // picked in Rust (selected / hovered / at rest), so the
+                    // hover has to be a value this render can read.
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.tab_hover = Some(hover_id.clone());
@@ -379,25 +398,18 @@ impl Shell {
                             space: drag_space,
                             from: ix,
                             title: title.clone(),
-                            brand,
+                            dot,
                         },
                         |payload, _point, _, cx| {
                             let title = payload.title.clone();
-                            let brand = payload.brand;
+                            let dot = payload.dot;
                             cx.stop_propagation();
-                            cx.new(|_| TabGhost { title, brand })
+                            cx.new(|_| TabGhost { title, dot })
                         },
                     )
-                    .when_some(brand, |el, (path, tint)| {
-                        el.child(
-                            icon(path)
-                                .size(px(14.0))
-                                .flex_none()
-                                .text_color(tint.unwrap_or(text_color)),
-                        )
-                    })
+                    .child(leading)
                     .child(div().flex_1().min_w_0().truncate().child(title))
-                    .child(trailing);
+                    .children(trailing);
 
                 // Sliding transform while a sibling is dragged over: animate
                 // 150ms between committed offsets (terminal-panel idiom).
@@ -557,12 +569,12 @@ impl Shell {
             tab_region.into_any_element()
         };
 
-        // Tabs live above the INSET CARD: sidebar open → they start at the
-        // card's left edge (+ its content pad); collapsed → they glide left
-        // (on the sidebar width tween) until they sit next to the control
-        // cluster.
-        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
+        // The strip starts right after the control cluster and STAYS there
+        // (claim B3: x=172), whatever the sidebar does. It is titlebar
+        // furniture, not a header for the card below it: the canvas runs the
+        // first tab straight across the sidebar divider at x=256, with the
+        // divider (claim A3) passing full height behind it.
+        let tabs_left = self.title_bar_content_start();
         // The board toggle (§gh#70): a sibling of the changes
         // toggle, showing an active wash while the board dock is open. Not
         // gated on git — the board is a global queue, not a checkout view.
