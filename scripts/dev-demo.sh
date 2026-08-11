@@ -19,7 +19,10 @@ echo "▸ building (first run takes a few minutes)…"
 cargo build -p comet -q
 
 echo "▸ starting engine daemon on :$IPC"
-env COMET_DATA_DIR="$DAEMON_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock \
+# COMET_EDGE_URL=off is what makes this offline claim true: without it the
+# daemon reaches for the edge and dies with "not signed in — run `comet
+# login`", which is the one thing this script promises you do not need.
+env COMET_EDGE_URL=off COMET_DATA_DIR="$DAEMON_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock \
   ${DELAY:+COMET_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
   ./target/debug/comet headless &
 DAEMON_PID=$!
@@ -35,15 +38,19 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   echo "▸ seeding demo chats"
   DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
   # One space per demo folder, created up-front (chats join by space id).
-  declare -A SPACES=()
+  #
+  # Kept to plain variables rather than `declare -A`: macOS ships bash 3.2 and
+  # has since 2007, so an associative array makes this script run everywhere
+  # EXCEPT the machine the headed app is judged on.
+  space_var() { printf 'SPACE_%s' "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_')"; }
   for project in comet-native soccertcg comet aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
     probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
-    SPACES[$project]="$sid"
+    eval "$(space_var "$project")=\$sid"
   done
   seed() { # title project branch age_hours run
     local id; id=$(uuidgen | tr 'A-Z' 'a-z')
-    local sid="${SPACES[$2]}"
+    local sid; eval "sid=\$$(space_var "$2")"
     probe Mutate "{\"op\":\"createChat\",\"chatId\":\"$id\",\"spaceId\":\"$sid\",\"config\":{\"harness\":\"mock\",\"model\":\"fable-5\",\"reasoning\":null,\"sandbox\":\"workspace-write\"}}" >/dev/null
     probe Mutate "{\"op\":\"renameChat\",\"chatId\":\"$id\",\"title\":\"$1\"}" >/dev/null
     probe Mutate "{\"op\":\"setChatBranch\",\"chatId\":\"$id\",\"branch\":\"$3\"}" >/dev/null
@@ -62,4 +69,5 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
 fi
 
 echo "▸ opening comet (composer is live — type into it; --slow shows streaming)"
-COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/comet
+COMET_EDGE_URL=off COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC RUST_LOG=warn \
+  ./target/debug/comet
