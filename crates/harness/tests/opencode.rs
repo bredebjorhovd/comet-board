@@ -182,6 +182,84 @@ async fn assert_serve_reaped(dir: &tempfile::TempDir) {
     );
 }
 
+/// Regression for gh#310: every fake-serve test above depends on the fixture
+/// playing its scenario, and the fixture used to be able to lose the cue.
+///
+/// The prompt and the `/event` subscription arrive on two different
+/// connections, so nothing orders the prompt against the `/event` handler
+/// reaching its wait. A dropped wakeup there is silent: the feed stays open and
+/// empty, the harness has nothing to read, and the run hangs until the test's
+/// deadline — which is what `idle_mid_turn_…` did on a loaded CI runner while
+/// passing on a re-run of the same commit.
+///
+/// So this drives the fixture directly in the losing order — prompt first,
+/// subscription second — which is the accident CI reproduced, made
+/// deterministic. The cue has to be latched, not signalled.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_prompt_that_lands_before_the_feed_subscribes_still_plays() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut serve = tokio::process::Command::new(fake_bin())
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("fake serve spawns");
+    let mut stdout = BufReader::new(serve.stdout.take().expect("stdout")).lines();
+    let line = tokio::time::timeout(common::scaled(FEED_DEADLINE), stdout.next_line())
+        .await
+        .expect("fake serve announced its port in time")
+        .expect("stdout readable")
+        .expect("fake serve printed a listening line");
+    let base = line
+        .rsplit_once(' ')
+        .map(|(_, url)| url.to_string())
+        .expect("listening line carries the url");
+
+    let http = reqwest::Client::new();
+    // The prompt goes in before anything is listening to the feed.
+    let prompted = http
+        .post(format!("{base}/session/ses_fake/prompt_async"))
+        .body(r#"{"parts":[{"type":"text","text":"scenario:stream-end"}]}"#)
+        .send()
+        .await
+        .expect("prompt accepted");
+    assert!(prompted.status().is_success(), "{:?}", prompted.status());
+
+    let res = http
+        .get(format!("{base}/event"))
+        .send()
+        .await
+        .expect("feed subscribed");
+    let mut feed = String::new();
+    let played = tokio::time::timeout(common::scaled(FEED_DEADLINE), async {
+        let mut chunks = res.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let Ok(bytes) = chunk else { break };
+            feed.push_str(&String::from_utf8_lossy(&bytes));
+            if feed.contains("message.part.delta") {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        played.is_ok(),
+        "the feed never played the scenario within {} — the prompt that arrived \
+         before this subscription was dropped. Feed so far: {feed:?}",
+        common::deadline_note(FEED_DEADLINE),
+    );
+    let _ = serve.kill().await;
+}
+
+/// Ceiling on the fixture-level feed assertions, before [`common::scaled`].
+#[cfg(unix)]
+const FEED_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Regression for gh#23: opencode closes its SSE feed for reasons that are NOT
 /// death (idle-parked / one-shot subscription). The harness must read the EOF
 /// as a clean stream end — a Completed turn, never an Errored crash — and must

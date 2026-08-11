@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::watch;
 
 const SESSION_ID: &str = "ses_fake";
 
@@ -84,14 +84,23 @@ async fn main() -> std::io::Result<()> {
 
     // The harness opens /event BEFORE sending the prompt, so the SSE handler
     // must wait until prompt_async arrives before playing its scenario.
-    let prompt = Arc::new(Notify::new());
-    let scenario = Arc::new(Mutex::new(None));
+    //
+    // A latch, not a notification (gh#310): the prompt lands on a *different*
+    // connection, so nothing orders it against the `/event` task reaching its
+    // wait. `Notify::notify_waiters()` drops a wakeup that has no waiter yet,
+    // and on a loaded CI runner the `/event` task is often still between its
+    // preamble write and its await when the prompt arrives — the scenario was
+    // then never played, the harness read an empty feed, and the test hung to
+    // its deadline. A `watch` holds the value, so a receiver that arrives late
+    // still sees it.
+    let (scenario_tx, scenario_rx) = watch::channel(None);
+    let scenario_tx = Arc::new(scenario_tx);
     loop {
         let (stream, _) = listener.accept().await?;
-        let prompt = prompt.clone();
-        let scenario = scenario.clone();
+        let scenario_tx = scenario_tx.clone();
+        let scenario_rx = scenario_rx.clone();
         tokio::spawn(async move {
-            handle(stream, prompt, scenario).await;
+            handle(stream, scenario_tx, scenario_rx).await;
         });
     }
 }
@@ -104,8 +113,8 @@ struct Request {
 
 async fn handle(
     mut stream: TcpStream,
-    prompt: Arc<Notify>,
-    scenario: Arc<Mutex<Option<Scenario>>>,
+    scenario_tx: Arc<watch::Sender<Option<Scenario>>>,
+    scenario_rx: watch::Receiver<Option<Scenario>>,
 ) {
     let Some(request) = read_request(&mut stream).await else {
         return;
@@ -133,15 +142,17 @@ async fn handle(
             } else {
                 Scenario::Happy
             };
-            *scenario.lock().await = Some(sc);
-            prompt.notify_waiters();
+            // Latched before the 200 goes out: the harness may not send
+            // anything else, so this value is all the `/event` handler ever
+            // gets — and it must survive arriving before that handler waits.
+            scenario_tx.send_replace(Some(sc));
             respond(&mut stream, 200, "{}").await;
         }
         ("POST", path) if path.ends_with("/abort") => {
             respond(&mut stream, 200, "{}").await;
         }
         ("GET", "/event") => {
-            serve_events(stream, prompt, scenario).await;
+            serve_events(stream, scenario_rx).await;
         }
         ("GET", "/config/providers") => {
             respond(&mut stream, 200, "{\"providers\":[],\"default\":{}}").await;
@@ -159,11 +170,7 @@ const SLOW_TURN_SLEEP: Duration = Duration::from_secs(2);
 /// delivers EOF to the harness's reader while this process stays alive (the
 /// accept loop above keeps serving, and `shutdown_child`'s SIGTERM is what
 /// actually ends the process).
-async fn serve_events(
-    mut stream: TcpStream,
-    prompt: Arc<Notify>,
-    scenario: Arc<Mutex<Option<Scenario>>>,
-) {
+async fn serve_events(mut stream: TcpStream, mut scenario: watch::Receiver<Option<Scenario>>) {
     let preamble = "HTTP/1.1 200 OK\r\n\
                     Content-Type: text/event-stream\r\n\
                     Cache-Control: no-cache\r\n\
@@ -171,8 +178,14 @@ async fn serve_events(
     if stream.write_all(preamble.as_bytes()).await.is_err() {
         return;
     }
-    prompt.notified().await;
-    let sc = scenario.lock().await.unwrap_or(Scenario::Happy);
+    // Waits for the prompt, or returns straight away if it already arrived —
+    // `wait_for` tests the value it is given before it ever sleeps, which is
+    // the whole point of the latch (gh#310).
+    let sc = match scenario.wait_for(Option::is_some).await {
+        Ok(seen) => (*seen).unwrap_or(Scenario::Happy),
+        // Every sender dropped: the server is going away, nothing left to play.
+        Err(_) => return,
+    };
     if sc == Scenario::SlowTurn {
         // A slow-but-progressing run: stream heartbeats (the real `/event`
         // handler emits one every 10s) past the total request deadline, then
