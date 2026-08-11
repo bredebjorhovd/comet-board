@@ -252,6 +252,35 @@ pub fn derive_state(d: Derivation) -> BoardState {
     }
 }
 
+/// A pull request's place in a GitHub stack.
+///
+/// GitHub's stacked pull requests are in public preview, and the `stack` object
+/// it hangs off a pull request is absent on every standalone PR — so this is
+/// `Option` at every layer that carries it, and the parser that builds it
+/// treats a shape it does not recognise as "not stacked" rather than as an
+/// error. A preview that renames a field must cost the board its stack view,
+/// never its sync (gh#282).
+///
+/// Stored flat on the task row rather than as a JSON blob: these four facts are
+/// what sibling grouping, retarget detection and parent-feedback fan-out all
+/// read, and a column is greppable from `sqlite3 board.db` the way every other
+/// `pr_*` field already is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrStack {
+    /// Identifies the stack — every PR in one carries the same value. This is
+    /// what siblings are grouped by, so it is the one field required to call a
+    /// PR stacked at all.
+    pub number: i64,
+    /// How many pull requests the stack holds, per GitHub.
+    pub size: Option<i64>,
+    /// This pull request's place in it, counting from the bottom.
+    pub position: Option<i64>,
+    /// The branch the *stack* targets — the bottom PR's base, which is where
+    /// the whole stack eventually lands. Distinct from [`Task::pr_base_ref`],
+    /// which for any PR above the bottom is the branch below it.
+    pub base_ref: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 // `source_state`, `updated_at` and `synced_at` are stored columns required by
 // impl spec §3 and are read by `sqlite3 board.db` when debugging; the UI derives
@@ -280,6 +309,13 @@ pub struct Task {
     /// GitHub's `mergeable_state` — `behind` and `dirty` are the ones that
     /// matter when several branches are in flight at once.
     pub pr_mergeable: Option<String>,
+    /// The branch the PR merges *into*. Half of the topology: `head_ref` said
+    /// where the work is, and the board never asked where it lands, so a PR
+    /// retargeted when its parent merged looked exactly like one that had not
+    /// moved (gh#282).
+    pub pr_base_ref: Option<String>,
+    /// Set only when GitHub says this PR is part of a stack.
+    pub pr_stack: Option<PrStack>,
     pub updated_at: String,
     pub synced_at: String,
     /// Populated by the read path, not stored on the row.

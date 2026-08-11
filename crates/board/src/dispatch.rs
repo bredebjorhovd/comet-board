@@ -590,6 +590,8 @@ mod tests {
             pr_open: false,
             pr_merged: false,
             pr_mergeable: None,
+            pr_base_ref: None,
+            pr_stack: None,
             updated_at: String::new(),
             synced_at: String::new(),
             attempts: vec![],

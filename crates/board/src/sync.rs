@@ -601,6 +601,11 @@ impl SyncEngine {
                     .db
                     .set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), pr.open);
                 let _ = self.db.set_pr_merged(&pr.task_id(), pr.merged);
+                // Free: the pull list already carried both (gh#282).
+                let stack = pr.stack.as_ref();
+                let _ = self
+                    .db
+                    .set_pr_topology(&pr.task_id(), Some(&pr.base_ref), stack);
                 if check_mergeable && pr.open {
                     let state = gh.mergeable_state(&pr.repo, pr.number);
                     let _ = self.db.set_pr_mergeable(&pr.task_id(), state.as_deref());
@@ -852,6 +857,10 @@ impl SyncEngine {
             };
             self.db
                 .set_pr(&task.id, Some(&pr.url), Some(pr.number), pr.open)?;
+            // A Linear issue's PR is topologically a PR like any other, and 7/9
+            // reads the base off the task row whichever source put it there.
+            self.db
+                .set_pr_topology(&task.id, Some(&pr.base_ref), pr.stack.as_ref())?;
             // Observing the merge is the same fact as performing it. A PR
             // merged with `gh pr merge` or on the web must not leave its
             // ticket in review forever — and not merely unadvanced: nothing
@@ -6755,11 +6764,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: None,
             open: true,
             merged: false,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         };
         let branches = e.attempt_branches();
@@ -6769,6 +6780,61 @@ max_duration = "{max_duration}"
         assert!(e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_open);
         // The unrelated task must not pick up the PR.
         assert!(!e.db.get_task("linear:LIN-999").unwrap().unwrap().pr_open);
+    }
+
+    #[test]
+    fn linking_a_pull_request_records_its_topology_and_forgets_it_again() {
+        // gh#282. The linked PR is the only place a Linear row learns where its
+        // branch lands, and a stack a PR has left must not linger on the row —
+        // sibling grouping would keep merging it into a stack it is out of.
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+
+        let mut pr = PullRequest {
+            repo: "o/r".into(),
+            number: 291,
+            title: "Add retry".into(),
+            body: None,
+            url: "https://github.com/o/r/pull/291".into(),
+            head_ref: "board/lin-142".into(),
+            base_ref: "board/lin-141".into(),
+            head_repo: None,
+            base_sha: None,
+            open: true,
+            merged: false,
+            draft: false,
+            stack: Some(crate::model::PrStack {
+                number: 4,
+                size: Some(3),
+                position: Some(2),
+                base_ref: Some("main".into()),
+            }),
+            updated_at: crate::db::now(),
+        };
+        e.link_pull_requests(std::slice::from_ref(&pr)).unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.pr_base_ref.as_deref(), Some("board/lin-141"));
+        assert_eq!(
+            task.pr_stack,
+            Some(crate::model::PrStack {
+                number: 4,
+                size: Some(3),
+                position: Some(2),
+                base_ref: Some("main".into()),
+            })
+        );
+
+        // The parent merged, the PR was retargeted onto main, and it is no
+        // longer stacked.
+        pr.base_ref = "main".into();
+        pr.stack = None;
+        e.link_pull_requests(std::slice::from_ref(&pr)).unwrap();
+
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(task.pr_base_ref.as_deref(), Some("main"));
+        assert_eq!(task.pr_stack, None);
     }
 
     #[derive(Clone)]
@@ -6836,11 +6902,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/265".into(),
             head_ref: "direct-pr".into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: Some(base.clone()),
             open: true,
             merged: false,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         };
         e.db.upsert_task(&pr.to_upsert()).unwrap();
@@ -6961,11 +7029,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/266".into(),
             head_ref: "comet/remote-pr".into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: Some("base".into()),
             open: true,
             merged: false,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         };
         e.db.upsert_task(&pr.to_upsert()).unwrap();
@@ -6994,11 +7064,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/another/repo/pull/9".into(),
             head_ref: "comet/remote-pr".into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: Some("other-base".into()),
             open: true,
             merged: false,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         };
 
@@ -7028,11 +7100,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/upstream/r/pull/267".into(),
             head_ref: "feature".into(),
+            base_ref: "main".into(),
             head_repo: Some("person/r".into()),
             base_sha: Some("base".into()),
             open: true,
             merged: false,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         };
         e.db.upsert_task(&pr.to_upsert()).unwrap();
@@ -7091,11 +7165,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/bredebjorhovd/OIOS/pull/10".into(),
             head_ref: "board/gh-2".into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: None,
             open: false,
             merged: true,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         }])
         .unwrap();
@@ -7170,11 +7246,13 @@ max_duration = "{max_duration}"
             body: None,
             url: "https://github.com/o/r/pull/291".into(),
             head_ref: "board/lin-142".into(),
+            base_ref: "main".into(),
             head_repo: None,
             base_sha: None,
             open: false,
             merged: true,
             draft: false,
+            stack: None,
             updated_at: crate::db::now(),
         }
     }

@@ -1489,6 +1489,8 @@ mod tests {
             pr_open: true,
             pr_merged: false,
             pr_mergeable: None,
+            pr_base_ref: None,
+            pr_stack: None,
             updated_at: "t".into(),
             synced_at: "t".into(),
             attempts: vec![attempt],
