@@ -22,7 +22,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      dispatched_by_device, dispatched_by_user, dispatched_by_verified, billed_to, \
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
-     cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed";
+     cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
+     context_used_tokens, context_max_tokens, context_compact_at_tokens";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -91,6 +92,20 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         claims_at: r.get(42)?,
         claims_error: r.get(43)?,
         board_managed: r.get::<_, i64>(44)? != 0,
+        // Written as a set, like the tokens above, and read on the same terms:
+        // `context_max_tokens` is the witness, because a fullness without a
+        // window is not a reading — see [`comet_proto::ContextUsage`] (gh#271).
+        context: match r.get::<_, Option<i64>>(46)? {
+            None => None,
+            Some(max) => Some(comet_proto::ContextUsage {
+                used_tokens: r.get::<_, Option<i64>>(45)?.unwrap_or(0).max(0) as u64,
+                max_tokens: max.max(0) as u64,
+                compact_at_tokens: r
+                    .get::<_, Option<i64>>(47)?
+                    .filter(|at| *at > 0)
+                    .map(|at| at as u64),
+            }),
+        },
     })
 }
 
@@ -253,6 +268,18 @@ impl Db {
               output_tokens INTEGER,
               cache_read_tokens INTEGER,
               cache_creation_tokens INTEGER,
+              -- How full the attempt's context window was when its harness
+              -- last said (gh#271). The other meter, and a different kind of
+              -- number: these are OVERWRITTEN by each reading, never added to,
+              -- because fullness is a level. Nullable for the tokens' reason —
+              -- a harness that meters no window, and every row from before
+              -- this existed, honestly reported nothing.
+              context_used_tokens INTEGER,
+              context_max_tokens INTEGER,
+              -- Where that harness would auto-compact, when it names such a
+              -- point (Claude does; codex fails the turn instead). NULL is
+              -- "no threshold reported", which is not "no compaction".
+              context_compact_at_tokens INTEGER,
               -- The model the harness announced for the run, recorded beside
               -- the tokens. The route's override is not it: most routes name
               -- none, so the column would be NULL exactly where the breakdown
@@ -446,6 +473,13 @@ impl Db {
                 ("cache_read_tokens", "INTEGER"),
                 ("cache_creation_tokens", "INTEGER"),
                 ("model", "TEXT"),
+                // Context fullness (gh#271), on the tokens' terms exactly:
+                // nullable, no default, existing rows keep NULL and read as
+                // "reported nothing". Backfilling is impossible here too — the
+                // level is a fact about a moment that has passed.
+                ("context_used_tokens", "INTEGER"),
+                ("context_max_tokens", "INTEGER"),
+                ("context_compact_at_tokens", "INTEGER"),
                 // Build-output sweeping (gh#186). Existing rows keep NULL on
                 // both, which reads as "never marked, never swept" — so the
                 // 109 GiB already sitting in the worktree root is swept on the
@@ -1047,6 +1081,33 @@ impl Db {
                 usage.cache_read_tokens as i64,
                 usage.cache_creation_tokens as i64,
                 model,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record how full an attempt's context window is (gh#271).
+    ///
+    /// **Overwrites, never accumulates** — the opposite of
+    /// [`Self::set_attempt_tokens`] beside it, and the difference is the whole
+    /// point: spend is a total that only grows, fullness is a level that can
+    /// (and after a compaction, does) fall. The three columns are written
+    /// together so `context_max_tokens IS NULL` is a sound witness for "this
+    /// attempt reported no window", which the reader keys the option on.
+    pub fn set_attempt_context(
+        &self,
+        attempt_id: i64,
+        context: comet_proto::ContextUsage,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET context_used_tokens = ?2, context_max_tokens = ?3,
+                 context_compact_at_tokens = ?4
+               WHERE id = ?1",
+            params![
+                attempt_id,
+                context.used_tokens as i64,
+                context.max_tokens as i64,
+                context.compact_at_tokens.map(|at| at as i64),
             ],
         )?;
         Ok(())

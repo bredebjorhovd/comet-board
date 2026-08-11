@@ -207,7 +207,15 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
                 });
             }
         }
-        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage(_) => {}
+        // Neither meter enters the doc. Spend stays out per ARCHITECTURE.md
+        // (token display is not transcript content), and fullness follows it
+        // for a second reason of its own: it is a *level*, so a doc that kept
+        // every reading would replay a hundred stale gauges to anybody
+        // scrolling back, none of them true any more. The live event and the
+        // attempt row carry it instead (gh#271).
+        AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::Usage(_)
+        | AgentEvent::ContextUsage(_) => {}
     }
     out
 }

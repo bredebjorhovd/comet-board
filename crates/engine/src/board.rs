@@ -688,6 +688,7 @@ fn handle_dispatch(
         // release below can take its place. Its tokens are read first, for the
         // reason `handle_cancel` reads them first (gh#151).
         engine.record_tokens(Some(runtime), attempt);
+        engine.record_context(Some(runtime), attempt);
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {
@@ -912,6 +913,7 @@ fn handle_cancel(
         // never goes through reconcile, so this is the attempt's last chance
         // to record what it spent (gh#151).
         engine.record_tokens(Some(runtime), attempt);
+        engine.record_context(Some(runtime), attempt);
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {

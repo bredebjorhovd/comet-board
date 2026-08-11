@@ -321,6 +321,76 @@ impl std::iter::Sum for TokenUsage {
     }
 }
 
+/// How full the agent's context window is right now (gh#271).
+///
+/// **A different number from [`TokenUsage`], and it must never be confused
+/// with one.** Tokens spent are a flow — they add up over a run, and a long
+/// session's total can be many times the window. Context fullness is a level:
+/// it says how much of the window the *next* request will carry, which is what
+/// predicts the moment the harness compacts away the context the agent is
+/// working from (or, worse, has already started thrashing against). Two
+/// attempts with identical spend can sit at 12% and 94%.
+///
+/// **A snapshot, never cumulative and never summed.** The last one reported
+/// wins; adding two of these together is meaningless. That is why it rides its
+/// own [`AgentEvent::ContextUsage`] instead of widening `TokenUsage`, whose
+/// whole contract is that its four buckets add up (see gh#151).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ContextUsage {
+    /// Tokens occupying the window — system prompt, tools, memory files and
+    /// the conversation so far, as the harness accounts for them.
+    pub used_tokens: u64,
+    /// The window they occupy. **Zero means the harness did not say**, and
+    /// every derived share below is then `None` rather than a made-up
+    /// denominator.
+    pub max_tokens: u64,
+    /// The level at which this harness auto-compacts, when it has one and
+    /// names it (Claude's `autoCompactThreshold`). `None` is "no such point
+    /// was reported" — auto-compaction off, or a harness that never had it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_at_tokens: Option<u64>,
+}
+
+impl ContextUsage {
+    /// Share of the window in use, `0.0..=1.0`. `None` when no window was
+    /// reported — see [`max_tokens`](Self::max_tokens).
+    pub fn fraction(&self) -> Option<f64> {
+        (self.max_tokens > 0).then(|| (self.used_tokens as f64 / self.max_tokens as f64).min(1.0))
+    }
+
+    /// The same share as a rounded percentage, `0..=100`.
+    pub fn percent(&self) -> Option<u8> {
+        self.fraction().map(|f| (f * 100.0).round() as u8)
+    }
+
+    /// Tokens left before the harness compacts, when it named a threshold.
+    /// Saturating: already past it reads as `0`, not as a wrapped headroom.
+    pub fn until_compact(&self) -> Option<u64> {
+        self.compact_at_tokens
+            .map(|at| at.saturating_sub(self.used_tokens))
+    }
+
+    /// Is this attempt at the point where compaction is imminent — past the
+    /// harness's own threshold, or (absent one) past `ratio` of the window?
+    ///
+    /// The threshold is preferred because it is the harness's own answer;
+    /// `ratio` is the fallback for a harness that meters fullness but does not
+    /// compact on a number it will state.
+    pub fn is_near_compaction(&self, ratio: f64) -> bool {
+        match self.compact_at_tokens {
+            Some(at) if at > 0 => self.used_tokens >= at,
+            _ => self.fraction().is_some_and(|f| f >= ratio),
+        }
+    }
+
+    /// Nothing was measured. Distinct from a *reported* empty window, which
+    /// cannot happen: a window always holds at least a system prompt.
+    pub fn is_zero(&self) -> bool {
+        self.used_tokens == 0 && self.max_tokens == 0
+    }
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -381,6 +451,15 @@ pub enum AgentEvent {
     /// that is the one property both harnesses had to be settled on before
     /// anything could be added up.
     Usage(TokenUsage),
+    /// How full the context window is at this moment (gh#271) — a level, not a
+    /// flow. See [`ContextUsage`] for why it is not folded into `Usage`.
+    ///
+    /// Emitted repeatedly *within* a turn (Claude polls its control channel,
+    /// Codex derives it from the token-usage snapshots it already streams) and
+    /// **never after that turn's [`Done`](AgentEvent::Done)**: the run journal
+    /// reads a trailing non-`Done` event as a run that died mid-stream, and an
+    /// event that arrives late must not make a finished attempt look live.
+    ContextUsage(ContextUsage),
     Error {
         message: String,
     },
@@ -494,6 +573,79 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(huge.merged(a).input_tokens, u64::MAX);
+    }
+
+    /// Fullness is a level: the wire keeps it flat and additive-free, and a
+    /// reader that predates the event simply does not know the variant.
+    #[test]
+    fn context_usage_rides_its_own_event_with_a_flat_shape() {
+        let ev = AgentEvent::ContextUsage(ContextUsage {
+            used_tokens: 120_000,
+            max_tokens: 200_000,
+            compact_at_tokens: Some(167_000),
+        });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "contextUsage");
+        assert_eq!(json["usedTokens"], 120_000);
+        assert_eq!(json["maxTokens"], 200_000);
+        assert_eq!(json["compactAtTokens"], 167_000);
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), ev);
+        // A harness that meters fullness but names no compaction point leaves
+        // the field off the wire entirely.
+        let json = serde_json::to_value(AgentEvent::ContextUsage(ContextUsage {
+            used_tokens: 1,
+            max_tokens: 2,
+            compact_at_tokens: None,
+        }))
+        .unwrap();
+        assert!(json.get("compactAtTokens").is_none());
+    }
+
+    /// A window nobody reported is not a full one and not an empty one: every
+    /// share is `None`, because the alternative is inventing a denominator.
+    #[test]
+    fn an_unreported_window_yields_no_percentage_at_all() {
+        let unknown = ContextUsage {
+            used_tokens: 40_000,
+            max_tokens: 0,
+            compact_at_tokens: None,
+        };
+        assert_eq!(unknown.fraction(), None);
+        assert_eq!(unknown.percent(), None);
+        assert!(!unknown.is_near_compaction(0.8));
+        assert!(!unknown.is_zero(), "used tokens were reported");
+        assert!(ContextUsage::default().is_zero());
+    }
+
+    #[test]
+    fn fullness_reads_the_harnesss_own_threshold_before_a_ratio() {
+        let ctx = ContextUsage {
+            used_tokens: 170_000,
+            max_tokens: 200_000,
+            compact_at_tokens: Some(167_000),
+        };
+        assert_eq!(ctx.percent(), Some(85));
+        // Past the threshold the harness stated, though short of any 90% rule.
+        assert!(ctx.is_near_compaction(0.9));
+        // Saturating: past the point is zero headroom, never a wrapped one.
+        assert_eq!(ctx.until_compact(), Some(0));
+        let ctx = ContextUsage {
+            compact_at_tokens: None,
+            ..ctx
+        };
+        assert!(ctx.is_near_compaction(0.8));
+        assert!(!ctx.is_near_compaction(0.9));
+        assert_eq!(ctx.until_compact(), None);
+        // Over-full (a harness reporting past its own window) clamps at 100%.
+        assert_eq!(
+            ContextUsage {
+                used_tokens: 300_000,
+                max_tokens: 200_000,
+                compact_at_tokens: None,
+            }
+            .percent(),
+            Some(100)
+        );
     }
 
     #[test]

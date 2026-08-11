@@ -114,6 +114,12 @@ pub fn task_row(task: &Task, route: Option<&Route>, cfg: &RoutingConfig) -> Task
         // a viewport reading a relayed board has never seen it — an elapsed
         // counter with no cap beside it says half of what it knows (gh#103).
         max_duration_secs: cfg.max_duration_secs(route),
+        // The live attempt's own, and no fallback to a closed one (gh#271):
+        // fullness is a level inside a context that no longer exists once the
+        // agent is gone, unlike `runtime` or `branch` above, which still
+        // describe the work. A finished attempt's last reading stays on its
+        // row in the database for the stats page; it is not row furniture.
+        context: live.and_then(|a| a.context),
     }
 }
 

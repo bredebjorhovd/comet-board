@@ -481,6 +481,24 @@ pub struct Attempt {
     /// Refreshed on every reconcile while the attempt is live, so one that is
     /// cancelled or orphaned keeps what it had spent up to the last tick.
     pub tokens: Option<comet_proto::TokenUsage>,
+    /// How full this attempt's context window was when its harness last said
+    /// (gh#271).
+    ///
+    /// The other meter, and a different kind of number from
+    /// [`tokens`](Self::tokens): spend accumulates, fullness is a level, so
+    /// this is overwritten by each fresh reading rather than added to. What it
+    /// answers is the question the spend column cannot — whether the agent is
+    /// about to have the context it is working from compacted out from under
+    /// it, which is a live-attempt fact, not a bill.
+    ///
+    /// `None` is "nothing reported", exactly as for tokens: a harness that
+    /// meters no window (opencode), a Claude CLI too old to answer, every
+    /// attempt from before this existed. Rendered as a blank, never as 0% —
+    /// which would read as an empty context rather than a silent one.
+    ///
+    /// Refreshed on every reconcile while the attempt is live, so an attempt
+    /// that is cancelled or orphaned keeps the last level it was seen at.
+    pub context: Option<comet_proto::ContextUsage>,
     /// The model the harness said it was running, recorded beside the tokens
     /// (gh#151). Not the route's override — see
     /// [`crate::runtime::RunTokens`] for why that is nearly always `None` and
@@ -631,6 +649,7 @@ pub(crate) mod tests {
             chat_archivable_at: None,
             chat_archived_at: None,
             tokens: None,
+            context: None,
             model: None,
             claims: Vec::new(),
             claims_at: None,

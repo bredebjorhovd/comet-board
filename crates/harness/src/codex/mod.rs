@@ -50,7 +50,8 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    Phase, delta_text, item_id, item_type, map_item, turn_error_message, turn_id, usage_event,
+    Phase, context_event, delta_text, item_id, item_type, map_item, turn_error_message, turn_id,
+    usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then PATH, then
@@ -581,6 +582,9 @@ async fn run_session(session: Session) {
     let mut streamed_text: HashSet<String> = HashSet::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
+    // …and context fullness is not held at all (gh#271): it is a level to
+    // watch on a live attempt. Kept only to stay quiet when it has not moved.
+    let mut last_context: Option<comet_proto::ContextUsage> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -660,6 +664,21 @@ async fn run_session(session: Session) {
                     "thread/tokenUsage/updated" => {
                         if let Some(usage) = usage_event(&params) {
                             pending_usage = Some(usage);
+                        }
+                        // Fullness, unlike spend, is worth having *before* the
+                        // turn ends — an attempt at 90% of its window is the
+                        // one somebody wants to hear about while it is still
+                        // running (gh#271). Held back once the turn is over:
+                        // a straggling notification must not leave the run
+                        // journal ending on something other than a `Done`.
+                        if let Some(ctx) = context_event(&params)
+                            && !done_current
+                            && last_context != Some(ctx)
+                        {
+                            last_context = Some(ctx);
+                            if !send(&event_tx, AgentEvent::ContextUsage(ctx)).await {
+                                break 'main;
+                            }
                         }
                     }
 

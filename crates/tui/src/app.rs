@@ -4398,6 +4398,7 @@ mod tests {
             dispatched_by_verified: false,
             billed_to: None,
             max_duration_secs: None,
+            context: None,
         }
     }
 

@@ -17,7 +17,9 @@ pub(crate) enum Frame {
     RateLimit(RateLimitFrame),
     Result(ResultFrame),
     ControlRequest(ControlRequestFrame),
-    /// control_response / control_cancel_request / anything unknown.
+    /// The CLI's reply to a request *we* sent (gh#271: `get_context_usage`).
+    ControlResponse(ControlResponseFrame),
+    /// control_cancel_request / anything unknown.
     Other,
 }
 
@@ -178,6 +180,84 @@ pub(crate) struct ControlRequestBody {
     pub input: Value,
 }
 
+/// A client→CLI request's reply. `response.response` is the payload on
+/// success; `subtype: "error"` carries `error` instead and no payload.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ControlResponseFrame {
+    #[serde(default)]
+    pub response: ControlResponseBody,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ControlResponseBody {
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub response: Value,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The `get_context_usage` payload, reduced to the four numbers a fullness
+/// signal is made of. The CLI's own reply is much larger — a per-category
+/// breakdown, an MCP tool inventory, a render grid for `/context` — and none
+/// of that is a level; see [`comet_proto::ContextUsage`].
+///
+/// `maxTokens` is the *usable* window (an auto-compact buffer can hold it
+/// under `rawMaxTokens`), which is the denominator the CLI itself divides by,
+/// so it is the one we read — falling back to `rawMaxTokens` on a CLI that
+/// only sends the latter.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextUsageBody {
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub raw_max_tokens: u64,
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
+    #[serde(default)]
+    pub is_auto_compact_enabled: Option<bool>,
+}
+
+impl ContextUsageBody {
+    /// `None` when the reply carried no usable window at all: a fullness with
+    /// no denominator is not a reading, and inventing one would put a
+    /// percentage on the board that no harness ever said.
+    pub fn to_usage(&self) -> Option<comet_proto::ContextUsage> {
+        let max_tokens = if self.max_tokens > 0 {
+            self.max_tokens
+        } else {
+            self.raw_max_tokens
+        };
+        if max_tokens == 0 && self.total_tokens == 0 {
+            return None;
+        }
+        Some(comet_proto::ContextUsage {
+            used_tokens: self.total_tokens,
+            max_tokens,
+            // A threshold the CLI will not act on is not a threshold. Absent
+            // `isAutoCompactEnabled` (older CLI) the number is taken at its
+            // word, which is what it meant before the flag existed.
+            compact_at_tokens: self
+                .auto_compact_threshold
+                .filter(|_| self.is_auto_compact_enabled.unwrap_or(true))
+                .filter(|at| *at > 0),
+        })
+    }
+}
+
+/// Decode a successful `get_context_usage` reply.
+pub(crate) fn parse_context_usage(payload: &Value) -> Option<comet_proto::ContextUsage> {
+    serde_json::from_value::<ContextUsageBody>(payload.clone())
+        .ok()?
+        .to_usage()
+}
+
 /// Parse one stdout JSONL line. `Err` = not JSON; unknown types = `Other`.
 pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     let value: Value = serde_json::from_str(line)?;
@@ -190,6 +270,7 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
         "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value)?),
         "result" => Frame::Result(serde_json::from_value(value)?),
         "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
+        "control_response" => Frame::ControlResponse(serde_json::from_value(value)?),
         _ => Frame::Other,
     };
     Ok(frame)
@@ -272,6 +353,18 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     .to_string()
 }
 
+/// Client→CLI context-usage control request (gh#271). Its reply arrives as a
+/// `control_response` carrying the same `request_id`, which is how the session
+/// loop tells our polls apart from the interrupt's reply.
+pub(crate) fn context_usage_request_line(request_id: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "get_context_usage" },
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +384,52 @@ mod tests {
             Frame::Other
         ));
         assert!(parse_frame("not json").is_err());
+    }
+
+    /// Verbatim (bar the trimmed grid/inventory fields) from claude 2.1.227
+    /// answering `get_context_usage` over a live stdio control channel. The
+    /// numbers the board renders come out of *these* four keys.
+    #[test]
+    fn context_usage_reply_decodes_to_a_level() {
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctx_1",
+            "response":{"categories":[{"name":"System prompt","tokens":6441}],"totalTokens":28294,
+            "maxTokens":200000,"rawMaxTokens":200000,"percentage":14,"autocompactSource":"auto",
+            "model":"claude-haiku-4-5-20251001","autoCompactThreshold":167000,
+            "isAutoCompactEnabled":true}}}"#;
+        let Frame::ControlResponse(frame) = parse_frame(line).expect("parses") else {
+            panic!("expected a control_response frame");
+        };
+        assert_eq!(frame.response.request_id, "ctx_1");
+        assert_eq!(frame.response.subtype, "success");
+        let usage = parse_context_usage(&frame.response.response).expect("a reading");
+        assert_eq!(usage.used_tokens, 28_294);
+        assert_eq!(usage.max_tokens, 200_000);
+        assert_eq!(usage.compact_at_tokens, Some(167_000));
+        assert_eq!(usage.percent(), Some(14), "matches the CLI's own rounding");
+    }
+
+    /// Auto-compaction off means there is no point to count down to — the
+    /// window is still the window, and the threshold must not be reported as
+    /// one the CLI will act on.
+    #[test]
+    fn a_disabled_autocompact_threshold_is_not_a_threshold() {
+        let payload = serde_json::json!({
+            "totalTokens": 10, "maxTokens": 100,
+            "autoCompactThreshold": 80, "isAutoCompactEnabled": false,
+        });
+        let usage = parse_context_usage(&payload).expect("a reading");
+        assert_eq!(usage.compact_at_tokens, None);
+        assert_eq!(usage.percent(), Some(10));
+        // And a reply with nothing in it at all is not a reading of zero.
+        assert!(parse_context_usage(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn context_usage_request_names_the_control_subtype() {
+        let v: Value = serde_json::from_str(&context_usage_request_line("ctx_7")).expect("json");
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request_id"], "ctx_7");
+        assert_eq!(v["request"]["subtype"], "get_context_usage");
     }
 
     #[test]

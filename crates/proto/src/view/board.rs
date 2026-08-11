@@ -388,6 +388,22 @@ pub struct TaskRow {
     /// viewport reading a relayed board has never seen it (gh#103).
     #[serde(default)]
     pub max_duration_secs: Option<u64>,
+    /// How full this row's attempt has filled its agent's context window
+    /// (gh#271) — the last level its harness reported.
+    ///
+    /// On the wire beside the elapsed clock and for the same reason: it is a
+    /// *live* fact with a horizon. An attempt at 94% of its window is minutes
+    /// from having the context it is working from compacted away, and that is
+    /// a different situation from the same attempt at 20% — while the elapsed
+    /// counter, the only other thing a watcher has, reads identically for
+    /// both.
+    ///
+    /// `None` is "nothing reported" and must render as a blank, never as 0%: a
+    /// harness that meters no window (opencode), a Claude CLI too old to
+    /// answer, and every row from before this existed all land here, and an
+    /// empty context is a very different claim from a silent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::ContextUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +869,11 @@ fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> V
                 MetaField::cell(row.runtime.as_deref().unwrap_or(""), RUNTIME_CELL),
                 MetaField::cell(ws(row), WS_CELL),
                 MetaField::flow(elapsed),
+                // After the clock, because it answers the question the clock
+                // raises and cannot: two rows an hour in look identical, and
+                // one of them is about to have its context compacted away
+                // (gh#271). Quiet until there is something to say.
+                MetaField::flow(context_note(row.context).unwrap_or_default()),
             ]
         }
         BoardState::Failed => vec![MetaField::flow("pane exited without completing")],
@@ -1077,6 +1098,41 @@ pub fn subscription_noun(harness: crate::HarnessId) -> &'static str {
 pub fn billing_note(row: &TaskRow) -> Option<String> {
     let billed = row.billed_to.as_deref()?;
     cross_billed(Some(billed), row.dispatched_by_user.as_deref()).then(|| bills_label(billed))
+}
+
+// ---------------------------------------------------------------------------
+// How full a live agent's context is (gh#271)
+// ---------------------------------------------------------------------------
+
+/// Below this share of the window, a row says nothing about its context.
+///
+/// Not squeamishness about clutter: a working row already carries a runtime, a
+/// workspace and an elapsed clock, and a gauge that reads `ctx 8%` on every
+/// row for the first hour teaches the eye to skip the place the warning will
+/// appear. Half a window is where the number starts predicting something.
+pub const CONTEXT_NOTE_FLOOR: f64 = 0.5;
+
+/// Absent a threshold the harness itself names, the share at which a row is
+/// called near compaction. Codex is the case: it states a window but no
+/// compaction point (it fails the turn instead), so a ratio is all there is.
+pub const CONTEXT_NEAR_COMPACTION: f64 = 0.9;
+
+/// What a row says about its agent's context window — `ctx 62%`, or
+/// `ctx 92% compacting` once the harness's own threshold is passed.
+///
+/// `None` for the two very different silences the board must not conflate: no
+/// reading at all (a harness that meters no window, a CLI too old to answer),
+/// and a reading with plenty of room left. Neither is worth a column, and
+/// neither may be rendered as `0%`.
+pub fn context_note(context: Option<crate::ContextUsage>) -> Option<String> {
+    let context = context?;
+    let percent = context.percent()?;
+    if context.is_near_compaction(CONTEXT_NEAR_COMPACTION) {
+        // The loud form. What it warns about is not the run ending — it is the
+        // agent losing the context it has been working from, mid-task.
+        return Some(format!("ctx {percent}% compacting"));
+    }
+    (context.fraction()? >= CONTEXT_NOTE_FLOOR).then(|| format!("ctx {percent}%"))
 }
 
 fn ws(row: &TaskRow) -> String {
@@ -2018,6 +2074,7 @@ mod tests {
             dispatched_by_verified: false,
             billed_to: None,
             max_duration_secs: None,
+            context: None,
         }
     }
 
@@ -2316,6 +2373,69 @@ mod tests {
         assert!(wide.contains("30s"), "elapsed: {wide}");
         // Below the narrow limit everything goes rather than wrapping.
         assert_eq!(row_metadata(&r, false, 59, now()), "");
+    }
+
+    /// gh#271: two rows an hour into their work read identically on the clock,
+    /// and one of them is about to have its context compacted away. The note
+    /// says so — and stays out of the way while there is nothing to say.
+    #[test]
+    fn a_working_row_says_how_full_its_context_is_only_once_that_means_something() {
+        let mut r = row("w", BoardState::Working);
+        r.started_at = Some("2026-08-01T11:59:30Z".into());
+        let line = |r: &TaskRow| row_metadata_line(r, false, now());
+
+        // Nothing reported (opencode, an older CLI, a row from before this):
+        // the row is exactly what it was.
+        assert_eq!(line(&r), "claude-code · ws:offhand · 30s");
+
+        // Reported, with room to spare: still quiet. A gauge that reads `ctx
+        // 8%` on every row teaches the eye to skip where the warning lands.
+        r.context = Some(crate::ContextUsage {
+            used_tokens: 24_000,
+            max_tokens: 200_000,
+            compact_at_tokens: Some(167_000),
+        });
+        assert_eq!(line(&r), "claude-code · ws:offhand · 30s");
+
+        // Half full: worth saying, plainly.
+        r.context = Some(crate::ContextUsage {
+            used_tokens: 124_000,
+            max_tokens: 200_000,
+            compact_at_tokens: Some(167_000),
+        });
+        assert_eq!(line(&r), "claude-code · ws:offhand · 30s · ctx 62%");
+
+        // Past the point the harness itself compacts at — short of any 90%
+        // rule, and the harness's own number is the one that counts.
+        r.context = Some(crate::ContextUsage {
+            used_tokens: 170_000,
+            max_tokens: 200_000,
+            compact_at_tokens: Some(167_000),
+        });
+        assert_eq!(
+            line(&r),
+            "claude-code · ws:offhand · 30s · ctx 85% compacting"
+        );
+
+        // A harness that states a window but no compaction point (codex) is
+        // judged on the ratio instead.
+        r.context = Some(crate::ContextUsage {
+            used_tokens: 250_000,
+            max_tokens: 272_000,
+            compact_at_tokens: None,
+        });
+        assert!(line(&r).ends_with("ctx 92% compacting"), "{}", line(&r));
+
+        // A window nobody reported is never a percentage of nothing.
+        assert_eq!(
+            context_note(Some(crate::ContextUsage {
+                used_tokens: 90_000,
+                max_tokens: 0,
+                compact_at_tokens: None,
+            })),
+            None
+        );
+        assert_eq!(context_note(None), None);
     }
 
     /// gh#176: the desktop sets this block in a proportional font, where the

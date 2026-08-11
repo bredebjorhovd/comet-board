@@ -30,6 +30,7 @@
     {
       "expect": {
         "completionPercent": null,
+        "contextReported": false,
         "coveragePercent": null,
         "hasSpend": false,
         "hasTokens": false,
@@ -79,6 +80,11 @@
         "bySource": {},
         "byWorkspace": {},
         "completionRate": null,
+        "context": {
+          "attemptsReported": 0,
+          "nearCompaction": 0,
+          "peakPercent": null
+        },
         "daily": [],
         "dailyTokens": [],
         "friction": {
@@ -145,6 +151,7 @@
     {
       "expect": {
         "completionPercent": null,
+        "contextReported": false,
         "coveragePercent": null,
         "hasSpend": false,
         "hasTokens": false,
@@ -194,6 +201,11 @@
         "bySource": {},
         "byWorkspace": {},
         "completionRate": null,
+        "context": {
+          "attemptsReported": 0,
+          "nearCompaction": 0,
+          "peakPercent": null
+        },
         "daily": [],
         "dailyTokens": [],
         "friction": {
@@ -260,6 +272,7 @@
     {
       "expect": {
         "completionPercent": null,
+        "contextReported": false,
         "coveragePercent": null,
         "hasSpend": false,
         "hasTokens": false,
@@ -309,6 +322,11 @@
         "bySource": {},
         "byWorkspace": {},
         "completionRate": null,
+        "context": {
+          "attemptsReported": 0,
+          "nearCompaction": 0,
+          "peakPercent": null
+        },
         "daily": [],
         "dailyTokens": [],
         "friction": {
@@ -375,6 +393,7 @@
     {
       "expect": {
         "completionPercent": null,
+        "contextReported": false,
         "coveragePercent": "0%",
         "hasSpend": false,
         "hasTokens": false,
@@ -424,6 +443,11 @@
         "bySource": {},
         "byWorkspace": {},
         "completionRate": null,
+        "context": {
+          "attemptsReported": 0,
+          "nearCompaction": 0,
+          "peakPercent": null
+        },
         "daily": [],
         "dailyTokens": [],
         "friction": {
@@ -490,6 +514,7 @@
     {
       "expect": {
         "completionPercent": "82%",
+        "contextReported": true,
         "coveragePercent": "62%",
         "hasSpend": false,
         "hasTokens": true,
@@ -545,6 +570,11 @@
           "edge": 4
         },
         "completionRate": 0.8181818181818182,
+        "context": {
+          "attemptsReported": 6,
+          "nearCompaction": 2,
+          "peakPercent": 97
+        },
         "daily": [
           {
             "date": "2026-08-03",
@@ -735,6 +765,7 @@
     {
       "expect": {
         "completionPercent": "82%",
+        "contextReported": true,
         "coveragePercent": "62%",
         "hasSpend": true,
         "hasTokens": true,
@@ -856,6 +887,11 @@
           "edge": 4
         },
         "completionRate": 0.8181818181818182,
+        "context": {
+          "attemptsReported": 6,
+          "nearCompaction": 2,
+          "peakPercent": 97
+        },
         "daily": [
           {
             "date": "2026-08-03",
@@ -1216,6 +1252,7 @@
     {
       "expect": {
         "completionPercent": null,
+        "contextReported": false,
         "coveragePercent": "100%",
         "hasSpend": false,
         "hasTokens": true,
@@ -1265,6 +1302,11 @@
         "bySource": {},
         "byWorkspace": {},
         "completionRate": null,
+        "context": {
+          "attemptsReported": 0,
+          "nearCompaction": 0,
+          "peakPercent": null
+        },
         "daily": [],
         "dailyTokens": [],
         "friction": {

@@ -440,6 +440,12 @@ impl Runtime for CometRuntime {
         }))
     }
 
+    /// How full the chat's window is, off the same journal (gh#271). The last
+    /// reading, never a sum — see [`RunJournal::context`].
+    fn run_context(&self, chat_id: &str) -> anyhow::Result<Option<comet_proto::ContextUsage>> {
+        Ok(self.journal.context(chat_id)?)
+    }
+
     /// The chat's commands, off the same journal again (§gh#183) — the half of
     /// a review the agent did not write. See [`RunJournal::commands`].
     fn run_commands(&self, chat_id: &str) -> anyhow::Result<Option<Vec<RanCommand>>> {
