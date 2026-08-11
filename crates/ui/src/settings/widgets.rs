@@ -21,8 +21,13 @@
 //!   with a comment (see the two functions).
 //! - **The scale is [`Theme`]'s.** Four type sizes, three radii, four greys:
 //!   no radius, size or tone is a literal here (gh#172, gh#173, gh#174).
-//!   Spacing still is — it is the one axis with no scale yet, and pretending
-//!   otherwise would be a token that means nothing.
+//! - **Spacing has two numbers, and they are named** (gh#277). The canvas
+//!   stacks a settings page out of [`BLOCK_GAP`] between blocks and
+//!   [`HEADER_GAP`] between a block's header and its card; a row is
+//!   [`ROW_PAD_Y`]×[`ROW_PAD_X`] with a [`ROW_GAP`] gap, and every small action
+//!   is [`ACTION_HEIGHT`] tall. Locked by
+//!   [`tests::the_canvas_measures_are_the_canvas_measures`], because a fourth
+//!   number invented at a call site is exactly how the last pass drifted.
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
@@ -47,6 +52,13 @@ pub const DASHBOARD_WIDTH: f32 = 1160.0;
 const PAGE_GUTTER: f32 = 24.0;
 const PAGE_TOP: f32 = 26.0;
 const SUBTITLE_WIDTH: f32 = 560.0;
+
+/// The canvas's two vertical rhythms (`docs/design/settings.md` C4, E1):
+/// **18px** between the blocks of a page, **8px** between a block's header and
+/// the card under it. Everything on a settings page is one of those two gaps;
+/// a third number is a page inventing a rhythm.
+pub const BLOCK_GAP: f32 = 18.0;
+pub const HEADER_GAP: f32 = 8.0;
 
 /// Centered page column at the form width — the default, and what seven of the
 /// eight pages use.
@@ -76,13 +88,15 @@ fn column(max_width: f32) -> gpui::Div {
         .flex_col()
 }
 
-/// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (comet settings.devices.tsx).
+/// Page headline row (`docs/design/settings.md` D2): the 15px/600 title, the
+/// 13px count beside it, 10px apart and vertically CENTRED — the canvas centres
+/// this row because the actions at its other end are 26px chips, and a baseline
+/// shared with a 15px word hangs them a pixel low.
 pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
         .flex_row()
-        .items_baseline()
+        .items_center()
         .gap(px(10.0))
         .child(
             div()
@@ -117,15 +131,19 @@ pub fn dashboard_header(theme: &Theme, title: &str) -> gpui::Div {
         .child(SharedString::from(title.to_string()))
 }
 
-/// Subtitle under the headline: 13px on a 20px line, in `--subtle`.
+/// Subtitle under the headline (`docs/design/settings.md` D6/J1): 13px on a
+/// 20px line in `--subtle`, 4px under the title, capped at the prose measure.
 ///
-/// `--subtle`, not `--muted` (gh#278): both the settings canvas and the stats
-/// canvas set this line one tone below the reading grey, and the widget was
-/// paying the reading grey on all eight pages. A subtitle competing with the
-/// copy it introduces is the header saying itself twice.
+/// `--subtle` and not `--muted` — and this one was found twice, independently,
+/// from two different canvases (gh#277 off the settings canvas, gh#278 off the
+/// stats one), which is about as much evidence as a tone choice gets. The
+/// canvases keep `--muted` for things you read one of (a row's name, a nav
+/// label) and drop the standing explanation a step below it; the widget was
+/// paying the reading grey on all eight pages. A subtitle set at row weight
+/// competes with the rows it introduces — the header saying itself twice.
 pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div {
     div()
-        .mt(px(1.0))
+        .mt(px(Theme::SPACE_XS))
         .max_w(px(SUBTITLE_WIDTH))
         .text_size(px(Theme::TEXT_BODY))
         .line_height(px(20.0))
@@ -133,11 +151,11 @@ pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div 
         .child(copy.into())
 }
 
-/// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
-/// — the opaque raised-card tone (comet `--card`), not a translucent wash.
+/// Section card (`docs/design/settings.md` E4/J2): the `--raised` bed, a
+/// `--line` hairline, radius 14, clipped — one block below whatever precedes it.
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
-        .mt(px(24.0))
+        .mt(px(BLOCK_GAP))
         .rounded(px(Theme::RADIUS_CARD))
         .border_1()
         .border_color(theme.border)
@@ -147,19 +165,25 @@ pub fn section_card(theme: &Theme) -> gpui::Div {
         .flex_col()
 }
 
-/// One card row: `border-t border-border px-5 py-3.5 first:border-t-0` with the
-/// quiet hover wash.
+/// One card row (`docs/design/settings.md` F1/J3): padding 14×18, a `--line`
+/// top border on every row after the first, no fill of its own — plus the quiet
+/// hover wash the canvas cannot draw.
 pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
     div()
-        .px(px(20.0))
-        .py(px(14.0))
+        .px(px(ROW_PAD_X))
+        .py(px(ROW_PAD_Y))
         .when(!first, |el| el.border_t_1().border_color(theme.border))
         .hover(|s| s.bg(theme.white_alpha(0.015)))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(14.0))
+        .gap(px(ROW_GAP))
 }
+
+/// The row measures every settings card shares.
+pub const ROW_PAD_X: f32 = 18.0;
+pub const ROW_PAD_Y: f32 = 14.0;
+pub const ROW_GAP: f32 = 12.0;
 
 /// The icon that introduces a row — a glyph, not a box.
 ///
@@ -227,54 +251,66 @@ pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
     line
 }
 
-/// Right-anchored badge pill: `rounded-full border px-2 py-0.5 text-[10.5px]`.
+/// The plain badge (`docs/design/settings.md` F8): padding 1×8, radius 6, 11px
+/// `--subtle` inside a `--line` hairline and nothing else. A badge that names a
+/// plan is a caption on the row's title, so it sits a step under it.
 pub fn badge(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
     div()
         .flex_none()
-        .px(px(8.0))
-        .py(px(2.0))
+        .px(px(BADGE_PAD_X))
+        .py(px(BADGE_PAD_Y))
         .rounded(px(Theme::RADIUS_CHIP))
         .border_1()
         .border_color(theme.border)
         .text_size(px(Theme::TEXT_CAPTION))
-        .text_color(theme.text_muted)
+        .text_color(theme.text_subtle)
         .child(label.into())
 }
 
-/// The settled status pill (the Accounts "Active" badge) — the ramp's settled
-/// hue at a 12% fill, with the tone that inverts for light on top.
+/// The settled status pill (the Accounts "Active" badge, `settings.md` F7) —
+/// the ramp's settled hue at a 14% fill, with the tone that inverts for light
+/// on top.
 pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
     div()
         .flex_none()
-        .px(px(8.0))
-        .py(px(2.0))
+        .px(px(BADGE_PAD_X))
+        .py(px(BADGE_PAD_Y))
         .rounded(px(Theme::RADIUS_CHIP))
-        .bg(theme.settled.opacity(0.12))
+        .bg(theme.settled.opacity(0.14))
         .text_size(px(Theme::TEXT_CAPTION))
         .text_color(theme.settled_text())
         .child(label.into())
 }
 
-/// A small quiet ghost action. Caller adds id + click + leading icon child AND
-/// its own `.hover(..)` — gpui panics on a second hover, and the pages vary
-/// it (reveal opacity, 4% vs 6% washes).
+const BADGE_PAD_X: f32 = 8.0;
+const BADGE_PAD_Y: f32 = 1.0;
+
+/// A small quiet ghost action (`docs/design/settings.md` D4). Caller adds id +
+/// click + leading icon child AND its own `.hover(..)` — gpui panics on a second
+/// hover, and the pages vary it (reveal opacity, 4% vs 6% washes).
 ///
-/// [`Theme::RADIUS_ROW`], the same step as the row it sits on: a button is a
-/// pressable row, not a chip inside one. Chip radius is for the things that
-/// sit *inside* this — the badges.
+/// The canvas's own measures: a 26px slot, radius 6, padding 0×9, 6px gap, 12px
+/// `--muted`. Same height and radius as the chip beside it in the Accounts
+/// header — the two actions there are one control each, and one of them happens
+/// to carry a bed.
 pub fn ghost_action(theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .flex_row()
         .items_center()
+        .h(px(ACTION_HEIGHT))
         .gap(px(6.0))
-        .rounded(px(Theme::RADIUS_ROW))
-        .px(px(10.0))
-        .py(px(6.0))
+        .rounded(px(Theme::RADIUS_CHIP))
+        .px(px(ACTION_PAD_X))
         .text_size(px(Theme::TEXT_DENSE))
         .text_color(theme.text_muted)
         .cursor_pointer()
 }
+
+/// The height of every small action on a settings page — the header chip, the
+/// ghost actions, the one filled button.
+pub const ACTION_HEIGHT: f32 = 26.0;
+pub const ACTION_PAD_X: f32 = 9.0;
 
 /// The default ghost-action hover wash (`hover:bg-white/[0.06]
 /// hover:text-foreground`).
@@ -294,29 +330,34 @@ pub fn error_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div
     severity_strip(
         theme.danger,
         theme.danger_text(),
-        px(16.0),
+        px(STRIP_PAD_X),
         px(12.0),
         px(16.0),
         message,
     )
-    .mt(px(16.0))
+    .mt(px(Theme::SPACE_LG))
 }
 
-/// The warning strip — the working hue, and one notch quieter than
-/// [`error_strip`] in padding and glyph: a notice, not a failure.
+/// The warning strip (`docs/design/settings.md` H1/H2) — the working hue, and
+/// one notch quieter than [`error_strip`] in padding and glyph: a notice, not a
+/// failure.
 pub fn warning_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div {
     severity_strip(
         theme.warning,
         theme.warning_text(),
-        px(16.0),
+        px(STRIP_PAD_X),
         px(10.0),
         px(14.0),
         message,
     )
-    .mt(px(8.0))
 }
 
 /// One severity strip, in whichever hue means what happened.
+///
+/// Radius 10, not the card's 14: a strip is a notice laid ON the page, the size
+/// of a row, and the canvas curves it like one. The hue carries the strip —
+/// 30% for the hairline, 9% for the wash — which is what makes it legible
+/// against `--raised` in light, where a 20/6 pair had almost nothing to say.
 fn severity_strip(
     hue: gpui::Hsla,
     text: gpui::Hsla,
@@ -328,18 +369,19 @@ fn severity_strip(
     div()
         .px(px_x)
         .py(px_y)
-        .rounded(px(Theme::RADIUS_CARD))
+        .rounded(px(Theme::RADIUS_ROW))
         .border_1()
-        .border_color(hue.opacity(0.2))
-        .bg(hue.opacity(0.06))
+        .border_color(hue.opacity(0.30))
+        .bg(hue.opacity(0.09))
         .text_size(px(Theme::TEXT_DENSE))
+        .line_height(px(18.0))
         .text_color(text)
         .flex()
         .flex_row()
         .items_start()
-        .gap(px(8.0))
+        .gap(px(9.0))
         .child(
-            div().flex_none().mt(px(2.0)).child(
+            div().flex_none().mt(px(1.0)).child(
                 crate::icons::icon(crate::icons::DANGER_TRIANGLE)
                     .size(glyph)
                     .text_color(text),
@@ -347,6 +389,8 @@ fn severity_strip(
         )
         .child(div().min_w_0().child(message.into()))
 }
+
+const STRIP_PAD_X: f32 = 14.0;
 
 #[cfg(test)]
 mod tests {
@@ -373,6 +417,29 @@ mod tests {
                 assert_eq!(hue.a, 1.0, "a ramp hue carries its own alpha nowhere");
             }
         }
+    }
+
+    /// The numbers `canvas/comet-settings-window.dc.html` declares, transcribed
+    /// (`docs/design/settings.md` C4, E1, F1, F7, F8, D4). Change one here and
+    /// this fails, which is the point: prose let four surfaces land half-done.
+    #[test]
+    fn the_canvas_measures_are_the_canvas_measures() {
+        // The page frame.
+        assert_eq!(PAGE_GUTTER, 24.0);
+        assert_eq!(PAGE_TOP, 26.0);
+        assert_eq!(SUBTITLE_WIDTH, 560.0);
+        // The two vertical rhythms, and the block gap is the wider one.
+        assert_eq!(BLOCK_GAP, 18.0);
+        assert_eq!(HEADER_GAP, 8.0);
+        const { assert!(BLOCK_GAP > HEADER_GAP) };
+        // A row.
+        assert_eq!(ROW_PAD_X, 18.0);
+        assert_eq!(ROW_PAD_Y, 14.0);
+        assert_eq!(ROW_GAP, 12.0);
+        // The badges and the actions.
+        assert_eq!((BADGE_PAD_X, BADGE_PAD_Y), (8.0, 1.0));
+        assert_eq!((ACTION_HEIGHT, ACTION_PAD_X), (26.0, 9.0));
+        assert_eq!(STRIP_PAD_X, 14.0);
     }
 
     /// Two widths, both named — the page picks one instead of redefining the
