@@ -145,6 +145,23 @@ enum Command {
         /// install it if it is missing.
         #[arg(long)]
         stack: bool,
+        /// Stack this release on another task (gh#285): cut its branch from
+        /// the branch that task's attempt holds, and open its pull request
+        /// against that branch instead of trunk. Takes a task id or the
+        /// identifier the board prints.
+        ///
+        /// The parent has to have PUSHED — a dispatch branches from origin,
+        /// never from a local checkout, so an unpushed parent branch refuses
+        /// the release rather than silently cutting from trunk.
+        #[arg(long)]
+        onto: Option<String>,
+        /// Cut this release from that branch instead of the route's `base`.
+        /// The escape hatch for a branch no task on the board holds — a
+        /// release branch, somebody else's branch. Use `--onto` for a
+        /// sibling: it records which attempt this was cut from, and a branch
+        /// name does not. Passing both is refused.
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Release a task again — the desktop panel's Retry, from a shell.
     ///
@@ -185,6 +202,16 @@ enum Command {
         /// exactly what is being reconsidered.
         #[arg(long)]
         stack: bool,
+        /// Stack this attempt on another task's branch (gh#285) — see
+        /// `dispatch --onto`. A retry only re-reads this when the branch is
+        /// actually cut: an existing branch is reused as it stands, so a
+        /// retry of an already-stacked task keeps the parent it had.
+        #[arg(long)]
+        onto: Option<String>,
+        /// Cut this attempt from that branch instead of the route's `base` —
+        /// see `dispatch --base`.
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Cancel a task's live attempt. The issue stays open.
     Cancel {
@@ -711,6 +738,8 @@ fn main() -> Result<()> {
             account,
             bill,
             stack,
+            onto,
+            base,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -720,6 +749,8 @@ fn main() -> Result<()> {
                 account: account.as_deref(),
                 bill: bill.as_deref(),
                 stack,
+                onto: onto.as_deref(),
+                base: base.as_deref(),
                 // Filled in from the engine below — this shell has no way to
                 // know who is signed in without asking.
                 via_user: None,
@@ -756,6 +787,8 @@ fn main() -> Result<()> {
             account,
             bill,
             stack,
+            onto,
+            base,
         } => {
             let via = ops::provenance(via);
             let opts = ops::DispatchOpts {
@@ -765,6 +798,8 @@ fn main() -> Result<()> {
                 account: account.as_deref(),
                 bill: bill.as_deref(),
                 stack,
+                onto: onto.as_deref(),
+                base: base.as_deref(),
                 // `replace` is not set here: `retry` reads the row and decides,
                 // because ending a live attempt is not something a verb should
                 // do without looking at what it is ending.
@@ -1593,6 +1628,8 @@ fn print_overrides(opts: &ops::DispatchOpts<'_>) {
         opts.model.map(|m| format!("model={m}")),
         opts.account.map(|a| format!("account={a}")),
         opts.bill.map(|b| format!("bill={b}")),
+        opts.onto.map(|o| format!("onto={o}")),
+        opts.base.map(|b| format!("base={b}")),
     ]
     .into_iter()
     .flatten()

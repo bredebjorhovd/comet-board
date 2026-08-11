@@ -261,7 +261,9 @@ pub fn stack_brief(branch: &str, base: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::model::{BoardState, PrStack, Source, UpstreamState};
-    use comet_proto::view::board::{Landing, TaskRow, landing, landing_note, stack_line};
+    use comet_proto::view::board::{
+        Landing, TaskRow, landing, landing_note, merge_confirmation, stack_line,
+    };
 
     /// One layer of a stack, as the board holds it after a poll.
     fn layer(
@@ -481,6 +483,54 @@ mod tests {
         assert_eq!(
             stack_line(&row_of(&tasks, 0)).as_deref(),
             Some("stack 1 of 3 · lands on main"),
+        );
+    }
+
+    /// The confirm step's whole job (gh#290): a reader pressing merge on the
+    /// top of a three-layer stack is merging three pull requests, and the board
+    /// names them rather than leaving it at a count.
+    #[test]
+    fn the_confirmation_names_every_layer_the_merge_takes_with_it() {
+        let tasks = three_layers([Some("clean"); 3]);
+        assert_eq!(
+            merge_confirmation(&row_of(&tasks, 2)),
+            "merge PR #13 into main · this lands PR #11, PR #12 with it — \
+             GitHub merges the group or none of it",
+        );
+        // The bottom layer takes nothing with it, and the sentence stays a
+        // sentence about one pull request.
+        assert_eq!(
+            merge_confirmation(&row_of(&tasks, 0)),
+            "merge PR #11 into main",
+        );
+    }
+
+    /// A layer that already landed is history in the chain, not cargo — and the
+    /// layers *above* are untouched by this merge, so neither is named.
+    #[test]
+    fn the_confirmation_leaves_out_what_the_merge_does_not_move() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[0].pr_open = false;
+        tasks[0].pr_merged = true;
+        tasks[1].pr_base_ref = Some("main".into());
+        assert_eq!(
+            merge_confirmation(&row_of(&tasks, 1)),
+            "merge PR #12 into main",
+            "the merged parent is gone and #13 is above, not below",
+        );
+    }
+
+    /// GitHub evaluates its rules when the merge executes, not when it is
+    /// submitted, so nothing upstream will stop a reader confirming on a layer
+    /// the board can see is stuck. The confirm step is where that gets said.
+    #[test]
+    fn the_confirmation_carries_the_boards_objection_when_it_has_one() {
+        let tasks = three_layers([Some("dirty"), Some("clean"), Some("clean")]);
+        assert_eq!(
+            merge_confirmation(&row_of(&tasks, 2)),
+            "merge PR #13 into main · this lands PR #11, PR #12 with it — \
+             GitHub merges the group or none of it · \
+             clean against board/gh-12-parser · waiting on PR #11",
         );
     }
 

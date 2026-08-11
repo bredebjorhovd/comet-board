@@ -234,6 +234,7 @@ mod tests {
         seed(&db, "gh:o/r#1", "gh#1");
         let a = db
             .insert_attempt(&NewAttempt {
+                stacked_on: None,
                 task_id: "gh:o/r#1".into(),
                 pane_id: None,
                 workspace: "ws".into(),
@@ -279,6 +280,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed(&db, "gh:o/r#74", "gh#74");
         db.insert_attempt(&NewAttempt {
+            stacked_on: None,
             task_id: "gh:o/r#74".into(),
             pane_id: None,
             workspace: "ws".into(),
@@ -314,6 +316,7 @@ mod tests {
         seed(&db, "gh:o/r#2", "gh#2");
         let first = db
             .insert_attempt(&NewAttempt {
+                stacked_on: None,
                 task_id: "gh:o/r#2".into(),
                 pane_id: None,
                 workspace: "ws".into(),
@@ -333,6 +336,7 @@ mod tests {
             .unwrap();
         db.close_attempt(first, Outcome::Cancelled).unwrap();
         db.insert_attempt(&NewAttempt {
+            stacked_on: None,
             task_id: "gh:o/r#2".into(),
             pane_id: None,
             workspace: "ws".into(),
@@ -397,6 +401,7 @@ mod tests {
         // Once an attempt exists, the row reports what it actually ran under —
         // here a per-dispatch override of the route's default.
         db.insert_attempt(&NewAttempt {
+            stacked_on: None,
             task_id: "gh:o/r#5".into(),
             pane_id: None,
             workspace: "r".into(),
@@ -469,6 +474,7 @@ mod tests {
         )
         .unwrap();
         db.insert_attempt(&NewAttempt {
+            stacked_on: None,
             task_id: "gh:o/r#6".into(),
             pane_id: None,
             workspace: "r".into(),

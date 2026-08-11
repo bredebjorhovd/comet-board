@@ -697,6 +697,14 @@ pub struct DispatchOpts<'a> {
     /// by hand: the CLI is a frontend like the other two, and without it the
     /// billing guard has nothing to compare an account against.
     pub via_user: Option<&'a str>,
+    /// `--onto`: stack this release on another task — cut it from the branch
+    /// that task's attempt holds, and open its pull request against that branch
+    /// rather than trunk (gh#285). A task id or the identifier on the board.
+    pub onto: Option<&'a str>,
+    /// `--base`: cut this release from that branch instead of the route's
+    /// `base`. The escape hatch for a branch no task on the board holds;
+    /// passing it together with `--onto` is refused by the engine.
+    pub base: Option<&'a str>,
     /// End the task's live attempt and release a fresh one — `retry` on a
     /// blocked row (gh#49), and the one deliberate breach of the
     /// one-live-attempt rule. Ordinary dispatches send `false` and are refused
@@ -1034,6 +1042,8 @@ fn dispatch_params(task_id: &str, opts: DispatchOpts<'_>) -> serde_json::Value {
         ("account", opts.account),
         ("bill", opts.bill),
         ("viaUser", opts.via_user),
+        ("onto", opts.onto),
+        ("base", opts.base),
     ] {
         if let Some(value) = value {
             object.insert(key.into(), serde_json::Value::String(value.to_string()));
@@ -2037,6 +2047,8 @@ mod tests {
                     account: Some("slot-a"),
                     bill: None,
                     via_user: None,
+                    onto: None,
+                    base: None,
                     replace: true,
                     stack: false,
                 }

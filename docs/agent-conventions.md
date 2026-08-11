@@ -170,6 +170,16 @@ is this board's `review`.
   the row stays one row, linked to the bottom layer, `merged` only once the
   whole stack has landed. Feedback on the upper layers does not reach the
   agent's chat yet; only the bottom layer's does.
+- **Stack a follow-up with `dispatch --onto <task>`.** The new task's branch is
+  cut from the branch that task's attempt holds, and its pull request targets
+  that branch instead of trunk — so the child's diff is only the child's work.
+  Takes a task id or the identifier on the board, and the parent has to have
+  **pushed**: a dispatch branches from origin, never from a local checkout, so
+  an unpushed parent branch refuses the release rather than quietly cutting
+  from trunk. Wait for the parent to reach `review` (or check that it pushed)
+  and dispatch then. `--base <branch>` is the same thing for a branch no task
+  on the board holds; use `--onto` for a sibling, because that is what records
+  which attempt the follow-up was cut from. Passing both is refused.
 - **Accounts are the operator's choice, not yours.** `routing.toml` decides
   which teammate's Claude/Codex subscription a route's work is billed to.
   `dispatch --account <id>` overrides it; do not pass it unless you were told
@@ -199,7 +209,10 @@ is this board's `review`.
   cap or another agent can take the slot. On a `failed` or `ready` row nothing
   is live and it is an ordinary dispatch. It takes the same `--runtime`,
   `--model` and `--account` overrides as `dispatch` — a retry under a different
-  model is the usual reason to retry at all. Retrying a blocked row **discards
+  model is the usual reason to retry at all. `--onto` it takes too, but only a
+  retry that actually *cuts* a branch reads it: an existing branch is reused as
+  it stands, so a retry of an already-stacked task keeps the parent it had.
+  Retrying a blocked row **discards
   the question its agent was waiting on**: read the chat first if the answer
   was the point.
 - **Freshness.** `list` prints the engine's current rows: `WatchBoard` pushes

@@ -809,6 +809,14 @@ impl Repos {
     /// - `HEAD` (or empty) — the space folder's current HEAD, no network. What
     ///   a repo with no remote needs, said out loud rather than inferred.
     ///
+    /// Any other branch on origin works the same way, which is what lets a
+    /// dispatch be cut from a *sibling's* branch (gh#285): the board resolves
+    /// the parent attempt to its branch name and hands it here, and nothing on
+    /// this side needs to know it came from an attempt rather than from
+    /// routing.toml. The one thing it does mean is that the parent has to have
+    /// pushed — an unpushed branch is not on origin, and the refusal below says
+    /// so.
+    ///
     /// A fetch that fails (offline, auth, no such branch) is an error and not a
     /// fallback: falling back means an agent branches from a stale main and
     /// nobody finds out until the pull request has the wrong diff in it.
@@ -840,7 +848,10 @@ impl Repos {
         .map_err(|e| {
             EngineError::Other(format!(
                 "could not fetch `{branch}` from origin in {} ({e}) — refusing to \
-                 branch from a possibly stale local checkout",
+                 branch from a possibly stale local checkout. If `{branch}` is \
+                 another attempt's branch, that attempt has not pushed it yet: a \
+                 dispatch stacks on what is on origin, and there is nothing there \
+                 to cut from until the parent pushes",
                 repo_path.display()
             ))
         })?;

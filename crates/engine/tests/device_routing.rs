@@ -606,6 +606,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         // run, and the review verbs forward for the reason every other board
         // verb does — the attempt row is on the box.
         db.insert_attempt(&comet_board::db::NewAttempt {
+            stacked_on: None,
             task_id: "task-on-the-box".into(),
             pane_id: Some("chat-55".into()),
             workspace: "offhand".into(),

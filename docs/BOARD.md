@@ -158,7 +158,7 @@ nearly verbatim — it never depended on herdr:
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
 `DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?,
-bill?}` →
+bill?, onto?, base?}` →
 `{chatId, cwd, attempt}`, `CancelTask {taskId}` — served in
 `crates/engine/src/rpc.rs` off the board service, which executes
 dispatch/cancel on its loop thread (`board.db` has one writer).
@@ -177,7 +177,13 @@ accounts a runtime could spend without re-implementing `harness_for_runtime`.
 answered by** — see §gh#165. `runtime`/`model`/`account`
 override the route's configured runtime, the harness's default model, and the
 route's `account` for that one dispatch; the attempt row records whatever the
-agent actually ran under. `bill` is the acknowledgement that a run spends
+agent actually ran under. `onto`/`base` override where the dispatch *branches
+from* — `onto` names another task and resolves to the branch its attempt holds,
+`base` names a branch outright — and with it where the pull request is aimed,
+which is the unit of stacking (gh#285). `onto` also records the parent attempt
+on the child's row (`attempts.stacked_on`), which a branch string cannot:
+merging the parent deletes its branch. The base has to be on **origin**, so a
+parent that has not pushed refuses the release rather than cutting from trunk. `bill` is the acknowledgement that a run spends
 somebody else's subscription, which `billing_guard = "require-own"` wants
 instead of a refusal — see §gh#97. `via`/`viaDevice`/`viaUser` are provenance,
 never authority — see §gh#73.

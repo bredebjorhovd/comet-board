@@ -3,11 +3,19 @@
 //! (§runtime-impl/§dispatch-pipeline).
 //!
 //! Deliberately only the *decisions* live here: task → route → branch → brief,
-//! plus the two refusals a dispatch owes its caller before anything is created
-//! ([`check_capacity`], [`route_for`]) and the provenance verdict
-//! ([`dispatcher_for`]) — pure functions over config and stored rows.
+//! plus the refusals a dispatch owes its caller before anything is created
+//! ([`check_capacity`], [`route_for`], [`stack_parent`]) and the provenance
+//! verdict ([`dispatcher_for`]) — pure functions over config and stored rows.
 //! Executing the spec is [`crate::runtime::Runtime::dispatch`]'s job; the
 //! attempt-row lifecycle around it lives with the board loop in the engine.
+//!
+//! Stacking (gh#285) is the newest of those decisions and the one that broke
+//! the shape: where a dispatch branches from used to be a *route* answer, one
+//! string for every task under it. Dispatching task B off task A's branch is a
+//! fact about a single release, so it arrives as an override
+//! ([`DispatchOverrides::base`]) and, in the spelling anybody actually uses, as
+//! a task to stack on ([`DispatchOverrides::onto`]) that [`stack_parent`]
+//! resolves to the attempt holding the branch.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -416,6 +424,13 @@ pub fn route_for<'a>(cfg: &'a RoutingConfig, task: &Task) -> Result<&'a Route> {
 /// decides here is the commit *author*, which is a claim anybody could write by
 /// hand anyway, and the alternative is a teammate's work landing under the
 /// box's name (gh#107).
+///
+/// The spec's `base` is the one place a *per-dispatch* answer overrides the
+/// route (gh#285): [`DispatchOverrides::base`] when the release named one, the
+/// route's `base` key otherwise. It is one value doing two jobs — where the
+/// branch is cut and where the pull request is aimed — and it has to stay one,
+/// or a layer cut from its sibling would open a request against trunk carrying
+/// the sibling's commits (gh#284).
 pub fn build_spec(
     cfg: &RoutingConfig,
     route: &Route,
@@ -448,7 +463,17 @@ pub fn build_spec(
     // rather than at commit time because that is when the dispatcher is known:
     // the agent that does the committing knows nothing about who released it.
     let git_author = by_user.and_then(|u| cfg.git_author_for(u));
-    let base = cfg.base(route).to_string();
+    // Where this one is cut from, and where its pull request goes: the
+    // dispatch's own base when it named one (gh#285), else the route's key.
+    // One value for both, exactly as before — a branch cut from a sibling whose
+    // request targeted trunk would carry the sibling's commits (gh#284).
+    let base = overrides
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| cfg.base(route))
+        .to_string();
     Ok(DispatchSpec {
         identifier: task.identifier.clone(),
         title: task.title.clone(),
@@ -532,6 +557,157 @@ pub struct DispatchOverrides {
     /// describes. A size threshold could come later; it would need a board that
     /// has watched this work first.
     pub stack: bool,
+    /// Cut this dispatch from that branch instead of the route's `base`, and
+    /// point its pull request at it (gh#285).
+    ///
+    /// The route's `base` key was the only way to say where work branches from,
+    /// and it is a *route* answer: every task under it gets the same one.
+    /// Stacking is the case that does not fit — task B is cut from task A's
+    /// branch, which is a fact about one dispatch and about nothing the config
+    /// could have known when it was written.
+    ///
+    /// Read exactly as the route's key is (`Repos::resolve_base`): `origin/` is
+    /// stripped, the branch is fetched from origin before the cut, and a fetch
+    /// that fails refuses the dispatch rather than falling back to whatever the
+    /// space folder happens to be sitting on. So the branch has to be **on
+    /// origin** — which, for a sibling's branch, means that sibling has pushed.
+    ///
+    /// Usually filled in from [`onto`](Self::onto) rather than typed: naming
+    /// the parent task is the gesture, and the branch is what it resolves to.
+    /// Kept as its own field because a base no task on the board holds — a
+    /// release branch, a colleague's branch — is a real thing to want, and
+    /// needs no board row to exist.
+    pub base: Option<String>,
+    /// Stack this dispatch onto that task: cut it from the branch that task's
+    /// attempt holds, and record the edge between the two attempts (gh#285).
+    ///
+    /// A task reference rather than a branch, because that is the gesture —
+    /// "a follow-up on this" — and because a branch alone loses the thing the
+    /// dependents need: which *attempt* the child was cut from. Resolved by
+    /// [`stack_parent`], which is also where a reference naming no task, no
+    /// attempt or no branch is refused.
+    pub onto: Option<String>,
+}
+
+/// The attempt a stacked dispatch cuts from (gh#285) — what [`onto`] resolves
+/// to, and the edge the child's row records.
+///
+/// [`onto`]: DispatchOverrides::onto
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackParent {
+    /// The attempt row itself. This is the edge worth keeping: a branch name
+    /// stops being true when the parent merges and its branch is deleted, and
+    /// an attempt id does not.
+    pub attempt: i64,
+    /// The task that attempt belongs to.
+    pub task_id: String,
+    /// …and its identifier, for the messages and the log line. A reader chasing
+    /// a chain wants `gh#12`, not a row id.
+    pub identifier: String,
+    /// The branch that attempt holds — this dispatch's [`base`].
+    ///
+    /// [`base`]: DispatchOverrides::base
+    pub branch: String,
+}
+
+/// Resolve a dispatch's `onto` to the attempt it stacks on.
+///
+/// `reference` is a task id (`gh:owner/repo#12`) or an identifier (`gh#12`),
+/// because both are things a caller has to hand: the RPC callers hold ids, and
+/// anybody typing one holds the identifier they read off the board. An
+/// identifier that matches more than one row is refused rather than guessed —
+/// two sources can spell the same name, and picking one silently would stack
+/// the work on the wrong branch.
+///
+/// Which attempt: the **live** one if there is one, else the most recent
+/// attempt holding a branch. Both are the same answer to "the branch this task's
+/// work is on" — the difference is only whether the agent is still in it, and a
+/// task in review is exactly the case the gesture was named for. An attempt
+/// with no branch (dispatched into the space folder rather than a worktree) is
+/// skipped: there is nothing to cut from.
+///
+/// Refusals, all of them before anything is created:
+/// - the reference names no row, or names several;
+/// - the task has no attempt at all, or none that holds a branch — nothing has
+///   been cut yet, so there is no sibling to stack on;
+/// - the task is the one being dispatched, which would have the branch be its
+///   own base.
+pub fn stack_parent(db: &Db, reference: &str, dispatching: &str) -> Result<StackParent> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        bail!("--onto needs a task to stack on");
+    }
+    let tasks = db.load_tasks()?;
+    let task = match tasks.iter().find(|t| t.id == reference) {
+        Some(task) => task,
+        None => {
+            let mut named = tasks
+                .iter()
+                .filter(|t| t.identifier.eq_ignore_ascii_case(reference));
+            let first = named.next().ok_or_else(|| {
+                anyhow::anyhow!("`{reference}` is not a task on the board — nothing to stack on")
+            })?;
+            if named.next().is_some() {
+                bail!(
+                    "`{reference}` names more than one task on the board — \
+                     pass the task id to say which"
+                );
+            }
+            first
+        }
+    };
+    if task.id == dispatching {
+        bail!(
+            "{} cannot stack on itself — `--onto` names the *other* task whose \
+             branch this one is cut from",
+            task.identifier
+        );
+    }
+    let attempt = task
+        .live_attempt()
+        .filter(|a| a.branch.is_some())
+        .or_else(|| task.attempts.iter().rev().find(|a| a.branch.is_some()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no attempt holding a branch — dispatch it first, and \
+                 stack on it once it has one",
+                task.identifier
+            )
+        })?;
+    Ok(StackParent {
+        attempt: attempt.id,
+        task_id: task.id.clone(),
+        identifier: task.identifier.clone(),
+        branch: attempt
+            .branch
+            .clone()
+            .expect("filtered to attempts holding a branch"),
+    })
+}
+
+/// The parent a dispatch stacks on, resolved from its overrides — `None` for
+/// the ordinary dispatch off the route's `base`, and for one that names a raw
+/// [`base`](DispatchOverrides::base) with no task behind it.
+///
+/// Naming both is refused rather than ranked. They are two spellings of the
+/// same decision, and a caller that sent both has said two things: quietly
+/// obeying one of them is how a dispatch ends up cut from a branch nobody
+/// asked for.
+pub fn stack_parent_for(
+    db: &Db,
+    task_id: &str,
+    overrides: &DispatchOverrides,
+) -> Result<Option<StackParent>> {
+    let base = overrides.base.as_deref().filter(|b| !b.trim().is_empty());
+    let onto = overrides.onto.as_deref().filter(|o| !o.trim().is_empty());
+    match (base, onto) {
+        (Some(base), Some(onto)) => bail!(
+            "this dispatch names both a base (`{base}`) and a task to stack on \
+             (`{onto}`) — say one or the other"
+        ),
+        (_, Some(onto)) => stack_parent(db, onto, task_id).map(Some),
+        _ => Ok(None),
+    }
 }
 
 impl DispatchOverrides {
@@ -872,6 +1048,7 @@ mod tests {
             account: None,
             bill: None,
             stack: false,
+            ..DispatchOverrides::default()
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -895,6 +1072,7 @@ mod tests {
             account: None,
             bill: None,
             stack: false,
+            ..DispatchOverrides::default()
         };
         let spec = build_spec(
             &RoutingConfig::default(),
@@ -918,6 +1096,7 @@ mod tests {
             account: None,
             bill: None,
             stack: false,
+            ..DispatchOverrides::default()
         };
         let err = build_spec(
             &RoutingConfig::default(),
@@ -1175,6 +1354,7 @@ mod tests {
         .unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
+                stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,
                 workspace: workspace.into(),
@@ -1406,5 +1586,236 @@ mod tests {
             "{sent}"
         );
         assert!(!sent.contains('{'), "unresolved placeholder: {sent}");
+    }
+
+    // ---- stacking: a dispatch cut from a sibling (gh#285) ------------------
+
+    /// A task row with one attempt on `branch`, live unless `outcome` says
+    /// otherwise — the shape `--onto` looks for.
+    fn sibling(db: &Db, task_id: &str, identifier: &str, branch: &str, outcome: Option<Outcome>) {
+        db.upsert_task(&UpsertTask {
+            id: task_id.into(),
+            source: Source::Github,
+            source_id: "1".into(),
+            identifier: identifier.into(),
+            title: "the layer below".into(),
+            body: None,
+            url: "u".into(),
+            labels: vec![],
+            source_state: None,
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Started,
+            updated_at: crate::db::now(),
+        })
+        .unwrap();
+        let id = db
+            .insert_attempt(&NewAttempt {
+                stacked_on: None,
+                task_id: task_id.into(),
+                pane_id: None,
+                workspace: "widget".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: Some(branch.into()),
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        if let Some(outcome) = outcome {
+            db.close_attempt(id, outcome).unwrap();
+        }
+    }
+
+    /// The headline: a dispatch cut from a sibling's branch, which nothing in
+    /// routing.toml could have said. The base decides both halves — where the
+    /// branch is cut and where the pull request goes (gh#284) — so a stacked
+    /// layer never opens a request that carries its parent's commits.
+    #[test]
+    fn a_per_dispatch_base_replaces_the_routes_own() {
+        let overrides = DispatchOverrides {
+            base: Some("board/gh-12-parser".into()),
+            ..DispatchOverrides::default()
+        };
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &overrides,
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.base, "board/gh-12-parser");
+        assert!(
+            spec.prompt
+                .contains("gh pr create --base board/gh-12-parser"),
+            "the agent has to be told where the request goes: {}",
+            spec.prompt
+        );
+        // Without one, the route's key is untouched.
+        let plain = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain.base, "origin/HEAD");
+        assert!(!plain.prompt.contains("--base"), "{}", plain.prompt);
+    }
+
+    /// The gesture: name the task, not the branch. What comes back is the
+    /// *attempt*, because that is the edge worth keeping once the parent
+    /// merges and its branch is deleted.
+    #[test]
+    fn onto_resolves_a_task_to_the_attempt_holding_its_branch() {
+        let db = Db::open_in_memory().unwrap();
+        sibling(
+            &db,
+            "gh:owner/widget#12",
+            "gh#12",
+            "board/gh-12-parser",
+            None,
+        );
+
+        for reference in ["gh:owner/widget#12", "gh#12", "GH#12"] {
+            let parent = stack_parent(&db, reference, "gh:owner/widget#7").unwrap();
+            assert_eq!(parent.branch, "board/gh-12-parser", "via `{reference}`");
+            assert_eq!(parent.identifier, "gh#12");
+            assert_eq!(parent.task_id, "gh:owner/widget#12");
+            assert_eq!(parent.attempt, 1);
+        }
+    }
+
+    /// A task in review is exactly what the gesture was named for: its agent is
+    /// gone, its branch is pushed, and a follow-up on it is the whole point.
+    #[test]
+    fn a_closed_attempt_is_still_something_to_stack_on() {
+        let db = Db::open_in_memory().unwrap();
+        sibling(
+            &db,
+            "gh:owner/widget#12",
+            "gh#12",
+            "board/gh-12-parser",
+            Some(Outcome::Done),
+        );
+        let parent = stack_parent(&db, "gh#12", "gh:owner/widget#7").unwrap();
+        assert_eq!(parent.branch, "board/gh-12-parser");
+    }
+
+    /// Every refusal happens before anything is created, and each says which
+    /// of the four things went wrong.
+    #[test]
+    fn a_parent_that_cannot_be_stacked_on_is_refused_by_name() {
+        let db = Db::open_in_memory().unwrap();
+        sibling(
+            &db,
+            "gh:owner/widget#12",
+            "gh#12",
+            "board/gh-12-parser",
+            None,
+        );
+        // A task with an attempt that never held a branch — nothing was cut, so
+        // there is nothing to cut from.
+        working_agent(&db, "linear:LIN-3", "chat-3", "widget");
+
+        let err = |reference: &str| {
+            stack_parent(&db, reference, "gh:owner/widget#7")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("gh#404").contains("not a task on the board"));
+        assert!(err("LIN-3").contains("no attempt holding a branch"));
+        assert!(err("  ").contains("needs a task"));
+        // Its own branch cannot be its own base.
+        assert!(
+            stack_parent(&db, "gh#12", "gh:owner/widget#12")
+                .unwrap_err()
+                .to_string()
+                .contains("cannot stack on itself")
+        );
+    }
+
+    /// Two rows can spell the same identifier — two sources, or two repos the
+    /// board watches. Picking one silently would stack the work on somebody
+    /// else's branch, which is the failure the whole refusal exists for.
+    #[test]
+    fn an_identifier_two_rows_answer_to_is_refused_rather_than_guessed() {
+        let db = Db::open_in_memory().unwrap();
+        sibling(
+            &db,
+            "gh:owner/widget#12",
+            "gh#12",
+            "board/gh-12-widget",
+            None,
+        );
+        sibling(&db, "gh:owner/other#12", "gh#12", "board/gh-12-other", None);
+        let err = stack_parent(&db, "gh#12", "gh:owner/widget#7")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than one task"), "{err}");
+        // The unambiguous id still works.
+        let parent = stack_parent(&db, "gh:owner/other#12", "gh:owner/widget#7").unwrap();
+        assert_eq!(parent.branch, "board/gh-12-other");
+    }
+
+    /// `--base` and `--onto` are two spellings of one decision. A caller that
+    /// sent both said two things, and obeying one of them quietly is how a
+    /// dispatch ends up cut from a branch nobody asked for.
+    #[test]
+    fn naming_both_a_base_and_a_parent_is_refused() {
+        let db = Db::open_in_memory().unwrap();
+        sibling(
+            &db,
+            "gh:owner/widget#12",
+            "gh#12",
+            "board/gh-12-parser",
+            None,
+        );
+
+        let both = DispatchOverrides {
+            base: Some("release-1.x".into()),
+            onto: Some("gh#12".into()),
+            ..DispatchOverrides::default()
+        };
+        let err = stack_parent_for(&db, "gh:owner/widget#7", &both)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("say one or the other"), "{err}");
+
+        // Either alone is fine, and only `onto` yields a parent: a raw base
+        // names a branch, and a branch is not an attempt.
+        let onto = DispatchOverrides {
+            onto: Some("gh#12".into()),
+            ..DispatchOverrides::default()
+        };
+        assert_eq!(
+            stack_parent_for(&db, "gh:owner/widget#7", &onto)
+                .unwrap()
+                .map(|p| p.branch),
+            Some("board/gh-12-parser".into()),
+        );
+        let base = DispatchOverrides {
+            base: Some("release-1.x".into()),
+            ..DispatchOverrides::default()
+        };
+        assert_eq!(
+            stack_parent_for(&db, "gh:owner/widget#7", &base).unwrap(),
+            None
+        );
+        assert_eq!(
+            stack_parent_for(&db, "gh:owner/widget#7", &DispatchOverrides::default()).unwrap(),
+            None
+        );
     }
 }

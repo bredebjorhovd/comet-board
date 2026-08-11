@@ -110,6 +110,8 @@ knowing it is being read.
 
 ```bash
 comet-board dispatch --task gh:owner/repo#14 [--account <slot>] [--runtime ..] [--model ..] [--stack]
+comet-board dispatch --task gh:owner/repo#14 [--account <slot>] [--runtime ..] [--model ..]
+comet-board dispatch --task gh:owner/repo#15 --onto gh#14   # stack it on #14's branch
 comet-board retry    --task gh:owner/repo#14   # blocked → replace; failed/ready → dispatch
 comet-board wait --timeout 3600 --json [--blocked-is-settled]
 ```
@@ -129,6 +131,11 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 - **Billing**: a dispatch naming no account runs on the box owner's Claude
   login. Pass `--account <slot>` for whoever should pay; the picker rows and
   the CLI warn on cross-billing (billing_guard).
+- **Stacking**: `--onto <task>` cuts the new branch from that task's attempt
+  branch and targets its PR there, so the follow-up's diff is only its own. The
+  parent must have PUSHED — a dispatch branches from origin, so an unpushed
+  parent refuses rather than cutting from trunk. `--base <branch>` is the same
+  for a branch no board task holds; passing both is refused.
 - Cancel ends the attempt, not the issue; the row returns to ready.
 - **`--stack`** asks the agent to decompose its task into a stack of layered
   pull requests (`gh stack`), one dependent concern per layer, reviewed in
@@ -167,6 +174,8 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `list` | `--state`, `--source`, `--json` | List what is on the board. `--json` for orchestrating agents |
 | `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack` | Release a task into a coding-agent chat |
 | `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack` | Release a task again — the desktop panel's Retry, from a shell |
+| `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--onto`, `--base` | Release a task into a coding-agent chat |
+| `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
 | `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
