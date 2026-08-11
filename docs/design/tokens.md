@@ -6,6 +6,8 @@ field that paints it. Reconciled for gh#274.
 The canvases are in `canvas/`. All five declare the same table, so this is one
 palette, not five — see `canvas/README.md`.
 
+Per-surface specs: `window.md` (gh#275), `stats.md` (gh#278).
+
 Locked by `every_canvas_token_is_the_value_the_canvas_declares` in `theme.rs`.
 Change a value here and that test fails, which is the point: the last redesign
 pass drifted because nothing compared the two.
@@ -58,13 +60,19 @@ spec; the surface issues wire them.
 
 | Canvas | Dark | Light | Theme |
 | --- | --- | --- | --- |
-| `--lift` | `none` | `0 1px 2px rgba(0,0,0,.05)` | `float_card` |
+| `--lift` | `none` | `0 1px 2px rgba(0,0,0,.05)` | `lift_shadow()` |
 | `--sellift` | `0 0 0 1px rgba(255,255,255,.13)` | `0 0 0 1px #dcdce2, 0 1px 2px rgba(0,0,0,.06)` | `row_edge` (+ `LIGHT_SELECT_EDGE`) |
-| `--cardshadow` | `none` | `0 1px 2px rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.18)` | `float_card` |
+| `--cardshadow` | `none` | `0 1px 2px rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.18)` | `float_shadow()` |
 
 Dark lifts with tone and a ring; light lifts with shadow. A selected row's ring
 is painted as an INSET shadow (`hairline_ring`) — a drop shadow behind a
 translucent fill shows through as a plate.
+
+The three are different sizes of the same idea and are not interchangeable.
+`--lift` is the smallest — the chosen segment of a segmented control, rising out
+of a chip wash — and `--cardshadow` is what a whole floating panel casts over
+the page. `float_card` is the float's *surface*, not its shadow; it was in the
+`--lift` row here until gh#278 wanted the shadow and found a colour.
 
 ## Borrowed marks
 

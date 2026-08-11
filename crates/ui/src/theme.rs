@@ -173,7 +173,10 @@
 //! 15), [`Theme::TEXT_PROSE`] 14/[`Theme::PROSE_LINE_HEIGHT`] 22 is reserved
 //! for the transcript, and [`Theme::TEXT_FIGURE`] is the single display size
 //! for a number shown as a number. Hierarchy past that comes from weight and
-//! the four greys above — not from half-pixels.
+//! the four greys above — not from half-pixels. Off the ramp entirely, and
+//! named so they cannot be reached by accident: [`Theme::TEXT_DISPLAY`] for the
+//! figure that replaces a card's title, and [`Theme::TEXT_HEADLINE`] for the
+//! one dashboard headline in the app.
 //!
 //! # The phone reads from here too (gh#181)
 //!
@@ -587,6 +590,19 @@ impl Theme {
     /// Titles: page headers, dialog titles, empty-state headings. The top of
     /// the UI ramp; anything louder is a matter of weight, not size.
     pub const TEXT_TITLE: f32 = 15.0;
+    /// The headline over a DASHBOARD — Board stats, and nothing else (gh#278).
+    ///
+    /// Not a fifth rung of the UI ramp: it is off it, the same way
+    /// [`Self::TEXT_FIGURE`] and [`Self::TEXT_DISPLAY`] are, and for the same
+    /// reason. Every other settings page is a section — the accounts canvas
+    /// heads its own at [`Self::TEXT_TITLE`] — but this one is a page of
+    /// figures, one of them at 34px, and a 15px title over a 34px number is not
+    /// a header, it is a caption. The canvases declare 20px exactly once, here.
+    ///
+    /// Reachable only through [`crate::settings::widgets::dashboard_header`],
+    /// so "is this page a dashboard" stays one decision rather than a size any
+    /// title can help itself to.
+    pub const TEXT_HEADLINE: f32 = 20.0;
     /// Prose, and only prose: rendered markdown, the message bubbles, and the
     /// composer you type them into. Reserved — a transcript is reading, not
     /// chrome, and it does not share the UI ramp.
@@ -770,6 +786,34 @@ impl Theme {
                 shadow(10.0, 15.0, -3.0, hsla(0.0, 0.0, 0.0, 0.1)),
                 shadow(4.0, 6.0, -4.0, hsla(0.0, 0.0, 0.0, 0.1)),
             ]
+        }
+    }
+
+    /// **The canvases' `--lift`** — the smallest lift there is, for a thing that
+    /// rises out of a *wash* rather than off the page: the chosen segment of a
+    /// segmented control, and nothing bigger.
+    ///
+    /// `none` in dark and `0 1px 2px rgba(0,0,0,.05)` in light, which is the
+    /// whole of the difference between the two variants (gh#278). Dark lifts by
+    /// changing surface — the segment drops to the near-black `--card` and the
+    /// chip wash around it stays where it was — and a black shadow on
+    /// near-black would add nothing to that. Light cannot lift by tone alone
+    /// because the segment's surface IS white, so the shadow is the mechanism.
+    ///
+    /// Distinct from [`Self::float_shadow`] (`--cardshadow`), which is what a
+    /// dialog or a popover casts over a whole page. A 30px shadow under a 22px
+    /// chip would read as the chip peeling off.
+    pub fn lift_shadow(&self) -> Vec<gpui::BoxShadow> {
+        if self.light {
+            vec![gpui::BoxShadow {
+                color: ink(0.05),
+                offset: gpui::point(gpui::px(0.0), gpui::px(1.0)),
+                blur_radius: gpui::px(2.0),
+                spread_radius: gpui::px(0.0),
+                inset: false,
+            }]
+        } else {
+            Vec::new()
         }
     }
 
@@ -1908,6 +1952,17 @@ mod tests {
         }
         assert_eq!(l.element_hover, ink(0.025), "light --hover");
         assert_eq!(l.chip, ink(0.05), "light --chip");
+
+        // --- `--lift`, which is a shadow and so is asserted as one (gh#278) ---
+        // `none` in dark, `0 1px 2px rgba(0,0,0,.05)` in light. The canvas puts
+        // this under the chosen segment of a segmented control and nowhere else.
+        assert!(d.lift_shadow().is_empty(), "dark --lift must be none");
+        let lift = l.lift_shadow();
+        assert_eq!(lift.len(), 1, "light --lift is one shadow");
+        assert_eq!(lift[0].color, ink(0.05), "light --lift colour");
+        assert_eq!(lift[0].offset.y, px(1.0), "light --lift offset");
+        assert_eq!(lift[0].blur_radius, px(2.0), "light --lift blur");
+        assert_eq!(lift[0].spread_radius, px(0.0), "light --lift spread");
 
         // --- the status ramp, both variants ---
         assert_eq!((Theme::STATUS_L, Theme::STATUS_C), (0.74, 0.14));
