@@ -36,6 +36,7 @@ pub mod notify;
 pub mod onboard;
 pub mod overrun;
 pub mod prices;
+pub mod rebased;
 pub mod review;
 pub mod routes;
 pub mod rows;
