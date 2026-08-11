@@ -1931,7 +1931,10 @@ impl Shell {
             self.titlebar_tween,
             cluster_buttons_start(is_macos, fullscreen),
         );
-        cluster + CLUSTER_BUTTONS_WIDTH + 10.0
+        // The same 8px clearance [`cluster_clearance`] gives a full-bleed
+        // header. On macOS at rest that is 88 + 76 + 8 = 172 — where the canvas
+        // starts the tab strip (`docs/design/window.md` claim B3).
+        cluster + CLUSTER_BUTTONS_WIDTH + Theme::SPACE_SM
     }
 
     /// The unified window titlebar: chat → the session tab strip; settings →
