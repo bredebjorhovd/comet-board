@@ -1274,6 +1274,15 @@ async fn drive_run(
         inner.touch_session(&chat_id);
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
+        //
+        // Since gh#280 a SUBAGENT reaches here too. A `run_in_background` Task
+        // returns its tool result the instant it is launched, so the parent
+        // can finish its turn and park while the subagent works on — and the
+        // frames it goes on to emit now un-park the session instead of falling
+        // into the silence that made "still working" and "finished" identical.
+        // It also keeps the idle reaper off a child that is doing real work;
+        // the CLI re-invokes the model when the background task completes,
+        // which ends in a Done that parks the session again.
         if idle_since.take().is_some() {
             inner.set_status(&chat_id, SessionStatus::Working, true);
         }

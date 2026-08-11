@@ -284,6 +284,7 @@ extension RenderToolCall {
         case "webSearch": return "Web"
         case "todo": return "Todo"
         case "mcp": return "MCP"
+        case "task": return "Task"
         // Only reachable if a skill ever ends up inside a group; the row
         // builder breaks it out into a landmark of its own (gh#134).
         case "skill": return "Skill"
@@ -307,6 +308,26 @@ extension RenderToolCall {
         case "mcp":
             let server = string("server").map { "\($0) · " } ?? ""
             return server + (string("tool") ?? "")
+        // Delegated work: which agent, what it was asked to do, and how far it
+        // has got — the step count is the only sign of life a subagent's
+        // minutes leave in this transcript (gh#280).
+        case "task":
+            let agent = (string("subagentType")?.trimmingCharacters(in: .whitespaces)).flatMap {
+                $0.isEmpty ? nil : $0
+            }
+            let description = string("description") ?? ""
+            var detail: String
+            switch (agent, description.trimmingCharacters(in: .whitespaces).isEmpty) {
+            case (let agent?, true): detail = agent
+            case (let agent?, false): detail = "\(agent) · \(description)"
+            case (nil, _): detail = description
+            }
+            let steps = Int(fields["steps"] as? Int64 ?? 0)
+            if steps > 0 {
+                if !detail.isEmpty { detail += " · " }
+                detail += steps == 1 ? "1 step" : "\(steps) steps"
+            }
+            return detail
         case "skill":
             let name = "/" + (string("name") ?? "")
             guard let args = string("args"), !args.isEmpty else { return name }
@@ -326,6 +347,7 @@ extension RenderToolCall {
         case "webFetch", "webSearch": return "globe"
         case "todo": return "checklist"
         case "skill": return "wand.and.stars"
+        case "task": return "person.2"
         default: return "square.grid.2x2"
         }
     }
@@ -349,7 +371,13 @@ func toolGroupSummary(_ tools: [ToolItem]) -> String {
     if reads > 0 { segments.append(reads == 1 ? "read 1 file" : "read \(reads) files") }
     let searches = tools.filter { ["search", "glob", "webSearch", "webFetch"].contains($0.call.tag) }.count
     if searches > 0 { segments.append(searches == 1 ? "1 search" : "\(searches) searches") }
-    let other = tools.count - runs - edits - reads - searches
+    // Delegation gets its own segment: "3 tools" would hide the work that took
+    // the longest (gh#280).
+    let delegated = tools.filter { $0.call.tag == "task" }.count
+    if delegated > 0 {
+        segments.append(delegated == 1 ? "delegated 1 task" : "delegated \(delegated) tasks")
+    }
+    let other = tools.count - runs - edits - reads - searches - delegated
     if other > 0 { segments.append(other == 1 ? "1 tool" : "\(other) tools") }
     let failed = tools.filter(\.isError).count
     if failed > 0 { segments.append("\(failed) failed") }

@@ -2226,6 +2226,8 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         // Only reachable if a skill ever ends up inside a group; `rows_for_entry`
         // breaks it out into a landmark of its own (gh#134).
         ToolCall::Skill { .. } => crate::icons::MAGIC_STICK,
+        // Delegated work — a second pair of hands, not another widget (gh#280).
+        ToolCall::Task { .. } => crate::icons::USERS_GROUP,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -3007,6 +3009,64 @@ mod tests {
             ],
         };
         assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
+    }
+
+    #[test]
+    fn a_task_chip_names_its_agent_and_counts_its_steps() {
+        // Before any step lands: who was asked, and to do what.
+        assert_eq!(
+            tool_chip_content(&ToolCall::Task {
+                description: "map the normalizer".into(),
+                subagent_type: Some("Explore".into()),
+                steps: 0,
+            }),
+            ("Task", "Explore · map the normalizer".to_string())
+        );
+        // While it runs, the count IS the row's news (gh#280).
+        assert_eq!(
+            tool_chip_content(&ToolCall::Task {
+                description: "map the normalizer".into(),
+                subagent_type: Some("Explore".into()),
+                steps: 53,
+            }),
+            (
+                "Task",
+                "Explore · map the normalizer · 53 steps".to_string()
+            )
+        );
+        // No agent named ⇒ no dangling separator.
+        assert_eq!(
+            tool_chip_content(&ToolCall::Task {
+                description: "tidy up".into(),
+                subagent_type: None,
+                steps: 1,
+            }),
+            ("Task", "tidy up · 1 step".to_string())
+        );
+        // Delegation is its own segment in a group summary — never folded
+        // into a generic "called 1 tool".
+        let tools = vec![
+            ToolItem {
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+                is_error: false,
+                resolved: true,
+            },
+            ToolItem {
+                call: ToolCall::Task {
+                    description: "x".into(),
+                    subagent_type: None,
+                    steps: 2,
+                },
+                is_error: false,
+                resolved: false,
+            },
+        ];
+        assert_eq!(
+            tool_group_summary(&tools),
+            "Ran 1 command · delegated 1 task"
+        );
     }
 
     #[test]

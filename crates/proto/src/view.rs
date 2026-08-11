@@ -489,6 +489,34 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
                 None => format!("/{name}"),
             },
         ),
+        // Delegated work names its agent first (`Explore`, `general-purpose`)
+        // — that is what the reader recognizes — then what it was asked to do,
+        // then how far it has got. The step count is the whole point of the
+        // row while it runs (gh#280): a subagent's own transcript never
+        // reaches this doc, so without it a five-minute delegation and a dead
+        // one look identical.
+        ToolCall::Task {
+            description,
+            subagent_type,
+            steps,
+        } => {
+            let mut detail = match subagent_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                Some(agent) if description.trim().is_empty() => agent.to_string(),
+                Some(agent) => format!("{agent} · {description}"),
+                None => description.clone(),
+            };
+            if *steps > 0 {
+                if !detail.is_empty() {
+                    detail.push_str(" · ");
+                }
+                detail.push_str(&plural(*steps as usize, "step", "steps"));
+            }
+            ("Task", detail)
+        }
         ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
     }
 }
@@ -505,6 +533,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     let mut searches = 0usize;
     let mut fetches = 0usize;
     let mut todos = 0usize;
+    let mut delegated = 0usize;
     let mut other = 0usize;
     let mut failed = 0usize;
     for (call, is_error) in tools {
@@ -530,6 +559,10 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
+            // Delegation gets its own segment rather than folding into the
+            // generic tool count: "called 3 tools" is the one summary that
+            // would hide the work that took the longest (gh#280).
+            ToolCall::Task { .. } => delegated += 1,
             // Defensive: both viewports break a skill out of the group into a
             // landmark of its own (gh#134), so one reaching here is a group
             // that was assembled without that split — count it rather than
@@ -555,6 +588,9 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     }
     if todos > 0 {
         segments.push("updated todos".to_string());
+    }
+    if delegated > 0 {
+        segments.push(format!("delegated {}", plural(delegated, "task", "tasks")));
     }
     if other > 0 {
         segments.push(format!("called {}", plural(other, "tool", "tools")));

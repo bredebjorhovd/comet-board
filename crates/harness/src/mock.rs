@@ -266,11 +266,38 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `COMET_MOCK_SUBAGENT=1` appends a delegation that
+        // is still running — a Task call followed by the subagent steps that
+        // count onto it, and deliberately NO ToolResult. That is the gh#280
+        // shape: a background subagent works on while the parent's turn ends,
+        // and the row is the only thing on screen that says so. The only
+        // data-side way to put a live Task row in the transcript.
+        let mock_subagent = std::env::var("COMET_MOCK_SUBAGENT")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let subagent_events = mock_subagent
+            .then(|| {
+                let id = "mock-task-1";
+                std::iter::once(AgentEvent::ToolCall {
+                    id: id.into(),
+                    call: comet_proto::ToolCall::Task {
+                        description: "map the streaming call sites".into(),
+                        subagent_type: Some("Explore".into()),
+                        steps: 0,
+                    },
+                })
+                .chain((0..12).map(|_| AgentEvent::SubagentActivity {
+                    parent_tool_use_id: id.into(),
+                }))
+            })
+            .into_iter()
+            .flatten();
         let events: Vec<Result<AgentEvent, HarnessError>> = body
             .iter()
             .cycle()
             .take(body.len() * repeat)
             .cloned()
+            .chain(subagent_events)
             .chain(code_tool_events)
             .chain(code_event)
             .chain(table_event)

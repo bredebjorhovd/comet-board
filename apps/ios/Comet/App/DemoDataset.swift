@@ -727,6 +727,8 @@ final class DemoDataset {
                     // point of rendering it differently.
                     .tool(id: "skill1", call: RenderToolCall(tag: "skill", fields: ["name": "comet-board", "args": "list --state ready"]), isError: false, resolved: true),
                     .tool(id: "tool2", call: RenderToolCall(tag: "editFile", fields: ["path": "Comet/Transcript/Veil.swift"]), isError: false, resolved: true),
+                    // A subagent still working: unresolved, and counting (gh#280).
+                    .tool(id: "task1", call: RenderToolCall(tag: "task", fields: ["description": "map the veil call sites", "subagentType": "Explore", "steps": Int64(12)]), isError: false, resolved: false),
                     .tool(id: "tool3", call: RenderToolCall(tag: "exec", fields: ["command": "xcodebuild -scheme Comet build"]), isError: false, resolved: true),
                     .text(id: "t1", text: """
                     Implementation lands in `Veil.swift`:
@@ -831,7 +833,22 @@ final class DemoDataset {
                 guard let store else { return }
                 var current = store.entries
                 guard let last = current.indices.last, current[last].id == liveId else { return }
-                current[last].parts = [.text(id: "t0", text: text)]
+                // A delegation running under the reply: unresolved, and its
+                // step count climbing while the text streams — the gh#280
+                // shape, and the only way the phone's live Task row can be
+                // photographed (a settled entry's tool group is collapsed and
+                // the screenshot rig has no touch to open it).
+                let steps = Int64(min(12, ix / 5 + 1))
+                current[last].parts = [
+                    .text(id: "t0", text: text),
+                    .tool(id: "task1",
+                          call: RenderToolCall(tag: "task", fields: [
+                              "description": "map the veil call sites",
+                              "subagentType": "Explore",
+                              "steps": steps,
+                          ]),
+                          isError: false, resolved: false),
+                ]
                 store.setEntries(current)
                 try? await Task.sleep(nanoseconds: UInt64.random(in: 30_000_000...140_000_000))
             }

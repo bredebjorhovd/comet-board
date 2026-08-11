@@ -153,6 +153,22 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
         "WebSearch" => ToolCall::WebSearch {
             query: str_field(input, "query"),
         },
+        // Delegation. `Task` is the long-standing spelling; `Agent` is the
+        // newer one — same tool, and a version skew must not cost the row its
+        // identity (an anonymous `Tool  Agent` is exactly the blind spot
+        // gh#280 is about). The `prompt` is deliberately not decoded: it is
+        // the whole brief, often thousands of words, and the description is
+        // what a chip can say.
+        "Task" | "Agent" => ToolCall::Task {
+            description: str_field(input, "description"),
+            subagent_type: ["subagent_type", "agentType"]
+                .into_iter()
+                .find_map(|key| input.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned),
+            steps: 0,
+        },
         "TodoWrite" => ToolCall::Todo {
             items: input
                 .get("todos")
@@ -252,8 +268,25 @@ impl Normalizer {
             // parent's text stream, so folding them in would split a contiguous
             // text block around a phantom tool call. Only null-parent frames
             // are this turn's own content.
+            //
+            // They are not, however, nothing. Dropping them outright made the
+            // busiest stretch of a run — an Explore subagent working for
+            // minutes across dozens of tool calls — emit not one event, so the
+            // chat could not be told apart from a stopped one (gh#280). Each
+            // kind of subagent frame is answered below with the smallest
+            // signal that keeps the parent transcript intact: the token stream
+            // becomes pure liveness, and the discrete steps get counted.
             Frame::StreamEvent(f) => {
-                if f.parent_tool_use_id.is_some() || f.event.kind != "content_block_delta" {
+                // The subagent's own tokens. Nothing here belongs in the
+                // parent's text, but "characters are arriving from somewhere"
+                // is exactly what an empty reasoning delta means — the engine
+                // takes those as liveness and never journals or renders them.
+                if f.parent_tool_use_id.is_some() {
+                    return vec![AgentEvent::ReasoningDelta {
+                        text: String::new(),
+                    }];
+                }
+                if f.event.kind != "content_block_delta" {
                     return Vec::new();
                 }
                 match f.event.delta.kind.as_str() {
@@ -276,8 +309,27 @@ impl Normalizer {
             }
 
             Frame::Assistant(f) => {
-                if f.parent_tool_use_id.is_some() {
-                    return Vec::new();
+                // A subagent's assistant frame: one step of delegated work.
+                // Its tool calls are the countable unit — they are what the
+                // subagent spends its minutes on — so each becomes an activity
+                // event against the Task row that launched it. A frame that
+                // only carries text (the subagent's final answer to its
+                // parent) still beats as liveness.
+                if let Some(parent) = f.parent_tool_use_id {
+                    let steps: Vec<AgentEvent> = f
+                        .message
+                        .blocks()
+                        .filter(|b: &ContentBlock| b.kind == "tool_use")
+                        .map(|_| AgentEvent::SubagentActivity {
+                            parent_tool_use_id: parent.clone(),
+                        })
+                        .collect();
+                    if steps.is_empty() {
+                        return vec![AgentEvent::ReasoningDelta {
+                            text: String::new(),
+                        }];
+                    }
+                    return steps;
                 }
                 let mut out: Vec<AgentEvent> = f
                     .message
@@ -306,8 +358,13 @@ impl Normalizer {
             }
 
             Frame::User(f) => {
+                // A subagent's tool results. Liveness only — the call they
+                // answer was already counted as the step, and counting both
+                // ends would double every subagent's progress.
                 if f.parent_tool_use_id.is_some() {
-                    return Vec::new();
+                    return vec![AgentEvent::ReasoningDelta {
+                        text: String::new(),
+                    }];
                 }
                 let mut out: Vec<AgentEvent> = Vec::new();
                 for block in f.message.blocks() {
@@ -626,6 +683,91 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"abc"}}}"#,
         );
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn delegation_decodes_to_a_named_task() {
+        assert_eq!(
+            decode_tool_use(
+                "Task",
+                &json!({
+                    "description": "find the normalizer",
+                    "subagent_type": "Explore",
+                    "prompt": "a very long brief…"
+                })
+            ),
+            ToolCall::Task {
+                description: "find the normalizer".into(),
+                subagent_type: Some("Explore".into()),
+                steps: 0
+            }
+        );
+        // The newer spelling of the same tool.
+        assert!(matches!(
+            decode_tool_use("Agent", &json!({"description": "x"})),
+            ToolCall::Task { .. }
+        ));
+        // No agent named ⇒ no agent shown (never a blank ` · ` in the chip).
+        assert_eq!(
+            decode_tool_use("Task", &json!({"description": "x", "subagent_type": " "})),
+            ToolCall::Task {
+                description: "x".into(),
+                subagent_type: None,
+                steps: 0
+            }
+        );
+    }
+
+    #[test]
+    fn subagent_frames_are_liveness_and_counted_steps() {
+        let normalize = |raw: &str| {
+            let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+            Normalizer::new().normalize(frame, false)
+        };
+        let beat = vec![AgentEvent::ReasoningDelta {
+            text: String::new(),
+        }];
+
+        // The subagent's token stream: liveness, never parent transcript text.
+        assert_eq!(
+            normalize(
+                r#"{"type":"stream_event","parent_tool_use_id":"toolu_1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"subagent prose"}}}"#,
+            ),
+            beat
+        );
+        // Its tool calls are the countable steps, one event each, attributed
+        // to the Task row that launched it.
+        assert_eq!(
+            normalize(
+                r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[
+                    {"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/a"}},
+                    {"type":"tool_use","id":"s2","name":"Grep","input":{"pattern":"x"}}]}}"#,
+            ),
+            vec![
+                AgentEvent::SubagentActivity {
+                    parent_tool_use_id: "toolu_1".into()
+                },
+                AgentEvent::SubagentActivity {
+                    parent_tool_use_id: "toolu_1".into()
+                },
+            ]
+        );
+        // A text-only subagent message is progress, not a step.
+        assert_eq!(
+            normalize(
+                r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"text","text":"here is what I found"}]}}"#,
+            ),
+            beat
+        );
+        // Its tool RESULTS beat but do not count — the call was the step.
+        assert_eq!(
+            normalize(
+                r#"{"type":"user","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"tool_result","tool_use_id":"s1"}]}}"#,
+            ),
+            beat
+        );
+        // And none of it disturbs the parent's own message accounting: no
+        // AssistantMessageCompleted, no ToolCall, no ToolResult above.
     }
 
     #[test]
