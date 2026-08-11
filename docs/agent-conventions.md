@@ -257,6 +257,20 @@ statement that you are finished, so it settles the attempt promptly. Commits
 are not — you were told to make them mid-flight — so they settle it only once
 the run has genuinely ended. Open the PR when you want the row to move promptly.
 
+**If your brief names a base, pass it.** `gh pr create` with no `--base`
+targets the repo's default branch, and a route can cut your branch from
+somewhere else — a release branch, or another agent's branch. When it has, the
+last line of your brief says so:
+
+> Open your pull request against `release-1.x`, not the repo's default branch:
+> `gh pr create --base release-1.x`.
+
+Do exactly that. Forgetting the flag does not produce a smaller mistake than
+usual: the request then asks to merge everything `release-1.x` is ahead by into
+`main`, so the diff is mostly other people's commits and the target is a branch
+nobody asked you to touch. A brief that says nothing about a base means your
+branch was cut from the repo default, and `gh`'s own default is already right.
+
 **Say what you changed, in claims a reviewer can check.** Before you call
 yourself done — after the commits, alongside the pull request — submit them:
 

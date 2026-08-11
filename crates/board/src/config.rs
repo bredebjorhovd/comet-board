@@ -549,6 +549,13 @@ pub struct Defaults {
     /// an always-on box, which is why it is not the default. Whatever it says,
     /// the dispatch never branches from a local branch: the folder sits on
     /// whatever was last checked out in it, and that is nobody's intended base.
+    ///
+    /// When this names a branch rather than the remote's default, the brief
+    /// says so and tells the agent to open its pull request against it
+    /// (gh#284): opening one is the agent's job, and `gh pr create` with no
+    /// `--base` targets the repo default — which for a route based on
+    /// `release-1.x` is a request to merge the release branch into `main`. See
+    /// [`crate::dispatch::pr_base`].
     #[serde(default = "default_base")]
     pub base: String,
     /// Surface a notification, out of band, when work blocks or settles.
