@@ -590,15 +590,39 @@ impl TaskRow {
     /// owner stays out for the same reason it stays out of branch names. A
     /// Linear identifier (`LIN-142`) is already unique across the board and is
     /// shown unchanged, as is any id this rule cannot parse.
+    ///
+    /// The separator is the id's own, `#` or `!` — this qualifies a name, it
+    /// does not replace one (gh#357). A `gh!508` row is a pull request nobody
+    /// filed a ticket for (gh#344), and `gh!508` *is* its identifier; rendering
+    /// it `tally #508` gives it a second name, and one already taken by
+    /// whatever issue #508 is.
     pub fn display_identifier(&self) -> String {
-        let number = self
+        let tail = self
             .id
-            .rsplit(['#', '!'])
-            .next()
-            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
-        match (gh_repo_name(&self.id), number) {
-            (Some(repo), Some(n)) if !repo.is_empty() => format!("{repo} #{n}"),
+            .rfind(['#', '!'])
+            .map(|ix| self.id.split_at(ix))
+            .map(|(_, tail)| (&tail[..1], &tail[1..]))
+            .filter(|(_, number)| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()));
+        match (gh_repo_name(&self.id), tail) {
+            (Some(repo), Some((sep, number))) if !repo.is_empty() => {
+                format!("{repo} {sep}{number}")
+            }
             _ => self.identifier.clone(),
+        }
+    }
+
+    /// Whether this row's name *is* its pull request: a `gh!508` row, a pull
+    /// request the board never dispatched and no ticket ever asked for (gh#344).
+    ///
+    /// gh#357 does not except such a row — `gh!508` is that task's identifier,
+    /// and the identifier is the name. What it changes is that naming the row
+    /// and saying where it lives are the same act here, so a surface that would
+    /// otherwise say both says one: `merge gh!508 into main`, not `merge gh!508
+    /// (PR #508)`, and a review row that ends at `waiting on you`.
+    pub fn is_pull_request(&self) -> bool {
+        match (self.id.rsplit_once('!'), self.pr_number) {
+            (Some((_, tail)), Some(number)) => tail == number.to_string(),
+            _ => false,
         }
     }
 }
@@ -1045,6 +1069,14 @@ fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> V
             ]
         }
         BoardState::Failed => vec![MetaField::flow("pane exited without completing")],
+        // What this row is, then what it needs, then where it lives — the
+        // pull request last, and never first (gh#357). The row is already
+        // named: its identifier leads the row on every viewport, and a bare
+        // `PR #12` at the head of the block is a second number in the same
+        // shape, competing to be read as the name of the work. It is a
+        // location, so it goes after the facts and wears the preposition that
+        // says so — which is also what keeps it from joining the list in
+        // `waiting on PR #11 · PR #12`.
         BoardState::Review => match (row.pr_number, row.branch.as_deref()) {
             // A stacked PR says which layer it is, and — where the board has
             // asked — what merging it would actually do. The landing note
@@ -1052,13 +1084,17 @@ fn state_metadata_fields(row: &TaskRow, selected: bool, now: DateTime<Utc>) -> V
             // row's call to action, and the one that names the branch says
             // strictly more (gh#283).
             (Some(n), _) => vec![
-                MetaField::flow(format!("PR #{n}")),
                 MetaField::flow(stack_note(row).unwrap_or_default()),
                 MetaField::flow(landing_note(row).unwrap_or_else(|| "waiting on you".into())),
+                // Nothing to add on a row the pull request already names.
+                MetaField::flow(match row.is_pull_request() {
+                    true => String::new(),
+                    false => format!("in PR #{n}"),
+                }),
             ],
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.
-            (None, Some(b)) => vec![MetaField::flow(b), MetaField::flow("no PR")],
+            (None, Some(b)) => vec![MetaField::flow("no PR"), MetaField::flow(format!("on {b}"))],
             (None, None) => vec![MetaField::flow("waiting on you")],
         },
         BoardState::Ready => {
@@ -1377,9 +1413,14 @@ pub fn stack_line(row: &TaskRow) -> Option<String> {
 /// reader most in need of the sentence, and GitHub evaluates the rules at
 /// execution time rather than at submission, so nothing upstream will stop them.
 pub fn merge_confirmation(row: &TaskRow) -> String {
+    // Named, then located (gh#357). The reader confirming this opened it from a
+    // row called `gh#353`, and a dialog that answers "merge PR #13" is asking
+    // them to match up two numbers before they can tell whether it is the same
+    // work. The pull request still has to appear — it is what merges — but as
+    // the address, in parentheses after the name.
     let what = match row.pr_number {
-        Some(n) => format!("PR #{n}"),
-        None => row.identifier.clone(),
+        Some(n) if !row.is_pull_request() => format!("{} (PR #{n})", row.identifier),
+        _ => row.identifier.clone(),
     };
     // Where the merge lands: for a stack that is the stack's target, which is
     // trunk, and not this layer's base — the branch below it disappears into
@@ -2730,9 +2771,11 @@ mod tests {
         r.id = "gh:Florin-AS/tally#507".into();
         r.identifier = "gh#507".into();
         assert_eq!(r.display_identifier(), "tally #507");
-        // The pull-request form of the id parses the same way.
+        // The pull-request form of the id parses the same way and keeps its
+        // own separator: `gh!508` is that row's name (gh#357), and `tally #508`
+        // would be a second one — already spoken for by issue #508.
         r.id = "gh:Florin-AS/tally!508".into();
-        assert_eq!(r.display_identifier(), "tally #508");
+        assert_eq!(r.display_identifier(), "tally !508");
         // A Linear identifier is already unique across the board.
         r.id = "linear:LIN-142".into();
         r.identifier = "LIN-142".into();
@@ -2839,15 +2882,49 @@ mod tests {
         );
     }
 
+    /// Where the work is, said after what the row needs — the pull request is
+    /// the location, and the row is already named by its identifier (gh#357).
     #[test]
-    fn review_metadata_names_the_pr_or_the_branch() {
+    fn review_metadata_says_where_the_work_is_after_what_it_needs() {
         let mut r = row("r", BoardState::Review);
         r.pr_number = Some(7);
-        assert_eq!(row_metadata(&r, false, 80, now()), "PR #7 · waiting on you");
+        assert_eq!(
+            row_metadata(&r, false, 80, now()),
+            "waiting on you · in PR #7"
+        );
         r.pr_number = None;
-        assert!(row_metadata(&r, false, 80, now()).contains("· no PR"));
+        assert_eq!(row_metadata(&r, false, 80, now()), "no PR · on board/gh-x");
         r.branch = None;
         assert_eq!(row_metadata(&r, false, 80, now()), "waiting on you");
+    }
+
+    /// A pull request the board never dispatched (gh#344) has no ticket, so the
+    /// pull request is the only name it has — and the rule holds without an
+    /// exception: the row is named, and nothing locates it a second time.
+    #[test]
+    fn a_pull_request_row_is_named_by_its_pull_request_and_located_once() {
+        let mut r = row("508", BoardState::Review);
+        r.id = "gh:Florin-AS/tally!508".into();
+        r.identifier = "gh!508".into();
+        r.pr_number = Some(508);
+        assert!(r.is_pull_request());
+        assert_eq!(r.display_identifier(), "tally !508");
+        assert_eq!(row_metadata(&r, false, 80, now()), "waiting on you");
+        assert_eq!(merge_confirmation(&r), "merge gh!508 into its base");
+
+        // An issue's row is a different thing that happens to have a pull
+        // request, and says where it is.
+        r.id = "gh:Florin-AS/tally#508".into();
+        r.identifier = "gh#508".into();
+        assert!(!r.is_pull_request());
+        assert_eq!(
+            row_metadata(&r, false, 80, now()),
+            "waiting on you · in PR #508"
+        );
+        assert_eq!(
+            merge_confirmation(&r),
+            "merge gh#508 (PR #508) into its base"
+        );
     }
 
     /// A layer of a stack, as it comes off the wire.
@@ -2884,7 +2961,7 @@ mod tests {
         let r = stacked("s", 2, 3, "board/gh-11-lexer");
         assert_eq!(
             row_metadata(&r, false, 80, now()),
-            "PR #12 · 2 of 3 · ready to land with 1 below",
+            "2 of 3 · ready to land with 1 below · in PR #12",
         );
     }
 
@@ -2896,7 +2973,7 @@ mod tests {
         r.stack.as_mut().unwrap().layers[0].mergeable = Some("dirty".into());
         assert_eq!(
             row_metadata(&r, false, 80, now()),
-            "PR #12 · 2 of 3 · clean against board/gh-11-lexer · waiting on PR #11",
+            "2 of 3 · clean against board/gh-11-lexer · waiting on PR #11 · in PR #12",
         );
         assert_eq!(landing(&r).as_str(), Some("waiting-on-stack"));
         assert!(!landing(&r).ready());
@@ -2911,7 +2988,7 @@ mod tests {
         r.pr_mergeable = None;
         assert_eq!(
             row_metadata(&r, false, 80, now()),
-            "PR #12 · 2 of 3 · waiting on you"
+            "2 of 3 · waiting on you · in PR #12"
         );
         assert_eq!(landing(&r), Landing::Unknown);
         assert_eq!(landing_note(&r), None);
@@ -2971,7 +3048,7 @@ mod tests {
         // The review row carries it where the landing verdict already went…
         assert_eq!(
             row_metadata(&r, false, 120, now()),
-            "PR #13 · 3 of 3 · PR #11 below was asked to change · this rebases under it",
+            "3 of 3 · PR #11 below was asked to change · this rebases under it · in PR #13",
         );
         // …and so does the last screen before something irreversible.
         assert!(
