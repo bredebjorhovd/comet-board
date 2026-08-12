@@ -547,6 +547,28 @@ fn receipt_case(
     projection: verdict::Projection,
     refused: Option<&str>,
 ) -> Value {
+    receipt_case_as(
+        name,
+        kind,
+        recorded,
+        not_delivered,
+        projection,
+        refused,
+        None,
+    )
+}
+
+/// The same, naming the credential the review was cast under (gh#369). Split
+/// so the five cases that predate it read as they did.
+fn receipt_case_as(
+    name: &str,
+    kind: verdict::VerdictKind,
+    recorded: bool,
+    not_delivered: Option<&str>,
+    projection: verdict::Projection,
+    refused: Option<&str>,
+    posted_as: Option<&str>,
+) -> Value {
     let receipt = verdict::VerdictReceipt {
         task_id: "gh:o/r#13".into(),
         attempt: 7,
@@ -558,6 +580,7 @@ fn receipt_case(
         not_delivered: not_delivered.map(str::to_string),
         projection,
         refused: refused.map(str::to_string),
+        posted_as: posted_as.map(str::to_string),
         unclaimed: 2,
         payload: String::new(),
     };
@@ -661,6 +684,12 @@ fn build() -> Value {
             receipt_case("a refused projection does not unmake the verdict",
                          verdict::VerdictKind::ChangesRequested, true, None,
                          verdict::Projection::Unposted, Some("github HTTP 500")),
+            // gh#369: cast under the reviewer's own credential, so the line
+            // says whose name is on it. The `posted_as` key is absent on every
+            // case above, which is what a board casting as itself sends.
+            receipt_case_as("cast under the reviewer's own credential",
+                            verdict::VerdictKind::Approve, true, None,
+                            verdict::Projection::Posted, None, Some("bredebjorhovd")),
         ],
         "reviewable": [
             reviewable_case("blocked", 1),

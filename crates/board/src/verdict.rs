@@ -53,8 +53,33 @@
 //! reported — the verdict goes out as a `COMMENT` whose first line says in words
 //! that it is an approval ([`as_comment_body`]), and the submission is marked
 //! [`Projection::PostedAsComment`]. Honest, needs no new credential, and leaves
-//! the thread readable by people who are not looking at comet. The real fix is
-//! a verdict that carries the *human's* GitHub identity, which is its own issue.
+//! the thread readable by people who are not looking at comet.
+//!
+//! ## The reviewer is not the board (gh#369)
+//!
+//! The paragraph above is what one credential can do. The fix is a second one:
+//! GitHub's objection is *"you opened this"*, and it stops being true the
+//! moment the verdict is cast by the person who did not. So a verdict goes out
+//! under the reviewer's own GitHub token when this box holds one for them
+//! ([`Credentials::user_token`](crate::config::Credentials::user_token), keyed
+//! off the login in their `[users]` entry), and under the board's credential
+//! when it does not.
+//!
+//! Two things follow, and both are deliberate:
+//!
+//! - **The identity that opens a dispatched pull request must never be one a
+//!   human reviews as.** That is the other half of the same invariant, and it
+//!   is not enforced here — it is a property of the credential the dispatched
+//!   agent pushes with ([`crate::git_credentials`]), and `doctor` is where a
+//!   board that breaks it is told so.
+//! - **Only [`POSTED_MARK`] tells the board's verdicts apart from a human's.**
+//!   [`crate::review::is_the_boards_own`] reads the *body*, never the author,
+//!   which is exactly why a verdict arriving under a person's login does not
+//!   quietly start being relayed back into the chat it was delivered to.
+//!
+//! Commit authorship is untouched by any of this. Who a dispatch commits as is
+//! [`crate::git_identity`]'s `GIT_AUTHOR_*`, decided at dispatch and written by
+//! the agent; this decides which bearer stamps one HTTP request, hours later.
 //!
 //! ## A pull request nobody dispatched gets a verdict, and no chat (§gh#344)
 //!
@@ -250,6 +275,14 @@ pub struct Submission {
     /// [`Projection::Unposted`]; `None` when GitHub took it as it was sent.
     #[serde(default)]
     pub refusal: Option<String>,
+    /// The GitHub login the review was submitted under, when it was not the
+    /// board's own credential (gh#369). `None` is the board — either nobody
+    /// named the reviewer, or this box holds no token of theirs.
+    ///
+    /// Kept on the ledger rather than only on the receipt so a retry of a
+    /// submission that already landed can still say whose name is on it.
+    #[serde(default)]
+    pub posted_as: Option<String>,
 }
 
 /// What one submission did.
@@ -280,6 +313,11 @@ pub struct VerdictReceipt {
     pub projection: Projection,
     /// GitHub's words for refusing the verdict as sent. `None` when it took it.
     pub refused: Option<String>,
+    /// Whose name is on the review (gh#369): the reviewer's GitHub login when
+    /// the verdict was cast under their own token, `None` when the board's
+    /// credential cast it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posted_as: Option<String>,
     /// How many unclaimed changes rode along, on both copies.
     pub unclaimed: usize,
     /// The exact text queued into the chat — what the preview promised.
@@ -429,9 +467,22 @@ pub fn as_comment_body(kind: VerdictKind, body: &str) -> String {
 ///
 /// Shared by every surface that prints a receipt, so the desktop, the CLI and
 /// the phone cannot disagree about what just happened.
-pub fn projection_line(kind: VerdictKind, projection: Projection, refused: Option<&str>) -> String {
+pub fn projection_line(
+    kind: VerdictKind,
+    projection: Projection,
+    refused: Option<&str>,
+    posted_as: Option<&str>,
+) -> String {
     match projection {
-        Projection::Posted => "It is on the pull request.".to_string(),
+        // Whose name is on it, when it is not the board's (gh#369). Worth the
+        // words: an approval carrying a person's login is a different object on
+        // the pull request from one carrying a bot's — it satisfies a review
+        // requirement, and it is what a reader a month later takes as somebody
+        // having looked.
+        Projection::Posted => match posted_as {
+            Some(login) => format!("It is on the pull request, as @{login}."),
+            None => "It is on the pull request.".to_string(),
+        },
         Projection::PostedAsComment => format!(
             "It is on the pull request as a comment that says it {} — GitHub does not let \
              the board {} its own pull request.",
@@ -466,7 +517,12 @@ pub fn receipt_line(receipt: &VerdictReceipt) -> String {
     };
     format!(
         "{board} {}",
-        projection_line(receipt.kind, receipt.projection, receipt.refused.as_deref())
+        projection_line(
+            receipt.kind,
+            receipt.projection,
+            receipt.refused.as_deref(),
+            receipt.posted_as.as_deref(),
+        )
     )
 }
 
@@ -580,6 +636,14 @@ impl SyncEngine {
     /// never seen. That is the recoverable direction — the submission is on the
     /// ledger with [`Projection::Unposted`] on it, and re-submitting the same
     /// words finishes the projection rather than posting a second review.
+    ///
+    /// `reviewer` is who is casting it — the sign-in address the caller's
+    /// transport could vouch for, and `None` when it could not. It decides one
+    /// thing and nothing else: which credential the copy on GitHub is submitted
+    /// under (gh#369). It is deliberately not the claim a frontend sends about
+    /// itself, the way [`crate::dispatch::DispatchOrigin::user`] is — a commit
+    /// author is a claim anybody may write by hand, and a token is not
+    /// something a caller gets to pick by naming somebody.
     pub fn submit_verdict(
         &self,
         runtime: Option<&dyn Runtime>,
@@ -587,6 +651,7 @@ impl SyncEngine {
         attempt: Option<i64>,
         kind: VerdictKind,
         comment: &str,
+        reviewer: Option<&str>,
     ) -> Result<VerdictReceipt> {
         let comment = comment.trim();
         if kind.needs_comment() && comment.is_empty() {
@@ -664,6 +729,7 @@ impl SyncEngine {
                 delivered: false,
                 projection: Projection::Unposted,
                 refusal: None,
+                posted_as: None,
             });
             if state.submissions.len() > MAX_SUBMISSIONS {
                 let drop = state.submissions.len() - MAX_SUBMISSIONS;
@@ -701,6 +767,7 @@ impl SyncEngine {
                 .as_ref()
                 .map_or(Projection::Unposted, |s| s.projection),
             refused: already.as_ref().and_then(|s| s.refusal.clone()),
+            posted_as: already.as_ref().and_then(|s| s.posted_as.clone()),
             unclaimed: review.remainder.unclaimed.len(),
             payload: payload.clone(),
         };
@@ -749,10 +816,18 @@ impl SyncEngine {
             let stood_under = (kind == VerdictKind::ChangesRequested)
                 .then_some(state.changes_requested)
                 .flatten();
-            let (projection, review_id, refused) =
-                self.project_verdict(gh, &repo, number, kind, &review, comment);
+            let cast = self.reviewer_credential(reviewer);
+            let (projection, review_id, refused, posted_as) = self.project_verdict(
+                gh,
+                cast.as_ref(),
+                &repo,
+                number,
+                kind,
+                &github_body(&review, comment),
+            );
             receipt.projection = projection;
             receipt.refused = refused.clone();
+            receipt.posted_as = posted_as.clone();
             if projection.on_github() {
                 receipt.review_id = review_id;
                 // The watermark, so an id at or below it can never come back
@@ -783,13 +858,19 @@ impl SyncEngine {
                 entry.projection = projection;
                 entry.review_id = review_id;
                 entry.refusal = refused;
+                entry.posted_as = posted_as;
             }
             crate::review::store(&self.db, &task.id, &state)?;
             let said = format!(
                 "{}: the `{}` verdict on {repo}#{number} — {}",
                 task.identifier,
                 kind.label(),
-                projection_line(kind, receipt.projection, receipt.refused.as_deref()),
+                projection_line(
+                    kind,
+                    receipt.projection,
+                    receipt.refused.as_deref(),
+                    receipt.posted_as.as_deref(),
+                ),
             );
             // A verdict nobody on the pull request can see is worth a louder
             // line than one that landed. It is not a failure — the verdict
@@ -865,49 +946,134 @@ impl SyncEngine {
         Ok(chat_id)
     }
 
-    /// Put the board's copy of the verdict on the pull request (gh#365).
+    /// The credential this verdict should be cast under (gh#369), when it is
+    /// not the board's own.
     ///
-    /// One refusal is answered rather than reported: GitHub will not let the
-    /// App that opened a pull request approve or request changes on it, which is
-    /// every pull request the board dispatched, so the verdict goes out as a
-    /// `COMMENT` that says in its first line what it is. That is the difference
-    /// between a review surface with one working button and one with three.
+    /// Three things have to line up, and any of them missing lands on the
+    /// board's credential and gh#365's behaviour: the caller has to know who is
+    /// reviewing, the `[users]` map has to say which GitHub account that is
+    /// ([`crate::config::RoutingConfig::github_login_for`]), and this box has
+    /// to hold a token of theirs. None of
+    /// the three is a failure — a board with no map at all reviews exactly as
+    /// it did before this existed.
+    fn reviewer_credential(&self, reviewer: Option<&str>) -> Option<Reviewer> {
+        let who = reviewer.map(str::trim).filter(|r| !r.is_empty())?;
+        let login = self.cfg.github_login_for(who)?;
+        let token = self.credentials.user_token(&login)?;
+        match self.as_user.github(token) {
+            Ok(gh) => Some(Reviewer { login, gh }),
+            // A token this box cannot build a client from is worth saying out
+            // loud — somebody put it there on purpose — but it is not worth
+            // refusing a verdict over: the board's own credential is right
+            // behind it.
+            Err(e) => {
+                self.log.warn(format!(
+                    "the review credential for @{login} could not be used: {e:#}"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Put the copy of the verdict on the pull request (gh#365, gh#369).
+    ///
+    /// Under the reviewer's own credential when there is one, which is the
+    /// whole of gh#369: GitHub refuses `APPROVE` on a pull request the caller
+    /// opened, and a verdict cast by the person who did *not* open it is one
+    /// GitHub simply takes — as an approving review, under their name, of the
+    /// kind branch protection counts.
+    ///
+    /// Then the board's own credential, for a reviewer this box holds no token
+    /// for, and as the fallback when theirs was refused. There one refusal is
+    /// answered rather than reported: GitHub will not let the App that opened a
+    /// pull request approve or request changes on it, which is every pull
+    /// request the board dispatched, so the verdict goes out as a `COMMENT`
+    /// that says in its first line what it is. That is the difference between a
+    /// review surface with one working button and one with three.
     ///
     /// Every other refusal — a body GitHub will not take, a network that is not
     /// there — comes back as [`Projection::Unposted`] with GitHub's words, for
     /// the receipt to show and a retry to try again.
+    ///
+    /// `body` is [`github_body`]'s, composed by the caller — the same text goes
+    /// out whichever identity carries it, and composing it here would be a
+    /// second place that decides what a verdict says.
+    ///
+    /// The answer's last field is whose name is on it: a login when the
+    /// reviewer's credential posted, `None` when the board's did.
     fn project_verdict(
         &self,
         gh: &Github<Box<dyn Rest>>,
+        cast_as: Option<&Reviewer>,
         repo: &str,
         number: i64,
         kind: VerdictKind,
-        review: &AttemptReview,
-        comment: &str,
-    ) -> (Projection, i64, Option<String>) {
-        let body = github_body(review, comment);
-        let refused = match gh.post_review(repo, number, kind.event(), &body) {
-            Ok(id) => return (Projection::Posted, id, None),
+        body: &str,
+    ) -> (Projection, i64, Option<String>, Option<String>) {
+        // The reviewer's own credential first. A failure here is not the
+        // reviewer's problem to solve mid-verdict — an expired token, a
+        // repository their account cannot see — so it is logged and the board
+        // tries with its own, which is the behaviour of every board that holds
+        // no member tokens at all.
+        let mut as_user_refused = None;
+        if let Some(who) = cast_as {
+            match who.gh.post_review(repo, number, kind.event(), body) {
+                Ok(id) => return (Projection::Posted, id, None, Some(who.login.clone())),
+                Err(e) => {
+                    let said = format!("as @{}: {e:#}", who.login);
+                    self.log.warn(format!(
+                        "{repo}#{number}: the verdict could not be cast under the \
+                         reviewer's own credential ({said}) — falling back to the board's"
+                    ));
+                    as_user_refused = Some(said);
+                }
+            }
+        }
+        // GitHub's words for the board's attempt, with the reviewer's refusal
+        // in front of it when there was one: a verdict that ended up as a
+        // comment because *both* identities were refused has two reasons, and
+        // the first is the one that explains why the second was tried.
+        let and_then = |said: String| match &as_user_refused {
+            Some(first) => format!("{first}; then as the board: {said}"),
+            None => said,
+        };
+        let refused = match gh.post_review(repo, number, kind.event(), body) {
+            Ok(id) => return (Projection::Posted, id, None, None),
             Err(e) => e,
         };
         // A `COMMENT` that GitHub refused is not going to be taken as a comment
         // either, so there is nothing to fall back to.
         if kind == VerdictKind::Comment || !refused_own_pull_request(&refused) {
-            return (Projection::Unposted, 0, Some(format!("{refused:#}")));
+            return (
+                Projection::Unposted,
+                0,
+                Some(and_then(format!("{refused:#}"))),
+                None,
+            );
         }
-        let said = format!("{refused:#}");
+        let said = and_then(format!("{refused:#}"));
         match gh.post_review(
             repo,
             number,
             VerdictKind::Comment.event(),
-            &as_comment_body(kind, &body),
+            &as_comment_body(kind, body),
         ) {
-            Ok(id) => (Projection::PostedAsComment, id, Some(said)),
+            Ok(id) => (Projection::PostedAsComment, id, Some(said), None),
             // Both attempts refused. The first refusal is the one worth
             // reporting: it is the reason the second was made.
-            Err(_) => (Projection::Unposted, 0, Some(said)),
+            Err(_) => (Projection::Unposted, 0, Some(said), None),
         }
     }
+}
+
+/// A person's GitHub credential, resolved for one verdict (gh#369).
+struct Reviewer {
+    /// Their login — what goes on the receipt, because "posted as @ana" is the
+    /// fact a reviewer needs to see to believe the split is working.
+    login: String,
+    /// A client stamping their token, built by
+    /// [`SyncEngine::as_user`](crate::sync::SyncEngine::as_user).
+    gh: Github<Box<dyn Rest>>,
 }
 
 #[cfg(test)]
@@ -1169,6 +1335,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Why does this need itertools?",
+                None,
             )
             .unwrap();
 
@@ -1267,6 +1434,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Nothing here says what it did.",
+                None,
             )
             .unwrap();
 
@@ -1315,6 +1483,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
         let again = e
@@ -1324,6 +1493,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
 
@@ -1341,6 +1511,7 @@ mod tests {
             None,
             VerdictKind::ChangesRequested,
             "Still wrong on the retry path.",
+            None,
         )
         .unwrap();
         assert_eq!(rest.wrote.borrow().len(), 2);
@@ -1365,6 +1536,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
         assert!(failed.recorded && !failed.delivered);
@@ -1380,6 +1552,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
         assert!(!retried.recorded, "the verdict was already on the ledger");
@@ -1405,6 +1578,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
 
@@ -1428,6 +1602,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Another look.",
+                None,
             )
             .unwrap();
         assert!(!receipt.delivered);
@@ -1469,6 +1644,7 @@ mod tests {
             None,
             VerdictKind::ChangesRequested,
             "Fix the gate.",
+            None,
         )
         .unwrap();
         assert_eq!(runtime.prompts.borrow().len(), 1);
@@ -1536,6 +1712,7 @@ mod tests {
             None,
             VerdictKind::ChangesRequested,
             "Fix the gate.",
+            None,
         )
         .unwrap();
         assert!(runtime.said_to("chat-1").is_some(), "the author, from here");
@@ -1568,6 +1745,7 @@ mod tests {
             None,
             VerdictKind::Approve,
             "Better.",
+            None,
         )
         .unwrap();
         assert_eq!(state_of(&e).changes_requested, None);
@@ -1593,6 +1771,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "   ",
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -1613,6 +1792,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -1630,7 +1810,14 @@ mod tests {
         let runtime = FakeRuntime::holding("/wt/gh-13-1");
 
         let receipt = e
-            .submit_verdict(Some(&runtime), "gh:o/r#13", None, VerdictKind::Approve, "")
+            .submit_verdict(
+                Some(&runtime),
+                "gh:o/r#13",
+                None,
+                VerdictKind::Approve,
+                "",
+                None,
+            )
             .unwrap();
 
         assert_eq!(rest.wrote.borrow()[0].2["event"], "APPROVE");
@@ -1669,6 +1856,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Why does this need itertools?",
+                None,
             )
             .unwrap();
 
@@ -1727,6 +1915,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
         assert_eq!(refused.projection, Projection::Unposted);
@@ -1739,6 +1928,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
 
@@ -1762,6 +1952,7 @@ mod tests {
             None,
             VerdictKind::ChangesRequested,
             "Fix the gate.",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1790,6 +1981,7 @@ mod tests {
                 None,
                 VerdictKind::Approve,
                 "Reads right.",
+                None,
             )
             .unwrap();
 
@@ -1859,6 +2051,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
 
@@ -1899,12 +2092,240 @@ mod tests {
                 None,
                 VerdictKind::Comment,
                 "One thought.",
+                None,
             )
             .unwrap();
 
         assert_eq!(rest.wrote.borrow().len(), 1, "asked once");
         assert_eq!(receipt.projection, Projection::Unposted);
         assert!(receipt.delivered, "and the agent still has it");
+    }
+
+    // ---- gh#369: the reviewer is not the board ------------------------
+
+    /// A box arranged the way gh#369 asks for: `ana@example.com` signs in,
+    /// `[users]` says which GitHub account that is, and this box holds a token
+    /// of hers. The reviewer's client writes to a fixture of its own, so
+    /// "under her credential and not the board's" is a countable claim rather
+    /// than an inference.
+    fn engine_with_a_member(
+        board: std::rc::Rc<crate::sources::github::FixtureRest>,
+        hers: std::rc::Rc<crate::sources::github::FixtureRest>,
+    ) -> (
+        SyncEngine,
+        std::rc::Rc<crate::sources::github::FixtureAsUser>,
+    ) {
+        let mut e = engine(board);
+        e.cfg.users.insert(
+            "ana@example.com".into(),
+            "22494697+ana@users.noreply.github.com".into(),
+        );
+        e.credentials = crate::config::Credentials::with_user_token("ana", "ghu_ana");
+        let as_user = std::rc::Rc::new(crate::sources::github::FixtureAsUser::over(hers));
+        e.as_user = as_user.clone();
+        (e, as_user)
+    }
+
+    /// The claim: a verdict cast from the review window is submitted under the
+    /// reviewer's identity, not the board's.
+    ///
+    /// The board's own client is not asked at all — which is the point. GitHub
+    /// refuses `APPROVE` because the caller opened the pull request, and the
+    /// reviewer did not open it, so there is nothing to refuse and nothing to
+    /// downgrade: the approval on the pull request is an approving review with
+    /// a person's name on it.
+    #[test]
+    fn a_verdict_is_cast_under_the_reviewers_own_credential() {
+        let board = std::rc::Rc::new(
+            crate::sources::github::FixtureRest::new(fixture()).refusing("APPROVE", OWN_PR),
+        );
+        let hers = std::rc::Rc::new(crate::sources::github::FixtureRest::new(fixture()));
+        let (e, as_user) = engine_with_a_member(board.clone(), hers.clone());
+        seed_with_a_remainder(&e);
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        let receipt = e
+            .submit_verdict(
+                Some(&runtime),
+                "gh:o/r#13",
+                None,
+                VerdictKind::Approve,
+                "Reads right.",
+                Some("ana@example.com"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            as_user.tokens.borrow().as_slice(),
+            ["ghu_ana"],
+            "her token, spent once",
+        );
+        assert!(
+            board.wrote.borrow().is_empty(),
+            "the board's credential was never asked: {:?}",
+            board.wrote.borrow(),
+        );
+        let wrote = hers.wrote.borrow();
+        assert_eq!(wrote.len(), 1, "one review, hers: {wrote:?}");
+        assert_eq!(wrote[0].1, "/repos/o/r/pulls/14/reviews");
+        assert_eq!(wrote[0].2["event"], "APPROVE", "an approval, not a comment");
+        drop(wrote);
+
+        assert_eq!(receipt.projection, Projection::Posted);
+        assert_eq!(receipt.review_id, POSTED_ID, "and it is watermarked");
+        assert_eq!(receipt.posted_as.as_deref(), Some("ana"));
+        assert_eq!(receipt.refused, None);
+        // The receipt says whose name is on it: an approval carrying a person
+        // is a different object on the pull request from one carrying a bot.
+        assert!(
+            receipt_line(&receipt).contains("on the pull request, as @ana"),
+            "{}",
+            receipt_line(&receipt),
+        );
+        assert_eq!(state_of(&e).review, POSTED_ID);
+    }
+
+    /// The identity moved and the mark did not, which is what keeps the relay
+    /// shut: [`crate::review::is_the_boards_own`] reads the body, so a verdict
+    /// arriving under a person's login is still recognised as one the board
+    /// already delivered rather than relayed back into the chat it came from.
+    #[test]
+    fn a_verdict_cast_as_a_person_is_still_recognised_as_the_boards_own() {
+        let board = std::rc::Rc::new(crate::sources::github::FixtureRest::new(fixture()));
+        let hers = std::rc::Rc::new(crate::sources::github::FixtureRest::new(fixture()));
+        let (e, _) = engine_with_a_member(board, hers.clone());
+        seed_with_a_remainder(&e);
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        e.submit_verdict(
+            Some(&runtime),
+            "gh:o/r#13",
+            None,
+            VerdictKind::ChangesRequested,
+            "Fix the gate.",
+            Some("ana@example.com"),
+        )
+        .unwrap();
+
+        let wrote = hers.wrote.borrow();
+        let body = wrote[0].2["body"].as_str().unwrap();
+        assert!(body.contains(POSTED_MARK), "{body}");
+        assert!(crate::review::is_the_boards_own(body), "{body}");
+    }
+
+    /// The claim gh#365 paid for, still true: a member this box holds no token
+    /// for reviews exactly as before — the board's credential, refused, and the
+    /// verdict arriving as a comment that says what it is.
+    #[test]
+    fn a_member_with_no_token_still_gets_the_comment_fallback() {
+        let board = std::rc::Rc::new(
+            crate::sources::github::FixtureRest::new(fixture()).refusing("APPROVE", OWN_PR),
+        );
+        let hers = std::rc::Rc::new(crate::sources::github::FixtureRest::new(fixture()));
+        let (mut e, as_user) = engine_with_a_member(board.clone(), hers.clone());
+        // Mapped, and no credential of his own — the ordinary state of a
+        // teammate on somebody else's box.
+        e.cfg.users.insert(
+            "sam@example.com".into(),
+            "8134+samito@users.noreply.github.com".into(),
+        );
+        seed_with_a_remainder(&e);
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        let receipt = e
+            .submit_verdict(
+                Some(&runtime),
+                "gh:o/r#13",
+                None,
+                VerdictKind::Approve,
+                "Reads right.",
+                Some("sam@example.com"),
+            )
+            .unwrap();
+
+        assert!(
+            as_user.tokens.borrow().is_empty(),
+            "nothing to spend on his behalf",
+        );
+        assert!(hers.wrote.borrow().is_empty(), "and nobody else's spent");
+        let wrote = board.wrote.borrow();
+        assert_eq!(wrote.len(), 2, "the approval, then the comment: {wrote:?}");
+        assert_eq!(wrote[1].2["event"], "COMMENT");
+        drop(wrote);
+        assert_eq!(receipt.projection, Projection::PostedAsComment);
+        assert_eq!(receipt.posted_as, None, "the board cast it, and says so");
+        assert!(receipt.delivered);
+    }
+
+    /// A token that no longer works is not the reviewer's problem to solve
+    /// mid-verdict: the board falls back to its own credential, and the receipt
+    /// carries both refusals — the second was made because of the first.
+    #[test]
+    fn a_refused_reviewer_credential_falls_back_to_the_board() {
+        let board = std::rc::Rc::new(
+            crate::sources::github::FixtureRest::new(fixture()).refusing("APPROVE", OWN_PR),
+        );
+        let hers = std::rc::Rc::new(
+            crate::sources::github::FixtureRest::new(fixture())
+                .refusing("APPROVE", "Bad credentials"),
+        );
+        let (e, _) = engine_with_a_member(board.clone(), hers.clone());
+        seed_with_a_remainder(&e);
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        let receipt = e
+            .submit_verdict(
+                Some(&runtime),
+                "gh:o/r#13",
+                None,
+                VerdictKind::Approve,
+                "Reads right.",
+                Some("ana@example.com"),
+            )
+            .unwrap();
+
+        assert_eq!(hers.wrote.borrow().len(), 1, "hers was tried");
+        assert_eq!(
+            board.wrote.borrow().len(),
+            2,
+            "then the board's, then a comment"
+        );
+        assert_eq!(receipt.projection, Projection::PostedAsComment);
+        assert_eq!(receipt.posted_as, None);
+        let refused = receipt.refused.unwrap();
+        assert!(refused.contains("as @ana"), "{refused}");
+        assert!(refused.contains("Bad credentials"), "{refused}");
+        assert!(refused.contains(OWN_PR), "{refused}");
+    }
+
+    /// Nobody named the reviewer — a board with no auth service, a signed-out
+    /// one — and the verdict is the board's, as it always was. The credential
+    /// is never picked from an unattributed call.
+    #[test]
+    fn an_unattributed_verdict_is_cast_by_the_board() {
+        let board = std::rc::Rc::new(crate::sources::github::FixtureRest::new(fixture()));
+        let hers = std::rc::Rc::new(crate::sources::github::FixtureRest::new(fixture()));
+        let (e, as_user) = engine_with_a_member(board.clone(), hers.clone());
+        seed_with_a_remainder(&e);
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        let receipt = e
+            .submit_verdict(
+                Some(&runtime),
+                "gh:o/r#13",
+                None,
+                VerdictKind::Comment,
+                "One thought.",
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            as_user.tokens.borrow().is_empty(),
+            "no token was reached for"
+        );
+        assert_eq!(board.wrote.borrow().len(), 1);
+        assert_eq!(receipt.posted_as, None);
     }
 
     /// A verdict GitHub has not numbered still fans out — and when GitHub
@@ -1950,6 +2371,7 @@ mod tests {
                 None,
                 VerdictKind::ChangesRequested,
                 "Fix the gate.",
+                None,
             )
             .unwrap();
         assert_eq!(refused.projection, Projection::Unposted);
@@ -1975,6 +2397,7 @@ mod tests {
             None,
             VerdictKind::ChangesRequested,
             "Fix the gate.",
+            None,
         )
         .unwrap();
         let state = state_of(&e);
@@ -2005,6 +2428,7 @@ mod tests {
             not_delivered: None,
             projection,
             refused: refused.map(str::to_string),
+            posted_as: None,
             unclaimed: 0,
             payload: String::new(),
         };

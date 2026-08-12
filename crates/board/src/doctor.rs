@@ -336,6 +336,17 @@ pub fn doctor(
             // the box, which looks exactly like a map that is working.
             checks.push(dispatch_authorship_check(&cfg, accounts));
 
+            // And whose name a verdict carries (gh#369) — the other end of the
+            // same pull request. Asked of the credential rather than of the
+            // config, because who opens a dispatched pull request is decided by
+            // whatever the agent pushes with, and only GitHub can put a name to
+            // a personal access token.
+            checks.push(review_identity_check(
+                &cfg,
+                &Credentials::load(paths),
+                opener(paths, rest.as_ref().ok()),
+            ));
+
             // The one Linear state the board resolves by name, so the one that
             // can be wrong. A missing state drops the writeback rather than
             // retrying it forever, and this is where that becomes visible.
@@ -1542,6 +1553,131 @@ fn dispatch_authorship_check(cfg: &RoutingConfig, accounts: Option<&[AgentAccoun
         // line names them rather than failing twice for one mistake.
         ok: true,
         detail,
+    }
+}
+
+/// Who opens a dispatched pull request on this box (gh#369).
+///
+/// Not a preference — a consequence. The dispatched agent pushes and runs `gh
+/// pr create` through the board's credential path ([`crate::git_credentials`]),
+/// so whichever credential that path hands over is the author of every pull
+/// request the board produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Opener {
+    /// The board's GitHub App. A bot: nobody reviews as it, which is exactly
+    /// what the invariant wants on this side.
+    App,
+    /// A personal access token, and the account GitHub says it belongs to.
+    /// `None` when GitHub could not be asked — an unnamed person is still a
+    /// person, and the check says so rather than clearing the box.
+    Person(Option<String>),
+    /// No board credential at all: the agent falls back to whatever git
+    /// credentials the box user has, which is a person nobody here can name.
+    BoxUser,
+}
+
+/// Put a name to the credential that opens pull requests, asking GitHub only
+/// when there is a token to ask about.
+///
+/// An App is not asked: `GET /user` under its JWT is a refusal, and under an
+/// installation token it names the App — neither is a person, which is the only
+/// thing this needs to know.
+fn opener(paths: &Paths, rest: Option<&crate::sources::github::HttpRest>) -> Opener {
+    match Credentials::load(paths).github_auth() {
+        GithubAuth::App { .. } => Opener::App,
+        GithubAuth::None => Opener::BoxUser,
+        GithubAuth::Token(_) => {
+            Opener::Person(rest.and_then(|r| crate::sources::github::Github::new(r).viewer().ok()))
+        }
+    }
+}
+
+/// Whether a verdict this board casts can be a verdict at all (gh#369).
+///
+/// GitHub refuses `APPROVE` and `REQUEST_CHANGES` on a pull request the caller
+/// opened. Both halves of avoiding that are box configuration, and neither is
+/// visible from anywhere else:
+///
+/// - the identity that **opens** a dispatched pull request should be a bot, so
+///   no human ever reviews as it;
+/// - the identity that **casts** a verdict should be the reviewer's own, which
+///   is a `GITHUB_USER_TOKEN_<LOGIN>` beside their `[users]` entry.
+///
+/// `ok` is false for the collision only — one identity on both sides, which is
+/// the state where an approval can never be more than a comment saying it
+/// approves. A board with no member tokens at all is not failing: it is the
+/// gh#365 arrangement, working as designed, and the line says what it costs.
+fn review_identity_check(cfg: &RoutingConfig, credentials: &Credentials, opener: Opener) -> Check {
+    let name = "review identity".to_string();
+    let opens = match &opener {
+        Opener::App => "the board's App opens dispatched pull requests — a bot, which is                         what lets a person's verdict on one be a verdict"
+            .to_string(),
+        Opener::Person(Some(login)) => format!(
+            "dispatched pull requests are opened by @{login} (GITHUB_TOKEN)"
+        ),
+        Opener::Person(None) => "dispatched pull requests are opened by whoever owns                                  GITHUB_TOKEN — GitHub could not be asked which account                                  that is"
+            .to_string(),
+        Opener::BoxUser => "no board credential, so dispatched agents push and open pull                             requests with this box's own git credentials — whoever that is"
+            .to_string(),
+    };
+    // Who can cast a verdict under their own name, and who reviews as the
+    // board. A member whose entry names no GitHub account has no login to key a
+    // token on, which `dispatch authorship` above already reports as the
+    // weaker mapping it is.
+    let mut casts = Vec::new();
+    let mut as_board = Vec::new();
+    let mut collides = Vec::new();
+    for user in cfg.users.keys() {
+        let Some(login) = cfg.github_login_for(user) else {
+            continue;
+        };
+        match credentials.user_token(&login) {
+            Some(token) => {
+                casts.push(format!("@{login}"));
+                // The same account both sides, reached the other way: the
+                // board's own token *is* this person's. GitHub reads one
+                // account, whichever variable it arrived in.
+                if credentials.github_token.as_deref() == Some(token) {
+                    collides.push(format!(
+                        "@{login}'s review token is the board's own GITHUB_TOKEN"
+                    ));
+                }
+            }
+            None => as_board.push(format!("@{login}")),
+        }
+        if let Opener::Person(Some(opener)) = &opener
+            && opener.eq_ignore_ascii_case(&login)
+        {
+            collides.push(format!(
+                "@{login} both opens and reviews — GitHub refuses an approval on your own                  pull request, so theirs can only ever arrive as a comment. Register a                  GitHub App (GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PATH) so the bot opens                  them"
+            ));
+        }
+    }
+    let mut sentences = vec![opens];
+    if !casts.is_empty() {
+        sentences.push(format!(
+            "{} casts verdicts under their own name",
+            casts.join(", ")
+        ));
+    }
+    if !as_board.is_empty() {
+        sentences.push(format!(
+            "{} reviews as the board — an approval arrives as a comment saying it approves              (gh#365) until {} is set",
+            as_board.join(", "),
+            crate::config::user_token_env(as_board[0].trim_start_matches('@')),
+        ));
+    }
+    if cfg.users.is_empty() {
+        sentences.push(
+            "no `[users]` map, so every verdict is the board's. `comet-board member add              <their-sign-in-email> --github <login>` names a reviewer; their token goes              in the board's .env as GITHUB_USER_TOKEN_<LOGIN>"
+                .into(),
+        );
+    }
+    sentences.extend(collides.clone());
+    Check {
+        name,
+        ok: collides.is_empty(),
+        detail: sentences.join(". "),
     }
 }
 
@@ -4971,6 +5107,115 @@ mod tests {
             !unknown.detail.contains("No agent account"),
             "{}",
             unknown.detail
+        );
+    }
+
+    // ── who opens, who reviews (gh#369) ─────────────────────────────────────
+
+    fn mapped(users: &[(&str, &str)]) -> RoutingConfig {
+        let mut cfg = RoutingConfig::default();
+        for (user, author) in users {
+            cfg.users.insert(user.to_string(), author.to_string());
+        }
+        cfg
+    }
+
+    /// The arrangement the split asks for: a bot opens, and the people who
+    /// review hold credentials of their own. Nothing to fix, and the line still
+    /// says which members review as the board — that is the difference between
+    /// an approval and a comment that says it approves.
+    #[test]
+    fn doctor_says_who_opens_a_pull_request_and_who_can_really_approve_it() {
+        let cfg = mapped(&[
+            ("ana@example.com", "22494697+ana@users.noreply.github.com"),
+            ("sam@example.com", "8134+samito@users.noreply.github.com"),
+        ]);
+        let c = review_identity_check(
+            &cfg,
+            &Credentials::with_user_token("ana", "ghu_ana"),
+            Opener::App,
+        );
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("the board's App opens"), "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("@ana casts verdicts under their own name"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("@samito reviews as the board"),
+            "{}",
+            c.detail
+        );
+        // And what to set for him, spelled exactly as the file wants it.
+        assert!(
+            c.detail.contains("GITHUB_USER_TOKEN_SAMITO"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// The failure gh#369 is about, on the machine that had it: one person
+    /// opens every dispatched pull request and is also the only person who
+    /// reviews them. GitHub refuses that approval, always, and no amount of
+    /// member tokens fixes it — the fix is a bot on the opening side.
+    #[test]
+    fn doctor_fails_when_one_account_opens_the_pull_request_and_reviews_it() {
+        let cfg = mapped(&[(
+            "brede@tally.no",
+            "22494697+bredebjorhovd@users.noreply.github.com",
+        )]);
+        let c = review_identity_check(
+            &cfg,
+            &Credentials::with_user_token("bredebjorhovd", "ghu_brede"),
+            Opener::Person(Some("bredebjorhovd".into())),
+        );
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("@bredebjorhovd both opens and reviews"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("GITHUB_APP_ID"), "{}", c.detail);
+    }
+
+    /// The same collision reached the other way: the board's own token *is* the
+    /// reviewer's. Two variables, one account, and GitHub reads the account.
+    #[test]
+    fn doctor_fails_when_the_boards_token_is_also_a_members_review_token() {
+        let cfg = mapped(&[("ana@example.com", "1+ana@users.noreply.github.com")]);
+        let mut credentials = Credentials::with_user_token("ana", "ghp_shared");
+        credentials.github_token = Some("ghp_shared".into());
+        let c = review_identity_check(&cfg, &credentials, Opener::Person(None));
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("@ana's review token is the board's own GITHUB_TOKEN"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// A board with no map is not broken — it is gh#365's arrangement, and the
+    /// line says what it costs and what would change it.
+    #[test]
+    fn doctor_says_a_board_with_no_map_reviews_as_itself() {
+        let c = review_identity_check(
+            &RoutingConfig::default(),
+            &Credentials::default(),
+            Opener::BoxUser,
+        );
+        assert!(c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("this box's own git credentials"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("GITHUB_USER_TOKEN_<LOGIN>"),
+            "{}",
+            c.detail
         );
     }
 

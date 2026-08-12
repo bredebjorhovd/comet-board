@@ -33,6 +33,33 @@ pub fn provider(credentials: &Credentials) -> Result<TokenProvider> {
     })
 }
 
+/// A GitHub client that speaks as a *person* rather than as the board
+/// (gh#369).
+///
+/// A seam, and it exists for one reason: the board holds exactly one credential
+/// of its own, and a verdict has to go out under somebody else's. Everything
+/// the board says to GitHub goes through [`crate::sync::SyncEngine::github`]
+/// and is the board's; this builds the one client that is not, from a token the
+/// board keeps and never spends on anything else.
+///
+/// Behind a trait so the whole projection path is testable without a network:
+/// which identity a verdict was cast under is the claim gh#369 is about, and a
+/// test that could not watch the second client could not check it.
+pub trait AsUser {
+    fn github(&self, token: &str) -> Result<Github<Box<dyn Rest>>>;
+}
+
+/// The real one: a static bearer against api.github.com, minted from nothing —
+/// a member's token is a token, not an App to mint from.
+pub struct HttpAsUser;
+
+impl AsUser for HttpAsUser {
+    fn github(&self, token: &str) -> Result<Github<Box<dyn Rest>>> {
+        let rest = HttpRest::with_auth(TokenProvider::Static(token.to_string()))?;
+        Ok(Github::new(Box::new(rest) as Box<dyn Rest>))
+    }
+}
+
 /// GitHub's maximum page size. `issues` walks pages until one comes back short;
 /// `open_issues` deliberately reads only the first, because it exists to preview
 /// roughly how much a repo would put on the board rather than to enumerate it.
@@ -640,6 +667,24 @@ impl<T: Rest> Github<T> {
                 .to_string(),
             id,
         })
+    }
+
+    /// Who this credential *is*, as GitHub knows it (gh#369) — the login behind
+    /// whatever token is stamping the requests.
+    ///
+    /// The question the split rests on: the identity that opens a dispatched
+    /// pull request must not be the identity that reviews it, and neither half
+    /// can be checked without a name for the credential. Only a token can
+    /// answer — `GET /user` under an App's JWT is a 403, and under an
+    /// installation token it names the App rather than a person — so the caller
+    /// asks it of a personal token or not at all.
+    pub fn viewer(&self) -> Result<String> {
+        self.rest
+            .get("/user")?
+            .get("login")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("github answered `/user` without a login"))
     }
 
     /// What GitHub says about one repo, under whatever credential is in force
@@ -1411,6 +1456,66 @@ impl Rest for FixtureRest {
             .find(|(p, _)| key.starts_with(p.as_str()))
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| serde_json::json!({ "status": "merged" })))
+    }
+}
+
+/// An [`AsUser`] that hands out clients over one recorded GitHub, and keeps
+/// every token it was asked to build one with (gh#369).
+///
+/// The tokens are the point: "this verdict went out under Ana's credential and
+/// not the board's" is a claim about *which secret stamped the request*, and
+/// the fixture is where a test can see one.
+#[cfg(test)]
+#[derive(Default)]
+pub struct FixtureAsUser {
+    /// The client every call answers with. `None` — the default — is a box
+    /// holding a token whose client cannot be built, which is the failure the
+    /// fallback exists for.
+    pub rest: Option<std::rc::Rc<FixtureRest>>,
+    pub tokens: std::cell::RefCell<Vec<String>>,
+}
+
+#[cfg(test)]
+impl FixtureAsUser {
+    pub fn over(rest: std::rc::Rc<FixtureRest>) -> FixtureAsUser {
+        FixtureAsUser {
+            rest: Some(rest),
+            tokens: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl AsUser for FixtureAsUser {
+    fn github(&self, token: &str) -> Result<Github<Box<dyn Rest>>> {
+        self.tokens.borrow_mut().push(token.to_string());
+        let rest = self
+            .rest
+            .clone()
+            .ok_or_else(|| anyhow!("no client for this token"))?;
+        Ok(Github::new(Box::new(SharedFixture(rest)) as Box<dyn Rest>))
+    }
+}
+
+/// One [`FixtureRest`] behind several clients — the board's and the reviewer's
+/// both write to the same recording, which is how a test asserts that exactly
+/// one review was posted.
+#[cfg(test)]
+pub struct SharedFixture(pub std::rc::Rc<FixtureRest>);
+
+#[cfg(test)]
+impl Rest for SharedFixture {
+    fn get(&self, path: &str) -> Result<Value> {
+        self.0.get(path)
+    }
+    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        self.0.post(path, body)
+    }
+    fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+        self.0.patch(path, body)
+    }
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        self.0.put(path, body)
     }
 }
 

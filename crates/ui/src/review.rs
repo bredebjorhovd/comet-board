@@ -2345,12 +2345,25 @@ mod tests {
             not_delivered: None,
             projection: verdict::Projection::Posted,
             refused: None,
+            posted_as: None,
             unclaimed: 2,
             payload: String::new(),
         };
         assert_eq!(
             ReviewPanel::receipt_line(&base),
             "Recorded, and delivered into the chat once. It is on the pull request."
+        );
+        // Cast under the reviewer's own credential (gh#369), the line says
+        // whose name is on it — the difference between a bot having spoken and
+        // a person having reviewed.
+        let as_person = VerdictReceipt {
+            posted_as: Some("bredebjorhovd".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            ReviewPanel::receipt_line(&as_person),
+            "Recorded, and delivered into the chat once. It is on the pull request, \
+             as @bredebjorhovd."
         );
         // The idempotent path says so rather than pretending it just happened.
         let retried = VerdictReceipt {

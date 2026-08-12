@@ -431,7 +431,12 @@ pub fn render_verdict(receipt: &VerdictReceipt) -> String {
         } else {
             "!"
         },
-        verdict::projection_line(receipt.kind, receipt.projection, receipt.refused.as_deref()),
+        verdict::projection_line(
+            receipt.kind,
+            receipt.projection,
+            receipt.refused.as_deref(),
+            receipt.posted_as.as_deref(),
+        ),
     );
     if receipt.unclaimed > 0 {
         let _ = writeln!(
