@@ -1764,10 +1764,8 @@ impl SyncEngine {
         task_id: &str,
         text: &str,
     ) -> Result<crate::claims::AttemptReview> {
-        let task = self
-            .db
-            .get_task(task_id)?
-            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
         let attempt = task
             .live_attempt()
             .or_else(|| task.attempts.last())
@@ -1808,10 +1806,8 @@ impl SyncEngine {
         attempt: Option<i64>,
     ) -> Result<crate::claims::AttemptReview> {
         use crate::claims::DiffSource;
-        let task = self
-            .db
-            .get_task(task_id)?
-            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
         let attempt =
             match attempt {
                 Some(id) => task
@@ -1849,7 +1845,7 @@ impl SyncEngine {
             }
         };
         let mut review = crate::claims::review(
-            &task,
+            task,
             &attempt,
             changed,
             diff,
@@ -10758,6 +10754,36 @@ max_duration = "{max_duration}"
         assert_eq!(review.remainder.claims[0].text, "Right");
         assert!(review.remainder.complete());
         assert_eq!(e.db.get_attempt(a).unwrap().unwrap().claims.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The verb takes the name the brief handed over (§gh#339). A dispatched
+    /// agent is greeted with its identifier — `LIN-142`, `gh#339` — and the
+    /// claim path compared that against the id column, so an agent that did
+    /// exactly what the skill asked was told its own task was not on the
+    /// board. Nothing in a dispatched run exports the id, so the refusal had
+    /// no repair in it either.
+    #[test]
+    fn claims_and_the_review_answer_to_the_identifier_the_agent_was_given() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
+        commit_all(&dir, "work");
+
+        let review = e
+            .submit_claims(None, "LIN-142", "Storage :: src/db.rs")
+            .unwrap();
+        assert_eq!(review.remainder.claims.len(), 1);
+        assert!(review.remainder.complete());
+        assert_eq!(e.db.get_attempt(a).unwrap().unwrap().claims.len(), 1);
+        // …and reading it back answers to either spelling, while the review it
+        // hands back names the canonical id whichever one was typed: the
+        // resolution is at the door, not in the payload.
+        assert_eq!(review.task_id, "linear:LIN-142");
+        for spelling in ["LIN-142", "linear:LIN-142"] {
+            assert_eq!(e.review(spelling, None).unwrap().task_id, "linear:LIN-142");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

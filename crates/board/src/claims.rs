@@ -460,6 +460,69 @@ pub fn parse(input: &str, worktree: Option<&str>) -> Result<Vec<Claim>> {
     Ok(claims)
 }
 
+// ---- the ask, in the brief itself (§gh#339) -------------------------------
+
+/// The paragraph every dispatch brief ends with: say what you did, here is the
+/// verb, here is the exact task to name (§gh#339).
+///
+/// The contract had three channels to reach an agent through and none of them
+/// was the one that always arrives. The skill is *discovered* — Claude Code
+/// reads it when the agent decides it is relevant, and an agent handed a
+/// ticket, a branch and a finish sequence has no reason to decide that. The
+/// instruction file (gh#272) is better and still a standing rule in a file,
+/// competing with everything else in it. The brief is neither: it is the one
+/// text the board hands to every dispatched agent of every runtime, and until
+/// this it asked for a commit, a push and a pull request and never once
+/// mentioned claims. Twenty-three settled attempts on the box ran the verb
+/// zero times and wrote a block zero times, with the skill installed the whole
+/// while. So the ask goes where the work is asked for.
+///
+/// It names `task_id` verbatim because that is the argument, and because the
+/// agent has no other way to learn it: nothing exports it into the run's
+/// environment, and the identifier the rest of the brief uses (`gh#339`) is a
+/// different string from the id (`gh:owner/repo#339`). Both spellings are
+/// accepted now ([`crate::dispatch::task_by_reference`]), which is the other
+/// half of this fix — but the one printed here is the one that cannot be
+/// ambiguous.
+///
+/// Appended after interpolation by [`crate::dispatch::resolve_prompt`], for the
+/// reason the base sentence is: a route's own `prompt` is somebody's wording
+/// for the *task*, and the contract is a fact about being dispatched at all.
+///
+/// The fallback fence is *named* rather than spelled, so this text contains no
+/// [`BLOCK_TAG`] fence of its own: an agent that quotes its brief back in a
+/// closing message would otherwise hand [`find_block`] the board's own
+/// instruction to read as that agent's answer to it.
+pub fn brief(task_id: &str) -> String {
+    format!(
+        "\n\nBefore you say you are done, tell the board what you changed — in \
+         **claims**, one per line, each anchored to the files or symbols it is \
+         about:\
+         \n\n```\
+         \ncomet-board claim --task {task_id} <<'EOF'\
+         \n<what you did> {ANCHOR} <anchor> [<anchor>…]\
+         \nEOF\
+         \n```\
+         \n\nAn anchor is a **path** — anything with a `/` or a file extension, \
+         repo-relative, and a directory accounts for everything under it — or a \
+         **symbol**, a function or type or constant the change is about, which \
+         accounts for every changed file whose diff names it. A line with no \
+         `{ANCHOR}`, or nothing after it, is refused: without an anchor a claim \
+         cannot be checked, and an unanchored summary is the thing this replaces.\
+         \n\nThe reply is the part worth reading. The board diffs your branch and \
+         prints every changed file no claim accounts for — computed from git, not \
+         from what you wrote, so it is where the dependency you bumped and the \
+         function you edited in passing turn up. Run it after your last commit, \
+         read what comes back, and either claim those changes or go and look at \
+         them.\
+         \n\nIf you finish without running the verb, write the same lines into a \
+         fenced block tagged `{BLOCK_TAG}` in your closing message and the board \
+         reads them off the attempt. Claiming nothing breaks nothing — the \
+         attempt settles and the pull request opens as they would anyway, and \
+         the review says the contract went unanswered."
+    )
+}
+
 // ---- the block, off the finished attempt (§gh#235) ------------------------
 
 /// The fence an agent writes its claims in when it is finishing rather than

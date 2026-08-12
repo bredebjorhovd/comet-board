@@ -346,6 +346,13 @@ The remainder is computed from the branch diff :: crates/board/src/claims.rs
 EOF
 ```
 
+`--task` takes the board's id (`gh:owner/repo#183`) or the identifier the board
+displays (`gh#183`); a dispatched brief prints the id beside the verb, so the
+argument is already in front of you. It is printed because nothing else in a
+dispatched run says it — the two spellings are different strings, and an agent
+that reached for the one its brief opened with used to be told its own task was
+not on the board (gh#339).
+
 One claim per line: `<what you did> :: <path> [<path>…]`. Paths are
 repo-relative, and a directory (`crates/board/src/`) accounts for everything
 under it. A line with no `::`, or nothing after it, is **refused** — a summary
