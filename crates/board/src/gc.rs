@@ -27,6 +27,7 @@
 //! the interval sync, so the retention window is aged in wall time and a burst
 //! of watch events cannot run the clock faster than the clock.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -154,8 +155,82 @@ pub fn standing(task: &Task, attempt: &Attempt, dependents: &Dependents) -> Stan
     Standing::Held
 }
 
+/// Which chats have released work the board is not finished with (gh#354) —
+/// read off the same edge the settle notices are delivered on.
+///
+/// `COMET_BOARD_CHAT_ID` rides every dispatch, so `dispatched_by_pane` on an
+/// attempt row is the chat that released it ([`crate::dispatch::dispatcher_for`]).
+/// The board already reads that edge downward, to find an address for a settle.
+/// Read *upward* — chat → what it is still waiting on — it is the only thing on
+/// the board that knows a chat is being **used as a dispatcher**, which is a
+/// role a chat acquires by dispatching rather than one anybody declares
+/// (gh#348).
+///
+/// **A dispatcher outlives the work it released**, and the measure of that is
+/// [`standing`] on the child — the same rule the child's own checkout and chat
+/// are kept on, asked one edge further up. Not the child's *outcome*: an
+/// attempt closes when the agent finishes and the pull request opens, and
+/// everything a person does with released work happens after that. The settle
+/// notice is delivered into this chat, the diff is read from it, the merge or
+/// the retry is decided in it. A hold that lifted at settle would cover the
+/// interval when nobody needs the chat and let go at the start of the one when
+/// they do — with `archive_chats` at its `on-settle` default there is no window
+/// to absorb the gap, so the thread would still vanish, and now a little before
+/// the merge rather than at it.
+///
+/// Still nowhere near "never archive anything that ever dispatched": a child
+/// that merges, closes upstream or is marked done is [`Standing::Spent`] and
+/// releases its dispatcher, so a chat whose work has all landed goes to the
+/// shelf on the ordinary terms and the shelf still clears.
+#[derive(Debug, Clone, Default)]
+pub struct Dispatchers {
+    released: HashMap<String, Vec<i64>>,
+}
+
+impl Dispatchers {
+    /// Build the map from one board's worth of tasks. Whole-board, for the same
+    /// reason [`crate::rebased::Dependents::of`] is: no amount of looking at
+    /// one attempt finds the work it released, which lives under another task.
+    ///
+    /// `dependents` is threaded through to [`standing`] rather than consulted
+    /// here — the point is that this asks the module's one ownership question
+    /// about the child rather than inventing a second one.
+    pub fn of(tasks: &[Task], dependents: &Dependents) -> Self {
+        let mut released: HashMap<String, Vec<i64>> = HashMap::new();
+        for task in tasks {
+            for attempt in &task.attempts {
+                let Some(chat) = attempt.dispatched_by_pane.as_deref() else {
+                    continue;
+                };
+                if standing(task, attempt, dependents) == Standing::Spent {
+                    continue;
+                }
+                released
+                    .entry(chat.to_string())
+                    .or_default()
+                    .push(attempt.id);
+            }
+        }
+        for ids in released.values_mut() {
+            ids.sort_unstable();
+        }
+        Self { released }
+    }
+
+    /// Is this chat waiting on work it released?
+    pub fn holds(&self, chat: &str) -> bool {
+        self.released.contains_key(chat)
+    }
+
+    /// Which attempts they are — for the log line that says why a chat is still
+    /// on the shelf, which is the only reason anybody needs the ids.
+    pub fn released(&self, chat: &str) -> &[i64] {
+        self.released.get(chat).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// Whose the *chat* of `attempt` is (gh#139) — the same question
-/// [`standing`] answers about its checkout, plus the two things that are true
+/// [`standing`] answers about its checkout, plus the things that are true
 /// of chats and not of directories.
 ///
 /// A chat and a checkout are the same attempt's leavings, so the rule is
@@ -169,6 +244,17 @@ pub fn standing(task: &Task, attempt: &Attempt, dependents: &Dependents) -> Stan
 ///   address every event that can reach no other agent goes to, so it is
 ///   *always* somebody's, whatever the attempt it was once dispatched as.
 ///   `Held`, not a skip, so a mark left from before it was pinned is cleared.
+/// - **Nor is a chat that has released work the board is not finished with**
+///   (gh#354). This is the same protection, attached to the behaviour instead
+///   of the pin: the orchestrator is spared because it is waiting on the board,
+///   and a chat with two agents out is waiting on exactly the same thing at a
+///   smaller scale. Until gh#354 the sweep could only see the declaration, so
+///   the pane somebody dispatched from was, once its own task merged, a
+///   finished attempt like any other — and it was archived out from under them
+///   mid-use. A dispatcher outlives what it dispatched: see [`Dispatchers`] for
+///   why that is the child's [`standing`] and not the child's outcome. `Live`
+///   rather than `Held`, because unlike a pin this says something about *right
+///   now*: somebody is in there waiting for an answer.
 /// - **A chatless attempt has nothing to archive.** A dispatch whose chat
 ///   never got recorded is `Held` for want of anything to do.
 ///
@@ -183,6 +269,7 @@ pub fn chat_standing(
     task: &Task,
     attempt: &Attempt,
     orchestrator: Option<&str>,
+    dispatchers: &Dispatchers,
     dependents: &Dependents,
 ) -> Standing {
     let Some(chat) = attempt.pane_id.as_deref() else {
@@ -190,6 +277,9 @@ pub fn chat_standing(
     };
     if orchestrator.is_some_and(|pinned| pinned == chat) {
         return Standing::Held;
+    }
+    if dispatchers.holds(chat) {
+        return Standing::Live;
     }
     standing(task, attempt, dependents)
 }
@@ -661,7 +751,13 @@ mod tests {
         );
         // The chat goes with it, for the same reason and by the same rule.
         assert_eq!(
-            chat_standing(&parent, &parent.attempts[0], None, &held),
+            chat_standing(
+                &parent,
+                &parent.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &held
+            ),
             Standing::Held
         );
         // Without the edge — the ordinary unstacked dispatch — it is spent,
@@ -728,7 +824,13 @@ mod tests {
                     t.pr_open = pr_open;
                     t.attempts = vec![attempt(1, outcome)];
                     assert_eq!(
-                        chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+                        chat_standing(
+                            &t,
+                            &t.attempts[0],
+                            None,
+                            &Dispatchers::default(),
+                            &Dependents::default(),
+                        ),
                         standing(&t, &t.attempts[0], &Dependents::default()),
                         "{upstream:?} {outcome:?} pr_open={pr_open}"
                     );
@@ -747,7 +849,13 @@ mod tests {
         t.pr_open = true;
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &Dependents::default(),
+            ),
             Standing::Held
         );
     }
@@ -759,7 +867,13 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, None)];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &Dependents::default(),
+            ),
             Standing::Live
         );
     }
@@ -772,7 +886,13 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], Some("chat-1"), &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                Some("chat-1"),
+                &Dispatchers::default(),
+                &Dependents::default()
+            ),
             Standing::Held
         );
         // Somebody else's pin leaves this chat exactly as spent as it was.
@@ -781,10 +901,121 @@ mod tests {
                 &t,
                 &t.attempts[0],
                 Some("chat-other"),
+                &Dispatchers::default(),
                 &Dependents::default()
             ),
             Standing::Spent
         );
+    }
+
+    // ---- the chat that is somebody's dispatcher (gh#354) -----------------
+
+    /// One board: a settled parent attempt in `chat-1`, and the work that chat
+    /// released under another task, in whatever state the test needs it.
+    fn dispatcher_board(children: &[Option<Outcome>], child_upstream: UpstreamState) -> [Task; 2] {
+        let mut parent = task(UpstreamState::Terminal);
+        parent.attempts = vec![attempt(1, Some(Outcome::Done))];
+        let mut child_task = task(child_upstream);
+        child_task.id = "gh:o/r#8".into();
+        child_task.attempts = children
+            .iter()
+            .enumerate()
+            .map(|(i, outcome)| {
+                let mut child = attempt(2 + i as i64, *outcome);
+                child.task_id = "gh:o/r#8".into();
+                child.pane_id = Some(format!("chat-{}", 2 + i));
+                child.dispatched_by_pane = Some("chat-1".into());
+                child
+            })
+            .collect();
+        [parent, child_task]
+    }
+
+    /// `chat_standing` for the parent of `board`, which is the whole question
+    /// these tests ask.
+    fn dispatcher_standing(board: &[Task; 2]) -> Standing {
+        let parent = &board[0];
+        chat_standing(
+            parent,
+            &parent.attempts[0],
+            None,
+            &Dispatchers::of(board, &Dependents::default()),
+            &Dependents::default(),
+        )
+    }
+
+    /// gh#354 whole: the pane somebody dispatched two agents from was itself a
+    /// board attempt. Its own task merged, and the sweep — which could see the
+    /// pin and nothing else — archived the thread they were working in out from
+    /// under them while both children were still out.
+    #[test]
+    fn a_chat_waiting_on_work_it_released_is_never_archived() {
+        let board = dispatcher_board(&[None, None], UpstreamState::Started);
+        let dispatchers = Dispatchers::of(&board, &Dependents::default());
+        assert_eq!(dispatchers.released("chat-1"), [2, 3]);
+        assert_eq!(dispatcher_standing(&board), Standing::Live);
+        // The *checkout* is a separate question with its own answer: nothing
+        // about having dispatched holds the directory or the branch, and this
+        // deliberately does not reach for them.
+        assert_eq!(
+            standing(&board[0], &board[0].attempts[0], &Dependents::default()),
+            Standing::Spent
+        );
+    }
+
+    /// The boundary that matters, and the one this got wrong first: an attempt
+    /// closes when the agent finishes and the pull request opens. Everything
+    /// the dispatcher exists for happens *after* that — the settle notice is
+    /// delivered into this chat, the diff is read from it, the merge is decided
+    /// in it. A hold that lifted at settle would let go one sweep before the
+    /// merge Brede described, not at it.
+    #[test]
+    fn a_settled_child_still_on_the_board_holds_the_chat_that_released_it() {
+        // Both children finished and opened pull requests; the issues are still
+        // open upstream, which is what `review` looks like from here.
+        let board = dispatcher_board(
+            &[Some(Outcome::Done), Some(Outcome::Done)],
+            UpstreamState::Started,
+        );
+        assert_eq!(dispatcher_standing(&board), Standing::Live);
+
+        // A pull request in review on a task that has *left* the board holds it
+        // too, by the same rule that holds the child's own chat there.
+        let mut board = dispatcher_board(&[Some(Outcome::Done)], UpstreamState::Terminal);
+        board[1].pr_open = true;
+        assert_eq!(dispatcher_standing(&board), Standing::Live);
+    }
+
+    /// And narrower than "never archive anything that ever dispatched": a
+    /// dispatcher outlives its work and no longer, so once the last child has
+    /// left the board the shelf gets cleared.
+    #[test]
+    fn once_the_work_it_released_has_left_the_board_the_chat_is_spent_again() {
+        let board = dispatcher_board(
+            &[Some(Outcome::Done), Some(Outcome::Failed)],
+            UpstreamState::Terminal,
+        );
+        assert!(!Dispatchers::of(&board, &Dependents::default()).holds("chat-1"));
+        assert_eq!(dispatcher_standing(&board), Standing::Spent);
+
+        // One child still owed is enough — the hold is per chat, not per
+        // dispatch, because the person is waiting on the slowest of them.
+        let board = dispatcher_board(&[Some(Outcome::Done), None], UpstreamState::Terminal);
+        assert_eq!(dispatcher_standing(&board), Standing::Live);
+    }
+
+    /// A blocked child holds its dispatcher just as a running one does: an
+    /// attempt that stopped to ask is precisely the case where somebody is
+    /// coming back to the chat that released it.
+    #[test]
+    fn a_blocked_child_holds_the_chat_that_released_it() {
+        let board = dispatcher_board(&[None], UpstreamState::Terminal);
+        assert!(Dispatchers::of(&board, &Dependents::default()).holds("chat-1"));
+        // And an operator's dispatch records no chat at all, which holds
+        // nothing — `Dispatchers` must not invent an address from a `None`.
+        let mut board = dispatcher_board(&[None], UpstreamState::Terminal);
+        board[1].attempts[0].dispatched_by_pane = None;
+        assert!(!Dispatchers::of(&board, &Dependents::default()).holds("chat-1"));
     }
 
     /// A dispatch whose chat was never recorded has nothing to archive, and
@@ -796,7 +1027,13 @@ mod tests {
         a.pane_id = None;
         t.attempts = vec![a];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &Dependents::default(),
+            ),
             Standing::Held
         );
     }

@@ -148,8 +148,11 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 - After releasing work, wait for it or say plainly you're leaving it running.
   Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
   default) — and is the first addressee, so what reaches you does not also
-  reach the board's orchestrator. Never promise you'll be woken: the setting
-  is invisible from here and an archived chat is told nothing.
+  reach the board's orchestrator. The board keeps your chat off the shelf
+  until the work you released has left the board — settling is not enough, so
+  the whole merge window is yours. Never promise
+  you'll be woken: the setting is invisible from here, and a chat somebody
+  filed away by hand is told nothing.
 - Never dispatch speculatively — a human keypress or explicit instruction
   releases tasks. Reading is always safe.
 - New repo: `comet-board onboard <owner/repo>` (clone on box + space + adopt,
