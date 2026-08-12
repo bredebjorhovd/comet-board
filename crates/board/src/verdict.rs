@@ -2294,6 +2294,10 @@ mod tests {
         assert_eq!(receipt.posted_as, None);
         let refused = receipt.refused.unwrap();
         assert!(refused.contains("as @ana"), "{refused}");
+        // It is read by a person, off a receipt. A wrapped literal that kept
+        // its own source indentation would say so here (see doctor's
+        // `every_sentence_the_review_identity_line_can_print_reads_as_prose`).
+        assert!(!refused.contains("  "), "{refused}");
         assert!(refused.contains("Bad credentials"), "{refused}");
         assert!(refused.contains(OWN_PR), "{refused}");
     }

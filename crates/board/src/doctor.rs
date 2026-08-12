@@ -1610,14 +1610,18 @@ fn opener(paths: &Paths, rest: Option<&crate::sources::github::HttpRest>) -> Ope
 fn review_identity_check(cfg: &RoutingConfig, credentials: &Credentials, opener: Opener) -> Check {
     let name = "review identity".to_string();
     let opens = match &opener {
-        Opener::App => "the board's App opens dispatched pull requests — a bot, which is                         what lets a person's verdict on one be a verdict"
+        Opener::App => "the board's App opens dispatched pull requests — a bot, which is \
+                        what lets a person's verdict on one be a verdict"
             .to_string(),
-        Opener::Person(Some(login)) => format!(
-            "dispatched pull requests are opened by @{login} (GITHUB_TOKEN)"
-        ),
-        Opener::Person(None) => "dispatched pull requests are opened by whoever owns                                  GITHUB_TOKEN — GitHub could not be asked which account                                  that is"
+        Opener::Person(Some(login)) => {
+            format!("dispatched pull requests are opened by @{login} (GITHUB_TOKEN)")
+        }
+        Opener::Person(None) => "dispatched pull requests are opened by whoever owns \
+                                 GITHUB_TOKEN — GitHub could not be asked which account \
+                                 that is"
             .to_string(),
-        Opener::BoxUser => "no board credential, so dispatched agents push and open pull                             requests with this box's own git credentials — whoever that is"
+        Opener::BoxUser => "no board credential, so dispatched agents push and open pull \
+                            requests with this box's own git credentials — whoever that is"
             .to_string(),
     };
     // Who can cast a verdict under their own name, and who reviews as the
@@ -1649,7 +1653,10 @@ fn review_identity_check(cfg: &RoutingConfig, credentials: &Credentials, opener:
             && opener.eq_ignore_ascii_case(&login)
         {
             collides.push(format!(
-                "@{login} both opens and reviews — GitHub refuses an approval on your own                  pull request, so theirs can only ever arrive as a comment. Register a                  GitHub App (GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PATH) so the bot opens                  them"
+                "@{login} both opens and reviews — GitHub refuses an approval on your own \
+                 pull request, so theirs can only ever arrive as a comment. Register a \
+                 GitHub App (GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PATH) so the bot \
+                 opens them"
             ));
         }
     }
@@ -1662,14 +1669,17 @@ fn review_identity_check(cfg: &RoutingConfig, credentials: &Credentials, opener:
     }
     if !as_board.is_empty() {
         sentences.push(format!(
-            "{} reviews as the board — an approval arrives as a comment saying it approves              (gh#365) until {} is set",
+            "{} reviews as the board — an approval arrives as a comment saying it \
+             approves (gh#365) until {} is set",
             as_board.join(", "),
             crate::config::user_token_env(as_board[0].trim_start_matches('@')),
         ));
     }
     if cfg.users.is_empty() {
         sentences.push(
-            "no `[users]` map, so every verdict is the board's. `comet-board member add              <their-sign-in-email> --github <login>` names a reviewer; their token goes              in the board's .env as GITHUB_USER_TOKEN_<LOGIN>"
+            "no `[users]` map, so every verdict is the board's. `comet-board member add \
+             <their-sign-in-email> --github <login>` names a reviewer; their token goes \
+             in the board's .env as GITHUB_USER_TOKEN_<LOGIN>"
                 .into(),
         );
     }
@@ -5195,6 +5205,51 @@ mod tests {
             "{}",
             c.detail
         );
+    }
+
+    /// Every sentence this check can print, read as a person reads it (gh#369).
+    ///
+    /// A Rust string literal wrapped across source lines keeps the newline
+    /// *and* the source indentation unless the line ends in `\`, and the first
+    /// cut of this check shipped six that did not — twelve to thirty-four
+    /// literal spaces, mid-sentence, in the one report somebody reads when they
+    /// have already lost an hour to a 422 that explains nothing. `cargo fmt`
+    /// does not look inside a string and clippy has no opinion about one, so
+    /// the guard has to be a test, and it has to cover every branch rather than
+    /// the branch a fixture happens to take.
+    #[test]
+    fn every_sentence_the_review_identity_line_can_print_reads_as_prose() {
+        let mapped_and_credentialled = mapped(&[
+            ("ana@example.com", "1+ana@users.noreply.github.com"),
+            ("sam@example.com", "2+samito@users.noreply.github.com"),
+        ]);
+        let mut shared = Credentials::with_user_token("ana", "ghp_shared");
+        shared.github_token = Some("ghp_shared".into());
+        let cases = [
+            // Every opener, and every state a member can be in: with a token,
+            // without one, colliding with the opener, and no map at all.
+            (&mapped_and_credentialled, &shared, Opener::App),
+            (
+                &mapped_and_credentialled,
+                &shared,
+                Opener::Person(Some("ana".into())),
+            ),
+            (&mapped_and_credentialled, &shared, Opener::Person(None)),
+            (&mapped_and_credentialled, &shared, Opener::BoxUser),
+            (
+                &RoutingConfig::default(),
+                &Credentials::default(),
+                Opener::BoxUser,
+            ),
+        ];
+        for (cfg, credentials, opener) in cases {
+            let c = review_identity_check(cfg, credentials, opener.clone());
+            assert!(
+                !c.detail.contains("  ") && !c.detail.contains('\n'),
+                "under {opener:?} the line carries its own source layout:\n{}",
+                c.detail
+            );
+        }
     }
 
     /// A board with no map is not broken — it is gh#365's arrangement, and the
