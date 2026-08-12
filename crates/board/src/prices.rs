@@ -324,7 +324,7 @@ mod tests {
     fn a_model_with_no_rate_is_visible_rather_than_missing() {
         let spent = models(&[
             ("claude-opus-5", usage(10_000, 2_000, 1_000_000, 20_000)),
-            ("gpt-5.6-terra", usage(400, 100, 0, 500)),
+            ("gpt-5.6-luna", usage(400, 100, 0, 500)),
             ("unnamed model", usage(7, 1, 0, 0)),
         ]);
         let spend = Prices::builtin()
@@ -339,7 +339,7 @@ mod tests {
         // Biggest unpriced first, and the total says how much the price above
         // does not account for.
         let unpriced: Vec<&str> = spend.unpriced.iter().map(|t| t.label.as_str()).collect();
-        assert_eq!(unpriced, ["gpt-5.6-terra", "unnamed model"]);
+        assert_eq!(unpriced, ["gpt-5.6-luna", "unnamed model"]);
         assert_eq!(spend.unpriced_tokens, 1_008);
         assert!(!spend.is_complete());
         assert!(spend.headline().contains("unpriced"));
@@ -512,7 +512,7 @@ mod tests {
         let prices = Prices::builtin();
         let spent = models(&[
             ("claude-opus-5", usage(1_000_000, 0, 0, 0)),
-            ("gpt-5.6-terra", usage(500, 100, 0, 0)),
+            ("gpt-5.6-luna", usage(500, 100, 0, 0)),
         ]);
         let counts = accounts(&[("ana@example.com", 2)]);
         let by_pair = split(&[
@@ -521,7 +521,7 @@ mod tests {
                 "claude-opus-5",
                 usage(1_000_000, 0, 0, 0),
             ),
-            ("ana@example.com", "gpt-5.6-terra", usage(500, 100, 0, 0)),
+            ("ana@example.com", "gpt-5.6-luna", usage(500, 100, 0, 0)),
         ]);
         let spend = prices
             .spend(&spent, &counts, &by_pair, Some(7))
@@ -535,12 +535,12 @@ mod tests {
     fn an_override_is_what_prices_a_model_the_table_never_heard_of() {
         let prices = Prices {
             table: comet_proto::view::rates::builtin().with_overrides([(
-                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
                 ModelRate::published(1.25, 10.0),
             )]),
             plans: Vec::new(),
         };
-        let spent = models(&[("gpt-5.6-terra", usage(1_000_000, 100_000, 0, 0))]);
+        let spent = models(&[("gpt-5.6-luna", usage(1_000_000, 100_000, 0, 0))]);
         let spend = prices
             .spend(&spent, &BTreeMap::new(), &BTreeMap::new(), Some(7))
             .expect("configured");
