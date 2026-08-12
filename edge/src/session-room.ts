@@ -72,6 +72,7 @@ import {
 } from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
+import { ensureMetaTable, readMeta, writeMeta } from "./meta";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -299,9 +300,7 @@ export class SessionRoom implements DurableObject {
     this.ctx = ctx;
     this.env = env;
     ensureUpdateLog(ctx.storage.sql);
-    ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    );
+    ensureMetaTable(ctx.storage.sql);
     this.blobs = createBlobStore(ctx.storage.sql);
     // Protocol-designed hibernation keepalive: ping → pong without waking us.
     // NOTE (2026-07-30 incident): precisely BECAUSE the runtime answers these
@@ -316,16 +315,14 @@ export class SessionRoom implements DurableObject {
   // ── meta helpers ──────────────────────────────────────────────────────────
 
   private getMeta(key: string): string | undefined {
-    const rows = [...this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key)];
-    return rows[0]?.value as string | undefined;
+    return readMeta(this.ctx.storage.sql, key);
   }
 
+  /** Storing a value that is already stored writes nothing — see meta.ts. The
+   * three flags `recordLoroUpdates` sets on every inbound batch are the reason
+   * that guard exists (gh#373). */
   private setMeta(key: string, value: string): void {
-    this.ctx.storage.sql.exec(
-      "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      key,
-      value
-    );
+    writeMeta(this.ctx.storage.sql, key, value);
   }
 
   // ── HTTP surface (only reachable through the authed Worker) ──────────────

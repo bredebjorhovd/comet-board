@@ -18,6 +18,7 @@
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, type Env } from "./env";
+import { ensureMetaTable, readMeta, writeMeta } from "./meta";
 
 export interface DeviceFrameHeader {
   /** Stream id, unique per (connId, logical stream). */
@@ -159,9 +160,7 @@ export class DeviceRoom implements DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     void env;
-    ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    );
+    ensureMetaTable(ctx.storage.sql);
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS pending_nudges (chat_id TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
     );
@@ -170,16 +169,13 @@ export class DeviceRoom implements DurableObject {
   }
 
   private getMeta(key: string): string | undefined {
-    const rows = [...this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key)];
-    return rows[0]?.value as string | undefined;
+    return readMeta(this.ctx.storage.sql, key);
   }
 
+  /** Re-stamping `owner`/`org` on every join is the common case here, and every
+   * one of those was a billed row write before the guard in meta.ts (gh#373). */
   private setMeta(key: string, value: string): void {
-    this.ctx.storage.sql.exec(
-      "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      key,
-      value
-    );
+    writeMeta(this.ctx.storage.sql, key, value);
   }
 
   /** The host socket to route to: the freshest one that has proven itself
