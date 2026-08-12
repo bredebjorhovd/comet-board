@@ -1518,6 +1518,315 @@
         "tokensByRuntime": {},
         "totalMinutes": 0
       }
+    },
+    {
+      "expect": {
+        "completionPercent": null,
+        "contextReported": false,
+        "coveragePercent": "100%",
+        "hasSpend": true,
+        "hasTokens": true,
+        "isEmpty": false,
+        "landingHeadline": "0 tasks",
+        "landingInFlightNote": null,
+        "landingSegments": [
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "merged",
+            "label": "Merged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "open",
+            "label": "PR open"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "closedUnmerged",
+            "label": "Closed unmerged"
+          },
+          {
+            "count": 0,
+            "fraction": 0.0,
+            "kind": "noPr",
+            "label": "No PR raised"
+          }
+        ],
+        "peakDispatches": 0,
+        "peakTokens": 0,
+        "spendLabel": "$0.40 at list price, plus 2.90M unpriced token(s) across 1 model(s)",
+        "tokenTotal": 3084000,
+        "windowLabel": "last 7 days"
+      },
+      "name": "one model the table has no rate for",
+      "stats": {
+        "agentDispatched": 0,
+        "attempts": 12,
+        "attemptsWithTokens": 12,
+        "breakdown": [
+          {
+            "dimension": "model",
+            "peak": 400250,
+            "ranking": "spend",
+            "rows": [
+              {
+                "cost": 0.40025,
+                "dispatches": 8,
+                "label": "claude-opus-5",
+                "unpricedTokens": 0,
+                "usage": {
+                  "cacheCreationTokens": 21000,
+                  "cacheReadTokens": 148000,
+                  "inputTokens": 9000,
+                  "outputTokens": 6000
+                }
+              },
+              {
+                "cost": 0.0,
+                "dispatches": 4,
+                "label": "gpt-5.6-luna",
+                "unpricedTokens": 2900000,
+                "usage": {
+                  "cacheCreationTokens": 110000,
+                  "cacheReadTokens": 2400000,
+                  "inputTokens": 300000,
+                  "outputTokens": 90000
+                }
+              }
+            ]
+          }
+        ],
+        "byAccount": {},
+        "byRuntime": {},
+        "bySource": {},
+        "byWorkspace": {},
+        "completionRate": null,
+        "context": {
+          "attemptsReported": 0,
+          "nearCompaction": 0,
+          "peakPercent": null
+        },
+        "daily": [],
+        "dailyTokens": [],
+        "friction": {
+          "blockedEntries": 0,
+          "earlySettles": 0,
+          "overruns": 0,
+          "retriedTasks": 0
+        },
+        "hourOfDay": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "hoursByWorkspace": {},
+        "landing": {
+          "closedUnmerged": 0,
+          "inFlight": 0,
+          "merged": 0,
+          "noPr": 0,
+          "open": 0
+        },
+        "live": 0,
+        "longestMinutes": null,
+        "medianMinutes": null,
+        "outcomes": {},
+        "p90Minutes": null,
+        "sinceDays": 7,
+        "spend": {
+          "accounts": [],
+          "byModel": [
+            {
+              "cost": 0.40025,
+              "label": "claude-opus-5",
+              "rate": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "rateKey": "claude-opus-5",
+              "source": "builtin",
+              "usage": {
+                "cacheCreationTokens": 21000,
+                "cacheReadTokens": 148000,
+                "inputTokens": 9000,
+                "outputTokens": 6000
+              }
+            }
+          ],
+          "listPrice": 0.40025,
+          "rates": {
+            "asOf": "2026-08-12",
+            "entries": {
+              "claude-fable-5": {
+                "cacheRead": 1.0,
+                "cacheWrite": 12.5,
+                "input": 10.0,
+                "output": 50.0
+              },
+              "claude-haiku-4-5": {
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25,
+                "input": 1.0,
+                "output": 5.0
+              },
+              "claude-mythos-5": {
+                "cacheRead": 1.0,
+                "cacheWrite": 12.5,
+                "input": 10.0,
+                "output": 50.0
+              },
+              "claude-opus-4-0": {
+                "cacheRead": 1.5,
+                "cacheWrite": 18.75,
+                "input": 15.0,
+                "output": 75.0
+              },
+              "claude-opus-4-1": {
+                "cacheRead": 1.5,
+                "cacheWrite": 18.75,
+                "input": 15.0,
+                "output": 75.0
+              },
+              "claude-opus-4-5": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-6": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-7": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-4-8": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-opus-5": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 25.0
+              },
+              "claude-sonnet-4-0": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-4-5": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-4-6": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "claude-sonnet-5": {
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75,
+                "input": 3.0,
+                "output": 15.0
+              },
+              "deepseek-v4-flash": {
+                "cacheRead": 0.0028,
+                "cacheWrite": 0.14,
+                "input": 0.14,
+                "output": 0.28
+              },
+              "gpt-5.6-sol": {
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "input": 5.0,
+                "output": 30.0
+              },
+              "gpt-5.6-terra": {
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5,
+                "input": 2.0,
+                "output": 12.0
+              }
+            },
+            "overridden": []
+          },
+          "unpriced": [
+            {
+              "label": "gpt-5.6-luna",
+              "usage": {
+                "cacheCreationTokens": 110000,
+                "cacheReadTokens": 2400000,
+                "inputTokens": 300000,
+                "outputTokens": 90000
+              }
+            }
+          ],
+          "unpricedTokens": 2900000
+        },
+        "tasksTouched": 10,
+        "tokenCoverage": 1.0,
+        "tokens": {
+          "cacheCreationTokens": 131000,
+          "cacheReadTokens": 2548000,
+          "inputTokens": 309000,
+          "outputTokens": 96000
+        },
+        "tokensByAccount": {},
+        "tokensByModel": {
+          "claude-opus-5": {
+            "cacheCreationTokens": 21000,
+            "cacheReadTokens": 148000,
+            "inputTokens": 9000,
+            "outputTokens": 6000
+          },
+          "gpt-5.6-luna": {
+            "cacheCreationTokens": 110000,
+            "cacheReadTokens": 2400000,
+            "inputTokens": 300000,
+            "outputTokens": 90000
+          }
+        },
+        "tokensByRuntime": {},
+        "totalMinutes": 0
+      }
     }
   ],
   "humanMinutes": [

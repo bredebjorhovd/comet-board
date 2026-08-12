@@ -211,9 +211,14 @@ const BREAKDOWN_LABEL: f32 = 132.0;
 
 /// The numeric columns: a row total on the grid, and tokens and money on a
 /// breakdown row.
+///
+/// The money column is wider than its figures need because it does not only
+/// hold figures: a row nobody could price says `unpriced` there (gh#359), and
+/// at 44px that word arrived as `unpric…` — a truncation that reads as a
+/// rendering fault, which is the one thing the word was chosen to avoid.
 const TOTAL_COL: f32 = 34.0;
 const TOKENS_COL: f32 = 52.0;
-const PRICE_COL: f32 = 44.0;
+const PRICE_COL: f32 = 58.0;
 
 /// The floor under an outcome band, so one merge out of ninety is a sliver you
 /// can see and point at rather than a rounding error. Bands grow from here,
@@ -1854,6 +1859,12 @@ impl StatsPage {
     /// Cut by model, this is also where the per-model table went (gh#252): the
     /// table was a second answer to the question this toggle's first segment
     /// already asks, drawn one card higher up the same page.
+    ///
+    /// Which is why a model nobody has a rate for keeps its row here (gh#359).
+    /// This is the *usage* view: its tokens are a fact the board knows exactly,
+    /// and the card that drops the biggest unpriced model is the card that
+    /// hides the one worth noticing. Only the money is unknown, and only the
+    /// money column says so.
     fn render_breakdown(
         &self,
         stats: &BoardStats,
@@ -2000,9 +2011,15 @@ impl StatsPage {
                         .truncate()
                         .text_size(px(Theme::TEXT_DENSE))
                         // The loudest thing on the row, because it is the one
-                        // the card is opened for.
-                        .text_color(theme.text)
-                        .child(SharedString::from(Self::row_price(row))),
+                        // the card is opened for — except where the answer is
+                        // a word about the absence of money (gh#359), which is
+                        // said a tone back so a column of figures still reads
+                        // as a column of figures.
+                        .text_color(match row.is_unpriced() {
+                            true => theme.text_subtle,
+                            false => theme.text,
+                        })
+                        .child(SharedString::from(row.price_label())),
                 )
             })
             .into_any_element()
@@ -2014,17 +2031,6 @@ impl StatsPage {
         match row.usage.is_zero() {
             true => "—".into(),
             false => human_tokens(row.usage.total()),
-        }
-    }
-
-    /// A row's money, with the two ways there is none said as a dash: nothing
-    /// metered here, and nothing here the rate table could price.
-    fn row_price(row: &BreakdownRow) -> String {
-        match row.cost {
-            Some(cost) if !row.usage.is_zero() && (!cost.is_zero() || row.unpriced_tokens == 0) => {
-                human_usd(cost)
-            }
-            _ => "—".into(),
         }
     }
 }
