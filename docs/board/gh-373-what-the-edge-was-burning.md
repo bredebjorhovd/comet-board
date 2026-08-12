@@ -12,7 +12,7 @@ Everything below is read from Cloudflare's own analytics for account
 `0cac004a6d08e46e625eafa75b3ab625` on 2026-08-12, via the GraphQL API and
 `wrangler tail`. Nothing was deployed, changed, or upgraded.
 
-## The limit, in Cloudflare's words
+### The limit, in Cloudflare's words
 
 Every single failure — 684 of 684 captured live on `wrangler tail`, one distinct
 message — is this:
@@ -48,7 +48,7 @@ The 12:00 hour wrote 62% of the entire day's allowance. 13:00 crossed 100,000.
 From 14:00 onward **every** Durable Object call fails and the row counter is
 frozen, because the throw happens in the constructor — before any handler runs.
 
-## What the 25,000 actually are
+### What the 25,000 actually are
 
 They are all downstream of that one cap. Per-day, per-class, from
 `durableObjectsInvocationsAdaptiveGroups`:
@@ -75,7 +75,7 @@ the cap the edge is ten times busier than it ever was working. That is the
 retry traffic, and it is what turned a broken afternoon into a five-digit
 number.
 
-### The retries are bounded, and that matters
+#### The retries are bounded, and that matters
 
 `crates/sync/src/room.rs:139-140` — `BACKOFF_BASE` 250 ms doubling to a
 `BACKOFF_CAP` of 30 s, reset only on a successful join. So each room still being
@@ -90,7 +90,7 @@ self-limiting*, so upgrading does not uncork anything. On the paid plan the cap
 that causes these failures does not exist at this volume, the constructor stops
 throwing, joins succeed, and the retries stop by themselves.
 
-### It is not the alarm chain
+#### It is not the alarm chain
 
 The first hypothesis was `SessionRoom.alarm()` retrying forever on Cloudflare's
 backoff — the one mechanism here that makes DO calls with no client connected.
@@ -108,7 +108,7 @@ alarm cannot construct its DO either, so **the nightly R2 backup
 (`backup/{chatId}/latest.loro`) has not run today.** `backupDirty` stays `1`, so
 it will catch up on its own once writes are possible again.
 
-## The defect: we write three rows per update that we did not need to write
+### The defect: we write three rows per update that we did not need to write
 
 The cap was hit by real traffic, but the multiplier is ours.
 `SessionRoom.recordLoroUpdates` (`edge/src/session-room.ts:940-944`) runs on
@@ -148,7 +148,7 @@ when the value is unchanged. A row read costs 1/50th of a row-write's daily
 allowance on free and 1/1000th of its price on paid, so trading a write for a
 read is strictly good on both plans.
 
-## The cost ceiling, in numbers
+### The cost ceiling, in numbers
 
 Workers Paid is **$5/month**, and it includes a Workers Paid allowance for each
 Durable Objects dimension. Our five clean days (08-07 → 08-11) average:
@@ -177,7 +177,7 @@ plan includes, so this dimension cannot get worse by upgrading.
 **Expected bill on Workers Paid at current volume: $5.00/month, with nothing
 added on top.**
 
-### And if it is not fixed
+#### And if it is not fixed
 
 The question that actually matters. Three adversarial cases:
 
@@ -205,7 +205,7 @@ Hibernation is being used correctly (`ctx.acceptWebSocket` in both classes, plus
 the `setWebSocketAutoResponse` ping/pong pair), so that active time is genuine
 work — Loro imports and replays — not idle sockets held open.
 
-## Recommendation
+### Recommendation
 
 **Upgrade.** The concern that motivated the question — that the plan change
 converts a runaway into a bill — does not survive the data. There is no runaway;
