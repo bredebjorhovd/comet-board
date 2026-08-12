@@ -18,10 +18,10 @@ request had no authoring attempt, therefore no chat to deliver a verdict into,
 no claims because nothing was ever told the contract, and no checkout to
 assemble a diff from. `SyncEngine::review` answered `has no attempts to review`
 and the row travelled `review` → `done` unread. On a board whose proposition is
-*"the screen that makes merging cheaper"* (§gh#234), the work that most needs
+*"the screen that makes merging cheaper"* (gh#234), the work that most needs
 review — work nobody planned, done outside the process — got none.
 
-This is not §gh#340. That one is *why the agent did not dispatch*. This one is:
+This is not gh#340. That one is *why the agent did not dispatch*. This one is:
 **when it does not, the result must still be reviewable.** Humans open pull
 requests too, so this failure mode does not get designed away.
 
@@ -65,7 +65,7 @@ and printed against a review with no run behind it.
 ### The head ref is now on the row
 
 `tasks.pr_head_ref`, written by the same poll that already wrote `pr_base_ref`
-(§gh#282) and free from the same response. For everything the board dispatched,
+(gh#282) and free from the same response. For everything the board dispatched,
 the attempt's own `branch` answers this; for a pull request nothing dispatched,
 this column is the only record of which branch the work is on, and the review
 header names it.
@@ -117,9 +117,12 @@ undispatched review and three review-door rows in
 
 ### Not in this issue
 
-§gh#340 (why the agent did not dispatch) and §gh#339 (the claims contract
-unfulfilled) are untouched. Nothing here tries to attribute authorship more
-aggressively than the existing session adoption does; the recovery path this
-issue leaves open — matching a chat by cwd *and* branch — is that adoption's,
-and it is deliberately the only way an undispatched pull request ever gets a
-chat.
+gh#340 — why the agent did not dispatch — is untouched, and is the half of this
+that can be designed out. §gh#339 taught the *brief* to ask for claims, which is
+a fix for runs the board starts; it cannot reach a pull request nobody
+dispatched, and that is exactly the gap this issue fills from the other end.
+
+Nothing here tries to attribute authorship more aggressively than the existing
+session adoption does; the recovery path this issue leaves open — matching a
+chat by cwd *and* branch — is that adoption's, and it is deliberately the only
+way an undispatched pull request ever gets a chat.

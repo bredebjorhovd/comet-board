@@ -1462,6 +1462,53 @@ impl ReviewPanel {
             .into_any_element()
     }
 
+    /// The terms this attempt ran on, when they are worth saying (§gh#349) —
+    /// a band under the verdict, in the verdict's own shape and none of its
+    /// volume.
+    ///
+    /// Under the verdict rather than in it, and never loud: `danger-full-access`
+    /// is a standing condition of most runs on this board (two of the three
+    /// runtimes apply no sandbox at all), so a band that shouted it would
+    /// shout on nearly every review — see [`AttemptReview::sandbox_note`]. It
+    /// is here at all because it qualifies everything below it: a reviewer
+    /// weighing the effects and the evidence is entitled to know whether the
+    /// agent that produced them was confined to its own checkout.
+    fn render_sandbox(review: &AttemptReview, theme: &Theme) -> Option<AnyElement> {
+        let note = review.sandbox_note()?;
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(BAND_GAP))
+                .px(px(Theme::SPACE_LG))
+                .py(px(BAND_PY))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(GLYPH_W))
+                        .flex()
+                        .justify_center()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("?")),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(note)),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// A section that is one sentence: inset to the blocks' column, with the
     /// air above them.
     fn quiet_block(color: gpui::Hsla, text: String) -> AnyElement {
@@ -2176,6 +2223,7 @@ impl Render for ReviewPanel {
 
         let header = self.render_header(&review, &theme, cx);
         let verdict = Self::render_verdict(&review.verdict(), &theme);
+        let sandbox = Self::render_sandbox(&review, &theme);
         let brief = self.render_brief(&review, &theme, window);
         let effects = Self::render_effects(&review, &theme);
         let claims = Self::render_claims(&review, &theme);
@@ -2219,7 +2267,11 @@ impl Render for ReviewPanel {
         // be reachable only by scrolling past a long issue body.
         motion::fade_quick(
             SharedString::from(format!("review-in-{}", review.task_id)),
-            card.child(header).child(verdict).child(body).children(bar),
+            card.child(header)
+                .child(verdict)
+                .children(sandbox)
+                .child(body)
+                .children(bar),
         )
         .into_any_element()
     }
@@ -2367,6 +2419,7 @@ mod tests {
             },
             claimed_at: Some("2026-08-09T10:00:00Z".into()),
             claims_error: None,
+            sandbox: None,
             remainder: comet_board::claims::Remainder {
                 unclaimed: vec![unclaimed.clone()],
                 claimed: 0,

@@ -596,14 +596,16 @@ impl SyncEngine {
                 kind.label()
             );
         }
-        let task = self
-            .db
-            .get_task(task_id)?
-            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        // By id or by identifier, like `claim` and `review` beside it (§gh#339):
+        // the three verbs of the review contract are typed by the same hands,
+        // out of the same window, and one of them refusing `gh#339` while the
+        // others take it would be a distinction nobody could learn.
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
         let Some(gh) = &self.github else {
             bail!("this board has no GitHub credential, so it cannot post a review");
         };
-        let (repo, number) = pr_target(&task).ok_or_else(|| {
+        let (repo, number) = pr_target(task).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} has no pull request on it — there is nothing to review",
                 task.identifier
@@ -707,7 +709,7 @@ impl SyncEngine {
         // The half gh#239 exists for, and the half GitHub has no part in: the
         // agent is still standing in the checkout this is about.
         if !receipt.delivered {
-            match self.deliver_verdict(runtime, &task, attempt_row, kind, comment, &payload) {
+            match self.deliver_verdict(runtime, task, attempt_row, kind, comment, &payload) {
                 Ok(chat_id) => {
                     receipt.delivered = true;
                     if let Some(entry) = state
@@ -962,6 +964,7 @@ mod tests {
             },
             claimed_at: Some("2026-08-09T10:00:00Z".into()),
             claims_error: None,
+            sandbox: None,
             remainder,
             changed: changed_files,
             diff: DiffSource::Checkout,

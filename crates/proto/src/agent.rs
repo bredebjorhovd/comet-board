@@ -39,6 +39,129 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
+impl SandboxLevel {
+    /// The wire word, for a surface that renders the level as text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    /// How much this level permits, as a total order — the thing a comparison
+    /// between a requested and an effective level needs and an enum does not
+    /// give for free (gh#349).
+    ///
+    /// Deliberately not a `derive(PartialOrd)`: the variant order happens to
+    /// agree today, and a level inserted in the middle later would silently
+    /// re-rank every comparison in the workspace.
+    pub fn permissiveness(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::WorkspaceWrite => 1,
+            Self::DangerFullAccess => 2,
+        }
+    }
+
+    /// Nothing between the agent and the box. The one level a reviewer has to
+    /// be told about, whether it was asked for or arrived at.
+    pub fn is_full_access(self) -> bool {
+        matches!(self, Self::DangerFullAccess)
+    }
+}
+
+/// What sandbox a run *actually* got, beside what was asked for (gh#349).
+///
+/// The board names a [`SandboxLevel`] on every dispatch and then never hears
+/// what became of it. That gap is not theoretical: the Codex adapter used to
+/// widen `workspace-write` to `danger-full-access` for a whole shape of
+/// checkout, and said so only in a `WARN` nobody reads — so every board
+/// dispatch ran unsandboxed and every surface still displayed the level that
+/// had been requested. With `approval_policy` pinned to `"never"` on every
+/// runtime, the sandbox is the only guardrail there is, and a guardrail whose
+/// actual setting is unobservable is not one.
+///
+/// So the harness states it, once per run, as a fact the journal keeps: what
+/// was asked for, what was applied, and — when they differ — why. A reviewer
+/// reading an attempt afterwards can then be told "this agent had full access
+/// to the box" instead of being shown the request and left to assume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxReport {
+    /// The level the run was dispatched with.
+    pub requested: SandboxLevel,
+    /// The level the harness actually applied.
+    pub effective: SandboxLevel,
+    /// Why the two differ, in one sentence a reviewer can read. `None` when
+    /// they do not differ — and required, by convention, when they do: an
+    /// unexplained widening is the thing this type exists to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl SandboxReport {
+    /// A run that got exactly what it asked for.
+    pub fn as_requested(level: SandboxLevel) -> Self {
+        Self {
+            requested: level,
+            effective: level,
+            reason: None,
+        }
+    }
+
+    /// A run whose harness applied something other than what was asked.
+    pub fn widened(
+        requested: SandboxLevel,
+        effective: SandboxLevel,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            requested,
+            effective,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// Did the run end up with more than it asked for? The direction that
+    /// matters — a harness that applied *less* has a run that fails loudly,
+    /// while one that applied more has a run that succeeds quietly.
+    pub fn widened_beyond_request(&self) -> bool {
+        self.effective.permissiveness() > self.requested.permissiveness()
+    }
+
+    /// The sentence a surface leads with, or `None` when there is nothing a
+    /// reviewer needs to be told: the run got what it asked for, and what it
+    /// asked for was not full access.
+    ///
+    /// Full access is reported even when it was requested. "Nobody widened
+    /// this" is not the reassurance it sounds like when the level was
+    /// `danger-full-access` from the start.
+    pub fn note(&self) -> Option<String> {
+        match (
+            self.widened_beyond_request(),
+            self.effective.is_full_access(),
+        ) {
+            (false, false) => None,
+            (false, true) => Some("this agent had full access to the box".into()),
+            (true, full) => {
+                let head = if full {
+                    "this agent had full access to the box".to_string()
+                } else {
+                    format!("this agent ran at {}", self.effective.as_str())
+                };
+                Some(match &self.reason {
+                    Some(why) => format!(
+                        "{head} — {} was requested, and {why}",
+                        self.requested.as_str()
+                    ),
+                    None => format!("{head} — {} was requested", self.requested.as_str()),
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SteeringMode {
@@ -460,6 +583,16 @@ pub enum AgentEvent {
     /// reads a trailing non-`Done` event as a run that died mid-stream, and an
     /// event that arrives late must not make a finished attempt look live.
     ContextUsage(ContextUsage),
+    /// What sandbox this run actually got (gh#349) — emitted once, before
+    /// [`SessionStarted`](AgentEvent::SessionStarted), by every harness.
+    ///
+    /// Its own variant rather than a field on `SessionStarted` for the reason
+    /// [`ContextUsage`] has one: it is a different *kind* of fact. The session
+    /// event says what the run is; this says what the run was permitted, and it
+    /// is the only event here that can contradict the request the engine sent.
+    /// A reader that wants it can tag-filter one line out of a journal that is
+    /// otherwise megabytes of text deltas.
+    Sandbox(SandboxReport),
     Error {
         message: String,
     },
@@ -500,6 +633,97 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// The report only speaks when a reviewer needs it to, and full access is
+    /// worth saying even when nobody widened anything.
+    #[test]
+    fn a_sandbox_report_says_something_exactly_when_a_reviewer_needs_it() {
+        // Got what it asked for, and what it asked for was confined. Silent.
+        assert_eq!(
+            SandboxReport::as_requested(SandboxLevel::WorkspaceWrite).note(),
+            None
+        );
+        assert_eq!(
+            SandboxReport::as_requested(SandboxLevel::ReadOnly).note(),
+            None
+        );
+
+        // Full access, unwidened. Still said: "nobody widened this" is not
+        // reassurance when the level was full access from the start.
+        let note = SandboxReport::as_requested(SandboxLevel::DangerFullAccess)
+            .note()
+            .expect("full access is always worth saying");
+        assert_eq!(note, "this agent had full access to the box");
+
+        // Widened, with the reason folded in and the request named.
+        let report = SandboxReport::widened(
+            SandboxLevel::WorkspaceWrite,
+            SandboxLevel::DangerFullAccess,
+            "this codex predates the worktree-mount fix",
+        );
+        assert!(report.widened_beyond_request());
+        let note = report.note().unwrap();
+        assert!(
+            note.starts_with("this agent had full access to the box"),
+            "{note}"
+        );
+        assert!(note.contains("workspace-write was requested"), "{note}");
+        assert!(note.contains("predates the worktree-mount fix"), "{note}");
+
+        // Widening that stops short of full access still reads as a widening.
+        let note = SandboxReport::widened(
+            SandboxLevel::ReadOnly,
+            SandboxLevel::WorkspaceWrite,
+            "a title run needs its scratch dir",
+        )
+        .note()
+        .unwrap();
+        assert!(note.contains("ran at workspace-write"), "{note}");
+        assert!(note.contains("read-only was requested"), "{note}");
+    }
+
+    /// A harness that applies *less* than was asked has a run that fails
+    /// loudly; only the other direction is a quiet broken promise.
+    #[test]
+    fn only_widening_counts_as_widening() {
+        let narrowed = SandboxReport {
+            requested: SandboxLevel::DangerFullAccess,
+            effective: SandboxLevel::ReadOnly,
+            reason: Some("no".into()),
+        };
+        assert!(!narrowed.widened_beyond_request());
+        assert!(
+            SandboxReport::widened(
+                SandboxLevel::ReadOnly,
+                SandboxLevel::DangerFullAccess,
+                "why"
+            )
+            .widened_beyond_request()
+        );
+    }
+
+    /// The event is journaled, and the journal is scanned by tag before it is
+    /// parsed — so the tag has to be what the reader greps for.
+    #[test]
+    fn the_sandbox_event_round_trips_under_the_tag_the_journal_filters_on() {
+        let ev = AgentEvent::Sandbox(SandboxReport::widened(
+            SandboxLevel::WorkspaceWrite,
+            SandboxLevel::DangerFullAccess,
+            "because",
+        ));
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"sandbox""#), "{json}");
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+
+        // An unwidened report drops the empty reason rather than writing null.
+        let json = serde_json::to_value(AgentEvent::Sandbox(SandboxReport::as_requested(
+            SandboxLevel::WorkspaceWrite,
+        )))
+        .unwrap();
+        assert!(json.get("reason").is_none(), "{json}");
+        assert_eq!(json["requested"], "workspace-write");
+        assert_eq!(json["effective"], "workspace-write");
     }
 
     #[test]

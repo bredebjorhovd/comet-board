@@ -28,10 +28,13 @@ through some other way is a finding, not a finish.
 
 **Say what you changed, in claims a reviewer can check.** `comet-board claim
 --task <id>`, one line each, `<what you did> :: <anchor> [<anchor>…]` — an
-anchor is a repo-relative path or a symbol. What comes back is the part worth
-reading: every changed file no claim accounts for, computed from the branch diff
-rather than from what you wrote, which is where the dependency you bumped and
-the function you edited in passing turn up.
+anchor is a repo-relative path or a symbol. The id is the one your brief prints
+beside this verb; the identifier it opened with (`gh#14`) is accepted too. What
+comes back is the part worth reading: every changed file no claim accounts for,
+computed from the branch diff rather than from what you wrote, which is where
+the dependency you bumped and the function you edited in passing turn up. Do it
+before you say you are done — a settled attempt that claimed nothing arrives at
+the review window with nothing in the middle of it.
 
 **Work you delegate goes through the board.** A ticket buys a branch, a pull
 request, a review that reaches the agent that wrote it, a cap, and a bill with a

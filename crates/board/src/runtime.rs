@@ -618,6 +618,27 @@ pub trait Runtime {
         Ok(None)
     }
 
+    /// What sandbox this chat's last run actually got (§gh#349) — off the same
+    /// journal as [`Runtime::run_commands`], and recorded on the same tick.
+    ///
+    /// The board names a level on every dispatch and, until this existed, never
+    /// learned what became of it: the Codex adapter widened a whole shape of
+    /// checkout to full access and said so only in a log line, and the Claude
+    /// and opencode adapters never applied a sandbox at all. With
+    /// `approval_policy` pinned to `"never"` everywhere, that level is the only
+    /// guardrail there is, so what it actually was belongs beside the commands
+    /// it governed rather than in a journal nobody opens.
+    ///
+    /// `None` is "no harness said": a journal from before this existed, and a
+    /// runtime that cannot read one. Never guessed from the dispatch — the
+    /// requested level is exactly the thing that turned out not to be true.
+    ///
+    /// Default `Ok(None)` for [`Runtime::run_tokens`]'s reason.
+    fn run_sandbox(&self, chat_id: &str) -> anyhow::Result<Option<comet_proto::SandboxReport>> {
+        let _ = chat_id;
+        Ok(None)
+    }
+
     /// The tail of what the agent *said* in this chat — off the same journal
     /// again (§gh#235).
     ///

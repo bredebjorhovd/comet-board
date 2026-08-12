@@ -1541,6 +1541,27 @@ impl SyncEngine {
         let Some(chat_id) = attempt.pane_id.as_deref() else {
             return;
         };
+        // The terms the commands below ran under (§gh#349). Recorded first and
+        // on its own `if`: a chat whose journal has no commands in it yet has
+        // still already said what sandbox it got — that line is written before
+        // the run does anything — and returning early on the commands would
+        // lose it for exactly the runs that end without executing much.
+        match runtime.run_sandbox(chat_id) {
+            Ok(Some(sandbox)) => {
+                if self.db.attempt_sandbox(attempt.id).ok().flatten().as_ref() != Some(&sandbox)
+                    && let Err(e) = self.db.set_attempt_sandbox(attempt.id, &sandbox)
+                {
+                    self.log.warn(format!(
+                        "recording sandbox for attempt {}: {e:#}",
+                        attempt.id
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self
+                .log
+                .warn(format!("sandbox for chat {chat_id} unreadable: {e:#}")),
+        }
         let commands = match runtime.run_commands(chat_id) {
             Ok(Some(commands)) => commands,
             Ok(None) => return,
@@ -1772,10 +1793,8 @@ impl SyncEngine {
         task_id: &str,
         text: &str,
     ) -> Result<crate::claims::AttemptReview> {
-        let task = self
-            .db
-            .get_task(task_id)?
-            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
         let attempt = task
             .live_attempt()
             .or_else(|| task.attempts.last())
@@ -1822,10 +1841,8 @@ impl SyncEngine {
         attempt: Option<i64>,
     ) -> Result<crate::claims::AttemptReview> {
         use crate::claims::DiffSource;
-        let task = self
-            .db
-            .get_task(task_id)?
-            .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
         let attempt = match attempt {
             Some(id) => task
                 .attempts
@@ -1837,7 +1854,7 @@ impl SyncEngine {
                 })?,
             None => match task.attempts.last().cloned() {
                 Some(attempt) => attempt,
-                None => return self.pull_request_review(&task),
+                None => return self.pull_request_review(task),
             },
         };
         let (changed, effects, diff) = match self.branch_facts(&attempt) {
@@ -1863,13 +1880,14 @@ impl SyncEngine {
             }
         };
         let mut review = crate::claims::review(
-            &task,
+            task,
             &attempt,
             changed,
             diff,
             self.uncommitted(&attempt),
             self.db.attempt_evidence(attempt.id)?.unwrap_or_default(),
             effects,
+            self.db.attempt_sandbox(attempt.id)?,
         );
         self.count_call_sites(&attempt, &mut review);
         Ok(review)
@@ -1886,12 +1904,16 @@ impl SyncEngine {
     ///
     /// A row with no attempt and no pull request either is still an error. It
     /// is not that its review is unavailable; there is nothing to review, and
-    /// answering with an empty screen would be inventing one.
+    /// answering with an empty screen would be inventing one. That error used
+    /// to read `has no attempts to review`, which stopped being the reason the
+    /// moment an attempt stopped being the requirement — nothing ran *and*
+    /// nothing was pushed is what is left, and it is what the sentence says.
     fn pull_request_review(&self, task: &Task) -> Result<crate::claims::AttemptReview> {
         use crate::claims::DiffSource;
         let Some((repo, number)) = crate::verdict::pr_target(task) else {
             anyhow::bail!(
-                "{} has no attempts and no pull request — there is nothing to review",
+                "nothing has run on {} and no pull request has been opened for it — \
+                 there is nothing to review",
                 task.identifier
             );
         };
@@ -10940,6 +10962,36 @@ max_duration = "{max_duration}"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The verb takes the name the brief handed over (§gh#339). A dispatched
+    /// agent is greeted with its identifier — `LIN-142`, `gh#339` — and the
+    /// claim path compared that against the id column, so an agent that did
+    /// exactly what the skill asked was told its own task was not on the
+    /// board. Nothing in a dispatched run exports the id, so the refusal had
+    /// no repair in it either.
+    #[test]
+    fn claims_and_the_review_answer_to_the_identifier_the_agent_was_given() {
+        let (dir, base) = checkout_with_a_base();
+        let e = engine(None);
+        let a = attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
+        commit_all(&dir, "work");
+
+        let review = e
+            .submit_claims(None, "LIN-142", "Storage :: src/db.rs")
+            .unwrap();
+        assert_eq!(review.remainder.claims.len(), 1);
+        assert!(review.remainder.complete());
+        assert_eq!(e.db.get_attempt(a).unwrap().unwrap().claims.len(), 1);
+        // …and reading it back answers to either spelling, while the review it
+        // hands back names the canonical id whichever one was typed: the
+        // resolution is at the door, not in the payload.
+        assert_eq!(review.task_id, "linear:LIN-142");
+        for spelling in ["LIN-142", "linear:LIN-142"] {
+            assert_eq!(e.review(spelling, None).unwrap().task_id, "linear:LIN-142");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Prose is refused where it is submitted, and nothing is recorded — the
     /// contract is enforced by the board, not by the agent remembering it.
     #[test]
@@ -11079,6 +11131,84 @@ max_duration = "{max_duration}"
         );
         assert_eq!(review.evidence.checks[0].runs, 2);
         assert!(review.evidence.checks[0].ever_passed());
+    }
+
+    /// The other half of the same tick (§gh#349): the terms those commands ran
+    /// under, recorded off the harness's own report and rendered as a caveat
+    /// rather than as a finding.
+    #[test]
+    fn the_sandbox_the_run_actually_got_is_recorded_and_read_back_on_the_review() {
+        use comet_proto::{SandboxLevel, SandboxReport};
+
+        /// A chat whose harness widened the sandbox out from under the
+        /// dispatch — and which ran no commands at all, so the recording must
+        /// not be behind the commands read.
+        struct Widened;
+        impl Runtime for Widened {
+            fn dispatch(&self, _: &DispatchSpec) -> Result<DispatchHandle> {
+                unreachable!()
+            }
+            fn prompt(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn cancel(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn session(&self, _: &str) -> Result<Option<comet_proto::Session>> {
+                Ok(None)
+            }
+            fn chat_alive(&self, _: &str) -> Result<bool> {
+                Ok(true)
+            }
+            fn chat_cwd(&self, _: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn last_run_end(&self, _: &str) -> Result<Option<RunEnd>> {
+                Ok(None)
+            }
+            fn run_sandbox(&self, _: &str) -> Result<Option<SandboxReport>> {
+                Ok(Some(SandboxReport::widened(
+                    SandboxLevel::WorkspaceWrite,
+                    SandboxLevel::DangerFullAccess,
+                    "this codex predates the worktree-mount fix",
+                )))
+            }
+        }
+
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+
+        // Before anything is recorded the answer is "nobody said", which is
+        // not the same as "it was sandboxed" and must not render as one.
+        assert_eq!(e.review("linear:LIN-142", None).unwrap().sandbox, None);
+        assert_eq!(
+            e.review("linear:LIN-142", None).unwrap().sandbox_note(),
+            None
+        );
+
+        e.record_review_facts(Some(&Widened), &attempt);
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        let report = review.sandbox.as_ref().expect("recorded");
+        assert_eq!(report.effective, SandboxLevel::DangerFullAccess);
+        assert_eq!(report.requested, SandboxLevel::WorkspaceWrite);
+        let note = review.sandbox_note().expect("worth saying");
+        assert!(note.contains("full access to the box"), "{note}");
+        assert!(note.contains("workspace-write was requested"), "{note}");
+
+        // A caveat, never a finding: the verdict is about what nobody
+        // accounted for, and two of three runtimes run unsandboxed always —
+        // routed through `findings` this would shout on nearly every review.
+        assert!(
+            !review
+                .findings()
+                .iter()
+                .any(|f| f.text.contains("full access")),
+            "the sandbox note stays out of the findings: {:?}",
+            review.findings()
+        );
     }
 
     // ---- the claims block, off a finished attempt (§gh#235) ---------------

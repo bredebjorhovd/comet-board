@@ -156,6 +156,7 @@ fn blank(task_id: &str, identifier: &str) -> AttemptReview {
         },
         claimed_at: Some("2026-08-10T07:41:00Z".into()),
         claims_error: None,
+        sandbox: None,
         remainder: Remainder::default(),
         changed: Vec::new(),
         diff: DiffSource::Checkout,
@@ -292,6 +293,7 @@ fn the_malformed_one() -> AttemptReview {
         claims_error: Some(
             "line 3: a claim needs an anchor\n\nWrite `did the thing :: path/to/file.rs`.".into(),
         ),
+        sandbox: None,
         changed: vec![
             changed("src/a.rs", "M", 2, 0),
             changed("src/b.rs", "A", 40, 0),

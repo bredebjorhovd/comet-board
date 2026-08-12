@@ -380,6 +380,15 @@ pub struct AttemptReview {
     /// checkout to ask.
     pub uncommitted: Option<u32>,
     pub evidence: RunEvidence,
+    /// What sandbox the run that produced all of the above actually had
+    /// (§gh#349) — read off the harness's own report, never off the dispatch.
+    ///
+    /// `None` is "nobody said": an attempt from before harnesses reported it,
+    /// and one whose journal the board could not read. Rendered as unknown, and
+    /// never filled in from the level the board *asked* for — a requested level
+    /// that turned out not to hold is the entire reason this field exists.
+    #[serde(default)]
+    pub sandbox: Option<comet_proto::SandboxReport>,
     /// What the board derived from the branch itself (§gh#236): the tests
     /// either side of it, the public surface, the schema, the config keys and
     /// the dependencies.
@@ -507,6 +516,69 @@ pub fn parse(input: &str, worktree: Option<&str>) -> Result<Vec<Claim>> {
         );
     }
     Ok(claims)
+}
+
+// ---- the ask, in the brief itself (§gh#339) -------------------------------
+
+/// The paragraph every dispatch brief ends with: say what you did, here is the
+/// verb, here is the exact task to name (§gh#339).
+///
+/// The contract had three channels to reach an agent through and none of them
+/// was the one that always arrives. The skill is *discovered* — Claude Code
+/// reads it when the agent decides it is relevant, and an agent handed a
+/// ticket, a branch and a finish sequence has no reason to decide that. The
+/// instruction file (gh#272) is better and still a standing rule in a file,
+/// competing with everything else in it. The brief is neither: it is the one
+/// text the board hands to every dispatched agent of every runtime, and until
+/// this it asked for a commit, a push and a pull request and never once
+/// mentioned claims. Twenty-three settled attempts on the box ran the verb
+/// zero times and wrote a block zero times, with the skill installed the whole
+/// while. So the ask goes where the work is asked for.
+///
+/// It names `task_id` verbatim because that is the argument, and because the
+/// agent has no other way to learn it: nothing exports it into the run's
+/// environment, and the identifier the rest of the brief uses (`gh#339`) is a
+/// different string from the id (`gh:owner/repo#339`). Both spellings are
+/// accepted now ([`crate::dispatch::task_by_reference`]), which is the other
+/// half of this fix — but the one printed here is the one that cannot be
+/// ambiguous.
+///
+/// Appended after interpolation by [`crate::dispatch::resolve_prompt`], for the
+/// reason the base sentence is: a route's own `prompt` is somebody's wording
+/// for the *task*, and the contract is a fact about being dispatched at all.
+///
+/// The fallback fence is *named* rather than spelled, so this text contains no
+/// [`BLOCK_TAG`] fence of its own: an agent that quotes its brief back in a
+/// closing message would otherwise hand [`find_block`] the board's own
+/// instruction to read as that agent's answer to it.
+pub fn brief(task_id: &str) -> String {
+    format!(
+        "\n\nBefore you say you are done, tell the board what you changed — in \
+         **claims**, one per line, each anchored to the files or symbols it is \
+         about:\
+         \n\n```\
+         \ncomet-board claim --task {task_id} <<'EOF'\
+         \n<what you did> {ANCHOR} <anchor> [<anchor>…]\
+         \nEOF\
+         \n```\
+         \n\nAn anchor is a **path** — anything with a `/` or a file extension, \
+         repo-relative, and a directory accounts for everything under it — or a \
+         **symbol**, a function or type or constant the change is about, which \
+         accounts for every changed file whose diff names it. A line with no \
+         `{ANCHOR}`, or nothing after it, is refused: without an anchor a claim \
+         cannot be checked, and an unanchored summary is the thing this replaces.\
+         \n\nThe reply is the part worth reading. The board diffs your branch and \
+         prints every changed file no claim accounts for — computed from git, not \
+         from what you wrote, so it is where the dependency you bumped and the \
+         function you edited in passing turn up. Run it after your last commit, \
+         read what comes back, and either claim those changes or go and look at \
+         them.\
+         \n\nIf you finish without running the verb, write the same lines into a \
+         fenced block tagged `{BLOCK_TAG}` in your closing message and the board \
+         reads them off the attempt. Claiming nothing breaks nothing — the \
+         attempt settles and the pull request opens as they would anyway, and \
+         the review says the contract went unanswered."
+    )
 }
 
 // ---- the block, off the finished attempt (§gh#235) ------------------------
@@ -842,6 +914,12 @@ pub fn remainder(claims: &[Claim], changed: &[ChangedFile]) -> Remainder {
 /// Pure, and takes the diff rather than reading it, so the ranking and the
 /// remainder are testable without a checkout — the same split
 /// [`crate::settled::decide`] makes for the settle hierarchy.
+///
+/// The parameter list is long because the *review* is: each argument is one
+/// independently-sourced fact about the attempt (the branch, the checkout, the
+/// journal), and bundling them into a struct here would only move the same list
+/// one call up while hiding which caller failed to supply which.
+#[allow(clippy::too_many_arguments)]
 pub fn review(
     task: &Task,
     attempt: &Attempt,
@@ -850,6 +928,7 @@ pub fn review(
     uncommitted: Option<u32>,
     evidence: RunEvidence,
     effects: crate::effects::Effects,
+    sandbox: Option<comet_proto::SandboxReport>,
 ) -> AttemptReview {
     let remainder = remainder(&attempt.claims, &changed);
     AttemptReview {
@@ -886,6 +965,7 @@ pub fn review(
         diff,
         uncommitted,
         evidence,
+        sandbox,
         effects,
     }
 }
@@ -897,11 +977,12 @@ pub fn review(
 /// network.
 ///
 /// What it deliberately does *not* invent. There is no attempt, so there is no
-/// evidence — nothing ran where the board could watch it — no effects, and no
-/// uncommitted count, because there is no checkout to have anything in.
-/// Defaults for those read as "not known" everywhere they are drawn, which is
-/// the truth. And `claimed_at` is `None`: nobody was told the contract, so the
-/// remainder is the whole diff.
+/// evidence — nothing ran where the board could watch it — no effects, no
+/// sandbox report (§gh#349: nothing this board dispatched, so no harness of its
+/// own said what it was given), and no uncommitted count, because there is no
+/// checkout to have anything in. Defaults for those read as "not known"
+/// everywhere they are drawn, which is the truth. And `claimed_at` is `None`:
+/// nobody was told the contract, so the remainder is the whole diff.
 pub fn pull_request_review(
     task: &Task,
     changed: Vec<ChangedFile>,
@@ -937,6 +1018,7 @@ pub fn pull_request_review(
         diff,
         uncommitted: None,
         evidence: RunEvidence::default(),
+        sandbox: None,
         effects: crate::effects::Effects::default(),
     }
 }
@@ -1198,6 +1280,25 @@ impl AttemptReview {
             });
         }
         out
+    }
+
+    /// The terms this attempt ran on, when they are worth a reviewer's
+    /// attention (§gh#349): "this agent had full access to the box", and why.
+    ///
+    /// `None` covers the two quiet cases — the run got the sandbox it was
+    /// dispatched with and that sandbox was not full access, or no harness ever
+    /// said and there is nothing to report but a guess.
+    ///
+    /// **Deliberately not a [`Finding`]**, for [`Self::effect_chips`]'s reason
+    /// and one that is sharper here. Two of the three runtimes apply no sandbox
+    /// at all, so this line is true of most attempts on the board; routed
+    /// through `findings` it would raise [`Tone::Alarm`] on nearly every review
+    /// and the alarm would stop meaning anything within a week. It is a
+    /// standing condition of the run, not something nobody accounted for — a
+    /// caveat on how much the rest of the screen is worth, which is exactly
+    /// where a reviewer should meet it.
+    pub fn sandbox_note(&self) -> Option<String> {
+        self.sandbox.as_ref()?.note()
     }
 
     /// The effects row (§gh#236): what the board found in the branch itself,
@@ -1632,6 +1733,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert_eq!(r.brief.identifier, "gh#183");
         // An issue whose body is whitespace has no description; a surface must
@@ -1709,6 +1811,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert!(!r.undispatched());
         assert!(
@@ -1732,6 +1835,7 @@ mod tests {
             None,
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert!(!r.claimed());
         assert_eq!(r.remainder.unclaimed.len(), 1);
@@ -1753,6 +1857,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         ))
         .unwrap();
 
@@ -1801,6 +1906,7 @@ mod tests {
             None,
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert!(matches!(r.diff, DiffSource::Unavailable { .. }));
         assert!(
@@ -1833,6 +1939,7 @@ mod tests {
             uncommitted,
             evidence,
             crate::effects::Effects::default(),
+            None,
         )
     }
 
@@ -2008,6 +2115,7 @@ mod tests {
             Some(4),
             crate::evidence::gather(&[ran("cargo test", true)]),
             crate::effects::Effects::default(),
+            None,
         );
         let findings = r.findings();
         assert_eq!(findings.len(), 1);
@@ -2321,6 +2429,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert_eq!(loud.findings()[0].kind, FindingKind::MalformedClaims);
         assert_eq!(loud.verdict().tone, Tone::Alarm);
