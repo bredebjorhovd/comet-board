@@ -648,3 +648,52 @@ async fn models_returns_curated_catalog() {
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
 }
+
+/// §gh#349. Codex's `workspace-write` denies writes to exactly `<cwd>/.git`, so
+/// a dispatched agent in a main checkout can edit files and cannot commit them.
+/// The fix is a permission grant, not a sandbox drop: the checkout's git
+/// metadata rides `sandboxPolicy.writableRoots`, which the fixture asserts on
+/// the wire — and the run announces the level it actually got before it says
+/// anything else.
+#[tokio::test]
+async fn a_checkouts_git_dir_rides_the_wire_and_the_level_is_announced() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let checkout = tmp.path().join("repo");
+    std::fs::create_dir_all(checkout.join(".git")).expect("fake checkout");
+
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:sandbox-roots");
+    req.cwd = checkout.display().to_string();
+    let events = run_to_end(&harness(), req, controls).await;
+
+    // The fixture fails the turn when `writableRoots` is missing, so reaching
+    // a completed Done IS the wire assertion.
+    assert!(
+        events.contains(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }),
+        "the git dir did not reach sandboxPolicy.writableRoots: {events:?}"
+    );
+
+    // And the run said what it got, first, and before SessionStarted — a
+    // journal's first line about a run is the terms it ran on.
+    let reports: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Sandbox(report) => Some(report),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reports.len(), 1, "one per run: {events:?}");
+    let report = reports[0];
+    // A modern codex on a plain checkout keeps its sandbox: nothing widened,
+    // and so nothing for a reviewer to be told.
+    assert_eq!(report.requested, SandboxLevel::WorkspaceWrite);
+    assert_eq!(report.effective, SandboxLevel::WorkspaceWrite);
+    assert!(!report.widened_beyond_request());
+    assert_eq!(report.note(), None);
+    assert!(matches!(events[0], AgentEvent::Sandbox(_)), "{events:?}");
+}

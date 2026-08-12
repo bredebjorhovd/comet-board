@@ -347,6 +347,15 @@ pub struct AttemptReview {
     /// checkout to ask.
     pub uncommitted: Option<u32>,
     pub evidence: RunEvidence,
+    /// What sandbox the run that produced all of the above actually had
+    /// (§gh#349) — read off the harness's own report, never off the dispatch.
+    ///
+    /// `None` is "nobody said": an attempt from before harnesses reported it,
+    /// and one whose journal the board could not read. Rendered as unknown, and
+    /// never filled in from the level the board *asked* for — a requested level
+    /// that turned out not to hold is the entire reason this field exists.
+    #[serde(default)]
+    pub sandbox: Option<comet_proto::SandboxReport>,
     /// What the board derived from the branch itself (§gh#236): the tests
     /// either side of it, the public surface, the schema, the config keys and
     /// the dependencies.
@@ -793,6 +802,12 @@ pub fn remainder(claims: &[Claim], changed: &[ChangedFile]) -> Remainder {
 /// Pure, and takes the diff rather than reading it, so the ranking and the
 /// remainder are testable without a checkout — the same split
 /// [`crate::settled::decide`] makes for the settle hierarchy.
+///
+/// The parameter list is long because the *review* is: each argument is one
+/// independently-sourced fact about the attempt (the branch, the checkout, the
+/// journal), and bundling them into a struct here would only move the same list
+/// one call up while hiding which caller failed to supply which.
+#[allow(clippy::too_many_arguments)]
 pub fn review(
     task: &Task,
     attempt: &Attempt,
@@ -801,6 +816,7 @@ pub fn review(
     uncommitted: Option<u32>,
     evidence: RunEvidence,
     effects: crate::effects::Effects,
+    sandbox: Option<comet_proto::SandboxReport>,
 ) -> AttemptReview {
     let remainder = remainder(&attempt.claims, &changed);
     AttemptReview {
@@ -837,6 +853,7 @@ pub fn review(
         diff,
         uncommitted,
         evidence,
+        sandbox,
         effects,
     }
 }
@@ -1087,6 +1104,25 @@ impl AttemptReview {
             });
         }
         out
+    }
+
+    /// The terms this attempt ran on, when they are worth a reviewer's
+    /// attention (§gh#349): "this agent had full access to the box", and why.
+    ///
+    /// `None` covers the two quiet cases — the run got the sandbox it was
+    /// dispatched with and that sandbox was not full access, or no harness ever
+    /// said and there is nothing to report but a guess.
+    ///
+    /// **Deliberately not a [`Finding`]**, for [`Self::effect_chips`]'s reason
+    /// and one that is sharper here. Two of the three runtimes apply no sandbox
+    /// at all, so this line is true of most attempts on the board; routed
+    /// through `findings` it would raise [`Tone::Alarm`] on nearly every review
+    /// and the alarm would stop meaning anything within a week. It is a
+    /// standing condition of the run, not something nobody accounted for — a
+    /// caveat on how much the rest of the screen is worth, which is exactly
+    /// where a reviewer should meet it.
+    pub fn sandbox_note(&self) -> Option<String> {
+        self.sandbox.as_ref()?.note()
     }
 
     /// The effects row (§gh#236): what the board found in the branch itself,
@@ -1520,6 +1556,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert_eq!(r.brief.identifier, "gh#183");
         // An issue whose body is whitespace has no description; a surface must
@@ -1546,6 +1583,7 @@ mod tests {
             None,
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert!(!r.claimed());
         assert_eq!(r.remainder.unclaimed.len(), 1);
@@ -1567,6 +1605,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         ))
         .unwrap();
 
@@ -1615,6 +1654,7 @@ mod tests {
             None,
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert!(matches!(r.diff, DiffSource::Unavailable { .. }));
         assert!(
@@ -1647,6 +1687,7 @@ mod tests {
             uncommitted,
             evidence,
             crate::effects::Effects::default(),
+            None,
         )
     }
 
@@ -1822,6 +1863,7 @@ mod tests {
             Some(4),
             crate::evidence::gather(&[ran("cargo test", true)]),
             crate::effects::Effects::default(),
+            None,
         );
         let findings = r.findings();
         assert_eq!(findings.len(), 1);
@@ -2135,6 +2177,7 @@ mod tests {
             Some(0),
             RunEvidence::default(),
             crate::effects::Effects::default(),
+            None,
         );
         assert_eq!(loud.findings()[0].kind, FindingKind::MalformedClaims);
         assert_eq!(loud.verdict().tone, Tone::Alarm);

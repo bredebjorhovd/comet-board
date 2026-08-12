@@ -490,6 +490,12 @@ impl Runtime for CometRuntime {
         Ok(self.journal.commands(chat_id)?)
     }
 
+    /// What sandbox the chat's last run actually got (§gh#349) — the terms the
+    /// commands above ran under. See [`RunJournal::sandbox`].
+    fn run_sandbox(&self, chat_id: &str) -> anyhow::Result<Option<comet_proto::SandboxReport>> {
+        Ok(self.journal.sandbox(chat_id)?)
+    }
+
     /// The tail of what the agent said, off the same journal once more
     /// (§gh#235) — where a finished attempt's claims block is, when it wrote
     /// one instead of running the verb. See [`RunJournal::final_text`].

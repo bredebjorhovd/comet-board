@@ -87,6 +87,18 @@ pub(crate) fn resolve_codex_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// The first codex-cli this workspace has verified the worktree-mount fix in
+/// (§gh#349). Below it, [`worktree_on_slashed_branch`] still earns the
+/// escalation; at or above it, the escalation is a sandbox dropped for a bug
+/// that is not there.
+///
+/// 0.144.x is the last release verified *broken* and 0.147.0 the first
+/// verified *fixed*, so 0.145 and 0.146 sit in a band nobody measured. The
+/// threshold sits at the top of that band on purpose: being wrong here costs a
+/// visible escalation on two patch releases, and being wrong the other way
+/// costs a run where no command can start.
+const WORKTREE_MOUNT_FIXED_IN: CliVersion = (0, 147, 0);
+
 /// True when `cwd` is a LINKED git worktree whose checked-out branch name
 /// contains '/' — the exact shape that trips codex's sandbox worktree-mount
 /// derivation (see the escalation in [`CodexHarness::run`]). Pure filesystem
@@ -113,6 +125,152 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
     head.trim()
         .strip_prefix("ref: refs/heads/")
         .is_some_and(|branch| branch.contains('/'))
+}
+
+/// The only parts of a *shared* git dir a dispatched agent is given write
+/// access to (§gh#349): the object store, the refs, and their reflogs.
+///
+/// Measured, not guessed. With exactly these four named, a run in a linked
+/// worktree can `add`, `commit`, `fetch`, `merge`, `rebase`, `branch -f`,
+/// `checkout -b`, `stash`, `stash pop` and write reflogs — while `hooks/` and
+/// `config` in the shared repository stay read-only. What *does* stop working
+/// is `git gc` and `git pack-refs`, which write `gc.log`, `gc.pid` and
+/// `packed-refs` at the shared root: repository maintenance, run by the
+/// operator on their own clone, and not something a dispatched agent does.
+///
+/// `hooks/` and `config` are the two that matter and the reason this is a list
+/// rather than the directory. A `.git/hooks/pre-commit` written into the
+/// operator's repository runs *on their machine, outside any sandbox*, the next
+/// time they commit; `config` reaches the same place through `core.pager` or an
+/// alias. Granting the shared root would make a sandboxed run a way out of the
+/// sandbox.
+const SHARED_GIT_WRITABLES: &[&str] = &["objects", "refs", "logs", "packed-refs"];
+
+/// The git metadata codex's `workspace-write` has to be told about, or a
+/// dispatched agent cannot record its work (§gh#349).
+///
+/// Measured against codex-cli 0.147.0. `workspace-write` grants the workspace,
+/// `/tmp` and `$TMPDIR`, and additionally denies **exactly `<cwd>/.git`** — not
+/// a nested `.git`, not another repository's, not a `.git`-prefixed sibling.
+/// Both checkout shapes lose their git dir, for two different reasons:
+///
+/// - A **main checkout** keeps its git dir at `<cwd>/.git`, inside the
+///   workspace and squarely under the deny. `git commit` fails on the index and
+///   `git fetch` on `FETCH_HEAD` — the report behind gh#349, verbatim.
+/// - A **linked worktree** has a `.git` pointer *file* there, and its real
+///   admin dir lives under the main checkout's `.git/worktrees/…` — outside the
+///   workspace, so never granted in the first place. Measured on a checkout
+///   under `$HOME`, such a run cannot even `git add`.
+///
+/// (A fixture under `/tmp` shows a worktree working, which is what `/tmp` being
+/// unconditionally writable looks like. Board worktrees live under `$HOME`.)
+///
+/// So the returned list is:
+///
+/// 1. **The git dir, entire.** This is the run's own checkout's state — its
+///    index, `HEAD`, `FETCH_HEAD`, `COMMIT_EDITMSG`, the rebase and merge
+///    scratch dirs — and there is no useful subset of it. For a main checkout
+///    it is `<cwd>/.git`, which sits in the workspace the agent already writes
+///    to freely; whole-directory access there is the same trust level as the
+///    build scripts beside it.
+/// 2. **[`SHARED_GIT_WRITABLES`] under the common dir, when that is a different
+///    directory** — i.e. a linked worktree, where the common dir is the
+///    *operator's own repository* and emphatically not the workspace. That one
+///    is narrowed on purpose.
+///
+/// The shared subpaths are named whether or not they exist yet: `packed-refs`
+/// is absent from a fresh clone and created by the first `pack-refs`, and codex
+/// accepts a root that is not there.
+///
+/// Pure filesystem reads (no `git` subprocess): a sandbox decision that
+/// depended on a subprocess succeeding inside the thing being sandboxed is a
+/// decision that fails in the interesting case.
+fn git_writable_roots(cwd: &str) -> Vec<PathBuf> {
+    if cwd.is_empty() {
+        return Vec::new();
+    }
+    let dot_git = std::path::Path::new(cwd).join(".git");
+    let Ok(meta) = std::fs::metadata(&dot_git) else {
+        return Vec::new(); // not a checkout at all
+    };
+    let git_dir = if meta.is_dir() {
+        dot_git
+    } else {
+        // A worktree pointer: `gitdir: /abs/path/to/.git/worktrees/name`.
+        let Some(target) = std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|p| p.strip_prefix("gitdir:").map(|t| PathBuf::from(t.trim())))
+        else {
+            return Vec::new();
+        };
+        target
+    };
+    if !git_dir.is_absolute() || !git_dir.exists() {
+        return Vec::new();
+    }
+    let mut roots = vec![git_dir.clone()];
+    // `commondir` is written relative to the admin dir (`../..`), so it is
+    // joined and then normalized — a literal `…/worktrees/x/../..` would be a
+    // path the sandbox matches against textually.
+    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir"))
+        && let Ok(common) = std::fs::canonicalize(git_dir.join(common.trim()))
+        && common != git_dir
+    {
+        roots.extend(SHARED_GIT_WRITABLES.iter().map(|leaf| common.join(leaf)));
+    }
+    roots
+}
+
+/// A codex-cli version, `(major, minor, patch)`, compared against
+/// [`WORKTREE_MOUNT_FIXED_IN`].
+type CliVersion = (u32, u32, u32);
+
+/// The installed CLI's version — `codex --version` prints `codex-cli 0.147.0`
+/// (§gh#349).
+///
+/// `None` when the binary cannot be run or says something this cannot parse,
+/// and every caller must read that as "no evidence", never as "old". The only
+/// thing the version gates is a *sandbox drop*, and a drop is an exception that
+/// has to be earned by evidence — see [`CodexHarness::run`].
+///
+/// Cached per executable path: `run` is called once per dispatch and a CLI does
+/// not change version under a running box, but it can change between them, so
+/// the cache is keyed by path rather than global.
+fn codex_version(exe: &std::path::Path) -> Option<CliVersion> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(map) = cache.lock()
+        && let Some(hit) = map.get(exe)
+    {
+        return *hit;
+    }
+    let probed = std::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_codex_version(&String::from_utf8_lossy(&out.stdout)));
+    if let Ok(mut map) = cache.lock() {
+        map.insert(exe.to_path_buf(), probed);
+    }
+    probed
+}
+
+/// Pull `(major, minor, patch)` out of `codex-cli 0.147.0`. Tolerates a bare
+/// `0.147.0`, a `v` prefix, and trailing pre-release junk; rejects anything
+/// without three numbers, because a half-read version is worse than none.
+fn parse_codex_version(out: &str) -> Option<CliVersion> {
+    let token = out
+        .split_whitespace()
+        .find_map(|t| {
+            let t = t.trim_start_matches('v');
+            t.starts_with(|c: char| c.is_ascii_digit()).then_some(t)
+        })?
+        .trim_start_matches('v');
+    let mut parts = token.split(['.', '-', '+']).map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -206,24 +364,55 @@ impl Harness for CodexHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
-        // worktree mount when the checked-out branch name contains '/'
-        // (verified against the real CLI: `wing/x` in a linked worktree kills
-        // every command before it starts; `wing-x` is fine; explicit
-        // writableRoots don't suppress the broken derivation; full access
-        // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run — parity note: the Claude adapter effectively
-        // grants full access anyway (auto-approved can_use_tool).
-        if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
+        // The two things this run has to settle about its own sandbox, and
+        // then say out loud (§gh#349).
+        //
+        // **The git dir has to be writable.** Under plain `workspace-write` a
+        // dispatched agent cannot record its work in either checkout shape —
+        // see [`git_writable_roots`], which is both the measurement and the
+        // fix: naming those paths as writable roots buys back exactly `git`,
+        // with the sandbox still on.
+        //
+        // **The old escalation is now version-gated, and these two changes go
+        // together.** Codex ≤0.144.x derived a MALFORMED worktree mount when
+        // the branch name contained '/' (verified against the real CLI:
+        // `wing/x` in a linked worktree killed every command before it started;
+        // `wing-x` was fine; full access worked), so the adapter widened that
+        // shape to `danger-full-access` rather than ship a session where
+        // nothing runs. Re-tested against 0.147.0 and that bug is gone.
+        //
+        // Since the board's branch template is `board/{identifier_lower}`, the
+        // escalation fired on *every* board dispatch into a worktree — and was
+        // therefore the only reason those runs could commit at all, given the
+        // writable-roots problem above. Removing it alone would have broken
+        // them; the roots are what make gating it safe. It now fires on no
+        // current box, and when it does fire [`SandboxReport`] carries the fact
+        // out of the WARN below and onto the review.
+        //
+        // The condition was also never the right one: a worktree on a branch
+        // *without* a slash got no escalation and no writable git dir, and
+        // could not commit either.
+        let requested = request.sandbox;
+        let mut sandbox_report = comet_proto::SandboxReport::as_requested(requested);
+        if requested == comet_proto::SandboxLevel::WorkspaceWrite
             && worktree_on_slashed_branch(&request.cwd)
+            && codex_version(&exe).is_some_and(|v| v < WORKTREE_MOUNT_FIXED_IN)
         {
+            let reason = "this codex predates the worktree-mount fix, and under it a linked \
+                          worktree on a slash-named branch cannot run any command at all";
             tracing::warn!(
                 cwd = %request.cwd,
-                "codex sandbox escalated to danger-full-access: linked worktree on a \
-                 slash-named branch trips codex's worktree-mount derivation"
+                "codex sandbox escalated to danger-full-access: {reason}"
             );
             request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
+            sandbox_report =
+                comet_proto::SandboxReport::widened(requested, request.sandbox, reason);
         }
+        let writable_roots = if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite {
+            git_writable_roots(&request.cwd)
+        } else {
+            Vec::new()
+        };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::prepend_exe_dir_to_path(&mut cmd, &exe);
@@ -282,6 +471,8 @@ impl Harness for CodexHarness {
             event_tx,
             controls,
             request,
+            sandbox_report,
+            writable_roots,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -305,6 +496,13 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     request: RunRequest,
+    /// What sandbox this run asked for and what it got (§gh#349) — settled at
+    /// spawn, announced once before the first turn.
+    sandbox_report: comet_proto::SandboxReport,
+    /// Paths handed to `workspace-write` as writable roots: the checkout's git
+    /// metadata, without which the agent cannot commit. Empty at every other
+    /// level, where the question does not arise.
+    writable_roots: Vec<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
@@ -395,6 +593,8 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         request,
+        sandbox_report,
+        writable_roots,
         interrupt_grace,
         kill_grace,
         stderr_tail,
@@ -522,7 +722,7 @@ async fn run_session(session: Session) {
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert(
             "sandboxPolicy".into(),
-            sandbox_policy_value(request.sandbox),
+            sandbox_policy_value(request.sandbox, &writable_roots),
         );
         // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
         // when asked for — without this codex "thinks" in silence for minutes:
@@ -542,6 +742,12 @@ async fn run_session(session: Session) {
     };
 
     let mut assistant_message_id = new_message_id();
+    // Before `SessionStarted`, so the very first thing a journal records about
+    // a run is the terms it ran on (§gh#349).
+    if !send(&event_tx, AgentEvent::Sandbox(sandbox_report)).await {
+        shutdown_child(&mut child, kill_grace).await;
+        return;
+    }
     if !send(
         &event_tx,
         AgentEvent::SessionStarted {
@@ -1196,6 +1402,135 @@ mod tests {
         assert!(!worktree_on_slashed_branch(&detached));
         assert!(!worktree_on_slashed_branch(""));
         assert!(!worktree_on_slashed_branch("/nonexistent/path"));
+    }
+
+    /// The grant [`git_writable_roots`] makes, in both checkout shapes — and
+    /// above all the one it refuses to make.
+    #[test]
+    fn a_worktree_gets_the_shared_object_store_and_not_the_operators_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A main checkout: `.git` is a directory, it IS the deny target, and it
+        // is inside the workspace the agent already writes to. Whole.
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        let roots = git_writable_roots(&main.display().to_string());
+        assert_eq!(roots, vec![main.join(".git")]);
+
+        // A linked worktree: `.git` is a pointer file, the admin dir lives
+        // under the main checkout, and `commondir` points at the shared one —
+        // which is the OPERATOR'S repository, not this workspace.
+        let admin = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        let roots = git_writable_roots(&wt.display().to_string());
+
+        // Its own admin dir, whole: index, HEAD, FETCH_HEAD, rebase scratch.
+        assert_eq!(roots[0], admin);
+        // And of the shared repository, only the object/ref store. Resolved,
+        // not left as a `…/worktrees/wt/../..` walk — the sandbox matches paths
+        // textually, so an unnormalized root would grant nothing.
+        let common = std::fs::canonicalize(main.join(".git")).unwrap();
+        assert_eq!(
+            roots[1..],
+            [
+                common.join("objects"),
+                common.join("refs"),
+                common.join("logs"),
+                common.join("packed-refs"),
+            ]
+        );
+
+        // The point of the whole list. A `pre-commit` written into the
+        // operator's repository runs on their machine, outside any sandbox, the
+        // next time they commit; `config` gets there via `core.pager`. Neither
+        // is reachable, and neither is the shared root they sit in.
+        for forbidden in ["hooks", "config", "hooks/pre-commit", ""] {
+            let path = common.join(forbidden);
+            assert!(
+                !roots.iter().any(|r| path.starts_with(r)),
+                "{} is writable under {roots:?}",
+                path.display()
+            );
+        }
+
+        // Nothing to name where there is no checkout, and nothing to crash on.
+        assert!(git_writable_roots(&tmp.path().join("bare").display().to_string()).is_empty());
+        assert!(git_writable_roots("").is_empty());
+        assert!(git_writable_roots("/nonexistent/path").is_empty());
+    }
+
+    /// `packed-refs` is absent from a fresh clone and created by the first
+    /// `pack-refs`, so the shared subpaths are named whether or not they exist
+    /// — a list filtered by existence would grant nothing for the write that
+    /// creates the file.
+    #[test]
+    fn the_shared_subpaths_are_named_before_they_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let admin = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+
+        let roots = git_writable_roots(&wt.display().to_string());
+        let common = std::fs::canonicalize(main.join(".git")).unwrap();
+        assert!(!common.join("packed-refs").exists(), "nothing created it");
+        assert!(roots.contains(&common.join("packed-refs")), "{roots:?}");
+    }
+
+    /// The writable roots ride the wire policy, and only where the level has a
+    /// field for them.
+    #[test]
+    fn writable_roots_ride_workspace_write_and_no_other_level() {
+        let roots = vec![PathBuf::from("/repo/.git")];
+        let policy = sandbox_policy_value(comet_proto::SandboxLevel::WorkspaceWrite, &roots);
+        assert_eq!(policy["type"], "workspaceWrite");
+        assert_eq!(policy["writableRoots"], json!(["/repo/.git"]));
+        // Full access needs no list, and read-only would not honour one.
+        let policy = sandbox_policy_value(comet_proto::SandboxLevel::DangerFullAccess, &roots);
+        assert!(policy.get("writableRoots").is_none());
+        let policy = sandbox_policy_value(comet_proto::SandboxLevel::ReadOnly, &roots);
+        assert!(policy.get("writableRoots").is_none());
+        // An empty list is omitted rather than sent as `[]` — nothing to say.
+        let policy = sandbox_policy_value(comet_proto::SandboxLevel::WorkspaceWrite, &[]);
+        assert!(policy.get("writableRoots").is_none());
+    }
+
+    #[test]
+    fn the_cli_version_is_read_off_the_line_codex_prints() {
+        assert_eq!(
+            parse_codex_version("codex-cli 0.147.0\n"),
+            Some((0, 147, 0))
+        );
+        assert_eq!(parse_codex_version("codex-cli 0.144.3"), Some((0, 144, 3)));
+        assert_eq!(parse_codex_version("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(
+            parse_codex_version("codex-cli 0.148.0-rc.1"),
+            Some((0, 148, 0))
+        );
+        // Anything this cannot read three numbers out of is `None`, never a
+        // half-parsed version — the only thing it gates is a sandbox drop.
+        assert_eq!(parse_codex_version("codex-cli 0.147"), None);
+        assert_eq!(parse_codex_version("some other tool"), None);
+        assert_eq!(parse_codex_version(""), None);
+    }
+
+    /// The escalation's whole reason to exist is a bug fixed in 0.147.0, and
+    /// the board's default branch template puts every dispatch into its blast
+    /// radius. The gate is what keeps it off a current box.
+    #[test]
+    fn the_worktree_escalation_is_gated_on_a_codex_old_enough_to_need_it() {
+        let needs = |v: CliVersion| v < WORKTREE_MOUNT_FIXED_IN;
+        assert!(needs((0, 144, 3)), "the version it was verified broken on");
+        assert!(!needs((0, 147, 0)), "the version it was verified fixed on");
+        assert!(!needs((0, 148, 0)));
+        assert!(!needs((1, 0, 0)));
     }
 
     #[test]

@@ -338,6 +338,12 @@ impl Db {
               -- compacted, while the review outlives both.
               changed_files TEXT,
               run_evidence TEXT,
+              -- What sandbox the run actually got, beside what was asked for
+              -- (§gh#349). Snapshotted here for the two above's reason, and
+              -- one more: it is the fact most likely to be needed after the
+              -- fact and least likely to still be readable, since a resumed
+              -- chat overwrites the journal's answer with its own.
+              run_sandbox TEXT,
               -- The attempt this one's branch was cut from, when it was
               -- dispatched onto a sibling instead of onto trunk (gh#285). An
               -- attempt id rather than the base branch name, because the branch
@@ -535,6 +541,14 @@ impl Db {
                 ("claims_at", "TEXT"),
                 ("changed_files", "TEXT"),
                 ("run_evidence", "TEXT"),
+                // What sandbox the run actually got (§gh#349). NULL on every
+                // row that came before, and it stays NULL: those runs were not
+                // asked and their journals have moved on. A review of one says
+                // the level is unknown, which is true and is also the whole
+                // point — backfilling them with the level that was *requested*
+                // would restore exactly the false record this column exists to
+                // replace.
+                ("run_sandbox", "TEXT"),
                 // The refusal an attempt's own claims block earned (§gh#235).
                 // NULL on every row that came before, which is what they are:
                 // nothing read a block off them, so none of them wrote one
@@ -1328,6 +1342,26 @@ impl Db {
         self.conn.execute(
             "UPDATE attempts SET run_evidence = ?2 WHERE id = ?1",
             params![attempt_id, serde_json::to_string(evidence)?],
+        )?;
+        Ok(())
+    }
+
+    /// What sandbox this attempt's run actually got (§gh#349). `None` is "never
+    /// recorded" — every row from before it was, and every attempt whose
+    /// journal the board could not read while it was live. Distinct from a
+    /// recorded `read-only`, and a review must not render the two the same.
+    pub fn attempt_sandbox(&self, attempt_id: i64) -> Result<Option<comet_proto::SandboxReport>> {
+        self.attempt_json("run_sandbox", attempt_id)
+    }
+
+    pub fn set_attempt_sandbox(
+        &self,
+        attempt_id: i64,
+        sandbox: &comet_proto::SandboxReport,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET run_sandbox = ?2 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(sandbox)?],
         )?;
         Ok(())
     }

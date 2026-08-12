@@ -935,6 +935,7 @@ mod tests {
             },
             claimed_at: Some("2026-08-09T10:00:00Z".into()),
             claims_error: None,
+            sandbox: None,
             remainder,
             changed: changed_files,
             diff: DiffSource::Checkout,

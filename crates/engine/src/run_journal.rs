@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use comet_board::evidence::RanCommand;
-use comet_proto::{AgentEvent, ContextUsage, TokenUsage, ToolCall};
+use comet_proto::{AgentEvent, ContextUsage, SandboxReport, TokenUsage, ToolCall};
 
 /// How much of a chat's assistant text [`RunJournal::final_text`] keeps.
 ///
@@ -261,6 +261,49 @@ impl RunJournal {
             };
             if let AgentEvent::ContextUsage(usage) = parsed.event {
                 last = Some(usage);
+            }
+        }
+        Ok(last)
+    }
+
+    /// What sandbox this chat's runs actually got (§gh#349) — one line per run,
+    /// written by the harness before it says anything else.
+    ///
+    /// **The last run wins, and it is not a sum or a maximum.** A chat is
+    /// persistent across turns and can be resumed after a CLI upgrade, so the
+    /// terms it is on now are the terms of its most recent run — the same rule
+    /// [`context`](Self::context) follows, for the same reason: this is a state,
+    /// not a flow.
+    ///
+    /// That does lose a chat that ran unsandboxed yesterday and sandboxed
+    /// today. The alternative — reporting the loosest level any run ever had —
+    /// would make one old run brand a chat for the rest of its life, and a
+    /// warning that can never be cleared is one nobody reads. The journal keeps
+    /// every line either way, so the history is there for anyone who wants it.
+    ///
+    /// `None` is "no harness ever said": a journal written before gh#349, and
+    /// every chat with no journal at all. The board keeps NULL for those rather
+    /// than assuming a level, because assuming the requested one is precisely
+    /// the mistake this exists to correct.
+    pub fn sandbox(&self, chat_id: &str) -> Result<Option<SandboxReport>, JournalError> {
+        const SANDBOX_TAG: &str = r#""type":"sandbox""#;
+        let path = self.path_for(chat_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut last = None;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.contains(SANDBOX_TAG) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<JournalLine>(&line) else {
+                continue;
+            };
+            if let AgentEvent::Sandbox(report) = parsed.event {
+                last = Some(report);
             }
         }
         Ok(last)
@@ -593,6 +636,46 @@ mod tests {
         assert!(ctx.is_near_compaction(0.9), "past the CLI's own threshold");
         // The spend scan is untouched by any of it — two meters, one journal.
         assert_eq!(journal.tokens("chat-1").unwrap().unwrap().usage.total(), 13);
+    }
+
+    /// The sandbox a chat is on is the one its most recent run got — a chat
+    /// resumed after a CLI upgrade is not still branded by the terms of the
+    /// run before it (§gh#349).
+    #[test]
+    fn the_sandbox_reading_is_the_last_run_not_the_loosest_one_ever_seen() {
+        use comet_proto::{SandboxLevel, SandboxReport};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.sandbox("never-ran").unwrap(), None);
+
+        // Run one, on a codex old enough to earn the escalation.
+        let widened = SandboxReport::widened(
+            SandboxLevel::WorkspaceWrite,
+            SandboxLevel::DangerFullAccess,
+            "this codex predates the worktree-mount fix",
+        );
+        journal
+            .append("chat-1", &AgentEvent::Sandbox(widened.clone()))
+            .unwrap();
+        journal.append("chat-1", &started("gpt-5.6-codex")).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(journal.sandbox("chat-1").unwrap(), Some(widened));
+
+        // Run two, after the upgrade. The chat is now sandboxed, and the read
+        // says so rather than carrying yesterday's escalation forever.
+        let clean = SandboxReport::as_requested(SandboxLevel::WorkspaceWrite);
+        journal
+            .append("chat-1", &AgentEvent::Sandbox(clean.clone()))
+            .unwrap();
+        journal.append("chat-1", &started("gpt-5.6-codex")).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(journal.sandbox("chat-1").unwrap(), Some(clean));
+
+        // A journal from before any harness reported one says nothing, which
+        // must not be read as "it was sandboxed".
+        journal.append("chat-2", &started("mock")).unwrap();
+        journal.append("chat-2", &done()).unwrap();
+        assert_eq!(journal.sandbox("chat-2").unwrap(), None);
     }
 
     /// A chat whose harness never metered a window says nothing, rather than

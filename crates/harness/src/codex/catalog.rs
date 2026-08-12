@@ -59,11 +59,30 @@ pub(crate) fn sandbox_policy_type(sandbox: SandboxLevel) -> &'static str {
 /// access: comet agents fetch deps and hit APIs unattended, and with the
 /// approval policy pinned to "never" a network-less sandbox would fail those
 /// commands with no escalation path.
-pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
+///
+/// `writable_roots` are the paths workspace-write must be told about on top of
+/// the workspace itself — in practice the checkout's git metadata, which the
+/// sandbox denies by default and a dispatched agent cannot commit without
+/// (§gh#349, and [`crate::codex::git_writable_roots`] for the measurement).
+/// Ignored at the other two levels, where the field does not exist on the wire:
+/// read-only grants no writes at all, and full access needs no list.
+pub(crate) fn sandbox_policy_value(
+    sandbox: SandboxLevel,
+    writable_roots: &[std::path::PathBuf],
+) -> serde_json::Value {
     let mut policy = serde_json::Map::new();
     policy.insert("type".into(), sandbox_policy_type(sandbox).into());
     if matches!(sandbox, SandboxLevel::WorkspaceWrite) {
         policy.insert("networkAccess".into(), true.into());
+        if !writable_roots.is_empty() {
+            policy.insert(
+                "writableRoots".into(),
+                writable_roots
+                    .iter()
+                    .map(|p| serde_json::Value::String(p.display().to_string()))
+                    .collect(),
+            );
+        }
     }
     serde_json::Value::Object(policy)
 }

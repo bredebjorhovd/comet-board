@@ -93,6 +93,18 @@ case "$turnline" in
   emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"modelContextWindow":272000,"last":{"totalTokens":271000},"total":{"totalTokens":521049}}}}'
   ;;
 
+# §gh#349: workspace-write denies writes to `<cwd>/.git`, so the harness has to
+# name the checkout's git metadata as writable roots or a dispatched agent
+# cannot commit. Verified on the wire, where the real app server reads it.
+*scenario:sandbox-roots*)
+  for want in '"type":"workspaceWrite"' '"writableRoots":[' '/.git'; do
+    has "$turnline" "$want" || { fail_turn "$tid" "turn param missing: $want"; exit 0; }
+  done
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"ok"}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
 # NOTE: steer-race before steer — `case` takes the first matching glob.
 *scenario:steer-race*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"

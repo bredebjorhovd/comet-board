@@ -335,10 +335,27 @@ impl Harness for ClaudeHarness {
             stderr_tail,
         }));
 
-        Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
-        })
-        .boxed())
+        // Ahead of everything the CLI will say, the terms it is running on
+        // (§gh#349). The Claude CLI takes no sandbox argument and this adapter
+        // approves every `can_use_tool` it is asked (see
+        // [`handle_control_request`]), so whatever level the board dispatched
+        // with, what actually ran had the run device to itself. That has been
+        // true since the adapter was written and was stated only in a comment;
+        // a board that displays the requested level and never this one is
+        // reporting a guardrail it does not have.
+        let sandbox = comet_proto::SandboxReport::widened(
+            request.sandbox,
+            comet_proto::SandboxLevel::DangerFullAccess,
+            "the Claude CLI has no sandbox of its own and this adapter approves every tool \
+             it is asked about",
+        );
+        Ok(
+            futures::stream::once(async move { Ok(AgentEvent::Sandbox(sandbox)) })
+                .chain(futures::stream::unfold(event_rx, |mut rx| async move {
+                    rx.recv().await.map(|ev| (ev, rx))
+                }))
+                .boxed(),
+        )
     }
 }
 

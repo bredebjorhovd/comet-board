@@ -271,6 +271,19 @@ impl Harness for OpencodeHarness {
             }
         };
 
+        // The terms this run is on, ahead of anything opencode says (§gh#349).
+        // Nothing below passes `request.sandbox` to the server — opencode is
+        // spawned as an ordinary child process with the run device's own
+        // permissions, and every tool it asks about is approved (see the
+        // approval handler in `run_session`). The requested level is a
+        // preference this adapter has never been able to honour, and the board
+        // should be told that rather than shown the request back.
+        let sandbox = comet_proto::SandboxReport::widened(
+            request.sandbox,
+            comet_proto::SandboxLevel::DangerFullAccess,
+            "opencode is run as an ordinary child process with no sandbox, and this adapter \
+             approves every tool it is asked about",
+        );
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         let model_ref = ModelRef {
             model: split_model(&request.model),
@@ -290,10 +303,13 @@ impl Harness for OpencodeHarness {
             event_res,
         }));
 
-        Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
-        })
-        .boxed())
+        Ok(
+            futures::stream::once(async move { Ok(AgentEvent::Sandbox(sandbox)) })
+                .chain(futures::stream::unfold(event_rx, |mut rx| async move {
+                    rx.recv().await.map(|ev| (ev, rx))
+                }))
+                .boxed(),
+        )
     }
 }
 

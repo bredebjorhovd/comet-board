@@ -213,8 +213,16 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
         // every reading would replay a hundred stale gauges to anybody
         // scrolling back, none of them true any more. The live event and the
         // attempt row carry it instead (gh#271).
+        // Nor does the sandbox report (§gh#349), and for the first of those
+        // reasons rather than the second: it is a fact about the run, not
+        // something anybody said in the chat, and a transcript is what was
+        // said. It arrives immediately before `SessionStarted`, which resets
+        // this accumulator anyway — folding it in would put a part in a
+        // transcript that the very next event throws away. The journal keeps
+        // it, and the attempt row and the review read it from there.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage(_)
+        | AgentEvent::Sandbox(_)
         | AgentEvent::ContextUsage(_) => {}
     }
     out
