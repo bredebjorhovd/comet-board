@@ -21,8 +21,16 @@
 //! peak day (the one bar drawn a tone up), all four landing categories
 //! including both losses, one attempt still running, two accounts and four
 //! models so the breakdown has rows on either axis, one of them unpriced so the
-//! footer has a caveat to carry, and evening-heavy hours in one space so the
-//! crossing has a shape rather than a smear.
+//! footer has a caveat to carry and the row has a word where its money would be
+//! (gh#359), and evening-heavy hours in one space so the crossing has a shape
+//! rather than a smear.
+//!
+//! **The unpriced one has to stay unpriced.** It was `gpt-5.6-terra` until the
+//! shipped table learned that model's rate (gh#358), which quietly turned the
+//! one state this fixture exists to show back into an ordinary priced row —
+//! and nothing failed, because a seed has no assertions. `gpt-5.6-luna` is the
+//! name the tests use for a model `comet_proto::view::rates::builtin()` has
+//! never heard of; if it is ever priced, pick another here.
 
 use anyhow::Result;
 use comet_board::db::{Db, NewAttempt, UpsertTask, rfc3339};
@@ -246,7 +254,7 @@ fn plan() -> Vec<Seed> {
             None,
             2.2,
         ),
-        (5, 21, 33, "attn", "codex", "gpt-5.6-terra", None, 0.9),
+        (5, 21, 33, "attn", "codex", "gpt-5.6-luna", None, 0.9),
         (
             3,
             11,
@@ -268,7 +276,7 @@ fn plan() -> Vec<Seed> {
             None,
             4.6,
         ),
-        (2, 8, 39, "scratch", "codex", "gpt-5.6-terra", None, 0.8),
+        (2, 8, 39, "scratch", "codex", "gpt-5.6-luna", None, 0.8),
         (
             2,
             16,
@@ -310,7 +318,7 @@ fn plan() -> Vec<Seed> {
             None,
             0.4,
         ),
-        (1, 23, 71, "attn", "codex", "gpt-5.6-terra", None, 1.2),
+        (1, 23, 71, "attn", "codex", "gpt-5.6-luna", None, 1.2),
         (
             0,
             9,

@@ -1442,6 +1442,41 @@ monthly_usd = 200
         assert_eq!(by(&spaces.rows, "edge"), Some(Usd::from_dollars(1.0)));
     }
 
+    /// gh#359: the whole path, from an attempt on a model nobody has a rate
+    /// for to the row the card draws for it. Tokens are a fact the board knows
+    /// exactly — only the money is unknown, and only the money says so.
+    #[test]
+    fn a_model_the_table_never_heard_of_keeps_its_row_and_its_tokens() {
+        let tasks = vec![task(
+            "t1",
+            vec![
+                spent(60, "claude-opus-5", None, usage(1_000_000, 0, 0, 0)),
+                spent(50, "gpt-5.6-luna", None, usage(2_900_000, 0, 0, 0)),
+            ],
+        )];
+        let s = gather_priced(&tasks, Some(7), &crate::prices::Prices::builtin());
+        let models = cut(&s, Dimension::Model);
+
+        // Present, and under the row that has a price rather than dropped or
+        // ranked among them at a zero it never spent.
+        let labels: Vec<&str> = models.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["claude-opus-5", "gpt-5.6-luna"]);
+        let luna = &models.rows[1];
+        assert_eq!(luna.usage.total(), 2_900_000, "the board counted these");
+        assert_eq!(luna.dispatches, 1);
+        assert!(luna.is_unpriced());
+        assert_eq!(luna.price_label(), comet_proto::view::stats::UNPRICED);
+        assert_eq!(models.rows[0].price_label(), "$5.00");
+
+        // And the footer's reconciliation is the same tokens said once more:
+        // what the row could not price is what the headline leaves out.
+        let spend = s.spend.as_ref().expect("priced");
+        assert_eq!(spend.unpriced_tokens, luna.usage.total());
+        assert_eq!(spend.list_price, Usd::from_dollars(5.0));
+        let named: Vec<&str> = spend.unpriced.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(named, ["gpt-5.6-luna"]);
+    }
+
     #[test]
     fn a_dimension_this_window_has_nothing_under_is_not_offered_at_all() {
         // Nothing ran: no cut has a row, so the card has no toggle to draw.

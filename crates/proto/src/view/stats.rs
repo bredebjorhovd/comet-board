@@ -778,6 +778,19 @@ impl Ranking {
     }
 }
 
+/// What the money column says about a row nobody could price (gh#359).
+///
+/// The word, not `$0.00` — which is a different and false claim — and not a
+/// blank, which reads as a rendering bug. One spelling, here, because both
+/// viewports write it and a phone that said `no rate` while the laptop said
+/// `unpriced` would be two answers to one question.
+pub const UNPRICED: &str = "unpriced";
+
+/// What the money column says about a row that metered nothing at all: an em
+/// dash. A bucket with dispatches and no usage has no money to report and no
+/// tokens to report it against, which is a third fact again.
+pub const NO_FIGURE: &str = "—";
+
 /// One row of the breakdown: a name, what it ran, what it spent, and what that
 /// would have cost.
 ///
@@ -811,6 +824,35 @@ impl BreakdownRow {
             Ranking::Dispatches => self.dispatches as u64,
         }
     }
+
+    /// Tokens here the table could not price, and no money at all to put in
+    /// their place (gh#359) — a row that ran a model nobody has a rate for.
+    ///
+    /// Not the same as a row that metered nothing, and not the same as a row
+    /// that ran one priced model and one unpriced one: that second row has a
+    /// real figure to show, and the card's footer says what the figure leaves
+    /// out. This is the row where the whole answer would otherwise be blank.
+    pub fn is_unpriced(&self) -> bool {
+        self.unpriced_tokens > 0 && self.cost.is_some_and(|c| c.is_zero())
+    }
+
+    /// What goes in the money column — three different facts, and never a zero
+    /// somebody could act on.
+    ///
+    /// `unpriced` where there are tokens and no rate to price them at,
+    /// [`NO_FIGURE`] where the bucket metered nothing, and the money otherwise.
+    /// A board with no rates at all answers `None` for every row and the card
+    /// drops the column entirely ([`Breakdown::is_priced`]), so that state is
+    /// not worded here.
+    pub fn price_label(&self) -> String {
+        if self.is_unpriced() {
+            return UNPRICED.to_string();
+        }
+        match self.cost {
+            Some(cost) if !self.usage.is_zero() => human_usd(cost),
+            _ => NO_FIGURE.to_string(),
+        }
+    }
 }
 
 /// One cut of the window, ranked and ready to draw.
@@ -833,6 +875,12 @@ impl Breakdown {
     }
 
     /// One row's share of the biggest, `0.0..=1.0`.
+    ///
+    /// Zero for an unpriced row under [`Ranking::Spend`], and deliberately so:
+    /// the track is drawn against money, and a bar scaled to *this* row's
+    /// tokens beside bars scaled to everyone else's dollars would be one
+    /// picture of two quantities. What the row does know is in the token
+    /// column, and [`BreakdownRow::price_label`] says why the track is empty.
     pub fn share(&self, row: &BreakdownRow) -> f32 {
         if self.peak == 0 {
             return 0.0;
@@ -858,6 +906,16 @@ pub const BREAKDOWN_ROWS: usize = 6;
 /// instead of one, against whichever of them this window can actually be ranked
 /// on.
 ///
+/// **A tie on the ranking quantity breaks on tokens before it breaks on the
+/// alphabet** (gh#359). That rule exists for one row in particular: a model the
+/// rate table has never heard of spends nothing measurable, so under
+/// [`Ranking::Spend`] every unpriced row ties at zero — and ordering the rows
+/// the card *cannot* price by the alphabet throws away the one number the board
+/// does know exactly about them. Ranked by tokens they sit under the priced
+/// rows, biggest first, which is the reading a person opening a usage view
+/// wants: the unpriced model doing the most work is the top of that group.
+/// Alphabetical remains the last word, so the order is still stable.
+///
 /// Like [`hour_grid`], this has no Swift counterpart yet: the phone's stats
 /// screen draws no breakdown, so there is nothing there to disagree with it.
 /// When it does, this is the arithmetic it adopts.
@@ -872,6 +930,7 @@ pub fn rank_breakdown(dimension: Dimension, mut rows: Vec<BreakdownRow>, max: us
     rows.sort_by(|a, b| {
         b.metric(ranking)
             .cmp(&a.metric(ranking))
+            .then_with(|| b.usage.total().cmp(&a.usage.total()))
             .then_with(|| a.label.cmp(&b.label))
     });
     if max > 0 && rows.len() > max {
@@ -1972,6 +2031,85 @@ mod tests {
         assert_eq!(cut.rows[0].label, "comet");
     }
 
+    /// gh#359: the row a *usage* view must not lose. Tokens are a fact the
+    /// board knows exactly; only the money is unknown, and only the money says
+    /// so.
+    #[test]
+    fn a_model_nobody_priced_keeps_its_row_and_says_which_half_is_missing() {
+        let cut = rank_breakdown(
+            Dimension::Model,
+            vec![
+                row("claude-opus-5", 9, 31_200_000, Some(198.0)),
+                BreakdownRow {
+                    unpriced_tokens: 2_900_000,
+                    ..row("gpt-5.6-luna", 4, 2_900_000, Some(0.0))
+                },
+                // Alphabetically first of the two unpriced rows, and much the
+                // smaller: it sorts under the one doing the work.
+                BreakdownRow {
+                    unpriced_tokens: 40_000,
+                    ..row("codestral-3", 1, 40_000, Some(0.0))
+                },
+                row("claude-sonnet-5", 2, 3_400_000, Some(14.0)),
+            ],
+            BREAKDOWN_ROWS,
+        );
+
+        // Priced rows first, by money; the rest by tokens rather than by the
+        // alphabet, which is the choice this ticket turns on.
+        let labels: Vec<&str> = cut.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "gpt-5.6-luna",
+                "codestral-3"
+            ]
+        );
+
+        // The row is whole: its tokens are its own, and where the money would
+        // be it says which fact is missing rather than claiming a zero.
+        let luna = &cut.rows[2];
+        assert_eq!(luna.usage.total(), 2_900_000);
+        assert!(luna.is_unpriced());
+        assert_eq!(luna.price_label(), UNPRICED);
+        assert_eq!(cut.rows[0].price_label(), "$198");
+        // And the bar is left empty rather than drawn against a second
+        // quantity: this cut is scaled in dollars.
+        assert_eq!(cut.share(luna), 0.0);
+    }
+
+    /// The three states the money column has to keep apart, and the two it must
+    /// never collapse into each other.
+    #[test]
+    fn the_money_column_says_nothing_metered_and_nothing_priceable_differently() {
+        // Dispatches, no usage: no money and no tokens to price.
+        let quiet = row("linear", 7, 0, Some(0.0));
+        assert!(!quiet.is_unpriced());
+        assert_eq!(quiet.price_label(), NO_FIGURE);
+
+        // Metered, and free at the rates configured — a real figure.
+        let free = row("mock", 2, 5_000, Some(0.0));
+        assert!(!free.is_unpriced());
+        assert_eq!(free.price_label(), "$0.00");
+
+        // Priced work beside unpriced work: the figure is real and the card's
+        // footer is what says what it leaves out.
+        let mixed = BreakdownRow {
+            unpriced_tokens: 900,
+            ..row("codex", 4, 41_000, Some(1.20))
+        };
+        assert!(!mixed.is_unpriced());
+        assert_eq!(mixed.price_label(), "$1.20");
+
+        // No rates configured at all: the card drops the column, so the row
+        // never has to word it.
+        let unrated = row("claude-opus-5", 3, 9_000, None);
+        assert!(!unrated.is_unpriced());
+        assert_eq!(unrated.price_label(), NO_FIGURE);
+    }
+
     #[test]
     fn a_folded_cut_carries_every_quantity_it_stood_for() {
         let cut = rank_breakdown(
@@ -2947,6 +3085,51 @@ mod spec {
             &[],
         ));
 
+        // A window that priced most of itself and could not price one model
+        // (gh#359) — the case Brede opened this on. The model keeps its row in
+        // the cut, under the priced ones and ranked on the tokens it did spend,
+        // and where its money would be the row says so. Both halves are here
+        // because they have to agree: the footer's "not in that total" sentence
+        // and the row are the same 2.90M tokens said twice.
+        let mut unpriced_model = BoardStats::empty(Some(7));
+        unpriced_model.attempts = 12;
+        unpriced_model.tasks_touched = 10;
+        unpriced_model.attempts_with_tokens = 12;
+        unpriced_model.token_coverage = Some(1.0);
+        unpriced_model.tokens = usage(309_000, 96_000, 2_548_000, 131_000);
+        unpriced_model.tokens_by_model = token_tally(&[
+            ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
+            ("gpt-5.6-luna", usage(300_000, 90_000, 2_400_000, 110_000)),
+        ]);
+        unpriced_model.breakdown = vec![rank_breakdown(
+            Dimension::Model,
+            vec![
+                BreakdownRow {
+                    label: "claude-opus-5".into(),
+                    dispatches: 8,
+                    usage: usage(9_000, 6_000, 148_000, 21_000),
+                    cost: Some(Usd::from_dollars(0.400_25)),
+                    unpriced_tokens: 0,
+                },
+                BreakdownRow {
+                    label: "gpt-5.6-luna".into(),
+                    dispatches: 4,
+                    usage: usage(300_000, 90_000, 2_400_000, 110_000),
+                    cost: Some(Usd::ZERO),
+                    unpriced_tokens: 2_900_000,
+                },
+            ],
+            BREAKDOWN_ROWS,
+        )];
+        unpriced_model.spend = Some(spend(
+            crate::view::rates::builtin(),
+            &[
+                ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
+                ("gpt-5.6-luna", usage(300_000, 90_000, 2_400_000, 110_000)),
+            ],
+            &[],
+        ));
+
         // Scalar rules, one case per input. Built before the object below
         // because `json!` reads a `[` as an array literal, not as a Rust one.
         let human_token_cases: Vec<Value> = [
@@ -3041,6 +3224,7 @@ mod spec {
                 stats_case("a busy week", &busy),
                 stats_case("a busy week, priced", &priced),
                 stats_case("rates configured, nothing priceable", &nothing_priceable),
+                stats_case("one model the table has no rate for", &unpriced_model),
             ],
         })
     }
