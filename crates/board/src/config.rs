@@ -765,8 +765,9 @@ pub struct Defaults {
     /// not read the same way: a checkout is evidence you might go back for, a
     /// chat is a row you are *shown*, and a merged task's row has nothing left
     /// to say. Every guard is in [`crate::gc::chat_standing`] and none of them
-    /// is the clock: a live attempt, a blocked one, an open pull request or an
-    /// issue still open all hold the chat on the shelf regardless. What is left
+    /// is the clock: a live attempt, a blocked one, an open pull request, an
+    /// issue still open, or work the chat released and is still waiting on
+    /// (gh#354) all hold the chat on the shelf regardless. What is left
     /// when they let go is a task that merged or closed, and a row for it is
     /// the landfill gh#139 was about. A duration still works — `2d`, `1w` — for
     /// a space that wants a grace period. `off` (or

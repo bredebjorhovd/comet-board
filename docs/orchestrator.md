@@ -37,9 +37,11 @@ ordinary chat again, with everything in it intact.
 - **Work no agent released.** A dispatch from the board panel, from the phone,
   or from a bare `comet-board dispatch` records no dispatching chat. On a board
   one person drives, that is most of what gets released.
-- **Work whose dispatcher did not survive it.** Attempts cap at two hours and
-  chats archive as their task settles, so a child routinely outlives the chat
-  that released it. That notice used to be dropped; it comes here instead.
+- **Work whose dispatcher did not survive it.** A chat somebody closed or filed
+  away by hand outlives nothing, and its child's settle used to be dropped; it
+  comes here instead. The *board* no longer opens that gap itself: since §gh#354
+  a chat with work still out is never swept off its shelf, however finished its
+  own attempt looks.
 - **Cap warnings.** The one notice about a run that is *still going*, and the
   only window in which reading its chat can change how it ends. It belongs to no
   dispatcher, because nothing has finished for one to be waiting on.

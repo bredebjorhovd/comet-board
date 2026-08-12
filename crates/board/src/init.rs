@@ -215,8 +215,9 @@ retain_build_output = "on-settle"
 # And when its *chat* leaves the space's shelf. `on-settle` is no window at all:
 # the same guards hold it — never while an attempt is live or blocked, never
 # while a pull request is in review, never the pinned orchestrator, never a chat
-# you made yourself — and once none of them do, the task has merged or closed and
-# its row has nothing left to say. Write a duration (`2d`, `1w`) for a grace
+# that has released work still running, never a chat you made yourself — and
+# once none of them do, the task has merged or closed and its row has nothing
+# left to say. Write a duration (`2d`, `1w`) for a grace
 # period instead. Archiving is not deleting: the transcript is intact and
 # Settings → Archived puts it back. `off` keeps every finished chat in the
 # sidebar, which is how a shelf becomes a landfill at agent throughput. Set it

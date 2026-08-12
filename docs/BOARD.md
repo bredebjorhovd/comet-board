@@ -72,7 +72,9 @@ nearly verbatim — it never depended on herdr:
   measurement `doctor` reports. The machinery is `sync.rs`'s
   `collect_worktrees`, on the same interval clock. `chat_standing` (§gh#132,
   gh#139) asks the same question about the attempt's *chat*, and
-  `sync.rs`'s `archive_chats` sweeps it beside the checkouts.
+  `sync.rs`'s `archive_chats` sweeps it beside the checkouts. `Dispatchers`
+  (§gh#354) is the one fact a chat has that a directory does not: a chat still
+  waiting on work it released is nobody's to sweep.
   `cache_standing` + `sweep_build_output` (§gh#186) ask it of the build
   output *inside* the checkout — the one leaving that is a cache rather than
   evidence, and the only one whose clock does not wait for the task to leave

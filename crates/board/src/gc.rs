@@ -27,6 +27,7 @@
 //! the interval sync, so the retention window is aged in wall time and a burst
 //! of watch events cannot run the clock faster than the clock.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -154,8 +155,64 @@ pub fn standing(task: &Task, attempt: &Attempt, dependents: &Dependents) -> Stan
     Standing::Held
 }
 
+/// Which chats have released work that has not come back yet (gh#354) — read
+/// off the same edge the settle notices are delivered on.
+///
+/// `COMET_BOARD_CHAT_ID` rides every dispatch, so `dispatched_by_pane` on an
+/// attempt row is the chat that released it ([`crate::dispatch::dispatcher_for`]).
+/// The board already reads that edge downward, to find an address for a settle.
+/// Read *upward* — chat → what it is still waiting on — it is the only thing on
+/// the board that knows a chat is being **used as a dispatcher**, which is a
+/// role a chat acquires by dispatching rather than one anybody declares
+/// (gh#348).
+///
+/// "Not come back yet" is exactly an open attempt: `outcome` unset, which is a
+/// running agent and a blocked one both. A dispatcher whose children have all
+/// ended is holding nothing — that is what keeps this narrower than "never
+/// archive a chat that ever dispatched", and what lets the shelf still clear.
+#[derive(Debug, Clone, Default)]
+pub struct Dispatchers {
+    released: HashMap<String, Vec<i64>>,
+}
+
+impl Dispatchers {
+    /// Build the map from one board's worth of tasks. Whole-board, for the same
+    /// reason [`crate::rebased::Dependents::of`] is: no amount of looking at
+    /// one attempt finds the work it released, which lives under another task.
+    pub fn of(tasks: &[Task]) -> Self {
+        let mut released: HashMap<String, Vec<i64>> = HashMap::new();
+        for attempt in tasks.iter().flat_map(|t| t.attempts.iter()) {
+            if attempt.outcome.is_some() {
+                continue;
+            }
+            let Some(chat) = attempt.dispatched_by_pane.as_deref() else {
+                continue;
+            };
+            released
+                .entry(chat.to_string())
+                .or_default()
+                .push(attempt.id);
+        }
+        for ids in released.values_mut() {
+            ids.sort_unstable();
+        }
+        Self { released }
+    }
+
+    /// Is this chat waiting on work it released?
+    pub fn holds(&self, chat: &str) -> bool {
+        self.released.contains_key(chat)
+    }
+
+    /// Which attempts they are — for the log line that says why a chat is still
+    /// on the shelf, which is the only reason anybody needs the ids.
+    pub fn released(&self, chat: &str) -> &[i64] {
+        self.released.get(chat).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// Whose the *chat* of `attempt` is (gh#139) — the same question
-/// [`standing`] answers about its checkout, plus the two things that are true
+/// [`standing`] answers about its checkout, plus the things that are true
 /// of chats and not of directories.
 ///
 /// A chat and a checkout are the same attempt's leavings, so the rule is
@@ -169,6 +226,15 @@ pub fn standing(task: &Task, attempt: &Attempt, dependents: &Dependents) -> Stan
 ///   address every event that can reach no other agent goes to, so it is
 ///   *always* somebody's, whatever the attempt it was once dispatched as.
 ///   `Held`, not a skip, so a mark left from before it was pinned is cleared.
+/// - **Nor is a chat that has released work still running** (gh#354). This is
+///   the same protection, attached to the behaviour instead of the pin: the
+///   orchestrator is spared because it is waiting on the board, and a chat with
+///   two agents out is waiting on exactly the same thing at a smaller scale.
+///   Until gh#354 the sweep could only see the declaration, so the pane
+///   somebody dispatched from was, once its own task merged, a finished
+///   attempt like any other — and it was archived out from under them mid-use.
+///   `Live` rather than `Held`, because unlike a pin this says something about
+///   *right now*: somebody is in there waiting for an answer.
 /// - **A chatless attempt has nothing to archive.** A dispatch whose chat
 ///   never got recorded is `Held` for want of anything to do.
 ///
@@ -183,6 +249,7 @@ pub fn chat_standing(
     task: &Task,
     attempt: &Attempt,
     orchestrator: Option<&str>,
+    dispatchers: &Dispatchers,
     dependents: &Dependents,
 ) -> Standing {
     let Some(chat) = attempt.pane_id.as_deref() else {
@@ -190,6 +257,9 @@ pub fn chat_standing(
     };
     if orchestrator.is_some_and(|pinned| pinned == chat) {
         return Standing::Held;
+    }
+    if dispatchers.holds(chat) {
+        return Standing::Live;
     }
     standing(task, attempt, dependents)
 }
@@ -661,7 +731,13 @@ mod tests {
         );
         // The chat goes with it, for the same reason and by the same rule.
         assert_eq!(
-            chat_standing(&parent, &parent.attempts[0], None, &held),
+            chat_standing(
+                &parent,
+                &parent.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &held
+            ),
             Standing::Held
         );
         // Without the edge — the ordinary unstacked dispatch — it is spent,
@@ -728,7 +804,13 @@ mod tests {
                     t.pr_open = pr_open;
                     t.attempts = vec![attempt(1, outcome)];
                     assert_eq!(
-                        chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+                        chat_standing(
+                            &t,
+                            &t.attempts[0],
+                            None,
+                            &Dispatchers::default(),
+                            &Dependents::default(),
+                        ),
                         standing(&t, &t.attempts[0], &Dependents::default()),
                         "{upstream:?} {outcome:?} pr_open={pr_open}"
                     );
@@ -747,7 +829,13 @@ mod tests {
         t.pr_open = true;
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &Dependents::default(),
+            ),
             Standing::Held
         );
     }
@@ -759,7 +847,13 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, None)];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &Dependents::default(),
+            ),
             Standing::Live
         );
     }
@@ -772,7 +866,13 @@ mod tests {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], Some("chat-1"), &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                Some("chat-1"),
+                &Dispatchers::default(),
+                &Dependents::default()
+            ),
             Standing::Held
         );
         // Somebody else's pin leaves this chat exactly as spent as it was.
@@ -781,10 +881,100 @@ mod tests {
                 &t,
                 &t.attempts[0],
                 Some("chat-other"),
+                &Dispatchers::default(),
                 &Dependents::default()
             ),
             Standing::Spent
         );
+    }
+
+    // ---- the chat that is somebody's dispatcher (gh#354) -----------------
+
+    /// One board: a settled parent attempt in `chat-1`, and the work that chat
+    /// released still running under another task.
+    fn dispatcher_board(children: &[Option<Outcome>]) -> [Task; 2] {
+        let mut parent = task(UpstreamState::Terminal);
+        parent.attempts = vec![attempt(1, Some(Outcome::Done))];
+        let mut child_task = task(UpstreamState::Started);
+        child_task.id = "gh:o/r#8".into();
+        child_task.attempts = children
+            .iter()
+            .enumerate()
+            .map(|(i, outcome)| {
+                let mut child = attempt(2 + i as i64, *outcome);
+                child.task_id = "gh:o/r#8".into();
+                child.pane_id = Some(format!("chat-{}", 2 + i));
+                child.dispatched_by_pane = Some("chat-1".into());
+                child
+            })
+            .collect();
+        [parent, child_task]
+    }
+
+    /// gh#354 whole: the pane somebody dispatched two agents from was itself a
+    /// board attempt. Its own task merged, and the sweep — which could see the
+    /// pin and nothing else — archived the thread they were working in out from
+    /// under them while both children were still running.
+    #[test]
+    fn a_chat_waiting_on_work_it_released_is_never_archived() {
+        let board = dispatcher_board(&[None, None]);
+        let (parent, dispatchers) = (&board[0], Dispatchers::of(&board));
+        assert_eq!(dispatchers.released("chat-1"), [2, 3]);
+        assert_eq!(
+            chat_standing(
+                parent,
+                &parent.attempts[0],
+                None,
+                &dispatchers,
+                &Dependents::default()
+            ),
+            Standing::Live
+        );
+        // The *checkout* is a separate question with its own answer: nothing
+        // about having dispatched holds the directory or the branch, and this
+        // deliberately does not reach for them.
+        assert_eq!(
+            standing(parent, &parent.attempts[0], &Dependents::default()),
+            Standing::Spent
+        );
+    }
+
+    /// And narrower than "never archive anything that dispatched": the hold is
+    /// on work in flight, so a dispatcher whose children have all ended is
+    /// finished like anything else and the shelf still gets cleared.
+    #[test]
+    fn once_the_work_it_released_has_come_back_the_chat_is_spent_again() {
+        let board = dispatcher_board(&[Some(Outcome::Done), Some(Outcome::Failed)]);
+        let (parent, dispatchers) = (&board[0], Dispatchers::of(&board));
+        assert!(!dispatchers.holds("chat-1"));
+        assert_eq!(
+            chat_standing(
+                parent,
+                &parent.attempts[0],
+                None,
+                &dispatchers,
+                &Dependents::default()
+            ),
+            Standing::Spent
+        );
+        // One of the two still out is enough — the hold is per chat, not per
+        // dispatch, because the person is waiting on the slowest of them.
+        let board = dispatcher_board(&[Some(Outcome::Done), None]);
+        assert!(Dispatchers::of(&board).holds("chat-1"));
+    }
+
+    /// A blocked child holds its dispatcher just as a running one does: an
+    /// attempt that stopped to ask is precisely the case where somebody is
+    /// coming back to the chat that released it.
+    #[test]
+    fn a_blocked_child_holds_the_chat_that_released_it() {
+        let board = dispatcher_board(&[None]);
+        assert!(Dispatchers::of(&board).holds("chat-1"));
+        // And an operator's dispatch records no chat at all, which holds
+        // nothing — `Dispatchers` must not invent an address from a `None`.
+        let mut board = dispatcher_board(&[None]);
+        board[1].attempts[0].dispatched_by_pane = None;
+        assert!(!Dispatchers::of(&board).holds("chat-1"));
     }
 
     /// A dispatch whose chat was never recorded has nothing to archive, and
@@ -796,7 +986,13 @@ mod tests {
         a.pane_id = None;
         t.attempts = vec![a];
         assert_eq!(
-            chat_standing(&t, &t.attempts[0], None, &Dependents::default()),
+            chat_standing(
+                &t,
+                &t.attempts[0],
+                None,
+                &Dispatchers::default(),
+                &Dependents::default(),
+            ),
             Standing::Held
         );
     }

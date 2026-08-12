@@ -186,6 +186,12 @@ pub mod meta {
     pub fn dependents_noted(attempt: i64) -> String {
         format!("dependents:{attempt}")
     }
+    /// When an attempt's chat was first kept on its shelf because it had
+    /// released work still running (gh#354) — the same once-per-attempt
+    /// discipline, for the same reason.
+    pub fn dispatcher_noted(attempt: i64) -> String {
+        format!("dispatcher:{attempt}")
+    }
     /// The head origin held when the board told an attempt its branch had been
     /// rewritten under it (gh#286). Holds the sha rather than a timestamp: it
     /// is both the "said already" mark and the thing a *second* rewrite is
@@ -2649,6 +2655,12 @@ impl SyncEngine {
     ///   still working on.
     /// - **The pinned orchestrator**, whatever attempt it was dispatched as: it
     ///   is told about every settle on the board, so it is never finished.
+    /// - **A chat that has released work still running** (gh#354). Read off
+    ///   [`gc::Dispatchers`], which is `dispatched_by_pane` — the same edge
+    ///   [`SyncEngine::wake_dispatcher`] delivers a settle notice on — turned
+    ///   around. A chat is a dispatcher because it dispatched, not because
+    ///   somebody pinned it, and the two agents it is waiting on are the whole
+    ///   reason somebody is sitting in it.
     /// - **A chat with no board attempt.** The sweep walks attempts, so a chat
     ///   somebody made by hand is never even a candidate. Those are theirs.
     ///
@@ -2657,6 +2669,16 @@ impl SyncEngine {
     /// work un-archives its own chat ([`SyncEngine::rewatch_settled_attempts`]).
     /// That is why this needs no grace beyond the window and no confirmation:
     /// the worst case is a shelf entry somebody restores in one click.
+    ///
+    /// That argument is about a *spent agent's* chat, and gh#354 is where it
+    /// was found being made about something else. One click restores a
+    /// transcript; it does not restore the place somebody was working from, and
+    /// a person whose window vanished mid-dispatch has no reason to guess that
+    /// "archived" is the word for what happened to it. The answer taken here is
+    /// to keep that window out of the sweep's reach — the hold above — rather
+    /// than to soften the sweep with a confirmation. Everything still archived
+    /// is an ended attempt's chat, which is what the reversibility argument was
+    /// always about.
     ///
     /// Failure is never fatal to the cycle: an error is logged and the attempt
     /// is left unstamped, so the next sweep tries again.
@@ -2680,6 +2702,10 @@ impl SyncEngine {
         // The same hold the checkouts get (gh#286): a parent whose layer is
         // still being written is not a finished conversation either.
         let dependents = rebased::Dependents::of(&tasks);
+        // And who is still waiting on work they released (gh#354). Built once
+        // from the whole board, for the same reason: the attempts a chat
+        // dispatched sit under other tasks entirely.
+        let dispatchers = gc::Dispatchers::of(&tasks);
         for task in &tasks {
             // Per route, resolved now rather than stamped at dispatch: the
             // window is a property of the shelf the chat sits on, and an
@@ -2701,7 +2727,11 @@ impl SyncEngine {
                     .chat_archivable_at
                     .as_deref()
                     .map(|t| secs_since(t, now).unwrap_or(0));
-                let standing = gc::chat_standing(task, attempt, orchestrator, &dependents);
+                let standing =
+                    gc::chat_standing(task, attempt, orchestrator, &dispatchers, &dependents);
+                if let Some(chat) = attempt.pane_id.as_deref().filter(|c| dispatchers.holds(c)) {
+                    self.note_held_as_dispatcher(task, attempt, chat, &dispatchers);
+                }
                 if let Err(e) = match gc::decide(standing, spent, window) {
                     gc::Verdict::Keep => Ok(()),
                     gc::Verdict::Mark => self.mark_chat_archivable(task, attempt, window),
@@ -2715,6 +2745,35 @@ impl SyncEngine {
                 }
             }
         }
+    }
+
+    /// Say, once, that a chat is being kept because it is somebody's dispatcher
+    /// (gh#354) — the counterpart to [`SyncEngine::note_held_by_dependents`],
+    /// and the answer to "why is this settled attempt's chat still on the
+    /// shelf" for a hold nothing else on the row makes visible.
+    fn note_held_as_dispatcher(
+        &self,
+        task: &Task,
+        attempt: &Attempt,
+        chat: &str,
+        dispatchers: &gc::Dispatchers,
+    ) {
+        let key = meta::dispatcher_noted(attempt.id);
+        if matches!(self.db.meta_get(&key), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.db.meta_set(&key, &crate::db::now());
+        let released = dispatchers
+            .released(chat)
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.log.info(format!(
+            "{}: keeping chat {chat} on the shelf — it released attempt {released}, \
+             which has not come back",
+            task.identifier,
+        ));
     }
 
     /// Does any route on this board archive its chats at all?
@@ -10055,6 +10114,67 @@ max_duration = "{max_duration}"
         assert!(
             attempt_row(&e, a).chat_archivable_at.is_none(),
             "and a mark from before it was pinned is cleared"
+        );
+    }
+
+    /// gh#354, end to end through the sweep. "I dispatched two agents through
+    /// another pane; when the PRs were merged, the thread that I was working
+    /// from disappeared." That pane was itself a board attempt: its own task
+    /// settled, its window passed, and the sweep — which could see the pin and
+    /// nothing else — filed away the thread somebody was working in.
+    #[test]
+    fn a_chat_that_released_work_still_running_is_never_archived() {
+        let e = engine(None);
+        // The pane he dispatched from: a settled attempt on a closed issue,
+        // which is every bit of what the sweep used to need.
+        let dispatcher = spent_chat(&e);
+        seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Started);
+        let child = dispatch_via(&e, "linear:LIN-143", "chat-10", "chat-9");
+        let shelf = Shelf::default();
+
+        for _ in 0..3 {
+            e.archive_chats(Some(&shelf));
+        }
+        assert!(
+            shelf.archived.borrow().is_empty(),
+            "the thread he is working in is not a finished attempt"
+        );
+        assert!(
+            attempt_row(&e, dispatcher).chat_archivable_at.is_none(),
+            "and the clock never starts while it is waiting on an agent"
+        );
+
+        // Narrower than "never archive anything that dispatched": once the work
+        // it released has come back, it is finished like anything else.
+        e.db.close_attempt(child, Outcome::Done).unwrap();
+        e.archive_chats(Some(&shelf));
+        assert!(attempt_row(&e, dispatcher).chat_archivable_at.is_some());
+        e.archive_chats(Some(&shelf));
+        assert_eq!(
+            shelf.archived.borrow().as_slice(),
+            [("chat-9".to_string(), true)]
+        );
+    }
+
+    /// A mark taken before the dispatch is reversed by it, the same way review
+    /// reversal works: the sweep may well have found the parent finished in the
+    /// minutes between its own settle and the dispatch it made afterwards.
+    #[test]
+    fn releasing_work_stops_a_shelf_clock_that_had_already_started() {
+        let e = engine(None);
+        let dispatcher = spent_chat(&e);
+        let shelf = Shelf::default();
+        e.archive_chats(Some(&shelf));
+        assert!(attempt_row(&e, dispatcher).chat_archivable_at.is_some());
+
+        seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-143", "chat-10", "chat-9");
+        age_shelf_mark(&e, dispatcher, 365 * 86_400);
+        e.archive_chats(Some(&shelf));
+        assert!(shelf.archived.borrow().is_empty());
+        assert!(
+            attempt_row(&e, dispatcher).chat_archivable_at.is_none(),
+            "the window starts over when the work it released comes back"
         );
     }
 
