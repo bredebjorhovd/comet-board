@@ -303,6 +303,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#117",
         "unclaimed": [
@@ -415,6 +416,7 @@
         },
         "outcome": "failed",
         "pr_url": null,
+        "sandbox": null,
         "state": "failed",
         "task_id": "gh:o/edge#39",
         "unclaimed": [
@@ -514,6 +516,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#183",
         "unclaimed": [
@@ -614,6 +617,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#235",
         "unclaimed": [
@@ -703,6 +707,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#72",
         "unclaimed": [],
@@ -903,6 +908,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#236",
         "unclaimed": [],
@@ -1005,6 +1011,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#180",
         "unclaimed": [],
@@ -1168,6 +1175,7 @@
         },
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
+        "sandbox": null,
         "state": "review",
         "task_id": "gh:o/r#238",
         "unclaimed": [],

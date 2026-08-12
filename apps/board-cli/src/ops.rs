@@ -466,6 +466,15 @@ pub fn render_review(review: &AttemptReview) -> String {
         if verdict.tone.loud() { "!" } else { "·" },
         verdict.text
     );
+    // Under the verdict and above the evidence it qualifies (§gh#349): what
+    // this run was actually permitted to do. A reviewer weighing "the tests
+    // passed" is entitled to know whether the agent that ran them was confined
+    // to its checkout. Marked `?` rather than `!` — it is a term of the run,
+    // not a finding against it, and [`AttemptReview::sandbox_note`] says why it
+    // stays out of the verdict.
+    if let Some(note) = review.sandbox_note() {
+        let _ = writeln!(out, "  ? {note}");
+    }
     out.push('\n');
     effects_section(review, &mut out);
     out.push('\n');
@@ -2192,6 +2201,7 @@ mod tests {
             },
             claimed_at: Some("2026-08-09T10:00:00Z".into()),
             claims_error: None,
+            sandbox: None,
             remainder,
             changed: changed_files,
             diff: DiffSource::Checkout,
@@ -2398,6 +2408,43 @@ mod tests {
         assert!(
             text.contains("3 file(s) changed in the checkout and not committed"),
             "an empty remainder over uncommitted work is the friendly lie: {text}"
+        );
+    }
+
+    /// What the agent was permitted to do, above the evidence it produced
+    /// (§gh#349). A reviewer weighing "cargo test passed" is entitled to know
+    /// whether the agent that ran it was confined to its own checkout.
+    #[test]
+    fn a_run_that_had_the_whole_box_says_so_above_its_own_evidence() {
+        use comet_proto::{SandboxLevel, SandboxReport};
+
+        // Nobody said: no line at all, rather than a reassuring one.
+        let review = review_of(Remainder::default(), vec![]);
+        let text = render_review(&review);
+        assert!(!text.contains("full access"), "{text}");
+
+        // Sandboxed as dispatched: still nothing to say.
+        let mut review = review_of(Remainder::default(), vec![]);
+        review.sandbox = Some(SandboxReport::as_requested(SandboxLevel::WorkspaceWrite));
+        assert!(!render_review(&review).contains("full access"));
+
+        // Widened out from under the dispatch: said, with the request named,
+        // and above the EFFECTS block it qualifies.
+        let mut review = review_of(Remainder::default(), vec![]);
+        review.sandbox = Some(SandboxReport::widened(
+            SandboxLevel::WorkspaceWrite,
+            SandboxLevel::DangerFullAccess,
+            "this codex predates the worktree-mount fix",
+        ));
+        let text = render_review(&review);
+        assert!(
+            text.contains("? this agent had full access to the box"),
+            "{text}"
+        );
+        assert!(text.contains("workspace-write was requested"), "{text}");
+        assert!(
+            text.find("full access").unwrap() < text.find("EFFECTS").unwrap(),
+            "the caveat comes before what it qualifies: {text}"
         );
     }
 }

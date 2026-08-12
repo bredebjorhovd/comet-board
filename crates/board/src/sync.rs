@@ -1527,6 +1527,27 @@ impl SyncEngine {
         let Some(chat_id) = attempt.pane_id.as_deref() else {
             return;
         };
+        // The terms the commands below ran under (§gh#349). Recorded first and
+        // on its own `if`: a chat whose journal has no commands in it yet has
+        // still already said what sandbox it got — that line is written before
+        // the run does anything — and returning early on the commands would
+        // lose it for exactly the runs that end without executing much.
+        match runtime.run_sandbox(chat_id) {
+            Ok(Some(sandbox)) => {
+                if self.db.attempt_sandbox(attempt.id).ok().flatten().as_ref() != Some(&sandbox)
+                    && let Err(e) = self.db.set_attempt_sandbox(attempt.id, &sandbox)
+                {
+                    self.log.warn(format!(
+                        "recording sandbox for attempt {}: {e:#}",
+                        attempt.id
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self
+                .log
+                .warn(format!("sandbox for chat {chat_id} unreadable: {e:#}")),
+        }
         let commands = match runtime.run_commands(chat_id) {
             Ok(Some(commands)) => commands,
             Ok(None) => return,
@@ -1850,6 +1871,7 @@ impl SyncEngine {
             self.uncommitted(&attempt),
             self.db.attempt_evidence(attempt.id)?.unwrap_or_default(),
             effects,
+            self.db.attempt_sandbox(attempt.id)?,
         );
         self.count_call_sites(&attempt, &mut review);
         Ok(review)
@@ -10709,6 +10731,84 @@ max_duration = "{max_duration}"
         );
         assert_eq!(review.evidence.checks[0].runs, 2);
         assert!(review.evidence.checks[0].ever_passed());
+    }
+
+    /// The other half of the same tick (§gh#349): the terms those commands ran
+    /// under, recorded off the harness's own report and rendered as a caveat
+    /// rather than as a finding.
+    #[test]
+    fn the_sandbox_the_run_actually_got_is_recorded_and_read_back_on_the_review() {
+        use comet_proto::{SandboxLevel, SandboxReport};
+
+        /// A chat whose harness widened the sandbox out from under the
+        /// dispatch — and which ran no commands at all, so the recording must
+        /// not be behind the commands read.
+        struct Widened;
+        impl Runtime for Widened {
+            fn dispatch(&self, _: &DispatchSpec) -> Result<DispatchHandle> {
+                unreachable!()
+            }
+            fn prompt(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn cancel(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn session(&self, _: &str) -> Result<Option<comet_proto::Session>> {
+                Ok(None)
+            }
+            fn chat_alive(&self, _: &str) -> Result<bool> {
+                Ok(true)
+            }
+            fn chat_cwd(&self, _: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn last_run_end(&self, _: &str) -> Result<Option<RunEnd>> {
+                Ok(None)
+            }
+            fn run_sandbox(&self, _: &str) -> Result<Option<SandboxReport>> {
+                Ok(Some(SandboxReport::widened(
+                    SandboxLevel::WorkspaceWrite,
+                    SandboxLevel::DangerFullAccess,
+                    "this codex predates the worktree-mount fix",
+                )))
+            }
+        }
+
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let attempt = e.db.get_attempt(a).unwrap().unwrap();
+
+        // Before anything is recorded the answer is "nobody said", which is
+        // not the same as "it was sandboxed" and must not render as one.
+        assert_eq!(e.review("linear:LIN-142", None).unwrap().sandbox, None);
+        assert_eq!(
+            e.review("linear:LIN-142", None).unwrap().sandbox_note(),
+            None
+        );
+
+        e.record_review_facts(Some(&Widened), &attempt);
+
+        let review = e.review("linear:LIN-142", None).unwrap();
+        let report = review.sandbox.as_ref().expect("recorded");
+        assert_eq!(report.effective, SandboxLevel::DangerFullAccess);
+        assert_eq!(report.requested, SandboxLevel::WorkspaceWrite);
+        let note = review.sandbox_note().expect("worth saying");
+        assert!(note.contains("full access to the box"), "{note}");
+        assert!(note.contains("workspace-write was requested"), "{note}");
+
+        // A caveat, never a finding: the verdict is about what nobody
+        // accounted for, and two of three runtimes run unsandboxed always —
+        // routed through `findings` this would shout on nearly every review.
+        assert!(
+            !review
+                .findings()
+                .iter()
+                .any(|f| f.text.contains("full access")),
+            "the sandbox note stays out of the findings: {:?}",
+            review.findings()
+        );
     }
 
     // ---- the claims block, off a finished attempt (§gh#235) ---------------
