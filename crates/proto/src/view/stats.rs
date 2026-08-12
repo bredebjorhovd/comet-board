@@ -2824,7 +2824,7 @@ mod spec {
         busy.agent_dispatched = 5;
         busy.tokens_by_model = token_tally(&[
             ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
-            ("gpt-5.6-terra", usage(400, 100, 0, 500)),
+            ("gpt-5.6-luna", usage(400, 100, 0, 500)),
         ]);
 
         // Context pressure (gh#271): fewer attempts reported a window than
@@ -2869,12 +2869,9 @@ mod spec {
                         unpriced_tokens: 0,
                     },
                     BreakdownRow {
-                        label: "gpt-5.6-terra".into(),
+                        label: "gpt-5.6-luna".into(),
                         dispatches: 5,
                         usage: usage(400, 100, 0, 500),
-                        // Metered, and priced at nothing because the table has
-                        // never heard of it — which is why the tokens it could
-                        // not price ride along on the row.
                         cost: Some(Usd::ZERO),
                         unpriced_tokens: 1_000,
                     },
@@ -2906,7 +2903,7 @@ mod spec {
             crate::view::rates::builtin(),
             &[
                 ("claude-opus-5", usage(9_000, 6_000, 148_000, 21_000)),
-                ("gpt-5.6-terra", usage(400, 100, 0, 500)),
+                ("gpt-5.6-luna", usage(400, 100, 0, 500)),
             ],
             &[
                 AccountSpend {
@@ -2943,10 +2940,10 @@ mod spec {
         nothing_priceable.token_coverage = Some(1.0);
         nothing_priceable.tokens = usage(400, 100, 0, 500);
         nothing_priceable.tokens_by_model =
-            token_tally(&[("gpt-5.6-terra", usage(400, 100, 0, 500))]);
+            token_tally(&[("gpt-5.6-luna", usage(400, 100, 0, 500))]);
         nothing_priceable.spend = Some(spend(
             crate::view::rates::builtin(),
-            &[("gpt-5.6-terra", usage(400, 100, 0, 500))],
+            &[("gpt-5.6-luna", usage(400, 100, 0, 500))],
             &[],
         ));
 

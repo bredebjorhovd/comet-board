@@ -1244,7 +1244,7 @@ mod tests {
                 // And a model the table has never heard of.
                 spent(
                     50,
-                    "gpt-5.6-terra",
+                    "gpt-5.6-luna",
                     Some("brede@tally.no"),
                     usage(400, 100, 0, 500),
                 ),
@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(spend.list_price, Usd::from_dollars(0.725));
         assert_eq!(spend.by_model.len(), 1);
         assert_eq!(spend.unpriced.len(), 1);
-        assert_eq!(spend.unpriced[0].label, "gpt-5.6-terra");
+        assert_eq!(spend.unpriced[0].label, "gpt-5.6-luna");
         assert_eq!(spend.unpriced_tokens, 1_000);
         assert!(!spend.is_complete());
         assert!(s.has_spend());

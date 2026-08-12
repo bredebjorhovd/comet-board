@@ -208,6 +208,22 @@ impl ModelRate {
         }
     }
 
+    /// A rate where the cache tiers are published explicitly, because the
+    /// provider's multipliers do not match the Anthropic defaults (0.1× read,
+    /// 1.25× write). DeepSeek V4 Flash, for example, charges 0.02× input for a
+    /// cache read rather than 0.1×, and does not publish a separate cache-write
+    /// price at all.
+    ///
+    /// All four fields are in dollars per million tokens.
+    pub fn explicit(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
+        ModelRate {
+            input: Usd::from_dollars(input),
+            output: Usd::from_dollars(output),
+            cache_read: Usd::from_dollars(cache_read),
+            cache_write: Usd::from_dollars(cache_write),
+        }
+    }
+
     /// What `usage` costs at this rate.
     pub fn cost(&self, usage: TokenUsage) -> Usd {
         self.input.per_million(usage.input_tokens)
@@ -271,26 +287,26 @@ pub struct RateTable {
 /// Bump this **only** with the rates it describes. A date moved on its own is
 /// the failure mode this whole design is about: a stale number wearing a fresh
 /// timestamp.
-pub const BUILTIN_AS_OF: &str = "2026-06-24";
+pub const BUILTIN_AS_OF: &str = "2026-08-12";
 
 /// Past this, `doctor` says the table is old. Rates change a few times a year,
 /// so a table older than two quarters has probably missed one.
 pub const STALE_AFTER_DAYS: i64 = 180;
 
-/// The shipped table: Anthropic's published API list prices, per million
-/// tokens, as of [`BUILTIN_AS_OF`].
+/// The shipped table: published API list prices, per million tokens, as of
+/// [`BUILTIN_AS_OF`].
 ///
-/// Anthropic models only, and deliberately so. The board runs Codex and
-/// opencode too, and this file will not carry a price nobody here checked
-/// against a published list — a model with no entry comes out *unpriced* on the
-/// page, which is the honest answer and the one an operator can fix with three
-/// lines of `routing.toml`.
+/// Carries the models this board dispatches: Anthropic (Claude), OpenAI
+/// (Codex), and DeepSeek (via opencode). Gemini has no harness yet (gh#426);
+/// the row will land when it does.
 ///
 /// Dated ids (`claude-haiku-4-5-20251001`) are not listed: [`RateTable::rate_for`]
 /// falls back to the longest matching family prefix, so one row prices every
 /// snapshot of its model.
 pub fn builtin() -> RateTable {
-    // (id, input $/MTok, output $/MTok). Cache rates derive from input.
+    // (id, input $/MTok, output $/MTok). Cache rates derive from input at the
+    // published Anthropic multipliers (0.1× read, 1.25× write) — see
+    // [`ModelRate::published`].
     const ROWS: &[(&str, f64, f64)] = &[
         ("claude-fable-5", 10.0, 50.0),
         ("claude-mythos-5", 10.0, 50.0),
@@ -309,13 +325,26 @@ pub fn builtin() -> RateTable {
         ("claude-sonnet-4-5", 3.0, 15.0),
         ("claude-sonnet-4-0", 3.0, 15.0),
         ("claude-haiku-4-5", 1.0, 5.0),
+        // OpenAI / Codex — short-context standard pricing (platform.openai.com/docs/pricing).
+        // Cache rates match the Anthropic multipliers exactly.
+        ("gpt-5.6-sol", 5.0, 30.0),
+        ("gpt-5.6-terra", 2.0, 12.0),
     ];
+    let mut entries: BTreeMap<String, ModelRate> = ROWS
+        .iter()
+        .map(|(id, input, output)| ((*id).to_string(), ModelRate::published(*input, *output)))
+        .collect();
+    // DeepSeek V4 Flash — cache rates are published explicitly (api-docs.deepseek.com).
+    // A cache read is 0.02× input ($0.0028/M), not the Anthropic 0.1×. No
+    // separate cache-write price is published; writes are the same as fresh
+    // input.
+    entries.insert(
+        "deepseek-v4-flash".to_string(),
+        ModelRate::explicit(0.14, 0.28, 0.0028, 0.14),
+    );
     RateTable {
         as_of: BUILTIN_AS_OF.to_string(),
-        entries: ROWS
-            .iter()
-            .map(|(id, input, output)| ((*id).to_string(), ModelRate::published(*input, *output)))
-            .collect(),
+        entries,
         overridden: Vec::new(),
     }
 }
@@ -432,6 +461,7 @@ fn normalize(model: &str) -> String {
         "anthropic.",
         "anthropic/",
         "openai/",
+        "deepseek/",
         "bedrock/",
         "vertex/",
         "models/",
@@ -552,7 +582,7 @@ mod tests {
     #[test]
     fn a_model_the_table_never_heard_of_is_unpriced_rather_than_free() {
         let table = builtin();
-        assert!(table.rate_for("gpt-5.6-terra").is_none());
+        assert!(table.rate_for("gpt-5.6-luna").is_none());
         assert!(table.rate_for("unnamed model").is_none());
         assert!(table.rate_for("").is_none());
         assert!(table.rate_for("   ").is_none());
@@ -563,7 +593,7 @@ mod tests {
         let table = builtin().with_overrides([
             // A negotiated rate no lookup would ever know.
             ("claude-opus-5".to_string(), ModelRate::published(4.0, 20.0)),
-            // And a model this binary shipped before.
+            // A different price for a model the table does ship.
             (
                 "gpt-5.6-terra".to_string(),
                 ModelRate::published(1.25, 10.0),
@@ -583,13 +613,69 @@ mod tests {
     }
 
     #[test]
+    fn codex_and_deepseek_models_are_in_the_shipped_table() {
+        let table = builtin();
+        let sol = table.rate_for("gpt-5.6-sol").expect("sol is priced");
+        assert_eq!(sol.key, "gpt-5.6-sol");
+        assert_eq!(sol.rate.input, Usd::from_dollars(5.0));
+        assert_eq!(sol.rate.output, Usd::from_dollars(30.0));
+        assert_eq!(sol.rate.cache_read, Usd::from_dollars(0.50));
+        assert_eq!(sol.rate.cache_write, Usd::from_dollars(6.25));
+        assert_eq!(sol.source, RateSource::Builtin);
+
+        let terra = table.rate_for("gpt-5.6-terra").expect("terra is priced");
+        assert_eq!(terra.rate.input, Usd::from_dollars(2.0));
+        assert_eq!(terra.rate.output, Usd::from_dollars(12.0));
+
+        // DeepSeek V4 Flash — explicit cache rates, not derived.
+        let ds = table.rate_for("deepseek-v4-flash").expect("deepseek is priced");
+        assert_eq!(ds.rate.input, Usd::from_dollars(0.14));
+        assert_eq!(ds.rate.output, Usd::from_dollars(0.28));
+        assert_eq!(ds.rate.cache_read, Usd::from_dollars(0.0028));
+        assert_eq!(ds.rate.cache_write, Usd::from_dollars(0.14));
+        assert_eq!(ds.source, RateSource::Builtin);
+
+        // Cost rounds correctly: 1M input from cache is $0.0028, not $0.014.
+        let turn = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert_eq!(ds.rate.cost(turn), Usd::from_dollars(0.14));
+        let cached = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 1_000_000,
+            cache_creation_tokens: 0,
+        };
+        assert_eq!(ds.rate.cost(cached), Usd::from_dollars(0.0028));
+    }
+
+    #[test]
+    fn deepseek_provider_prefix_is_stripped_during_normalization() {
+        let table = builtin();
+        let direct = table.rate_for("deepseek-v4-flash").unwrap();
+        for spelling in [
+            "deepseek/deepseek-v4-flash",
+            "DeepSeek/DeepSeek-V4-Flash",
+            "  deepseek/deepseek-v4-flash  ",
+        ] {
+            let m = table
+                .rate_for(spelling)
+                .unwrap_or_else(|| panic!("{spelling}"));
+            assert_eq!(m.rate, direct.rate, "{spelling}");
+        }
+    }
+
+    #[test]
     fn the_table_says_how_old_it_is_and_never_implies_freshness() {
         let table = builtin();
         assert_eq!(table.as_of, BUILTIN_AS_OF);
-        assert_eq!(table.age_days("2026-06-24"), Some(0));
-        assert_eq!(table.age_days("2026-08-09"), Some(46));
-        assert!(!table.is_stale("2026-08-09"));
-        assert!(table.is_stale("2027-06-24"));
+        assert_eq!(table.age_days("2026-08-12"), Some(0));
+        assert_eq!(table.age_days("2026-08-24"), Some(12));
+        assert!(!table.is_stale("2026-08-24"));
+        assert!(table.is_stale("2027-08-12"));
         // A date it cannot read is "cannot say", which is not the same as fresh
         // — and must not read as stale either.
         assert_eq!(table.age_days("sometime"), None);
