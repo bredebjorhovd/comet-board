@@ -15,78 +15,132 @@ fails. Nothing on the board said so.
 Two questions came out of that, and the answers turned out to be the same fact
 read from opposite ends.
 
-### What codex's `workspace-write` actually denies
+### What codex's `workspace-write` actually grants
 
-Measured against the installed CLI, **codex-cli 0.147.0**, by running real
-dispatched-shaped sessions and having them probe the filesystem:
+Measured against the installed CLI, **codex-cli 0.147.0**, by driving real
+sessions and having them probe the filesystem.
 
-| checkout | `<cwd>` writable | `.git` writable | `git commit` | `git fetch` |
-| --- | --- | --- | --- | --- |
-| main checkout (`.git` is a directory) | yes | **no** | **fails** | **fails** |
-| linked worktree (`.git` is a pointer file) | yes | yes | ok | ok |
-
-The rule behind it, isolated with a second probe in a main checkout on the
-branch `main`:
+`workspace-write` grants the **workspace, `/tmp` and `$TMPDIR`**, and on top of
+that denies **exactly `<cwd>/.git`**. The deny is narrow and it beats the
+grants — isolated with a probe in a main checkout on the branch `main`:
 
 | path | writable |
 | --- | --- |
 | `<cwd>/anything` | yes |
 | `<cwd>/.git` | **no** |
 | `<cwd>/sub/.git` | yes |
-| `<other-repo>/.git` | yes |
+| `<other-repo>/.git` | yes (it is under `/tmp`; see below) |
 | `<cwd>/.githooksish` | yes |
 
-So the sandbox denies writes to **exactly `<cwd>/.git`** — not a nested `.git`,
-not another repository's, not a `.git`-prefixed sibling — and nothing else about
-the workspace. It has nothing to do with the branch name.
+Not a nested `.git`, not a `.git`-prefixed sibling, and nothing to do with the
+branch name.
 
-That is the whole of the report. A **main checkout** keeps its git dir at
-`<cwd>/.git`, squarely under the deny rule: the agent can edit files and cannot
-record the edit. A **linked worktree** has a pointer *file* there and its real
-admin dir under the main checkout's `.git/worktrees/…`, outside the workspace —
-so nothing it writes is ever under the rule, and it works. By accident, and only
-because the paths happen not to overlap.
+**A correction, because it changes the conclusion.** The first round of this
+measurement ran in a fixture under `/private/tmp` and showed a linked worktree
+committing happily — from which the obvious reading was that worktrees "work by
+accident", their git dir being outside the deny. That reading was an artifact of
+the fixture's location: `/tmp` is granted wholesale, so *everything* there is
+writable. Repeated on a checkout under `$HOME`, where board worktrees actually
+live:
 
-### Which means the escalation was pointed at the wrong case
+| checkout (under `$HOME`) | `git add` | `commit` | `fetch` | `merge` |
+| --- | --- | --- | --- | --- |
+| main checkout (`.git` is a directory) | ok | **fails** | **fails** | **fails** |
+| linked worktree (`.git` is a pointer file) | **fails** | **fails** | **fails** | **fails** |
 
-`codex/mod.rs` widened `workspace-write` to `danger-full-access` whenever the
-cwd was a linked worktree on a branch whose name contained `/`. Against the
-table above, that condition fires on exactly the shape that already works, and
-stays quiet for the main checkout that does not. It could not have prevented the
-report, and it never did anything for the runs it fired on except turn the
-sandbox off.
+Both shapes lose their git dir, for two different reasons. A **main checkout**
+keeps it at `<cwd>/.git` — inside the workspace and explicitly denied. A
+**linked worktree** keeps a pointer file there and its real admin dir under the
+main checkout's `.git/worktrees/…` — outside the workspace, so never granted at
+all; a worktree run cannot even stage a file.
 
-It also fired on **every** board dispatch into a worktree, because the default
-branch template is `board/{identifier_lower}`. Every one of those agents had the
-run device to itself, and the only record was a `WARN` in the journal.
+### Which means the escalation was load-bearing, and pointed at the wrong thing
+
+`codex/mod.rs` widened `workspace-write` to `danger-full-access` whenever the cwd
+was a linked worktree on a branch whose name contained `/`. The board's branch
+template is `board/{identifier_lower}`, so that fired on **every** board dispatch
+into a worktree — and, given the table above, was the only reason those runs
+could commit at all. Every one of those agents had the run device to itself, and
+the only record was a `WARN` in the journal.
+
+The condition was still the wrong one twice over: it never fired for the main
+checkout that produced the report, and a worktree on a branch *without* a slash
+got no escalation and no writable git dir either — it simply could not commit.
 
 The bug it was written for is real and is fixed. Codex ≤0.144.x derived a
 malformed worktree mount for a slash-named branch and killed every command
-before it started; on 0.147.0 a linked worktree on `board/gh-349-probe` runs,
-writes, and commits under plain `workspace-write`.
+before it started; on 0.147.0 that is gone.
+
+This is why the two changes below ship together. Removing the escalation on its
+own would have broken every worktree dispatch on the box.
 
 ### What changed
 
-**1. The git dir is named as a writable root, and the sandbox stays on.**
-`workspace-write`'s `sandboxPolicy` takes `writableRoots`, and putting the
-checkout's resolved git dir in it lifts the deny. Verified over the *same wire
-path the harness uses* — a `codex app-server` driven by hand through
-`initialize` → `thread/start` → `turn/start`, in the main checkout that was
-failing, twice:
+**1. The git metadata is named as writable roots, and the sandbox stays on.**
+`workspace-write`'s `sandboxPolicy` takes `writableRoots`. Verified over the
+*same wire path the harness uses* — a `codex app-server` driven by hand through
+`initialize` → `thread/start` → `turn/start`:
 
 | `turn/start` `sandboxPolicy` | result |
 | --- | --- |
-| `{workspaceWrite, networkAccess}` | `GIT_FETCH=FAIL`, no commit in the log |
-| `… + writableRoots: ["<cwd>/.git"]` | `GITDIR_WRITE=ok`, `GIT_COMMIT=ok`, `GIT_FETCH=ok`, and the commit is in the log |
+| `{workspaceWrite, networkAccess}` | `git add`/`commit`/`fetch` all fail, nothing in the log |
+| `… + writableRoots` | `add`, `commit`, `fetch`, `merge`, `rebase`, `branch -f`, `checkout -b`, `stash`, `stash pop`, reflogs — all ok, and the commit is in the log |
 
-Sandbox still `workspace-write` in both. `git_writable_roots` resolves
-it with plain filesystem reads and returns **both** the git dir and the common
-dir: in a worktree those are different directories, a commit writes to the
-first and a fetch to the second, and a list naming only one would fix `commit`
-and leave `pull` broken.
+Sandbox still `workspace-write` in both. `git_writable_roots` resolves the paths
+with plain filesystem reads — a sandbox decision that depended on a subprocess
+succeeding inside the thing being sandboxed would fail in the interesting case.
 
-This replaces a sandbox drop with a permission grant of two paths. It is the
-part of this issue that actually fixes the reported failure.
+#### What the roots grant, and the one thing they must not
+
+The list is deliberately asymmetric, because the two directories are not the
+same kind of thing:
+
+- **The git dir, entire.** The run's own state: index, `HEAD`, `FETCH_HEAD`,
+  `COMMIT_EDITMSG`, the rebase and merge scratch dirs. There is no useful subset
+  — and for a main checkout it is `<cwd>/.git`, sitting in the workspace the
+  agent already writes to freely, so whole-directory access is the same trust
+  level as the build scripts beside it.
+- **`objects/`, `refs/`, `logs/`, `packed-refs` under the common dir**, and only
+  when that is a *different* directory — i.e. a linked worktree.
+
+That second case is the one worth stating plainly, because on this box it is
+every board dispatch:
+
+```
+$ cd ~/.herdr/worktrees/comet-board/board-gh-349-comet-board
+$ git rev-parse --git-dir --git-common-dir
+/Users/brede/dev/comet-board/.git/worktrees/board-gh-349-comet-board
+/Users/brede/dev/comet-board/.git
+```
+
+The common dir is the **operator's own working repository**, not a copy and not
+the workspace. Granting it whole would hand a dispatched agent `hooks/` and
+`config` there — and a `.git/hooks/pre-commit` written into that repository runs
+*on the operator's machine, outside any sandbox*, the next time they commit.
+`config` reaches the same place through `core.pager` or an alias. A sandboxed
+run would be a documented way out of the sandbox, and "the deny lifts, the
+sandbox stays on" would be true of the sentence and false of the situation.
+
+So the four subpaths are named instead of the directory. Measured on a worktree
+under `$HOME` with exactly those four:
+
+| | narrowed roots |
+| --- | --- |
+| `add`, `commit`, `fetch`, `merge`, `rebase`, `branch -f`, `checkout -b`, `stash`, `stash pop`, reflog | **ok** |
+| write `<common>/hooks/pre-commit` | **denied** |
+| write `<common>/config` | **denied** |
+| write `<common>/` at all | **denied** |
+| `$HOME` | **denied** |
+
+Two things genuinely stop working, and both are the operator's own maintenance
+rather than an agent's work: `git gc` and `git pack-refs`, which write `gc.log`,
+`gc.pid` and `packed-refs` at the shared root. The board's git identity is
+unaffected — it stamps `GIT_AUTHOR_*` on the harness child (gh#107) rather than
+writing `config` in the checkout — but an agent that tries to `git config
+--local` something in a worktree will now be refused, where before it was not.
+
+This replaces a sandbox drop with a permission grant of five paths, four of them
+leaves. It is the part of this issue that fixes the reported failure.
 
 **2. The escalation is gated on a codex old enough to need it.**
 `WORKTREE_MOUNT_FIXED_IN = 0.147.0` — the last version verified broken is
@@ -147,6 +201,15 @@ reviewer meets it before the evidence rather than after.
 Full access is reported **even when it was requested**. "Nobody widened this" is
 not the reassurance it sounds like when the level was `danger-full-access` from
 the start.
+
+The cost of that silence is worth naming, because it lands exactly on the case
+this issue newly grants. A workspace-write dispatch that is *not* escalated has
+`requested == effective`, so `note()` returns `None` and the review says nothing
+— which is right (a band on every review is a band nobody reads) and does mean
+the review is not where anyone will learn what the writable roots permit. This
+document is. If the roots ever widen — the shared root, `hooks/`, `config` — the
+section above is the thing to change, and a run that got them would still show a
+clean review.
 
 #### Attempts from before this say nothing
 

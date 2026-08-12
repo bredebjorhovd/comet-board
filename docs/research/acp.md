@@ -126,17 +126,21 @@ target changes.
    inherited from upstream and the ordering rule has to survive the move.
 3. **The codex sandbox handling is ours alone.** Two pieces, both measured in
    §gh#349 and both smaller than they were when this was written. The one that
-   matters is `writableRoots`: codex's `workspace-write` denies writes to
-   exactly `<cwd>/.git`, so `codex/mod.rs` names the checkout's git dir and
-   common dir as writable roots — without them a dispatched agent in a main
-   checkout can edit files and cannot commit them. The old escalation
-   (`WorkspaceWrite` → `DangerFullAccess` for a linked worktree on a
+   matters is `writableRoots`: under plain `workspace-write` a dispatched codex
+   run cannot record its work in *either* checkout shape — a main checkout's
+   git dir is inside the workspace and explicitly denied, a linked worktree's is
+   outside the workspace and never granted — so `codex/mod.rs` names the git dir
+   whole plus `objects`/`refs`/`logs`/`packed-refs` of the shared common dir,
+   which is deliberately not the whole of it (that directory is the operator's
+   own repository, and `hooks/` there executes on their machine). The old
+   escalation (`WorkspaceWrite` → `DangerFullAccess` for a linked worktree on a
    slash-named branch) is now gated on codex < 0.147.0, the version the
    worktree-mount bug was verified fixed in, so on a current box it fires on
-   nothing. Upstream calls sandbox policy "adapter-owned" and drops it. We
-   cannot drop the writable roots — that converts into a configuration where a
-   dispatched codex run cannot record its work. Whether `codex-acp` applies the
-   same `.git` deny is **not yet measured** and is the next probe to write.
+   nothing — but only because the roots replaced what it was really doing, which
+   was making every worktree dispatch able to commit. Upstream calls sandbox
+   policy "adapter-owned" and drops it. We cannot drop the writable roots.
+   Whether `codex-acp` applies the same rules is **not yet measured** and is the
+   next probe to write.
 4. **opencode has no upstream path.** ~2 000 lines that upstream never had and
    will never carry. It stays bespoke either way, which also means the
    `Harness` trait keeps earning its keep.

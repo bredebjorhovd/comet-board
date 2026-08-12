@@ -127,32 +127,64 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
         .is_some_and(|branch| branch.contains('/'))
 }
 
-/// Where `cwd`'s git metadata actually lives — its git dir, and the common dir
-/// it shares with the rest of the repository (§gh#349).
+/// The only parts of a *shared* git dir a dispatched agent is given write
+/// access to (§gh#349): the object store, the refs, and their reflogs.
 ///
-/// These are the paths codex's `workspace-write` sandbox has to be told about
-/// or a dispatched agent cannot commit. Verified against codex-cli 0.147.0: the
-/// sandbox denies writes to **exactly `<cwd>/.git`** — not a nested `.git`, not
-/// another repository's, not a `.git`-prefixed sibling — and denies nothing
-/// else about the workspace. So:
+/// Measured, not guessed. With exactly these four named, a run in a linked
+/// worktree can `add`, `commit`, `fetch`, `merge`, `rebase`, `branch -f`,
+/// `checkout -b`, `stash`, `stash pop` and write reflogs — while `hooks/` and
+/// `config` in the shared repository stay read-only. What *does* stop working
+/// is `git gc` and `git pack-refs`, which write `gc.log`, `gc.pid` and
+/// `packed-refs` at the shared root: repository maintenance, run by the
+/// operator on their own clone, and not something a dispatched agent does.
 ///
-/// - A **main checkout** keeps its git dir at `<cwd>/.git`, squarely under the
-///   deny rule. `git commit` fails on the index, `git fetch` fails on
-///   `FETCH_HEAD`, and the agent is left able to edit files and unable to
-///   record the edit — the report behind gh#349, verbatim.
-/// - A **linked worktree** has a `.git` pointer *file* there instead, and its
-///   real admin dir lives under the main checkout's `.git/worktrees/…`, outside
-///   the workspace entirely. Nothing it writes is ever under the deny rule, so
-///   it works — by accident, and only because the paths happen not to overlap.
+/// `hooks/` and `config` are the two that matter and the reason this is a list
+/// rather than the directory. A `.git/hooks/pre-commit` written into the
+/// operator's repository runs *on their machine, outside any sandbox*, the next
+/// time they commit; `config` reaches the same place through `core.pager` or an
+/// alias. Granting the shared root would make a sandboxed run a way out of the
+/// sandbox.
+const SHARED_GIT_WRITABLES: &[&str] = &["objects", "refs", "logs", "packed-refs"];
+
+/// The git metadata codex's `workspace-write` has to be told about, or a
+/// dispatched agent cannot record its work (§gh#349).
 ///
-/// Both are returned, existing paths only. The common dir is where a fetch puts
-/// objects and remote refs, and in a worktree that is a different directory
-/// from the git dir; a list that named only one of them would fix `commit` and
-/// leave `pull` broken.
+/// Measured against codex-cli 0.147.0. `workspace-write` grants the workspace,
+/// `/tmp` and `$TMPDIR`, and additionally denies **exactly `<cwd>/.git`** — not
+/// a nested `.git`, not another repository's, not a `.git`-prefixed sibling.
+/// Both checkout shapes lose their git dir, for two different reasons:
 ///
-/// Pure filesystem reads (no `git` subprocess): the pointer file names the
-/// admin dir, and the admin dir's `commondir` names the shared one, relative to
-/// itself.
+/// - A **main checkout** keeps its git dir at `<cwd>/.git`, inside the
+///   workspace and squarely under the deny. `git commit` fails on the index and
+///   `git fetch` on `FETCH_HEAD` — the report behind gh#349, verbatim.
+/// - A **linked worktree** has a `.git` pointer *file* there, and its real
+///   admin dir lives under the main checkout's `.git/worktrees/…` — outside the
+///   workspace, so never granted in the first place. Measured on a checkout
+///   under `$HOME`, such a run cannot even `git add`.
+///
+/// (A fixture under `/tmp` shows a worktree working, which is what `/tmp` being
+/// unconditionally writable looks like. Board worktrees live under `$HOME`.)
+///
+/// So the returned list is:
+///
+/// 1. **The git dir, entire.** This is the run's own checkout's state — its
+///    index, `HEAD`, `FETCH_HEAD`, `COMMIT_EDITMSG`, the rebase and merge
+///    scratch dirs — and there is no useful subset of it. For a main checkout
+///    it is `<cwd>/.git`, which sits in the workspace the agent already writes
+///    to freely; whole-directory access there is the same trust level as the
+///    build scripts beside it.
+/// 2. **[`SHARED_GIT_WRITABLES`] under the common dir, when that is a different
+///    directory** — i.e. a linked worktree, where the common dir is the
+///    *operator's own repository* and emphatically not the workspace. That one
+///    is narrowed on purpose.
+///
+/// The shared subpaths are named whether or not they exist yet: `packed-refs`
+/// is absent from a fresh clone and created by the first `pack-refs`, and codex
+/// accepts a root that is not there.
+///
+/// Pure filesystem reads (no `git` subprocess): a sandbox decision that
+/// depended on a subprocess succeeding inside the thing being sandboxed is a
+/// decision that fails in the interesting case.
 fn git_writable_roots(cwd: &str) -> Vec<PathBuf> {
     if cwd.is_empty() {
         return Vec::new();
@@ -173,18 +205,19 @@ fn git_writable_roots(cwd: &str) -> Vec<PathBuf> {
         };
         target
     };
+    if !git_dir.is_absolute() || !git_dir.exists() {
+        return Vec::new();
+    }
     let mut roots = vec![git_dir.clone()];
     // `commondir` is written relative to the admin dir (`../..`), so it is
     // joined and then normalized — a literal `…/worktrees/x/../..` would be a
     // path the sandbox matches against textually.
-    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
-        let common = git_dir.join(common.trim());
-        if let Ok(common) = std::fs::canonicalize(&common) {
-            roots.push(common);
-        }
+    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir"))
+        && let Ok(common) = std::fs::canonicalize(git_dir.join(common.trim()))
+        && common != git_dir
+    {
+        roots.extend(SHARED_GIT_WRITABLES.iter().map(|leaf| common.join(leaf)));
     }
-    roots.retain(|p| p.is_absolute() && p.exists());
-    roots.dedup();
     roots
 }
 
@@ -334,29 +367,31 @@ impl Harness for CodexHarness {
         // The two things this run has to settle about its own sandbox, and
         // then say out loud (§gh#349).
         //
-        // **The git dir has to be writable.** Codex's `workspace-write` denies
-        // writes to `<cwd>/.git` and nothing else, which leaves a dispatched
-        // agent able to edit files and unable to commit them — see
-        // [`git_writable_roots`], which is also the fix: naming those paths as
-        // writable roots lifts the deny with the sandbox still on. That is
-        // strictly better than what this code used to do, which was turn the
-        // sandbox off.
+        // **The git dir has to be writable.** Under plain `workspace-write` a
+        // dispatched agent cannot record its work in either checkout shape —
+        // see [`git_writable_roots`], which is both the measurement and the
+        // fix: naming those paths as writable roots buys back exactly `git`,
+        // with the sandbox still on.
         //
-        // **The old escalation is now version-gated.** Codex ≤0.144.x derived
-        // a MALFORMED worktree mount when the branch name contained '/'
-        // (verified against the real CLI: `wing/x` in a linked worktree killed
-        // every command before it started; `wing-x` was fine; full access
-        // worked), so the adapter widened that shape to `danger-full-access`
-        // rather than ship a session where nothing runs. Re-tested against
-        // 0.147.0 and the bug is gone — a linked worktree on `board/gh-349-…`
-        // runs, writes, and commits under plain `workspace-write`.
+        // **The old escalation is now version-gated, and these two changes go
+        // together.** Codex ≤0.144.x derived a MALFORMED worktree mount when
+        // the branch name contained '/' (verified against the real CLI:
+        // `wing/x` in a linked worktree killed every command before it started;
+        // `wing-x` was fine; full access worked), so the adapter widened that
+        // shape to `danger-full-access` rather than ship a session where
+        // nothing runs. Re-tested against 0.147.0 and that bug is gone.
         //
-        // Which matters more than a tidied workaround, because the board's
-        // default branch template is `board/{identifier_lower}`: the
-        // escalation fired on *every* board dispatch into a worktree, and said
-        // so only in the WARN below. Gated on the version, it now fires on no
-        // current box — and when it does fire, [`SandboxReport`] carries the
-        // fact out of the log and onto the review.
+        // Since the board's branch template is `board/{identifier_lower}`, the
+        // escalation fired on *every* board dispatch into a worktree — and was
+        // therefore the only reason those runs could commit at all, given the
+        // writable-roots problem above. Removing it alone would have broken
+        // them; the roots are what make gating it safe. It now fires on no
+        // current box, and when it does fire [`SandboxReport`] carries the fact
+        // out of the WARN below and onto the review.
+        //
+        // The condition was also never the right one: a worktree on a branch
+        // *without* a slash got no escalation and no writable git dir, and
+        // could not commit either.
         let requested = request.sandbox;
         let mut sandbox_report = comet_proto::SandboxReport::as_requested(requested);
         if requested == comet_proto::SandboxLevel::WorkspaceWrite
@@ -1369,25 +1404,22 @@ mod tests {
         assert!(!worktree_on_slashed_branch("/nonexistent/path"));
     }
 
-    /// The measurement behind [`git_writable_roots`], as a fixture: codex's
-    /// `workspace-write` denies exactly `<cwd>/.git`, so a main checkout needs
-    /// that path named or the agent cannot commit — and a worktree, whose git
-    /// dir is somewhere else entirely, is the case that already worked.
+    /// The grant [`git_writable_roots`] makes, in both checkout shapes — and
+    /// above all the one it refuses to make.
     #[test]
-    fn a_main_checkouts_git_dir_is_named_writable_and_a_worktrees_pair_is_too() {
+    fn a_worktree_gets_the_shared_object_store_and_not_the_operators_hooks() {
         let tmp = tempfile::tempdir().unwrap();
 
-        // A main checkout: `.git` is a directory, and it IS the deny target.
+        // A main checkout: `.git` is a directory, it IS the deny target, and it
+        // is inside the workspace the agent already writes to. Whole.
         let main = tmp.path().join("main");
         std::fs::create_dir_all(main.join(".git")).unwrap();
         let roots = git_writable_roots(&main.display().to_string());
         assert_eq!(roots, vec![main.join(".git")]);
 
         // A linked worktree: `.git` is a pointer file, the admin dir lives
-        // under the main checkout, and `commondir` points at the shared one.
-        // Both are returned — the admin dir is where a commit writes and the
-        // common dir is where a fetch does, and naming one would fix `commit`
-        // while leaving `pull` broken.
+        // under the main checkout, and `commondir` points at the shared one —
+        // which is the OPERATOR'S repository, not this workspace.
         let admin = main.join(".git").join("worktrees").join("wt");
         std::fs::create_dir_all(&admin).unwrap();
         std::fs::write(admin.join("commondir"), "../..\n").unwrap();
@@ -1395,20 +1427,61 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         let roots = git_writable_roots(&wt.display().to_string());
-        assert_eq!(roots.len(), 2, "git dir and common dir: {roots:?}");
+
+        // Its own admin dir, whole: index, HEAD, FETCH_HEAD, rebase scratch.
         assert_eq!(roots[0], admin);
-        // Normalized, not `…/worktrees/wt/../..` — the sandbox matches paths
-        // textually, so an unresolved one would grant nothing.
+        // And of the shared repository, only the object/ref store. Resolved,
+        // not left as a `…/worktrees/wt/../..` walk — the sandbox matches paths
+        // textually, so an unnormalized root would grant nothing.
+        let common = std::fs::canonicalize(main.join(".git")).unwrap();
         assert_eq!(
-            roots[1],
-            std::fs::canonicalize(main.join(".git")).unwrap(),
-            "the common dir is resolved, not left as a `..` walk"
+            roots[1..],
+            [
+                common.join("objects"),
+                common.join("refs"),
+                common.join("logs"),
+                common.join("packed-refs"),
+            ]
         );
+
+        // The point of the whole list. A `pre-commit` written into the
+        // operator's repository runs on their machine, outside any sandbox, the
+        // next time they commit; `config` gets there via `core.pager`. Neither
+        // is reachable, and neither is the shared root they sit in.
+        for forbidden in ["hooks", "config", "hooks/pre-commit", ""] {
+            let path = common.join(forbidden);
+            assert!(
+                !roots.iter().any(|r| path.starts_with(r)),
+                "{} is writable under {roots:?}",
+                path.display()
+            );
+        }
 
         // Nothing to name where there is no checkout, and nothing to crash on.
         assert!(git_writable_roots(&tmp.path().join("bare").display().to_string()).is_empty());
         assert!(git_writable_roots("").is_empty());
         assert!(git_writable_roots("/nonexistent/path").is_empty());
+    }
+
+    /// `packed-refs` is absent from a fresh clone and created by the first
+    /// `pack-refs`, so the shared subpaths are named whether or not they exist
+    /// — a list filtered by existence would grant nothing for the write that
+    /// creates the file.
+    #[test]
+    fn the_shared_subpaths_are_named_before_they_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let admin = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+
+        let roots = git_writable_roots(&wt.display().to_string());
+        let common = std::fs::canonicalize(main.join(".git")).unwrap();
+        assert!(!common.join("packed-refs").exists(), "nothing created it");
+        assert!(roots.contains(&common.join("packed-refs")), "{roots:?}");
     }
 
     /// The writable roots ride the wire policy, and only where the level has a
