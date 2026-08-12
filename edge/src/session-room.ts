@@ -1492,6 +1492,12 @@ export class SessionRoom implements DurableObject {
       if (attempts >= ALARM_FAILURE_LIMIT) {
         this.noteAlarmGaveUp(attempts);
       } else {
+        // LOAD-BEARING that this is NOT itself wrapped in a try: swallowing
+        // the work's failure means our setAlarm is the only reschedule left,
+        // so if the reschedule ITSELF fails the chain would end silently
+        // mid-budget. Uncaught, it escapes alarm() and the runtime's own
+        // retry fires as the backstop — the one place a throw is still the
+        // right answer. A tidy that catches here removes that; don't.
         await this.ctx.storage.setAlarm(Date.now() + alarmRetryDelay(attempts));
       }
       // Escalate LAST: a wasm-poisoning strike-out calls ctx.abort(), which

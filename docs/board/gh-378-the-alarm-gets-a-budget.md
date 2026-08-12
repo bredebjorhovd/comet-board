@@ -35,6 +35,17 @@ and R2 backup are untouched — and the wrapper is the budget:
 - past `ALARM_FAILURE_LIMIT` consecutive failures it stops rescheduling and
   writes `alarmGaveUpAt`.
 
+Swallowing has a consequence worth recording, because it is currently a
+property of where a line sits rather than a decision anyone wrote down: with the
+runtime no longer retrying on our behalf, **our `setAlarm` is the only
+reschedule left**, so a reschedule that itself failed would end the chain
+silently mid-budget. It is safe because the `setAlarm` call is *not* wrapped in
+a `try` of its own — an exception there escapes `alarm()` uncaught and the
+runtime's retry fires as the backstop. That is the one place in this handler
+where a throw is still the right answer. A later tidy that wraps the catch body,
+or moves the reschedule into a helper that logs and continues, would remove the
+last backstop while appearing to change nothing.
+
 **N = 24.** Chosen against the failure it has to survive: gh#373's outage lasted
 six hours, and a room whose writes are impossible for a day should still heal
 itself once they are possible again. Twenty-four attempts on that ladder span
