@@ -706,26 +706,38 @@ pub struct StackParent {
 ///
 /// The id is tried first and whole. An identifier that matches more than one
 /// row is refused rather than guessed — two sources can spell the same name,
-/// and the point of the exact id is to be the thing that says which.
+/// and the point of the exact id is to be the thing that says which. The
+/// refusal names **every** matching id, because naming one of them would be a
+/// disambiguator picked by iteration order: right half the time, and wrong in
+/// a way the reader cannot see.
 pub fn task_by_reference<'a>(tasks: &'a [Task], reference: &str) -> Result<&'a Task> {
     let reference = reference.trim();
     if let Some(task) = tasks.iter().find(|t| t.id == reference) {
         return Ok(task);
     }
-    let mut named = tasks
+    let named: Vec<&Task> = tasks
         .iter()
-        .filter(|t| t.identifier.eq_ignore_ascii_case(reference));
-    let first = named
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("`{reference}` is not a task on the board"))?;
-    if named.next().is_some() {
-        bail!(
-            "`{reference}` names more than one task on the board — pass the \
-             task id (`{}`) to say which",
-            first.id
-        );
+        .filter(|t| t.identifier.eq_ignore_ascii_case(reference))
+        .collect();
+    match named.as_slice() {
+        [] => bail!("`{reference}` is not a task on the board"),
+        [only] => Ok(only),
+        // Every id, never one of them. A message that hands the reader a
+        // single id and calls it the disambiguator is a message that can be
+        // wrong: it would be whichever row the scan reached first, and a
+        // reviewer who pastes it lands on the other task's review believing
+        // they were told which to use.
+        several => bail!(
+            "`{reference}` names {} tasks on the board — pass the task id to \
+             say which: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|t| format!("`{}`", t.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
-    Ok(first)
 }
 
 /// Resolve a dispatch's `onto` to the attempt it stacks on.
@@ -1049,15 +1061,23 @@ mod tests {
 
     /// Two sources can spell one name. Guessing which row a reviewer meant is
     /// how a verdict lands on somebody else's attempt, so the ambiguity is
-    /// refused and the message says the id that would settle it.
+    /// refused — and the refusal names **every** candidate.
+    ///
+    /// Naming one would be a disambiguator chosen by iteration order. A reader
+    /// told `pass the task id (gh:owner/widget#7)` has been handed something
+    /// shaped like the answer to their question, and if theirs was the other
+    /// row they paste it and read somebody else's review believing the board
+    /// told them to.
     #[test]
-    fn an_identifier_two_tasks_share_is_refused_with_the_id_that_settles_it() {
+    fn an_identifier_two_tasks_share_is_refused_and_every_candidate_is_named() {
         let mut other = task();
         other.id = "gh:owner/gadget#7".into();
         let tasks = vec![task(), other];
         let err = task_by_reference(&tasks, "gh#7").unwrap_err().to_string();
-        assert!(err.contains("more than one"), "{err}");
-        assert!(err.contains("gh:owner/widget#7"), "{err}");
+        assert!(err.contains("names 2 tasks"), "{err}");
+        for id in ["gh:owner/widget#7", "gh:owner/gadget#7"] {
+            assert!(err.contains(id), "{id} missing from: {err}");
+        }
         // The exact id is never ambiguous — that is what it is for.
         assert_eq!(
             task_by_reference(&tasks, "gh:owner/gadget#7").unwrap().id,
@@ -2039,7 +2059,12 @@ mod tests {
         let err = stack_parent(&db, "gh#12", "gh:owner/widget#7")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("more than one task"), "{err}");
+        assert!(err.contains("names 2 tasks"), "{err}");
+        // Both candidates by name, so `--onto` is as repairable as `--task`:
+        // the reader picks, and the message never picks for them.
+        for id in ["gh:owner/widget#12", "gh:owner/other#12"] {
+            assert!(err.contains(id), "{id} missing from: {err}");
+        }
         // The unambiguous id still works.
         let parent = stack_parent(&db, "gh:owner/other#12", "gh:owner/widget#7").unwrap();
         assert_eq!(parent.branch, "board/gh-12-other");

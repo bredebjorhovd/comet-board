@@ -84,5 +84,18 @@ detecting it would mean the board reading a template for meaning.
 
 **Nothing read-side changed.** The remainder, the harvest and the two-way
 distinction between an unanswered contract and an empty answer were all correct
-and untouched. The verification that matters is the next settled attempt on the
-box: `comet-board review --task <id> --json` with a non-null `claims_at` on it.
+and untouched.
+
+### Where to watch for it working
+
+The verification that matters is the next settled attempt on the box:
+`comet-board review --task <id> --json` with a non-null `claims_at` on it.
+
+**On the box, and nowhere else.** `resolve_prompt` is comet-board's, and
+`herdr-board` is a different binary out of a different repo (`~/dev/herdr-board`,
+installed at `~/.local/bin/herdr-board`) with its own brief. A dispatch from
+there — every worktree under `~/.herdr/worktrees/`, including the one this was
+written in — does not pass through this code and will not carry the paragraph.
+Watching a herdr dispatch for the ask to appear and concluding the fix did not
+work is worse than the bug it fixes, because it looks like evidence. If the ask
+is wanted there too, it is herdr-board's own change to make.
