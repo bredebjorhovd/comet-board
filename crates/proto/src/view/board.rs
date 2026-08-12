@@ -1899,22 +1899,32 @@ pub fn detail_actions(row: &TaskRow) -> Vec<RowAction> {
     out
 }
 
-/// Is there anything to review on this row (§gh#180)?
+/// Is there anything to review on this row (§gh#180, §gh#344)?
 ///
 /// One attempt is enough, and the state is deliberately not consulted. A
 /// finished attempt, a failed one and a cancelled one all left a branch and a
 /// run journal behind them, and "what did it actually change before it stopped"
 /// is the same question in all three cases — arguably the most useful one on a
-/// row that failed. What has no answer is a row nothing has ever run on: there
-/// is no attempt, so there is no diff, no claims and no journal, and a surface
-/// that offered the door anyway would be offering an empty room.
+/// row that failed.
+///
+/// **A pull request is enough on its own.** A row whose pull request nobody
+/// dispatched — an agent that did the work in its own chat instead of releasing
+/// it, or a person who pushed a branch — has no attempt and is still the work
+/// that most needs reading, precisely because no process watched it happen. The
+/// diff is on GitHub, the claims are empty and therefore the whole diff is
+/// unaccounted for, and saying that is worth a door. Barring one would send the
+/// row `review` → `done` having never been reviewable.
+///
+/// What has no answer is a row with neither: nothing ran and nothing was
+/// pushed, so there is no diff, no claims and no journal, and a surface that
+/// offered the door anyway would be offering an empty room.
 ///
 /// Not a [`RowAction`]: the action set is the verbs the *board* offers, and
 /// they must mean the same thing on every surface that draws them. Reviewing is
 /// a place a surface may or may not have, so the rule about which rows have one
 /// lives here and the affordance stays each surface's own.
 pub fn reviewable(row: &TaskRow) -> bool {
-    row.attempts > 0
+    row.attempts > 0 || row.pr_url.as_deref().is_some_and(|url| !url.is_empty())
 }
 
 /// The URL an action opens, or `None` for the ones that are not links.
@@ -4026,9 +4036,25 @@ mod tests {
             ran.attempts = 1;
             assert!(reviewable(&ran), "{state:?} has an attempt to review");
         }
-        // A row nobody has dispatched has no attempt, so no diff, no claims and
-        // no journal. The door would open on an empty room.
+        // A row nobody has dispatched and nobody has pushed has no attempt, so
+        // no diff, no claims and no journal. The door would open on an empty
+        // room.
         assert!(!reviewable(&row("2", BoardState::Ready)));
+    }
+
+    /// §gh#344: the pull request an agent opened from its own chat instead of
+    /// dispatching. No attempt, and the most-needed reading on the board.
+    #[test]
+    fn a_pull_request_nobody_dispatched_still_opens_the_door() {
+        let mut undispatched = row("gh:o/r#191", BoardState::Review);
+        undispatched.attempts = 0;
+        assert!(!reviewable(&undispatched), "nothing to review yet");
+        undispatched.pr_url = Some("https://github.com/o/r/pull/191".into());
+        assert!(reviewable(&undispatched), "the diff is on GitHub");
+        // An empty string is what an absent URL looks like on some wires, and
+        // it is not a pull request.
+        undispatched.pr_url = Some(String::new());
+        assert!(!reviewable(&undispatched));
     }
 
     #[test]

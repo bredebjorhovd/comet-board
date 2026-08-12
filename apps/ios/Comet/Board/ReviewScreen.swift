@@ -373,6 +373,11 @@ struct ReviewScreen: View {
             return "This attempt wrote a claims block the board could not read: "
                 + reviewFirstLine(error)
         }
+        if review.undispatched {
+            // Nobody was asked, so nobody ignored the ask (§gh#344).
+            return "Nothing dispatched this pull request, so nobody was ever told "
+                + "the claim contract."
+        }
         return review.claimed
             ? "This attempt answered the contract and claimed nothing."
             : "This attempt never answered the claim contract."
@@ -541,6 +546,15 @@ struct ReviewScreen: View {
             if case .recorded = review.diff {
                 Text("From the diff the board recorded while the run was live; "
                      + "the checkout is gone.")
+                    .font(Theme.sans(Theme.textCaption))
+                    .foregroundStyle(Theme.textFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Where the numbers came from when nothing local ever held this
+            // branch (§gh#344): a count is only as good as its provenance.
+            if case .pullRequest = review.diff {
+                Text("From GitHub's file list for the pull request; "
+                     + "nothing ran here to read a checkout of.")
                     .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(Theme.textFaint)
                     .fixedSize(horizontal: false, vertical: true)

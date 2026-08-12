@@ -78,6 +78,10 @@ enum ReviewSpecRunner {
     private struct ReviewableCase: Decodable {
         var state: String
         var attempts: Int
+        /// The row's pull request, if it carries one (§gh#344). A row with no
+        /// attempt and a pull request is still reviewable — the diff is on
+        /// GitHub and nothing claimed any of it.
+        var prUrl: String?
         var expect: Bool
     }
 
@@ -200,11 +204,14 @@ enum ReviewSpecRunner {
 
         // The navigation door is the shared Rust rule, not an iOS state list:
         // every row with an attempt remains reviewable, including a cancelled
-        // attempt back at ready and history behind a working retry.
+        // attempt back at ready and history behind a working retry — and so is
+        // every row carrying a pull request, dispatched or not (§gh#344).
         for c in spec.reviewable {
             let row = TaskRow(id: "gh:o/r#1", identifier: "gh#1", title: "A task",
-                              state: BoardState.parse(c.state), attempts: c.attempts)
-            let what = "review door — \(c.state), attempts \(c.attempts)"
+                              state: BoardState.parse(c.state), prUrl: c.prUrl,
+                              attempts: c.attempts)
+            let what = "review door — \(c.state), attempts \(c.attempts), "
+                + "pr \(c.prUrl ?? "none")"
             expect(boardReviewable(row), c.expect, "\(what): shared rule")
             expect(boardShowsReviewDoor(row), c.expect, "\(what): detail-sheet presentation")
         }

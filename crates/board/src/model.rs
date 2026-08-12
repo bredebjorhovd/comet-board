@@ -350,6 +350,11 @@ pub struct Task {
     /// retargeted when its parent merged looked exactly like one that had not
     /// moved (gh#282).
     pub pr_base_ref: Option<String>,
+    /// The branch the PR's work is on. The other half of the same fact, and the
+    /// only record of it for a pull request the board never dispatched (gh#344)
+    /// — a dispatched one is answered by its attempt's own `branch`, which is
+    /// what [`crate::review::authoring_attempt`] matches on.
+    pub pr_head_ref: Option<String>,
     /// Set only when GitHub says this PR is part of a stack.
     pub pr_stack: Option<PrStack>,
     /// The review that last asked this pull request to change, and which nothing

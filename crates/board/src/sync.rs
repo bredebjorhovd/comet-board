@@ -652,11 +652,15 @@ impl SyncEngine {
                     .db
                     .set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), pr.open);
                 let _ = self.db.set_pr_merged(&pr.task_id(), pr.merged);
-                // Free: the pull list already carried both (gh#282).
+                // Free: the pull list already carried all of them (gh#282,
+                // gh#344).
                 let stack = pr.stack.as_ref();
-                let _ = self
-                    .db
-                    .set_pr_topology(&pr.task_id(), Some(&pr.base_ref), stack);
+                let _ = self.db.set_pr_topology(
+                    &pr.task_id(),
+                    Some(&pr.base_ref),
+                    Some(&pr.head_ref),
+                    stack,
+                );
                 if check_mergeable && pr.open {
                     let state = gh.mergeable_state(&pr.repo, pr.number);
                     let _ = self.db.set_pr_mergeable(&pr.task_id(), state.as_deref());
@@ -909,8 +913,12 @@ impl SyncEngine {
                 .set_pr(&task.id, Some(&pr.url), Some(pr.number), link.open)?;
             // A Linear issue's PR is topologically a PR like any other, and 7/9
             // reads the base off the task row whichever source put it there.
-            self.db
-                .set_pr_topology(&task.id, Some(&pr.base_ref), pr.stack.as_ref())?;
+            self.db.set_pr_topology(
+                &task.id,
+                Some(&pr.base_ref),
+                Some(&pr.head_ref),
+                pr.stack.as_ref(),
+            )?;
             // Observing the merge is the same fact as performing it. A PR
             // merged with `gh pr merge` or on the web must not leave its
             // ticket in review forever — and not merely unadvanced: nothing
@@ -1821,6 +1829,12 @@ impl SyncEngine {
     /// when there is one and falls back to the snapshot the board took while
     /// the attempt was live — and says which, because "nothing changed" and
     /// "the checkout is gone" must never render the same.
+    ///
+    /// A row with a pull request and **no attempt at all** is reviewed from the
+    /// pull request (§gh#344): [`Self::pull_request_review`]. That is the whole
+    /// of what an undispatched pull request used to be missing — it had a row,
+    /// it was polled like any other, and every part of review needed an attempt
+    /// that nothing had created.
     pub fn review(
         &self,
         task_id: &str,
@@ -1829,20 +1843,20 @@ impl SyncEngine {
         use crate::claims::DiffSource;
         let tasks = self.db.load_tasks()?;
         let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
-        let attempt =
-            match attempt {
-                Some(id) => task
-                    .attempts
-                    .iter()
-                    .find(|a| a.id == id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("attempt {id} does not belong to {}", task.identifier)
-                    })?,
-                None => task.attempts.last().cloned().ok_or_else(|| {
-                    anyhow::anyhow!("{} has no attempts to review", task.identifier)
+        let attempt = match attempt {
+            Some(id) => task
+                .attempts
+                .iter()
+                .find(|a| a.id == id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("attempt {id} does not belong to {}", task.identifier)
                 })?,
-            };
+            None => match task.attempts.last().cloned() {
+                Some(attempt) => attempt,
+                None => return self.pull_request_review(task),
+            },
+        };
         let (changed, effects, diff) = match self.branch_facts(&attempt) {
             Some((changed, effects)) => (changed, effects, DiffSource::Checkout),
             None => {
@@ -1877,6 +1891,58 @@ impl SyncEngine {
         );
         self.count_call_sites(&attempt, &mut review);
         Ok(review)
+    }
+
+    /// A review of a pull request nobody dispatched (§gh#344).
+    ///
+    /// The row is ordinary — a `gh!<n>` upserted by the poll like any other —
+    /// and the only thing it is missing is the attempt every part of review
+    /// used to be read from. So the attempt becomes an enrichment: the brief is
+    /// the row, the diff is GitHub's file list, and the claims are empty, which
+    /// makes the remainder the whole diff. That is the honest reading rather
+    /// than a degraded one — nobody was ever told the contract.
+    ///
+    /// A row with no attempt and no pull request either is still an error. It
+    /// is not that its review is unavailable; there is nothing to review, and
+    /// answering with an empty screen would be inventing one. That error used
+    /// to read `has no attempts to review`, which stopped being the reason the
+    /// moment an attempt stopped being the requirement — nothing ran *and*
+    /// nothing was pushed is what is left, and it is what the sentence says.
+    fn pull_request_review(&self, task: &Task) -> Result<crate::claims::AttemptReview> {
+        use crate::claims::DiffSource;
+        let Some((repo, number)) = crate::verdict::pr_target(task) else {
+            anyhow::bail!(
+                "nothing has run on {} and no pull request has been opened for it — \
+                 there is nothing to review",
+                task.identifier
+            );
+        };
+        // Every failure below is a *source*, never a refusal: the brief, the
+        // pull request and the fact that nothing was claimed are worth reading
+        // on their own, and a review that erred because GitHub was unreachable
+        // would take them away too.
+        let (changed, diff) = match self.github.as_ref() {
+            None => (
+                Vec::new(),
+                DiffSource::Unavailable {
+                    reason: "nothing ran here and this board has no GitHub credential to \
+                             read the pull request's diff with"
+                        .to_string(),
+                },
+            ),
+            Some(gh) => match gh.pull_files(&repo, number) {
+                Ok(changed) => (changed, DiffSource::PullRequest),
+                Err(e) => (
+                    Vec::new(),
+                    DiffSource::Unavailable {
+                        reason: format!(
+                            "nothing ran here, and GitHub would not say what {repo}#{number} changed: {e:#}"
+                        ),
+                    },
+                ),
+            },
+        };
+        Ok(crate::claims::pull_request_review(task, changed, diff))
     }
 
     /// Count, for every symbol anchor on every claim, how many lines name it
@@ -8086,6 +8152,123 @@ max_duration = "{max_duration}"
         assert_eq!(task.attempts[0].worktree, None);
     }
 
+    /// The row Brede watched go `review` → `done` unread (§gh#344): a pull
+    /// request opened by an agent that never dispatched, with no comet chat
+    /// this board can see. There is no attempt, and the review is assembled
+    /// from the pull request anyway.
+    #[test]
+    fn a_pull_request_nobody_dispatched_is_reviewed_from_the_pull_request() {
+        let mut e = engine_with(
+            None,
+            Some(Github::new(Box::new(FixtureRest::new(vec![(
+                "/repos/b/itsm-agent/pulls/191/files".into(),
+                json!([
+                    { "filename": "src/approval.rs", "status": "modified",
+                      "additions": 44, "deletions": 9, "patch": "@@" },
+                    { "filename": ".github/workflows/ci.yml", "status": "modified",
+                      "additions": 3, "deletions": 1, "patch": "@@" }
+                ]),
+            )])) as Box<dyn Rest>)),
+        );
+        e.cfg.github.repos = vec!["b/itsm-agent".into()];
+        let pr = PullRequest {
+            repo: "b/itsm-agent".into(),
+            number: 191,
+            title: "fix: restore approval lifecycle and CI".into(),
+            body: None,
+            url: "https://github.com/b/itsm-agent/pull/191".into(),
+            head_ref: "codex/restore-green-main".into(),
+            base_ref: "main".into(),
+            head_repo: None,
+            base_sha: None,
+            open: true,
+            merged: false,
+            draft: false,
+            stack: None,
+            updated_at: crate::db::now(),
+        };
+        e.db.upsert_task(&pr.to_upsert()).unwrap();
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
+            .unwrap();
+        e.db.set_pr_topology(&pr.task_id(), Some(&pr.base_ref), Some(&pr.head_ref), None)
+            .unwrap();
+        let task = e.db.get_task(&pr.task_id()).unwrap().unwrap();
+        assert!(task.attempts.is_empty(), "nothing was ever dispatched");
+        assert!(
+            comet_proto::view::board::reviewable(&crate::rows::task_row(
+                &task, None, &e.cfg, None, None
+            )),
+            "the row has a door to go through"
+        );
+
+        let review = e.review(&pr.task_id(), None).unwrap();
+        assert!(review.undispatched());
+        assert_eq!(review.diff, crate::claims::DiffSource::PullRequest);
+        assert_eq!(review.changed.len(), 2, "the diff is GitHub's");
+        assert_eq!(
+            review.remainder.unclaimed.len(),
+            2,
+            "with no claims, every changed file is unaccounted for"
+        );
+        assert_eq!(
+            review.branch.as_deref(),
+            Some("codex/restore-green-main"),
+            "the head ref is the poll's, and the only record of it"
+        );
+        assert_eq!(review.brief.title, "fix: restore approval lifecycle and CI");
+        assert!(review.verdict().text.contains("nothing dispatched"));
+    }
+
+    /// GitHub being unreachable takes the diff away, not the review: the brief,
+    /// the pull request and "nobody claimed anything" are still worth reading,
+    /// and the reason is on the screen rather than in a log (§gh#344).
+    #[test]
+    fn a_diff_github_will_not_answer_for_leaves_the_review_standing() {
+        let e = engine_with(
+            None,
+            Some(Github::new(
+                Box::new(FixtureRest::new(vec![])) as Box<dyn Rest>
+            )),
+        );
+        let pr = PullRequest {
+            repo: "o/r".into(),
+            number: 8,
+            title: "Opened by hand".into(),
+            body: None,
+            url: "https://github.com/o/r/pull/8".into(),
+            head_ref: "hand-written".into(),
+            base_ref: "main".into(),
+            head_repo: None,
+            base_sha: None,
+            open: true,
+            merged: false,
+            draft: false,
+            stack: None,
+            updated_at: crate::db::now(),
+        };
+        e.db.upsert_task(&pr.to_upsert()).unwrap();
+        e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
+            .unwrap();
+
+        let review = e.review(&pr.task_id(), None).unwrap();
+        let crate::claims::DiffSource::Unavailable { reason } = &review.diff else {
+            panic!("an unanswerable diff is unknown, never empty: {review:?}");
+        };
+        assert!(reason.contains("o/r#8"), "{reason}");
+        assert_eq!(review.brief.title, "Opened by hand");
+        assert!(review.undispatched());
+    }
+
+    /// A row with neither an attempt nor a pull request has nothing to review,
+    /// and answering with an empty screen would be inventing one.
+    #[test]
+    fn a_row_that_never_ran_and_never_pushed_has_no_review() {
+        let e = engine(None);
+        seed(&e, "gh:o/r#4", "gh#4", UpstreamState::Unstarted);
+        let err = e.review("gh:o/r#4", None).unwrap_err().to_string();
+        assert!(err.contains("nothing to review"), "{err}");
+    }
+
     #[test]
     fn a_pull_request_never_crosses_into_another_repo() {
         // herdr-board AGE-20, seen live: gh#2 exists in two repos, both branch
@@ -11302,7 +11485,7 @@ max_duration = "{max_duration}"
         // The parent lands, GitHub rebases, and the agent brings the checkout
         // across. The stamp is now a commit on no branch at all.
         let trunk = s.parent_lands_and_the_child_is_rebased();
-        e.db.set_pr_topology("gh:o/r#12", Some("main"), None)
+        e.db.set_pr_topology("gh:o/r#12", Some("main"), Some("work"), None)
             .unwrap();
 
         assert_eq!(
@@ -11440,7 +11623,7 @@ max_duration = "{max_duration}"
         let rewritten = origin_rebased_the_child(&s);
         // What the board has seen so far: the child still targets the parent's
         // branch, and the parent's request is still open.
-        e.db.set_pr_topology("gh:o/r#12", Some(Stacked::PARENT), None)
+        e.db.set_pr_topology("gh:o/r#12", Some(Stacked::PARENT), Some("work"), None)
             .unwrap();
 
         let rt = InTheCheckout::at(&s.path());
@@ -11452,7 +11635,7 @@ max_duration = "{max_duration}"
         // The poll catches up: the parent merged, and the child was retargeted
         // onto trunk in the same motion.
         e.db.set_pr_merged("gh:o/r#11", true).unwrap();
-        e.db.set_pr_topology("gh:o/r#12", Some("main"), None)
+        e.db.set_pr_topology("gh:o/r#12", Some("main"), Some("work"), None)
             .unwrap();
         e.note_rewritten_branches(Some(&rt));
         let said = rt.said();

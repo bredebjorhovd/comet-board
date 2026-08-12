@@ -1082,7 +1082,10 @@ impl ReviewPanel {
                 .into_any_element();
         }
         // Never asked and claimed nothing are different facts, and this is the
-        // last place they could be flattened into one.
+        // last place they could be flattened into one. So is never *having been
+        // asked*: an agent that was told the contract and said nothing and a
+        // pull request no agent was ever given are not the same silence
+        // (§gh#344).
         if !review.claimed() {
             return div()
                 .flex_none()
@@ -1096,8 +1099,13 @@ impl ReviewPanel {
                 ))
                 .child(Self::claims_line(
                     theme.text_subtle,
-                    "This attempt never answered the claim contract. \
-                     Nothing here is asserted, and nothing is checked.",
+                    if review.undispatched() {
+                        "Nothing dispatched this pull request, so nobody was ever told the \
+                         claim contract. Nothing here is asserted, and nothing is checked."
+                    } else {
+                        "This attempt never answered the claim contract. \
+                         Nothing here is asserted, and nothing is checked."
+                    },
                 ))
                 .into_any_element();
         }
@@ -1309,6 +1317,20 @@ impl ReviewPanel {
                         .child(SharedString::from(
                             "From the diff the board recorded while the run was live; \
                                  the checkout is gone.",
+                        )),
+                )
+            })
+            // Where the numbers came from when nothing local ever held this
+            // branch (§gh#344). Said for the same reason the line above is: a
+            // count is only as good as its provenance.
+            .when(matches!(review.diff, DiffSource::PullRequest), |el| {
+                el.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(
+                            "From GitHub's file list for the pull request; \
+                                 nothing ran here to read a checkout of.",
                         )),
                 )
             });
@@ -1633,18 +1655,25 @@ impl ReviewPanel {
         }
         // What the board knows about the run itself. The canvas names the model
         // and how long it took; neither is on the wire (see review.md), and the
-        // attempt and its outcome are what the board does know.
+        // attempt and its outcome are what the board does know. When there was
+        // no run at all (§gh#344) this is the fact that says so — "attempt 1 ·
+        // still running" about a pull request nobody dispatched would be two
+        // inventions in four words.
         facts.push(Self::fact(
             theme,
             None,
-            format!(
-                "attempt {} · {}",
-                review.attempt_number.max(1),
-                match &review.outcome {
-                    Some(outcome) => outcome.as_str(),
-                    None => "still running",
-                }
-            ),
+            if review.undispatched() {
+                "no attempt · opened outside the board".to_string()
+            } else {
+                format!(
+                    "attempt {} · {}",
+                    review.attempt_number.max(1),
+                    match &review.outcome {
+                        Some(outcome) => outcome.as_str(),
+                        None => "still running",
+                    }
+                )
+            },
             None,
         ));
         let mut row: Vec<AnyElement> = Vec::new();
@@ -2480,6 +2509,14 @@ mod tests {
             ..reviewed()
         };
         assert!(!ReviewPanel::diff_openable(&gone, Some("chat-1")));
+        // A pull request nobody dispatched (§gh#344): the counts are GitHub's
+        // and there is no checkout here to open. The numbers are still drawn;
+        // the chip is only the route to the rest of it.
+        let undispatched = AttemptReview {
+            diff: DiffSource::PullRequest,
+            ..reviewed()
+        };
+        assert!(!ReviewPanel::diff_openable(&undispatched, Some("chat-1")));
     }
 
     /// The pill separates a review that wants a human from one already
