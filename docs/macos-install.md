@@ -50,6 +50,36 @@ the app. Do it for builds from
 [the project's releases](https://github.com/bredebjorhovd/comet-board/releases),
 not for a `Comet.app` that arrived some other way.
 
+## One extra tool, if the board you joined stacks
+
+Nothing above is affected by this, and the app does not need it. It is here
+because this is the page you are on while setting your own machine up, and
+because nothing else would tell you.
+
+A board can dispatch a task as a **stack** — one task decomposed into layered
+pull requests, each a dependent concern, reviewed in parallel instead of as one
+wall of diff (§gh#287). GitHub builds those with a `gh` extension, and reading
+one is the same extension:
+
+```sh
+brew install gh                          # if you have not already
+gh auth login                            # your own account, your own machine
+gh extension install github/gh-stack
+
+gh stack view                            # the chain, from any branch in it
+gh stack checkout 12                     # move around it by pull request number
+```
+
+Without it those pull requests still open, still notify you and still review
+normally — GitHub's web UI draws the stack either way. What you lose is the
+CLI's view of them: `gh pr list` shows five requests with nothing saying which
+one sits under which, and `gh stack` answers `unknown command "stack"`.
+
+This is per machine, and yours is separate from the box's. The box needs its own
+copy for the agents to *write* stacks with, which is an operator step on the box
+and not something your laptop can supply — see
+[`docs/teammate.md`](teammate.md).
+
 ## Making the step go away (operator)
 
 The workaround exists only because nobody has bought an **Apple Developer

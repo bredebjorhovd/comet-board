@@ -172,10 +172,40 @@ dispatched agent fail on the credential.
 
 ---
 
+## Not a sixth step: `gh stack`
+
+The one tool a dispatch can ask for that a box may not have. `comet-board
+dispatch --stack` asks the agent to decompose its task into layered pull
+requests, and the layers are cut by the `gh stack` extension (§gh#287):
+
+```bash
+gh extension install github/gh-stack     # on the box, once, for everybody
+```
+
+Once per **box**, not once per person — `gh` installs extensions into
+`~/.local/share/gh/extensions/`, which every slot and every run on the machine
+shares. That is why it is not a step here: adding a teammate never needs it
+done again.
+
+**If you skip it:** nothing breaks. The brief tells a `--stack` agent to
+install the extension itself, and it can — gh#324 measured that install
+succeeding on the board's own credential, needing nobody's login. What it costs
+is the opening minutes of a run that is billed and capped, spent on tooling,
+with no sign to whoever is watching that that is what they are watching.
+`comet-board doctor`'s `gh stack` line says whether this box has it, and says so
+more pointedly once the board holds stacked pull requests of its own.
+
+The teammate's *own machine* is the quieter half. Somebody who opens a stack the
+board produced and wants to see the chain rather than five unrelated pull
+requests runs the same one command locally, against their own `gh` login —
+[`docs/macos-install.md`](macos-install.md) says so where they set that machine
+up. Nothing on the box can do it for them.
+
 ## What `doctor` confirms
 
-`comet-board doctor` on the box is the check for steps 3, 4 and 5. The three
-lines, and which step each one is about:
+`comet-board doctor` on the box is the check for steps 3, 4 and 5. The lines,
+and which step each one is about — the last is about the box rather than about
+anybody on it:
 
 | line | step | what a healthy one says |
 | --- | --- | --- |
@@ -184,6 +214,7 @@ lines, and which step each one is about:
 | `github auth` / `github app` | 5 | which credential is live, which repos it reaches, and when its token expires |
 | `route N: account` | 4 | the slot a route names is one this device has saved, and of the right kind |
 | `billing guard` | 4 | what the board does about a dispatch that spends somebody else's subscription |
+| `gh stack` | no step — the box, once | the extension `dispatch --stack` needs is installed here. Never a FAIL, because an agent can install it mid-run; it changes what it says once this board holds stacked pull requests, which is the only durable evidence that a missing extension is costing anybody anything (§gh#335) |
 
 `dispatch authorship` is always printed and never a failure. No map at all is
 the single-operator default and is exactly right on a box only one person
