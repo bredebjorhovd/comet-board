@@ -31,8 +31,9 @@ learn and map back, which is the problem gh#357 exists to remove.
 ### The first three words are the wrong three
 
 The obvious slug is the title's opening words, and it is *worse than the
-number*, because English titles open with articles, auxiliaries and hedges.
-Measured against this board's own issue titles:
+number*, because titles open with articles, auxiliaries and hedges. Measured
+against this repo's own issue titles — which, as the next section is about, is
+not the same population as the board's:
 
 | first four words | content words |
 | --- | --- |
@@ -42,10 +43,9 @@ Measured against this board's own issue titles:
 | `the-review-page-loads` | `review-page-loads` |
 
 So the stopwords come out first, three content words go in, and the whole thing
-is capped at 28 characters and cut between words. Roughly four in five titles
-produce something genuinely useful; the rest come out harmless, which is the
-trade this is allowed to make — the identifier beside it still carries the
-meaning, so a poor slug costs a reader nothing but the width.
+is capped at 28 characters and cut between words. The trade this is allowed to
+make is that a *poor* slug costs a reader nothing but the width, because the
+identifier beside it still carries the meaning.
 
 Three kinds of word most stopword lists strip are content here, deliberately:
 
@@ -55,19 +55,64 @@ Three kinds of word most stopword lists strip are content here, deliberately:
 - **Quantities.** `a-github-only-board`, `one-name-for-a-task`: when a title
   mentions the count, the count is usually the point.
 
-A word carrying non-ASCII letters is dropped whole rather than mangled.
-`Ålesund` has no honest ASCII form, `lesund` is not the word, and a branch name
-is not the place to invent a transliteration. A Norwegian title can therefore
-produce no slug at all — which is a supported answer everywhere, because the
-identifier alone is always enough.
+### The population it was measured against was not the one it ships to
+
+The table above is drawn from this repo, and every title in it is English. The
+board is not. Review of this pull request ran the first cut over the live set of
+651 tasks: **73 titles — 11% — contained a word that was being dropped whole for
+carrying a non-ASCII letter**, and in most of them that was the word carrying the
+meaning.
+
+```
+fix(nav): ⌘K åpner søket — ikke assistenten        ->  fix-nav-k
+Kjør dryRun av Altinn-innboks-cronen i prod        ->  dryrun-av-altinn
+Fakturahistorikk og kreditering per byrå           ->  fakturahistorikk-og
+```
+
+`fix-nav-k` is not the harmless outcome this design budgets for. It is a slug
+whose one distinguishing word is a letter, standing next to an identifier that
+was perfectly clear on its own — and the standard this rests on is that a poor
+slug costs a reader *nothing but the width*.
+
+The first cut argued that `Ålesund` cannot survive an ASCII slug, because
+`lesund` is not the word. That is true of **deleting** the letter and skips the
+third option: `å→a`, `ø→o`, `æ→ae` is not a transliteration this module
+invented — it is what every Norwegian system does, and what everybody here
+already types by hand into a branch name. `Kjør` is `kjor`, `byrå` is `byra`.
+`fold` carries that map, plus the accents that turn up beside it (`é ö ü`) and
+combining marks for decomposed input. A letter with *no* ASCII spelling —
+Cyrillic, CJK — still drops its word, and a title that loses every word this way
+still has no slug. `None` just stopped being reachable by way of a language.
+
+Two rules followed from the same reading:
+
+- **The stopword list is language-scoped.** Look at what the survivors spent
+  their three slots on: `fakturahistorikk-og`, `lag-tilbud-fra`,
+  `kan-ikke-konteres`. Norwegian articles, prepositions and modals, in exactly
+  the position the list exists to protect — so a Norwegian title was charged
+  twice, losing content words to the ASCII rule and then spending the freed
+  slots on function words the list could not see. Norwegian entries are listed
+  in their *folded* spelling (`på` is `pa`), because the fold runs first. `ikke`
+  stays content, for the reason `not` does.
+- **A one-character word is not a word.** `⌘K` leaves a bare `k` behind, and a
+  lone letter says less than the identifier beside it already does.
+
+Of the seven titles the review sampled, five improve and two were already right;
+`fix(nav): ⌘K åpner søket` becomes `fix-nav-apner`. All seven are pinned as
+tests.
+
+**Why this rose above a nit:** the slug is documented as decoration that drops
+first, and on every *row* it does. But it also names the branch and the worktree
+path, where it cannot drop and gets no second chance — `board/gh-341-fix-nav-k`
+is what `git branch` says for the life of that work.
 
 ### The branch was already spending that budget, on nothing
 
 `branch_slug` was `slugify("{identifier}-{repo}")`, so a branch was
 `board/gh-341-comet-board` and its worktree
 `~/.comet-native/worktrees/comet-board/board-gh-341-comet-board`. **The repo
-appears twice there and is implicit both times**: a branch lives in the repo it was cut
-in, and the worktree already sits under a per-repo directory
+appears twice there and is implicit both times**: a branch lives in the repo it
+was cut in, and the worktree already sits under a per-repo directory
 (`Repos::create_worktree_on`). Branch namespaces are per-repo, so nothing
 collides by dropping it. It now reads `board/gh-341-review-page-loads`, and
 every `git branch`, worktree path and pull request head ref reads with it.
@@ -133,8 +178,11 @@ so a narrow panel truncates the description and never the identifier. That is
 the same rule the terminal keeps by dropping the slug outright — the difference
 is the medium, not the decision.
 
-The Swift stopword list is a hand-port and has to stay in step with the Rust
-one: a branch is named on the box, from the Rust list, and a phone stripping a
-different set would render a different slug for the same task. There is no Swift
-spec runner over these derivations, so that half rests on the Rust tests and on
-review — the same standing gap gh#357 recorded.
+The Swift stopword list and fold table are hand-ports and have to stay in step
+with the Rust: a phone that folded a different letter would render a different
+slug for the same task. What it cannot do is *name* anything differently — the
+branch is cut on the box, from the Rust — so a drift here is cosmetic, which is
+why this ships without the cross-language fixture that `view::stats` and
+`board::claims` have (`scripts/ios-stats-spec.sh`, `scripts/ios-review-spec.sh`).
+The project's groups are file-system-synchronized, so adding one later costs a
+generator, a runner and a script, and no `project.pbxproj` edit.

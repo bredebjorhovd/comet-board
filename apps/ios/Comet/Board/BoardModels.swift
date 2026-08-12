@@ -405,9 +405,14 @@ private let slugMax = 28
 /// named on the box from the Rust list, and a phone that stripped a different
 /// set would render a different slug for the same task.
 ///
-/// Negations (`no`, `not`), particles (`up`, `out`, `off`, `down`) and
+/// Language-scoped, and a list rather than a law: English, plus the Norwegian
+/// that is about one title in nine on this board. Norwegian entries are spelled
+/// folded (`på` is `pa`), because `asciiFold` runs before the lookup.
+///
+/// Negations (`no`, `not`, `ikke`), particles (`up`, `out`, `off`, `down`) and
 /// quantities (`one`, `once`, `only`, `two`) are content here, deliberately —
-/// see the Rust list for what each is protecting.
+/// see the Rust list for what each is protecting, including why `var` is absent
+/// from the Norwegian half.
 private let slugStopwords: Set<String> = [
     "a", "an", "the",
     "and", "or", "but", "nor", "so", "if", "because", "while", "when", "whether", "than", "then",
@@ -422,23 +427,76 @@ private let slugStopwords: Set<String> = [
     "might", "must", "let",
     "just", "even", "still", "really", "actually", "simply", "quite", "rather", "also", "very",
     "too",
+    "og", "eller", "men", "hvis", "pa", "av", "med", "som", "til", "fra", "en", "et", "den", "det",
+    "de", "er", "kan", "skal", "vil", "har", "ved", "om",
 ]
+
+/// The ASCII a Latin letter is spelled with when ASCII is all there is — a port
+/// of `view::slug::fold`, and the half of this file most worth keeping in step:
+/// `å→a`, `ø→o`, `æ→ae` is what every Norwegian system already does, and what
+/// the box will have put in the branch name.
+///
+/// Nil means the letter has no ASCII spelling at all (Cyrillic, CJK), which
+/// drops its word rather than guessing at it.
+private func asciiFold(_ c: Character) -> String? {
+    switch Character(c.lowercased()) {
+    case "å": return "a"
+    case "ø": return "o"
+    case "æ": return "ae"
+    case "à", "á", "â", "ã", "ä", "ā", "ă", "ą": return "a"
+    case "è", "é", "ê", "ë", "ē", "ė", "ę": return "e"
+    case "ì", "í", "î", "ï", "ī", "į": return "i"
+    case "ò", "ó", "ô", "õ", "ö", "ō": return "o"
+    case "ù", "ú", "û", "ü", "ū", "ů": return "u"
+    case "ý", "ÿ": return "y"
+    case "ñ", "ń": return "n"
+    case "ç", "ć", "č": return "c"
+    case "š", "ś": return "s"
+    case "ž", "ź", "ż": return "z"
+    case "ł": return "l"
+    case "đ", "ð": return "d"
+    case "ř": return "r"
+    case "ť": return "t"
+    case "œ": return "oe"
+    case "ß": return "ss"
+    case "þ": return "th"
+    default: return nil
+    }
+}
 
 /// A slug of a title: up to `slugWords` content words, joined with `-`, capped
 /// at `slugMax` characters. Nil when the title yields nothing — which every
 /// caller must handle, because the identifier alone is always enough.
 ///
-/// A port of `view::slug::title_slug`, down to the two rules that look like
-/// details and are not: an apostrophe does not split a word (`task's` is
-/// `tasks`, not `task` + `s`), and a word carrying non-ASCII letters is dropped
-/// whole rather than mangled — `Ålesund` has no honest ASCII form, and
-/// `lesund` beside an identifier is worse than the identifier standing alone.
+/// A port of `view::slug::title_slug`, down to the rules that look like details
+/// and are not: an apostrophe does not split a word (`task's` is `tasks`, not
+/// `task` + `s`); a non-ASCII letter is folded rather than dropped (`Kjør` is
+/// `kjor`), and only a letter with no ASCII spelling at all drops its word; and
+/// a one-character word is not a word, because `⌘K åpner søket` is about the
+/// search and not about the letter `k`.
+///
+/// Swift's `Character` is a grapheme cluster, so a decomposed `å` arrives as one
+/// `Character` and folds like the precomposed one — the combining-mark case the
+/// Rust side handles per `char`.
 func titleSlug(_ title: String) -> String? {
     var words: [String] = []
     for raw in title.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "\u{2019}" }) {
-        if raw.contains(where: { ($0.isLetter || $0.isNumber) && !$0.isASCII }) { continue }
-        let word = String(raw.filter { $0.isASCII && ($0.isLetter || $0.isNumber) }).lowercased()
-        if word.isEmpty || slugStopwords.contains(word) { continue }
+        var word = ""
+        var droppable = false
+        for c in raw {
+            if c.isASCII && (c.isLetter || c.isNumber) {
+                word += c.lowercased()
+            } else if c == "'" || c == "\u{2019}" {
+                continue
+            } else if let ascii = asciiFold(c) {
+                word += ascii
+            } else if c.isLetter || c.isNumber {
+                droppable = true
+                break
+            }
+        }
+        // A lone letter and a function word are the same kind of nothing.
+        if droppable || word.count < 2 || slugStopwords.contains(word) { continue }
         words.append(word)
         if words.count == slugWords { break }
     }
