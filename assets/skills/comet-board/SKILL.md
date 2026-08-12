@@ -149,7 +149,8 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
   Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
   default) — and is the first addressee, so what reaches you does not also
   reach the board's orchestrator. The board keeps your chat off the shelf
-  while work you released is still out, so waiting is safe. Never promise
+  until the work you released has left the board — settling is not enough, so
+  the whole merge window is yours. Never promise
   you'll be woken: the setting is invisible from here, and a chat somebody
   filed away by hand is told nothing.
 - Never dispatch speculatively — a human keypress or explicit instruction

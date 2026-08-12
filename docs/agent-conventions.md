@@ -430,9 +430,10 @@ reclaimed on its own, week-long clock (`archive_chats`, per route;
 `retain_worktrees`, board-wide). Never while
 your attempt is live or blocked, and never while a pull request is still in
 review: a chat in review is how the board delivers comments back to you, so it
-outlives everything else. Never, either, while work *you* released is still
-running — dispatch through the board and your own chat is held until every
-child has come back, whether or not anybody pinned you. The transcript survives archiving, Settings →
+outlives everything else. Never, either, while work *you* released is
+still owed — dispatch through the board and your own chat is held until every
+child has left the board, not merely until it settled, whether or not anybody
+pinned you. You get the whole merge window in the thread you dispatched from. The transcript survives archiving, Settings →
 Archived puts a chat back, and an attempt re-opened by the rule above brings its
 own chat back with it. Nothing here needs anything from you; it is why a space's
 sidebar shows what is current rather than everything that ever ran.

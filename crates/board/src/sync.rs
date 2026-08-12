@@ -2655,12 +2655,15 @@ impl SyncEngine {
     ///   still working on.
     /// - **The pinned orchestrator**, whatever attempt it was dispatched as: it
     ///   is told about every settle on the board, so it is never finished.
-    /// - **A chat that has released work still running** (gh#354). Read off
-    ///   [`gc::Dispatchers`], which is `dispatched_by_pane` — the same edge
-    ///   [`SyncEngine::wake_dispatcher`] delivers a settle notice on — turned
-    ///   around. A chat is a dispatcher because it dispatched, not because
-    ///   somebody pinned it, and the two agents it is waiting on are the whole
-    ///   reason somebody is sitting in it.
+    /// - **A chat that has released work the board is not finished with**
+    ///   (gh#354). Read off [`gc::Dispatchers`], which is `dispatched_by_pane`
+    ///   — the same edge [`SyncEngine::wake_dispatcher`] delivers a settle
+    ///   notice on — turned around. A chat is a dispatcher because it
+    ///   dispatched, not because somebody pinned it, and the two agents it is
+    ///   waiting on are the whole reason somebody is sitting in it. The hold
+    ///   runs until the *work* leaves the board rather than until the attempt
+    ///   closes: the settle notice is delivered into this chat, so a hold that
+    ///   ended at settle would end one sweep before the merge it is there for.
     /// - **A chat with no board attempt.** The sweep walks attempts, so a chat
     ///   somebody made by hand is never even a candidate. Those are theirs.
     ///
@@ -2705,7 +2708,7 @@ impl SyncEngine {
         // And who is still waiting on work they released (gh#354). Built once
         // from the whole board, for the same reason: the attempts a chat
         // dispatched sit under other tasks entirely.
-        let dispatchers = gc::Dispatchers::of(&tasks);
+        let dispatchers = gc::Dispatchers::of(&tasks, &dependents);
         for task in &tasks {
             // Per route, resolved now rather than stamped at dispatch: the
             // window is a property of the shelf the chat sits on, and an
@@ -2729,7 +2732,22 @@ impl SyncEngine {
                     .map(|t| secs_since(t, now).unwrap_or(0));
                 let standing =
                     gc::chat_standing(task, attempt, orchestrator, &dispatchers, &dependents);
-                if let Some(chat) = attempt.pane_id.as_deref().filter(|c| dispatchers.holds(c)) {
+                // Say why, but only where this hold is the operative one. A
+                // chat its own open attempt, its pin or its review already
+                // holds is not on the shelf because of what it dispatched, and
+                // a line claiming otherwise sends the reader to a fact that is
+                // not the one keeping it — the failure gh#194 was about. Asked
+                // by re-running the same decision without the hold, so there is
+                // no second copy of the rule to drift from the first.
+                if let Some(chat) = attempt.pane_id.as_deref().filter(|c| dispatchers.holds(c))
+                    && gc::chat_standing(
+                        task,
+                        attempt,
+                        orchestrator,
+                        &gc::Dispatchers::default(),
+                        &dependents,
+                    ) == gc::Standing::Spent
+                {
                     self.note_held_as_dispatcher(task, attempt, chat, &dispatchers);
                 }
                 if let Err(e) = match gc::decide(standing, spent, window) {
@@ -2771,7 +2789,7 @@ impl SyncEngine {
             .join(", ");
         self.log.info(format!(
             "{}: keeping chat {chat} on the shelf — it released attempt {released}, \
-             which has not come back",
+             which the board is not finished with",
             task.identifier,
         ));
     }
@@ -10117,13 +10135,18 @@ max_duration = "{max_duration}"
         );
     }
 
-    /// gh#354, end to end through the sweep. "I dispatched two agents through
-    /// another pane; when the PRs were merged, the thread that I was working
-    /// from disappeared." That pane was itself a board attempt: its own task
-    /// settled, its window passed, and the sweep — which could see the pin and
-    /// nothing else — filed away the thread somebody was working in.
+    /// gh#354, end to end through the sweep, replayed against the report it
+    /// came from: "I dispatched two agents through another pane; when the PRs
+    /// were merged, the thread that I was working from disappeared."
+    ///
+    /// The hold has to survive the children *settling*, which is the moment the
+    /// pull requests open and the notices land in this chat — not the moment
+    /// the work is over. With `archive_chats` at its `on-settle` default there
+    /// is no window to absorb the difference: a hold that ended at settle would
+    /// take the thread one sweep earlier than he described rather than fixing
+    /// anything.
     #[test]
-    fn a_chat_that_released_work_still_running_is_never_archived() {
+    fn a_chat_that_released_unfinished_work_is_never_archived() {
         let e = engine(None);
         // The pane he dispatched from: a settled attempt on a closed issue,
         // which is every bit of what the sweep used to need.
@@ -10144,15 +10167,33 @@ max_duration = "{max_duration}"
             "and the clock never starts while it is waiting on an agent"
         );
 
-        // Narrower than "never archive anything that dispatched": once the work
-        // it released has come back, it is finished like anything else.
+        // The agent finishes and opens its pull request. The task is still on
+        // the board — this is the interval he reads the diff and merges in, and
+        // the notice that starts it was delivered into this very chat.
         e.db.close_attempt(child, Outcome::Done).unwrap();
+        for _ in 0..3 {
+            e.archive_chats(Some(&shelf));
+        }
+        assert!(
+            shelf.archived.borrow().is_empty(),
+            "a settled child is not a finished one — this is the merge window"
+        );
+        assert!(attempt_row(&e, dispatcher).chat_archivable_at.is_none());
+
+        // The pull request merges and the issue closes. Now nothing is owed,
+        // and the shelf clears on the ordinary terms.
+        seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Terminal);
         e.archive_chats(Some(&shelf));
         assert!(attempt_row(&e, dispatcher).chat_archivable_at.is_some());
         e.archive_chats(Some(&shelf));
+        // Both of them: the child's chat is spent for the ordinary reason and
+        // the dispatcher's is spent because the child is. A family finishes
+        // together, which is the whole of what the shelf sweep is for.
+        let mut archived = shelf.archived.borrow().clone();
+        archived.sort();
         assert_eq!(
-            shelf.archived.borrow().as_slice(),
-            [("chat-9".to_string(), true)]
+            archived,
+            [("chat-10".to_string(), true), ("chat-9".to_string(), true)]
         );
     }
 
@@ -10176,6 +10217,34 @@ max_duration = "{max_duration}"
             attempt_row(&e, dispatcher).chat_archivable_at.is_none(),
             "the window starts over when the work it released comes back"
         );
+    }
+
+    /// The "why is this still here" line claims the hold that is actually
+    /// keeping the chat. A pinned orchestrator that also dispatches was held by
+    /// its pin before any of this existed, so the dispatcher note must not
+    /// speak for it — the reader would go and look at the wrong fact.
+    #[test]
+    fn the_note_names_the_hold_that_is_doing_the_work() {
+        let mut e = engine(None);
+        let dispatcher = spent_chat(&e);
+        seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Started);
+        dispatch_via(&e, "linear:LIN-143", "chat-10", "chat-9");
+        let shelf = Shelf::default();
+
+        e.cfg.defaults.orchestrator_chat = Some("chat-9".into());
+        e.archive_chats(Some(&shelf));
+        assert!(
+            matches!(e.db.meta_get(&meta::dispatcher_noted(dispatcher)), Ok(None)),
+            "the pin was holding this chat with or without what it dispatched"
+        );
+
+        // Unpinned, the dispatch is the only thing keeping it, and says so.
+        e.cfg.defaults.orchestrator_chat = None;
+        e.archive_chats(Some(&shelf));
+        assert!(matches!(
+            e.db.meta_get(&meta::dispatcher_noted(dispatcher)),
+            Ok(Some(_))
+        ));
     }
 
     #[test]
