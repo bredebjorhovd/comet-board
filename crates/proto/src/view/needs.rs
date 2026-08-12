@@ -103,6 +103,16 @@ pub struct NeedRow {
     /// WHO wants you: [`ORCHESTRATOR_NAME`], an issue identifier (`gh#503`),
     /// or the chat's own title.
     pub who: String,
+    /// A short slug of the task's title (gh#364), drawn after
+    /// [`who`](Self::who) where the room is there — `gh#503
+    /// review-page-loads`.
+    ///
+    /// Only ever set on the rows whose `who` is an identifier: the
+    /// orchestrator's row and an ad-hoc chat's are already named in words, and
+    /// a slug of the chat title beside the chat title says one thing twice.
+    /// Decoration on the key, so a narrow surface drops it and keeps the
+    /// identifier — see [`crate::view::board::AgentRow::slug`].
+    pub slug: Option<String>,
     /// WHAT it wants, one line: the chat's last words
     /// (`last_message_preview`), or the kind's [`NeedKind::fallback`].
     pub what: String,
@@ -164,6 +174,8 @@ pub fn needs_you(
                 chat_id: chat.id.clone(),
                 space_id: chat.space_id.clone(),
                 who: ORCHESTRATOR_NAME.to_string(),
+                // A name already, and not a task's — nothing to decorate.
+                slug: None,
                 what: what_line(chat, kind),
                 kind,
                 since: match kind {
@@ -210,6 +222,7 @@ pub fn needs_you(
             chat_id: chat_id.to_string(),
             space_id: chat.space_id.clone(),
             who: row.identifier.clone(),
+            slug: row.slug(),
             what: what_line(chat, kind),
             kind,
             since,
@@ -241,6 +254,8 @@ pub fn needs_you(
                 .filter(|t| !t.is_empty())
                 .unwrap_or(crate::view::board::UNTITLED_CHAT)
                 .to_string(),
+            // Named in its own words already — see [`NeedRow::slug`].
+            slug: None,
             what: what_line(chat, NeedKind::Question),
             kind: NeedKind::Question,
             since: session.map(|s| s.updated_at),

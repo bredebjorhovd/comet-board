@@ -956,8 +956,12 @@ fn default_max_concurrent() -> usize {
     3
 }
 
-/// Impl spec §5. The design fixtures show `lin-145-altinn-retry`, but the design
-/// handoff (#11) defers to the impl spec here, and it is config either way.
+/// Impl spec §5. The design fixtures show `lin-145-altinn-retry`, and gh#364
+/// has now arrived at that from the other end — `{identifier_lower}` carries
+/// the identifier and a slug of the title, so the default renders
+/// `board/lin-145-altinn-retry-fails` rather than the identifier alone. The
+/// template is config either way; what it interpolates to is
+/// [`crate::dispatch::branch_slug`].
 fn default_branch_template() -> String {
     "board/{identifier_lower}".into()
 }

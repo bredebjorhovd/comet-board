@@ -182,9 +182,10 @@ labels = ["herd"]
 {linear_routes}{routes}
 [defaults]
 max_concurrent_per_workspace = 3
-# The identifier made branch-safe: `LIN-145` → `lin-145`. GitHub numbers issues
-# per repository, so a GitHub identifier carries its repo as well — `gh#2` in
-# tripletex-mcp is `gh-2-tripletex-mcp`.
+# The identifier made branch-safe, then a short slug of the title: `gh#341`
+# titled "The review page loads nothing" branches to
+# `board/gh-341-review-page-loads`. A title that yields no slug leaves the
+# identifier alone, which is always enough to name the task.
 branch_template = "board/{{identifier_lower}}"
 # What each branch is cut from. `origin/HEAD` is the remote's default branch,
 # fetched before the worktree is cut, so a box whose folders sit on last week's

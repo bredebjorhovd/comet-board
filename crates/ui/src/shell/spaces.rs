@@ -1728,7 +1728,21 @@ impl Shell {
                             .text_size(px(Theme::TEXT_BODY))
                             .line_height(px(17.0))
                             .child(SharedString::from(transcript::single_line(&need.who))),
-                    ),
+                    )
+                    // The slug after an identifier WHO (gh#364): an inbox of
+                    // `gh#341` and `gh#342` is two rows that look alike. Muted
+                    // and shrinkable, so a narrow panel spends its last pixels
+                    // on the name rather than on the description of it.
+                    .when_some(need.slug.clone(), |el, slug| {
+                        el.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(subline)
+                                .child(SharedString::from(slug)),
+                        )
+                    }),
             )
             // Line 2: WHAT, aligned under WHO.
             .child(
@@ -2144,17 +2158,40 @@ impl Shell {
                     .gap(px(6.0))
                     .child(rail)
                     .child(
-                        div().flex_1().min_w_0().flex().flex_row().child(
-                            div()
-                                .max_w_full()
-                                .truncate()
-                                .px(px(5.0))
-                                .rounded(px(Theme::RADIUS_CHIP))
-                                .bg(theme.wash(0.11))
-                                .text_size(px(Theme::TEXT_DENSE))
-                                .line_height(px(17.0))
-                                .child(SharedString::from(agent.identifier.clone())),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .max_w_full()
+                                    .truncate()
+                                    .px(px(5.0))
+                                    .rounded(px(Theme::RADIUS_CHIP))
+                                    .bg(theme.wash(0.11))
+                                    .text_size(px(Theme::TEXT_DENSE))
+                                    .line_height(px(17.0))
+                                    .child(SharedString::from(agent.identifier.clone())),
+                            )
+                            // The slug (gh#364), outside the chip: the chip is
+                            // the origin telling, and this is what the work is
+                            // — four agents in flight are `gh#341 gh#342
+                            // gh#343 gh#356` without it. It shrinks with the
+                            // panel, and being the longer of the two it is the
+                            // one that gives its pixels up.
+                            .when_some(agent.slug.clone(), |el, slug| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(Theme::TEXT_CAPTION))
+                                        .text_color(subline)
+                                        .child(SharedString::from(slug)),
+                                )
+                            }),
                     )
                     .when_some(agent.elapsed_label(now), |el, label| {
                         el.child(

@@ -1449,7 +1449,7 @@ runtime = "mock"
         // The runtime got the resolved spec…
         let specs = runtime.dispatched.lock().unwrap();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].branch, "board/gh-7-widget");
+        assert_eq!(specs[0].branch, "board/gh-7-add-retry");
         assert_eq!(specs[0].space_id, "space-widget");
         assert_eq!(specs[0].harness, comet_proto::HarnessId::Mock);
         drop(specs);
@@ -1460,7 +1460,7 @@ runtime = "mock"
         let attempt = task.live_attempt().expect("live attempt");
         assert_eq!(attempt.pane_id.as_deref(), Some("chat-for-gh#7"));
         assert_eq!(attempt.dispatched_by_pane.as_deref(), Some("chat-parent"));
-        assert_eq!(attempt.branch.as_deref(), Some("board/gh-7-widget"));
+        assert_eq!(attempt.branch.as_deref(), Some("board/gh-7-add-retry"));
 
         // A second dispatch is refused while the first attempt is live.
         let err = service

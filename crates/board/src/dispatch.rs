@@ -21,20 +21,44 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use comet_proto::view::slug::title_slug;
 
 use crate::billing::{Attribution, Billing};
 use crate::config::{Route, RoutingConfig, interpolate, slugify};
 use crate::db::Db;
-use crate::model::{Dispatcher, Task, UpstreamState, gh_repo_name};
+use crate::model::{Dispatcher, Task, UpstreamState};
 use crate::runtime::{DispatchSpec, harness_for_runtime};
 use crate::sync::route_context;
 
-/// The branch slug for a task: `gh#2` in `owner/repo` → `gh-2-repo`, `LIN-145`
-/// → `lin-145`. Repo-qualified for GitHub tasks so two repos releasing their
-/// issue 2 at once do not collide (herdr-board AGE-20).
+/// The branch slug for a task: `gh#341` titled "The review page loads nothing"
+/// → `gh-341-review-page-loads`, `LIN-145` → `lin-145-<its slug>`. The
+/// identifier, made branch-safe, and then what the task is *about* (gh#364).
+///
+/// It used to be the identifier and the *repo* — `gh-341-comet-board`, from
+/// herdr-board AGE-20, where another repo's merged pull request had attached
+/// itself to an untouched task. The repo appears twice in the result of that
+/// and is implicit both times: a branch lives in the repo it was cut in, and
+/// the worktree is already under a per-repo directory
+/// (`Repos::create_worktree_on`), so
+/// `~/.comet-native/worktrees/comet-board/board-gh-341-comet-board` says it
+/// three times and tells a reader nothing. Branch namespaces are
+/// per-repo, so nothing collides by dropping it.
+///
+/// AGE-20's fix is unaffected, because the branch was never what fixed it: the
+/// scope is the repo the *task id* names ([`crate::sync::link_for`]'s
+/// `own_repo`, and `AttemptBranches`' `in_repo`), which is exactly why those
+/// two carry the comment that attempts recorded before the qualification do
+/// not have it in their branch either. Nothing anywhere parses a repo back out
+/// of a branch name — `crate::stacks::layer_of` reads the `-2`/`-3` suffix off
+/// whatever the attempt branch is, and `link_pull_requests` matches `head_ref
+/// == attempt.branch` whole.
+///
+/// A title with no slug in it ([`title_slug`]) leaves the identifier standing
+/// alone, which is the rule the whole feature keeps: the identifier is always
+/// enough.
 pub fn branch_slug(task: &Task) -> String {
-    match gh_repo_name(&task.id) {
-        Some(repo) => slugify(&format!("{}-{repo}", task.identifier)),
+    match title_slug(&task.title) {
+        Some(slug) => slugify(&format!("{}-{slug}", task.identifier)),
         None => slugify(&task.identifier),
     }
 }
@@ -50,6 +74,11 @@ pub fn prompt_vars<'a>(
     v.insert("title", task.title.clone());
     v.insert("identifier", task.identifier.clone());
     v.insert("identifier_lower", branch_slug(task));
+    // The two halves of that on their own, for a template that wants to
+    // compose them itself — or to leave the slug out, which a route whose
+    // branches are read by something stricter than a human may want.
+    v.insert("identifier_slug", slugify(&task.identifier));
+    v.insert("title_slug", title_slug(&task.title).unwrap_or_default());
     v.insert("body", task.body.clone().unwrap_or_default());
     v.insert("url", task.url.clone());
     v.insert("branch", branch.to_string());
@@ -156,9 +185,46 @@ fn pr_base_line(base: &str) -> String {
 }
 
 /// Resolve the branch name for an attempt.
+///
+/// The template's answer, unless this task already holds a branch under the
+/// same template — then that one, whatever it is called.
+///
+/// The reuse is gh#364's cost of admission. A branch built from the identifier
+/// and the repo was built from two things that never change; one built from the
+/// *title* is built on a field the tracker's owner can edit at any moment, and
+/// nothing warns the board when they do. Without this, an issue renamed between
+/// two attempts would send the retry to a fresh branch cut from base, leaving
+/// the first attempt's commits (and its pull request) on a branch nothing on the
+/// board points at any more — which is precisely the promise
+/// `Repos::create_worktree_on` makes and keeps: *a retry must land on the
+/// previous attempt's commits, never rebase them onto a newer base.*
+///
+/// Same-template is decided by the stem — the template with the descriptive
+/// half emptied, `board/gh-341` — because that half is the only part allowed to
+/// move. A branch that does not start with the stem was named by a different
+/// template (a route edited between attempts) or by nothing here at all, and
+/// reusing it would be a guess. Attempts recorded before this issue land on the
+/// same rule for free: `board/gh-341-comet-board` starts with `board/gh-341`,
+/// so a task in flight when the box updates keeps the branch it is working on.
 pub fn resolve_branch(cfg: &RoutingConfig, route: &Route, task: &Task) -> String {
     let vars = prompt_vars(task, "", &route.workspace);
-    interpolate(cfg.branch_template(route), &vars)
+    let template = cfg.branch_template(route);
+    let branch = interpolate(template, &vars);
+    let stem = {
+        let mut vars = vars.clone();
+        vars.insert("identifier_lower", slugify(&task.identifier));
+        vars.insert("title_slug", String::new());
+        interpolate(template, &vars)
+    };
+    task.attempts
+        .iter()
+        .rev()
+        .filter_map(|attempt| attempt.branch.as_deref())
+        .find(|held| {
+            *held == stem || held.strip_prefix(&stem).is_some_and(|t| t.starts_with('-'))
+        })
+        .map(str::to_string)
+        .unwrap_or(branch)
 }
 
 /// The space a route's `workspace` names, resolved by the caller — the board
@@ -832,8 +898,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(spec.prompt.contains("gh stack init board/gh-7-widget"));
-        assert!(spec.prompt.contains("gh stack add board/gh-7-widget-2"));
+        assert!(spec.prompt.contains("gh stack init board/gh-7-fix-flaky-retry"));
+        assert!(spec.prompt.contains("gh stack add board/gh-7-fix-flaky-retry-2"));
         // And the task's own brief is still in front of it.
         assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
     }
@@ -855,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_comes_from_the_template_repo_qualified() {
+    fn branch_comes_from_the_template_and_says_what_the_task_is() {
         let spec = build_spec(
             &RoutingConfig::default(),
             &route(),
@@ -865,7 +931,71 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(spec.branch, "board/gh-7-widget");
+        assert_eq!(spec.branch, "board/gh-7-fix-flaky-retry");
+    }
+
+    /// gh#364. The half a branch used to spend on the repo — which a branch
+    /// and its worktree path both already say — now says what the task is.
+    #[test]
+    fn the_branch_spends_its_descriptive_half_on_the_title() {
+        let mut task = task();
+        assert_eq!(branch_slug(&task), "gh-7-fix-flaky-retry");
+
+        // A Linear task is qualified the same way; it never carried a repo to
+        // lose, and it gains the same description.
+        task.id = "linear:LIN-145".into();
+        task.identifier = "LIN-145".into();
+        task.title = "Altinn retry fails on the second attempt".into();
+        assert_eq!(branch_slug(&task), "lin-145-altinn-retry-fails");
+
+        // A title with no content words in it leaves the identifier standing
+        // alone — the guarantee gh#357's rule rests on, and cheaper than
+        // inventing something.
+        task.title = "It is what it is".into();
+        assert_eq!(branch_slug(&task), "lin-145");
+    }
+
+    /// The cost of admission, paid: the branch now depends on a field the
+    /// tracker's owner can edit mid-flight, so a retry has to find the branch
+    /// the first attempt is actually on rather than cut a fresh one and orphan
+    /// its commits.
+    #[test]
+    fn a_retry_lands_on_the_branch_the_task_already_holds() {
+        let db = Db::open_in_memory().unwrap();
+        let cfg = RoutingConfig::default();
+        sibling(&db, "gh:owner/widget#7", "gh#7", "board/gh-7-fix-flaky-retry", None);
+        let reload = |db: &Db| db.get_task("gh:owner/widget#7").unwrap().unwrap();
+
+        // Renamed upstream after the first attempt: the slug the template
+        // would render has moved, and the branch has not.
+        let mut task = reload(&db);
+        task.title = "Fix the retry that flakes under load".into();
+        assert_eq!(
+            resolve_branch(&cfg, &route(), &task),
+            "board/gh-7-fix-flaky-retry",
+            "a renamed issue must not orphan the branch its attempt is on"
+        );
+
+        // The same rule carries an attempt made before gh#364 — the old
+        // repo-qualified branch shares the identifier stem, so a box that
+        // updates mid-flight keeps working where it was working.
+        let db = Db::open_in_memory().unwrap();
+        sibling(&db, "gh:owner/widget#7", "gh#7", "board/gh-7-widget", None);
+        let mut task = reload(&db);
+        task.title = "Fix the flaky retry".into();
+        assert_eq!(resolve_branch(&cfg, &route(), &task), "board/gh-7-widget");
+
+        // A branch under a different stem is a different template's, and
+        // guessing at it would be worse than naming the branch this template
+        // asks for.
+        let db = Db::open_in_memory().unwrap();
+        sibling(&db, "gh:owner/widget#7", "gh#7", "wip/hand-cut", None);
+        let mut task = reload(&db);
+        task.title = "Fix the flaky retry".into();
+        assert_eq!(
+            resolve_branch(&cfg, &route(), &task),
+            "board/gh-7-fix-flaky-retry"
+        );
     }
 
     #[test]
@@ -882,7 +1012,7 @@ mod tests {
         assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
         assert!(
             spec.prompt
-                .contains("the branch board/gh-7-widget is prepared")
+                .contains("the branch board/gh-7-fix-flaky-retry is prepared")
         );
         assert!(spec.prompt.contains("It flakes."));
     }
@@ -1581,9 +1711,9 @@ mod tests {
         // Unresolved (and legible) until the executor knows the checkout…
         assert!(spec.prompt.contains("{worktree}"), "{}", spec.prompt);
         // …then resolved with the real path.
-        let sent = spec.prompt_at("/worktrees/widget/board-gh-7-widget");
+        let sent = spec.prompt_at("/worktrees/widget/board-gh-7-fix-flaky-retry");
         assert!(
-            sent.contains("in /worktrees/widget/board-gh-7-widget."),
+            sent.contains("in /worktrees/widget/board-gh-7-fix-flaky-retry."),
             "{sent}"
         );
         assert!(!sent.contains('{'), "unresolved placeholder: {sent}");

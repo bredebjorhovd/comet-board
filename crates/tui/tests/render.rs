@@ -2967,3 +2967,54 @@ fn the_pinned_slot_carries_the_unpin_switch() {
         other => panic!("expected the config write, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The descriptive half of a name (gh#364)
+// ---------------------------------------------------------------------------
+
+/// An inbox of `gh#101` and `gh#102` is two rows that look alike. The slug goes
+/// after the identifier where the row has the width — and the identifier keeps
+/// it where the row has not, which on a 32-column sidebar is most of the time.
+#[test]
+fn a_row_that_has_the_room_says_what_the_task_is() {
+    let mut app = populated();
+    use comet_proto::view::board::BoardState;
+    app.apply(Update::Chats(vec![Chat {
+        branch: Some("board/gh-101-review-page-loads".into()),
+        ..chat("c1", "whatever the agent called it")
+    }]));
+    let mut row = board_row("101", BoardState::Blocked);
+    row.title = "The review page loads nothing".into();
+    row.chat_id = Some("c1".into());
+    row.branch = Some("board/gh-101-review-page-loads".into());
+    row.started_at = Some((Utc::now() - chrono::Duration::minutes(110)).to_rfc3339());
+    row.max_duration_secs = Some(7200);
+    app.apply(Update::Board(vec![row]));
+    app.apply(Update::Sessions(vec![Session {
+        chat_id: "c1".into(),
+        device_id: "dev".into(),
+        status: SessionStatus::AwaitingInput,
+        started_at: None,
+        updated_at: Utc::now(),
+    }]));
+
+    let sidebar = joined(&sidebar_of(&snapshot(&mut app, 100, 30), 100));
+    // The inbox row leads with the identifier and says what it is about — this
+    // line has no counter on it, so there is room for both.
+    assert!(
+        sidebar.contains("gh#101 review-page-loads"),
+        "the inbox row keeps its slug:\n{sidebar}"
+    );
+    // The Active row is the narrow case: the elapsed counter holds the right
+    // end, so the slug goes rather than the name. What must never happen is a
+    // row that lost the identifier, or one carrying half a word.
+    let active = sidebar
+        .lines()
+        .find(|line| line.contains("1h50m / 2h"))
+        .expect("the live attempt's row");
+    assert!(active.contains("gh#101"), "the name survives: {active:?}");
+    assert!(
+        !active.contains("review-page"),
+        "whole or not at all: {active:?}"
+    );
+}
