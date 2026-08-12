@@ -75,10 +75,12 @@ of those sentences has been told less than nothing.
 
 ### Where it shows
 
-- **The row**, on both viewports: `PR #12 · 2 of 3 · clean against
-  board/gh-11-lexer · waiting on PR #11`. The landing note replaces `waiting on
-  you` rather than joining it — both are the row's call to action and the one
-  that names a branch says strictly more.
+- **The row**, on both viewports: `2 of 3 · clean against board/gh-11-lexer ·
+  waiting on PR #11 · in PR #12`. The landing note replaces `waiting on you`
+  rather than joining it — both are the row's call to action and the one that
+  names a branch says strictly more. (This block led with `PR #12` when it
+  shipped; gh#357 moved the row's own pull request behind the facts, because
+  leading with it made the location read as the task's name.)
 - **The open row** carries `stack 2 of 3 · onto board/gh-11-lexer · lands on
   main` and the map itself: `#11 ↑ #12 ↑ #13`, this layer marked, a layer GitHub
   objects to in the failed colour, a landed one muted. On the desktop each chip

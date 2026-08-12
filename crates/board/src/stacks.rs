@@ -678,14 +678,14 @@ mod tests {
         let tasks = three_layers([Some("clean"); 3]);
         assert_eq!(
             merge_confirmation(&row_of(&tasks, 2)),
-            "merge PR #13 into main · this lands PR #11, PR #12 with it — \
+            "merge gh!13 into main · this lands PR #11, PR #12 with it — \
              GitHub merges the group or none of it",
         );
         // The bottom layer takes nothing with it, and the sentence stays a
         // sentence about one pull request.
         assert_eq!(
             merge_confirmation(&row_of(&tasks, 0)),
-            "merge PR #11 into main",
+            "merge gh!11 into main",
         );
     }
 
@@ -699,7 +699,7 @@ mod tests {
         tasks[1].pr_base_ref = Some("main".into());
         assert_eq!(
             merge_confirmation(&row_of(&tasks, 1)),
-            "merge PR #12 into main",
+            "merge gh!12 into main",
             "the merged parent is gone and #13 is above, not below",
         );
     }
@@ -712,7 +712,7 @@ mod tests {
         let tasks = three_layers([Some("dirty"), Some("clean"), Some("clean")]);
         assert_eq!(
             merge_confirmation(&row_of(&tasks, 2)),
-            "merge PR #13 into main · this lands PR #11, PR #12 with it — \
+            "merge gh!13 into main · this lands PR #11, PR #12 with it — \
              GitHub merges the group or none of it · \
              clean against board/gh-12-parser · waiting on PR #11",
         );

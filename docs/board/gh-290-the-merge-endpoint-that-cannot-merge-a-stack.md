@@ -87,9 +87,15 @@ because 1/9 and 2/9 put the stack on the row: the board knows which pull request
 a merge takes with it and names them.
 
 ```
-merge PR #13 into main · this lands PR #11, PR #12 with it — GitHub merges the
+merge gh!13 into main · this lands PR #11, PR #12 with it — GitHub merges the
 group or none of it · clean against board/gh-12-parser · waiting on PR #11
 ```
+
+The sentence opened `merge PR #13` when it shipped. gh#357 made it name the task
+first — `merge gh#353 (PR #13) into main`, and `merge gh!13 into main` where the
+row's name already *is* the pull request. The layers it takes with it stay pull
+request numbers: they are locations, and the task at each one may not be a row
+on this board at all.
 
 Only the layers *below* appear — the ones that come along. The layers above are
 untouched, and an already-merged layer is history in the chain rather than cargo.

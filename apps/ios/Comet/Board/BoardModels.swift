@@ -360,16 +360,31 @@ extension TaskRow {
     /// per repository, so the bare identifier is ambiguous across repos. A
     /// Linear identifier (`LIN-142`) is already unique and shows unchanged, as
     /// does any id this rule cannot parse.
+    ///
+    /// The separator is the id's own, `#` or `!` — this qualifies a name, it
+    /// does not replace one (gh#357). `gh!508` is the identifier of a pull
+    /// request nobody filed a ticket for, and `tally #508` would be a second
+    /// name for it, already spoken for by issue #508.
     var displayIdentifier: String {
-        let number = id.split(whereSeparator: { $0 == "#" || $0 == "!" }).last
-            .map(String.init)
-            .flatMap { n in
-                !n.isEmpty && n.allSatisfy({ $0.isASCII && $0.isNumber }) ? n : nil
-            }
-        guard let repo = ghRepoName(id), !repo.isEmpty, let number else {
+        let separators: Set<Character> = ["#", "!"]
+        guard let ix = id.lastIndex(where: { separators.contains($0) }) else {
             return identifier
         }
-        return "\(repo) #\(number)"
+        let number = String(id[id.index(after: ix)...])
+        guard let repo = ghRepoName(id), !repo.isEmpty,
+              !number.isEmpty, number.allSatisfy({ $0.isASCII && $0.isNumber })
+        else {
+            return identifier
+        }
+        return "\(repo) \(id[ix])\(number)"
+    }
+
+    /// Whether this row's name *is* its pull request — a `gh!508` row, ported
+    /// from `TaskRow::is_pull_request` (gh#357). Naming it and saying where it
+    /// lives are one act, so the row says one of them.
+    var isPullRequest: Bool {
+        guard let number = prNumber, let ix = id.lastIndex(of: "!") else { return false }
+        return String(id[id.index(after: ix)...]) == String(number)
     }
 }
 
@@ -553,12 +568,16 @@ func boardRowDetail(_ row: TaskRow, now: Date = Date()) -> BoardRowDetail {
     case .failed:
         text = "pane exited without completing"
     case .review:
+        // What the row needs, then where it lives (gh#357). The row is already
+        // named — its identifier is the line above this one — and a bare
+        // `PR #12` at the head of the sub-line is a second number in the same
+        // shape, competing to be read as the name of the work.
         if let number = row.prNumber {
-            text = "PR #\(number) · waiting on you"
+            text = row.isPullRequest ? "waiting on you" : "waiting on you · in PR #\(number)"
         } else if let branch = row.branch, !branch.isEmpty {
             // Finished on commits with no PR raised: say which branch, or the
             // row reads as "waiting on you" with nowhere to look.
-            text = "\(branch) · no PR"
+            text = "no PR · on \(branch)"
         } else {
             text = "waiting on you"
         }

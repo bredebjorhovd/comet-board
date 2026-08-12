@@ -2602,6 +2602,22 @@ fn a_stacked_row_says_which_layer_it_is_and_what_clean_meant() {
         screen.contains("waiting on PR #11"),
         "and what merging it would actually wait for:\n{screen}"
     );
+    // gh#357: the row's name is `gh#2`, and it reaches the eye first. The pull
+    // request is where the work sits, so it comes after the facts about the
+    // work — a bare `PR #12` ahead of them reads as the row's name.
+    let line = screen
+        .lines()
+        .find(|l| l.contains("2 of 3"))
+        .expect("the stacked row");
+    let (name, pr) = (
+        line.find("gh#2").expect("the identifier"),
+        line.find("in PR #12").expect("where it lives"),
+    );
+    assert!(name < line.find("2 of 3").unwrap(), "name first:\n{line}");
+    assert!(
+        pr > line.find("waiting on PR #11").unwrap(),
+        "location last:\n{line}"
+    );
 
     app.board.selected = Some("2".into());
     app.act(Action::BoardPeek);
