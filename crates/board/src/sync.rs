@@ -193,6 +193,13 @@ pub mod meta {
     pub fn rewritten_noted(attempt: i64) -> String {
         format!("rewritten:{attempt}")
     }
+    /// What the last settle notice about an attempt asserted (§gh#356) —
+    /// [`crate::notify::Signal::settle_print`]. Like `rewritten:`, it holds the
+    /// claim rather than a timestamp: it is both the "said already" mark and
+    /// the thing the *next* settle is recognised against.
+    pub fn settle_announced(attempt: i64) -> String {
+        format!("settled:{attempt}")
+    }
 }
 
 /// Which `routing.toml` sections differ, for the reload's log line: an
@@ -3096,6 +3103,10 @@ impl SyncEngine {
     /// Nothing here can fail the caller. A settle that has already happened is
     /// not undone because a webhook host is down, and an attempt is not left
     /// open because a dispatcher's chat was archived.
+    ///
+    /// One announcement per thing that happened, not per time the board
+    /// noticed it (§gh#356): a settle whose print matches the last one sent for
+    /// this attempt stops here, on every channel.
     fn announce(
         &self,
         runtime: Option<&dyn Runtime>,
@@ -3103,6 +3114,9 @@ impl SyncEngine {
         attempt: &Attempt,
         signal: Signal,
     ) {
+        if !self.is_news(task, attempt, &signal) {
+            return;
+        }
         match runtime {
             // The hop, in the order the addresses get more general.
             Some(rt) => {
@@ -3129,6 +3143,76 @@ impl SyncEngine {
             )),
         }
         self.post_webhook(task, attempt, &signal);
+    }
+
+    /// Is there anything in this signal the last one did not already say?
+    /// (§gh#356.)
+    ///
+    /// An attempt settles more than once as a matter of routine. A settled chat
+    /// that works again is re-opened rather than re-dispatched (§settle-logic's
+    /// inverse), and the re-close settles it again — on a pull request that is
+    /// still open, which needs no new work to be evidence. So a task sitting in
+    /// `review` with an open PR re-announces its settle every time anything
+    /// touches its chat: a review delivered into it, an operator's follow-up,
+    /// the agent answering that it already handled the point. Two orion
+    /// dispatches did exactly that on the box, and the dispatcher is the party
+    /// that pays for it — each repeat is a wake-up and a round of "has anything
+    /// actually changed?" against a branch head that had not moved.
+    ///
+    /// Not deduped by *event*, because some repeats are the feature working:
+    /// the review that lands, the fix that is pushed, the second settle that
+    /// genuinely follows. What separates them is whether anything the addressee
+    /// can act on moved — a new commit, a new pull request, a different outcome
+    /// — which is precisely what [`Signal::settle_print`] holds.
+    ///
+    /// Suppression covers every channel, the webhook included. An operator's
+    /// endpoint has the same complaint as an orchestrator: a notification that
+    /// arrives is read as something having happened.
+    ///
+    /// The mark records what was *announced*, not what was delivered. A notice
+    /// the dispatcher's chat could not take is not owed a retry — the attempt
+    /// is closed, the comment upstream is the durable trail, and re-sending it
+    /// on the next reopen is the bug this closes rather than a recovery.
+    fn is_news(&self, task: &Task, attempt: &Attempt, signal: &Signal) -> bool {
+        let Some(print) = signal.settle_print(self.attempt_head(attempt).as_deref()) else {
+            // A block. Told once per block already, counted by `blocked_count`
+            // on the attempt, which is a state and not an event.
+            return true;
+        };
+        let key = meta::settle_announced(attempt.id);
+        if self.db.meta_get(&key).ok().flatten().as_deref() == Some(print.as_str()) {
+            self.log.info(format!(
+                "{}: {} says what the last one said — same outcome, same pull request, \
+                 no new commit on {} — so nobody is being told twice",
+                task.identifier,
+                signal.event(),
+                attempt.branch.as_deref().unwrap_or("its branch"),
+            ));
+            return false;
+        }
+        if let Err(e) = self.db.meta_set(&key, &print) {
+            // A mark that could not be written costs a repeat on the next
+            // settle, which is the failure this whole guard is about — but
+            // dropping a notice over it would be the worse one.
+            self.log.warn(format!(
+                "{}: recording what {} said: {e}",
+                task.identifier,
+                signal.event(),
+            ));
+        }
+        true
+    }
+
+    /// The commit this attempt's checkout is standing on, for
+    /// [`SyncEngine::is_news`].
+    ///
+    /// Local `HEAD` rather than origin's, and never a fetch: the question is
+    /// "did the agent do anything since the last notice?", the checkout answers
+    /// it offline, and a settle path that reached across the network to decide
+    /// whether to *speak* would be paying a poll for a notice.
+    fn attempt_head(&self, attempt: &Attempt) -> Option<String> {
+        let worktree = attempt.worktree.as_deref()?;
+        git_out(worktree, &["rev-parse", "HEAD"]).filter(|h| !h.is_empty())
     }
 
     /// Announce a close the board did not settle: an attempt somebody ended
@@ -6706,6 +6790,134 @@ mod tests {
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
         assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    // ---- a settle announced twice with nothing behind it (gh#356) --------
+
+    /// Settle an attempt `chat-parent` released, on a real checkout, so the
+    /// notice has a dispatcher to reach. Returns the checkout.
+    fn settled_for_its_dispatcher(e: &SyncEngine, rt: &JournalFact) -> std::path::PathBuf {
+        let a = dispatch_via(e, "linear:LIN-142", "chat-9", "chat-parent");
+        let work = agent_worked_in(e, a, Work::Pushed);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(rt))
+            .unwrap();
+        assert_eq!(live(e).outcome, Some(Outcome::Done), "fixture must settle");
+        work
+    }
+
+    /// Wake the settled chat and let its run end again, settling the attempt a
+    /// second time — the shape every repeat on the box had.
+    fn woke_and_settled_again(e: &SyncEngine, rt: &JournalFact) {
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(rt))
+            .unwrap();
+        assert_eq!(live(e).reopened, 1, "the reopen is not the thing at fault");
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(rt))
+            .unwrap();
+        assert_eq!(live(e).outcome, Some(Outcome::Done), "and settles again");
+    }
+
+    /// The report, in full. The chat wakes with nothing to do — a review
+    /// delivered into it, an operator's follow-up, the agent saying it already
+    /// handled the point — the attempt re-opens, and the still-open pull
+    /// request settles it again on the spot. The dispatcher hears about it
+    /// once, because that is how many things happened.
+    #[test]
+    fn a_settle_the_dispatcher_already_heard_is_not_sent_twice() {
+        let mut e = engine(None);
+        let log = logging(&mut e);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let rt = JournalFact::ending(None);
+        let work = settled_for_its_dispatcher(&e, &rt);
+        assert_eq!(rt.prompts().len(), 1, "the first settle is news");
+
+        woke_and_settled_again(&e, &rt);
+
+        assert_eq!(
+            rt.prompts().len(),
+            1,
+            "the same close, the same branch head: {:?}",
+            rt.prompts()
+        );
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            log.contains("on_settled says what the last one said"),
+            "and the log says why nobody was told: {log}"
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// The repeat that *is* the feature. The review landed, the agent pushed a
+    /// fix, and the attempt settled on a commit the dispatcher has never seen —
+    /// so it is told, exactly as it was the first time. A guard that suppressed
+    /// this would be worse than the bug it closes.
+    #[test]
+    fn a_reopened_attempt_that_pushes_a_fix_is_announced_again() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let rt = JournalFact::ending(None);
+        let work = settled_for_its_dispatcher(&e, &rt);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        std::fs::write(work.join("fix"), "what the review asked for").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "-m", "the fix the review asked for"]);
+        git_in(&work, &["push", "origin", "main"]);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(live(&e).outcome, Some(Outcome::Done));
+        assert_eq!(
+            rt.prompts().len(),
+            2,
+            "a new commit is news: {:?}",
+            rt.prompts()
+        );
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// The operator's endpoint has the same complaint as the orchestrator: a
+    /// POST that arrives reads as something having happened. So the suppression
+    /// is not per channel — it is the announcement that does not happen.
+    #[test]
+    fn the_repeat_is_not_posted_to_the_webhook_either() {
+        let (e, hook) = engine_with_webhook("https://hook.test/x", false);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let rt = JournalFact::ending(None);
+        let work = settled_for_its_dispatcher(&e, &rt);
+        assert_eq!(hook.posts.lock().unwrap().len(), 1);
+
+        woke_and_settled_again(&e, &rt);
+
+        assert_eq!(hook.posts.lock().unwrap().len(), 1, "one close, one POST");
+        std::fs::remove_dir_all(work.parent().unwrap()).ok();
+    }
+
+    /// A cancel on top of a settle is a different fact about the attempt, and
+    /// the guard must not swallow it: the outcome is in the print, so an
+    /// operator ending an attempt the board had called done still reaches
+    /// whoever was waiting on that step (gh#194).
+    #[test]
+    fn a_different_outcome_on_the_same_attempt_is_still_news() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let rt = JournalFact::ending(None);
+        let work = settled_for_its_dispatcher(&e, &rt);
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        let attempt = live(&e);
+
+        e.announce_ended(
+            Some(&rt),
+            &task,
+            &attempt,
+            Outcome::Cancelled,
+            "cancelled from the panel",
+        );
+
+        assert_eq!(rt.prompts().len(), 2, "{:?}", rt.prompts());
         std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
