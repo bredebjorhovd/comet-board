@@ -34,7 +34,10 @@
  *
  * Hibernation discipline: no wall-clock JS timers except the flush debounce
  * (which only exists while traffic keeps the DO awake anyway); scheduled work
- * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm.
+ * (checkpoints, history trim, R2 backup §3.3) rides the durable alarm. That
+ * alarm is the only thing here that can call this object with no client behind
+ * it, so it is also the only thing that needs a budget of its own: see
+ * ALARM_FAILURE_LIMIT and `alarm()` (gh#378).
  *
  * That discipline is why presence is derived here. Until gh#145 every engine
  * wrote `presence/{deviceId} → now` into this room's ephemeral store every 15s.
@@ -90,6 +93,29 @@ const MAX_REASSEMBLED_BYTES = 32 * 1024 * 1024;
 const MAX_FRAGMENT_COUNT = 4096;
 /** Keep a rolling ~5 weeks of daily frontier checkpoints. */
 const MAX_CHECKPOINTS = 36;
+/** Consecutive failed alarms before this room stops rescheduling its own
+ * chain (gh#378). The daily alarm was the ONE unbounded call source here:
+ * everything else is client-driven and self-limiting (the Rust client caps
+ * reconnect backoff at 30s), while a throwing alarm left `backupDirty` set and
+ * retried on the runtime's backoff forever — with nobody connected to notice,
+ * and on a paid plan billing requests and duration on every attempt.
+ *
+ * The number is chosen against the failure it must survive: gh#373's edge
+ * outage lasted six hours, and a room whose writes are impossible for a day
+ * should still heal itself once they are possible again. On the ladder below
+ * 24 attempts span ~18h, which clears that with room, and caps a permanently
+ * broken room at 24 invocations instead of an open account. */
+export const ALARM_FAILURE_LIMIT = 24;
+/** Retry ladder after a failed alarm: doubling from a minute, capped at an
+ * hour. Fast at first (a transient storage/R2 blip heals in minutes and the
+ * backup should not wait a day for it), then slow enough that a long outage
+ * is measured in a couple of dozen attempts rather than hundreds. */
+const ALARM_RETRY_BASE_MS = 60_000;
+const ALARM_RETRY_MAX_MS = 60 * 60 * 1000;
+/** Delay before retry number `failures + 1`, given the consecutive failures so
+ * far. Pure, so the ladder is testable without a DO (like [`livePresence`]). */
+export const alarmRetryDelay = (failures: number): number =>
+  Math.min(ALARM_RETRY_BASE_MS * 2 ** Math.max(failures - 1, 0), ALARM_RETRY_MAX_MS);
 /** Isolate-wide poisoned-wasm strike counter — MODULE state on purpose: every
  * SessionRoom co-located in this isolate shares ONE loro-wasm linear memory,
  * so heap exhaustion poisons them all at once (2026-08-04: every
@@ -418,6 +444,17 @@ export class SessionRoom implements DurableObject {
           checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
           lastTrimAt: this.getMeta("lastTrimAt") ?? null,
           backupDirty: this.getMeta("backupDirty") === "1",
+          // The daily chain's health (gh#378). A room that has given up on its
+          // own checkpoint/trim/backup is a fact somebody must be able to
+          // READ — the alternative is silence, and the give-up window is
+          // precisely the window with nobody connected to notice. `gaveUpAt`
+          // is when it FIRST gave up; `limit` is the budget it exhausted.
+          alarm: {
+            consecutiveFailures: Number(this.getMeta("alarmFailures") ?? "0"),
+            gaveUp: Boolean(this.getMeta("alarmGaveUpAt")),
+            gaveUpAt: Number(this.getMeta("alarmGaveUpAt") || "0") || null,
+            limit: ALARM_FAILURE_LIMIT
+          },
           // Non-zero while a cold replay is in flight or has been dying — the
           // wedge signature ensureDoc's automated reset watches for.
           replayAttempts: Number(this.getMeta("replayAttempts") ?? "0"),
@@ -682,6 +719,9 @@ export class SessionRoom implements DurableObject {
       }
     }
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
+    // A client is back on a room that had given up on its own maintenance
+    // (gh#378) — that is the signal to try again, whatever broke last time.
+    this.reviveAlarm();
 
     if (message.crdt === CrdtType.Loro) {
       const doc = await this.ensureDoc();
@@ -1409,8 +1449,101 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  /** Daily alarm: frontier checkpoint, history trim, R2 backup. */
+  /** Daily alarm: frontier checkpoint, history trim, R2 backup — bounded by a
+   * consecutive-failure counter (gh#378).
+   *
+   * The work itself is in [`runScheduledWork`]; this wrapper is the budget.
+   * Every attempt is counted BEFORE the work starts and cleared when it
+   * completes, so the counter survives the failure class that has no catch
+   * block — a CPU-limit kill takes the whole invocation and rolls back
+   * anything not yet committed (the same reasoning as `replayAttempts` in
+   * `ensureDoc`, and the same `sync()`).
+   *
+   * A failure is SWALLOWED, not rethrown: rethrowing hands scheduling back to
+   * the runtime's own retry, which is exactly the chain being replaced. This
+   * room owns its ladder now — `alarmRetryDelay` until the budget runs out,
+   * then nothing, with `alarmGaveUpAt` left behind to say so on /stats.
+   *
+   * Giving up is not permanent, and must not be: the alarm chain is how a
+   * wedged room repairs and backs itself up with zero clients connected. Any
+   * join, /tail read, or write revives it — see [`reviveAlarm`]. `backupDirty`
+   * is deliberately left set through all of this: the work is still owed. */
   async alarm(): Promise<void> {
+    const failures = Number(this.getMeta("alarmFailures") ?? "0");
+    if (failures >= ALARM_FAILURE_LIMIT) {
+      // Reached only when the runtime retries an invocation that died where
+      // no catch could see it. Same terminus as the catch below.
+      this.noteAlarmGaveUp(failures);
+      return;
+    }
+    this.setMeta("alarmFailures", String(failures + 1));
+    await this.ctx.storage.sync();
+    const attempts = failures + 1;
+    try {
+      await this.runScheduledWork();
+    } catch (e) {
+      console.error(
+        "alarm failed",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `consecutiveFailures=${attempts}`,
+        String(e)
+      );
+      if (attempts >= ALARM_FAILURE_LIMIT) {
+        this.noteAlarmGaveUp(attempts);
+      } else {
+        // LOAD-BEARING that this is NOT itself wrapped in a try: swallowing
+        // the work's failure means our setAlarm is the only reschedule left,
+        // so if the reschedule ITSELF fails the chain would end silently
+        // mid-budget. Uncaught, it escapes alarm() and the runtime's own
+        // retry fires as the backstop — the one place a throw is still the
+        // right answer. A tidy that catches here removes that; don't.
+        await this.ctx.storage.setAlarm(Date.now() + alarmRetryDelay(attempts));
+      }
+      // Escalate LAST: a wasm-poisoning strike-out calls ctx.abort(), which
+      // tears this instance down where it stands — anything after it may never
+      // run, and the ladder is what must survive.
+      this.escalateWasmPoisoning(e);
+      return;
+    }
+    // Completed — the chain is clean. One failure followed by a success costs
+    // nothing but the retry that healed it.
+    this.setMeta("alarmFailures", "0");
+    if (this.getMeta("alarmGaveUpAt")) this.setMeta("alarmGaveUpAt", "");
+  }
+
+  /** Stop rescheduling and leave the state that says so. Recorded once, so
+   * "since when" answers the first give-up rather than the latest retry. */
+  private noteAlarmGaveUp(failures: number): void {
+    if (!this.getMeta("alarmGaveUpAt")) this.setMeta("alarmGaveUpAt", String(Date.now()));
+    console.error(
+      "alarm gave up; no further retries until a client returns",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `consecutiveFailures=${failures}`
+    );
+  }
+
+  /** A client came back: undo a give-up and re-arm the daily chain (gh#378).
+   *
+   * Returns whether it revived anything, so `markActivity` can skip its own
+   * arming when this already did it.
+   *
+   * Deliberately narrow: a counter mid-ladder is NOT reset. Resetting on every
+   * join would let one flapping client restart the retry budget indefinitely —
+   * the same unboundedness in a client's clothes. A room that goes on to give
+   * up is revived by the next join, /tail read or write anyway, which is the
+   * case that matters: a room that has stopped retrying must never be a room
+   * that has stopped backing up. */
+  private reviveAlarm(): boolean {
+    if (!this.getMeta("alarmGaveUpAt")) return false;
+    this.setMeta("alarmGaveUpAt", "");
+    this.setMeta("alarmFailures", "0");
+    console.log("alarm re-armed after give-up", `room=${this.getMeta("chatId") ?? "?"}`);
+    this.armDailyAlarm();
+    return true;
+  }
+
+  /** The scheduled work proper: frontier checkpoint, history trim, R2 backup. */
+  private async runScheduledWork(): Promise<void> {
     await this.flush();
     if (this.getMeta("backupDirty") !== "1") return; // idle: stop the chain
     const doc = await this.ensureDoc();
@@ -1438,7 +1571,10 @@ export class SessionRoom implements DurableObject {
     // (clearing postReset) can never replace the last good copy with a
     // hollow one. CRDT merge guarantees a genuinely recovered doc includes
     // the old VV, at which point the put resumes; until then backupDirty
-    // stays set and the alarm chain keeps trying.
+    // stays set and the alarm chain keeps trying — for as long as its budget
+    // lasts, and then until a client returns (gh#378). Note this branch does
+    // not THROW: a paused or non-advancing put is a completed alarm, not a
+    // failed one, so it never spends the failure budget.
     const chatId = this.getMeta("chatId");
     if (chatId && this.getMeta("postReset") !== "1") {
       // Guarded re-resolve, not `this.doc ?? doc`: the trim above may have
@@ -1483,14 +1619,24 @@ export class SessionRoom implements DurableObject {
     // on the next write otherwise.
   }
 
-  /** Arm the daily alarm if none is scheduled (called on every write). */
+  /** Arm the daily alarm if none is scheduled (called on every write). A write
+   * is also a client returning, so it revives a room that gave up. */
   private markActivity(): void {
+    if (this.reviveAlarm()) return; // already re-armed
+    this.armDailyAlarm();
+  }
+
+  private armDailyAlarm(): void {
     void this.ctx.storage.getAlarm().then((existing) => {
       if (existing === null) void this.ctx.storage.setAlarm(Date.now() + DAY_MS);
     });
   }
 
   private async currentTail(): Promise<unknown> {
+    // An explicit read counts as a client returning too (gh#378): the L2 tail
+    // is what an instant-open does before any socket exists, so on a room
+    // nobody has joined yet it is the earliest evidence anyone is watching.
+    this.reviveAlarm();
     await this.flush();
     if (this.getMeta("tailDirty") !== "1") {
       const cached = getJsonBlob<unknown>(this.blobs, "tail");
