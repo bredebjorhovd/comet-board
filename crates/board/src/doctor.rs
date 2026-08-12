@@ -591,7 +591,14 @@ pub fn doctor(
     // have (gh#287). Beside the two above because it is the same question again
     // — what can an agent here actually do — asked of the machine rather than
     // of a config dir.
-    checks.push(gh_stack_check(gh_extensions()));
+    checks.push(gh_stack_check(
+        gh_extensions(),
+        db_ok
+            .as_ref()
+            .ok()
+            .and_then(|db| db.stacked_task_count().ok())
+            .unwrap_or(0),
+    ));
 
     Ok(checks)
 }
@@ -626,23 +633,43 @@ fn have_phrase(spaces: &[Space]) -> String {
 /// `dispatch --stack` finds out, halfway through a task, with `unknown command
 /// "stack" for "gh"`.
 ///
-/// **It never fails the report.** Nothing in `routing.toml` says whether this
-/// box stacks — the ask is per dispatch (`--stack`) — so an absent extension is
-/// not a broken board, it is a fact about what one flag would do here. And the
-/// brief tells the agent how to repair it in place: gh#324 measured that `gh
-/// extension install` succeeds through the board's own `gh` shim on the minted
-/// installation token, needing no login of anybody's. This line is so that
-/// nobody has to discover any of that from a dead run.
+/// **It never fails the report.** An absent extension is not a broken board:
+/// the brief tells the agent how to repair it in place, and gh#324 measured
+/// that `gh extension install` succeeds through the board's own `gh` shim on the
+/// minted installation token, needing no login of anybody's. A FAIL here would
+/// be a FAIL an operator is right to ignore, which is the expensive kind. This
+/// line is so that nobody has to discover any of that from a dead run.
+///
+/// What gh#335 changed is *which sentence* it says when the extension is
+/// missing. `routing.toml` has no stacking flag — the ask is per dispatch
+/// (`--stack`), and the flag is not kept on the attempt — so "a route with
+/// stacking enabled" is not a state this board can be in, and the only durable
+/// evidence that this box stacks is its own history: `stacked` is how many rows
+/// hold a pull request GitHub says is in a stack ([`Db::stacked_task_count`]).
+/// Zero of them and the missing extension is a fact about what one flag would do
+/// here; some of them and it is a box already doing the thing it lacks the tool
+/// for — the next `--stack` run spends its opening minutes installing tooling
+/// inside a billed, capped attempt, and the operator cannot run `gh stack view`
+/// on the stacks the board is already holding. Same non-failure, different news.
 ///
 /// `extensions` is what `gh extension list` printed, or `None` when `gh` could
 /// not be run at all — which is worth saying plainly rather than reporting as
 /// "not installed", the same distinction gh#155 drew for an unreachable device.
-fn gh_stack_check(extensions: Option<String>) -> Check {
+///
+/// [`Db::stacked_task_count`]: crate::db::Db::stacked_task_count
+fn gh_stack_check(extensions: Option<String>, stacked: usize) -> Check {
     let name = "gh stack".to_string();
     let detail = match &extensions {
         Some(list) if list.contains("gh-stack") => {
             "installed — `dispatch --stack` can ask an agent for layered pull requests".to_string()
         }
+        Some(_) if stacked > 0 => format!(
+            "not installed, and this board holds {stacked} stacked pull request{} — \
+             `gh extension install github/gh-stack` (box-level, one command). Until then \
+             the next `dispatch --stack` installs it mid-run on the board's own credential, \
+             and `gh stack view` here cannot read the stacks the board already has",
+            if stacked == 1 { "" } else { "s" }
+        ),
         Some(_) => "not installed — `gh extension install github/gh-stack` (box-level, one \
                     command); until then a `dispatch --stack` agent installs it itself on \
                     the board's own credential"
@@ -5062,9 +5089,10 @@ mod tests {
     /// that could not ask.
     #[test]
     fn the_gh_stack_line_reports_and_never_fails() {
-        let installed = gh_stack_check(Some(
-            "gh stack\tgithub/gh-stack\tv0.1.0\ngh co\tgithub/gh-co\tv1\n".into(),
-        ));
+        let installed = gh_stack_check(
+            Some("gh stack\tgithub/gh-stack\tv0.1.0\ngh co\tgithub/gh-co\tv1\n".into()),
+            0,
+        );
         assert!(installed.ok);
         assert!(
             installed.detail.starts_with("installed"),
@@ -5072,7 +5100,7 @@ mod tests {
             installed.detail
         );
 
-        let missing = gh_stack_check(Some("gh co\tgithub/gh-co\tv1\n".into()));
+        let missing = gh_stack_check(Some("gh co\tgithub/gh-co\tv1\n".into()), 0);
         assert!(missing.ok, "an absent extension is not a broken board");
         assert!(
             missing
@@ -5082,9 +5110,49 @@ mod tests {
             missing.detail
         );
 
-        let no_gh = gh_stack_check(None);
+        let no_gh = gh_stack_check(None, 0);
         assert!(no_gh.ok);
         assert!(no_gh.detail.contains("not checked"), "{}", no_gh.detail);
+    }
+
+    /// gh#335: the same non-failure, saying something else. A box holding
+    /// stacked pull requests and missing the extension is not the same news as
+    /// a box that has never stacked, and the line an operator reads should not
+    /// be. The count is the only durable evidence there is — `routing.toml` has
+    /// no stacking flag to consult.
+    #[test]
+    fn a_board_that_already_stacks_gets_a_different_missing_line() {
+        let missing = gh_stack_check(Some("gh co\tgithub/gh-co\tv1\n".into()), 4);
+        assert!(
+            missing.ok,
+            "still not a broken board — the agent installs it itself"
+        );
+        assert!(
+            missing.detail.contains("4 stacked pull requests"),
+            "{}",
+            missing.detail
+        );
+        assert!(
+            missing.detail.contains("gh stack view"),
+            "the operator's own half of the cost is what is new here: {}",
+            missing.detail
+        );
+
+        // One is one, and reads like it.
+        let one = gh_stack_check(Some("gh co\tgithub/gh-co\tv1\n".into()), 1);
+        assert!(
+            one.detail.contains("1 stacked pull request —"),
+            "{}",
+            one.detail
+        );
+
+        // Installed is installed, however much this board has stacked.
+        let installed = gh_stack_check(Some("gh stack\tgithub/gh-stack\tv0.1.0\n".into()), 4);
+        assert!(
+            installed.detail.starts_with("installed"),
+            "{}",
+            installed.detail
+        );
     }
 
     /// These checks read the provider, never the wire. Answering at all would

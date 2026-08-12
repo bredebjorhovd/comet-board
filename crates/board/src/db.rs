@@ -772,6 +772,28 @@ impl Db {
         Ok(())
     }
 
+    /// How many rows hold a pull request GitHub says is part of a stack (gh#335).
+    ///
+    /// The one durable answer to "does this box stack?". Nothing in
+    /// `routing.toml` says so — the ask is per dispatch (`--stack`), and the flag
+    /// is not kept on the attempt — so the board's own history is what is left:
+    /// a row whose `pr_stack_number` survived a poll is a stack this board
+    /// produced or adopted. [`crate::doctor`] reads it to decide which sentence
+    /// its `gh stack` line should say.
+    ///
+    /// Counts rows and not stacks: two layers of one chain are two rows here.
+    /// The caller only asks whether the number is zero, and a count that means
+    /// "how many stacks" would have to group by repository as well as number
+    /// ([`crate::stacks`]), which is more machinery than the question needs.
+    pub fn stacked_task_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE pr_stack_number IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Record that a reviewer asked this pull request to change, or that nothing
     /// is outstanding on it any more (gh#289).
     ///
@@ -1856,6 +1878,35 @@ mod tests {
             stored.dispatched_by_user.as_deref(),
             Some("ana@example.com")
         );
+    }
+
+    /// gh#335: the board's own history is the only place that says this box
+    /// stacks, so the count has to follow the topology write in both directions
+    /// — a retargeted pull request that leaves its stack stops being evidence.
+    #[test]
+    fn the_stacked_count_follows_what_the_poll_last_saw() {
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        assert_eq!(db.stacked_task_count().unwrap(), 0);
+
+        db.set_pr_topology(
+            "linear:LIN-142",
+            Some("main"),
+            Some(&PrStack {
+                number: 7,
+                size: Some(3),
+                position: Some(1),
+                base_ref: Some("main".into()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(db.stacked_task_count().unwrap(), 1);
+
+        // Its parent merged and GitHub retargeted it onto trunk: no longer a
+        // layer, and no longer evidence of anything.
+        db.set_pr_topology("linear:LIN-142", Some("main"), None)
+            .unwrap();
+        assert_eq!(db.stacked_task_count().unwrap(), 0);
     }
 
     #[test]
