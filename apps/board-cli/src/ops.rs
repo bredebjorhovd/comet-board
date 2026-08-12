@@ -28,7 +28,7 @@ use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
 use comet_board::rows::TaskRow;
 use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
-use comet_board::verdict::VerdictReceipt;
+use comet_board::verdict::{self, Projection, VerdictReceipt};
 use comet_proto::Device;
 use comet_proto::view::board as view;
 use comet_rpc::{RpcClient, connect_ws, methods};
@@ -400,12 +400,12 @@ pub fn render_verdict(receipt: &VerdictReceipt) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "· {} on the pull request{}",
+        "· {} recorded{}",
         receipt.kind.label(),
-        if receipt.posted {
+        if receipt.recorded {
             ""
         } else {
-            " — already posted, nothing sent twice"
+            " — already submitted, nothing sent twice"
         }
     );
     match (receipt.delivered, receipt.not_delivered.as_deref()) {
@@ -421,6 +421,18 @@ pub fn render_verdict(receipt: &VerdictReceipt) -> String {
         }
         (false, None) => {}
     }
+    // A verdict GitHub would not take is the loud line, not a missing one: it
+    // stands and the agent has it, and nobody on the pull request knows (gh#365).
+    let _ = writeln!(
+        out,
+        "{} {}",
+        if receipt.projection == Projection::Posted {
+            "·"
+        } else {
+            "!"
+        },
+        verdict::projection_line(receipt.kind, receipt.projection, receipt.refused.as_deref()),
+    );
     if receipt.unclaimed > 0 {
         let _ = writeln!(
             out,

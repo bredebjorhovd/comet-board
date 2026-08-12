@@ -181,7 +181,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
 | `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
 | `review` | `--task`, `--attempt`, `--json` | What an attempt was asked to do, what it says it did, and what it did not account for |
-| `verdict` | `--task`, `--attempt`, `--comment`, `--approve`, `--request-changes`, `--json` | Give the verdict: post it on the pull request, and hand it to the agent still standing in the checkout |
+| `verdict` | `--task`, `--attempt`, `--comment`, `--approve`, `--request-changes`, `--json` | Give the verdict: record it, hand it to the agent still standing in the checkout, and post it on the pull request |
 | `new <title>` | `--body`, `--team`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
 | `stats` | `--since-days`, `--json` | What the board knows about its own throughput |
 | `doctor` | — | Check the environment: keys, engine, routes, repos. Exits non-zero on any failing check |

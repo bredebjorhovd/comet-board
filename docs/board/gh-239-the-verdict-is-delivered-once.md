@@ -29,9 +29,9 @@ Delivery is `Runtime::prompt` into the authoring attempt's chat, guarded by the
 same author check the inbound path makes: `chat_alive`, plus
 `review::still_the_authors_checkout` on the chat row's cwd. A chat re-pointed at
 another checkout is somebody else's session, and a review pasted into it is
-delivered to the wrong author. The review is still posted — the pull request is
-where it belongs regardless — and the receipt says nobody was told, which is a
-real outcome rather than an error.
+delivered to the wrong author. The verdict still stands and is still projected
+onto the pull request — that is where it belongs regardless — and the receipt
+says nobody was told, which is a real outcome rather than an error.
 
 An approval with nothing written in it is posted and delivered to nobody, which
 is §gh#180's actionability rule kept on the way out: it says the agent has
@@ -56,10 +56,13 @@ call that answers with an id. When GitHub answers without one, the body's
 `POSTED_MARK` trailer is what `review::is_the_boards_own` recognises instead.
 The watermark is the mechanism; the mark is the backstop.
 
-Order is post → record → deliver, which is the recoverable one. A crash between
-the post and the record costs one duplicate review, a window of milliseconds;
-recording first would remember a failed post as a success and the verdict would
-never reach GitHub at all.
+Order was post → record → deliver, on the reasoning that a crash between the
+post and the record costs one duplicate review — a window of milliseconds —
+while recording first would remember a failed post as a success. **§gh#365
+inverted it to record → deliver → project**, because the failure that actually
+happened was not a crash: it was GitHub refusing the write, and with the post
+first that refusal threw away the standing verdict, the delivery, and the
+sentence the reviewer had just typed. None of those are GitHub's to veto.
 
 ### What it refuses
 

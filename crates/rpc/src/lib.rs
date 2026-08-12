@@ -186,16 +186,22 @@ pub mod methods {
     /// A call and not a stream, like [`READ_BOARD_TASK`]: it reads a diff out
     /// of a checkout, and it is read when somebody opens a review.
     pub const READ_ATTEMPT_REVIEW: &str = "ReadAttemptReview";
-    /// Submit a verdict on an attempt's pull request (§gh#239): post the
-    /// review on GitHub *and* hand it to the agent still standing in the
-    /// checkout. Params: `{taskId, attempt?, kind, comment}` — `kind` is
-    /// `comment` | `approve` | `changes_requested` — → a
+    /// Submit a verdict on an attempt's pull request (§gh#239): record it, hand
+    /// it to the agent still standing in the checkout, *and* project it onto
+    /// the pull request. Params: `{taskId, attempt?, kind, comment}` — `kind`
+    /// is `comment` | `approve` | `changes_requested` — → a
     /// [`comet_board::verdict::VerdictReceipt`].
     ///
     /// The unclaimed set is not a parameter. It is recomputed on the board's
     /// host from the diff and attached to both copies, because a reviewer
     /// cannot be asked to retype it and a caller that could supply it could
     /// also get it wrong.
+    ///
+    /// A GitHub that refuses the review is **not** an error here (gh#365). The
+    /// verdict is a board fact and stands; the receipt's `projection` says what
+    /// became of the copy on the pull request, and `refused` carries GitHub's
+    /// words. Only a verdict the board itself will not take — a closed pull
+    /// request, an empty `comment` or `changes requested` — fails the call.
     ///
     /// Idempotent on `{attempt, kind, comment}`: a retry finishes whichever
     /// half failed rather than posting a second review. A caller that times out

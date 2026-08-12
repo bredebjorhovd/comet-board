@@ -500,6 +500,40 @@ fn diff_totals(review: &AttemptReview) -> (String, u32, u32) {
     (label, added, removed)
 }
 
+/// One receipt and the sentence a reviewer reads off it (gh#365).
+///
+/// Serialized as the wire carries it, so the Swift decodes the same JSON
+/// `SubmitVerdict` answers with — a renamed field fails here rather than
+/// silently reading as a verdict nobody recorded.
+fn receipt_case(
+    name: &str,
+    kind: verdict::VerdictKind,
+    recorded: bool,
+    not_delivered: Option<&str>,
+    projection: verdict::Projection,
+    refused: Option<&str>,
+) -> Value {
+    let receipt = verdict::VerdictReceipt {
+        task_id: "gh:o/r#13".into(),
+        attempt: 7,
+        kind,
+        review_id: 900,
+        recorded,
+        chat_id: Some("chat-1".into()),
+        delivered: not_delivered.is_none(),
+        not_delivered: not_delivered.map(str::to_string),
+        projection,
+        refused: refused.map(str::to_string),
+        unclaimed: 2,
+        payload: String::new(),
+    };
+    json!({
+        "name": name,
+        "receipt": receipt,
+        "expect": verdict::receipt_line(&receipt),
+    })
+}
+
 /// One row for the shared review-door rule. Decoded from the published board
 /// wire shape so this fixture checks the same input the phone receives.
 fn reviewable_case(state: &str, attempts: usize) -> Value {
@@ -564,6 +598,24 @@ fn build() -> Value {
             case("a branch the board never read", &the_unread_one()),
             case("binary, uncounted call sites, and an unrun suite", &the_unknowable_one()),
         ],
+        // What one submission did, in the order gh#365 puts it: the verdict and
+        // its delivery first, GitHub's copy second.
+        "receipts": [
+            receipt_case("recorded, delivered and posted", verdict::VerdictKind::ChangesRequested,
+                         true, None, verdict::Projection::Posted, None),
+            receipt_case("the idempotent path", verdict::VerdictKind::ChangesRequested,
+                         false, None, verdict::Projection::Posted, None),
+            receipt_case("recorded, and the author is gone", verdict::VerdictKind::ChangesRequested,
+                         true, Some("chat chat-1 no longer holds the agent"),
+                         verdict::Projection::Posted, None),
+            receipt_case("an approval GitHub would not cast travels as a comment",
+                         verdict::VerdictKind::Approve, true, None,
+                         verdict::Projection::PostedAsComment,
+                         Some("Can not approve your own pull request")),
+            receipt_case("a refused projection does not unmake the verdict",
+                         verdict::VerdictKind::ChangesRequested, true, None,
+                         verdict::Projection::Unposted, Some("github HTTP 500")),
+        ],
         "reviewable": [
             reviewable_case("blocked", 1),
             reviewable_case("working", 1),
@@ -613,7 +665,7 @@ fn the_cross_language_fixture_matches_this_reading() {
     // Report the case that moved rather than the whole document — a diff of
     // four hundred lines is a diff nobody reads.
     let mut moved = Vec::new();
-    for key in ["note", "reviewable", "runsTests"] {
+    for key in ["note", "reviewable", "runsTests", "receipts"] {
         if disk.get(key) != built.get(key) {
             moved.push(format!("  {key} changed"));
         }

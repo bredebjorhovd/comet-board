@@ -161,10 +161,17 @@ out. So `submit_verdict` sets the standing verdict directly (`ChangesRequested` 
 the id, `Approve` → cleared, `Comment` → untouched) and the fan-out runs off the
 standing fact rather than off a review just read. One path, two sources.
 
+§gh#365 moved that write *ahead* of the post, so a `changes requested` GitHub
+refuses still reaches the layers above. It has no review id yet at that point, so
+it stands under one the board makes up until the projection lands — and when it
+does, the local id and every `fanned_out` entry recorded under it move onto
+GitHub's number together, so one verdict is never fanned out twice under two
+names.
+
 It also re-derives on the spot. A reviewer who just pressed the button should see
 the layers above leave the review section now rather than on the next poll — and a
 derivation that fails there is a log line, not a failed submission, because the
-review is already on GitHub. `deliver_reviews` does the same once at the end of its
+verdict is already recorded. `deliver_reviews` does the same once at the end of its
 pass, and only when a standing verdict actually moved: that pass runs *after* the
 cycle has already derived every row, so without it the rows above would look
 reviewable for one more poll interval.

@@ -324,6 +324,29 @@ pub fn refusal(status: u16, path: &str, body: &Value) -> anyhow::Error {
     }
 }
 
+/// Is this GitHub refusing to let the identity that is submitting cast *this*
+/// verdict on *this* pull request (gh#365)?
+///
+/// `Can not approve your own pull request` and `Can not request changes on your
+/// own pull request` — the 422 a board App gets on every pull request the board
+/// opened, because the App submitting and the App that opened it are one
+/// identity. Only `COMMENT` is left, which is why the caller can answer this by
+/// posting the verdict as a comment that says what it is
+/// ([`crate::verdict::as_comment_body`]) rather than by giving up.
+///
+/// Read off GitHub's own sentence rather than predicted from the pull request's
+/// author. Predicting it would cost a fetch of the author and a second one of
+/// the App's own slug on every submission, and would still have to handle the
+/// refusal for the cases the prediction gets wrong — a pull request opened by a
+/// human under a token the board is not using, a repo whose installation
+/// changed under it. GitHub is the authority on who may review; asking it is
+/// one round trip, and only on the pull requests where the answer is no.
+pub fn refused_own_pull_request(e: &anyhow::Error) -> bool {
+    format!("{e:#}")
+        .to_ascii_lowercase()
+        .contains("your own pull request")
+}
+
 impl Rest for HttpRest {
     fn get(&self, path: &str) -> Result<Value> {
         self.request(reqwest::Method::GET, path, None)
@@ -780,7 +803,8 @@ impl<T: Rest> Github<T> {
     /// not cast this verdict on this pull request — and which verdict was being
     /// submitted is half of telling those apart, since a board App reviewing a
     /// pull request its own App opened may `COMMENT` on it but not approve it
-    /// (gh#338). GitHub's own words arrive with it, from [`refusal`].
+    /// (gh#338). GitHub's own words arrive with it, from [`refusal`], and
+    /// [`refused_own_pull_request`] is what reads that one refusal back out.
     pub fn post_review(&self, repo: &str, number: i64, event: &str, body: &str) -> Result<i64> {
         let r = self
             .rest
@@ -1210,6 +1234,13 @@ pub struct FixtureRest {
     pub routes: Vec<(String, Value)>,
     pub asked: std::cell::RefCell<Vec<String>>,
     pub wrote: std::cell::RefCell<Vec<(String, String, Value)>>,
+    /// Review `event`s this fixture refuses, and GitHub's sentence for each.
+    ///
+    /// A route answers a path; this answers a *body*, which is the only way to
+    /// script the refusal gh#365 is about: `APPROVE` and `COMMENT` are the same
+    /// endpoint, and the whole behaviour under test is that the second is sent
+    /// after the first comes back 422.
+    pub refused: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -1219,7 +1250,18 @@ impl FixtureRest {
             routes,
             asked: std::cell::RefCell::new(Vec::new()),
             wrote: std::cell::RefCell::new(Vec::new()),
+            refused: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Refuse one review `event` the way GitHub refuses it — a 422 whose
+    /// `errors` blame `user_id`, which is what says a refusal is about *who* is
+    /// reviewing rather than about what they wrote.
+    pub fn refusing(self, event: &str, message: &str) -> FixtureRest {
+        self.refused
+            .borrow_mut()
+            .insert(event.to_string(), message.to_string());
+        self
     }
 }
 
@@ -1238,6 +1280,22 @@ impl Rest for FixtureRest {
         self.wrote
             .borrow_mut()
             .push(("POST".into(), path.into(), body.clone()));
+        // A refused event answers the way GitHub does: the call is an error,
+        // and the attempt is still on `wrote` — a refusal the board acted on is
+        // a request it made.
+        if let Some(event) = body.get("event").and_then(Value::as_str)
+            && let Some(why) = self.refused.borrow().get(event)
+        {
+            return Err(refusal(
+                422,
+                path,
+                &serde_json::json!({
+                    "message": "Validation Failed",
+                    "errors": [{ "resource": "PullRequestReview", "code": "custom",
+                                 "field": "user_id", "message": why }],
+                }),
+            ));
+        }
         // A canned reply when the test recorded one under `POST <path>` — a
         // review post reads the id back out of it. Keyed with the verb because
         // several endpoints here answer a GET and a POST at the same path, and

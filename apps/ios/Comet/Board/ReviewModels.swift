@@ -1155,6 +1155,43 @@ enum VerdictKind: String, CaseIterable, Identifiable {
     /// `REQUEST_CHANGES` with an empty body, and it is right to: a verdict with
     /// nothing in it tells the agent to change something unnamed.
     var needsComment: Bool { self != .approve }
+
+    /// The verdict in the present tense — what a comment carrying it says it
+    /// is (gh#365). `comet_board::verdict::VerdictKind::says`.
+    var says: String {
+        switch self {
+        case .comment: return "comments"
+        case .approve: return "approves"
+        case .changesRequested: return "requests changes"
+        }
+    }
+
+    /// The verb GitHub's refusal is about — `refused_verb`.
+    var refusedVerb: String {
+        switch self {
+        case .comment: return "comment on"
+        case .approve: return "approve"
+        case .changesRequested: return "request changes on"
+        }
+    }
+}
+
+/// Where a verdict's copy on the pull request got to (gh#365) —
+/// `comet_board::verdict::Projection`.
+///
+/// Nothing here is about whether the verdict *stands*. It always does, from the
+/// moment the board records it; this is only about GitHub's copy.
+enum Projection: String, Decodable, Hashable {
+    /// On the pull request, as the verdict it is.
+    case posted
+    /// On the pull request as a comment that says in words what it is, because
+    /// GitHub will not let this identity cast this verdict here.
+    case postedAsComment = "posted_as_comment"
+    /// Not on the pull request. GitHub refused it, or could not be asked.
+    case unposted
+
+    /// Has GitHub got a copy in some form?
+    var onGithub: Bool { self != .unposted }
 }
 
 /// What came back from `SubmitVerdict`: where it landed, and what did not.
@@ -1163,17 +1200,22 @@ struct VerdictReceipt: Decodable, Hashable {
     var attempt: Int64
     var kind: String
     var reviewId: Int64
-    /// Whether it reached the pull request.
-    var posted: Bool
+    /// Whether this call is the one that recorded it. It says nothing about
+    /// GitHub — that is `projection` (gh#365).
+    var recorded: Bool
     var chatId: String?
     /// Whether it reached the checkout the agent is still in.
     var delivered: Bool
     var notDelivered: String?
+    /// Where the copy on the pull request got to.
+    var projection: Projection
+    /// GitHub's words for refusing the verdict as sent. Nil when it took it.
+    var refused: String?
     var unclaimed: Int
     var payload: String
 
     enum CodingKeys: String, CodingKey {
-        case attempt, kind, posted, delivered, unclaimed, payload
+        case attempt, kind, recorded, delivered, projection, refused, unclaimed, payload
         case taskId = "task_id"
         case reviewId = "review_id"
         case chatId = "chat_id"
@@ -1189,25 +1231,30 @@ struct VerdictReceipt: Decodable, Hashable {
         attempt = try c.decode(Int64.self, forKey: .attempt)
         kind = try c.decode(String.self, forKey: .kind)
         reviewId = try c.decode(Int64.self, forKey: .reviewId)
-        posted = try c.decode(Bool.self, forKey: .posted)
+        recorded = try c.decode(Bool.self, forKey: .recorded)
         chatId = try requireNullable(String.self, c, .chatId)
         delivered = try c.decode(Bool.self, forKey: .delivered)
         notDelivered = try requireNullable(String.self, c, .notDelivered)
+        projection = try c.decode(Projection.self, forKey: .projection)
+        refused = try requireNullable(String.self, c, .refused)
         unclaimed = try c.decode(Int.self, forKey: .unclaimed)
         payload = try c.decode(String.self, forKey: .payload)
     }
 
     init(taskId: String, attempt: Int64 = 0, kind: String = "", reviewId: Int64 = 0,
-         posted: Bool = false, chatId: String? = nil, delivered: Bool = false,
-         notDelivered: String? = nil, unclaimed: Int = 0, payload: String = "") {
+         recorded: Bool = false, chatId: String? = nil, delivered: Bool = false,
+         notDelivered: String? = nil, projection: Projection = .posted,
+         refused: String? = nil, unclaimed: Int = 0, payload: String = "") {
         self.taskId = taskId
         self.attempt = attempt
         self.kind = kind
         self.reviewId = reviewId
-        self.posted = posted
+        self.recorded = recorded
         self.chatId = chatId
         self.delivered = delivered
         self.notDelivered = notDelivered
+        self.projection = projection
+        self.refused = refused
         self.unclaimed = unclaimed
         self.payload = payload
     }
@@ -1240,22 +1287,41 @@ func reviewContractLine(_ review: AttemptReview, delivering: Bool) -> String {
     return "Delivered into \(target) once\(attached)."
 }
 
-/// One sentence for where a verdict landed — the desktop's `receipt_line`.
+/// One sentence for where the copy on the pull request got to, written for
+/// somebody who does not know GitHub's rules about who may review what —
+/// `comet_board::verdict::projection_line` (gh#365).
+func reviewProjectionLine(_ kind: VerdictKind, _ projection: Projection,
+                          _ refused: String?) -> String {
+    switch projection {
+    case .posted:
+        return "It is on the pull request."
+    case .postedAsComment:
+        return "It is on the pull request as a comment that says it \(kind.says) — "
+            + "GitHub does not let the board \(kind.refusedVerb) its own pull request."
+    case .unposted:
+        guard let why = refused else { return "It is not on the pull request." }
+        return "It is not on the pull request — GitHub refused it: \(why)"
+    }
+}
+
+/// What one submission did — `comet_board::verdict::receipt_line`.
 ///
-/// "Posted and delivered" and "posted, and the author is gone" are different
-/// facts, and a receipt that said only the first would be the phone claiming
-/// something it was told did not happen.
+/// The board's half first: the verdict stands and the agent has it whatever
+/// GitHub says, and the copy on the pull request is the sentence after. A
+/// receipt that said only one of those would be the phone claiming something it
+/// was told did not happen.
 func reviewReceiptLine(_ receipt: VerdictReceipt) -> String {
     // The idempotent path: this exact verdict was already submitted.
-    let posted = receipt.posted
-        ? "Posted on the pull request"
-        : "Already on the pull request"
+    let stands = receipt.recorded ? "Recorded" : "Already recorded"
+    let board: String
     switch (receipt.delivered, receipt.notDelivered) {
     case (true, _):
-        return "\(posted), and delivered into the chat once."
+        board = "\(stands), and delivered into the chat once."
     case (false, .some(let why)):
-        return "\(posted). Nothing was delivered into the chat: \(why)."
+        board = "\(stands). Nothing was delivered into the chat: \(why)."
     case (false, .none):
-        return "\(posted)."
+        board = "\(stands)."
     }
+    let kind = VerdictKind(rawValue: receipt.kind) ?? .comment
+    return "\(board) \(reviewProjectionLine(kind, receipt.projection, receipt.refused))"
 }
