@@ -158,6 +158,51 @@ impl Signal {
             Signal::Settled { .. } => "on_settled",
         }
     }
+
+    /// What this settle asserts, as one line — the mark that tells a settle
+    /// worth sending from one that has already been sent (§gh#356).
+    ///
+    /// An attempt can settle more than once: a settled chat that works again is
+    /// re-opened rather than re-dispatched (§settle-logic's inverse), and every
+    /// re-close runs the settle path afresh. Some of those repeats are the
+    /// feature working — a review was delivered, the agent pushed a fix, the
+    /// attempt settled again — and some are the same close said twice, because
+    /// the pull request that settled it the first time is still open and still
+    /// settles it instantly. The two are indistinguishable from the signal
+    /// alone, which is why this exists: **everything the notice asserts, plus
+    /// the branch head it asserts it about.** Equal prints mean a dispatcher
+    /// woken twice would be read the same sentence about the same commit.
+    ///
+    /// `head` is the attempt checkout's own `HEAD`, not origin's. It moves in a
+    /// superset of the cases origin's does — work has to exist locally before it
+    /// can be pushed — and the direction of that error is the safe one: a
+    /// commit that never left the box costs a repeat notice, where reading a
+    /// stale tracking ref would cost a suppressed real one. `None` (no
+    /// checkout, or a git that would not answer) narrows the print rather than
+    /// widening it, so an unreadable checkout also fails towards sending.
+    ///
+    /// `None` for a block: those are already told once per block by
+    /// [`Attempt::blocked_count`], which counts a *state* rather than an event
+    /// and needs no mark of its own.
+    pub fn settle_print(&self, head: Option<&str>) -> Option<String> {
+        let Signal::Settled {
+            outcome,
+            evidence,
+            pr_url,
+            note,
+        } = self
+        else {
+            return None;
+        };
+        Some(format!(
+            "{}|{}|{}|{}|{}",
+            outcome.as_str(),
+            evidence.map(Evidence::as_str).unwrap_or("-"),
+            pr_url.as_deref().unwrap_or("-"),
+            head.unwrap_or("-"),
+            note.as_deref().unwrap_or("-"),
+        ))
+    }
 }
 
 /// One line, for a webhook that renders nothing but text.
@@ -810,6 +855,77 @@ mod tests {
         // ...and only the orchestrator's is careful not to claim it released it.
         assert!(to_dispatcher.contains("work you released"));
         assert!(!to_orchestrator.contains("work you released"));
+    }
+
+    // ---- the print that tells a repeat from a second settle (gh#356) -----
+
+    fn settled(pr: Option<&str>) -> Signal {
+        Signal::Settled {
+            outcome: Outcome::Done,
+            evidence: Some(Evidence::PullRequest),
+            pr_url: pr.map(str::to_string),
+            note: None,
+        }
+    }
+
+    /// The bug, at the level the decision is made: the pull request is still
+    /// open, so the attempt settles again the moment its chat stops — and every
+    /// one of those closes reads identically, because it is one close.
+    #[test]
+    fn a_settle_repeated_on_an_unchanged_attempt_prints_the_same() {
+        let s = settled(Some("https://github.com/o/r/pull/7"));
+        assert_eq!(
+            s.settle_print(Some("31d8fc5")),
+            s.settle_print(Some("31d8fc5"))
+        );
+    }
+
+    /// Each of the three things the dispatcher can act on, one at a time. A
+    /// print that missed any of them would suppress a settle somebody is
+    /// waiting on, which is the worse half of this trade.
+    #[test]
+    fn a_new_commit_a_new_pull_request_or_a_new_outcome_all_print_differently() {
+        let s = settled(Some("https://github.com/o/r/pull/7"));
+        let base = s.settle_print(Some("31d8fc5"));
+        assert_ne!(base, s.settle_print(Some("1fbcfb4")), "a new commit");
+        assert_ne!(
+            base,
+            settled(Some("https://github.com/o/r/pull/8")).settle_print(Some("31d8fc5")),
+            "a new pull request"
+        );
+        assert_ne!(
+            base,
+            Signal::Settled {
+                outcome: Outcome::Cancelled,
+                evidence: None,
+                pr_url: Some("https://github.com/o/r/pull/7".into()),
+                note: Some("cancelled from the panel".into()),
+            }
+            .settle_print(Some("31d8fc5")),
+            "a different close"
+        );
+    }
+
+    /// An unreadable checkout must not make two different settles look alike.
+    /// `None` is one value among many, not a wildcard — so it prints as itself,
+    /// and differs from every branch head there is.
+    #[test]
+    fn an_unknown_head_is_a_value_not_a_wildcard() {
+        let s = settled(Some("https://github.com/o/r/pull/7"));
+        assert_ne!(s.settle_print(None), s.settle_print(Some("31d8fc5")));
+        assert_eq!(s.settle_print(None), s.settle_print(None));
+    }
+
+    /// A block has no print: it is told once per block by `blocked_count`,
+    /// which counts a state rather than an event, and a second mark for the
+    /// same thing is a second way for the two to disagree.
+    #[test]
+    fn a_block_has_no_print_of_its_own() {
+        assert!(
+            Signal::Blocked(Stopped::Asking)
+                .settle_print(Some("31d8fc5"))
+                .is_none()
+        );
     }
 
     /// Most of what reaches the orchestrator is somebody else's dispatch, and

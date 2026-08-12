@@ -68,6 +68,13 @@ itself, which matters more here than anywhere else: the orchestrator is exempt
 from `max_duration` because it is meant to live forever, so the volume of what
 arrives is the only thing bounding what it costs.
 
+One message per *event*, not per time the board noticed it. An attempt can
+settle more than once — a closed attempt whose chat works again is re-opened,
+and the still-open pull request settles it again the moment that chat stops — so
+the ending you are told about is the one where something moved: a new commit on
+the branch, a new pull request, a different outcome. A close that says exactly
+what the last one said is not sent again (§gh#356).
+
 Unpinned, those three reach no agent at all. The board says so once per event in
 its log ("… reached no agent — …") rather than dropping them in silence, and
 `comet-board doctor`'s `settle notice` and `orchestrator` lines say between them

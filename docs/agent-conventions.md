@@ -237,7 +237,11 @@ is this board's `review`.
   or blocks, and it is the first addressee: what reaches you does not also
   reach the board's orchestrator. *Every* ending arrives, not only the happy
   one: an attempt someone cancelled, and one the duration cap killed, come
-  through the same channel with a line saying which. What you will *not* be told about is work
+  through the same channel with a line saying which. An ending you have already
+  been told about is not repeated: an attempt can close, re-open and close again
+  without anything you could act on having moved, and you are woken for the
+  second close only when something did — a new commit on the branch, a new pull
+  request, a different ending. What you will *not* be told about is work
   you did not release; that is the orchestrator's, and only when this chat
   could not be told. You cannot see either setting from here, and a chat that
   is archived before its child finishes is told nothing at all, so never
