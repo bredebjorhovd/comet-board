@@ -18,6 +18,7 @@
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, type Env } from "./env";
+import { createMetaStore, type MetaStore } from "./meta";
 
 export interface DeviceFrameHeader {
   /** Stream id, unique per (connId, logical stream). */
@@ -155,13 +156,12 @@ const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly blobs: BlobStore;
+  private readonly meta: MetaStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     void env;
-    ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    );
+    this.meta = createMetaStore(ctx.storage.sql);
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS pending_nudges (chat_id TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
     );
@@ -170,16 +170,12 @@ export class DeviceRoom implements DurableObject {
   }
 
   private getMeta(key: string): string | undefined {
-    const rows = [...this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key)];
-    return rows[0]?.value as string | undefined;
+    return this.meta.get(key);
   }
 
+  /** Storing a value that is already stored is not a write — see meta.ts. */
   private setMeta(key: string, value: string): void {
-    this.ctx.storage.sql.exec(
-      "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      key,
-      value
-    );
+    this.meta.set(key, value);
   }
 
   /** The host socket to route to: the freshest one that has proven itself
