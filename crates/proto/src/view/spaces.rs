@@ -622,6 +622,7 @@ mod tests {
             task_id: format!("t-{chat_id}"),
             chat_id: chat_id.into(),
             identifier: "gh#25".into(),
+            slug: None,
             branch: None,
             state: super::super::board::AgentState::Working,
             started_at: None,

@@ -107,6 +107,12 @@ identifier, because it has a repo column of its own.)
 
 ### Not in this issue
 
+The other half of what was asked for here — that the name be *informative*, not
+merely agreed on — is gh#364, which carries a slug of the title beside the
+identifier (`gh#341 review-page-loads`) and spends the branch's repo half on it.
+It is decoration on the key and drops before the identifier does, so the rule
+above is what it rests on rather than something it competes with.
+
 The iOS row sub-line is a hand-port of `state_metadata_fields` and has been
 drifting since gh#283 — it still carries no stack or landing facts. This change
 keeps the port faithful for the facts it does carry (`waiting on you · in PR

@@ -895,11 +895,11 @@ impl SyncEngine {
             // be its own. Branch names are not unique across repos — `gh#2` in
             // two repos both branched to `board/gh-2` — so matching on the
             // branch alone attached another repo's merged PR to this task and
-            // derived it straight to review (herdr-board AGE-20). Branches
-            // carry their repo now, but the scope stays: attempts recorded
-            // before that do not, and `--branch` can name anything at all.
-            // Linear identifiers are globally unique, so Linear rows need no
-            // such scoping.
+            // derived it straight to review (herdr-board AGE-20). This scope is
+            // the whole of that fix, and it is why gh#364 could spend the
+            // branch's repo half on the title: the branch never carried the
+            // answer, the task id did. Linear identifiers are globally unique,
+            // so Linear rows need no such scoping.
             let own_repo = crate::model::gh_repo(&task.id);
             let Some(link) = link_for(pulls, &branches, own_repo) else {
                 continue;
@@ -4518,8 +4518,10 @@ struct Linked<'a> {
 /// names are not unique across repositories — `gh#2` in two repos both branch to
 /// `board/gh-2` — so matching on the branch alone attached another repo's merged
 /// pull request to this task and derived it straight to review (herdr-board
-/// AGE-20). `None` for a Linear task, whose identifier is globally unique and
-/// whose pull request is honoured in whichever repo it turns up in.
+/// AGE-20). Branch names have never had to answer for that and since gh#364 do
+/// not pretend to: they carry a slug of the title where the repo used to be.
+/// `None` for a Linear task, whose identifier is globally unique and whose pull
+/// request is honoured in whichever repo it turns up in.
 ///
 /// Ordering is (layer, then newest first), so the link is the bottom layer, and
 /// within one branch the most recent pull request on it — a branch whose first

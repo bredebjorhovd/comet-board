@@ -106,10 +106,24 @@ struct NeedRowView: View {
                 .foregroundStyle(accent)
                 .frame(width: 10)
             VStack(alignment: .leading, spacing: 2) {
-                Text(need.who)
-                    .font(Theme.sans(Theme.textBody, weight: .medium))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(need.who)
+                        .font(Theme.sans(Theme.textBody, weight: .medium))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                    // The slug after an identifier WHO (gh#364): an inbox of
+                    // `gh#341` and `gh#342` is two rows that look alike. Lower
+                    // layout priority, so what a narrow screen gives up is the
+                    // description and never the name.
+                    if let slug = need.slug {
+                        Text(slug)
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.textSubtle)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
                 Text(need.what)
                     .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(Theme.textSubtle)

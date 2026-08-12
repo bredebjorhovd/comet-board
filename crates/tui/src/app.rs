@@ -158,6 +158,9 @@ pub enum Row {
         chat_id: String,
         space_id: Option<String>,
         who: String,
+        /// The slug drawn after an identifier WHO (gh#364), and dropped before
+        /// it when the pane is too narrow for both.
+        slug: Option<String>,
         what: String,
         kind: NeedKind,
     },
@@ -189,6 +192,10 @@ pub enum Row {
         /// can tell this row from the same chat's entry in the sessions list.
         chat_id: String,
         identifier: String,
+        /// A slug of the task's title, drawn after the identifier where the
+        /// pane is wide enough for it (gh#364). The identifier is the name; a
+        /// row too narrow for both keeps the name.
+        slug: Option<String>,
         branch: Option<String>,
         state: AgentState,
         /// When the attempt started, and what it is capped at — the instant, not
@@ -2238,6 +2245,7 @@ impl App {
                 chat_id: need.chat_id,
                 space_id: need.space_id,
                 who: need.who,
+                slug: need.slug,
                 what: need.what,
                 kind: need.kind,
             });
@@ -2307,6 +2315,7 @@ impl App {
                     board_view::ActiveRow::Agent(agent) => rows.push(Row::Agent {
                         chat_id: agent.chat_id,
                         identifier: agent.identifier,
+                        slug: agent.slug,
                         branch: agent.branch,
                         state: agent.state,
                         started_at: agent.started_at,

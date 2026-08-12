@@ -625,6 +625,17 @@ impl TaskRow {
             _ => false,
         }
     }
+
+    /// The short slug of this row's title (gh#364), for a surface that shows
+    /// the identifier and has no room for the title itself.
+    ///
+    /// Not for the board pane, which draws the whole title in a column of its
+    /// own — a slug there would be the title said twice and worse the second
+    /// time. This is for the places that name a task in a token: the Active
+    /// list, the Needs-you inbox, a branch.
+    pub fn slug(&self) -> Option<String> {
+        crate::view::slug::title_slug(&self.title)
+    }
 }
 
 /// The `owner/repo` a GitHub task id names — `gh:Florin-AS/tally#507` →
@@ -2058,6 +2069,20 @@ pub struct AgentRow {
     /// The issue identifier (`AGE-14`, `gh#103`): what the agent is *for*, and
     /// a better title than the chat's, which the agent writes about itself.
     pub identifier: String,
+    /// A short slug of the task's title (gh#364), to be drawn after the
+    /// identifier — `gh#341 review-page-loads`.
+    ///
+    /// Four agents in flight is the case this exists for: `gh#341 gh#342
+    /// gh#343 gh#356` is four rows that look alike, and the section's whole job
+    /// is telling them apart at a glance. Its own field rather than folded into
+    /// [`identifier`](Self::identifier) because it is **decoration on the key
+    /// and drops first** — a renderer short of width draws the identifier
+    /// without it, and one that had them pre-joined could only truncate, which
+    /// eats the name from the wrong end.
+    ///
+    /// `None` when the title yields no content words; see
+    /// [`crate::view::slug::title_slug`].
+    pub slug: Option<String>,
     pub branch: Option<String>,
     pub state: AgentState,
     /// When the attempt started. `None` on a row carrying no `started_at`,
@@ -2072,6 +2097,24 @@ pub struct AgentRow {
 }
 
 impl AgentRow {
+    /// What to call this row where there is room for both — `gh#341
+    /// review-page-loads`, and the bare identifier when there is no slug.
+    ///
+    /// A space, not a separator: `·` would make the slug read as a second
+    /// field, and it is not one. It is the name wearing a description.
+    ///
+    /// For one-line surfaces and width arithmetic. A renderer that styles the
+    /// two halves differently — the identifier in the row's own weight, the
+    /// slug muted after it — reads the fields instead, and must drop the slug
+    /// rather than truncate this string: what elides from the right here is the
+    /// decoration's job to lose, never the identifier's.
+    pub fn name(&self) -> String {
+        match &self.slug {
+            Some(slug) => format!("{} {slug}", self.identifier),
+            None => self.identifier.clone(),
+        }
+    }
+
     /// How long this attempt has been going.
     pub fn elapsed_secs(&self, now: DateTime<Utc>) -> Option<i64> {
         agent_elapsed_secs(self.started_at, now)
@@ -2160,6 +2203,7 @@ pub fn agent_rows(
                 task_id: row.id.clone(),
                 chat_id: chat_id.to_string(),
                 identifier: row.identifier.clone(),
+                slug: row.slug(),
                 // The chat's branch first: it is the checkout the agent is
                 // actually in, and the attempt row's copy is what it was cut as.
                 branch: chat
@@ -2763,6 +2807,61 @@ mod tests {
         unrouted.workspace = None;
         unrouted.dispatchable = false;
         assert_eq!(row_metadata(&unrouted, false, 80, now()), "no route");
+    }
+
+    /// gh#364. The slug is decoration on the key: derived from the title, and
+    /// absent rather than invented when the title has nothing in it.
+    #[test]
+    fn a_row_carries_a_slug_of_its_title_beside_the_identifier() {
+        let mut r = row("341", BoardState::Working);
+        r.title = "The review page loads nothing".into();
+        assert_eq!(r.slug().as_deref(), Some("review-page-loads"));
+
+        // Nothing but function words, and nothing at all: no slug, and the
+        // identifier is still the row's name.
+        r.title = "It is what it is".into();
+        assert_eq!(r.slug(), None);
+        r.title = String::new();
+        assert_eq!(r.slug(), None);
+        assert_eq!(r.display_identifier(), "gh#341");
+    }
+
+    /// The four-in-flight case this exists for: the rows the Active list draws
+    /// carry the slug, and [`AgentRow::name`] is what a one-line surface says.
+    #[test]
+    fn live_agent_rows_are_told_apart_by_their_slugs() {
+        let titles = [
+            (341, "The review page loads nothing"),
+            (342, "A settle announced twice is one settle"),
+            (343, "It is what it is"),
+        ];
+        let rows: Vec<TaskRow> = titles
+            .iter()
+            .map(|(n, title)| {
+                let mut r = row(&n.to_string(), BoardState::Working);
+                r.title = (*title).into();
+                r.chat_id = Some(format!("chat-{n}"));
+                r
+            })
+            .collect();
+        let chats: Vec<crate::Chat> = titles
+            .iter()
+            .map(|(n, _)| chat(&format!("chat-{n}"), None))
+            .collect();
+        let names: Vec<String> = agent_rows(&rows, &chats, &[], now())
+            .iter()
+            .map(AgentRow::name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "gh#341 review-page-loads",
+                "gh#342 settle-announced-twice",
+                // No slug in that title — the identifier alone, which is the
+                // guarantee the whole feature rests on.
+                "gh#343",
+            ]
+        );
     }
 
     #[test]

@@ -159,16 +159,32 @@ struct AgentRowView: View {
                 .foregroundStyle(accent)
                 .frame(width: 10)
             VStack(alignment: .leading, spacing: 2) {
-                // The chip fill is the white-wash language, not an accent
-                // tint — the accent stays on the state glyph.
-                Text(agent.identifier)
-                    .font(Theme.sans(Theme.textDense, weight: .medium))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Theme.elementActive,
-                                in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                HStack(spacing: 5) {
+                    // The chip fill is the white-wash language, not an accent
+                    // tint — the accent stays on the state glyph.
+                    Text(agent.identifier)
+                        .font(Theme.sans(Theme.textDense, weight: .medium))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Theme.elementActive,
+                                    in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+                        .layoutPriority(1)
+                    // The slug (gh#364), outside the chip and muted: the chip
+                    // is the origin telling, this is what the work is. Four
+                    // agents in flight are `gh#341 gh#342 gh#343 gh#356`
+                    // without it. It has the lower layout priority, so a
+                    // narrow phone truncates the description and never the
+                    // name.
+                    if let slug = agent.slug {
+                        Text(slug)
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(subline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
                 HStack(spacing: 4) {
                     if let branch = agent.branch {
                         LineIconView(.gitBranch, size: 11, color: subline)

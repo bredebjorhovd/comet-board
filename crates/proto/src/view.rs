@@ -22,6 +22,7 @@ pub mod needs;
 pub mod rates;
 pub mod repos;
 pub mod skills;
+pub mod slug;
 pub mod spaces;
 pub mod stats;
 

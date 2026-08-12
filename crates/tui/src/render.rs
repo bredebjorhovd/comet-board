@@ -468,7 +468,11 @@ fn draw_sidebar_row(
         // one-line WHAT under it. No dots — the kind glyph is the board's own
         // shape family, and everything else is words.
         Row::Need {
-            who, what, kind, ..
+            who,
+            slug,
+            what,
+            kind,
+            ..
         } => {
             let base = if selected {
                 theme.selected()
@@ -478,16 +482,22 @@ fn draw_sidebar_row(
             if selected {
                 fill(frame, bleed, theme.selected());
             }
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(kind.glyph().to_string(), base.patch(theme.need_kind(*kind))),
-                    Span::styled(
-                        format!(" {}", wrap::truncate(who, width.saturating_sub(2))),
-                        base.patch(theme.subtle()),
-                    ),
-                ])),
-                Rect { height: 1, ..area },
-            );
+            let name_width = width.saturating_sub(2);
+            let who_text = wrap::truncate(who, name_width);
+            // Whole or not at all, and after the name — the agent row's rule
+            // (gh#364), for the reason that row has it: an inbox of `gh#341`
+            // and `gh#342` is two rows that look alike.
+            let slug = slug.as_deref().filter(|slug| {
+                wrap::width_of(slug) + 1 <= name_width.saturating_sub(wrap::width_of(&who_text))
+            });
+            let mut line = vec![
+                Span::styled(kind.glyph().to_string(), base.patch(theme.need_kind(*kind))),
+                Span::styled(format!(" {who_text}"), base.patch(theme.subtle())),
+            ];
+            if let Some(slug) = slug {
+                line.push(Span::styled(format!(" {slug}"), base.patch(theme.hint())));
+            }
+            frame.render_widget(Paragraph::new(Line::from(line)), Rect { height: 1, ..area });
             if area.height > 1 {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
@@ -596,6 +606,7 @@ fn draw_sidebar_row(
         Row::Agent {
             chat_id,
             identifier,
+            slug,
             branch,
             state,
             started_at,
@@ -628,26 +639,40 @@ fn draw_sidebar_row(
             let elapsed_width = wrap::width_of(&elapsed);
             // Two columns more than a bare title: the chip's own padding.
             let title_width = width.saturating_sub(5 + elapsed_width).max(1);
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(glyph, glyph_style),
-                    Span::raw(" "),
-                    // The identifier as a chip — element fill, the ramp's "a
-                    // thing you act on" level, held even on the cursor row so
-                    // origin survives selection. `NO_COLOR` has no fills and
-                    // simply reads the identifier, which the branch sub-line
-                    // backs up.
-                    Span::styled(
-                        format!(" {} ", wrap::truncate(identifier, title_width)),
-                        base.patch(if open {
-                            theme.element()
-                        } else {
-                            theme.element_subtle()
-                        }),
-                    ),
-                ])),
-                Rect { height: 1, ..area },
-            );
+            let id_text = wrap::truncate(identifier, title_width);
+            // The slug goes after the chip and takes what the identifier left
+            // (gh#364), which on this pane is usually nothing — the sidebar is
+            // narrow, and this is exactly the "anywhere narrow" case the rule
+            // was written for. It is drawn whole or not at all: half a slug
+            // reads as a broken word, and the identifier beside it is already
+            // the name.
+            let slug = slug.as_deref().filter(|slug| {
+                wrap::width_of(slug) + 1 <= title_width.saturating_sub(wrap::width_of(&id_text))
+            });
+            let mut line = vec![
+                Span::styled(glyph, glyph_style),
+                Span::raw(" "),
+                // The identifier as a chip — element fill, the ramp's "a
+                // thing you act on" level, held even on the cursor row so
+                // origin survives selection. `NO_COLOR` has no fills and
+                // simply reads the identifier, which the branch sub-line
+                // backs up.
+                Span::styled(
+                    format!(" {id_text} "),
+                    base.patch(if open {
+                        theme.element()
+                    } else {
+                        theme.element_subtle()
+                    }),
+                ),
+            ];
+            if let Some(slug) = slug {
+                // Outside the chip and in hint weight: the chip is the origin
+                // telling, and the slug is a description of the work, not part
+                // of what the board calls it.
+                line.push(Span::styled(format!(" {slug}"), base.patch(theme.hint())));
+            }
+            frame.render_widget(Paragraph::new(Line::from(line)), Rect { height: 1, ..area });
             if elapsed_width > 0 && (elapsed_width as u16) < area.width {
                 // Past its cap the counter is the warning: gh#70's clock will
                 // interrupt this agent, and the number is why.

@@ -153,11 +153,20 @@ max_tool_calls = "2000"
 # What to do about a dispatch that charges somebody else: warn, require-own, or
 # off. See the per-route note above for what each one does.
 billing_guard = "warn"
-# `{identifier_lower}` is the identifier made branch-safe: `LIN-145` →
-# `lin-145`. For GitHub it also carries the repo — `gh#2` in tripletex-mcp is
-# `gh-2-tripletex-mcp` — because GitHub numbers issues per repository, and every
-# watched repo's issue 2 sharing one branch name is how another repo's merged
-# pull request ends up attached to an untouched task.
+# `{identifier_lower}` is the identifier made branch-safe, then a short slug of
+# the title: `gh#341` titled "The review page loads nothing" branches to
+# `board/gh-341-review-page-loads`. The slug is stopword-stripped and capped, so
+# it is three content words at most; a title that yields none of them leaves the
+# identifier standing alone, which is always enough to name the task.
+#
+# It carried the *repo* until gh#364 (`gh-2-tripletex-mcp`) and no longer does:
+# a branch already lives in one repo and its worktree already sits under a
+# per-repo directory, so that word was spent saying nothing twice. Nothing is
+# less safe for it — a pull request is attached to a task by the repo the task
+# id names, never by reading a repo back out of the branch.
+#
+# `{identifier_slug}` and `{title_slug}` are the two halves on their own, for a
+# template that wants to compose them itself — or to leave the slug out.
 branch_template = "board/{identifier_lower}"
 # What a dispatch's branch is cut from. The dispatch fetches this from origin
 # first, then branches off the remote-tracking ref — never off the space
