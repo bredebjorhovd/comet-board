@@ -73,6 +73,11 @@ pub fn prompt_vars<'a>(
     let mut v = BTreeMap::new();
     v.insert("title", task.title.clone());
     v.insert("identifier", task.identifier.clone());
+    // The board's own name for the task — what every verb takes as `--task`,
+    // and a different string from the identifier above (`gh:owner/repo#339`
+    // against `gh#339`). A route template that wants to name the verb itself
+    // needs this one; nothing else in a dispatched run says it (§gh#339).
+    v.insert("task_id", task.id.clone());
     v.insert("identifier_lower", branch_slug(task));
     // The two halves of that on their own, for a template that wants to
     // compose them itself — or to leave the slug out, which a route whose
@@ -96,9 +101,13 @@ pub fn prompt_vars<'a>(
 /// brief rather than interpolated into it — see [`pr_base`] for why the agent
 /// has to be told, and why the line lands on a route's own `prompt` too.
 ///
-/// `stack` is [`DispatchOverrides::stack`], and it is appended last for the
-/// same reason and one more: [`crate::stacks::stack_brief`] answers the base
+/// `stack` is [`DispatchOverrides::stack`], and it is appended for the same
+/// reason and one more: [`crate::stacks::stack_brief`] answers the base
 /// sentence above it, so it has to come after the sentence it answers.
+///
+/// [`crate::claims::brief`] closes it, on the same rule and for the failure
+/// gh#339 opened on: a brief that asked for a commit, a push and a pull request
+/// and never mentioned the review contract got exactly what it asked for.
 pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str, stack: bool) -> String {
     let vars = prompt_vars(task, branch, &route.workspace);
     let template = route.prompt.clone().unwrap_or_else(|| {
@@ -118,6 +127,13 @@ pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str, stac
     if stack {
         prompt.push_str(&crate::stacks::stack_brief(branch, pr_base(base)));
     }
+    // Last, because it is the last thing the agent does — and unconditional,
+    // because the review contract is what the board dispatched for (§gh#339).
+    // A template that already names the verb still gets it: the paragraph is
+    // about being dispatched, not about this task, and the duplicate a route
+    // author would create by mentioning claims themselves is cheaper than an
+    // attempt that claims nothing.
+    prompt.push_str(&crate::claims::brief(&task.id));
     prompt
 }
 
@@ -676,14 +692,57 @@ pub struct StackParent {
     pub branch: String,
 }
 
+/// The task a caller named, by id (`gh:owner/repo#12`) or by identifier
+/// (`gh#12`).
+///
+/// Both, because both are things a caller has to hand: the RPC callers and the
+/// board's own surfaces hold ids, and anybody *typing* one holds the identifier
+/// they read off the board — or, for a dispatched agent, the identifier its
+/// brief opened with. That second case is gh#339's other half: the brief said
+/// `gh#339`, `claim --task` compared strings against the id column, and an
+/// agent that did everything the skill asked was answered "gh#339 is not on the
+/// board". A contract whose one verb refuses the name it handed you is not a
+/// contract anybody can keep.
+///
+/// The id is tried first and whole. An identifier that matches more than one
+/// row is refused rather than guessed — two sources can spell the same name,
+/// and the point of the exact id is to be the thing that says which. The
+/// refusal names **every** matching id, because naming one of them would be a
+/// disambiguator picked by iteration order: right half the time, and wrong in
+/// a way the reader cannot see.
+pub fn task_by_reference<'a>(tasks: &'a [Task], reference: &str) -> Result<&'a Task> {
+    let reference = reference.trim();
+    if let Some(task) = tasks.iter().find(|t| t.id == reference) {
+        return Ok(task);
+    }
+    let named: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.identifier.eq_ignore_ascii_case(reference))
+        .collect();
+    match named.as_slice() {
+        [] => bail!("`{reference}` is not a task on the board"),
+        [only] => Ok(only),
+        // Every id, never one of them. A message that hands the reader a
+        // single id and calls it the disambiguator is a message that can be
+        // wrong: it would be whichever row the scan reached first, and a
+        // reviewer who pastes it lands on the other task's review believing
+        // they were told which to use.
+        several => bail!(
+            "`{reference}` names {} tasks on the board — pass the task id to \
+             say which: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|t| format!("`{}`", t.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// Resolve a dispatch's `onto` to the attempt it stacks on.
 ///
-/// `reference` is a task id (`gh:owner/repo#12`) or an identifier (`gh#12`),
-/// because both are things a caller has to hand: the RPC callers hold ids, and
-/// anybody typing one holds the identifier they read off the board. An
-/// identifier that matches more than one row is refused rather than guessed —
-/// two sources can spell the same name, and picking one silently would stack
-/// the work on the wrong branch.
+/// `reference` is a task id or an identifier, per [`task_by_reference`].
 ///
 /// Which attempt: the **live** one if there is one, else the most recent
 /// attempt holding a branch. Both are the same answer to "the branch this task's
@@ -704,24 +763,7 @@ pub fn stack_parent(db: &Db, reference: &str, dispatching: &str) -> Result<Stack
         bail!("--onto needs a task to stack on");
     }
     let tasks = db.load_tasks()?;
-    let task = match tasks.iter().find(|t| t.id == reference) {
-        Some(task) => task,
-        None => {
-            let mut named = tasks
-                .iter()
-                .filter(|t| t.identifier.eq_ignore_ascii_case(reference));
-            let first = named.next().ok_or_else(|| {
-                anyhow::anyhow!("`{reference}` is not a task on the board — nothing to stack on")
-            })?;
-            if named.next().is_some() {
-                bail!(
-                    "`{reference}` names more than one task on the board — \
-                     pass the task id to say which"
-                );
-            }
-            first
-        }
-    };
+    let task = task_by_reference(&tasks, reference)?;
     if task.id == dispatching {
         bail!(
             "{} cannot stack on itself — `--onto` names the *other* task whose \
@@ -918,6 +960,129 @@ mod tests {
         )
         .unwrap();
         assert!(!spec.prompt.contains("gh stack"));
+    }
+
+    // ---- the review contract reaches the agent (§gh#339) -----------------
+
+    /// The headline. Twenty-three settled attempts on the box claimed nothing,
+    /// with the skill installed the whole time, because the one text that
+    /// always arrives asked for a commit, a push and a pull request and never
+    /// mentioned the contract the review screen is built on.
+    #[test]
+    fn every_brief_asks_for_the_claims_the_review_is_made_of() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            spec.prompt
+                .contains("comet-board claim --task gh:owner/widget#7"),
+            "{}",
+            spec.prompt
+        );
+        // The fallback too: an agent that finishes without running the verb
+        // has still been told where to write the block.
+        assert!(
+            spec.prompt.contains("fenced block tagged `claims`"),
+            "{}",
+            spec.prompt
+        );
+        // …and it *names* that fence rather than spelling one, so a brief
+        // quoted back in a closing message cannot be harvested as the agent's
+        // own claims. The board must never read its own instruction as an
+        // answer to it.
+        assert_eq!(crate::claims::find_block(&spec.prompt), None);
+    }
+
+    /// And it reaches a route that wrote its own brief, on `pr_base_line`'s
+    /// rule: a template is somebody's wording for the *task*, and the contract
+    /// is a fact about being dispatched at all. This is the case that produced
+    /// the bug — the box's own routes carry custom prompts.
+    #[test]
+    fn a_route_with_its_own_prompt_is_still_asked() {
+        let mut route = route();
+        route.prompt = Some("Do {title}. Commit, push, open a PR.".into());
+        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false);
+        assert!(prompt.starts_with("Do Fix the flaky retry."), "{prompt}");
+        assert!(
+            prompt.contains("comet-board claim --task gh:owner/widget#7"),
+            "{prompt}"
+        );
+    }
+
+    /// The id is in the brief because nothing else in a dispatched run says
+    /// it: no environment variable carries it, and the identifier the brief
+    /// opens with is a different string.
+    #[test]
+    fn the_brief_names_the_id_the_verb_takes_and_not_the_identifier() {
+        let prompt = resolve_prompt(&route(), &task(), "board/gh-7", "origin/HEAD", false);
+        let asked = prompt.split("--task ").nth(1).expect("the verb");
+        assert!(asked.starts_with("gh:owner/widget#7"), "{asked}");
+    }
+
+    /// A route that wants to place the id itself can: same var, same value.
+    #[test]
+    fn a_template_can_name_the_task_id() {
+        let mut route = route();
+        route.prompt = Some("claim against {task_id} when done".into());
+        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false);
+        assert!(
+            prompt.starts_with("claim against gh:owner/widget#7 when done"),
+            "{prompt}"
+        );
+    }
+
+    /// The other half of gh#339: the verbs take the name the brief handed
+    /// over. An agent that reached for the identifier it was greeted with was
+    /// told its own task was not on the board — which reads as the board
+    /// having lost the row, not as the wrong spelling.
+    #[test]
+    fn a_task_answers_to_its_id_and_to_its_identifier() {
+        let tasks = vec![task()];
+        assert_eq!(
+            task_by_reference(&tasks, "gh:owner/widget#7").unwrap().id,
+            "gh:owner/widget#7"
+        );
+        // Typed by hand, so spelled by hand — either case, either spelling.
+        for typed in ["gh#7", " GH#7 "] {
+            assert_eq!(
+                task_by_reference(&tasks, typed).unwrap().id,
+                "gh:owner/widget#7",
+                "{typed}"
+            );
+        }
+        assert!(task_by_reference(&tasks, "gh#8").is_err());
+    }
+
+    /// Two sources can spell one name. Guessing which row a reviewer meant is
+    /// how a verdict lands on somebody else's attempt, so the ambiguity is
+    /// refused — and the refusal names **every** candidate.
+    ///
+    /// Naming one would be a disambiguator chosen by iteration order. A reader
+    /// told `pass the task id (gh:owner/widget#7)` has been handed something
+    /// shaped like the answer to their question, and if theirs was the other
+    /// row they paste it and read somebody else's review believing the board
+    /// told them to.
+    #[test]
+    fn an_identifier_two_tasks_share_is_refused_and_every_candidate_is_named() {
+        let mut other = task();
+        other.id = "gh:owner/gadget#7".into();
+        let tasks = vec![task(), other];
+        let err = task_by_reference(&tasks, "gh#7").unwrap_err().to_string();
+        assert!(err.contains("names 2 tasks"), "{err}");
+        for id in ["gh:owner/widget#7", "gh:owner/gadget#7"] {
+            assert!(err.contains(id), "{id} missing from: {err}");
+        }
+        // The exact id is never ambiguous — that is what it is for.
+        assert_eq!(
+            task_by_reference(&tasks, "gh:owner/gadget#7").unwrap().id,
+            "gh:owner/gadget#7"
+        );
     }
 
     #[test]
@@ -1894,7 +2059,12 @@ mod tests {
         let err = stack_parent(&db, "gh#12", "gh:owner/widget#7")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("more than one task"), "{err}");
+        assert!(err.contains("names 2 tasks"), "{err}");
+        // Both candidates by name, so `--onto` is as repairable as `--task`:
+        // the reader picks, and the message never picks for them.
+        for id in ["gh:owner/widget#12", "gh:owner/other#12"] {
+            assert!(err.contains(id), "{id} missing from: {err}");
+        }
         // The unambiguous id still works.
         let parent = stack_parent(&db, "gh:owner/other#12", "gh:owner/widget#7").unwrap();
         assert_eq!(parent.branch, "board/gh-12-other");

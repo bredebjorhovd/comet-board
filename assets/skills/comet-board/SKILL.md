@@ -55,6 +55,10 @@ Both surfaces read one derivation per frame :: active_placements
 EOF
 ```
 
+`--task` takes either spelling: the board's own id (`gh:owner/repo#183`) or the
+identifier you read off the board (`gh#183`). A dispatched agent's brief prints
+the id beside the verb, so the one to paste is already in front of you.
+
 `<sentence> :: <anchor> [<anchor>…]`. An anchor is a **path** or a **symbol**,
 told apart by how it is spelled — never by a flag:
 
