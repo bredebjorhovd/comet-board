@@ -993,6 +993,41 @@ impl<T: Rest> Github<T> {
         Ok(out)
     }
 
+    /// What one pull request changed, as the changed set a review is derived
+    /// from (§gh#344).
+    ///
+    /// The diff of a pushed branch is GitHub's whether or not this box has a
+    /// checkout of it, which is what makes a review of an undispatched pull
+    /// request possible at all: no attempt, no worktree, and still a real
+    /// denominator for the remainder.
+    ///
+    /// Asked only when a review is opened on a row with no attempt — never on
+    /// the poll. One file list per open pull request per cycle would be a call
+    /// per PR for a number nobody is looking at.
+    ///
+    /// Truncation is reported, not hidden: GitHub caps this endpoint at 3000
+    /// files, and a remainder computed against a silently short list would say
+    /// "everything is accounted for" about a diff it had only seen part of.
+    pub fn pull_files(&self, repo: &str, number: i64) -> Result<Vec<crate::claims::ChangedFile>> {
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let path = format!("/repos/{repo}/pulls/{number}/files?per_page={PAGE}&page={page}");
+            let v = self.rest.get(&path)?;
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow!("github {path}: expected an array"))?;
+            let raw = arr.len();
+            out.extend(arr.iter().filter_map(parse_changed_file));
+            if raw < PAGE {
+                return Ok(out);
+            }
+        }
+        bail!(
+            "{repo}#{number} changed more than {} files; refusing to report a partial diff",
+            PAGE * MAX_PAGES
+        )
+    }
+
     pub fn pulls(&self, repo: &str) -> Result<Vec<PullRequest>> {
         let v = self
             .rest
@@ -1040,6 +1075,48 @@ fn parse_issue(repo: &str, n: &Value) -> Option<GithubIssue> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+    })
+}
+
+/// One entry of GitHub's pull-request file list, as a [`ChangedFile`].
+///
+/// The status is translated into git's own letter rather than kept in GitHub's
+/// words, because the review screen and the CLI both draw that column and a row
+/// that read `modified` beside one that read `M` would be two spellings of one
+/// fact. `renamed` and `copied` become `R` and `C`, which is what
+/// `git diff --name-status` calls them.
+///
+/// A binary file is the one that has to be inferred: GitHub reports it as zero
+/// added, zero removed and no patch, which is exactly what git's `-` means and
+/// what [`ChangedFile::binary`] exists to say. A patch withheld because the
+/// diff is enormous still carries its counts, so it is not mistaken for one.
+fn parse_changed_file(n: &Value) -> Option<crate::claims::ChangedFile> {
+    let path = n.get("filename")?.as_str()?.to_string();
+    let added = n.get("additions").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let removed = n.get("deletions").and_then(Value::as_u64).unwrap_or(0) as u32;
+    Some(crate::claims::ChangedFile {
+        path,
+        status: match n
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("modified")
+        {
+            "added" => "A",
+            "removed" => "D",
+            "renamed" => "R",
+            "copied" => "C",
+            // `modified`, `changed` and `unchanged` are all "this file is in
+            // the diff and was neither created nor deleted".
+            _ => "M",
+        }
+        .to_string(),
+        added,
+        removed,
+        binary: added == 0 && removed == 0 && n.get("patch").is_none(),
+        // Symbols are read off a unified diff by `claims::attach_symbols`, and
+        // this list is not one. Empty is "not known", which makes a symbol
+        // anchor come back unmatched rather than quietly satisfied.
+        symbols: Vec::new(),
     })
 }
 
@@ -1645,6 +1722,41 @@ mod tests {
         assert_eq!(issues[0].number, 87);
         assert_eq!(issues[0].task_id(), "gh:o/r#87");
         assert_eq!(issues[0].identifier(), "gh#87");
+    }
+
+    /// The diff of a pushed branch is GitHub's, so a review needs no checkout
+    /// to have a denominator (§gh#344) — and it is read in git's vocabulary,
+    /// not GitHub's, because the same column is drawn beside checkout-read
+    /// rows.
+    #[test]
+    fn a_pull_requests_files_are_the_changed_set_in_gits_own_letters() {
+        let g = Github::new(FixtureRest::new(vec![(
+            "/repos/o/r/pulls/265/files".into(),
+            json!([
+                { "filename": "src/a.rs", "status": "modified",
+                  "additions": 18, "deletions": 2, "patch": "@@" },
+                { "filename": "src/new.rs", "status": "added",
+                  "additions": 40, "deletions": 0, "patch": "@@" },
+                { "filename": "src/old.rs", "status": "removed",
+                  "additions": 0, "deletions": 12, "patch": "@@" },
+                { "filename": "docs/moved.md", "status": "renamed",
+                  "additions": 0, "deletions": 0, "patch": "@@" },
+                { "filename": "assets/logo.png", "status": "modified",
+                  "additions": 0, "deletions": 0 }
+            ]),
+        )]));
+        let files = g.pull_files("o/r", 265).unwrap();
+        let letters: Vec<&str> = files.iter().map(|f| f.status.as_str()).collect();
+        assert_eq!(letters, ["M", "A", "D", "R", "M"]);
+        assert_eq!(files[0].counts(), "+18 −2");
+        // A rename with no line movement is not binary: GitHub sent a patch.
+        assert!(!files[3].binary);
+        // No patch and no lines is what git spells `-`.
+        assert!(files[4].binary, "a binary file has no lines to count");
+        assert_eq!(files[4].counts(), "binary");
+        // Symbols come off a unified diff, and this is not one. Empty is "not
+        // known", which makes a symbol anchor come back unmatched.
+        assert!(files.iter().all(|f| f.symbols.is_empty()));
     }
 
     #[test]

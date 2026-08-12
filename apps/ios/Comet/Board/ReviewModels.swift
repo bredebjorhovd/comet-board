@@ -220,6 +220,9 @@ struct ClaimView: Decodable, Hashable {
 enum DiffSource: Decodable, Hashable {
     case checkout
     case recorded
+    /// GitHub's own file list for the pull request (§gh#344) — what answers
+    /// when no attempt ever held a checkout of this branch.
+    case pullRequest
     case unavailable(reason: String)
 
     private enum CodingKeys: String, CodingKey {
@@ -228,7 +231,7 @@ enum DiffSource: Decodable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        // Internally tagged on `source`, and there is no fourth variant. An
+        // Internally tagged on `source`, and there is no fifth variant. An
         // unrecognised tag is a board on another build, not an unreadable diff
         // — reading it as `unavailable` would turn a version skew into a
         // sentence about a reclaimed checkout that nobody said.
@@ -236,6 +239,7 @@ enum DiffSource: Decodable, Hashable {
         switch source {
         case "checkout": self = .checkout
         case "recorded": self = .recorded
+        case "pull_request": self = .pullRequest
         case "unavailable":
             self = .unavailable(reason: try c.decode(String.self, forKey: .reason))
         default:
@@ -505,6 +509,15 @@ struct AttemptReview: Decodable, Hashable {
 
     /// Did the agent answer the claim contract at all?
     var claimed: Bool { claimedAt != nil }
+
+    /// Is this a review of a pull request nobody dispatched (§gh#344)?
+    ///
+    /// The port of `AttemptReview::undispatched`, and the sentinel is the same:
+    /// `attempts.id` starts at 1, so zero is "there is no attempt behind this".
+    /// Every surface asks this before it says a word about claims — "this
+    /// attempt never answered the contract" said about a pull request no agent
+    /// was ever given blames somebody for missing a message nobody sent.
+    var undispatched: Bool { attempt == 0 }
 
     /// Is every changed file accounted for?
     var complete: Bool { unclaimed.isEmpty }
@@ -896,6 +909,13 @@ extension AttemptReview {
                 kind: .malformedClaims,
                 text: "this attempt wrote a claims block the board could not read, "
                     + "so nothing accounts for its \(files): \(reviewFirstLine(error))"))
+        } else if undispatched {
+            // Nobody was told the contract, so nobody failed to answer it. The
+            // number is the same and the sentence is not (§gh#344).
+            out.append(ReviewFinding(
+                kind: .neverClaimed,
+                text: "nothing dispatched this pull request, so no claims were ever made "
+                    + "and nothing accounts for its \(files)"))
         } else if !claimed {
             out.append(ReviewFinding(
                 kind: .neverClaimed,

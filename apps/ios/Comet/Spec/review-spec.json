@@ -96,42 +96,68 @@
     {
       "attempts": 1,
       "expect": true,
+      "prUrl": null,
       "state": "blocked"
     },
     {
       "attempts": 1,
       "expect": true,
+      "prUrl": null,
       "state": "working"
     },
     {
       "attempts": 1,
       "expect": true,
+      "prUrl": null,
       "state": "ready"
     },
     {
       "attempts": 1,
       "expect": true,
+      "prUrl": null,
       "state": "review"
     },
     {
       "attempts": 1,
       "expect": true,
+      "prUrl": null,
       "state": "failed"
     },
     {
       "attempts": 1,
       "expect": true,
+      "prUrl": null,
       "state": "done"
     },
     {
       "attempts": 0,
       "expect": false,
+      "prUrl": null,
       "state": "ready"
     },
     {
       "attempts": 0,
       "expect": false,
+      "prUrl": null,
       "state": "review"
+    },
+    {
+      "attempts": 0,
+      "expect": true,
+      "prUrl": "https://github.com/o/r/pull/191",
+      "state": "review"
+    },
+    {
+      "attempts": 0,
+      "expect": true,
+      "prUrl": "https://github.com/o/r/pull/191",
+      "state": "done"
+    },
+    {
+      "attempts": 0,
+      "expect": false,
+      "prUrl": "",
+      "state": "ready"
     }
   ],
   "reviews": [
@@ -1101,6 +1127,114 @@
         "task_id": "gh:o/r#180",
         "unclaimed": [],
         "uncommitted": 0,
+        "unmatched_anchors": [],
+        "worktree": null
+      }
+    },
+    {
+      "expect": {
+        "claimed": false,
+        "claims": [],
+        "complete": false,
+        "contractDelivering": "Delivered into codex/restore-green-main once, with both unclaimed changes attached.",
+        "contractPostedOnly": "Posted to the pull request. Nothing is delivered into the chat.",
+        "counts": [
+          "+44 −9",
+          "+3 −1"
+        ],
+        "diffAdded": 47,
+        "diffLabel": "2 files changed",
+        "diffRemoved": 10,
+        "effectChips": [
+          {
+            "ground": "unknown",
+            "text": "no effects read from this branch"
+          }
+        ],
+        "findings": [
+          {
+            "kind": "never_claimed",
+            "text": "nothing dispatched this pull request, so no claims were ever made and nothing accounts for its 2 changed files"
+          }
+        ],
+        "verdict": {
+          "text": "nothing dispatched this pull request, so no claims were ever made and nothing accounts for its 2 changed files",
+          "tone": "unknown"
+        }
+      },
+      "name": "a pull request nobody dispatched",
+      "review": {
+        "attempt": 0,
+        "attempt_number": 0,
+        "branch": "codex/restore-green-main",
+        "brief": {
+          "body": null,
+          "identifier": "gh!191",
+          "title": "A title",
+          "url": "https://github.com/o/r/issues/1"
+        },
+        "changed": [
+          {
+            "added": 44,
+            "binary": false,
+            "path": "src/approval.rs",
+            "removed": 9,
+            "status": "M",
+            "symbols": []
+          },
+          {
+            "added": 3,
+            "binary": false,
+            "path": ".github/workflows/ci.yml",
+            "removed": 1,
+            "status": "M",
+            "symbols": []
+          }
+        ],
+        "claimed": 0,
+        "claimed_at": null,
+        "claims": [],
+        "claims_error": null,
+        "diff": {
+          "source": "pull_request"
+        },
+        "effects": {
+          "deps_added": [],
+          "deps_known": false,
+          "files": [],
+          "read": false,
+          "tests_after": null,
+          "tests_before": null
+        },
+        "evidence": {
+          "checks": [],
+          "commands": 0,
+          "failed": 0,
+          "truncated": false
+        },
+        "outcome": null,
+        "pr_url": "https://github.com/o/r/pull/191",
+        "state": "review",
+        "task_id": "gh:o/r#191",
+        "unclaimed": [
+          {
+            "added": 44,
+            "binary": false,
+            "path": "src/approval.rs",
+            "removed": 9,
+            "status": "M",
+            "symbols": []
+          },
+          {
+            "added": 3,
+            "binary": false,
+            "path": ".github/workflows/ci.yml",
+            "removed": 1,
+            "status": "M",
+            "symbols": []
+          }
+        ],
+        "uncommitted": null,
         "unmatched_anchors": [],
         "worktree": null
       }

@@ -447,6 +447,38 @@ fn the_unknowable_one() -> AttemptReview {
 
 // ---- the fixture ---------------------------------------------------------
 
+/// A pull request nobody dispatched (§gh#344). No attempt, so no claims were
+/// ever asked for, no evidence was gathered and no checkout was read — and the
+/// diff is GitHub's own file list. Every changed file is unaccounted for, which
+/// is true rather than degraded.
+fn the_undispatched_one() -> AttemptReview {
+    AttemptReview {
+        attempt: 0,
+        attempt_number: 0,
+        state: "review".into(),
+        outcome: None,
+        branch: Some("codex/restore-green-main".into()),
+        pr_url: Some("https://github.com/o/r/pull/191".into()),
+        claimed_at: None,
+        changed: vec![
+            changed("src/approval.rs", "M", 44, 9),
+            changed(".github/workflows/ci.yml", "M", 3, 1),
+        ],
+        remainder: Remainder {
+            unclaimed: vec![
+                changed("src/approval.rs", "M", 44, 9),
+                changed(".github/workflows/ci.yml", "M", 3, 1),
+            ],
+            ..Remainder::default()
+        },
+        diff: DiffSource::PullRequest,
+        uncommitted: None,
+        evidence: RunEvidence::default(),
+        effects: Effects::default(),
+        ..blank("gh:o/r#191", "gh!191")
+    }
+}
+
 fn case(name: &str, review: &AttemptReview) -> Value {
     let (label, added, removed) = diff_totals(review);
     json!({
@@ -537,6 +569,12 @@ fn receipt_case(
 /// One row for the shared review-door rule. Decoded from the published board
 /// wire shape so this fixture checks the same input the phone receives.
 fn reviewable_case(state: &str, attempts: usize) -> Value {
+    reviewable_pr_case(state, attempts, None)
+}
+
+/// The same, for a row carrying a pull request (§gh#344) — the door opens on
+/// one whether or not anything ever ran.
+fn reviewable_pr_case(state: &str, attempts: usize, pr_url: Option<&str>) -> Value {
     let row: TaskRow = serde_json::from_value(json!({
         "id": "gh:o/r#1",
         "identifier": "gh#1",
@@ -551,7 +589,7 @@ fn reviewable_case(state: &str, attempts: usize) -> Value {
         "workspace": "r",
         "runtime": null,
         "chat_id": null,
-        "pr_url": null,
+        "pr_url": pr_url,
         "pr_number": null,
         "branch": null,
         "dispatched_by": null,
@@ -562,7 +600,12 @@ fn reviewable_case(state: &str, attempts: usize) -> Value {
         "reopened": 0
     }))
     .expect("published task row");
-    json!({ "state": state, "attempts": attempts, "expect": reviewable(&row) })
+    json!({
+        "state": state,
+        "attempts": attempts,
+        "prUrl": pr_url,
+        "expect": reviewable(&row),
+    })
 }
 
 fn build() -> Value {
@@ -596,6 +639,7 @@ fn build() -> Value {
             case("no diff to check against", &the_unreadable_one()),
             case("a clean remainder that is still wrong", &the_complete_but_wrong_one()),
             case("a branch the board never read", &the_unread_one()),
+            case("a pull request nobody dispatched", &the_undispatched_one()),
             case("binary, uncounted call sites, and an unrun suite", &the_unknowable_one()),
         ],
         // What one submission did, in the order gh#365 puts it: the verdict and
@@ -625,6 +669,11 @@ fn build() -> Value {
             reviewable_case("done", 1),
             reviewable_case("ready", 0),
             reviewable_case("review", 0),
+            // §gh#344: the pull request nobody dispatched. No attempt, and the
+            // reading that matters most.
+            reviewable_pr_case("review", 0, Some("https://github.com/o/r/pull/191")),
+            reviewable_pr_case("done", 0, Some("https://github.com/o/r/pull/191")),
+            reviewable_pr_case("ready", 0, Some("")),
         ],
         "runsTests": tests_cases,
     })

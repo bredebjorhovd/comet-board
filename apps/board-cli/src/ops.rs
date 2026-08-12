@@ -452,16 +452,26 @@ pub fn render_review(review: &AttemptReview) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{} · {}", review.brief.identifier, review.brief.title);
     let _ = writeln!(out, "  {}", review.brief.url);
-    let _ = write!(out, "  attempt {}", review.attempt);
-    if let Some(branch) = &review.branch {
-        let _ = write!(out, " · {branch}");
-    }
-    match &review.outcome {
-        Some(outcome) => {
-            let _ = writeln!(out, " · {outcome}");
+    // "attempt 0 · still running" would be two lies about a pull request
+    // nobody dispatched (§gh#344), so that line says what happened instead.
+    if review.undispatched() {
+        let _ = write!(out, "  no attempt");
+        if let Some(branch) = &review.branch {
+            let _ = write!(out, " · {branch}");
         }
-        None => {
-            let _ = writeln!(out, " · still running");
+        let _ = writeln!(out, " · opened outside the board");
+    } else {
+        let _ = write!(out, "  attempt {}", review.attempt);
+        if let Some(branch) = &review.branch {
+            let _ = write!(out, " · {branch}");
+        }
+        match &review.outcome {
+            Some(outcome) => {
+                let _ = writeln!(out, " · {outcome}");
+            }
+            None => {
+                let _ = writeln!(out, " · still running");
+            }
         }
     }
     if let Some(pr) = &review.pr_url {
@@ -556,7 +566,14 @@ fn claims_section(review: &AttemptReview, out: &mut String) {
     if !review.claimed() {
         let _ = writeln!(
             out,
-            "CLAIMS — none submitted; this attempt never answered the contract"
+            "{}",
+            if review.undispatched() {
+                // Nobody was told the contract, so nobody ignored it (§gh#344).
+                "CLAIMS — none; nothing dispatched this pull request, so no agent was \
+                 ever told the contract"
+            } else {
+                "CLAIMS — none submitted; this attempt never answered the contract"
+            }
         );
         return;
     }
@@ -664,6 +681,12 @@ fn remainder_section(review: &AttemptReview, out: &mut String) {
         let _ = writeln!(
             out,
             "  (from the diff the board recorded; the checkout is gone)"
+        );
+    }
+    if matches!(review.diff, comet_board::claims::DiffSource::PullRequest) {
+        let _ = writeln!(
+            out,
+            "  (from GitHub's file list for the pull request; nothing ran here)"
         );
     }
     // The one thing that would make an empty remainder a lie: work that is in
@@ -2410,6 +2433,46 @@ mod tests {
         assert!(
             text.contains("3 file(s) changed in the checkout and not committed"),
             "an empty remainder over uncommitted work is the friendly lie: {text}"
+        );
+    }
+
+    /// A pull request nobody dispatched (§gh#344), in the terminal: no attempt
+    /// to name, no contract anybody was told, and a diff that came from GitHub.
+    #[test]
+    fn an_undispatched_pull_request_says_what_it_is_and_blames_nobody() {
+        let mut review = review_of(
+            Remainder {
+                unclaimed: vec![changed("src/approval.rs", "M")],
+                ..Remainder::default()
+            },
+            vec![changed("src/approval.rs", "M")],
+        );
+        review.attempt = comet_board::claims::NO_ATTEMPT;
+        review.attempt_number = 0;
+        review.outcome = None;
+        review.claimed_at = None;
+        review.uncommitted = None;
+        review.diff = DiffSource::PullRequest;
+        review.branch = Some("codex/restore-green-main".into());
+
+        let text = render_review(&review);
+        assert!(
+            text.contains("no attempt · codex/restore-green-main · opened outside the board"),
+            "{text}"
+        );
+        assert!(!text.contains("still running"), "nothing is running: {text}");
+        assert!(
+            text.contains("nothing dispatched this pull request"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("never answered the contract"),
+            "nobody was asked: {text}"
+        );
+        assert!(text.contains("UNCLAIMED (1 of 1"), "{text}");
+        assert!(
+            text.contains("from GitHub's file list for the pull request"),
+            "{text}"
         );
     }
 }

@@ -165,6 +165,11 @@ impl Db {
               -- when GitHub says it is in a stack — which stack, where in it,
               -- how big, and what the stack as a whole targets.
               pr_base_ref        TEXT,
+              -- And the branch the work is on (gh#344). Free from the same poll
+              -- as the base, and the only place the head is recorded for a pull
+              -- request no attempt ever wrote: an attempt's own `branch` column
+              -- answers this for everything the board dispatched.
+              pr_head_ref        TEXT,
               pr_stack_number    INTEGER,
               pr_stack_size      INTEGER,
               pr_stack_position  INTEGER,
@@ -401,6 +406,8 @@ impl Db {
                 // gh#282. Existing rows keep NULL until the next poll, which is
                 // the same thing "we have not looked yet" has always meant here.
                 ("pr_base_ref", "TEXT"),
+                // gh#344, and NULL until the next poll for the same reason.
+                ("pr_head_ref", "TEXT"),
                 ("pr_stack_number", "INTEGER"),
                 ("pr_stack_size", "INTEGER"),
                 ("pr_stack_position", "INTEGER"),
@@ -744,7 +751,8 @@ impl Db {
         Ok(())
     }
 
-    /// Record where a PR sits relative to the rest of the tree (gh#282).
+    /// Record where a PR sits relative to the rest of the tree (gh#282), and
+    /// which branch the work itself is on (gh#344).
     ///
     /// Written whole every poll, stack and all, so a PR that leaves a stack —
     /// or is retargeted onto `main` when its parent merges — clears the fields
@@ -753,12 +761,13 @@ impl Db {
         &self,
         task_id: &str,
         base_ref: Option<&str>,
+        head_ref: Option<&str>,
         stack: Option<&PrStack>,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET pr_base_ref = ?2, pr_stack_number = ?3,
                               pr_stack_size = ?4, pr_stack_position = ?5,
-                              pr_stack_base_ref = ?6
+                              pr_stack_base_ref = ?6, pr_head_ref = ?7
              WHERE id = ?1",
             params![
                 task_id,
@@ -767,6 +776,7 @@ impl Db {
                 stack.and_then(|s| s.size),
                 stack.and_then(|s| s.position),
                 stack.and_then(|s| s.base_ref.as_deref()),
+                head_ref.filter(|r| !r.is_empty()),
             ],
         )?;
         Ok(())
@@ -843,7 +853,8 @@ impl Db {
                     local_done, pr_url, pr_number, pr_open, pr_merged,
                     pr_mergeable, updated_at, synced_at,
                     pr_base_ref, pr_stack_number, pr_stack_size,
-                    pr_stack_position, pr_stack_base_ref, pr_changes_requested
+                    pr_stack_position, pr_stack_base_ref, pr_changes_requested,
+                    pr_head_ref
              FROM tasks",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -884,6 +895,7 @@ impl Db {
                     }),
                 },
                 pr_changes_requested: r.get(26)?,
+                pr_head_ref: r.get(27)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -1892,6 +1904,7 @@ mod tests {
         db.set_pr_topology(
             "linear:LIN-142",
             Some("main"),
+            Some("layer-1"),
             Some(&PrStack {
                 number: 7,
                 size: Some(3),
@@ -1904,7 +1917,7 @@ mod tests {
 
         // Its parent merged and GitHub retargeted it onto trunk: no longer a
         // layer, and no longer evidence of anything.
-        db.set_pr_topology("linear:LIN-142", Some("main"), None)
+        db.set_pr_topology("linear:LIN-142", Some("main"), Some("layer-1"), None)
             .unwrap();
         assert_eq!(db.stacked_task_count().unwrap(), 0);
     }

@@ -842,7 +842,7 @@ func boardDetailActions(_ row: TaskRow) -> [BoardRowAction] {
     return out
 }
 
-/// Is there an attempt on this row worth reviewing (gh#256)?
+/// Is there anything on this row worth reviewing (gh#256, gh#344)?
 ///
 /// Not a `BoardRowAction`: the actions are the shared rule `row_actions` owns,
 /// and the review is a *screen* rather than something a row does — the desktop
@@ -852,8 +852,13 @@ func boardDetailActions(_ row: TaskRow) -> [BoardRowAction] {
 /// includes a cancelled attempt returned to `ready`, and the historical
 /// attempt while a retry is `working`; both still have a diff, claims and a
 /// journal worth reading.
+///
+/// A pull request is enough on its own. A row whose pull request nobody
+/// dispatched has no attempt and is still the work that most needs reading:
+/// the diff is on GitHub, and with no claims the whole of it is unaccounted
+/// for.
 func boardReviewable(_ row: TaskRow) -> Bool {
-    row.attempts > 0
+    row.attempts > 0 || nonEmpty(row.prUrl) != nil
 }
 
 /// The detail sheet's navigation door. Kept as a named derivation so the

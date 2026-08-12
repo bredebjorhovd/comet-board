@@ -472,6 +472,7 @@ mod tests {
             pr_merged: false,
             pr_mergeable: mergeable.map(str::to_string),
             pr_base_ref: Some(base.to_string()),
+            pr_head_ref: None,
             pr_stack: Some(PrStack {
                 number: 7,
                 size: Some(size),

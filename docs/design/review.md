@@ -202,7 +202,12 @@ other difference from the list is a bug.
   `crates/board/src/claims.rs`, and the review is read from a board that may be
   on another device. The third fact is `attempt 1 · done`, which is what the
   board does know about the run. The icons, separators and the `--claude` mark
-  on the agent fact are exactly as B5/B6 give them.
+  on the agent fact are exactly as B5/B6 give them. On a pull request nobody
+  dispatched (§gh#344) there is no run to name, and the same fact reads `no
+  attempt · opened outside the board`; the claims section says nobody was ever
+  told the contract, and the remainder block names GitHub's file list as where
+  its counts came from. The canvas draws no such review because the canvas has
+  no such row.
 
 - **B2's icon button is a link out, and there are up to two.** The canvas draws
   one 24px globe. The app draws the same 24px control twice — the GitHub mark

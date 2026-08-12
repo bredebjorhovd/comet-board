@@ -61,6 +61,25 @@
 //! (§gh#235). Neither is required. An attempt that claimed nothing settles
 //! exactly as it did before any of this existed — but a block that *was*
 //! written and could not be parsed is reported, never dropped.
+//!
+//! ## When nothing was dispatched at all (§gh#344)
+//!
+//! Every paragraph above assumes an attempt: a run the board started, with a
+//! checkout, a chat and a contract somebody was told. A pull request opened
+//! outside the board has none of that — an agent that answered "which of these
+//! should I start with?" by doing the work in its own chat, or a person who
+//! pushed a branch — and the row for it used to travel `review` → `done`
+//! having never been reviewable, because the review was assembled from the
+//! attempt and there was no attempt.
+//!
+//! So the attempt is an **enrichment**, not a requirement:
+//! [`pull_request_review`] builds the same [`AttemptReview`] from the pull
+//! request alone. The diff is GitHub's ([`DiffSource::PullRequest`]), the
+//! brief is the row, and the claims are empty — which means the remainder is
+//! the *whole* diff. That is not a degraded reading, it is the true one:
+//! nobody was ever told the contract, so nothing accounts for anything, and
+//! the review says exactly that ([`AttemptReview::undispatched`]) rather than
+//! erroring or drawing a clean screen.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -278,6 +297,15 @@ pub enum DiffSource {
     /// answers after `gc` reclaims the worktree (gh#72) — the reason the
     /// snapshot is taken at all.
     Recorded,
+    /// GitHub's own file list for the pull request (§gh#344).
+    ///
+    /// What answers when there is no attempt to read a checkout from — a pull
+    /// request nobody dispatched — and it is a *first-class* source rather than
+    /// a fallback: the diff was pushed, so GitHub has it, and every count here
+    /// is the same count a reader sees in the Files tab. What it does not carry
+    /// is anything that needs the working tree: no uncommitted files, no
+    /// symbols, no call sites.
+    PullRequest,
     /// Neither: no checkout on disk and nothing recorded.
     Unavailable { reason: String },
 }
@@ -309,6 +337,11 @@ pub struct Brief {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptReview {
     pub task_id: String,
+    /// The attempt this review reads, or [`NO_ATTEMPT`] when there is none —
+    /// a pull request nobody dispatched (§gh#344). Every consumer that looks up
+    /// the attempt row by this id already handles "not found"; the sentinel is
+    /// so that a review with no run behind it can still be *submitted a verdict
+    /// on*, fingerprinted and printed, without a second shape on the wire.
     pub attempt: i64,
     /// Which attempt of the task this is, 1-based — a retry makes new claims,
     /// and "attempt 3" is how every other board surface names them.
@@ -363,7 +396,23 @@ impl AttemptReview {
     pub fn claimed(&self) -> bool {
         self.claimed_at.is_some()
     }
+
+    /// Is this a review of a pull request nobody dispatched (§gh#344)?
+    ///
+    /// The distinction every surface needs before it says a word about claims:
+    /// "this attempt never answered the contract" is a fact about an agent, and
+    /// saying it about a pull request no agent was ever given would be blaming
+    /// somebody for missing a message nobody sent.
+    pub fn undispatched(&self) -> bool {
+        self.attempt == NO_ATTEMPT
+    }
 }
+
+/// The `attempt` id of a review with no attempt behind it (§gh#344).
+///
+/// Zero is safe as a sentinel because `attempts.id` is a SQLite
+/// `INTEGER PRIMARY KEY`, which starts at 1 and is never handed out again.
+pub const NO_ATTEMPT: i64 = 0;
 
 // ---- the format ----------------------------------------------------------
 
@@ -841,6 +890,57 @@ pub fn review(
     }
 }
 
+/// The same review, assembled from a pull request nobody dispatched (§gh#344).
+///
+/// Pure, like [`review`], and for the same reason: the caller fetched the file
+/// list from GitHub, and everything this does to it is testable without a
+/// network.
+///
+/// What it deliberately does *not* invent. There is no attempt, so there is no
+/// evidence — nothing ran where the board could watch it — no effects, and no
+/// uncommitted count, because there is no checkout to have anything in.
+/// Defaults for those read as "not known" everywhere they are drawn, which is
+/// the truth. And `claimed_at` is `None`: nobody was told the contract, so the
+/// remainder is the whole diff.
+pub fn pull_request_review(
+    task: &Task,
+    changed: Vec<ChangedFile>,
+    diff: DiffSource,
+) -> AttemptReview {
+    let remainder = remainder(&[], &changed);
+    AttemptReview {
+        task_id: task.id.clone(),
+        attempt: NO_ATTEMPT,
+        attempt_number: 0,
+        state: task.state.as_str().to_string(),
+        // Not `None` meaning "still running": nothing is running. Every surface
+        // reads `undispatched` before it reads this.
+        outcome: None,
+        branch: task.pr_head_ref.clone(),
+        worktree: None,
+        pr_url: task.pr_url.clone(),
+        brief: Brief {
+            identifier: task.identifier.clone(),
+            title: task.title.clone(),
+            url: task.url.clone(),
+            body: task
+                .body
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string),
+        },
+        claimed_at: None,
+        claims_error: None,
+        remainder,
+        changed,
+        diff,
+        uncommitted: None,
+        evidence: RunEvidence::default(),
+        effects: crate::effects::Effects::default(),
+    }
+}
+
 // ---- the reading ---------------------------------------------------------
 //
 // Everything from here down turns a finished [`AttemptReview`] into the
@@ -1023,6 +1123,17 @@ impl AttemptReview {
                      so nothing accounts for its {}: {}",
                     count(changed, "changed file", "changed files"),
                     first_line(err)
+                ),
+            });
+        } else if self.undispatched() {
+            // Nobody was told the contract, so nobody failed to answer it. The
+            // number is the same and the sentence is not (§gh#344).
+            out.push(Finding {
+                kind: FindingKind::NeverClaimed,
+                text: format!(
+                    "nothing dispatched this pull request, so no claims were ever made and \
+                     nothing accounts for its {}",
+                    count(changed, "changed file", "changed files")
                 ),
             });
         } else if !self.claimed() {
@@ -1490,6 +1601,7 @@ mod tests {
             pr_merged: false,
             pr_mergeable: None,
             pr_base_ref: None,
+            pr_head_ref: None,
             pr_stack: None,
             pr_changes_requested: None,
             updated_at: "t".into(),
@@ -1530,6 +1642,80 @@ mod tests {
         assert_eq!(r.remainder.unclaimed.len(), 1);
         assert_eq!(r.remainder.unclaimed[0].path, "Cargo.lock");
         assert_eq!(r.pr_url.as_deref(), Some("https://github.com/o/r/pull/200"));
+    }
+
+    /// A pull request nobody dispatched is reviewable from the pull request
+    /// (§gh#344), and every changed file in it is unaccounted for — which is
+    /// true, and is the sentence the screen exists to say.
+    #[test]
+    fn a_review_of_an_undispatched_pull_request_accounts_for_nothing() {
+        let mut task = task_with(attempt_with(vec![], None));
+        task.attempts.clear();
+        task.pr_head_ref = Some("codex/restore-green-main".into());
+        let r = pull_request_review(
+            &task,
+            vec![changed("src/a.rs"), changed("src/b.rs")],
+            DiffSource::PullRequest,
+        );
+
+        assert!(r.undispatched(), "no attempt wrote this pull request");
+        assert_eq!(r.attempt, NO_ATTEMPT);
+        assert_eq!(r.attempt_number, 0);
+        assert!(!r.claimed(), "nobody was ever told the contract");
+        assert_eq!(
+            r.remainder.unclaimed.len(),
+            2,
+            "the whole diff is the remainder"
+        );
+        assert_eq!(r.remainder.claimed, 0);
+        // The branch is the pull request's, and the brief is the row's.
+        assert_eq!(r.branch.as_deref(), Some("codex/restore-green-main"));
+        assert_eq!(r.brief.identifier, "gh#183");
+        assert_eq!(r.pr_url.as_deref(), Some("https://github.com/o/r/pull/200"));
+        // Nothing ran, so nothing is claimed to have been checked. `None`
+        // rather than `Some(0)`: there is no checkout to have counted.
+        assert_eq!(r.uncommitted, None);
+        assert_eq!(r.evidence.commands, 0);
+        assert!(!r.effects.read);
+
+        // And the finding blames nobody for a message nobody sent.
+        let verdict = r.verdict();
+        assert_eq!(verdict.tone, Tone::Unknown, "unknown, never clean");
+        assert!(
+            verdict
+                .text
+                .contains("nothing dispatched this pull request"),
+            "{}",
+            verdict.text
+        );
+        assert!(
+            !verdict.text.contains("never answered"),
+            "an agent that was never asked did not fail to answer: {}",
+            verdict.text
+        );
+    }
+
+    /// The other half of the same rule: a *dispatched* attempt that said
+    /// nothing still reads as an attempt that ignored the contract.
+    #[test]
+    fn an_attempt_that_was_asked_still_reads_as_one_that_was_asked() {
+        let silent = attempt_with(vec![], None);
+        let task = task_with(silent.clone());
+        let r = review(
+            &task,
+            &silent,
+            vec![changed("a.rs")],
+            DiffSource::Checkout,
+            Some(0),
+            RunEvidence::default(),
+            crate::effects::Effects::default(),
+        );
+        assert!(!r.undispatched());
+        assert!(
+            r.verdict()
+                .text
+                .contains("never answered the claim contract")
+        );
     }
 
     /// "Never answered the contract" and "claimed nothing" are different facts,

@@ -56,6 +56,22 @@
 //! the thread readable by people who are not looking at comet. The real fix is
 //! a verdict that carries the *human's* GitHub identity, which is its own issue.
 //!
+//! ## A pull request nobody dispatched gets a verdict, and no chat (§gh#344)
+//!
+//! A review can now be assembled from a pull request alone, so a verdict can be
+//! written on one — and that raises the question of where it goes. It goes to
+//! GitHub, and to nobody's chat. Not because delivering would be hard: comet
+//! *can* recognise the chat that opened a pull request from its checkout and
+//! branch, and where it does, the poll's session adoption records an attempt
+//! and this path delivers into it exactly as it does for a dispatch. What it
+//! will not do is guess. With no attempt there is nothing for
+//! [`still_the_authors_checkout`] to check a chat against, and a review typed
+//! into a session on the strength of a plausible match is a review delivered to
+//! whoever happens to be sitting in that session — the precise hazard that
+//! check exists to prevent. The receipt says nobody was told, in those words,
+//! because a verdict that reached the pull request and no agent is a fact the
+//! reviewer needs and not a failure.
+//!
 //! ## What it refuses
 //!
 //! A closed pull request (the payload's promise that the branch is still live
@@ -803,7 +819,18 @@ impl SyncEngine {
         if !worth_delivering(kind, comment) {
             return Err("an approval with nothing to say interrupts nobody".into());
         }
-        let (Some(runtime), Some(attempt_row)) = (runtime, attempt_row) else {
+        // No attempt is not a missing chat, and the receipt must not say it is
+        // (§gh#344): nothing the board started wrote this pull request, so
+        // there is no session it has any business typing into. The verdict is
+        // recorded and posted regardless — see this module's header.
+        let Some(attempt_row) = attempt_row else {
+            return Err(format!(
+                "nothing dispatched {}, so the board knows no chat that wrote it — \
+                 the verdict is on the pull request",
+                task.identifier
+            ));
+        };
+        let Some(runtime) = runtime else {
             return Err("there is no live runtime to deliver into".into());
         };
         let Some(chat_id) = attempt_row.pane_id.as_deref() else {
@@ -1180,6 +1207,93 @@ mod tests {
         assert_eq!(receipt.review_id, POSTED_ID);
         assert_eq!(receipt.unclaimed, 2);
         assert_eq!(receipt.chat_id.as_deref(), Some("chat-1"));
+    }
+
+    /// A verdict on a pull request nobody dispatched (§gh#344): it is recorded,
+    /// it carries the remainder — the whole diff, since nothing claimed any of
+    /// it — it is posted to the pull request, and it is typed into nobody's
+    /// chat. The receipt says which, in words that do not blame a missing
+    /// agent for a message nobody sent.
+    #[test]
+    fn a_verdict_on_an_undispatched_pull_request_reaches_github_and_no_chat() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![
+            (
+                "POST /repos/o/r/pulls/14/reviews".into(),
+                serde_json::json!({ "id": POSTED_ID }),
+            ),
+            (
+                "/repos/o/r/pulls/14/files".into(),
+                serde_json::json!([
+                    { "filename": "src/a.rs", "status": "modified",
+                      "additions": 7, "deletions": 1, "patch": "@@" }
+                ]),
+            ),
+        ]));
+        let e = engine(rest.clone());
+        // The `gh!14` row an undispatched pull request arrives as: a task, a
+        // pull request, and no attempt behind it.
+        e.db.upsert_task(&crate::db::UpsertTask {
+            id: "gh:o/r#14".into(),
+            source: crate::model::Source::Github,
+            source_id: "n".into(),
+            identifier: "gh!14".into(),
+            title: "fix: restore approval lifecycle and CI".into(),
+            body: None,
+            url: "https://github.com/o/r/pull/14".into(),
+            labels: vec![],
+            source_state: Some("open".into()),
+            linear_team: None,
+            linear_project: None,
+            upstream: crate::model::UpstreamState::Started,
+            updated_at: crate::db::now(),
+        })
+        .unwrap();
+        e.db.set_pr(
+            "gh:o/r#14",
+            Some("https://github.com/o/r/pull/14"),
+            Some(14),
+            true,
+        )
+        .unwrap();
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+
+        let receipt = e
+            .submit_verdict(
+                Some(&runtime),
+                "gh:o/r#14",
+                None,
+                VerdictKind::ChangesRequested,
+                "Nothing here says what it did.",
+            )
+            .unwrap();
+
+        assert!(receipt.recorded);
+        assert_eq!(receipt.attempt, crate::claims::NO_ATTEMPT);
+        assert_eq!(receipt.unclaimed, 1, "the whole diff is unaccounted for");
+        assert_eq!(receipt.projection, Projection::Posted);
+        assert_eq!(receipt.review_id, POSTED_ID);
+        // Nobody's session was written into, and nothing was guessed at.
+        assert!(!receipt.delivered);
+        assert_eq!(receipt.chat_id, None);
+        assert!(
+            runtime.prompts.borrow().is_empty(),
+            "no chat was typed into"
+        );
+        let why = receipt
+            .not_delivered
+            .clone()
+            .expect("a reason, not silence");
+        assert!(why.contains("nothing dispatched"), "{why}");
+        assert!(
+            !why.contains("no longer holds"),
+            "there was never a chat to lose: {why}"
+        );
+
+        let wrote = rest.wrote.borrow();
+        assert_eq!(wrote.len(), 1, "{wrote:?}");
+        let body = wrote[0].2["body"].as_str().unwrap();
+        assert!(body.contains("Nothing here says what it did."), "{body}");
+        assert!(body.contains("1 change no claim accounts for"), "{body}");
     }
 
     /// Once. A second submission of the same verdict — a double click, a

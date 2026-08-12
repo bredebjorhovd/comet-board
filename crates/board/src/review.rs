@@ -1242,6 +1242,7 @@ pub(crate) mod tests {
             pr_merged: false,
             pr_mergeable: None,
             pr_base_ref: None,
+            pr_head_ref: None,
             pr_stack: None,
             pr_changes_requested: None,
             updated_at: "t".into(),
