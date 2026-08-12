@@ -454,16 +454,17 @@ final class DemoDataset {
         let unclaimed = review(taskId: target.taskId)?.unclaimed.count ?? 0
         let json = """
             {"task_id": "\(target.taskId)", "attempt": \(target.attempt), "kind": "\(kind.rawValue)",
-             "review_id": 4021, "posted": true, "chat_id": "chat-tabs",
+             "review_id": 4021, "recorded": true, "chat_id": "chat-tabs",
              "delivered": \(reviewWorthDelivering(kind, comment)),
-             "not_delivered": null, "unclaimed": \(unclaimed), "payload": ""}
+             "not_delivered": null, "projection": "posted", "refused": null,
+             "unclaimed": \(unclaimed), "payload": ""}
             """
         // The fixture is this file's own literal, so a decode that fails here
         // is a bug in the model rather than a thing the demo should invent
         // around — the fallback says the plain truth and nothing more.
         return (try? JSONDecoder().decode(VerdictReceipt.self, from: Data(json.utf8)))
             ?? VerdictReceipt(taskId: target.taskId, attempt: target.attempt,
-                              kind: kind.rawValue, posted: true)
+                              kind: kind.rawValue, recorded: true)
     }
 
     /// The demo's review row: a codex attempt that claimed three things, and a

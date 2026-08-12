@@ -280,13 +280,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Give the verdict: post it on the pull request, and hand it to the agent
-    /// still standing in the checkout.
+    /// Give the verdict: record it, hand it to the agent still standing in the
+    /// checkout, and post it on the pull request.
     ///
     /// The changes no claim accounts for ride along on both copies — the board
     /// derives them from the diff, so there is nothing to retype and nothing to
     /// get wrong. The agent is prompted in the chat it wrote the branch in, so
     /// the fix is a commit on that branch rather than a new dispatch.
+    ///
+    /// A GitHub that refuses the review does not lose the verdict: it stands,
+    /// the agent still has it, and the receipt says it is not on the pull
+    /// request. Re-run the same verdict to try the posting again.
     ///
     /// Sending the same verdict twice sends it once: the submission is
     /// recorded, and a retry finishes whichever half failed.

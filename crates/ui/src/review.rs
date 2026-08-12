@@ -323,8 +323,9 @@ pub struct ReviewPanel {
     kind: VerdictKind,
     submitting: bool,
     /// What the last submission did — where it went, and what it could not
-    /// reach. Kept on screen: "posted, and the chat is gone" is the one
-    /// outcome a reviewer has to know about, and it is not an error.
+    /// reach. Kept on screen: "recorded, and the chat is gone" and "recorded,
+    /// and GitHub would not take it" (gh#365) are outcomes a reviewer has to
+    /// know about, and neither is an error.
     receipt: Option<VerdictReceipt>,
     submit_error: Option<SharedString>,
     submit_task: Option<Task<()>>,
@@ -469,8 +470,9 @@ impl ReviewPanel {
         }));
     }
 
-    /// Submit the armed verdict (§gh#239): one review on the pull request, one
-    /// prompt into the checkout the agent is still in.
+    /// Submit the armed verdict (§gh#239): the verdict recorded, one prompt
+    /// into the checkout the agent is still in, and one review projected onto
+    /// the pull request — in that order (gh#365).
     ///
     /// Sent to the device that answered the read, not swept for again: this is
     /// a write, and a write that wandered to a second board would be a verdict
@@ -518,9 +520,18 @@ impl ReviewPanel {
                         // The verdict is sent; the box is for the next one. A
                         // resend would be refused as the same submission
                         // anyway, but leaving it there invites the click.
-                        panel
-                            .comment
-                            .update(cx, |input, cx| input.set_text(String::new(), cx));
+                        //
+                        // Unless GitHub would not take it (gh#365). The verdict
+                        // stands and the agent has it, but nobody reading the
+                        // pull request does — so the words stay where the
+                        // reviewer can retry them or paste them there by hand.
+                        // The retry is the same submission and posts nothing
+                        // twice; it finishes the projection.
+                        if !verdict::keeps_the_comment(&receipt) {
+                            panel
+                                .comment
+                                .update(cx, |input, cx| input.set_text(String::new(), cx));
+                        }
                         panel.receipt = Some(receipt);
                     }
                     Ok(Err(err)) => {
@@ -1777,21 +1788,14 @@ impl ReviewPanel {
     }
 
     /// What the submission did, in one line. Not an error even when nothing
-    /// was delivered: a verdict that reached the pull request and not the chat
-    /// is a real outcome, and the reviewer is the person who needs to know it
-    /// happened.
+    /// was delivered or nothing was posted: a verdict that reached the agent
+    /// and not the pull request is a real outcome, and the reviewer is the
+    /// person who needs to know which one happened.
+    ///
+    /// The sentence itself is [`verdict::receipt_line`] — the board's, so the
+    /// phone and the CLI say the same thing about the same receipt.
     fn receipt_line(receipt: &VerdictReceipt) -> String {
-        let posted = if receipt.posted {
-            "Posted on the pull request"
-        } else {
-            // The idempotent path: this exact verdict was already submitted.
-            "Already on the pull request"
-        };
-        match (receipt.delivered, receipt.not_delivered.as_deref()) {
-            (true, _) => format!("{posted}, and delivered into the chat once."),
-            (false, Some(why)) => format!("{posted}. Nothing was delivered into the chat: {why}."),
-            (false, None) => format!("{posted}."),
-        }
+        verdict::receipt_line(receipt)
     }
 
     /// The payload, before it is sent.
@@ -2243,10 +2247,10 @@ mod tests {
         }
     }
 
-    /// A submission is not an error, and the two ways it lands are not the
-    /// same sentence. "Posted and delivered" and "posted, and the author is
-    /// gone" are the difference between a review that arrived and one that is
-    /// sitting on GitHub waiting for somebody to notice it.
+    /// A submission is not an error, and the ways it lands are not the same
+    /// sentence. "Recorded and delivered" and "recorded, and the author is
+    /// gone" are the difference between a review that arrived and one nobody
+    /// has read — and the projection is a third fact on top of both (gh#365).
     #[test]
     fn the_receipt_says_what_reached_the_chat_and_what_did_not() {
         let base = VerdictReceipt {
@@ -2254,35 +2258,49 @@ mod tests {
             attempt: 7,
             kind: VerdictKind::ChangesRequested,
             review_id: 900,
-            posted: true,
+            recorded: true,
             chat_id: Some("chat-1".into()),
             delivered: true,
             not_delivered: None,
+            projection: verdict::Projection::Posted,
+            refused: None,
             unclaimed: 2,
             payload: String::new(),
         };
         assert_eq!(
             ReviewPanel::receipt_line(&base),
-            "Posted on the pull request, and delivered into the chat once."
+            "Recorded, and delivered into the chat once. It is on the pull request."
         );
-        // The idempotent path says so rather than pretending it just posted.
+        // The idempotent path says so rather than pretending it just happened.
         let retried = VerdictReceipt {
-            posted: false,
+            recorded: false,
             ..base.clone()
         };
         assert!(
-            ReviewPanel::receipt_line(&retried).starts_with("Already on the pull request"),
+            ReviewPanel::receipt_line(&retried).starts_with("Already recorded"),
             "{}",
             ReviewPanel::receipt_line(&retried)
         );
         let undelivered = VerdictReceipt {
             delivered: false,
             not_delivered: Some("chat chat-1 no longer holds the agent".into()),
-            ..base
+            ..base.clone()
         };
         let line = ReviewPanel::receipt_line(&undelivered);
         assert!(line.contains("Nothing was delivered"), "{line}");
         assert!(line.contains("no longer holds the agent"), "{line}");
+
+        // A verdict GitHub would not take still stands, and the line says both
+        // halves without the reader having to know GitHub's rules.
+        let unposted = VerdictReceipt {
+            projection: verdict::Projection::Unposted,
+            refused: Some("github HTTP 422: Can not approve your own pull request".into()),
+            ..base
+        };
+        let line = ReviewPanel::receipt_line(&unposted);
+        assert!(line.starts_with("Recorded, and delivered"), "{line}");
+        assert!(line.contains("not on the pull request"), "{line}");
+        assert!(line.contains("Can not approve"), "{line}");
     }
 
     /// The preview is the payload, not a paraphrase of it: it is composed by

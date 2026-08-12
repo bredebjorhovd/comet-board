@@ -61,8 +61,18 @@ enum ReviewSpecRunner {
 
     private struct Spec: Decodable {
         var reviews: [ReviewCase]
+        var receipts: [ReceiptCase]
         var reviewable: [ReviewableCase]
         var runsTests: [CommandCase]
+    }
+
+    /// One receipt and the sentence it reads as (gh#365). The receipt is a real
+    /// serialized `VerdictReceipt`, so a field the board renamed fails here
+    /// rather than reaching the screen as a verdict nobody recorded.
+    private struct ReceiptCase: Decodable {
+        var name: String
+        var receipt: VerdictReceipt
+        var expect: String
     }
 
     private struct ReviewableCase: Decodable {
@@ -199,6 +209,10 @@ enum ReviewSpecRunner {
             expect(boardShowsReviewDoor(row), c.expect, "\(what): detail-sheet presentation")
         }
 
+        for c in spec.receipts {
+            expect(reviewReceiptLine(c.receipt), c.expect, "receipt — \(c.name)")
+        }
+
         for c in spec.runsTests {
             expect(reviewRunsTests(c.command), c.expect, "runsTests(\(c.command))")
         }
@@ -273,9 +287,11 @@ enum ReviewSpecRunner {
                    "header: repository is the workspace fallback")
         }
 
-        // The two rules the fixture cannot carry: `turn_pill` and
-        // `receipt_line` live in `comet_ui`, where a Rust test has no way to
-        // hand them over. Small, and asserted here rather than left to nobody.
+        // The one rule the fixture cannot carry: `turn_pill` lives in
+        // `comet_ui`, where a Rust test has no way to hand it over. Small, and
+        // asserted here rather than left to nobody. `receipt_line` used to sit
+        // beside it and now comes off the fixture — it moved into `comet_board`
+        // with gh#365, because three surfaces print it.
         expect(reviewTurnPill(state: "review", answered: false)?.label, "Waiting on you",
                "turn pill: a review waits on you")
         expect(reviewTurnPill(state: "blocked", answered: false)?.label, "Blocked on you",
@@ -290,18 +306,6 @@ enum ReviewSpecRunner {
         // the unclaimed set alone.
         expect(reviewTurnPill(state: "blocked", answered: false)?.status, .review,
                "turn pill: blocked wears the review hue, never the loud one")
-
-        expect(reviewReceiptLine(VerdictReceipt(taskId: "t", posted: true, delivered: true)),
-               "Posted on the pull request, and delivered into the chat once.",
-               "receipt: posted and delivered")
-        expect(reviewReceiptLine(VerdictReceipt(taskId: "t", posted: true, delivered: false,
-                                                notDelivered: "chat chat-1 no longer holds the agent")),
-               "Posted on the pull request. Nothing was delivered into the chat: "
-               + "chat chat-1 no longer holds the agent.",
-               "receipt: posted, and the author is gone")
-        expect(reviewReceiptLine(VerdictReceipt(taskId: "t", posted: false, delivered: false)),
-               "Already on the pull request.",
-               "receipt: the idempotent path")
 
         // A bare approval interrupts nobody; anything with words does.
         expect(reviewWorthDelivering(.approve, ""), false, "worthDelivering: a bare approval")
