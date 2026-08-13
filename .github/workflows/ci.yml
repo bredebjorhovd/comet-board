@@ -12,6 +12,11 @@ name: ci
 # exactly the tree those E0061s lived in. The push-to-main job is the backstop
 # for anything that lands without a PR.
 #
+# The workspace is not the whole repo: edge/ is TypeScript, and for a while the
+# two cargo jobs were all there was, so a pull request touching only edge/ went
+# green without a single one of its 74 tests running (gh#380). The `edge` job
+# below closes that.
+#
 # Not here on purpose:
 #   - `cargo fmt --check`: main currently has ~249 diffs, so gating on it would
 #     fail every PR. Separate cleanup if wanted.
@@ -84,3 +89,82 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy --all-targets
         run: cargo clippy --workspace --all-targets
+
+  # The edge Worker's own tests, on the pull request rather than after it.
+  #
+  # Neither cargo job above touches edge/, so `cargo test --workspace` on an
+  # edge-only change is green by vacuity. Until this job existed the 74 vitest
+  # tests first ran in deploy.yml — `on: push: branches: [main]`, i.e. *after*
+  # merge — where a failure aborts the deploy and leaves main carrying code the
+  # live edge is not running, signalled only by a red workflow on a branch
+  # nobody is looking at any more. That is the wrong way round for the directory
+  # holding the Loro sync layer both room classes implement, the absorbed WorkOS
+  # auth routes, and the /releases/* surface every install and update comes
+  # through.
+  #
+  # install/typecheck/test are deploy.yml's three steps, lifted rather than
+  # reinvented, so the gate and the deploy cannot disagree about what passing
+  # means. deploy.yml keeps running them too: it is the last gate before the
+  # live edge, and a force-push or a merge queue can still reach it without
+  # passing through here. deploy.yml is in the detect pattern below for that
+  # reason — a change to the steps it runs re-runs this job to check the two
+  # still agree.
+  #
+  # Read a green `edge` check carefully: it means *either* the 74 tests passed
+  # *or* the pull request never touched edge/ and the steps were skipped. A
+  # skipped step reports success like any other, so the check alone does not
+  # tell you the tests ran — look for `changed=true` in the detect step, or for
+  # the install/typecheck/test steps having a non-zero duration.
+  #
+  # Always-runs, conditional steps — rather than a `paths:` filter, which in
+  # Actions applies to the whole workflow and would take the cargo jobs with it,
+  # and which would also make this un-*required*-able (a required check that
+  # never runs blocks the PR forever). The job therefore reports on every pull
+  # request; a Rust-only one pays a checkout and a `git diff` — call it fifteen
+  # seconds — and never installs node. Metered minutes are the reason for the
+  # gating; requirability is the reason it is at step level and not workflow
+  # level.
+  #
+  # Not run on push-to-main: deploy.yml already runs these same three steps
+  # there, and paying twice per merge buys nothing.
+  edge:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The default depth-1 fetch of the merge commit has no base commit to
+          # diff against.
+          fetch-depth: 0
+      - name: detect edge changes
+        id: changed
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$base" "$GITHUB_SHA" \
+            | grep -qE "^(edge/|\.github/workflows/(ci|deploy)\.yml)"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.changed.outputs.changed == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: install
+        if: steps.changed.outputs.changed == 'true'
+        working-directory: edge
+        run: npm ci
+      - name: typecheck
+        if: steps.changed.outputs.changed == 'true'
+        working-directory: edge
+        run: npm run typecheck
+      - name: test
+        if: steps.changed.outputs.changed == 'true'
+        working-directory: edge
+        run: npm test
