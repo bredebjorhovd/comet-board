@@ -267,6 +267,10 @@ base = "origin/HEAD"
 #   GITHUB_APP_ID=123456                     a GitHub App
 #   GITHUB_APP_PRIVATE_KEY_PATH=/…/app.pem   (chmod 600)
 #
+# There is a third, and it is not the board's: `GITHUB_USER_TOKEN_<LOGIN>` is a
+# reviewer's own token, spent on one call — submitting their verdict. See
+# `[users]` below.
+#
 # The token is simplest and stays supported — it belongs to an account and
 # carries that account's whole reach, which is fine for a board watching your
 # own repos. An App is installed by whoever owns the repos, on the repos they
@@ -349,6 +353,21 @@ deliver_reviews = true
 # A file rather than a directory service: a two-person box does not need one,
 # and nothing here can answer "which GitHub account is this person?" on its own
 # — the board's App may not read anybody's verified addresses.
+#
+# One entry, two different questions (gh#369). The address above decides who a
+# dispatch *commits* as. A token in `.env` named after the same login decides
+# who a verdict is *cast* as:
+#
+#   GITHUB_USER_TOKEN_ANA=ghp_…              in the board's .env, never here
+#
+# GitHub refuses `APPROVE` on a pull request the caller opened, and the board's
+# credential opened every dispatched one — so without a token of their own, a
+# reviewer's approval arrives as a comment that says it approves. With one, it
+# is an approving review with their name on it. The hyphen in a login is an
+# underscore in the variable (`octo-cat` → GITHUB_USER_TOKEN_OCTO_CAT), and
+# `comet-board doctor` says who has one, who does not, and whether the identity
+# that opens the pull requests is also the one reviewing them — which is the
+# one arrangement no token can rescue.
 
 # The board lists git repos that have a comet space but no config here, in an
 # UNADOPTED section. Ignoring is needed because you open a chat in plenty of

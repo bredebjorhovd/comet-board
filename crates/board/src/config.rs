@@ -181,6 +181,44 @@ pub struct Credentials {
     /// leaves the board silently on whatever `GITHUB_TOKEN` says.
     pub(crate) github_app_id: Option<String>,
     pub(crate) github_app_key_path: Option<String>,
+    /// A member's *own* GitHub token, keyed by [`user_token_key`] of their
+    /// login (gh#369) — `GITHUB_USER_TOKEN_ANA` for `@ana`.
+    ///
+    /// The one credential here that does not belong to the board. It is read
+    /// for exactly one call — submitting a review — because GitHub refuses
+    /// `APPROVE` on a pull request the caller's own identity opened, and the
+    /// board's identity opened every dispatched one. A verdict cast under the
+    /// reviewer's token is a verdict GitHub takes, and it carries their name
+    /// on the pull request, which is the only version of an approval that
+    /// means anything to somebody reading it later.
+    ///
+    /// Keyed by login rather than by the sign-in email the `[users]` map keys
+    /// on: an email is not a legal environment variable name, and the login is
+    /// the half of the map GitHub actually recognises.
+    pub(crate) user_tokens: BTreeMap<String, String>,
+}
+
+/// The `.env` prefix under which a member keeps their own GitHub token
+/// (gh#369).
+pub const USER_TOKEN_PREFIX: &str = "GITHUB_USER_TOKEN_";
+
+/// The `.env` key holding `login`'s own token: the login, uppercased, with the
+/// one character a login may hold and an environment variable may not — the
+/// hyphen — written `_`.
+///
+/// Injective, which is what stops two teammates sharing one key: a GitHub login
+/// is ASCII alphanumerics and hyphens ([`crate::members::is_github_login`]), so
+/// `a_b` is not a login anybody can have and `a-b` is the only thing that can
+/// produce `A_B`.
+pub fn user_token_env(login: &str) -> String {
+    format!("{USER_TOKEN_PREFIX}{}", user_token_key(login))
+}
+
+/// The map key [`Credentials::user_token`] looks a login up under — the part of
+/// [`user_token_env`] after the prefix, which is also what a `.env` key that
+/// carries the prefix is stripped down to.
+fn user_token_key(login: &str) -> String {
+    login.trim().to_ascii_uppercase().replace('-', "_")
 }
 
 /// Which GitHub credential is in force.
@@ -200,19 +238,65 @@ pub enum GithubAuth {
 
 impl Credentials {
     pub fn load(paths: &Paths) -> Credentials {
-        Self::load_with(paths, |key| std::env::var(key))
+        Self::load_with_env(paths, |key| std::env::var(key), std::env::vars())
     }
 
+    /// A read with a lookup and no shell environment behind it — the shape the
+    /// tests want, where "what the shell has" is exactly what they pass in.
+    #[cfg(test)]
     fn load_with<F>(paths: &Paths, inherited: F) -> Credentials
     where
         F: Fn(&str) -> std::result::Result<String, std::env::VarError>,
+    {
+        Self::load_with_env(paths, inherited, [])
+    }
+
+    /// As [`Credentials::load_with`], with the shell's whole environment rather
+    /// than a lookup.
+    ///
+    /// The member tokens are the reason: they are named after whoever holds
+    /// them ([`user_token_env`]), so there is no fixed key to ask for and the
+    /// set has to be walked. Everything else keeps asking by name.
+    fn load_with_env<F, I>(paths: &Paths, inherited: F, shell: I) -> Credentials
+    where
+        F: Fn(&str) -> std::result::Result<String, std::env::VarError>,
+        I: IntoIterator<Item = (String, String)>,
     {
         Credentials {
             linear_api_key: credential(paths, "LINEAR_API_KEY", &inherited),
             github_token: credential(paths, "GITHUB_TOKEN", &inherited),
             github_app_id: credential(paths, "GITHUB_APP_ID", &inherited),
             github_app_key_path: credential(paths, "GITHUB_APP_PRIVATE_KEY_PATH", &inherited),
+            user_tokens: user_tokens(paths, shell),
         }
+    }
+
+    /// The token `login` keeps on this box, when they keep one (gh#369).
+    ///
+    /// `None` is the ordinary case and not a fault: a member with no token of
+    /// their own reviews exactly as the board did before this existed, which
+    /// gh#365 made a safe path rather than a failed submission.
+    pub fn user_token(&self, login: &str) -> Option<&str> {
+        self.user_tokens
+            .get(&user_token_key(login))
+            .map(String::as_str)
+    }
+
+    /// A box holding one member's review token and nothing else — the
+    /// arrangement gh#369's tests are about, without a `.env` on disk.
+    #[cfg(test)]
+    pub(crate) fn with_user_token(login: &str, token: &str) -> Credentials {
+        Credentials {
+            user_tokens: BTreeMap::from([(user_token_key(login), token.to_string())]),
+            ..Default::default()
+        }
+    }
+
+    /// Which members this box holds a review credential for, by login. For
+    /// `doctor` and `member list`, which say who can cast a verdict GitHub
+    /// will take — never the tokens themselves.
+    pub fn user_token_logins(&self) -> impl Iterator<Item = &str> {
+        self.user_tokens.keys().map(String::as_str)
     }
 
     /// The GitHub credential to authenticate with, App first.
@@ -257,6 +341,41 @@ where
         .filter_map(std::result::Result::ok)
         .find_map(|(name, value)| (name == key).then_some(value))
         .filter(|value| !value.is_empty())
+}
+
+/// Every `GITHUB_USER_TOKEN_*` this box holds, keyed by [`user_token_key`].
+///
+/// The same precedence [`credential`] gives one key, applied to a set: the file
+/// first, the shell over it, and a shell variable that is explicitly empty
+/// takes the file's value away rather than shadowing it with nothing. A key
+/// with nothing after the prefix is skipped — it names no login, so no lookup
+/// could ever reach it.
+fn user_tokens<I>(paths: &Paths, shell: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut out = BTreeMap::new();
+    let mut put = |name: String, value: String| {
+        let Some(key) = name
+            .strip_prefix(USER_TOKEN_PREFIX)
+            .filter(|k| !k.is_empty())
+        else {
+            return;
+        };
+        match value.trim().is_empty() {
+            true => drop(out.remove(key)),
+            false => drop(out.insert(key.to_string(), value.trim().to_string())),
+        }
+    };
+    if let Ok(entries) = dotenvy::from_path_iter(paths.env_file()) {
+        for (name, value) in entries.flatten() {
+            put(name, value);
+        }
+    }
+    for (name, value) in shell {
+        put(name, value);
+    }
+    out
 }
 
 pub fn linear_api_key(paths: &Paths) -> Option<String> {
@@ -1570,6 +1689,20 @@ impl RoutingConfig {
             .iter()
             .find(|(k, _)| k.trim().eq_ignore_ascii_case(user))
             .and_then(|(_, v)| crate::git_identity::parse_author(v))
+    }
+
+    /// Which GitHub account the map says somebody is (gh#369) — the login
+    /// inside the address [`RoutingConfig::git_author_for`] resolves.
+    ///
+    /// Only a noreply address answers. GitHub minted it and no other account
+    /// can hold it, so the login inside it is a fact rather than a guess; a
+    /// work address on the same account is a perfectly good *commit* author and
+    /// still says nothing about which login it belongs to. That asymmetry is
+    /// deliberate: a commit author is a claim anybody may write, and this
+    /// chooses which credential a review is cast under.
+    pub fn github_login_for(&self, user: &str) -> Option<String> {
+        let author = self.git_author_for(user)?;
+        crate::git_identity::noreply_login(&author.email).map(str::to_string)
     }
 
     /// The Linear teams this config actually dispatches for, deduplicated.
@@ -2917,6 +3050,120 @@ runtime = "claude"
         let c = creds("LINEAR_API_KEY=\nGITHUB_TOKEN=ghp_real\n");
         assert_eq!(c.linear_api_key, None);
         assert_eq!(c.github_auth(), GithubAuth::Token("ghp_real".into()));
+    }
+
+    /// Which GitHub account the map says somebody is (gh#369). Only an address
+    /// GitHub minted answers: it is the one form that names an account by
+    /// construction, and choosing whose credential casts a review is not a
+    /// question to answer by inference.
+    #[test]
+    fn only_a_github_minted_address_says_which_account_a_member_is() {
+        let mut cfg = RoutingConfig::default();
+        cfg.users.insert(
+            "ana@example.com".into(),
+            "22494697+ana@users.noreply.github.com".into(),
+        );
+        cfg.users.insert(
+            "sam@example.com".into(),
+            "Sam Ito <sam@work.example>".into(),
+        );
+        assert_eq!(
+            cfg.github_login_for("ana@example.com").as_deref(),
+            Some("ana")
+        );
+        // Case-insensitive on the key, exactly as the author lookup is: the
+        // address arrives from whichever frontend they signed in on.
+        assert_eq!(
+            cfg.github_login_for("ANA@example.com").as_deref(),
+            Some("ana")
+        );
+        // A perfectly good commit author, and no account name in it — Sam
+        // reviews as the board until his entry says which login he is.
+        assert_eq!(cfg.github_login_for("sam@example.com"), None);
+        assert_eq!(cfg.github_login_for("nobody@example.com"), None);
+        assert_eq!(cfg.github_login_for(""), None);
+    }
+
+    /// A member's own review credential (gh#369): named after the account it
+    /// belongs to, so a box holding several does not have to be told which is
+    /// whose, and read from the same file with the same precedence as every
+    /// other secret.
+    #[test]
+    fn a_members_review_token_is_read_off_the_login_it_belongs_to() {
+        assert_eq!(user_token_env("ana"), "GITHUB_USER_TOKEN_ANA");
+        // The one character a login may hold and an environment variable may
+        // not. `a_b` is not a login anybody can have, so nothing else can
+        // normalise onto this key.
+        assert_eq!(user_token_env("octo-cat"), "GITHUB_USER_TOKEN_OCTO_CAT");
+
+        let c = creds(
+            "GITHUB_TOKEN=ghp_board\nGITHUB_USER_TOKEN_ANA=ghu_ana\n\
+             GITHUB_USER_TOKEN_OCTO_CAT=ghu_octo\n",
+        );
+        assert_eq!(c.user_token("ana"), Some("ghu_ana"));
+        // GitHub does not care how the login is cased, and neither does the
+        // lookup: the address in `[users]` is whatever somebody pasted.
+        assert_eq!(c.user_token("Ana"), Some("ghu_ana"));
+        assert_eq!(c.user_token("octo-cat"), Some("ghu_octo"));
+        assert_eq!(
+            c.user_token("sam"),
+            None,
+            "a member with no token of their own"
+        );
+        assert_eq!(
+            c.user_token_logins().collect::<Vec<_>>(),
+            vec!["ANA", "OCTO_CAT"],
+        );
+        // The board's own credential is untouched by any of this — one of them
+        // opens pull requests and the other reviews them, and they must not be
+        // able to become the same string by accident.
+        assert_eq!(c.github_auth(), GithubAuth::Token("ghp_board".into()));
+
+        // A skipped value is not a credential, here as everywhere (gh#96), and
+        // a key with nothing after the prefix names nobody.
+        let empty = creds("GITHUB_USER_TOKEN_ANA=\nGITHUB_USER_TOKEN_=ghu_nobody\n");
+        assert_eq!(empty.user_token("ana"), None);
+        assert_eq!(empty.user_token_logins().count(), 0);
+    }
+
+    /// The shell wins over the file, the way it does for one key — including
+    /// the emptied variable, which takes the file's value away rather than
+    /// shadowing it with nothing.
+    #[test]
+    fn a_review_token_in_the_shell_overrides_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hb-user-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+        };
+        std::fs::write(
+            paths.env_file(),
+            "GITHUB_USER_TOKEN_ANA=from-file\nGITHUB_USER_TOKEN_SAM=from-file\n",
+        )
+        .unwrap();
+        let c = Credentials::load_with_env(
+            &paths,
+            |_| Err(std::env::VarError::NotPresent),
+            [
+                (
+                    "GITHUB_USER_TOKEN_ANA".to_string(),
+                    "from-shell".to_string(),
+                ),
+                ("GITHUB_USER_TOKEN_SAM".to_string(), String::new()),
+                ("PATH".to_string(), "/usr/bin".to_string()),
+            ],
+        );
+        assert_eq!(c.user_token("ana"), Some("from-shell"));
+        assert_eq!(c.user_token("sam"), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

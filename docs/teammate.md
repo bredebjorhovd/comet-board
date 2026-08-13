@@ -1,6 +1,6 @@
 # Adding a teammate to the box
 
-Five steps, in this order. Each one is cheap; each one is invisible until it is
+Six steps, in this order. Each one is cheap; each one is invisible until it is
 missing, and three of them fail *after* the teammate's first task has already
 run. That is what this page exists for — every mechanism below shipped
 separately, and what an operator has to actually do only existed as three
@@ -14,7 +14,8 @@ The short version, for a box that is already running:
 comet-board member add ana@example.com --github ana      # 3
 # 4  Settings → Agent accounts on the box → sign their Claude/Codex login in
 # 5  install the board's GitHub App on whatever repos they bring
-comet-board doctor                                       # confirms 3, 4 and 5
+# 6  put their own GitHub token in the board's .env, so their verdicts are theirs
+comet-board doctor                                       # confirms 3 to 6
 ```
 
 Everything here is per **person**. Putting a new *repo* on the board is
@@ -170,6 +171,43 @@ widening. A repo already on the board whose installation was later narrowed
 fails later and less clearly: polls stop returning issues, and pushes from a
 dispatched agent fail on the credential.
 
+## 6. Let their verdict be a verdict
+
+A review written in comet's review window is posted on the pull request. Under
+whose name is a credential question, and GitHub has a rule about it: **it
+refuses `APPROVE` and `REQUEST_CHANGES` on a pull request the caller opened**.
+The board's own credential opens every dispatched pull request, so a verdict the
+board casts on one can never be more than a comment that says it approves
+(§gh#365). The identity that opens and the identity that reviews have to be two
+different accounts (§gh#369).
+
+They already are on one side — the App opens. The other side is a token of the
+reviewer's own, in the board's `.env`, named after the login you mapped in step
+3:
+
+```bash
+# on the box, in the board's .env — chmod 600, like the App key
+GITHUB_USER_TOKEN_ANA=github_pat_…
+```
+
+A fine-grained personal access token of **theirs**, with `Pull requests: read &
+write` on the repos this board watches, is enough. The variable is the login
+uppercased, with a hyphen written as an underscore (`octo-cat` →
+`GITHUB_USER_TOKEN_OCTO_CAT`). It is spent on exactly one call — submitting
+their review — and on nothing else the board does.
+
+**If you skip it:** their verdict still stands, still reaches the agent in the
+chat, and still lands on the pull request — as a comment whose first line says
+it is an approval. That is gh#365's arrangement and it is safe; what it is not
+is a review GitHub counts.
+
+The step nobody can skip is the *other* side of the same invariant: whoever
+opens the pull requests must not be somebody who reviews them. A board running
+on a `GITHUB_TOKEN` opens every dispatched pull request as the person that token
+belongs to — and if that is also the person reviewing, no member token helps,
+because it is one account on both sides. `doctor`'s `review identity` line is
+where that shows up, and the fix is step 5's App.
+
 ---
 
 ## Not a sixth step: `gh stack`
@@ -203,13 +241,14 @@ up. Nothing on the box can do it for them.
 
 ## What `doctor` confirms
 
-`comet-board doctor` on the box is the check for steps 3, 4 and 5. The lines,
+`comet-board doctor` on the box is the check for steps 3 to 6. The lines,
 and which step each one is about — the last is about the box rather than about
 anybody on it:
 
 | line | step | what a healthy one says |
 | --- | --- | --- |
 | `dispatch authorship` | 3, and 4 | every mapped person, what their address resolves to, and — since gh#162 — which of them has no agent account of their own |
+| `review identity` | 6, and 5 | who opens dispatched pull requests, who can cast a verdict under their own name, and who reviews as the board. The one FAIL here is one account on both sides (§gh#369) |
 | `git identity` | the box itself | the box has a `git config user.*` at all, so what it commits as *committer* is attributable. A box with none is the one state that FAILs |
 | `github auth` / `github app` | 5 | which credential is live, which repos it reaches, and when its token expires |
 | `route N: account` | 4 | the slot a route names is one this device has saved, and of the right kind |
@@ -242,5 +281,7 @@ account a sign-in email belongs to, and the board cannot verify it — its App
 may not read anybody's verified addresses. `dispatched_by_user` is unverified
 provenance in the same way. What decides what a run may actually *spend* is the
 explicit `account` (gh#59); what decides what it may *push* is the board's own
-App credential (gh#58). This page is about attribution and about nobody being
+App credential (gh#58); and what decides whose name is on a review is that
+person's own token (gh#369) — the one thing here that is a credential belonging
+to a human rather than a claim about one. This page is about attribution and about nobody being
 surprised, which are worth having on their own.

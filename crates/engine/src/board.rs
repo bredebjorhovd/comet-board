@@ -114,6 +114,11 @@ enum Msg {
         attempt: Option<i64>,
         kind: VerdictKind,
         comment: String,
+        /// Whose verdict this is, as the RPC surface resolved it (gh#369) —
+        /// the address the copy on GitHub is submitted under when this box
+        /// holds that person's own token. `None` when nobody could be named,
+        /// which posts as the board.
+        reviewer: Option<String>,
         reply: oneshot::Sender<anyhow::Result<VerdictReceipt>>,
     },
     Shutdown,
@@ -389,6 +394,11 @@ impl BoardService {
     /// GitHub, delivered into the chat that wrote it, with the unclaimed
     /// changes attached to both.
     ///
+    /// `reviewer` is the address the caller's transport vouched for, and it
+    /// decides which credential the GitHub copy is cast under (gh#369).
+    /// Resolved by the RPC surface rather than here: only that layer can tell
+    /// a relayed call the edge verified from a claim a frontend typed.
+    ///
     /// Idempotent on what was said — a retry finishes the half that failed —
     /// so a caller whose call times out should re-send it verbatim rather than
     /// guessing whether it landed.
@@ -398,6 +408,7 @@ impl BoardService {
         attempt: Option<i64>,
         kind: VerdictKind,
         comment: &str,
+        reviewer: Option<String>,
     ) -> anyhow::Result<VerdictReceipt> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -406,6 +417,7 @@ impl BoardService {
                 attempt,
                 kind,
                 comment: comment.to_string(),
+                reviewer,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
@@ -596,6 +608,7 @@ fn run_loop(
                 attempt,
                 kind,
                 comment,
+                reviewer,
                 reply,
             }) => {
                 let result = engine.submit_verdict(
@@ -604,6 +617,7 @@ fn run_loop(
                     attempt,
                     kind,
                     &comment,
+                    reviewer.as_deref(),
                 );
                 let _ = reply.send(result);
             }

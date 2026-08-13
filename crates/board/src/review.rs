@@ -1428,23 +1428,10 @@ pub(crate) mod tests {
     }
 
     /// Shares one fixture between the engine, which owns its transport, and the
-    /// test, which needs to read back what was asked.
-    pub(crate) struct Shared(std::rc::Rc<crate::sources::github::FixtureRest>);
-
-    impl Rest for Shared {
-        fn get(&self, path: &str) -> Result<serde_json::Value> {
-            self.0.get(path)
-        }
-        fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-            self.0.post(path, body)
-        }
-        fn patch(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-            self.0.patch(path, body)
-        }
-        fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-            self.0.put(path, body)
-        }
-    }
+    /// test, which needs to read back what was asked. Since gh#369 the
+    /// reviewer's own client shares it too, so "one review was posted" is a
+    /// countable claim however many identities were involved.
+    pub(crate) use crate::sources::github::SharedFixture as Shared;
 
     /// An engine over an in-memory board and a recorded GitHub.
     pub(crate) fn engine(rest: std::rc::Rc<crate::sources::github::FixtureRest>) -> SyncEngine {
@@ -1461,6 +1448,9 @@ pub(crate) mod tests {
             log: std::sync::Arc::new(crate::log::Logger::new("", false)),
             linear: None,
             github: Some(Github::new(Box::new(Shared(rest)) as Box<dyn Rest>)),
+            // Nothing to hand out until a test says a member holds a token
+            // (gh#369); a board that holds none never asks for a client.
+            as_user: std::rc::Rc::new(crate::sources::github::FixtureAsUser::default()),
             webhook: std::sync::Arc::new(crate::notify::HttpWebhook),
         }
     }

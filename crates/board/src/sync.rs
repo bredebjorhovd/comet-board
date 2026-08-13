@@ -37,17 +37,41 @@ use crate::overrun;
 use crate::rebased;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Commits, Evidence, Verdict, Why};
-use crate::sources::github::{Github, HttpRest, MergeStatus, PullRequest, Rest, pr_matches_branch};
+use crate::sources::github::{
+    AsUser, Github, HttpAsUser, HttpRest, MergeStatus, PullRequest, Rest, pr_matches_branch,
+};
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
 
 impl GraphQl for Box<dyn GraphQl> {
     fn query(&self, body: &Value) -> Result<Value> {
         (**self).query(body)
+    }
+}
+
+/// A borrowed client is a client (gh#369). `doctor` holds one [`HttpRest`] and
+/// hands it to several checks, one of which wants to ask a question through
+/// [`Github`] — which owns its transport.
+impl<T: Rest + ?Sized> Rest for &T {
+    fn get(&self, path: &str) -> Result<Value> {
+        (**self).get(path)
+    }
+    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).post(path, body)
+    }
+    fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).patch(path, body)
+    }
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).put(path, body)
+    }
+    fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        (**self).put_reply(path, body)
     }
 }
 
@@ -148,6 +172,15 @@ pub struct SyncEngine {
     pub log: Arc<Logger>,
     pub linear: Option<Linear<Box<dyn GraphQl>>>,
     pub github: Option<Github<Box<dyn Rest>>>,
+    /// How a verdict is cast under the *reviewer's* identity rather than the
+    /// board's (gh#369). A field for the same reason [`Self::webhook`] is one:
+    /// which credential the review went out under is exactly what a test of
+    /// this needs to watch, and it must not take a socket to see it.
+    ///
+    /// `Rc` rather than `Arc`, unlike the webhook: what it hands out is a
+    /// [`Github`] over a `Box<dyn Rest>`, which is this engine's own and goes
+    /// nowhere else.
+    pub as_user: Rc<dyn AsUser>,
     /// Where `[defaults] notify_webhook` is POSTed (gh#71). A field rather than
     /// a call into `notify::HttpWebhook` so a test can watch what the board
     /// would have sent without one listening socket in the suite.
@@ -288,6 +321,7 @@ impl SyncEngine {
             log,
             linear,
             github,
+            as_user: Rc::new(HttpAsUser),
             webhook: Arc::new(crate::notify::HttpWebhook),
         })
     }
@@ -4918,6 +4952,7 @@ mod tests {
             log: Arc::new(Logger::new("", false)),
             linear,
             github: None,
+            as_user: Rc::new(crate::sources::github::FixtureAsUser::default()),
             webhook: Arc::new(RecordingWebhook::default()),
         }
     }

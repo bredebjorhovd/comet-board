@@ -1231,6 +1231,10 @@ struct VerdictReceipt: Decodable, Hashable {
     var projection: Projection
     /// GitHub's words for refusing the verdict as sent. Nil when it took it.
     var refused: String?
+    /// The GitHub login the review was submitted under, when it was the
+    /// reviewer's own credential and not the board's (gh#369). Nil is the
+    /// board — and, on an older box, a field that was never sent.
+    var postedAs: String?
     var unclaimed: Int
     var payload: String
 
@@ -1240,6 +1244,7 @@ struct VerdictReceipt: Decodable, Hashable {
         case reviewId = "review_id"
         case chatId = "chat_id"
         case notDelivered = "not_delivered"
+        case postedAs = "posted_as"
     }
 
     init(from decoder: Decoder) throws {
@@ -1257,6 +1262,9 @@ struct VerdictReceipt: Decodable, Hashable {
         notDelivered = try requireNullable(String.self, c, .notDelivered)
         projection = try c.decode(Projection.self, forKey: .projection)
         refused = try requireNullable(String.self, c, .refused)
+        // Absent rather than null on the wire: a board that casts every verdict
+        // as itself omits the key, and a box older than gh#369 never had one.
+        postedAs = try c.decodeIfPresent(String.self, forKey: .postedAs)
         unclaimed = try c.decode(Int.self, forKey: .unclaimed)
         payload = try c.decode(String.self, forKey: .payload)
     }
@@ -1264,7 +1272,8 @@ struct VerdictReceipt: Decodable, Hashable {
     init(taskId: String, attempt: Int64 = 0, kind: String = "", reviewId: Int64 = 0,
          recorded: Bool = false, chatId: String? = nil, delivered: Bool = false,
          notDelivered: String? = nil, projection: Projection = .posted,
-         refused: String? = nil, unclaimed: Int = 0, payload: String = "") {
+         refused: String? = nil, postedAs: String? = nil,
+         unclaimed: Int = 0, payload: String = "") {
         self.taskId = taskId
         self.attempt = attempt
         self.kind = kind
@@ -1275,6 +1284,7 @@ struct VerdictReceipt: Decodable, Hashable {
         self.notDelivered = notDelivered
         self.projection = projection
         self.refused = refused
+        self.postedAs = postedAs
         self.unclaimed = unclaimed
         self.payload = payload
     }
@@ -1311,10 +1321,12 @@ func reviewContractLine(_ review: AttemptReview, delivering: Bool) -> String {
 /// somebody who does not know GitHub's rules about who may review what —
 /// `comet_board::verdict::projection_line` (gh#365).
 func reviewProjectionLine(_ kind: VerdictKind, _ projection: Projection,
-                          _ refused: String?) -> String {
+                          _ refused: String?, _ postedAs: String? = nil) -> String {
     switch projection {
     case .posted:
-        return "It is on the pull request."
+        // Whose name is on it, when it is not the board's (gh#369).
+        guard let login = postedAs else { return "It is on the pull request." }
+        return "It is on the pull request, as @\(login)."
     case .postedAsComment:
         return "It is on the pull request as a comment that says it \(kind.says) — "
             + "GitHub does not let the board \(kind.refusedVerb) its own pull request."
@@ -1343,5 +1355,5 @@ func reviewReceiptLine(_ receipt: VerdictReceipt) -> String {
         board = "\(stands)."
     }
     let kind = VerdictKind(rawValue: receipt.kind) ?? .comment
-    return "\(board) \(reviewProjectionLine(kind, receipt.projection, receipt.refused))"
+    return "\(board) \(reviewProjectionLine(kind, receipt.projection, receipt.refused, receipt.postedAs))"
 }

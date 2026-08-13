@@ -90,6 +90,25 @@
         "task_id": "gh:o/r#13",
         "unclaimed": 2
       }
+    },
+    {
+      "expect": "Recorded, and delivered into the chat once. It is on the pull request, as @bredebjorhovd.",
+      "name": "cast under the reviewer's own credential",
+      "receipt": {
+        "attempt": 7,
+        "chat_id": "chat-1",
+        "delivered": true,
+        "kind": "approve",
+        "not_delivered": null,
+        "payload": "",
+        "posted_as": "bredebjorhovd",
+        "projection": "posted",
+        "recorded": true,
+        "refused": null,
+        "review_id": 900,
+        "task_id": "gh:o/r#13",
+        "unclaimed": 2
+      }
     }
   ],
   "reviewable": [

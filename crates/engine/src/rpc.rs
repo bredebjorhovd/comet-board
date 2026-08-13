@@ -686,6 +686,33 @@ impl EngineRpc {
         }
     }
 
+    /// Who is casting a verdict, at the strongest form this device can vouch
+    /// for (gh#369).
+    ///
+    /// The same two sources [`Self::dispatch_origin`] uses, weighed
+    /// differently, because the answer is spent on a different thing. A commit
+    /// author is provenance and takes a frontend's claim; this picks a
+    /// *credential*, so a `viaUser` naming somebody else must not be able to
+    /// spend that person's token:
+    ///
+    /// 1. **The relay's stamp**, resolved to an address — a call the edge
+    ///    verified is the only thing that can name somebody who is not here.
+    /// 2. **This box's own session**, for a local call. There is no relay to
+    ///    have stamped anything and the process on the other end is the box's
+    ///    own, which is the desktop review window in the ordinary case.
+    ///
+    /// `None` — a box with no auth service, a signed-out one, a roster that
+    /// could not be read — posts the verdict under the board's own credential,
+    /// which is what every board did before member tokens existed.
+    async fn reviewer(&self, caller: &Caller) -> Option<String> {
+        let auth = self.auth.as_ref()?;
+        let user_id = match caller.user() {
+            Some(id) => id.to_string(),
+            None => auth.user_id()?,
+        };
+        auth.email_for_user(&user_id).await
+    }
+
     fn updater(&self) -> Result<&comet_update::Updater, RpcError> {
         self.updater
             .as_ref()
@@ -1468,8 +1495,9 @@ fn forwardable(method: &str) -> bool {
             | methods::SUBMIT_CLAIMS
             | methods::READ_ATTEMPT_REVIEW
             // A verdict is written on a laptop and lands in two places that
-            // are both on the box: GitHub, with the board's credential, and
-            // the chat the box is hosting (§gh#239).
+            // are both on the box: GitHub — under the reviewer's own credential
+            // when the box holds one (gh#369), else the board's — and the chat
+            // the box is hosting (§gh#239).
             | methods::SUBMIT_VERDICT
             | methods::LIST_BOARD_RUNTIMES
             // Throughput is read off `board.db`, which only the box has
@@ -1946,9 +1974,10 @@ impl RpcService for EngineRpc {
                         p.kind
                     ))
                 })?;
+                let reviewer = self.reviewer(caller).await;
                 let receipt = self
                     .board()?
-                    .submit_verdict(&p.task_id, p.attempt, kind, &p.comment)
+                    .submit_verdict(&p.task_id, p.attempt, kind, &p.comment, reviewer)
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&receipt)
