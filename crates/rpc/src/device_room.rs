@@ -354,13 +354,13 @@ const DIAL_RETRY_SPACING: Duration = Duration::from_millis(1500);
 /// DO's lifecycle, not our failure, so the rejoin does not escalate.
 const HOST_HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
+/// Spread for host-relay rejoins. Same herd-breaking job the room actors do
+/// (gh#396), through the same helper — an edge deploy ends this session and
+/// every room session at once.
+const REJOIN_SPREAD: Duration = Duration::from_secs(2);
+
 fn jitter() -> Duration {
-    // Cheap decorrelation without a rand dependency.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    Duration::from_millis(u64::from(nanos) % 2_000)
+    comet_sync::jitter::spread(REJOIN_SPREAD)
 }
 
 /// One per-client virtual connection: `in_tx` feeds the ndjson dispatch loop

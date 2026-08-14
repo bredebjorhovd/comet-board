@@ -138,6 +138,26 @@ const ROOM_PROBE_MAX: Duration = Duration::from_secs(4 * 3600);
 const PROBE_REPLY_GRACE: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// A session must stay joined at least this long for its end to count as a
+/// working session and reset the backoff ladder (gh#396).
+///
+/// Reaching `JoinResponseOk` is NOT that proof. A DO that accepts the join and
+/// then dies — the duration cap hit mid-session, the `ctx.abort()` in the
+/// WASM-poisoning escalation (gh#378) — answered the join every time, so
+/// resetting on `joined` alone made the room redial at BACKOFF_BASE forever:
+/// ~4 dials/second, per room, with no ceiling, precisely while the edge is
+/// least able to take it. Requiring a lifetime instead bounds the steady state
+/// of any join-then-die loop to roughly one dial per session lifetime, and the
+/// ladder still climbs to BACKOFF_CAP when the deaths stay fast. Matches
+/// `HOST_HEALTHY_SESSION` in the device-room relay, which draws the same line.
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+/// Window over which a post-wake redial is spread across the box's rooms
+/// (gh#396). Wake is broadcast to every room actor in the same instant, so an
+/// undelayed redial is N simultaneous dials at an edge that has just watched
+/// the whole fleet resume. Short enough that recovery is still immediate to a
+/// human — the alternative, waiting out a silence lease, is the minute-long
+/// stall this wake path exists to kill.
+const WAKE_SPREAD: Duration = Duration::from_millis(1000);
 /// Stop resubmitting after this many InvalidUpdate-triggered rejoins in one
 /// session — our history predates the room's shallow start and can never
 /// import; recovery is an app-layer concern (§3.1).
@@ -541,34 +561,69 @@ enum SessionEnd {
     Lost(SyncError),
 }
 
+/// One session as the redial loop needs to see it: how it ended, and the two
+/// facts that set the next delay.
+struct SessionOutcome {
+    end: SessionEnd,
+    /// The session stayed joined for at least [`HEALTHY_SESSION`] — proof the
+    /// room actually worked, and the only thing that resets the backoff ladder
+    /// (gh#396).
+    healthy: bool,
+    /// The session was ended by a system wake, not by a failure: the redial is
+    /// immediate but spread over [`WAKE_SPREAD`], because every room on the box
+    /// got the same broadcast.
+    woke: bool,
+}
+
+impl SessionOutcome {
+    /// A session that never ran (dial error, dial timeout) or one that ended
+    /// without earning anything.
+    fn failed(end: SessionEnd) -> Self {
+        Self {
+            end,
+            healthy: false,
+            woke: false,
+        }
+    }
+}
+
 impl RoomActor {
     async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
         // System wake is an EVENT: it ends the (half-open) session immediately
-        // and cancels any pending backoff, so the room is redialing within a
-        // second of the lid opening instead of waiting out a silence lease.
+        // and cancels any pending backoff, so the room is redialing a second or
+        // so after the lid opens (WAKE_SPREAD, which staggers the box's rooms)
+        // instead of waiting out a silence lease.
         let mut wake = crate::wake::subscribe();
         loop {
             if *self.shutdown.borrow() {
                 return;
             }
             let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
-            let (end, joined) = match dial {
+            let outcome = match dial {
                 Ok(Ok(pipe)) => self.run_session(pipe, &mut wake, &mut ready).await,
-                Ok(Err(err)) => (SessionEnd::Lost(err), false),
+                Ok(Err(err)) => SessionOutcome::failed(SessionEnd::Lost(err)),
                 Err(_) => {
                     // The dial itself hung (URL provider stall, blackholed
                     // handshake) — without this bound the actor wedged here
                     // forever with no log line (see CONNECT_TIMEOUT).
                     tracing::warn!(room = %self.room_id, timeout = ?CONNECT_TIMEOUT, "dial timed out; backing off to redial");
-                    (
-                        SessionEnd::Lost(SyncError::WebSocket("dial timeout".into())),
-                        false,
-                    )
+                    SessionOutcome::failed(SessionEnd::Lost(SyncError::WebSocket(
+                        "dial timeout".into(),
+                    )))
                 }
             };
-            match end {
+            // A session that did real work earns a fresh ladder; one that only
+            // got a join answer before dying does not (gh#396, HEALTHY_SESSION).
+            // Applied BEFORE the match so an eviction's deliberate long
+            // backoff below is the last word — reset-after-match let a
+            // long-lived session that was then evicted rejoin at 250ms, which
+            // is the one case the eviction backoff exists to prevent.
+            if outcome.healthy {
+                backoff = BACKOFF_BASE;
+            }
+            match outcome.end {
                 SessionEnd::Shutdown => {
                     // `local_rx`/`eph_rx` closing reaches here too — the doc or
                     // ephemeral subscription is gone, so this actor can never
@@ -612,29 +667,46 @@ impl RoomActor {
                     let _ = self.events.send(RoomEvent::Disconnected);
                 }
             }
-            if joined {
-                backoff = BACKOFF_BASE;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(backoff) => {}
-                _ = wake.recv() => {
-                    backoff = BACKOFF_BASE; // redial NOW with fresh credentials
-                    continue;
+            // A wake cancels the backoff — during it, or as the thing that
+            // ended the session a moment ago.
+            let mut woke = outcome.woke;
+            if !woke {
+                // The ladder value is a ceiling, not a schedule: sleeping
+                // exactly `backoff` keeps every room that failed together
+                // (an edge deploy, one flaky uplink) redialing together
+                // forever. Wait a jittered [backoff/2, backoff) instead —
+                // half a step of spread at every rung, widening with the
+                // rung, which is where the rooms are most piled up (gh#396).
+                let wait = backoff / 2 + crate::jitter::spread(backoff / 2);
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = wake.recv() => woke = true,
+                    _ = self.shutdown.changed() => return,
                 }
-                _ = self.shutdown.changed() => return,
+            }
+            if woke {
+                // Redial NOW with fresh credentials — but every room on this
+                // box got that same broadcast in the same millisecond, so
+                // stagger the herd across WAKE_SPREAD first (gh#396).
+                tokio::select! {
+                    _ = tokio::time::sleep(crate::jitter::spread(WAKE_SPREAD)) => {}
+                    _ = self.shutdown.changed() => return,
+                }
+                backoff = BACKOFF_BASE;
+                continue;
             }
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
     }
 
-    /// Drive one connection until it ends. Returns the end reason and whether
-    /// the session ever completed a join (for backoff reset).
+    /// Drive one connection until it ends. Returns the end reason plus what
+    /// the redial loop needs to time the next dial (see [`SessionOutcome`]).
     async fn run_session(
         &mut self,
         mut pipe: Pipe,
         wake: &mut broadcast::Receiver<()>,
         ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
-    ) -> (SessionEnd, bool) {
+    ) -> SessionOutcome {
         // Local updates queued while disconnected are already in the doc; the
         // VV diff pushed on join re-derives them, so stale queue entries are
         // dropped rather than replayed.
@@ -652,6 +724,7 @@ impl RoomActor {
             pending: HashMap::new(),
             fragments: HashMap::new(),
             joined_lor: false,
+            joined_at: None,
             joined_eph: false,
             eph_join_sent_at: None,
             invalid_rejoins: 0,
@@ -663,11 +736,12 @@ impl RoomActor {
 
         let version = sess.local_version_bytes();
         if let Err(err) = sess.send_join_loro(version).await {
-            return (SessionEnd::Lost(err), false);
+            return SessionOutcome::failed(SessionEnd::Lost(err));
         }
 
         let mut probe_interval = ROOM_PROBE_AFTER;
         let mut last_probe_at: Option<tokio::time::Instant> = None;
+        let mut woke = false;
 
         let end = loop {
             // Two-tier room liveness: an in-flight %LOR JoinRequest has a hard
@@ -707,6 +781,7 @@ impl RoomActor {
                 // freshly-provided URL/token instead of waiting out the
                 // silence lease. A false positive costs one cheap rejoin.
                 _ = wake.recv() => {
+                    woke = true;
                     break SessionEnd::Lost(SyncError::WebSocket(
                         "system woke from suspend; reconnecting".into(),
                     ));
@@ -810,12 +885,16 @@ impl RoomActor {
                 }
             }
         };
-        let joined = sess.joined_lor;
+        // Joined-and-then-died is not a working session (gh#396): the ladder
+        // only resets for one that carried the room past HEALTHY_SESSION.
+        let healthy = sess
+            .joined_at
+            .is_some_and(|at| at.elapsed() >= HEALTHY_SESSION);
         // The session is over whatever the reason; nothing is live again until
         // the next JoinResponseOk raises these.
         self.connected.set(false);
         self.presence.set(false);
-        (end, joined)
+        SessionOutcome { end, healthy, woke }
     }
 }
 
@@ -846,6 +925,10 @@ struct Session {
     /// Inbound reassembly buffers.
     fragments: HashMap<BatchId, FragmentBuffer>,
     joined_lor: bool,
+    /// Instant the FIRST `%LOR` join of this session was answered (a rejoin or
+    /// probe answer does not restart it). The session's lifetime as a joined
+    /// room, which is what earns a backoff reset — see [`HEALTHY_SESSION`].
+    joined_at: Option<tokio::time::Instant>,
     joined_eph: bool,
     /// Instant of the last `%EPH` JoinRequest — `run_session` re-sends on
     /// [`EPH_JOIN_RETRY`] while `joined_lor && !joined_eph` (gh#126).
@@ -1055,6 +1138,7 @@ impl Session {
                 self.join_sent_at = None; // join answered — disarm the deadline
                 let was_probe = std::mem::take(&mut self.join_is_probe);
                 self.joined_lor = true;
+                self.joined_at.get_or_insert_with(tokio::time::Instant::now);
                 self.connected.set(true);
                 // Resubmit-from-VV: push everything the server lacks. This
                 // covers both fresh docs (first upload) and updates that went

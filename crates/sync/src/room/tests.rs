@@ -10,8 +10,14 @@ use super::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn wait_until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(TEST_TIMEOUT, async {
+async fn wait_until(condition: impl FnMut() -> bool) {
+    wait_until_within(TEST_TIMEOUT, condition).await;
+}
+
+/// [`wait_until`] with its own budget — for waits that legitimately outlast
+/// the default one (a backoff ladder sitting at BACKOFF_CAP, say).
+async fn wait_until_within(budget: Duration, mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(budget, async {
         loop {
             if condition() {
                 return;
@@ -40,6 +46,10 @@ struct FakeEdge {
     /// wedged-DO shape: the runtime keeps the socket (and would keep
     /// auto-ponging keepalives) while the room never speaks.
     mute: AtomicBool,
+    /// When set, the room answers the `%LOR` join and then dies — the gh#396
+    /// shape: a DO hitting its duration cap mid-session, or aborting itself
+    /// out of a poisoned WASM instance (gh#378). Every dial "joins".
+    die_after_join: AtomicBool,
     leaves: AtomicUsize,
     join_requests: AtomicUsize,
     /// Swallow this many `%EPH` JoinRequests (consume, answer nothing) — the
@@ -63,6 +73,7 @@ impl FakeEdge {
             fragments: Mutex::new(HashMap::new()),
             reject_next_update: AtomicBool::new(false),
             mute: AtomicBool::new(false),
+            die_after_join: AtomicBool::new(false),
             leaves: AtomicUsize::new(0),
             join_requests: AtomicUsize::new(0),
             swallow_eph_joins: AtomicUsize::new(0),
@@ -82,6 +93,15 @@ impl FakeEdge {
             conn.task.abort();
             drop(conn.tx);
         }
+    }
+
+    /// Forget one connection so its handler can end it by returning: the
+    /// registry holds the last sender keeping the client's stream open.
+    fn forget(&self, conn: &mpsc::Sender<Vec<u8>>) {
+        self.conns
+            .lock()
+            .unwrap()
+            .retain(|live| !live.tx.same_channel(conn));
     }
 
     async fn reply(&self, to: &mpsc::Sender<Vec<u8>>, message: &ProtocolMessage) {
@@ -381,6 +401,13 @@ impl Connector for FakeConnector {
             let task = tokio::spawn(async move {
                 while let Some(bytes) = server_rx.recv().await {
                     handler_edge.handle(&reply_to, &bytes).await;
+                    // gh#396: answer the join, then die. Deregistering first
+                    // drops the registry's sender; returning drops this one,
+                    // and the client's stream ends.
+                    if handler_edge.die_after_join.load(Ordering::SeqCst) && is_loro_join(&bytes) {
+                        handler_edge.forget(&reply_to);
+                        return;
+                    }
                 }
             });
             edge.conns.lock().unwrap().push(FakeConn {
@@ -393,6 +420,16 @@ impl Connector for FakeConnector {
             })
         })
     }
+}
+
+fn is_loro_join(bytes: &[u8]) -> bool {
+    matches!(
+        decode(bytes),
+        Ok(ProtocolMessage::JoinRequest {
+            crdt: CrdtType::Loro,
+            ..
+        })
+    )
 }
 
 fn doc_text(doc: &LoroDoc) -> String {
@@ -725,6 +762,83 @@ async fn established_client_redials_when_rejoin_goes_unanswered() {
         "each redial must re-attempt the join handshake"
     );
     drop(client);
+}
+
+/// gh#396: a room that JOINS and then dies must climb the backoff ladder like
+/// any other failure.
+///
+/// The DO answers the JoinRequest and the socket dies a moment later — the
+/// duration cap reached mid-session, or the `ctx.abort()` of the gh#378
+/// WASM-poisoning escalation. Resetting the ladder on the join answer alone
+/// made this cycle run at BACKOFF_BASE forever: ~4 dials/second, per room,
+/// against an edge that is already unwell, with no ceiling and nothing else in
+/// the client capable of that rate.
+#[tokio::test(start_paused = true)]
+async fn a_room_that_joins_and_then_dies_is_not_redialed_at_base_backoff() {
+    let edge = FakeEdge::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new())
+        .await
+        .expect("connect");
+
+    // From here every dial gets its join answered and then loses the socket.
+    edge.die_after_join.store(true, Ordering::SeqCst);
+    let before = edge.dials.load(Ordering::SeqCst);
+    edge.kick_all();
+
+    // Five minutes of joins-then-deaths. The ladder (jittered, so between
+    // half and all of each step) needs ~8 dials to reach BACKOFF_CAP and
+    // spends the rest of the window there: a few dozen at the very most. The
+    // unfixed loop spent this window at 250ms a dial — 1200 of them.
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    let dials = edge.dials.load(Ordering::SeqCst) - before;
+    assert!(
+        dials <= 40,
+        "join-then-die must back off; saw {dials} dials in 5 minutes"
+    );
+    assert!(dials >= 5, "the room must keep trying; saw {dials} dials");
+
+    // And the ceiling holds: once at the cap the rate stays there.
+    let at_cap = edge.dials.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let dials = edge.dials.load(Ordering::SeqCst) - at_cap;
+    assert!(
+        dials <= 12,
+        "backoff must stay at the cap; saw {dials} dials in 2 minutes"
+    );
+    drop(client);
+}
+
+/// The other half of gh#396: escalation must not punish a room that WORKED.
+/// A session that carried the room past `HEALTHY_SESSION` and then lost its
+/// socket (an edge deploy, a NAT timeout) reconnects at base backoff — even if
+/// the ladder was at the cap when it got there.
+#[tokio::test(start_paused = true)]
+async fn a_working_session_earns_a_fresh_ladder() {
+    let edge = FakeEdge::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new())
+        .await
+        .expect("connect");
+
+    // Drive the ladder to the cap with join-then-die dials…
+    edge.die_after_join.store(true, Ordering::SeqCst);
+    edge.kick_all();
+    tokio::time::sleep(Duration::from_secs(300)).await;
+
+    // …then let a dial stick, and give it a working session's worth of life.
+    edge.die_after_join.store(false, Ordering::SeqCst);
+    wait_until_within(Duration::from_secs(120), || client.connected()).await;
+    tokio::time::sleep(HEALTHY_SESSION + Duration::from_secs(1)).await;
+
+    edge.kick_all();
+    wait_until(|| !client.connected()).await;
+    let down_at = tokio::time::Instant::now();
+    wait_until_within(Duration::from_secs(120), || client.connected()).await;
+    assert!(
+        down_at.elapsed() < Duration::from_secs(2),
+        "a healthy session must reset the ladder; rejoin took {:?}",
+        down_at.elapsed()
+    );
+    client.shutdown().await.unwrap();
 }
 
 /// A dial that never resolves (`provider.url()` or `connect_async` hanging —
