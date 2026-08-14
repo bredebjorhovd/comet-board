@@ -2634,6 +2634,74 @@ fn a_stacked_row_says_which_layer_it_is_and_what_clean_meant() {
     assert!(screen.contains("[/] stack"), "and how to walk it:\n{screen}");
 }
 
+/// gh#388: the shape the first real stack actually arrived in — every layer
+/// `clean`, including the two that cannot reach trunk on their own.
+///
+/// The row above has a `dirty` layer under it, which is the easy half: there is
+/// an objection to repeat. This is the half that had never been drawn. The
+/// screen may not print `clean` — the word is true of the branch below and not
+/// of `main` — and it may not stop at `ready to land` either, because merging
+/// this one merges three pull requests. It says how many come with it, and the
+/// panel names them before the key that cannot be undone.
+#[test]
+fn the_top_of_an_all_clean_stack_says_how_many_it_would_land() {
+    use comet_proto::view::board::{BoardState, RowStack, StackLayer};
+    let mut app = populated();
+    app.act(Action::ToggleBoard);
+    let layers: Vec<StackLayer> = [(1, 47), (2, 48), (3, 50)]
+        .into_iter()
+        .map(|(position, pr)| StackLayer {
+            id: position.to_string(),
+            identifier: format!("gh#{}", 43 + position),
+            pr_number: Some(pr),
+            position: Some(position),
+            open: true,
+            mergeable: Some("clean".into()),
+            changes_requested: false,
+        })
+        .collect();
+    let mut row = board_row("3", BoardState::Review);
+    row.identifier = "gh#46".into();
+    row.pr_number = Some(50);
+    row.pr_base_ref = Some("board/gh-45-auto-promote-bug".into());
+    row.pr_mergeable = Some("clean".into());
+    row.landing = Some("ready".into());
+    row.stack = Some(RowStack {
+        number: 49,
+        position: Some(3),
+        size: Some(3),
+        base_ref: Some("main".into()),
+        layers,
+    });
+    app.apply(Update::Board(vec![row]));
+
+    let screen = joined(&snapshot(&mut app, 120, 26));
+    let line = screen
+        .lines()
+        .find(|l| l.contains("3 of 3"))
+        .expect("the top layer's row");
+    assert!(
+        line.contains("ready to land with 2 below"),
+        "what merging it would do:\n{line}"
+    );
+    assert!(
+        !line.contains("clean"),
+        "GitHub's word is about the branch below, not about main:\n{line}"
+    );
+
+    app.board.selected = Some("3".into());
+    app.act(Action::BoardPeek);
+    let screen = joined(&snapshot(&mut app, 120, 26));
+    assert!(
+        screen.contains("stack 3 of 3") && screen.contains("onto board/gh-45-auto-promote-bug"),
+        "which layer, and the branch under it:\n{screen}"
+    );
+    assert!(
+        screen.contains("#47 ↑ #48 ↑ #50"),
+        "the map, bottom first:\n{screen}"
+    );
+}
+
 #[test]
 fn an_open_row_that_leaves_the_board_says_so_rather_than_drawing_a_stale_card() {
     let mut app = populated();

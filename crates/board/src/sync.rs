@@ -8346,6 +8346,278 @@ max_duration = "{max_duration}"
         assert!(task.local_done, "the merge finished the task");
     }
 
+    // ---- the first real stack, end to end (gh#388) ------------------------
+    //
+    // The nine stacks issues landed against fixtures somebody wrote, and gh#337
+    // asked that one payload GitHub actually sent be put through the whole path
+    // before the vocabulary is trusted. Stack 49 on
+    // `Florin-AS/orion-productmapping` is that payload — three layers, filed
+    // from the board, merged the same morning — and it enters these tests as
+    // the JSON `GET /pulls` returned and leaves as the words a reader reads.
+    //
+    // The question gh#388 raised is the one below: **every layer of it reports
+    // `mergeable_state: clean`**, including the two that cannot reach `main`
+    // alone. GitHub is not wrong — each is clean against its own base — and
+    // `clean` is the field a reader reaches for. What the board must not do is
+    // pass it on.
+
+    /// Stack 49, as GitHub answered it. The fixture's `_provenance` says what
+    /// was recorded, what was withheld and which three fields of the open
+    /// snapshot were restored to their values inside the window.
+    const STACK_49: &str = include_str!("../fixtures/gh-388-stack-49.json");
+
+    const STACK_49_REPO: &str = "Florin-AS/orion-productmapping";
+
+    /// The board after one poll of stack 49 — `snapshot` is `open` for the
+    /// three layers as gh#388 found them, `merged` for the same three after
+    /// they landed.
+    ///
+    /// Nothing here is hand-built: the pull requests are parsed by
+    /// [`Github::pulls`] out of the recorded payload, linked by the poll's own
+    /// [`SyncEngine::link_pull_requests`], and read back as the rows
+    /// [`crate::rows::board_rows`] streams to both viewports.
+    fn stack_49(snapshot: &str) -> Vec<comet_proto::view::board::TaskRow> {
+        stack_49_board(snapshot).1
+    }
+
+    fn stack_49_board(snapshot: &str) -> (SyncEngine, Vec<comet_proto::view::board::TaskRow>) {
+        let fixture: Value = serde_json::from_str(STACK_49).unwrap();
+        let repo = STACK_49_REPO;
+        // Most specific first: `FixtureRest` answers on a path prefix, and
+        // `/repos/{repo}/pulls` is a prefix of `/repos/{repo}/pulls/47`. The
+        // per-pull route is the mergeability call the full sweep makes.
+        let mut routes: Vec<(String, Value)> = fixture["mergeable_open"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(number, state)| (format!("/repos/{repo}/pulls/{number}"), state.clone()))
+            .collect();
+        routes.push((format!("/repos/{repo}/pulls?"), fixture[snapshot].clone()));
+        let e = engine_with(
+            None,
+            Some(Github::new(
+                Box::new(FixtureRest::new(routes)) as Box<dyn Rest>
+            )),
+        );
+
+        // The three issues the layers were written for, each dispatched onto
+        // the branch its own layer heads — this is what makes them three rows
+        // of one stack rather than three strangers — and gh#33, whose pull
+        // request rides the same poll and is in no stack at all (gh#337's
+        // control). gh#33 is merged already: no unstacked pull request was
+        // open while stack 49 was, so the nearest real one is the last to
+        // close before it.
+        for (issue, branch) in [
+            (33, "board/gh-33-orion-productmapping"),
+            (44, "board/gh-44-packages-kind-decided"),
+            (45, "board/gh-45-auto-promote-bug"),
+            (46, "board/gh-46-auto-ready-auto"),
+        ] {
+            let id = format!("gh:{repo}#{issue}");
+            seed_gh_in(&e, &id);
+            dispatch_on(&e, &id, branch);
+        }
+
+        let pulls = e.github.as_ref().unwrap().pulls(repo).unwrap();
+        e.link_pull_requests(&pulls).unwrap();
+        e.rederive_all().unwrap();
+        let rows = crate::rows::board_rows(&e.db, &e.cfg).unwrap();
+        (e, rows)
+    }
+
+    fn layer_row(
+        rows: &[comet_proto::view::board::TaskRow],
+        issue: i64,
+    ) -> comet_proto::view::board::TaskRow {
+        let id = format!("gh:{STACK_49_REPO}#{issue}");
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no row for {id}"))
+            .clone()
+    }
+
+    /// gh#337 case 1: the three arrive as one thing. Every row carries the
+    /// whole chain, its own place in it, and the branch the chain lands on —
+    /// off a payload where the only link between the three is GitHub's `stack`
+    /// object and a `base` pointing at the branch below.
+    #[test]
+    fn the_real_stack_arrives_as_one_chain_on_every_row() {
+        let rows = stack_49("open");
+        for (issue, position) in [(44, 1), (45, 2), (46, 3)] {
+            let row = layer_row(&rows, issue);
+            let stack = row
+                .stack
+                .as_ref()
+                .unwrap_or_else(|| panic!("gh#{issue} arrived with no stack on it"));
+            assert_eq!(stack.number, 49);
+            assert_eq!(stack.size, Some(3));
+            assert_eq!(stack.position, Some(position));
+            assert_eq!(stack.base_ref.as_deref(), Some("main"));
+            // The `#47 ↑ #48 ↑ #50` map, bottom first, the same on all three.
+            assert_eq!(
+                comet_proto::view::board::stack_map(&row)
+                    .iter()
+                    .map(|l| l.pr_number)
+                    .collect::<Vec<_>>(),
+                vec![Some(47), Some(48), Some(50)],
+            );
+            assert_eq!(
+                comet_proto::view::board::stack_note(&row).as_deref(),
+                Some(format!("{position} of 3").as_str()),
+            );
+        }
+    }
+
+    /// gh#337 case 2 and 3, and the whole of gh#388: what the layers *read* as
+    /// when every one of them reports `clean`.
+    ///
+    /// The raw field is on the row — the board keeps GitHub's answer — and no
+    /// surface prints it. What they print is the verdict [`landing`] derived
+    /// from it, which for this payload is the one shape where a mid-stack
+    /// `clean` may say `ready`: every layer below is clean too, so merging any
+    /// of them lands the ones underneath with it, atomically (gh#290). The
+    /// count is the part that makes it honest — "ready to land" alone would
+    /// claim this pull request lands by itself, and PR 50 lands three.
+    ///
+    /// The wording gh#337 asked for (`waiting on PR #47`) is the answer to a
+    /// *different* payload — a layer below that GitHub objects to — and
+    /// `a_clean_child_over_a_dirty_parent_is_not_ready_to_land` in `stacks.rs`
+    /// is where that one is held. Stack 49 never entered that state.
+    #[test]
+    fn a_clean_layer_over_clean_layers_says_what_merging_it_would_do() {
+        let rows = stack_49("open");
+        let now = chrono::Utc::now();
+        let read = |issue: i64| {
+            let row = layer_row(&rows, issue);
+            (
+                row.pr_mergeable.clone(),
+                row.landing.clone(),
+                comet_proto::view::board::landing_note(&row),
+                comet_proto::view::board::row_metadata_line(&row, false, now),
+            )
+        };
+
+        // The bottom layer: nothing below it, so merging it lands one thing.
+        let (mergeable, landing, note, line) = read(44);
+        assert_eq!(mergeable.as_deref(), Some("clean"));
+        assert_eq!(landing.as_deref(), Some("ready"));
+        assert_eq!(note.as_deref(), Some("ready to land"));
+        assert_eq!(line, "1 of 3 · ready to land · in PR #47");
+
+        // The middle layer. `clean` here is clean against
+        // `board/gh-44-packages-kind-decided`, and the row says so by naming
+        // what comes along rather than by repeating GitHub's word.
+        let (mergeable, landing, note, line) = read(45);
+        assert_eq!(mergeable.as_deref(), Some("clean"));
+        assert_eq!(landing.as_deref(), Some("ready"));
+        assert_eq!(note.as_deref(), Some("ready to land with 1 below"));
+        assert_eq!(line, "2 of 3 · ready to land with 1 below · in PR #48");
+
+        // The top layer, three pull requests deep.
+        let (mergeable, landing, note, line) = read(46);
+        assert_eq!(mergeable.as_deref(), Some("clean"));
+        assert_eq!(landing.as_deref(), Some("ready"));
+        assert_eq!(note.as_deref(), Some("ready to land with 2 below"));
+        assert_eq!(line, "3 of 3 · ready to land with 2 below · in PR #50");
+
+        // Nowhere on any row does the flat word reach a reader.
+        for issue in [44, 45, 46] {
+            let row = layer_row(&rows, issue);
+            assert!(
+                !comet_proto::view::board::row_metadata_line(&row, false, now).contains("clean"),
+                "gh#{issue} passed GitHub's `clean` through to the row"
+            );
+        }
+    }
+
+    /// The detail surface, on the same payload: which layer this is, the branch
+    /// it sits on, where the chain lands — and, on the one irreversible key,
+    /// the pull requests the merge takes with it by number.
+    #[test]
+    fn the_detail_surface_names_the_branch_below_and_the_merge_it_would_make() {
+        let rows = stack_49("open");
+
+        let bottom = layer_row(&rows, 44);
+        assert_eq!(
+            comet_proto::view::board::stack_line(&bottom).as_deref(),
+            Some("stack 1 of 3 · lands on main"),
+            "the bottom layer's base *is* the target; saying it twice reads as two branches",
+        );
+        assert_eq!(
+            comet_proto::view::board::merge_confirmation(&bottom),
+            "merge gh#44 (PR #47) into main",
+        );
+
+        let top = layer_row(&rows, 46);
+        assert_eq!(
+            comet_proto::view::board::stack_line(&top).as_deref(),
+            Some("stack 3 of 3 · onto board/gh-45-auto-promote-bug · lands on main"),
+        );
+        assert_eq!(
+            comet_proto::view::board::merge_confirmation(&top),
+            "merge gh#46 (PR #50) into main · this lands PR #47, PR #48 with it \
+             — GitHub merges the group or none of it",
+        );
+    }
+
+    /// gh#337 case 4: an unstacked pull request of the same repository, in the
+    /// same poll, is untouched by any of it. PR 42 carries `stack: null`, so it
+    /// is grouped into nothing, says nothing about a position, and answers for
+    /// itself alone.
+    #[test]
+    fn an_unstacked_pull_request_in_the_same_repo_is_untouched() {
+        let rows = stack_49("open");
+        for row in &rows {
+            if let Some(stack) = row.stack.as_ref() {
+                assert!(
+                    stack.layers.iter().all(|l| l.pr_number != Some(42)),
+                    "PR 42 was grouped into stack 49",
+                );
+            }
+        }
+        // And on its own row: no stack, no position, no map to draw.
+        let row = layer_row(&rows, 33);
+        assert_eq!(row.pr_number, Some(42), "gh#33's own pull request");
+        assert!(row.stack.is_none());
+        assert_eq!(comet_proto::view::board::stack_note(&row), None);
+        assert!(comet_proto::view::board::stack_map(&row).is_empty());
+        assert_eq!(comet_proto::view::board::stack_line(&row), None);
+        assert_eq!(
+            comet_proto::view::board::landing(&row),
+            comet_proto::view::board::Landing::Unknown,
+            "a closed pull request nobody asked GitHub about answers nothing",
+        );
+    }
+
+    /// The same three layers after they landed — 09:15:08, :09 and :11, each
+    /// into its own base, which is what a group merge looks like from outside.
+    ///
+    /// Two things have to hold on the merged payload: no row claims it can land
+    /// (there is nothing left to merge, and GitHub answers `unknown` for a
+    /// closed pull request rather than `clean`), and each task is finished by
+    /// its own layer merging.
+    #[test]
+    fn the_merged_stack_leaves_nothing_claiming_it_can_land() {
+        let (e, rows) = stack_49_board("merged");
+        let now = chrono::Utc::now();
+        for issue in [44, 45, 46] {
+            let task =
+                e.db.get_task(&format!("gh:{STACK_49_REPO}#{issue}"))
+                    .unwrap()
+                    .unwrap();
+            assert!(task.pr_merged, "gh#{issue} merged with the group");
+            assert!(!task.pr_open);
+            assert!(task.local_done, "the merge finished gh#{issue}");
+            let row = layer_row(&rows, issue);
+            assert_eq!(row.landing, None, "a merged layer has nothing to land");
+            let line = comet_proto::view::board::row_metadata_line(&row, false, now);
+            assert!(
+                !line.contains("ready to land"),
+                "gh#{issue} still offers to land: {line}"
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct DirectReviewChat {
         candidates: Vec<crate::runtime::ReviewCandidate>,
