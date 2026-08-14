@@ -15,9 +15,21 @@
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
 //! another device POSTs a durable nudge to that device's room (§7 cold-chat delivery);
 //! the host's relay receives it and warm-opens the doc, which drains the queue.
+//!
+//! The handle map is a CACHE, not a registry: [`DocHost::release_idle`] closes
+//! chats nobody is using (gh#395). Every open chat costs a standing websocket to
+//! the edge, and an insert-only map turned "chats this engine touched since
+//! boot" into permanent edge load — 20 rooms ten minutes after a restart, 70% of
+//! all edge traffic, and the multiplier behind the recurring Durable Objects
+//! free-tier trips. Releasing is safe because [`DocHost::open`] rebuilds a
+//! handle from the snapshot on demand, and a command for a released chat still
+//! arrives: the nudge is what wakes a cold host, with or without a standing
+//! socket.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -43,6 +55,23 @@ const WARM_OPEN_WINDOW_DAYS: i64 = 14;
 /// Ceiling on boot-time warm opens — each one is a room socket and a live doc,
 /// so a device hosting hundreds of chats must not open all of them at boot.
 const WARM_OPEN_MAX: usize = 30;
+
+/// How long a chat may sit unused before [`DocHost::release_idle`] closes it.
+///
+/// Short enough that a burst of chats does not leave a burst of sockets behind
+/// for the rest of the day; long enough that a user reading one chat, answering
+/// in another and coming back does not pay for a redial. A wrong release costs
+/// a snapshot load and one dial — the same work a nudge already does.
+const IDLE_RELEASE_MS: i64 = 5 * 60 * 1000;
+
+/// Hard bound on simultaneously open chats, enforced least-recently-used-first
+/// once the idle sweep has had its say. Above [`WARM_OPEN_MAX`] on purpose: the
+/// boot warm-open is a deliberate burst and must not be trimmed the moment it
+/// lands — the idle sweep is what gives those chats back once they have drained.
+const MAX_OPEN_CHATS: usize = 32;
+
+/// How often [`DocHost::spawn_idle_release`] sweeps.
+const RELEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
@@ -173,6 +202,10 @@ pub struct ChatDocHandle {
     /// An `Arc` because the supervisor holds a `Weak` to it: dropping the handle
     /// is what ends the supervision (and, with it, the room client).
     room: Arc<Mutex<Option<RoomClient>>>,
+    /// When this chat was last used: an [`DocHost::open`] (hit or miss) or a doc
+    /// change (a local commit, or an import from the room). The idle sweep's
+    /// clock — see [`DocHost::release_idle`].
+    last_used: AtomicI64,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -180,6 +213,23 @@ pub struct ChatDocHandle {
 impl ChatDocHandle {
     pub fn chat_id(&self) -> &str {
         &self.chat_id
+    }
+
+    /// Mark this chat used now, deferring its release.
+    fn touch(&self) {
+        self.last_used.store(now_ms(), Ordering::Relaxed);
+    }
+
+    fn last_used(&self) -> i64 {
+        self.last_used.load(Ordering::Relaxed)
+    }
+
+    /// Is anyone streaming this chat's transcript right now? A watcher's stream
+    /// is fed by `messages_tx` and ENDS when that sender drops, so releasing a
+    /// watched chat would cut a live viewer's transcript off — the sweep pins on
+    /// this rather than letting the UI discover it.
+    fn watched(&self) -> bool {
+        self.messages_tx.receiver_count() > 0
     }
 
     pub fn doc(&self) -> &SessionDoc {
@@ -325,6 +375,10 @@ impl DocHost {
     /// `(open chat docs, of which hold a LIVE session room)` — the chat half of
     /// [`comet_proto::EdgeHealth`]. Every open chat is meant to hold a room, so
     /// a gap between the two numbers is rooms that need to come back.
+    ///
+    /// A chat [`Self::release_idle`] closed is in neither number, which is the
+    /// honest answer: it has no socket because it is not meant to have one. The
+    /// gap keeps meaning what it meant — rooms that are down.
     pub fn room_census(&self) -> (usize, usize) {
         if !self.edge_enabled() {
             return (0, 0);
@@ -336,8 +390,13 @@ impl DocHost {
 
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
+    ///
+    /// A chat [`Self::release_idle`] closed re-opens here transparently: the
+    /// snapshot is the doc, so the caller cannot tell a rebuilt handle from a
+    /// cached one — only the room has to be dialled again.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
+            handle.touch();
             return Ok(handle.clone());
         }
         let doc = match self.inner.store.load_snapshot(chat_id)? {
@@ -364,11 +423,13 @@ impl DocHost {
             doc: doc.clone(),
             messages_tx,
             room: Arc::new(Mutex::new(None)),
+            last_used: AtomicI64::new(now_ms()),
             _sub: sub,
         });
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(existing) = handles.get(chat_id) {
+                existing.touch();
                 return Ok(existing.clone()); // racing open — keep the first
             }
             handles.insert(chat_id.to_string(), handle.clone());
@@ -457,6 +518,119 @@ impl DocHost {
             );
         }
         opened
+    }
+
+    /// Start the idle-release sweep: every [`RELEASE_SWEEP_INTERVAL`], hand back
+    /// the chats nobody is using (gh#395). Needs a runtime — a bare synchronous
+    /// assembly (unit tests) skips it rather than panicking.
+    ///
+    /// The task holds a `Weak` to the host, so a dropped engine ends the sweep
+    /// instead of keeping its docs and sockets alive for the process's life.
+    pub fn spawn_idle_release(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RELEASE_SWEEP_INTERVAL);
+            ticker.tick().await; // the first tick is immediate
+            loop {
+                ticker.tick().await;
+                let Some(inner) = weak.upgrade() else { return };
+                DocHost { inner }.release_idle();
+            }
+        });
+    }
+
+    /// Close the chats nobody is using and return how many were released.
+    ///
+    /// "Using" is asked of the things that would actually break: a live watcher
+    /// (its transcript stream dies with the sender), a live run (it streams
+    /// through a doc handle of its own, so the cache cannot see it), and any
+    /// caller currently holding the handle. Everything else is released once it
+    /// has been idle for [`IDLE_RELEASE_MS`], and the least recently used go
+    /// early when more than [`MAX_OPEN_CHATS`] are open.
+    pub fn release_idle(&self) -> usize {
+        self.release_idle_at(now_ms(), IDLE_RELEASE_MS, MAX_OPEN_CHATS)
+    }
+
+    /// [`Self::release_idle`] with the clock and the bounds passed in — the seam
+    /// the policy tests drive, so they need neither a five-minute wait nor 32
+    /// chats.
+    fn release_idle_at(&self, now: i64, idle_ms: i64, max_open: usize) -> usize {
+        // Pass 1, under the lock: everything the cache itself knows. No call out
+        // to another service from here — a dispatch on another thread walks
+        // sessions → doc host, and this lock must never be held facing back.
+        let mut candidates: Vec<RoomCandidate> = {
+            let handles = lock(&self.inner.handles);
+            handles
+                .iter()
+                .map(|(chat_id, handle)| RoomCandidate {
+                    chat_id: chat_id.clone(),
+                    last_used: handle.last_used(),
+                    // `strong_count == 1` is the map's own reference: anything
+                    // more is a caller mid-write holding the handle.
+                    pinned: handle.watched() || Arc::strong_count(handle) > 1,
+                })
+                .collect()
+        };
+        // Pass 2, lock released: the runs the cache cannot see.
+        for candidate in &mut candidates {
+            candidate.pinned = candidate.pinned || self.chat_is_busy(&candidate.chat_id);
+        }
+        let releasing = rooms_to_release(candidates, now, idle_ms, max_open);
+        if releasing.is_empty() {
+            return 0;
+        }
+        // Pass 3: take them out, re-checking under the lock — an `open()`
+        // between the passes either handed the handle out (strong count) or
+        // moved the clock, and either way this chat is in use again.
+        let mut released = Vec::new();
+        {
+            let mut handles = lock(&self.inner.handles);
+            for (chat_id, decided_on) in releasing {
+                let stale = handles.get(&chat_id).is_some_and(|handle| {
+                    handle.last_used() != decided_on
+                        || handle.watched()
+                        || Arc::strong_count(handle) > 1
+                });
+                if stale {
+                    continue;
+                }
+                if let Some(handle) = handles.remove(&chat_id) {
+                    released.push(handle);
+                }
+            }
+        }
+        let count = released.len();
+        for handle in released {
+            let chat_id = handle.chat_id.clone();
+            let doc = handle.doc_arc();
+            tracing::debug!(chat = %chat_id, "releasing idle chat room");
+            // Drop BEFORE the save, not after: dropping the handle is what ends
+            // the room supervision (it holds only a `Weak` to the room slot) and
+            // the chat task, so by the time the snapshot is exported nothing can
+            // still be importing changes into the doc behind it.
+            drop(handle);
+            self.save_doc(&chat_id, &doc);
+        }
+        if count > 0 {
+            tracing::info!(
+                released = count,
+                open = lock(&self.inner.handles).len(),
+                "released idle chat rooms"
+            );
+        }
+        count
+    }
+
+    /// Is a run live on this chat? Unwired sessions (bare-DocHost tests) means
+    /// nothing is running.
+    fn chat_is_busy(&self, chat_id: &str) -> bool {
+        self.inner
+            .sessions
+            .get()
+            .is_some_and(|sessions| sessions.chat_is_busy(chat_id))
     }
 
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
@@ -617,14 +791,15 @@ impl DocHost {
     /// "claimable, so mine to execute" — which would run the box's work a
     /// second time, in a cwd that does not exist there. The stamp travels with
     /// the chat, so the answer is the same everywhere the chat is.
-    fn is_host(&self, chat_id: &str) -> bool {
-        let stamped = lock(&self.inner.handles)
-            .get(chat_id)
-            .and_then(|handle| handle.doc.host_device_id());
-        if let Some(host) = stamped {
+    ///
+    /// Asked of the handle the caller already holds, never of the cache: the
+    /// drain's answer must not depend on the chat still being cached (gh#395).
+    fn is_host(&self, handle: &ChatDocHandle) -> bool {
+        if let Some(host) = handle.doc.host_device_id() {
             return host == self.inner.config.device_id;
         }
-        self.workspace().is_none_or(|ws| ws.is_host(chat_id))
+        self.workspace()
+            .is_none_or(|ws| ws.is_host(&handle.chat_id))
     }
 
     /// Record this device as the chat's host in the session doc, when the
@@ -657,7 +832,7 @@ impl DocHost {
         let Some(sessions) = self.inner.sessions.get() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
-        if !self.is_host(&handle.chat_id) {
+        if !self.is_host(handle) {
             return;
         }
         // Entries this pass decided to leave alone (processed dedupe hits).
@@ -936,14 +1111,20 @@ impl DocHost {
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
-        match handle.doc.export_snapshot() {
+        self.save_doc(&handle.chat_id, &handle.doc);
+    }
+
+    /// [`Self::save_snapshot`] against the doc alone — the release path, which
+    /// has let go of the handle (and with it the room) before it exports.
+    fn save_doc(&self, chat_id: &str, doc: &SessionDoc) {
+        match doc.export_snapshot() {
             Ok(bytes) => {
-                if let Err(err) = self.inner.store.save_snapshot(&handle.chat_id, &bytes) {
-                    tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
+                if let Err(err) = self.inner.store.save_snapshot(chat_id, &bytes) {
+                    tracing::warn!(chat = %chat_id, error = %err, "snapshot save failed");
                 }
             }
             Err(err) => {
-                tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot export failed");
+                tracing::warn!(chat = %chat_id, error = %err, "snapshot export failed");
             }
         }
     }
@@ -955,6 +1136,64 @@ impl DocHost {
             self.save_snapshot(&handle);
         }
     }
+}
+
+/// One open chat, as the release policy sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoomCandidate {
+    chat_id: String,
+    /// [`ChatDocHandle::last_used`] at the moment the sweep looked.
+    last_used: i64,
+    /// Something outside the cache is using this chat right now — a watcher, a
+    /// live run, a caller holding the handle. Never released, at any age.
+    pinned: bool,
+}
+
+/// Which chats to release, and the `last_used` each decision was made on (the
+/// sweep re-checks that stamp before it actually removes anything).
+///
+/// Two rules, in order: anything unpinned and idle for `idle_ms` goes, and then
+/// — if more than `max_open` chats would still be open — the least recently used
+/// unpinned chats go until the cache is back under the bound. Pure, so the
+/// policy is testable without a clock, a socket or a doc.
+fn rooms_to_release(
+    candidates: Vec<RoomCandidate>,
+    now: i64,
+    idle_ms: i64,
+    max_open: usize,
+) -> Vec<(String, i64)> {
+    let mut by_age = candidates;
+    // Oldest first; chat id breaks ties so a sweep is deterministic.
+    by_age.sort_by(|a, b| {
+        a.last_used
+            .cmp(&b.last_used)
+            .then_with(|| a.chat_id.cmp(&b.chat_id))
+    });
+    let mut open = by_age.len();
+    let mut releasing = Vec::new();
+    let mut idle = vec![false; by_age.len()];
+    for (i, candidate) in by_age.iter().enumerate() {
+        if candidate.pinned || now.saturating_sub(candidate.last_used) < idle_ms {
+            continue;
+        }
+        idle[i] = true;
+        releasing.push((candidate.chat_id.clone(), candidate.last_used));
+        open -= 1;
+    }
+    // Over the bound: keep taking from the oldest end. A pinned chat is never
+    // eligible, so a device with more than `max_open` LIVE chats simply stays
+    // over the bound — cutting a live run's socket is not a trade worth making.
+    for (i, candidate) in by_age.iter().enumerate() {
+        if open <= max_open {
+            break;
+        }
+        if candidate.pinned || idle[i] {
+            continue;
+        }
+        releasing.push((candidate.chat_id.clone(), candidate.last_used));
+        open -= 1;
+    }
+    releasing
 }
 
 /// The resumed-turn prompt for answers to a question whose run died: each
@@ -999,6 +1238,9 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break; // doc handle (and its change sender) is gone
                 }
                 let Some(handle) = weak.upgrade() else { break };
+                // A change is use: a local commit, or an import from the room.
+                // Keeps a chat that is quietly syncing out of the idle sweep.
+                handle.touch();
                 handle.publish_messages();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
@@ -1014,5 +1256,276 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.save_snapshot(&handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! gh#395 — the handle map lets go.
+    //!
+    //! The policy is tested twice over: once as the pure decision
+    //! ([`rooms_to_release`]), and once through a real [`DocHost`] whose chats
+    //! are opened, released and re-opened, because the part that matters to a
+    //! user is that a released chat comes back with its transcript intact.
+    //!
+    //! Edge-less throughout (`edge: None`): what a release does to a live
+    //! websocket cannot be asserted in a unit test, and as of this commit the
+    //! edge is refusing every request on its free-tier duration cap, so it has
+    //! not been asserted against a live one either.
+
+    use super::*;
+
+    fn candidate(chat_id: &str, last_used: i64, pinned: bool) -> RoomCandidate {
+        RoomCandidate {
+            chat_id: chat_id.to_string(),
+            last_used,
+            pinned,
+        }
+    }
+
+    fn released_ids(released: Vec<(String, i64)>) -> Vec<String> {
+        let mut ids: Vec<String> = released.into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        ids
+    }
+
+    // ── the policy ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn releases_only_chats_idle_past_the_window() {
+        let now = 1_000_000;
+        let released = rooms_to_release(
+            vec![
+                candidate("idle", now - 60_000, false),
+                candidate("just-inside", now - 29_000, false),
+                candidate("fresh", now - 10, false),
+            ],
+            now,
+            30_000,
+            100,
+        );
+        assert_eq!(released_ids(released), vec!["idle".to_string()]);
+    }
+
+    #[test]
+    fn a_pinned_chat_is_never_released_however_old() {
+        // A watcher, a live run, a caller mid-write — the sweep cannot tell
+        // which, and does not need to: all three mean "in use".
+        let now = 1_000_000;
+        let released = rooms_to_release(
+            vec![
+                candidate("watched", 0, true),
+                candidate("running", 0, true),
+                candidate("nobody", 0, false),
+            ],
+            now,
+            30_000,
+            100,
+        );
+        assert_eq!(released_ids(released), vec!["nobody".to_string()]);
+    }
+
+    #[test]
+    fn the_bound_releases_the_least_recently_used_even_when_fresh() {
+        // Every chat is inside the idle window, so only the cap can act.
+        let now = 1_000_000;
+        let candidates: Vec<RoomCandidate> = (0..6)
+            .map(|i| candidate(&format!("chat-{i}"), now - (6 - i) * 1_000, false))
+            .collect();
+        let released = rooms_to_release(candidates, now, 30_000, 4);
+        assert_eq!(
+            released_ids(released),
+            vec!["chat-0".to_string(), "chat-1".to_string()],
+            "the two oldest go; the cache lands exactly on the bound"
+        );
+    }
+
+    #[test]
+    fn the_bound_never_takes_a_pinned_chat() {
+        // Six live chats and a bound of four: the bound loses. Cutting a room
+        // out from under a live run would cost the run its sync.
+        let now = 1_000_000;
+        let mut candidates: Vec<RoomCandidate> = (0..6)
+            .map(|i| candidate(&format!("live-{i}"), now - (6 - i) * 1_000, true))
+            .collect();
+        candidates.push(candidate("spare", now - 500, false));
+        let released = rooms_to_release(candidates, now, 30_000, 4);
+        assert_eq!(
+            released_ids(released),
+            vec!["spare".to_string()],
+            "only the unpinned one is eligible, and the cache stays over the bound"
+        );
+    }
+
+    #[test]
+    fn the_idle_sweep_counts_toward_the_bound() {
+        // Three idle + three fresh, bound 4: the idle three already put the
+        // cache under it, so no fresh chat is taken as well.
+        let now = 1_000_000;
+        let mut candidates: Vec<RoomCandidate> = (0..3)
+            .map(|i| candidate(&format!("idle-{i}"), now - 90_000, false))
+            .collect();
+        candidates.extend((0..3).map(|i| candidate(&format!("fresh-{i}"), now - 100, false)));
+        let released = rooms_to_release(candidates, now, 30_000, 4);
+        assert_eq!(
+            released_ids(released),
+            vec![
+                "idle-0".to_string(),
+                "idle-1".to_string(),
+                "idle-2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_to_do_is_nothing_released() {
+        let now = 1_000_000;
+        assert!(rooms_to_release(Vec::new(), now, 30_000, 4).is_empty());
+        assert!(
+            rooms_to_release(vec![candidate("fresh", now, false)], now, 30_000, 4).is_empty(),
+            "a quiet, under-bound cache is left alone"
+        );
+    }
+
+    // ── the cache ───────────────────────────────────────────────────────────
+
+    fn host(dir: &std::path::Path) -> DocHost {
+        let store = Arc::new(DocsStore::open(dir).expect("docs store"));
+        DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        )
+    }
+
+    /// Let the per-chat tasks run their initial pass: each one holds an
+    /// upgraded handle while it publishes and drains, which is (correctly) a
+    /// pin. Nothing about the policy depends on this — it is the test getting
+    /// out of the way of the code it is testing.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn an_unused_chat_is_released_and_comes_back_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+
+        let handle = host.open("chat-a").expect("open");
+        handle
+            .write_user_message("m1", "the thing I said", 1)
+            .expect("write");
+        drop(handle); // nobody is holding it now
+        settle().await;
+        assert_eq!(host.open_chats(), vec!["chat-a".to_string()]);
+
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert!(
+            host.open_chats().is_empty(),
+            "the cache entry ended, so the room census stops counting it"
+        );
+
+        // Transparent re-open: same chat, same transcript, from the snapshot
+        // the release wrote — a different handle underneath, which is precisely
+        // what no caller can tell.
+        let reopened = host.open("chat-a").expect("re-open");
+        let entries = reopened.doc().read_entries().expect("entries");
+        assert_eq!(entries.len(), 1, "transcript survived the release");
+        assert_eq!(entries[0].id, "m1");
+        assert_eq!(host.open_chats(), vec!["chat-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_watched_chat_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+
+        let watcher = {
+            let handle = host.open("chat-watched").expect("open");
+            handle.watch_messages() // the handle goes; the watcher stays
+        };
+        host.open("chat-quiet").expect("open");
+        settle().await;
+
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(
+            host.open_chats(),
+            vec!["chat-watched".to_string()],
+            "releasing a watched chat would end its transcript stream"
+        );
+
+        // …and once the viewer leaves, it goes like any other.
+        drop(watcher);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert!(host.open_chats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chat_someone_is_holding_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+
+        let held = host.open("chat-held").expect("open");
+        host.open("chat-loose").expect("open");
+        settle().await;
+
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(host.open_chats(), vec!["chat-held".to_string()]);
+        drop(held);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert!(host.open_chats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idleness_is_measured_from_the_last_use_not_the_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        let first = host.open("chat-a").expect("open").last_used();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let latest = host.open("chat-a").expect("re-open").last_used();
+        settle().await;
+        assert!(latest > first, "the second open moved the clock");
+
+        let window = latest - first;
+        assert_eq!(
+            host.release_idle_at(first + window, window, 100),
+            0,
+            "idle by the FIRST open's clock, but it has been used since"
+        );
+        assert_eq!(host.open_chats(), vec!["chat-a".to_string()]);
+        assert_eq!(
+            host.release_idle_at(latest + window, window, 100),
+            1,
+            "the window has now passed since the last use"
+        );
+        assert!(host.open_chats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_bound_trims_the_oldest_open_chats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        for i in 0..5 {
+            host.open(&format!("chat-{i}")).expect("open");
+            // Distinct `last_used` stamps, so "least recently used" is a fact
+            // rather than a tie broken by the chat id.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        settle().await;
+
+        // Nothing is idle (window of an hour), so only the bound can act.
+        assert_eq!(host.release_idle_at(now_ms(), 3_600_000, 3), 2);
+        assert_eq!(
+            host.open_chats(),
+            vec![
+                "chat-2".to_string(),
+                "chat-3".to_string(),
+                "chat-4".to_string()
+            ],
+            "the two least recently opened were released"
+        );
     }
 }

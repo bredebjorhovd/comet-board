@@ -223,6 +223,24 @@ impl SessionsEngine {
         })
     }
 
+    /// Is a run live on this chat — dispatched and not settled, or holding an
+    /// open question?
+    ///
+    /// The doc host's release gate (gh#395): a run streams through an
+    /// `Arc<SessionDoc>` of its own rather than the chat handle, so the handle
+    /// cache cannot see it, and releasing the chat under it would drop the room
+    /// socket the turn is syncing through. The `runs` map first because a
+    /// dispatch is live there before its status transition lands.
+    pub fn chat_is_busy(&self, chat_id: &str) -> bool {
+        if lock(&self.inner.runs).contains_key(chat_id) {
+            return true;
+        }
+        matches!(
+            lock(&self.inner.statuses).get(chat_id).map(|s| s.status),
+            Some(SessionStatus::Working | SessionStatus::AwaitingInput)
+        )
+    }
+
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
@@ -1640,4 +1658,47 @@ async fn drive_run(
 
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// gh#395 — the doc host asks this before it releases a chat's room, so
+    /// what counts as "busy" is worth pinning down on its own: a settled chat
+    /// keeps a status row forever, and reading that row as busy would leave
+    /// every chat this engine has ever run permanently un-releasable.
+    #[test]
+    fn chat_is_busy_only_while_a_run_is_unsettled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).expect("journal"));
+        let sessions = SessionsEngine::new(
+            "device-a".into(),
+            journal,
+            Arc::new(crate::registry::default_registry()),
+        );
+
+        assert!(
+            !sessions.chat_is_busy("never-ran"),
+            "a chat with no status row at all"
+        );
+
+        sessions.set_status("chat-a", SessionStatus::Working, true);
+        assert!(sessions.chat_is_busy("chat-a"));
+
+        sessions.set_status("chat-a", SessionStatus::AwaitingInput, false);
+        assert!(
+            sessions.chat_is_busy("chat-a"),
+            "a question is a live run waiting for an answer"
+        );
+
+        sessions.set_status("chat-a", SessionStatus::Idle, false);
+        assert!(!sessions.chat_is_busy("chat-a"), "settled: releasable");
+
+        sessions.set_status("chat-a", SessionStatus::Errored, false);
+        assert!(
+            !sessions.chat_is_busy("chat-a"),
+            "a failed turn is over too — nothing is streaming through this doc"
+        );
+    }
 }

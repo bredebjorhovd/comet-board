@@ -269,7 +269,10 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
 - **Doc host**: per-chat handle (join room, VV backfill, write user entries + stream assistant
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
-  snapshot store.
+  snapshot store. The handle map is a **cache**: chats nobody is watching, running or holding are
+  released after 5min idle (LRU-bounded at 32), because every open chat is a standing edge socket
+  and an insert-only map made per-chat rooms the dominant load on the edge (gh#395). Re-opening is
+  transparent — the snapshot is the doc — and a command for a released chat still arrives by nudge.
 - **Harness** (research pending — `docs/research/harness.md`): trait mirroring comet's
   `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
   permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
