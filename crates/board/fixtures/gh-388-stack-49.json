@@ -1,0 +1,193 @@
+{
+  "_provenance": {
+    "issue": "gh#388 — the first real GitHub stack the board produced",
+    "repo": "Florin-AS/orion-productmapping",
+    "stack": "#49, three layers, base main",
+    "recorded": "2026-08-14, from GET /repos/Florin-AS/orion-productmapping/pulls?state=all&per_page=100 and GET /repos/.../pulls/{n}",
+    "fields": "only the fields `parse_pull` reads, plus `state`, `created_at` and `merged_at`. Titles and bodies are withheld: the source repository is private and this one is public, and gh#388 published the numbers, branches and stack objects but not the prose.",
+    "open_snapshot": "`open` is the payload gh#388 reported at 2026-08-13T08:31Z, while all three layers were still open. Everything in it is verbatim from GitHub except three fields per layer, restored to what they were in that window: `state` (`open`), `merged_at` (`null`) and `updated_at` (set to the layer's own `created_at`, the only real timestamp inside the window — GitHub's live `updated_at` is now the merge). `mergeable_open` is what gh#388 recorded off the per-PR endpoint at the same time.",
+    "merged_snapshot": "`merged` is verbatim, unedited: the same three layers after they landed. All three merged within three seconds of each other — 09:15:08, :09, :11 — each into its own base, which is what a stack merge looks like from the outside.",
+    "control": "PR 42 is the same repo's most recent unstacked pull request (`stack: null`). No unstacked pull request was open while stack 49 was, so the control is a closed one from the same payload — the point it carries is that the grouping does not reach a row GitHub never stacked."
+  },
+
+  "open": [
+    {
+      "number": 42,
+      "title": "[withheld: private repository]",
+      "state": "closed",
+      "draft": false,
+      "merged_at": "2026-08-13T05:10:47Z",
+      "updated_at": "2026-08-13T05:10:47Z",
+      "created_at": "2026-08-12T21:57:57Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/42",
+      "head": {
+        "ref": "board/gh-33-orion-productmapping",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "main",
+        "sha": "8e4a2ca62632981fe1e01f3a1c8dea4f0bacd7a1"
+      },
+      "stack": null
+    },
+    {
+      "number": 47,
+      "title": "[withheld: private repository]",
+      "state": "open",
+      "draft": false,
+      "merged_at": null,
+      "updated_at": "2026-08-13T07:34:04Z",
+      "created_at": "2026-08-13T07:34:04Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/47",
+      "head": {
+        "ref": "board/gh-44-packages-kind-decided",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "main",
+        "sha": "b9605fd7e6f56ad80fa8f3a0773b44bf95ad69a7"
+      },
+      "stack": {
+        "id": 334176,
+        "number": 49,
+        "base": { "ref": "main", "sha": null },
+        "size": 3,
+        "position": 1
+      }
+    },
+    {
+      "number": 48,
+      "title": "[withheld: private repository]",
+      "state": "open",
+      "draft": false,
+      "merged_at": null,
+      "updated_at": "2026-08-13T07:53:18Z",
+      "created_at": "2026-08-13T07:53:18Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/48",
+      "head": {
+        "ref": "board/gh-45-auto-promote-bug",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "board/gh-44-packages-kind-decided",
+        "sha": "95d130107ed87171d8bce8d9da1d83e726d536c6"
+      },
+      "stack": {
+        "id": 334176,
+        "number": 49,
+        "base": { "ref": "main", "sha": null },
+        "size": 3,
+        "position": 2
+      }
+    },
+    {
+      "number": 50,
+      "title": "[withheld: private repository]",
+      "state": "open",
+      "draft": false,
+      "merged_at": null,
+      "updated_at": "2026-08-13T08:13:45Z",
+      "created_at": "2026-08-13T08:13:45Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/50",
+      "head": {
+        "ref": "board/gh-46-auto-ready-auto",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "board/gh-45-auto-promote-bug",
+        "sha": "4c95d3ce07083908567b8630001458035fb72d4c"
+      },
+      "stack": {
+        "id": 334176,
+        "number": 49,
+        "base": { "ref": "main", "sha": null },
+        "size": 3,
+        "position": 3
+      }
+    }
+  ],
+
+  "mergeable_open": {
+    "47": { "mergeable_state": "clean" },
+    "48": { "mergeable_state": "clean" },
+    "50": { "mergeable_state": "clean" }
+  },
+
+  "merged": [
+    {
+      "number": 47,
+      "title": "[withheld: private repository]",
+      "state": "closed",
+      "draft": false,
+      "merged_at": "2026-08-13T09:15:08Z",
+      "updated_at": "2026-08-13T09:15:08Z",
+      "created_at": "2026-08-13T07:34:04Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/47",
+      "head": {
+        "ref": "board/gh-44-packages-kind-decided",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "main",
+        "sha": "b9605fd7e6f56ad80fa8f3a0773b44bf95ad69a7"
+      },
+      "stack": {
+        "id": 334176,
+        "number": 49,
+        "base": { "ref": "main", "sha": null },
+        "size": 3,
+        "position": 1
+      }
+    },
+    {
+      "number": 48,
+      "title": "[withheld: private repository]",
+      "state": "closed",
+      "draft": false,
+      "merged_at": "2026-08-13T09:15:09Z",
+      "updated_at": "2026-08-13T09:15:10Z",
+      "created_at": "2026-08-13T07:53:18Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/48",
+      "head": {
+        "ref": "board/gh-45-auto-promote-bug",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "board/gh-44-packages-kind-decided",
+        "sha": "95d130107ed87171d8bce8d9da1d83e726d536c6"
+      },
+      "stack": {
+        "id": 334176,
+        "number": 49,
+        "base": { "ref": "main", "sha": null },
+        "size": 3,
+        "position": 2
+      }
+    },
+    {
+      "number": 50,
+      "title": "[withheld: private repository]",
+      "state": "closed",
+      "draft": false,
+      "merged_at": "2026-08-13T09:15:11Z",
+      "updated_at": "2026-08-13T09:15:11Z",
+      "created_at": "2026-08-13T08:13:45Z",
+      "html_url": "https://github.com/Florin-AS/orion-productmapping/pull/50",
+      "head": {
+        "ref": "board/gh-46-auto-ready-auto",
+        "repo": { "full_name": "Florin-AS/orion-productmapping" }
+      },
+      "base": {
+        "ref": "board/gh-45-auto-promote-bug",
+        "sha": "4c95d3ce07083908567b8630001458035fb72d4c"
+      },
+      "stack": {
+        "id": 334176,
+        "number": 49,
+        "base": { "ref": "main", "sha": null },
+        "size": 3,
+        "position": 3
+      }
+    }
+  ]
+}
