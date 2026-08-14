@@ -130,9 +130,11 @@ target changes.
    run cannot record its work in *either* checkout shape — a main checkout's
    git dir is inside the workspace and explicitly denied, a linked worktree's is
    outside the workspace and never granted — so `codex/mod.rs` names the git dir
-   whole plus `objects`/`refs`/`logs`/`packed-refs` of the shared common dir,
-   which is deliberately not the whole of it (that directory is the operator's
-   own repository, and `hooks/` there executes on their machine). The old
+   whole plus `objects`/`refs`/`logs` of the shared common dir, which is
+   deliberately not the whole of it (that directory is the operator's own
+   repository, and `hooks/` there executes on their machine) and just as
+   deliberately all directories (§gh#394: a file root fails the sandbox setup
+   itself, taking every command in the run with it). The old
    escalation (`WorkspaceWrite` → `DangerFullAccess` for a linked worktree on a
    slash-named branch) is now gated on codex < 0.147.0, the version the
    worktree-mount bug was verified fixed in, so on a current box it fires on

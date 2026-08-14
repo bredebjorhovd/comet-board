@@ -100,8 +100,10 @@ same kind of thing:
   — and for a main checkout it is `<cwd>/.git`, sitting in the workspace the
   agent already writes to freely, so whole-directory access is the same trust
   level as the build scripts beside it.
-- **`objects/`, `refs/`, `logs/`, `packed-refs` under the common dir**, and only
-  when that is a *different* directory — i.e. a linked worktree.
+- **`objects/`, `refs/`, `logs/` under the common dir**, and only when that is a
+  *different* directory — i.e. a linked worktree. (`packed-refs` was a fourth
+  here and is gone: it is a *file*, and on Linux a file writable root fails the
+  sandbox setup and takes every command in the run with it — §gh#394.)
 
 That second case is the one worth stating plainly, because on this box it is
 every board dispatch:
@@ -121,8 +123,9 @@ the workspace. Granting it whole would hand a dispatched agent `hooks/` and
 run would be a documented way out of the sandbox, and "the deny lifts, the
 sandbox stays on" would be true of the sentence and false of the situation.
 
-So the four subpaths are named instead of the directory. Measured on a worktree
-under `$HOME` with exactly those four:
+So the subpaths are named instead of the directory. Measured on a worktree
+under `$HOME` with exactly those (then four; `packed-refs` has since been
+dropped — §gh#394):
 
 | | narrowed roots |
 | --- | --- |
@@ -139,8 +142,9 @@ unaffected — it stamps `GIT_AUTHOR_*` on the harness child (gh#107) rather tha
 writing `config` in the checkout — but an agent that tries to `git config
 --local` something in a worktree will now be refused, where before it was not.
 
-This replaces a sandbox drop with a permission grant of five paths, four of them
-leaves. It is the part of this issue that fixes the reported failure.
+This replaces a sandbox drop with a permission grant of a handful of paths, all
+but one of them leaves. It is the part of this issue that fixes the reported
+failure.
 
 **2. The escalation is gated on a codex old enough to need it.**
 `WORKTREE_MOUNT_FIXED_IN = 0.147.0` — the last version verified broken is

@@ -105,6 +105,20 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
+# §gh#394: the sandbox failed SETUP, so the command never ran. The real app
+# server keeps the thread alive and happily takes more turns — which is the bug:
+# the harness has to end the run instead. Emits more after the failed command to
+# prove the run is over at that point and not merely quiet.
+*scenario:sandbox-dead*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"item/started","params":{"item":{"id":"c1","type":"commandExecution","command":"pwd"}}}'
+  emit '{"method":"item/completed","params":{"item":{"id":"c1","type":"commandExecution","command":"pwd","status":"failed","exitCode":1,"aggregatedOutput":"Can'"'"'t mkdir parents for /home/comet/dev/tally/.git/packed-refs/.git: Not a directory"}}}'
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"I cannot run anything"}}'
+  # No turn/completed, ever: the live-but-paralyzed chat gh#394 reported.
+  exec sleep 30
+  ;;
+
 # NOTE: steer-race before steer — `case` takes the first matching glob.
 *scenario:steer-race*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"

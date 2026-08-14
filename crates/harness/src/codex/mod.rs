@@ -50,8 +50,8 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    Phase, context_event, delta_text, item_id, item_type, map_item, turn_error_message, turn_id,
-    usage_event,
+    Phase, context_event, delta_text, item_id, item_type, map_item, sandbox_setup_failure,
+    turn_error_message, turn_id, usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then PATH, then
@@ -130,7 +130,7 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
 /// The only parts of a *shared* git dir a dispatched agent is given write
 /// access to (§gh#349): the object store, the refs, and their reflogs.
 ///
-/// Measured, not guessed. With exactly these four named, a run in a linked
+/// Measured, not guessed. With exactly these three named, a run in a linked
 /// worktree can `add`, `commit`, `fetch`, `merge`, `rebase`, `branch -f`,
 /// `checkout -b`, `stash`, `stash pop` and write reflogs — while `hooks/` and
 /// `config` in the shared repository stay read-only. What *does* stop working
@@ -144,7 +144,50 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
 /// time they commit; `config` reaches the same place through `core.pager` or an
 /// alias. Granting the shared root would make a sandboxed run a way out of the
 /// sandbox.
-const SHARED_GIT_WRITABLES: &[&str] = &["objects", "refs", "logs", "packed-refs"];
+///
+/// **Every entry is a directory, and that is a hard requirement** (§gh#394).
+/// `packed-refs` was a fourth entry here and it is a *file*; on a Linux box it
+/// took down every command in the run before the first one started — see
+/// [`mountable_root`]. Losing it costs the deletion of an already-packed ref
+/// (`git branch -d`, `fetch --prune` on a packed remote ref); it costs nothing
+/// on the write path an attempt actually uses, because a commit, a fetch and a
+/// branch create all write *loose* refs under `refs/`, which is granted.
+const SHARED_GIT_WRITABLES: &[&str] = &["objects", "refs", "logs"];
+
+/// A candidate writable root, kept only if codex can actually mount it
+/// (§gh#394). **A writable root must be a directory.**
+///
+/// The rule is not a style preference, it is the whole of gh#394. Naming the
+/// shared `packed-refs` — an ordinary *file* — as a writable root killed the
+/// sandbox during setup on a Linux box, and with it every command in the run:
+///
+/// ```text
+/// Can't mkdir parents for …/tally/.git/packed-refs/.git: Not a directory
+/// ```
+///
+/// The derived path in that message is the tell: codex treats each writable
+/// root as a directory it may have to create and reach *through* (there it is
+/// resolving a `.git` under the root), which a file cannot be. The failure is
+/// in sandbox setup, so it lands before the agent's first command — the
+/// reported run could not even `pwd` from `/tmp`. macOS's seatbelt tolerates a
+/// file root, which is why the grant measured clean when gh#349 shipped and
+/// broke on the box that runs the dispatches.
+///
+/// So:
+/// - **an existing directory** — mount it;
+/// - **nothing there** — name it anyway. Codex accepts a root that does not
+///   exist and creates it as a directory, which is the right shape for every
+///   leaf in [`SHARED_GIT_WRITABLES`] (a repo with no reflogs yet has no
+///   `logs/`, and the run that writes the first one needs the grant);
+/// - **an existing anything-else** (a file, a symlink to one) — drop it. One
+///   unmountable root is not a narrower sandbox, it is a dead run.
+fn mountable_root(path: PathBuf) -> Option<PathBuf> {
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Some(path),
+        Ok(_) => None,
+        Err(_) => Some(path),
+    }
+}
 
 /// The git metadata codex's `workspace-write` has to be told about, or a
 /// dispatched agent cannot record its work (§gh#349).
@@ -178,9 +221,11 @@ const SHARED_GIT_WRITABLES: &[&str] = &["objects", "refs", "logs", "packed-refs"
 ///    *operator's own repository* and emphatically not the workspace. That one
 ///    is narrowed on purpose.
 ///
-/// The shared subpaths are named whether or not they exist yet: `packed-refs`
-/// is absent from a fresh clone and created by the first `pack-refs`, and codex
-/// accepts a root that is not there.
+/// The shared subpaths are named whether or not they exist yet — a repository
+/// with no reflogs has no `logs/`, and the run that writes the first one needs
+/// the grant — but every root that *does* exist has to be a directory, or the
+/// sandbox does not come up at all. [`mountable_root`] is that filter and
+/// §gh#394 is why it is there.
 ///
 /// Pure filesystem reads (no `git` subprocess): a sandbox decision that
 /// depended on a subprocess succeeding inside the thing being sandboxed is a
@@ -205,7 +250,7 @@ fn git_writable_roots(cwd: &str) -> Vec<PathBuf> {
         };
         target
     };
-    if !git_dir.is_absolute() || !git_dir.exists() {
+    if !git_dir.is_absolute() || !git_dir.is_dir() {
         return Vec::new();
     }
     let mut roots = vec![git_dir.clone()];
@@ -216,7 +261,11 @@ fn git_writable_roots(cwd: &str) -> Vec<PathBuf> {
         && let Ok(common) = std::fs::canonicalize(git_dir.join(common.trim()))
         && common != git_dir
     {
-        roots.extend(SHARED_GIT_WRITABLES.iter().map(|leaf| common.join(leaf)));
+        roots.extend(
+            SHARED_GIT_WRITABLES
+                .iter()
+                .filter_map(|leaf| mountable_root(common.join(leaf))),
+        );
     }
     roots
 }
@@ -864,6 +913,45 @@ async fn run_session(session: Session) {
                                     break 'main;
                                 }
                             }
+                            // A sandbox that failed SETUP takes every command
+                            // in the run with it, including the ones the agent
+                            // would use to report being stuck (§gh#394). The
+                            // tool result above is journaled first — the
+                            // failure is on the record as a command — and then
+                            // the run ends, because a chat that cannot execute
+                            // anything must not go on reading as `working`.
+                            if let Some(line) = sandbox_setup_failure(&item) {
+                                let message = format!(
+                                    "Codex could not build its sandbox, so no command in this \
+                                     run can start: {line}"
+                                );
+                                tracing::warn!(
+                                    target: "comet_harness::codex",
+                                    cwd = %request.cwd,
+                                    "{message}"
+                                );
+                                let reported = AgentEvent::Error {
+                                    message: message.clone(),
+                                };
+                                if !send(&event_tx, reported).await {
+                                    break 'main;
+                                }
+                                done_current = true;
+                                // One Done per run: an interrupt already in
+                                // flight must not add a second one below.
+                                done_after_interrupt = true;
+                                let _ = send(
+                                    &event_tx,
+                                    AgentEvent::Done {
+                                        status: DoneStatus::Errored,
+                                        result: None,
+                                        error: Some(message),
+                                        session_id: Some(thread_id.clone()),
+                                    },
+                                )
+                                .await;
+                                break 'main;
+                            }
                         }
                     }
 
@@ -1440,7 +1528,6 @@ mod tests {
                 common.join("objects"),
                 common.join("refs"),
                 common.join("logs"),
-                common.join("packed-refs"),
             ]
         );
 
@@ -1463,10 +1550,10 @@ mod tests {
         assert!(git_writable_roots("/nonexistent/path").is_empty());
     }
 
-    /// `packed-refs` is absent from a fresh clone and created by the first
-    /// `pack-refs`, so the shared subpaths are named whether or not they exist
-    /// — a list filtered by existence would grant nothing for the write that
-    /// creates the file.
+    /// A repository with no reflogs yet has no `logs/`, and the run that writes
+    /// the first one needs the grant — so a directory-shaped subpath is named
+    /// whether or not it exists. A list filtered by existence would grant
+    /// nothing for the write that creates the directory.
     #[test]
     fn the_shared_subpaths_are_named_before_they_exist() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1480,8 +1567,66 @@ mod tests {
 
         let roots = git_writable_roots(&wt.display().to_string());
         let common = std::fs::canonicalize(main.join(".git")).unwrap();
-        assert!(!common.join("packed-refs").exists(), "nothing created it");
-        assert!(roots.contains(&common.join("packed-refs")), "{roots:?}");
+        assert!(!common.join("logs").exists(), "nothing created it");
+        assert!(roots.contains(&common.join("logs")), "{roots:?}");
+    }
+
+    /// §gh#394. `packed-refs` is a FILE, and a writable root that is a file
+    /// takes the whole sandbox down during setup — every command in the run
+    /// fails before it starts, including `pwd` from `/tmp`. So no root is ever
+    /// a file: not the one that used to be named unconditionally, and not one
+    /// that turns up in the wrong shape.
+    #[test]
+    fn no_writable_root_is_ever_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let admin = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        // The shape the box that reported gh#394 was in: a packed repository.
+        let common = std::fs::canonicalize(main.join(".git")).unwrap();
+        std::fs::write(common.join("packed-refs"), "# pack-refs with: peeled\n").unwrap();
+        // …and a leaf in the wrong shape, to prove the filter is the rule and
+        // not a special case for one name.
+        std::fs::write(common.join("logs"), "not a directory\n").unwrap();
+
+        let roots = git_writable_roots(&wt.display().to_string());
+        assert!(
+            !roots.contains(&common.join("packed-refs")),
+            "the file that killed the run is back: {roots:?}"
+        );
+        for root in &roots {
+            assert!(
+                !root.exists() || root.is_dir(),
+                "{} is not a directory: {roots:?}",
+                root.display()
+            );
+        }
+        // What is left is still enough to commit with: the run's own admin dir
+        // and the shared object/ref store.
+        assert_eq!(
+            roots,
+            vec![admin, common.join("objects"), common.join("refs")]
+        );
+    }
+
+    /// The filter, stated on its own: absent is fine (codex creates it, as a
+    /// directory), a directory is fine, anything else is not mountable.
+    #[test]
+    fn only_directories_are_mountable_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let absent = tmp.path().join("absent");
+
+        assert_eq!(mountable_root(dir.clone()), Some(dir));
+        assert_eq!(mountable_root(file), None);
+        assert_eq!(mountable_root(absent.clone()), Some(absent));
     }
 
     /// The writable roots ride the wire policy, and only where the level has a

@@ -573,6 +573,51 @@ async fn turn_failed_maps_to_errored_done() {
     );
 }
 
+/// §gh#394. The sandbox failed to come up, so no command in the run can start
+/// — not even `pwd`. The agent is alive and can still talk, which is exactly
+/// the failure mode: it cannot push, cannot open a pull request, cannot claim,
+/// and cannot signal blocked either, so the board row reads `working` until a
+/// human notices the prose. The run has to end, and end as errored, which is
+/// what the board reads as blocked and retryable.
+#[tokio::test]
+async fn a_sandbox_that_cannot_start_a_command_ends_the_run_instead_of_hanging() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:sandbox-dead"), controls).await;
+
+    let Some(AgentEvent::Done {
+        status,
+        error: Some(error),
+        session_id,
+        ..
+    }) = events.last()
+    else {
+        panic!("the run must end with an errored Done: {events:?}");
+    };
+    assert_eq!(*status, DoneStatus::Errored);
+    assert_eq!(session_id.as_deref(), Some("th-1"));
+    assert!(
+        error.contains("sandbox") && error.contains("Can't mkdir parents"),
+        "the reason must name the sandbox and quote the line: {error}"
+    );
+
+    // The failed command is still on the record as a command — a reviewer sees
+    // what was attempted, not only that the run died.
+    assert!(
+        events.contains(&AgentEvent::ToolResult {
+            id: "c1".into(),
+            is_error: true,
+        }),
+        "{events:?}"
+    );
+    // And the same reason is visible in the transcript, not only in the Done.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("sandbox"))),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn resume_falls_back_to_fresh_thread() {
     let (controls, _steer, _token) = controls("Yes");
