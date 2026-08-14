@@ -83,6 +83,13 @@ final class AppModel {
             ReviewSpecRunner.run()
             return
         }
+        // The room's redial schedule (gh#405). Arithmetic, not a socket —
+        // deliberately, since a reconnect loop cannot be honestly checked
+        // against an edge that is failing every request.
+        if args.contains("-sync-spec") {
+            SyncSpecRunner.run()
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return
