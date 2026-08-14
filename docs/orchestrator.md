@@ -32,7 +32,7 @@ ordinary chat again, with everything in it intact.
 
 ## What it receives
 
-**Everything nobody else can be told**, which is three things:
+**Everything nobody else can be told**, which is four things:
 
 - **Work no agent released.** A dispatch from the board panel, from the phone,
   or from a bare `comet-board dispatch` records no dispatching chat. On a board
@@ -45,6 +45,17 @@ ordinary chat again, with everything in it intact.
 - **Cap warnings.** The one notice about a run that is *still going*, and the
   only window in which reading its chat can change how it ends. It belongs to no
   dispatcher, because nothing has finished for one to be waiting on.
+- **Interrupted runs** (§gh#390). Live attempts whose runs died under them while
+  their chats stayed put — an engine restart or update, nearly always. The board
+  restarts each one in its own chat (no attempt spent, no chat archived, no
+  branch re-cut) and tells you **once for the whole incident**, naming every
+  attempt affected. Six separate settle notices about six tasks is how this
+  event used to arrive, and it is unreadable: what you need to see is the box,
+  not the tasks. Nothing is owed from you when it says everything was restarted
+  — it is context for the next thing that looks strange. When it says an attempt
+  was *closed*, that one had already been restarted three times: the box is not
+  keeping runs alive, and `comet-board doctor`'s `runs` line is where to look
+  before releasing anything else there.
 
 An **ending** here is any of the four, not only the settle: a run that finished,
 an attempt whose chat vanished, one somebody cancelled, and one the cap killed.

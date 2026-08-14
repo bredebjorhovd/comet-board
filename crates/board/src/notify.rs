@@ -205,6 +205,131 @@ impl Signal {
     }
 }
 
+/// One attempt whose run died under it while its chat stayed put (gh#390).
+///
+/// Owned strings rather than borrows: this is collected across a whole
+/// reconcile pass, from rows that go out of scope as the loop moves on, and the
+/// point of collecting it at all is that the notice comes after the pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interrupted {
+    pub identifier: String,
+    pub chat: Option<String>,
+    pub fate: Fate,
+}
+
+/// What the board did about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fate {
+    /// Prompted to carry on in its own chat. No attempt spent, nothing deleted.
+    Resumed { resume: i64, of: i64 },
+    /// Restarted as often as it is going to be; the attempt is closed `failed`.
+    Ended,
+}
+
+/// The incident notice: runs died, here is how many and what happened to them
+/// (gh#390).
+///
+/// This exists because of what the alternative looked like. Six attempts lost
+/// their runs to one engine restart, and the board reported six unrelated
+/// settles — each true, none of them saying the thing that had actually
+/// happened, and `doctor` a minute later reporting every check ok. The event
+/// was an engine restart; the notices were about six tasks; nobody could see
+/// the first from the second.
+///
+/// Addressed to the orchestrator and to the operator's webhook rather than to
+/// any dispatcher, for the cap warning's reason ([`Event::CapWarning`]): a
+/// resumed attempt has not ended, so there is nothing for an agent waiting on
+/// that step to do — while an agent whose job is the board wants to know that
+/// the box just dropped every run on it.
+pub fn interrupted_message(runs: &[Interrupted]) -> String {
+    let mut s = format!("comet-board: {}.\n\n", interrupted_headline(runs));
+    for run in runs {
+        s.push_str(&format!("  {}", run.identifier));
+        if let Some(chat) = run.chat.as_deref() {
+            s.push_str(&format!(" · chat {chat}"));
+        }
+        s.push_str(&match &run.fate {
+            Fate::Resumed { resume, of } => format!(" · restarted in place ({resume}/{of})"),
+            Fate::Ended => " · attempt closed, it had been restarted too often already".to_string(),
+        });
+        s.push('\n');
+    }
+    s.push('\n');
+    s.push_str(
+        "The usual cause is the engine restarting or updating under live runs: chats, branches \
+         and checkouts survive that, runs do not. A restarted attempt keeps its number, its \
+         chat and its branch — nothing was re-dispatched and no attempt was spent. If runs on \
+         this box keep dying within minutes of starting, that is the box rather than the work: \
+         run `comet-board doctor` and read its `runs` line before releasing anything else here.\n",
+    );
+    s
+}
+
+/// The headline both the prompt and the webhook's `text` open with, so the
+/// agent reading its chat and the operator reading their phone are told the
+/// same thing about the same incident.
+fn interrupted_headline(runs: &[Interrupted]) -> String {
+    let resumed = runs
+        .iter()
+        .filter(|r| matches!(r.fate, Fate::Resumed { .. }))
+        .count();
+    let ended = runs.len() - resumed;
+    let what = match runs.len() {
+        1 => "1 live attempt lost its run".to_string(),
+        n => format!("{n} live attempts lost their runs"),
+    };
+    match (resumed, ended) {
+        (_, 0) => format!("{what} and {} restarted in place", one_or_all(resumed)),
+        (0, _) => format!("{what} and {} closed", one_or_all(ended)),
+        _ => format!("{what} — {resumed} restarted in place, {ended} closed"),
+    }
+}
+
+fn one_or_all(n: usize) -> String {
+    match n {
+        1 => "was".to_string(),
+        n => format!("all {n} were"),
+    }
+}
+
+/// One line, for a webhook that renders nothing but text.
+pub fn interrupted_summary(runs: &[Interrupted]) -> String {
+    format!(
+        "{} ({})",
+        interrupted_headline(runs),
+        runs.iter()
+            .map(|r| r.identifier.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// The JSON body an incident POSTs to `[defaults] notify_webhook`.
+///
+/// Its own `event` rather than a settle with a reason attached: a receiver
+/// routing on `on_settled` is routing on "a task is over", and none of these
+/// are — the resumed ones are still running and the closed ones ended for a
+/// reason that belongs to the box.
+pub fn interrupted_payload(runs: &[Interrupted], at: &str) -> Value {
+    json!({
+        "event": "on_runs_interrupted",
+        "at": at,
+        "text": interrupted_summary(runs),
+        "runs": runs.iter().map(|r| json!({
+            "identifier": r.identifier,
+            "chat_id": r.chat,
+            "outcome": match &r.fate {
+                Fate::Resumed { .. } => "resumed",
+                Fate::Ended => "failed",
+            },
+            "resume": match &r.fate {
+                Fate::Resumed { resume, .. } => json!(resume),
+                Fate::Ended => Value::Null,
+            },
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// One line, for a webhook that renders nothing but text.
 pub fn summary(task: &Task, signal: &Signal) -> String {
     let n = attempt_no(task);

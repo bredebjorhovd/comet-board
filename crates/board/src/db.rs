@@ -23,7 +23,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
-     context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on";
+     context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -107,6 +107,7 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
             }),
         },
         stacked_on: r.get(48)?,
+        resumes: r.get(49)?,
     })
 }
 
@@ -357,7 +358,12 @@ impl Db {
               -- branch equality would then find nothing. NULL is an ordinary
               -- dispatch off the route's `base`, and every row from before
               -- stacking existed.
-              stacked_on INTEGER REFERENCES attempts(id)
+              stacked_on INTEGER REFERENCES attempts(id),
+              -- How many times the board has restarted this attempt's run in
+              -- its own chat (gh#390). Not a retry and not a second attempt:
+              -- the chat, the branch and the checkout are the same ones, and
+              -- the count exists to bound the restarting, not to number it.
+              resumes INTEGER NOT NULL DEFAULT 0
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -578,6 +584,10 @@ impl Db {
                 // costs nothing here: the id is written by the same dispatch
                 // that read it, and nothing deletes attempt rows.
                 ("stacked_on", "INTEGER"),
+                // Restarted runs (gh#390). 0 on every row that came before,
+                // which is what they are: the board could not restart a run
+                // then, it closed the attempt instead.
+                ("resumes", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )?;
         self.add_missing_columns(
@@ -1490,6 +1500,42 @@ impl Db {
             params![attempt_id, ticks],
         )?;
         Ok(())
+    }
+
+    /// Count a run the board restarted in this attempt's own chat, and clear
+    /// the absence that led to it (gh#390).
+    ///
+    /// One statement for both, because they are one fact: the run that was
+    /// missing has been asked to come back, so the ticks that measured its
+    /// absence are spent — the next verdict has to earn its own two.
+    ///
+    /// Returns the new count, which is what bounds the restarting
+    /// ([`crate::runs::MAX_RESUMES`]) and what the prompt tells the agent.
+    pub fn note_resume(&self, attempt_id: i64) -> Result<i64> {
+        self.conn.execute(
+            "UPDATE attempts SET resumes = resumes + 1, missing_ticks = 0 WHERE id = ?1",
+            params![attempt_id],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT resumes FROM attempts WHERE id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every attempt that *started* since `since`, closed or not (gh#390).
+    ///
+    /// `started_at` rather than `ended_at` because the question this answers is
+    /// about the box's recent behaviour, and an attempt that started inside the
+    /// window and is still running is part of that behaviour — it is the
+    /// evidence that runs can, in fact, still start here.
+    pub fn attempts_since(&self, since: &str) -> Result<Vec<Attempt>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts
+              WHERE started_at >= ?1 AND board_managed = 1 ORDER BY started_at"
+        ))?;
+        let rows = stmt.query_map(params![since], read_attempt)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Record the screen this pane is showing, and that it is showing it *now*.
