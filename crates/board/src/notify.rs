@@ -258,9 +258,11 @@ pub fn interrupted_message(runs: &[Interrupted]) -> String {
     s.push_str(
         "The usual cause is the engine restarting or updating under live runs: chats, branches \
          and checkouts survive that, runs do not. A restarted attempt keeps its number, its \
-         chat and its branch — nothing was re-dispatched and no attempt was spent. If runs on \
-         this box keep dying within minutes of starting, that is the box rather than the work: \
-         run `comet-board doctor` and read its `runs` line before releasing anything else here.\n",
+         chat and its branch — nothing was re-dispatched and no attempt was spent. The count in \
+         brackets is every restart that run has had, including any the engine revived on its own \
+         boot recovery before the board saw it. If runs on this box keep dying within minutes of \
+         starting, that is the box rather than the work: run `comet-board doctor` and read its \
+         `runs` line before releasing anything else here.\n",
     );
     s
 }

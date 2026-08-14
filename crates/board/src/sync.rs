@@ -1403,12 +1403,11 @@ impl SyncEngine {
                     continue;
                 }
                 // The run is gone; whether the *chat* is gone with it is what
-                // decides the attempt's fate (§gh#390).
-                match runs::decide(
-                    self.chat_liveness(runtime, &task, chat_id),
-                    ticks,
-                    attempt.resumes,
-                ) {
+                // decides the attempt's fate (§gh#390), and how often it has
+                // been started already — by the board and by the engine's own
+                // boot recovery — is what bounds it (§gh#392).
+                let restarts = self.restarts(runtime, &task, chat_id, attempt.resumes);
+                match runs::decide(self.chat_liveness(runtime, &task, chat_id), ticks, restarts) {
                     runs::Verdict::Wait => {
                         self.log.info(format!(
                             "{} chat {} missing (tick {}/{})",
@@ -1434,13 +1433,14 @@ impl SyncEngine {
                         // Resuming an agent that already opened its pull
                         // request would spend a turn undoing the work.
                         if !self.maybe_settle(runtime, &task, &attempt, AgentStatus::Idle, false)?
-                            && let Some(fate) = self.resume(runtime, &task, &attempt, chat_id)?
+                            && let Some(fate) =
+                                self.resume(runtime, &task, &attempt, chat_id, restarts)?
                         {
                             interrupted.push(fate);
                         }
                     }
                     runs::Verdict::GiveUp => {
-                        interrupted.push(self.give_up(runtime, &task, &attempt)?);
+                        interrupted.push(self.give_up(runtime, &task, &attempt, restarts)?);
                     }
                 }
                 continue;
@@ -3151,6 +3151,45 @@ impl SyncEngine {
         }
     }
 
+    /// How often this attempt's run has been started again already, counting
+    /// the restarts the board did not perform (§gh#392).
+    ///
+    /// The board's own column is the easy half and the engine's ledger is the
+    /// half that decides whether the other half means anything: boot recovery
+    /// spends three revivals without writing a word to the board, and hands
+    /// over a state indistinguishable from a first interruption. Asking is one
+    /// call on the runtime that is already being asked whether the chat is
+    /// there.
+    ///
+    /// A runtime that cannot answer leaves [`runs::Restarts::engine`] `None` —
+    /// the board then restarts on its own budget exactly as it did before the
+    /// question existed, and says nothing about a total it does not have.
+    /// Logged at info, not warn: on a box whose chats run on another device
+    /// this is the ordinary answer, and a warning per tick per attempt would
+    /// bury the ones that mean something.
+    fn restarts(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        chat_id: &str,
+        board: i64,
+    ) -> runs::Restarts {
+        let Some(runtime) = runtime else {
+            return runs::Restarts::board_only(board);
+        };
+        match runtime.chat_revivals(chat_id) {
+            Ok(engine) => runs::Restarts { board, engine },
+            Err(e) => {
+                self.log.info(format!(
+                    "{}: asking how often the engine revived chat {chat_id}: {e:#} — \
+                     counting only the board's own restarts (§gh#392)",
+                    task.identifier
+                ));
+                runs::Restarts::board_only(board)
+            }
+        }
+    }
+
     /// Restart an interrupted run in the chat it was already in (§gh#390).
     ///
     /// The whole of the fix, and it is deliberately small: the chat holds the
@@ -3170,20 +3209,34 @@ impl SyncEngine {
     /// `Ok(None)` when there was nothing to prompt with — a cycle without a
     /// runtime never reaches here through [`runs::decide`], but the type says
     /// so rather than the reader having to.
+    ///
+    /// The number this reports is the joined one (§gh#392): the board's column
+    /// counts what the board spends, but the budget being spent covers the
+    /// engine's own revivals too, so "restart 2 of 3" on an attempt whose
+    /// column reads 1 is the sentence that is true.
     fn resume(
         &self,
         runtime: Option<&dyn Runtime>,
         task: &Task,
         attempt: &Attempt,
         chat_id: &str,
+        restarts: runs::Restarts,
     ) -> Result<Option<notify::Interrupted>> {
         let Some(runtime) = runtime else {
             return Ok(None);
         };
-        let resume = self.db.note_resume(attempt.id)?;
+        let restarts = runs::Restarts {
+            board: self.db.note_resume(attempt.id)?,
+            ..restarts
+        };
+        let resume = restarts.spent();
+        let by_engine = match restarts.engine.filter(|e| *e > 0) {
+            Some(engine) => format!(", {engine} of them the engine's own"),
+            None => String::new(),
+        };
         self.log.warn(format!(
             "{}: chat {chat_id} is still there but its run is not — restarting it in place \
-             ({resume}/{}), attempt {} unspent",
+             ({resume}/{}{by_engine}), attempt {} unspent",
             task.identifier,
             runs::MAX_RESUMES,
             attempt.id,
@@ -3211,13 +3264,19 @@ impl SyncEngine {
     /// it, and what went wrong is that this box could not keep a run alive —
     /// which is a red row somebody has to look at, not a row that quietly
     /// returns to `ready` for the board to try again on the same broken box.
+    ///
+    /// `restarts` rather than `attempt.resumes` because the note is evidence
+    /// (§gh#392): the engine's boot recovery may have started this run several
+    /// times before the board saw it was gone, and a count that omits those is
+    /// the board being confidently wrong in the one sentence a person reads.
     fn give_up(
         &self,
         runtime: Option<&dyn Runtime>,
         task: &Task,
         attempt: &Attempt,
+        restarts: runs::Restarts,
     ) -> Result<notify::Interrupted> {
-        let note = runs::gave_up_note(attempt.resumes);
+        let note = runs::gave_up_note(restarts);
         self.db.close_attempt(attempt.id, Outcome::Failed)?;
         self.enqueue_outcome_note(task, Outcome::Failed, None, Some(&note))?;
         self.log
@@ -6028,6 +6087,9 @@ mod tests {
         /// A runtime that cannot answer whether a chat is there at all
         /// (§gh#390) — the third answer, which must end nothing.
         blind: bool,
+        /// What the engine's own boot recovery already spent on every chat
+        /// here (§gh#392). `None` is the ledger the board could not read.
+        revivals: Option<i64>,
     }
 
     impl JournalFact {
@@ -6037,6 +6099,22 @@ mod tests {
                 queued: Default::default(),
                 gone: Vec::new(),
                 blind: false,
+                revivals: Some(0),
+            }
+        }
+        /// The same, on a box whose engine has already revived these runs
+        /// itself — invisibly, before the board ever looked (§gh#392).
+        fn revived(end: Option<RunEnd>, times: i64) -> JournalFact {
+            JournalFact {
+                revivals: Some(times),
+                ..JournalFact::ending(end)
+            }
+        }
+        /// The same, with no readable engine ledger at all.
+        fn uncounted(end: Option<RunEnd>) -> JournalFact {
+            JournalFact {
+                revivals: None,
+                ..JournalFact::ending(end)
             }
         }
         /// The same, with some chats already archived.
@@ -6081,6 +6159,9 @@ mod tests {
                 anyhow::bail!("the workspace could not be read");
             }
             Ok(!self.gone.iter().any(|c| c == chat))
+        }
+        fn chat_revivals(&self, _: &str) -> anyhow::Result<Option<i64>> {
+            Ok(self.revivals)
         }
         fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
             unreachable!("settling never reads the chat cwd")
@@ -7404,6 +7485,137 @@ mod tests {
             e.db.pending_writeback_count().unwrap(),
             1,
             "and the issue is told once, when it is actually over"
+        );
+    }
+
+    // ---- one budget, wherever the restart came from (§gh#392) -------------
+
+    /// The bug. The engine's boot recovery revives a crashed run three times on
+    /// its own ledger and then stops — leaving a live chat, a closed journal
+    /// and no run, which is exactly the state the board resumes from. It used
+    /// to start counting at zero there, so the run was started six times and
+    /// the note said three.
+    #[test]
+    fn the_engines_own_revivals_are_spent_from_the_same_budget() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::revived(None, runs::MAX_RESUMES);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert_eq!(
+            a.outcome,
+            Some(Outcome::Failed),
+            "the budget was already spent by the engine"
+        );
+        assert_eq!(a.resumes, 0, "and the board added nothing to the pile");
+        assert!(
+            rt.prompts().iter().all(|(c, _)| c != "chat-9"),
+            "a fourth start is the one this exists to prevent: {:?}",
+            rt.prompts()
+        );
+    }
+
+    /// And what it tells the person who has to act on it counts every start,
+    /// including the three nothing on the board recorded.
+    #[test]
+    fn the_note_counts_the_restarts_the_board_never_made() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::revived(None, 2);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt); // the board's one remaining restart
+        assert!(live(&e).outcome.is_none(), "one left of the three");
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert_eq!(a.outcome, Some(Outcome::Failed));
+        assert_eq!(a.resumes, 1, "the board restarted it once");
+        let note = outcome_payload(&e)["note"].as_str().unwrap().to_string();
+        assert!(note.contains("died 3 times"), "{note}");
+        assert!(
+            note.contains("2 of those restarts were the engine's own"),
+            "{note}"
+        );
+    }
+
+    /// An engine ledger the board cannot read must cost the attempt nothing —
+    /// the board restarts on its own count exactly as before — and must not be
+    /// reported as a number. "Restarted until the board gave up" is honest;
+    /// "3 times" would not be.
+    #[test]
+    fn an_unreadable_ledger_changes_nothing_and_claims_nothing() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::uncounted(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        for _ in 0..runs::MAX_RESUMES {
+            lose_the_run(&e, &rt);
+            assert!(live(&e).outcome.is_none(), "still worth restarting");
+        }
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert_eq!(a.outcome, Some(Outcome::Failed));
+        assert_eq!(a.resumes, runs::MAX_RESUMES);
+        let note = outcome_payload(&e)["note"].as_str().unwrap().to_string();
+        assert!(!note.contains('3'), "no count it cannot support: {note}");
+        assert!(note.contains("the box is not keeping runs alive"), "{note}");
+    }
+
+    /// The disjoint path, unchanged: an engine with budget left revives the run
+    /// itself, the board sees a chat that is working, and nothing is spent on
+    /// either side of the fence.
+    #[test]
+    fn an_engine_restart_with_budget_left_costs_the_board_nothing() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::revived(None, 1);
+
+        for _ in 0..4 {
+            e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+                .unwrap();
+        }
+
+        let a = live(&e);
+        assert!(a.outcome.is_none(), "the run is going; nothing to decide");
+        assert_eq!(a.resumes, 0, "no board resume was spent on it");
+        assert!(rt.prompts().is_empty(), "and it was not prompted");
+    }
+
+    /// The prompt the agent reads says where in the budget it is, not where in
+    /// the board's column — an attempt the engine already revived twice is on
+    /// its last restart, and the sentence has to say so.
+    #[test]
+    fn the_restarted_agent_is_told_the_joined_position() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::revived(None, 2);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt);
+
+        let prompts = rt.prompts();
+        assert_eq!(prompts[0].0, "chat-9");
+        assert!(
+            prompts[0]
+                .1
+                .contains(&format!("Restart 3 of {}", runs::MAX_RESUMES)),
+            "{}",
+            prompts[0].1
         );
     }
 

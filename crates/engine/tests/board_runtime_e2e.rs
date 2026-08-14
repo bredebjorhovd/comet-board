@@ -276,6 +276,12 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         runtime.last_run_end(&handle.chat_id).unwrap(),
         Some(RunEnd::Completed)
     );
+    // The other journal fact, the one the restart budget is spent against
+    // (§gh#392): this chat has a journal here and boot recovery has revived it
+    // nothing, which is a zero. A chat this device has never run is not a zero
+    // — it is no answer at all, and the board reports the two differently.
+    assert_eq!(runtime.chat_revivals(&handle.chat_id).unwrap(), Some(0));
+    assert_eq!(runtime.chat_revivals("chat-somewhere-else").unwrap(), None);
 
     // ── an account that does not resolve refuses the dispatch (gh#59) ───────
     //

@@ -37,6 +37,36 @@
 //! closes `failed` — not `orphaned`, because nothing vanished, and the row
 //! should stay red until somebody looks at the box — and [`health`] is what the
 //! looking finds.
+//!
+//! ## Why the ceiling counts something it did not start (gh#392)
+//!
+//! The board is not the only thing on the box that restarts a dead run. The
+//! engine's own boot recovery (`Sessions::recover_stale`) walks every journal a
+//! crash left open, closes it with a synthetic interrupted `Done` — and then
+//! picks the run back up against the remembered harness session, on its own
+//! budget of three, counted in a file beside the journal.
+//!
+//! On the ordinary path the two never meet: the engine acts on a journal that
+//! is *stale*, the board on a chat whose journal is *closed* and whose run is
+//! gone. They meet at exhaustion. An engine out of revivals still closes the
+//! journal and simply stops re-dispatching, which leaves a chat that is alive,
+//! a journal that is closed and no run — [`Liveness::Alive`] with nothing
+//! running, exactly the state this module decides about. The board would then
+//! begin resuming from zero, and one attempt's run would be started six times
+//! and reported as three.
+//!
+//! Three is the number [`gave_up_note`] hands a person, and the sentence it is
+//! in — *this box is not keeping runs alive* — is an argument from how many
+//! times a thing has actually failed. Three prior failures nobody counted make
+//! it false. So [`Restarts`] carries both counts, one budget is spent against
+//! their sum, and when the engine's ledger cannot be read the note claims no
+//! number at all rather than a number it cannot support.
+//!
+//! What this does **not** do is stop the engine: boot recovery answers to
+//! nobody here, and a revival it performs while the board is between ticks
+//! happens whatever the board has spent. The board counts it, decides with it,
+//! and says it — which is the whole of what the board can honestly do about a
+//! restart it does not perform.
 
 /// Is this attempt's chat still there?
 ///
@@ -85,8 +115,56 @@ pub const MISSING_TICKS: i64 = 2;
 /// closed and `doctor` has something to report.
 pub const MAX_RESUMES: i64 = 3;
 
+/// How often this attempt's run has already been started again — and by which
+/// of the two things on the box that can do it (gh#392).
+///
+/// One budget, two ledgers, because the two restarts are performed by different
+/// processes and neither can write the other's record: the board's count is a
+/// column on the attempt row, the engine's is a file beside the run journal.
+/// The board is the one that has to add them up, because it is the one that
+/// decides and the one that reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restarts {
+    /// What the board has spent on this attempt — `attempts.resumes`.
+    pub board: i64,
+    /// What the engine's boot recovery revived this chat, off its own ledger.
+    ///
+    /// `None` is "nobody could be asked" — no runtime this cycle, a runtime
+    /// that could not read the ledger, or a chat this device has never run.
+    /// It is not zero: zero is a ledger that says the engine did nothing, and
+    /// the difference is exactly what [`gave_up_note`] is allowed to claim.
+    pub engine: Option<i64>,
+}
+
+impl Restarts {
+    /// What the board knows on its own — the answer when the engine's ledger
+    /// is out of reach, and the behaviour the board had before gh#392.
+    pub fn board_only(board: i64) -> Self {
+        Self {
+            board,
+            engine: None,
+        }
+    }
+
+    /// What the budget is spent against.
+    ///
+    /// An unreadable engine ledger counts as nothing, deliberately: the board
+    /// must not refuse to restart a run because it could not ask a question,
+    /// which is [`Liveness::Unknown`]'s rule applied to the other half of the
+    /// same state. It errs towards restarting, and towards saying less.
+    pub fn spent(&self) -> i64 {
+        self.board + self.engine.unwrap_or(0)
+    }
+
+    /// How many times this run has actually been started again, when that is
+    /// knowable at all — the number a note may put in front of a person.
+    pub fn counted(&self) -> Option<i64> {
+        self.engine.map(|engine| self.board + engine)
+    }
+}
+
 /// The verdict, given what the chat says and what this attempt has already had.
-pub fn decide(chat: Liveness, missing_ticks: i64, resumes: i64) -> Verdict {
+pub fn decide(chat: Liveness, missing_ticks: i64, restarts: Restarts) -> Verdict {
     if missing_ticks < MISSING_TICKS {
         return Verdict::Wait;
     }
@@ -95,7 +173,7 @@ pub fn decide(chat: Liveness, missing_ticks: i64, resumes: i64) -> Verdict {
         // reason to look next tick, never a reason to end an attempt.
         Liveness::Unknown => Verdict::Wait,
         Liveness::Gone => Verdict::Orphan,
-        Liveness::Alive if resumes < MAX_RESUMES => Verdict::Resume,
+        Liveness::Alive if restarts.spent() < MAX_RESUMES => Verdict::Resume,
         Liveness::Alive => Verdict::GiveUp,
     }
 }
@@ -107,6 +185,10 @@ pub fn decide(chat: Liveness, missing_ticks: i64, resumes: i64) -> Verdict {
 /// finished — and then gets out of the way. It deliberately does not re-state
 /// the task: the chat holds the brief, the transcript and whatever the run had
 /// already done, which is the whole reason resuming beats re-dispatching.
+///
+/// `resume` is [`Restarts::spent`] and not the board's own column: what the
+/// sentence is about is the budget and what happens at the end of it, and the
+/// budget is the joined one (gh#392).
 pub fn resume_prompt(resume: i64) -> String {
     format!(
         "comet-board: this run stopped without finishing — the engine was restarted under it, \
@@ -119,11 +201,35 @@ pub fn resume_prompt(resume: i64) -> String {
 }
 
 /// What an attempt closed for having its run die too often says upstream.
-pub fn gave_up_note(resumes: i64) -> String {
-    format!(
-        "its run died {resumes} times and was restarted every time without finishing — the box \
+///
+/// The one sentence a person reads when the board finally stops, so the number
+/// in it is evidence and has to be defensible (gh#392). It is the joined count
+/// or it is nothing: an engine revival the board never saw is still a time this
+/// run was started and died, and a count that omits three of them is an
+/// argument from a premise that is false. When the engine's ledger could not be
+/// read the sentence says what happened without saying how often — the reader
+/// loses a number the board never had, rather than being handed a wrong one.
+pub fn gave_up_note(restarts: Restarts) -> String {
+    let Some(total) = restarts.counted() else {
+        return "its run kept dying and was restarted until the board would restart it no more, \
+                never finishing — the box is not keeping runs alive"
+            .to_string();
+    };
+    let mut note = format!(
+        "its run died {total} times and was restarted every time without finishing — the box \
          is not keeping runs alive"
-    )
+    );
+    // Named rather than folded in, because it is the part that is otherwise
+    // unfindable: the engine's revivals leave nothing on the board at all, so a
+    // reader comparing this number against `attempts.resumes` would find them
+    // missing and trust the smaller one.
+    if let Some(engine) = restarts.engine.filter(|e| *e > 0) {
+        note.push_str(&format!(
+            " ({engine} of those restarts were the engine's own boot recovery, before the board \
+             saw the run was gone)"
+        ));
+    }
+    note
 }
 
 // ---- is this box keeping runs alive at all? (the `doctor` half) ------------
@@ -197,35 +303,120 @@ pub fn health(samples: &[Sample]) -> Health {
 mod tests {
     use super::*;
 
+    /// The board's own count, with an engine that says it did nothing.
+    fn board(n: i64) -> Restarts {
+        Restarts {
+            board: n,
+            engine: Some(0),
+        }
+    }
+
     #[test]
     fn one_absent_tick_decides_nothing_whatever_the_chat_says() {
         for chat in [Liveness::Alive, Liveness::Gone, Liveness::Unknown] {
-            assert_eq!(decide(chat, 1, 0), Verdict::Wait);
+            assert_eq!(decide(chat, 1, board(0)), Verdict::Wait);
         }
     }
 
     /// The bug: six chats that were all still there, all closed as gone.
     #[test]
     fn a_chat_that_is_still_there_is_a_dead_run_not_an_orphan() {
-        assert_eq!(decide(Liveness::Alive, 2, 0), Verdict::Resume);
+        assert_eq!(decide(Liveness::Alive, 2, board(0)), Verdict::Resume);
     }
 
     #[test]
     fn a_chat_that_is_really_gone_still_orphans() {
-        assert_eq!(decide(Liveness::Gone, 2, 0), Verdict::Orphan);
+        assert_eq!(decide(Liveness::Gone, 2, board(0)), Verdict::Orphan);
     }
 
     /// A runtime that could not answer must not end an attempt — the same rule
     /// that already governed a chat which had never worked.
     #[test]
     fn an_unanswerable_chat_is_never_orphaned() {
-        assert_eq!(decide(Liveness::Unknown, 9, 0), Verdict::Wait);
+        assert_eq!(decide(Liveness::Unknown, 9, board(0)), Verdict::Wait);
     }
 
     #[test]
     fn resuming_is_bounded_and_then_the_attempt_closes() {
-        assert_eq!(decide(Liveness::Alive, 2, MAX_RESUMES - 1), Verdict::Resume);
-        assert_eq!(decide(Liveness::Alive, 2, MAX_RESUMES), Verdict::GiveUp);
+        assert_eq!(
+            decide(Liveness::Alive, 2, board(MAX_RESUMES - 1)),
+            Verdict::Resume
+        );
+        assert_eq!(
+            decide(Liveness::Alive, 2, board(MAX_RESUMES)),
+            Verdict::GiveUp
+        );
+    }
+
+    // ---- the two budgets that could not see each other (§gh#392) ----------
+
+    /// The bug: an engine that spent its whole revival budget hands the board a
+    /// live chat with no run, which is the state the board resumes from zero.
+    /// Six starts, and a note that would have said three.
+    #[test]
+    fn an_engine_that_spent_its_budget_leaves_the_board_none() {
+        let restarts = Restarts {
+            board: 0,
+            engine: Some(MAX_RESUMES),
+        };
+        assert_eq!(decide(Liveness::Alive, 2, restarts), Verdict::GiveUp);
+    }
+
+    /// One budget, wherever the restart came from: one engine revival leaves
+    /// the board two, not three.
+    #[test]
+    fn one_budget_is_shared_between_the_engine_and_the_board() {
+        let after_engine = |board| Restarts {
+            board,
+            engine: Some(1),
+        };
+        assert_eq!(decide(Liveness::Alive, 2, after_engine(1)), Verdict::Resume);
+        assert_eq!(decide(Liveness::Alive, 2, after_engine(2)), Verdict::GiveUp);
+    }
+
+    /// An engine ledger nobody could read must not cost the attempt a restart —
+    /// the same rule as a chat nobody could ask about, and the same reason.
+    #[test]
+    fn an_unreadable_engine_ledger_spends_nothing() {
+        assert_eq!(
+            decide(Liveness::Alive, 2, Restarts::board_only(MAX_RESUMES - 1)),
+            Verdict::Resume
+        );
+    }
+
+    #[test]
+    fn the_note_counts_the_restarts_the_board_did_not_perform() {
+        let note = gave_up_note(Restarts {
+            board: 2,
+            engine: Some(3),
+        });
+        assert!(note.contains("died 5 times"), "{note}");
+        assert!(
+            note.contains("3 of those restarts were the engine's own"),
+            "{note}"
+        );
+    }
+
+    /// A count the board cannot see is a count it must not state.
+    #[test]
+    fn the_note_claims_no_number_it_cannot_support() {
+        let note = gave_up_note(Restarts::board_only(3));
+        assert!(!note.contains('3'), "{note}");
+        assert!(
+            note.contains("restarted until the board would restart it no more"),
+            "{note}"
+        );
+    }
+
+    /// Nothing extra is said about an engine that did nothing.
+    #[test]
+    fn the_note_is_unchanged_when_only_the_board_restarted_it() {
+        let note = gave_up_note(board(3));
+        assert_eq!(
+            note,
+            "its run died 3 times and was restarted every time without finishing — the box is \
+             not keeping runs alive"
+        );
     }
 
     fn died(secs: i64) -> Sample {

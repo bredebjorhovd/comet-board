@@ -288,6 +288,17 @@ impl Runtime for CometRuntime {
             .is_some_and(|chat| !chat.archived))
     }
 
+    /// The engine's own revival ledger, read for the board's budget (gh#392).
+    ///
+    /// Off the same journal directory every other fact here comes from, and
+    /// keyed the same way — which is what makes the answer trustworthy: this
+    /// process is the one that wrote it, in `Sessions::recover_stale`, on this
+    /// device's boot. A chat with no journal here is one this device has never
+    /// run, and answers `None` rather than a zero the board would count.
+    fn chat_revivals(&self, chat_id: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self.journal.revivals(chat_id).map(i64::from))
+    }
+
     fn chat_cwd(&self, chat_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self.workspace.doc().chat(chat_id)?.and_then(|c| c.cwd))
     }
