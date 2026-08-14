@@ -374,22 +374,38 @@ const EXEC_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Run the shim the way git runs it, waiting out `ETXTBSY` (see
 /// [`verify_askpass`] for why that is a wait and not a retry-around-a-defect).
+fn run_askpass(askpass: &Path, prompt: &str) -> std::io::Result<std::process::Output> {
+    exec_waiting_out_busy(std::process::Command::new(askpass).arg(prompt))
+}
+
+/// Run `cmd` to completion, waiting out an `ETXTBSY` that a sibling thread's
+/// `fork` put there, for at most [`EXEC_BUSY_BUDGET`].
+///
+/// The race is the one [`verify_askpass`] documents, and it belongs to the
+/// *process*, not to askpass: any thread that execs a file this process has
+/// recently written can be refused because some other thread forked while the
+/// write handle was open. So this is written against a `Command` rather than
+/// against a shim path — gh#385 was the `gh` shim's own test hitting it, one
+/// caller away from the code that already knew about it.
 ///
 /// Nothing else is waited on. No such file, not executable, exec'd and exited
 /// non-zero for a reason of its own — each is answered immediately, because none
-/// of them is transient and reporting them is what the check is for.
-fn run_askpass(askpass: &Path, prompt: &str) -> std::io::Result<std::process::Output> {
+/// of them is transient and reporting them is what a run is for.
+///
+/// `cmd` is re-run rather than rebuilt: `output` takes `&mut self`, and every
+/// attempt must be the same command, or a wait would be hiding a difference.
+fn exec_waiting_out_busy(cmd: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     let mut waited = std::time::Duration::ZERO;
     let mut nap = std::time::Duration::from_millis(1);
     loop {
-        let attempt = std::process::Command::new(askpass).arg(prompt).output();
+        let attempt = cmd.output();
         let busy = match &attempt {
-            // The shim itself could not be exec'd.
+            // The thing itself could not be exec'd.
             Err(e) => e.kind() == std::io::ErrorKind::ExecutableFileBusy,
-            // The shim ran, and the `exec` *inside* it could not be: the same
-            // refusal one level down, on the `comet-board` the shim reaches.
-            // A payload install writes that binary and the engine dispatches
-            // through it, so it is the same window as the shim's own.
+            // It ran, and an `exec` *inside* it could not be: the same refusal
+            // one level down, on whatever a shim reaches. A payload install
+            // writes that binary and the engine dispatches through it, so it is
+            // the same window as the shim's own.
             Ok(out) => !out.status.success() && exec_said_busy(&out.stderr),
         };
         if !busy || waited >= EXEC_BUSY_BUDGET {
@@ -1115,6 +1131,16 @@ mod tests {
 
     /// The shim is a real script `sh` will run, not just text that looks like
     /// one — including with a space in the path it execs.
+    ///
+    /// Exec'd through [`exec_waiting_out_busy`], for the reason
+    /// [`verify_askpass`] gives at length: this test writes three files and
+    /// runs them, inside a `cargo test` binary whose other threads are forking
+    /// the whole time, and on Linux a child that has not reached its own `exec`
+    /// yet holds those inodes open for writing. gh#385 was this test failing
+    /// that way on CI — never on macOS, which does not enforce `ETXTBSY`, and
+    /// never on demand. Writing more carefully cannot fix it: [`install_shim`]
+    /// already renames a closed file into place, and the handle the kernel
+    /// objects to is a *copy* of one this thread had already dropped.
     #[test]
     #[cfg(unix)]
     fn the_gh_shim_runs_and_falls_back_when_nothing_can_be_minted() {
@@ -1138,13 +1164,14 @@ mod tests {
             }
         }
         let bin = install_gh_shim(&dir.join("bin"), &broken, &fake_gh).unwrap();
-        let out = std::process::Command::new(bin.join("gh"))
-            .arg("pr")
-            .env(ASKPASS_REPO_ENV, "o/r")
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            .output()
-            .unwrap();
+        let out = exec_waiting_out_busy(
+            std::process::Command::new(bin.join("gh"))
+                .arg("pr")
+                .env(ASKPASS_REPO_ENV, "o/r")
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN"),
+        )
+        .unwrap();
         // A mint that fails leaves GH_TOKEN unset rather than empty, so a box
         // with its own `gh auth login` keeps working.
         assert_eq!(
