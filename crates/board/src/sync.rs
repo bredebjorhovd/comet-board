@@ -233,6 +233,14 @@ pub mod meta {
     pub fn rewritten_noted(attempt: i64) -> String {
         format!("rewritten:{attempt}")
     }
+    /// What became of the last stack call the board made (gh#387) —
+    /// [`crate::stacks::Asked`], which is both the "asked already" mark and the
+    /// retry budget. Keyed by [`crate::stacks::StackWork::signature`] rather
+    /// than by an attempt: two chains can share a bottom layer, and what a
+    /// budget is spent on is a *request*.
+    pub fn stack_asked(signature: &str) -> String {
+        format!("stack:{signature}")
+    }
     /// What the last settle notice about an attempt asserted (§gh#356) —
     /// [`crate::notify::Signal::settle_print`]. Like `rewritten:`, it holds the
     /// claim rather than a timestamp: it is both the "said already" mark and
@@ -408,6 +416,10 @@ impl SyncEngine {
     ) -> Result<Vec<PullRequest>> {
         self.poll_linear();
         let pulls = self.poll_github();
+        // Straight after the poll that linked them: a chain `--onto` cut
+        // becomes a stack GitHub will take at the moment its last pull request
+        // turns up, and this cycle is the one that just saw it (gh#387).
+        self.link_dispatched_stacks();
         if let Some(runtime) = runtime
             && let Err(e) = self.adopt_session_pull_requests(&pulls, runtime)
         {
@@ -2610,6 +2622,103 @@ impl SyncEngine {
         }
         self.db.set_attempt_cache_swept(attempt.id)?;
         Ok(())
+    }
+
+    // ---- telling GitHub about a chain the board cut (gh#387) -------------
+
+    /// Make the chains `--onto` built into GitHub stacks.
+    ///
+    /// `--onto` does everything it documents — cuts each branch from the one
+    /// below, opens each pull request against it, records the edge on the
+    /// attempt — and creates no stack, so GitHub's `stack` object is absent,
+    /// [`crate::stacks::Stacks`] finds nothing to group, and the dependency
+    /// lives in the branch bases and nowhere else. Until somebody ran `gh stack
+    /// link` by hand, a board where every stacks feature worked had never once
+    /// produced a stack.
+    ///
+    /// It cannot happen at dispatch, which is the whole reason it is here: a
+    /// stack is made of pull requests, and at dispatch there is not one yet.
+    /// The chain becomes stackable at some unpredictable point afterwards —
+    /// when the last agent opens its pull request — so the board watches for
+    /// that the way it watches for everything else, on the cycle that has just
+    /// polled the pull requests.
+    ///
+    /// What keeps it from being a write on a loop:
+    ///
+    /// - **Nothing to send is the ordinary answer.** [`crate::stacks::unlinked`]
+    ///   plans from board rows alone, and a chain already stacked, half-open, or
+    ///   not adjacent yet plans to nothing at all.
+    /// - **One request is sent once**, and a refused one at most
+    ///   [`crate::stacks::LINK_TRIES`] times — [`crate::stacks::Asked`], stored
+    ///   under [`meta::stack_asked`]. A chain that grows a layer is a different
+    ///   request and gets its own budget.
+    /// - **A refusal costs the chain, never the cycle.** GitHub validates the
+    ///   base refs itself, and it is right to when the board's picture of them
+    ///   is one poll old.
+    fn link_dispatched_stacks(&self) {
+        let Some(gh) = &self.github else {
+            return;
+        };
+        let tasks = match self.db.load_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .error(format!("stack linking: reading the board: {e}"));
+                return;
+            }
+        };
+        for work in crate::stacks::unlinked(&tasks) {
+            let key = meta::stack_asked(&work.signature());
+            let mark = self
+                .db
+                .meta_get(&key)
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(crate::stacks::Asked::parse);
+            if !crate::stacks::worth_asking(mark) {
+                continue;
+            }
+            let layers = work.layers().join(", ");
+            let pulls = work
+                .pulls()
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sent = match &work {
+                crate::stacks::StackWork::Create { repo, pulls, .. } => gh
+                    .create_stack(repo, pulls)
+                    .map(|stack| format!("{layers} are {repo} stack {stack}")),
+                crate::stacks::StackWork::Add {
+                    repo, stack, pulls, ..
+                } => gh
+                    .add_to_stack(repo, *stack, pulls)
+                    .map(|()| format!("{layers} joined {repo} stack {stack}")),
+            };
+            let asked = match sent {
+                Ok(said) => {
+                    self.log.info(format!(
+                        "{said} — {pulls} was dispatched onto the branch below it \
+                         and GitHub had never been told",
+                    ));
+                    crate::stacks::Asked::Linked
+                }
+                Err(e) => {
+                    let asked = crate::stacks::Asked::refused_again(mark);
+                    let crate::stacks::Asked::Refused(spent) = asked else {
+                        unreachable!("a refusal is a refusal")
+                    };
+                    self.log.warn(format!(
+                        "stacking {layers} in {}: {e:#} (attempt {spent} of {})",
+                        work.repo(),
+                        crate::stacks::LINK_TRIES,
+                    ));
+                    asked
+                }
+            };
+            let _ = self.db.meta_set(&key, &asked.render());
+        }
     }
 
     // ---- surviving the parent's merge (gh#286) ---------------------------
@@ -12165,5 +12274,159 @@ max_duration = "{max_duration}"
         let e = engine(None);
         e.note_rewritten_branches(None);
         assert!(e.db.meta_get(&meta::rewritten_noted(1)).unwrap().is_none());
+    }
+
+    // ---- telling GitHub about a chain the board cut (gh#387) ------------
+
+    /// A `--onto` dispatch as the board holds it once the agent has opened its
+    /// pull request: an attempt cut from `onto`, and a pull request based on
+    /// that attempt's branch — and no stack anywhere.
+    fn seed_onto(e: &SyncEngine, number: i64, pr: i64, base: &str, onto: Option<i64>) -> i64 {
+        let id = format!("gh:o/r#{number}");
+        seed_gh_in(e, &id);
+        let branch = format!("board/gh-{number}-x");
+        let attempt =
+            e.db.insert_attempt(&crate::db::NewAttempt {
+                task_id: id.clone(),
+                branch: Some(branch.clone()),
+                stacked_on: onto,
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        e.db.set_pr(
+            &id,
+            Some(&format!("https://github.com/o/r/pull/{pr}")),
+            Some(pr),
+            true,
+        )
+        .unwrap();
+        e.db.set_pr_topology(&id, Some(base), Some(&branch), None)
+            .unwrap();
+        attempt
+    }
+
+    /// An engine whose GitHub answers a stack create, and the fixture the test
+    /// reads the request back off.
+    fn engine_that_can_stack() -> (SyncEngine, std::rc::Rc<FixtureRest>) {
+        let rest = std::rc::Rc::new(FixtureRest::new(vec![(
+            "POST /repos/o/r/stacks".into(),
+            json!({ "id": 334176, "number": 49, "base": { "ref": "main" } }),
+        )]));
+        let e = engine_with(None, Some(Github::new(Box::new(SharedRest(rest.clone())))));
+        (e, rest)
+    }
+
+    /// The fixture, still readable after the engine has boxed it away.
+    struct SharedRest(std::rc::Rc<FixtureRest>);
+
+    impl Rest for SharedRest {
+        fn get(&self, path: &str) -> Result<Value> {
+            self.0.get(path)
+        }
+        fn post(&self, path: &str, body: &Value) -> Result<Value> {
+            self.0.post(path, body)
+        }
+        fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+            self.0.patch(path, body)
+        }
+        fn put(&self, path: &str, body: &Value) -> Result<Value> {
+            self.0.put(path, body)
+        }
+    }
+
+    /// The headline, end to end: two tasks the board cut from each other, and
+    /// the sweep sends GitHub the one call that makes them a stack — bottom
+    /// first, in the repository the task ids name.
+    #[test]
+    fn a_chain_the_board_cut_is_stacked_on_github() {
+        let (e, rest) = engine_that_can_stack();
+        let bottom = seed_onto(&e, 44, 47, "main", None);
+        seed_onto(&e, 45, 48, "board/gh-44-x", Some(bottom));
+
+        e.link_dispatched_stacks();
+
+        let wrote = rest.wrote.borrow().clone();
+        assert_eq!(wrote.len(), 1, "{wrote:?}");
+        assert_eq!(wrote[0].0, "POST");
+        assert_eq!(wrote[0].1, "/repos/o/r/stacks");
+        assert_eq!(wrote[0].2, json!({ "pull_requests": [47, 48] }));
+    }
+
+    /// And it is sent once. The poll that would prove the stack landed is a
+    /// whole cycle away, and a sweep that filled that window with retries would
+    /// be a write on a loop.
+    #[test]
+    fn the_same_stack_is_never_asked_for_twice() {
+        let (e, rest) = engine_that_can_stack();
+        let bottom = seed_onto(&e, 44, 47, "main", None);
+        seed_onto(&e, 45, 48, "board/gh-44-x", Some(bottom));
+
+        e.link_dispatched_stacks();
+        e.link_dispatched_stacks();
+        e.link_dispatched_stacks();
+
+        assert_eq!(rest.wrote.borrow().len(), 1);
+        assert_eq!(
+            e.db.meta_get(&meta::stack_asked("create:o/r:47,48"))
+                .unwrap()
+                .as_deref(),
+            Some("linked"),
+            "and what was asked for is on the record",
+        );
+    }
+
+    /// A refusal is retried, and then the chain is left alone — a repository
+    /// with stacks switched off must not be asked at the poll interval for as
+    /// long as the board is up.
+    #[test]
+    fn a_refused_stack_stops_after_its_budget() {
+        // No `POST /repos/o/r/stacks` route, so the fixture answers `Null`
+        // and `create_stack` finds no number in it — a refusal, as far as the
+        // sweep is concerned.
+        let rest = std::rc::Rc::new(FixtureRest::new(vec![]));
+        let e = engine_with(None, Some(Github::new(Box::new(SharedRest(rest.clone())))));
+        let bottom = seed_onto(&e, 44, 47, "main", None);
+        seed_onto(&e, 45, 48, "board/gh-44-x", Some(bottom));
+
+        for _ in 0..6 {
+            e.link_dispatched_stacks();
+        }
+        assert_eq!(
+            rest.wrote.borrow().len(),
+            crate::stacks::LINK_TRIES as usize,
+        );
+
+        // The chain growing a layer is a different request, and asks again.
+        seed_onto(&e, 46, 50, "board/gh-45-x", Some(bottom + 1));
+        e.link_dispatched_stacks();
+        assert_eq!(
+            rest.wrote.borrow().last().unwrap().2,
+            json!({ "pull_requests": [47, 48, 50] }),
+        );
+    }
+
+    /// A board with no GitHub credential has nobody to tell, and an ordinary
+    /// dispatch is not a chain: neither costs a call.
+    #[test]
+    fn nothing_is_sent_for_a_board_with_no_chain_to_stack() {
+        let (e, rest) = engine_that_can_stack();
+        seed_onto(&e, 44, 47, "main", None);
+        e.link_dispatched_stacks();
+        assert!(rest.wrote.borrow().is_empty());
+
+        let e = engine(None);
+        e.link_dispatched_stacks();
     }
 }

@@ -139,7 +139,9 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
   branch and targets its PR there, so the follow-up's diff is only its own. The
   parent must have PUSHED — a dispatch branches from origin, so an unpushed
   parent refuses rather than cutting from trunk. `--base <branch>` is the same
-  for a branch no board task holds; passing both is refused.
+  for a branch no board task holds; passing both is refused. Once every layer's
+  PR is open the board makes the chain a real GitHub stack itself, on a sync
+  cycle — do not run `gh stack link`.
 - Cancel ends the attempt, not the issue; the row returns to ready.
 - **`--stack`** asks the agent to decompose its task into a stack of layered
   pull requests (`gh stack`), one dependent concern per layer, reviewed in

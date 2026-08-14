@@ -33,6 +33,21 @@
 //! board as one attempt's work rather than as strangers, and the block of brief
 //! that tells a dispatched agent to write one. See [`layer_branch`].
 //!
+//! …and then a third half (gh#387), which is what makes the first two meet.
+//! `dispatch --onto` builds a chain and creates no stack: it cuts each branch
+//! from the one below, opens each pull request against it, records the edge on
+//! the attempt — and **never tells GitHub**, so the `stack` object the grouping
+//! above keys on does not exist and the dependency lives in the branch bases
+//! and nowhere else. Every stacks feature working and no dispatch ever creating
+//! a stack is the worst version of this. See [`unlinked`], which is the request
+//! the board owes GitHub, and [`crate::sync::SyncEngine::link_dispatched_stacks`],
+//! which sends it.
+//!
+//! The board's own record of the chain was never the missing piece and is not
+//! added here: [`crate::model::Attempt::stacked_on`] has held it since gh#285,
+//! which is exactly why this can be planned from board rows alone and why a
+//! retry or a question about ordering already has something to consult.
+//!
 //! [`landing`]: comet_proto::view::board::landing
 
 use std::collections::HashMap;
@@ -432,6 +447,384 @@ pub fn stack_brief(branch: &str, base: Option<&str>) -> String {
          — it installs for the whole box and your GitHub credential is the \
          board's, so it needs no login of yours — and carry on."
     )
+}
+
+// ---- telling GitHub about a chain the board cut (gh#387) -----------------
+
+/// One layer of a chain the board dispatched, as the stack call needs to see
+/// it.
+///
+/// Everything here is read off the [`Task`] row rather than off the attempt: by
+/// the time there is a stack to make, what matters is the *pull request* — its
+/// number, whether it is still open, and the two refs GitHub validates the
+/// chain against. The attempt's only job was to say which rows are in the
+/// chain and in what order, and [`chains`] has already spent it by then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer {
+    pub id: String,
+    pub identifier: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub base_ref: String,
+    pub head_ref: String,
+    /// The stack GitHub already has this pull request in, if any.
+    pub stack: Option<i64>,
+}
+
+/// The one call a chain needs to become a stack, or to catch up with one.
+///
+/// Deliberately not "a stack the board wants": it is a *request*, already
+/// checked against everything the board can check locally, so the sweep that
+/// executes it holds no policy at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StackWork {
+    /// `POST /repos/{repo}/stacks` — nothing in this chain is stacked yet.
+    Create {
+        repo: String,
+        /// Bottom first, as GitHub takes them.
+        pulls: Vec<i64>,
+        /// The rows those pull requests belong to, in the same order, for the
+        /// log line. A reader chasing a chain wants `gh#45`, not `PR #48`.
+        layers: Vec<String>,
+    },
+    /// `POST /repos/{repo}/stacks/{stack}/add` — the bottom of this chain is
+    /// already a stack and the layers above it are not in it yet.
+    Add {
+        repo: String,
+        stack: i64,
+        pulls: Vec<i64>,
+        layers: Vec<String>,
+    },
+}
+
+impl StackWork {
+    pub fn repo(&self) -> &str {
+        match self {
+            StackWork::Create { repo, .. } | StackWork::Add { repo, .. } => repo,
+        }
+    }
+
+    /// The pull requests this call sends, bottom first.
+    pub fn pulls(&self) -> &[i64] {
+        match self {
+            StackWork::Create { pulls, .. } | StackWork::Add { pulls, .. } => pulls,
+        }
+    }
+
+    /// The rows behind them, in the same order.
+    pub fn layers(&self) -> &[String] {
+        match self {
+            StackWork::Create { layers, .. } | StackWork::Add { layers, .. } => layers,
+        }
+    }
+
+    /// A name for this call, and the key the sweep remembers it under.
+    ///
+    /// Everything that would change what GitHub is sent is in it — the verb,
+    /// the repository, the stack being extended, the pull requests — and
+    /// nothing else is: never a timestamp, never a counter. That is the whole
+    /// property the memory needs. An unchanged world produces an unchanged
+    /// string and no second call; a chain that has grown a layer produces a
+    /// different one, which is a different request and gets a budget of its
+    /// own.
+    ///
+    /// It is the key rather than a key *derived* from the chain because two
+    /// chains can share a bottom layer — a fan, two dispatches cut from one
+    /// sibling — and a key that named only the bottom would have them
+    /// overwriting each other's memory and each retrying the other's budget.
+    pub fn signature(&self) -> String {
+        let verb = match self {
+            StackWork::Create { .. } => "create".to_string(),
+            StackWork::Add { stack, .. } => format!("add:{stack}"),
+        };
+        format!(
+            "{verb}:{}:{}",
+            self.repo(),
+            self.pulls()
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+/// Every chain `--onto` built, bottom first, as task ids.
+///
+/// **Only the dispatched edge** ([`crate::model::Attempt::stacked_on`]), never
+/// GitHub's own stack object. That is the whole scope of gh#387: the board cut
+/// these branches from each other and opened each pull request against the one
+/// below it, and then told nobody. Reading GitHub's topology back in here would
+/// have the board proposing to restack pull requests somebody else's tool
+/// arranged, which is not a repair — it is a second opinion nobody asked for.
+///
+/// A fan — two dispatches cut from one sibling — is two chains, because it is
+/// two stacks. GitHub stacks are linear, and a stack holding both halves of a
+/// fork would be a claim that one of them sits on the other.
+pub fn chains(tasks: &[Task]) -> Vec<Vec<String>> {
+    let owner: HashMap<i64, &str> = tasks
+        .iter()
+        .flat_map(|t| t.attempts.iter().map(move |a| (a.id, t.id.as_str())))
+        .collect();
+    // child → parent. Newest attempt wins, the way `Dependents` reads it: a
+    // retry cut from somewhere else is where this row's branch stands now.
+    let mut parent: HashMap<&str, &str> = HashMap::new();
+    for task in tasks {
+        for attempt in &task.attempts {
+            let Some(on) = attempt.stacked_on.and_then(|id| owner.get(&id)) else {
+                continue;
+            };
+            if *on != task.id {
+                parent.insert(task.id.as_str(), on);
+            }
+        }
+    }
+    let has_child: std::collections::HashSet<&str> = parent.values().copied().collect();
+
+    let mut out = Vec::new();
+    // One chain per leaf, walked down to its root. A row that is somebody's
+    // parent is in its child's chain already.
+    for task in tasks {
+        let leaf = task.id.as_str();
+        if has_child.contains(leaf) || !parent.contains_key(leaf) {
+            continue;
+        }
+        let mut chain = vec![leaf];
+        let mut at = leaf;
+        // A malformed edge — two rows each recorded as the other's parent —
+        // must cost a short chain, never a hung sweep. There cannot be more
+        // layers than there are rows.
+        while let Some(next) = parent.get(at) {
+            if chain.len() > tasks.len() || chain.contains(next) {
+                break;
+            }
+            chain.push(next);
+            at = next;
+        }
+        chain.reverse();
+        out.push(chain.into_iter().map(str::to_string).collect());
+    }
+    // Stable, so two cycles plan the same chains in the same order and a log
+    // line does not reshuffle.
+    out.sort();
+    out
+}
+
+/// The runs of a chain that GitHub would accept as a stack.
+///
+/// A chain the board cut is not automatically a stack GitHub will take, and
+/// every reason it might not be is a reason to *narrow* rather than to refuse:
+///
+/// - **A layer with no pull request yet.** The agent has not opened one, or it
+///   opened one the board has not polled. The layers below it are still a
+///   stack, and the one above will be added on the cycle after its pull request
+///   turns up.
+/// - **A layer that is closed.** A merged parent has had its branch deleted and
+///   its children retargeted; it cannot be in a new stack, and it is not in the
+///   way of one either.
+/// - **A layer in another repository.** A stack is scoped to a repository, the
+///   way [`stack_key`] is scoped, and for the same reason.
+/// - **A base ref that is not the layer below's head ref.** GitHub's own
+///   validation, checked here so the board does not spend a call learning it.
+///   It is the ordinary state of a chain mid-flight: a retarget, a rename, an
+///   agent that branched from trunk after all.
+///
+/// So: split the chain wherever a layer fails one of those, and answer the runs
+/// that survive, in order, bottom first.
+pub fn segments(chain: &[&Task]) -> Vec<Vec<Layer>> {
+    let mut out: Vec<Vec<Layer>> = Vec::new();
+    let mut run: Vec<Layer> = Vec::new();
+    for task in chain {
+        let usable = layer_of_task(task).filter(|layer| match run.last() {
+            // Same repository, and sitting on the layer below.
+            Some(below) => layer.repo == below.repo && layer.base_ref == below.head_ref,
+            None => true,
+        });
+        match usable {
+            Some(layer) => run.push(layer),
+            None => {
+                // The break costs the run, not the chain: whatever is above it
+                // may still stack among itself.
+                out.push(std::mem::take(&mut run));
+                if let Some(layer) = layer_of_task(task) {
+                    run.push(layer);
+                }
+            }
+        }
+    }
+    out.push(run);
+    out.retain(|run| run.len() > 1);
+    out
+}
+
+/// One row as a [`Layer`], or `None` when it is not stackable at all: no open
+/// pull request, or no repository to scope it to.
+fn layer_of_task(task: &Task) -> Option<Layer> {
+    if !task.pr_open {
+        return None;
+    }
+    let repo = crate::model::gh_repo(&task.id)
+        .map(str::to_string)
+        .or_else(|| crate::model::pr_repo(task.pr_url.as_deref()?))?;
+    Some(Layer {
+        id: task.id.clone(),
+        identifier: task.identifier.clone(),
+        repo,
+        pr_number: task.pr_number?,
+        base_ref: task.pr_base_ref.clone()?,
+        head_ref: task.pr_head_ref.clone()?,
+        stack: task.pr_stack.as_ref().map(|s| s.number),
+    })
+}
+
+/// What one run of stackable layers still needs said to GitHub, or `None` when
+/// it needs nothing.
+///
+/// Three answers, and the third is the important one:
+///
+/// - Nothing stacked → [`StackWork::Create`] for the whole run. This is the
+///   second `--onto` in a chain, and the case gh#387 was filed on.
+/// - A stacked prefix and unstacked layers above it →
+///   [`StackWork::Add`]. This is the third `--onto` and every one after it: the
+///   stack exists, and this dispatch is another layer on top of it.
+/// - **Anything else → `None`.** A run whose layers name two different stacks,
+///   or one where a stacked layer sits above an unstacked one, is a topology
+///   somebody else arranged. The board may complete a chain it cut; it may not
+///   rearrange one it did not, and a request that would has to be nothing at
+///   all rather than a best guess.
+pub fn plan(run: &[Layer]) -> Option<StackWork> {
+    if run.len() < 2 {
+        return None;
+    }
+    let stacked = run.iter().take_while(|l| l.stack.is_some()).count();
+    let (below, above) = run.split_at(stacked);
+    // Above the prefix, nothing may already be in a stack — that is the "not
+    // ours to rearrange" case, and it is also what makes the prefix a prefix.
+    if above.iter().any(|l| l.stack.is_some()) {
+        return None;
+    }
+    if above.is_empty() {
+        // Every layer is already stacked. One stack or several, there is
+        // nothing for the board to add either way.
+        return None;
+    }
+    let repo = run[0].repo.clone();
+    let pulls: Vec<i64> = above.iter().map(|l| l.pr_number).collect();
+    let layers: Vec<String> = above.iter().map(|l| l.identifier.clone()).collect();
+    match below.split_first() {
+        // The prefix has to be one stack, and the layers above it join that
+        // one. A prefix spanning two stacks is the rearranging case again.
+        Some((first, rest)) => {
+            let stack = first.stack?;
+            rest.iter()
+                .all(|l| l.stack == Some(stack))
+                .then_some(StackWork::Add {
+                    repo,
+                    stack,
+                    pulls,
+                    layers,
+                })
+        }
+        None => Some(StackWork::Create {
+            repo,
+            pulls,
+            layers,
+        }),
+    }
+}
+
+/// How many times the board will ask GitHub for one particular stack before
+/// leaving it alone.
+///
+/// A budget rather than a single shot, because the honest failures here are
+/// transient — GitHub recomputing a base ref it has just been pushed, a poll
+/// that raced the agent's `gh pr create` — and a board that gave up on the first
+/// refusal would leave the chain unstacked for the sake of a five-second race.
+///
+/// A budget rather than forever, because the sweep runs every cycle and the
+/// dishonest failures here do not heal: a repository with stacks switched off,
+/// a credential without the permission, a preview that has moved under us. None
+/// of those gets better by being asked again at the poll interval for as long
+/// as the board is up.
+///
+/// Spending it is not the end of the chain: any change to what the board would
+/// send — one more layer, a different pull request — is a different request and
+/// starts a fresh budget. See [`Asked`].
+pub const LINK_TRIES: i64 = 3;
+
+/// What became of one request the sweep has already made — stored under its
+/// [`StackWork::signature`], so a request that has not changed reads its own
+/// history back.
+///
+/// The sweep is a *write* on a loop, so the interesting question is not what to
+/// send but when to shut up. This is both answers: a request that succeeded is
+/// never sent twice, and a request that is refused is sent [`LINK_TRIES`] times
+/// and then dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// GitHub took it. The poll that will prove the stack landed may be a whole
+    /// cycle away, and the board must not fill that window with retries.
+    Linked,
+    /// GitHub refused it, this many times.
+    Refused(i64),
+}
+
+impl Asked {
+    /// As stored — `linked`, or `refused <n>`. A value this cannot read is
+    /// treated as no mark at all: a board upgraded into a new spelling asks
+    /// once more, which is the safe direction.
+    pub fn render(&self) -> String {
+        match self {
+            Asked::Linked => "linked".to_string(),
+            Asked::Refused(n) => format!("refused {n}"),
+        }
+    }
+
+    pub fn parse(stored: &str) -> Option<Asked> {
+        let mut words = stored.split_whitespace();
+        match words.next()? {
+            "linked" => Some(Asked::Linked),
+            "refused" => Some(Asked::Refused(words.next()?.parse().ok()?)),
+            _ => None,
+        }
+    }
+
+    /// This mark, plus one more refusal.
+    pub fn refused_again(mark: Option<Asked>) -> Asked {
+        match mark {
+            Some(Asked::Refused(n)) => Asked::Refused(n + 1),
+            _ => Asked::Refused(1),
+        }
+    }
+}
+
+/// Is a request worth sending, given what the board remembers about it?
+///
+/// Nothing remembered is always worth sending — nobody has asked yet, or the
+/// chain has changed shape and this is a request that has never been made.
+/// Otherwise: only while the budget holds, and never once it has been taken.
+pub fn worth_asking(mark: Option<Asked>) -> bool {
+    match mark {
+        None => true,
+        Some(Asked::Linked) => false,
+        Some(Asked::Refused(n)) => n < LINK_TRIES,
+    }
+}
+
+/// Every stack call one board's worth of tasks is owed — [`chains`],
+/// [`segments`] and [`plan`] in the one order they are ever used in.
+pub fn unlinked(tasks: &[Task]) -> Vec<StackWork> {
+    let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    chains(tasks)
+        .iter()
+        .flat_map(|chain| {
+            let rows: Vec<&Task> = chain
+                .iter()
+                .filter_map(|id| by_id.get(id.as_str()).copied())
+                .collect();
+            segments(&rows).into_iter().filter_map(|run| plan(&run))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1055,5 +1448,323 @@ mod tests {
         let brief = stack_brief("board/gh-12-widget", Some("release-1.x"));
         assert!(brief.contains("gh stack init board/gh-12-widget --base release-1.x"));
         assert_eq!(brief.matches("--base").count(), 1);
+    }
+
+    // ---- telling GitHub about a chain the board cut (gh#387) ------------
+
+    /// One row of a chain `--onto` built, in the state the board holds it in
+    /// after the agent has opened its pull request: a branch cut from the layer
+    /// below, a pull request based on it — and no stack.
+    ///
+    /// The numbers are the ones the issue was filed with, so a reader can put
+    /// this beside the transcript in it.
+    fn dispatched(issue: i64, pr: i64, base: &str, attempt: i64, onto: Option<i64>) -> Task {
+        let branch = format!("board/gh-{issue}-x");
+        Task {
+            id: format!("gh:Florin-AS/orion-productmapping#{issue}"),
+            identifier: format!("gh#{issue}"),
+            url: format!("https://github.com/Florin-AS/orion-productmapping/issues/{issue}"),
+            pr_url: Some(format!(
+                "https://github.com/Florin-AS/orion-productmapping/pull/{pr}"
+            )),
+            pr_number: Some(pr),
+            pr_base_ref: Some(base.to_string()),
+            pr_head_ref: Some(branch.clone()),
+            pr_stack: None,
+            attempts: vec![crate::model::Attempt {
+                id: attempt,
+                task_id: format!("gh:Florin-AS/orion-productmapping#{issue}"),
+                branch: Some(branch),
+                stacked_on: onto,
+                ..crate::model::tests::blank_attempt()
+            }],
+            ..layer(
+                "Florin-AS/orion-productmapping",
+                pr,
+                1,
+                1,
+                base,
+                Some("clean"),
+            )
+        }
+    }
+
+    /// The three-layer chain from the issue, before anybody linked it: PR 47 on
+    /// `main`, PR 48 on 47's branch, PR 50 on 48's.
+    fn the_chain() -> Vec<Task> {
+        vec![
+            dispatched(44, 47, "main", 1, None),
+            dispatched(45, 48, "board/gh-44-x", 2, Some(1)),
+            dispatched(46, 50, "board/gh-45-x", 3, Some(2)),
+        ]
+    }
+
+    /// The headline. Three tasks the board cut from each other, each pull
+    /// request open against the branch below it, and GitHub holding no stack —
+    /// exactly what `--onto` produced on the day this was filed. One call makes
+    /// it a stack.
+    #[test]
+    fn a_chain_dispatched_with_onto_is_a_stack_waiting_to_be_created() {
+        let tasks = the_chain();
+        assert!(
+            Stacks::of(&tasks).row_stack(&tasks[2]).is_none(),
+            "GitHub has not been told, so there is nothing to group on",
+        );
+        assert_eq!(
+            unlinked(&tasks),
+            vec![StackWork::Create {
+                repo: "Florin-AS/orion-productmapping".into(),
+                pulls: vec![47, 48, 50],
+                layers: vec!["gh#44".into(), "gh#45".into(), "gh#46".into()],
+            }],
+        );
+    }
+
+    /// The order is the dependency, bottom first, whichever order the rows come
+    /// back in. GitHub validates the chain against it and a stack built upside
+    /// down would be a different stack.
+    #[test]
+    fn the_layers_are_sent_bottom_first_whatever_order_the_board_holds_them_in() {
+        let mut tasks = the_chain();
+        tasks.reverse();
+        assert_eq!(unlinked(&tasks)[0].pulls(), [47, 48, 50]);
+    }
+
+    /// The second dispatch is what creates the stack; the third and every one
+    /// after it joins the one that exists. Both halves of the sequence the
+    /// issue watched, in the order it watched them.
+    #[test]
+    fn a_layer_dispatched_onto_an_existing_stack_is_added_to_it() {
+        let mut tasks = the_chain();
+        for (position, task) in tasks.iter_mut().take(2).enumerate() {
+            task.pr_stack = Some(PrStack {
+                number: 49,
+                size: Some(2),
+                position: Some(position as i64 + 1),
+                base_ref: Some("main".into()),
+            });
+        }
+        assert_eq!(
+            unlinked(&tasks),
+            vec![StackWork::Add {
+                repo: "Florin-AS/orion-productmapping".into(),
+                stack: 49,
+                pulls: vec![50],
+                layers: vec!["gh#46".into()],
+            }],
+        );
+    }
+
+    /// And once GitHub holds the whole chain there is nothing left to ask for —
+    /// the state the sweep is in on every cycle for the rest of the chain's
+    /// life.
+    #[test]
+    fn a_chain_github_already_holds_asks_for_nothing() {
+        let mut tasks = the_chain();
+        for (position, task) in tasks.iter_mut().enumerate() {
+            task.pr_stack = Some(PrStack {
+                number: 49,
+                size: Some(3),
+                position: Some(position as i64 + 1),
+                base_ref: Some("main".into()),
+            });
+        }
+        assert!(unlinked(&tasks).is_empty());
+    }
+
+    /// A chain mid-flight: the top layer's agent has not opened its pull
+    /// request yet. The two below it are still a stack, and the third joins on
+    /// whichever cycle first sees its pull request.
+    #[test]
+    fn a_layer_with_no_pull_request_yet_leaves_the_ones_below_it_stackable() {
+        let mut tasks = the_chain();
+        tasks[2].pr_number = None;
+        tasks[2].pr_url = None;
+        tasks[2].pr_open = false;
+        assert_eq!(unlinked(&tasks)[0].pulls(), [47, 48]);
+    }
+
+    /// Nothing is a stack of one. A chain whose only open layer is the bottom
+    /// one has nothing to say to GitHub, and saying it would be a 422.
+    #[test]
+    fn one_layer_is_a_pull_request_rather_than_a_stack() {
+        let mut tasks = the_chain();
+        tasks[1].pr_number = None;
+        tasks[2].pr_number = None;
+        assert!(unlinked(&tasks).is_empty());
+    }
+
+    /// GitHub's own rule, checked before the call rather than learned from it:
+    /// a layer's base ref has to be the branch below it. A chain whose middle
+    /// layer was retargeted onto trunk is two chains, and only the part that is
+    /// still adjacent is asked for.
+    #[test]
+    fn a_layer_that_is_no_longer_based_on_the_one_below_breaks_the_run() {
+        let mut tasks = the_chain();
+        tasks[1].pr_base_ref = Some("main".into());
+        assert_eq!(
+            unlinked(&tasks),
+            vec![StackWork::Create {
+                repo: "Florin-AS/orion-productmapping".into(),
+                pulls: vec![48, 50],
+                layers: vec!["gh#45".into(), "gh#46".into()],
+            }],
+            "the top two still sit on each other",
+        );
+    }
+
+    /// A layer that has landed is not in a new stack and is not in the way of
+    /// one: GitHub retargets its children onto its own base, and the same walk
+    /// that reads past it elsewhere reads past it here.
+    #[test]
+    fn a_merged_bottom_layer_leaves_the_open_ones_above_to_stack_among_themselves() {
+        let mut tasks = the_chain();
+        tasks[0].pr_open = false;
+        tasks[0].pr_merged = true;
+        tasks[1].pr_base_ref = Some("main".into());
+        assert_eq!(unlinked(&tasks)[0].pulls(), [48, 50]);
+    }
+
+    /// A stack is scoped to a repository the way every other stack fact is. Two
+    /// repositories in one chain is not a deeper stack, it is two.
+    #[test]
+    fn a_chain_never_crosses_a_repository() {
+        let mut tasks = the_chain();
+        tasks[2].id = "gh:other/repo#46".into();
+        tasks[2].pr_url = Some("https://github.com/other/repo/pull/50".into());
+        tasks[2].attempts[0].task_id = "gh:other/repo#46".into();
+        let work = unlinked(&tasks);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].pulls(), [47, 48]);
+        assert_eq!(work[0].repo(), "Florin-AS/orion-productmapping");
+    }
+
+    /// The board completes a chain it cut. It does not rearrange one somebody
+    /// else's tool built: a run whose upper layers are already in a stack of
+    /// their own is left exactly as it is, rather than restacked on a
+    /// best guess.
+    #[test]
+    fn a_topology_somebody_else_arranged_is_left_alone() {
+        let mut tasks = the_chain();
+        tasks[2].pr_stack = Some(PrStack {
+            number: 88,
+            size: Some(1),
+            position: Some(1),
+            base_ref: Some("main".into()),
+        });
+        assert!(unlinked(&tasks).is_empty());
+
+        // …and so is a prefix that names two different stacks.
+        let mut tasks = the_chain();
+        for (i, number) in [(0usize, 61), (1, 62)] {
+            tasks[i].pr_stack = Some(PrStack {
+                number,
+                size: Some(1),
+                position: Some(1),
+                base_ref: Some("main".into()),
+            });
+        }
+        assert!(unlinked(&tasks).is_empty());
+    }
+
+    /// Two dispatches cut from one sibling are a fork, and GitHub stacks are
+    /// linear. Two stacks, never one that claims either half sits on the other.
+    #[test]
+    fn a_fan_is_two_stacks() {
+        let mut tasks = the_chain();
+        // The third layer was cut from the first, not the second.
+        tasks[2].attempts[0].stacked_on = Some(1);
+        tasks[2].pr_base_ref = Some("board/gh-44-x".into());
+        let work = unlinked(&tasks);
+        assert_eq!(work.len(), 2);
+        assert_eq!(work[0].pulls(), [47, 48]);
+        assert_eq!(work[1].pulls(), [47, 50]);
+    }
+
+    /// An ordinary dispatch is not a chain and costs no call at all — the state
+    /// nearly every row on the board is in.
+    #[test]
+    fn a_dispatch_that_was_not_stacked_asks_for_nothing() {
+        let tasks = vec![dispatched(44, 47, "main", 1, None)];
+        assert!(chains(&tasks).is_empty());
+        assert!(unlinked(&tasks).is_empty());
+    }
+
+    /// Two rows each recorded as the other's parent must cost a short chain,
+    /// never a hung sweep.
+    #[test]
+    fn a_malformed_edge_costs_a_short_chain_rather_than_a_loop() {
+        let mut tasks = the_chain();
+        tasks[0].attempts[0].stacked_on = Some(3);
+        assert!(unlinked(&tasks).len() <= 1);
+    }
+
+    // ---- asking once, and giving up (gh#387) ----------------------------
+
+    fn create(pulls: Vec<i64>) -> StackWork {
+        StackWork::Create {
+            repo: "o/r".into(),
+            pulls,
+            layers: vec![],
+        }
+    }
+
+    /// The mark survives the round trip through `meta`, both ways it can read.
+    #[test]
+    fn what_the_board_remembers_about_a_request_survives_being_stored() {
+        for mark in [Asked::Linked, Asked::Refused(2)] {
+            assert_eq!(Asked::parse(&mark.render()), Some(mark));
+        }
+        assert_eq!(Asked::parse("something a later board wrote"), None);
+    }
+
+    /// A request GitHub took is never sent again — the poll that would prove it
+    /// landed may be a whole cycle away, and the board must not fill that
+    /// window with retries.
+    #[test]
+    fn a_stack_the_board_already_made_is_not_asked_for_twice() {
+        assert!(worth_asking(None), "nobody has asked yet");
+        assert!(!worth_asking(Some(Asked::Linked)));
+    }
+
+    /// A refusal is retried, and then it is not. The honest failures here are
+    /// races that heal in seconds; the dishonest ones do not heal at all, and
+    /// the sweep runs every cycle.
+    #[test]
+    fn a_refused_request_is_retried_on_a_budget_and_then_dropped() {
+        let mut mark = None;
+        for spent in 1..=LINK_TRIES {
+            assert!(worth_asking(mark), "attempt {spent}");
+            mark = Some(Asked::refused_again(mark));
+        }
+        assert_eq!(mark, Some(Asked::Refused(LINK_TRIES)));
+        assert!(!worth_asking(mark), "the budget is spent");
+    }
+
+    /// Everything that would change what GitHub is sent is in the signature,
+    /// and nothing else is — so a chain that grew a layer is a different
+    /// request with a budget of its own, and giving up on one shape of a chain
+    /// is never giving up on the chain.
+    #[test]
+    fn a_chain_that_grew_a_layer_is_a_different_request() {
+        assert_ne!(
+            create(vec![47, 48]).signature(),
+            create(vec![47, 48, 50]).signature(),
+        );
+        assert_eq!(
+            create(vec![47, 48]).signature(),
+            create(vec![47, 48]).signature()
+        );
+    }
+
+    /// Two chains cut from one sibling must not overwrite each other's memory,
+    /// which a key naming only the bottom layer would have them do — each
+    /// retrying the other's budget, and neither ever recording its own.
+    #[test]
+    fn a_fans_two_chains_are_remembered_separately() {
+        assert_ne!(
+            create(vec![47, 48]).signature(),
+            create(vec![47, 50]).signature(),
+        );
     }
 }

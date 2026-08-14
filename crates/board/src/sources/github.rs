@@ -899,6 +899,61 @@ impl<T: Rest> Github<T> {
             .map(str::to_string)
     }
 
+    /// Make a stack out of pull requests that are already chained by their base
+    /// refs (gh#387).
+    ///
+    /// `pulls` is **bottom first**, and GitHub's own rule is the one the caller
+    /// has to have checked before getting here: each pull request's base ref
+    /// must be the one below it's head ref. Two is the minimum — a stack of one
+    /// is a pull request — and GitHub says so itself with a 422 rather than
+    /// inventing a degenerate stack.
+    ///
+    /// Answers the stack's number, which is what the board groups on
+    /// ([`crate::stacks`]). Read with [`parse_stack`] rather than by reaching
+    /// for `number`: the create response is the same stack object the pull
+    /// request list carries, and the preview is entitled to move that field on
+    /// both at once.
+    ///
+    /// The `X-GitHub-Api-Version` the transport stamps is not bumped for this,
+    /// for [`Github::merge_pr`]'s reason and with the same tell: the read half
+    /// of stacked pull requests already arrives on the version the board sends,
+    /// and if the write half ever stops, it shows up as a 404 on a path that
+    /// plainly exists.
+    pub fn create_stack(&self, repo: &str, pulls: &[i64]) -> Result<i64> {
+        let body = self
+            .rest
+            .post(
+                &format!("/repos/{repo}/stacks"),
+                &serde_json::json!({ "pull_requests": pulls }),
+            )
+            .with_context(|| format!("creating a stack of {} in {repo}", numbers(pulls)))?;
+        parse_stack(Some(&body)).map(|s| s.number).ok_or_else(|| {
+            anyhow!(
+                "github created a stack of {} in {repo} and named no number — \
+                 the next poll is what will report it",
+                numbers(pulls)
+            )
+        })
+    }
+
+    /// Put more layers on a stack that already exists (gh#387).
+    ///
+    /// `pulls` is bottom first again, and holds **only the new layers**: the
+    /// first of them has to sit on the stack's current top, which is the same
+    /// base-ref rule one layer along. Extending is a separate call from
+    /// creating because a chain the board grew one dispatch at a time reaches
+    /// this point already half-stacked — the second `--onto` creates, the third
+    /// and every one after it adds.
+    pub fn add_to_stack(&self, repo: &str, stack: i64, pulls: &[i64]) -> Result<()> {
+        self.rest
+            .post(
+                &format!("/repos/{repo}/stacks/{stack}/add"),
+                &serde_json::json!({ "pull_requests": pulls }),
+            )
+            .with_context(|| format!("adding {} to stack {stack} in {repo}", numbers(pulls)))?;
+        Ok(())
+    }
+
     /// Ask GitHub to merge a pull request, and answer with where that got to.
     ///
     /// Only ever from an explicit keypress with a confirmation — this is the
@@ -1297,6 +1352,17 @@ fn parse_stack(v: Option<&Value>) -> Option<PrStack> {
             .filter(|r| !r.is_empty())
             .map(str::to_string),
     })
+}
+
+/// Pull request numbers as a reader would say them — `PR #47, PR #48`. Only
+/// ever for the sentence attached to a stack call's failure, where the numbers
+/// *are* the diagnosis.
+fn numbers(pulls: &[i64]) -> String {
+    pulls
+        .iter()
+        .map(|n| format!("PR #{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Read an asynchronous merge's answer, whichever of its four shapes came back
