@@ -501,6 +501,17 @@ pub struct Attempt {
     /// live, or a line left in scrollback by a turn that died (gh#32).
     pub screen_print: Option<String>,
     pub screen_at: Option<String>,
+    /// How many times the board has restarted this attempt's run in its own
+    /// chat, after finding the chat alive with no run in it (gh#390).
+    ///
+    /// **Not a retry and not [`reopened`](Self::reopened).** A retry is a fresh
+    /// attempt in a fresh chat; a re-open is the board taking back a settle it
+    /// got wrong. This is the same attempt, the same chat and the same branch,
+    /// picked up after something outside the run killed it — an engine restart
+    /// above all, which used to close every live attempt on the box as
+    /// `orphaned`. Capped at [`crate::runs::MAX_RESUMES`], because a run that
+    /// cannot survive three starts is a fact about the box.
+    pub resumes: i64,
     /// How many times the board has typed a "carry on" into this pane for the
     /// stall it is currently in, and when the last one went (gh#40). Capped at
     /// [`crate::nudge::MAX_NUDGES`], and cleared once the pane has been moving
@@ -748,6 +759,7 @@ pub(crate) mod tests {
             saw_working: true,
             settled_at: None,
             reopened: 0,
+            resumes: 0,
             screen_print: None,
             screen_at: None,
             nudges: 0,

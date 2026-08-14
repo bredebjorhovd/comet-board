@@ -147,6 +147,14 @@ pub fn doctor(
     // the disk, and the two retentions are set in the same table.
     checks.push(chats_check(paths, db_ok.as_ref().ok()));
 
+    // …and whether anything this box starts survives long enough to be work
+    // (gh#390). Beside the two above because all three read the same table
+    // about the same attempts, and first among the board's own questions
+    // because it is the one that invalidates the others: a box where no run
+    // lives five minutes is a box whose every other check being green is the
+    // problem, not the reassurance.
+    checks.push(runs_check(db_ok.as_ref().ok(), chrono::Utc::now()));
+
     // Read once and used three times below — the credential's own check, the
     // review-state check, and the decision whether to mention Linear at all.
     let linear_key = linear_api_key(paths);
@@ -1891,6 +1899,94 @@ fn chats_check(paths: &Paths, db: Option<&Db>) -> Check {
             .collect::<Vec<_>>()
             .join(" · "),
     }
+}
+
+/// Does anything this box starts actually run (gh#390)?
+///
+/// The check that was missing on the morning of gh#390. Twelve attempts across
+/// three harnesses died within minutes of starting, one after another, and
+/// `doctor` reported every check ok — because every check was about
+/// *configuration*, and the configuration was fine. Nothing asked the one
+/// question an operator has when the board keeps handing back empty attempts:
+/// is this box still able to run anything at all?
+///
+/// It reads the board's own history rather than probing, because probing would
+/// answer a different question — a run doctor starts is not a run a dispatch
+/// starts, with its account, its sandbox and its worktree — and because the
+/// history is free. The rule and the thresholds are [`crate::runs::health`];
+/// this is the reading and the sentence.
+///
+/// A `FAIL` here means: stop dispatching to this box and look at the engine
+/// log. It is deliberately hard to trip — one attempt finishing anywhere in the
+/// window clears it — because an operator who learns to ignore this line has
+/// lost the only check that would have caught the night gh#390 describes.
+fn runs_check(db: Option<&Db>, now: chrono::DateTime<chrono::Utc>) -> Check {
+    let Some(db) = db else {
+        return Check {
+            name: "runs".into(),
+            ok: true,
+            detail: "not checked — the board database could not be opened".into(),
+        };
+    };
+    let since = crate::db::rfc3339(now - chrono::Duration::seconds(crate::runs::WINDOW_SECS));
+    let attempts = match db.attempts_since(&since) {
+        Ok(a) => a,
+        Err(e) => {
+            return Check {
+                name: "runs".into(),
+                ok: true,
+                detail: format!("not checked — reading recent attempts: {e:#}"),
+            };
+        }
+    };
+    let samples: Vec<crate::runs::Sample> = attempts
+        .iter()
+        // A live attempt is evidence that a run started, not yet evidence about
+        // how it ends. Counting one as a young death would fail the box for
+        // every dispatch made in the last five minutes.
+        .filter_map(|a| {
+            let ended = a.ended_at.as_deref()?;
+            Some(crate::runs::Sample {
+                lived_secs: span_secs(&a.started_at, ended).unwrap_or(0),
+                finished: a.outcome == Some(crate::model::Outcome::Done),
+            })
+        })
+        .collect();
+    let window = crate::runs::WINDOW_SECS / 3600;
+    match crate::runs::health(&samples) {
+        crate::runs::Health::Quiet => Check {
+            name: "runs".into(),
+            ok: true,
+            detail: format!("no attempt has finished in the last {window}h — nothing to judge"),
+        },
+        crate::runs::Health::Healthy { ran, young } => Check {
+            name: "runs".into(),
+            ok: true,
+            detail: format!(
+                "{ran} attempt(s) ended in the last {window}h, {young} of them within {} of \
+                 starting — runs are starting on this box",
+                gc::human_window(crate::runs::YOUNG_SECS as u64),
+            ),
+        },
+        crate::runs::Health::Dying { ran, young } => Check {
+            name: "runs".into(),
+            ok: false,
+            detail: format!(
+                "all {young} of the last {ran} attempt(s) died within {} of starting and none \
+                 finished — runs are not surviving on this box. Dispatching more work here \
+                 will burn attempts; check the engine log for the runs' own errors before \
+                 releasing anything else",
+                gc::human_window(crate::runs::YOUNG_SECS as u64),
+            ),
+        },
+    }
+}
+
+/// Seconds between two RFC3339 stamps, or `None` if either will not parse.
+fn span_secs(from: &str, to: &str) -> Option<i64> {
+    let from = chrono::DateTime::parse_from_rfc3339(from).ok()?;
+    let to = chrono::DateTime::parse_from_rfc3339(to).ok()?;
+    Some((to - from).num_seconds().max(0))
 }
 
 /// Can a dispatched agent on this box push and open a pull request (gh#68)?
@@ -5453,6 +5549,121 @@ mod tests {
             "{}",
             installed.detail
         );
+    }
+
+    // ---- is the box still able to run anything (gh#390)? -----------------
+
+    /// One attempt that started and ended without producing anything — a run
+    /// that died within seconds of starting, which is what the whole box was
+    /// doing on the morning gh#390 describes.
+    fn dead_run(db: &Db, task: &str, outcome: crate::model::Outcome) {
+        let a = started_run(db, task);
+        db.close_attempt(a, outcome).unwrap();
+    }
+
+    /// The same, left running.
+    fn started_run(db: &Db, task: &str) -> i64 {
+        if db.get_task(task).unwrap().is_none() {
+            db.upsert_task(&crate::db::UpsertTask {
+                id: task.into(),
+                source: crate::model::Source::Github,
+                source_id: "1".into(),
+                identifier: task.into(),
+                title: "Something".into(),
+                body: None,
+                url: "https://github.com/o/r/issues/1".into(),
+                labels: vec![],
+                source_state: None,
+                linear_team: None,
+                linear_project: None,
+                upstream: crate::model::UpstreamState::Started,
+                updated_at: crate::db::now(),
+            })
+            .unwrap();
+        }
+        db.insert_attempt(&crate::db::NewAttempt {
+            stacked_on: None,
+            task_id: task.into(),
+            pane_id: None,
+            workspace: "offhand".into(),
+            runtime: "claude-code".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: None,
+            repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: None,
+            dispatched_by_verified: false,
+            billed_to: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_board_with_no_history_judges_nothing() {
+        let (_d, p) = tmp();
+        let db = Db::open(&p.db()).unwrap();
+        let c = runs_check(Some(&db), chrono::Utc::now());
+        assert!(c.ok);
+        assert!(c.detail.contains("nothing to judge"), "{}", c.detail);
+    }
+
+    /// The check that was missing: twelve attempts died in minutes across three
+    /// harnesses and `doctor` said every check was ok.
+    #[test]
+    fn doctor_fails_a_box_where_every_run_dies_in_minutes() {
+        let (_d, p) = tmp();
+        let db = Db::open(&p.db()).unwrap();
+        for n in 1..=3 {
+            dead_run(&db, &format!("gh:o/r#{n}"), crate::model::Outcome::Orphaned);
+        }
+        let c = runs_check(Some(&db), chrono::Utc::now());
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("runs are not surviving on this box"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// Deliberately hard to trip: one attempt that finished anywhere in the
+    /// window means runs demonstrably still start here, whatever else is wrong.
+    #[test]
+    fn one_finished_attempt_clears_the_window() {
+        let (_d, p) = tmp();
+        let db = Db::open(&p.db()).unwrap();
+        for n in 1..=3 {
+            dead_run(&db, &format!("gh:o/r#{n}"), crate::model::Outcome::Orphaned);
+        }
+        dead_run(&db, "gh:o/r#4", crate::model::Outcome::Done);
+        let c = runs_check(Some(&db), chrono::Utc::now());
+        assert!(c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("runs are starting on this box"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// A live attempt is evidence a run started, not yet evidence about how it
+    /// ends — counting one as a young death would fail the box for every
+    /// dispatch made in the last five minutes.
+    #[test]
+    fn a_running_attempt_is_not_counted_as_a_dead_one() {
+        let (_d, p) = tmp();
+        let db = Db::open(&p.db()).unwrap();
+        for n in 1..=3 {
+            dead_run(&db, &format!("gh:o/r#{n}"), crate::model::Outcome::Orphaned);
+        }
+        // …and a fourth that is still going. It is not a death yet, so it
+        // neither rescues the box nor damns it.
+        started_run(&db, "gh:o/r#4");
+        let c = runs_check(Some(&db), chrono::Utc::now());
+        assert!(!c.ok);
+        assert!(c.detail.contains("of the last 3"), "{}", c.detail);
     }
 
     /// These checks read the provider, never the wire. Answering at all would

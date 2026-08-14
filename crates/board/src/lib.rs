@@ -40,6 +40,7 @@ pub mod rebased;
 pub mod review;
 pub mod routes;
 pub mod rows;
+pub mod runs;
 pub mod runtime;
 pub mod settled;
 pub mod skill;

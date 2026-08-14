@@ -35,6 +35,7 @@ use crate::model::*;
 use crate::notify::{self, Signal, Stopped, Webhook};
 use crate::overrun;
 use crate::rebased;
+use crate::runs;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Commits, Evidence, Verdict, Why};
 use crate::sources::github::{
@@ -1301,11 +1302,15 @@ impl SyncEngine {
     /// Lifecycle decisions here are deliberately few:
     ///
     /// - A chat whose session row vanished *after the agent was seen working*
-    ///   is a chat that was archived or deleted out from under its attempt —
-    ///   session rows persist as `Idle` after a run ends, so absence after
-    ///   activity means the chat itself is gone. That orphans on the same
-    ///   two-consecutive-ticks rule herdr-board used, so a transient snapshot
-    ///   cannot flap an attempt into `failed`.
+    ///   has lost its run, and [`Runtime::chat_alive`] says which of the two
+    ///   things that is (§gh#390): a chat that is gone orphans the attempt on
+    ///   the same two-consecutive-ticks rule herdr-board used, and a chat that
+    ///   is still there is an interrupted run, which is resumed in place — same
+    ///   attempt, same chat, same branch. The distinction is the whole of
+    ///   gh#390: session rows persist as `Idle` after a run ends *within one
+    ///   engine process*, and an engine restart rebuilds the mirror empty, so
+    ///   the old reading closed every live attempt on the box as `orphaned`
+    ///   while every one of their chats sat intact on its shelf.
     /// - A chat that has *never* had a session row is indistinguishable from a
     ///   dispatch whose first run has not started yet (the brief sits in the
     ///   command ledger until the host device executes it). Ticks are counted
@@ -1336,6 +1341,12 @@ impl SyncEngine {
         statuses: &SessionStatuses,
         runtime: Option<&dyn Runtime>,
     ) -> Result<()> {
+        // Every run this pass found dead in a chat that is still alive
+        // (§gh#390). Collected rather than announced one at a time, because
+        // what happened to six of them at once is one event — an engine
+        // restart — and six separate notices are how that event stayed
+        // invisible while every one of its casualties was reported.
+        let mut interrupted: Vec<notify::Interrupted> = Vec::new();
         for attempt in self.db.live_attempts()? {
             let Some(chat_id) = attempt.pane_id.as_deref() else {
                 // Dispatch is still in flight; nothing to reconcile yet.
@@ -1379,18 +1390,46 @@ impl SyncEngine {
                     }
                     continue;
                 }
-                if ticks >= 2 {
-                    self.log.warn(format!(
-                        "{} chat {} gone for {} ticks — orphaned",
-                        task.identifier, chat_id, ticks
-                    ));
-                    self.orphan(runtime, &task, &attempt)?;
-                } else {
-                    self.log.info(format!(
-                        "{} chat {} missing (tick {}/2)",
-                        task.identifier, chat_id, ticks
-                    ));
-                    self.db.set_missing_ticks(attempt.id, ticks)?;
+                // The run is gone; whether the *chat* is gone with it is what
+                // decides the attempt's fate (§gh#390).
+                match runs::decide(
+                    self.chat_liveness(runtime, &task, chat_id),
+                    ticks,
+                    attempt.resumes,
+                ) {
+                    runs::Verdict::Wait => {
+                        self.log.info(format!(
+                            "{} chat {} missing (tick {}/{})",
+                            task.identifier,
+                            chat_id,
+                            ticks,
+                            runs::MISSING_TICKS
+                        ));
+                        self.db.set_missing_ticks(attempt.id, ticks)?;
+                    }
+                    runs::Verdict::Orphan => {
+                        self.log.warn(format!(
+                            "{} chat {} gone for {} ticks — orphaned",
+                            task.identifier, chat_id, ticks
+                        ));
+                        self.orphan(runtime, &task, &attempt)?;
+                    }
+                    runs::Verdict::Resume => {
+                        // The run may have died *after* finishing — an engine
+                        // restart lands on attempts at every stage. Ask the
+                        // settle logic first, with `Idle` standing for the fact
+                        // this branch establishes: there is no run any more.
+                        // Resuming an agent that already opened its pull
+                        // request would spend a turn undoing the work.
+                        if !self.maybe_settle(runtime, &task, &attempt, AgentStatus::Idle, false)?
+                            && let Some(fate) = self.resume(runtime, &task, &attempt, chat_id)?
+                        {
+                            interrupted.push(fate);
+                        }
+                    }
+                    runs::Verdict::GiveUp => {
+                        interrupted.push(self.give_up(runtime, &task, &attempt)?);
+                    }
                 }
                 continue;
             }
@@ -1422,6 +1461,10 @@ impl SyncEngine {
                 self.note_blocked(runtime, &task, &attempt, chat_id)?;
             }
         }
+        // One notice for the whole incident, before anything else this cycle
+        // decides (§gh#390) — a box that just lost every run it had should say
+        // that as itself, not leave it to be inferred from the wreckage.
+        self.report_interrupted(runtime, &interrupted);
         // After settling, so an attempt that just finished is never failed for
         // running long; before the rewatch, which only looks at closed rows.
         self.enforce_duration_cap(runtime)?;
@@ -2966,6 +3009,163 @@ impl SyncEngine {
         Ok(())
     }
 
+    // ---- a run that died under a chat that did not (§gh#390) --------------
+
+    /// Is this attempt's chat still there, as [`runs::decide`] wants the
+    /// question asked?
+    ///
+    /// The one call that separates "the chat was deleted" from "the engine
+    /// restarted". Both failures answer [`runs::Liveness::Unknown`] — a cycle
+    /// with no runtime and a runtime that would not answer — because neither of
+    /// them is evidence about the chat, and an attempt must never end on the
+    /// board's inability to look.
+    fn chat_liveness(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        chat_id: &str,
+    ) -> runs::Liveness {
+        let Some(runtime) = runtime else {
+            return runs::Liveness::Unknown;
+        };
+        match runtime.chat_alive(chat_id) {
+            Ok(true) => runs::Liveness::Alive,
+            Ok(false) => runs::Liveness::Gone,
+            Err(e) => {
+                self.log.warn(format!(
+                    "{}: asking whether chat {chat_id} is still there: {e:#} — \
+                     deciding nothing about it this tick",
+                    task.identifier
+                ));
+                runs::Liveness::Unknown
+            }
+        }
+    }
+
+    /// Restart an interrupted run in the chat it was already in (§gh#390).
+    ///
+    /// The whole of the fix, and it is deliberately small: the chat holds the
+    /// brief, the transcript and whatever the run had already done, and the
+    /// checkout still stands on the branch. So there is nothing to re-create —
+    /// one prompt puts an agent back in front of the same work. No attempt is
+    /// spent, no chat is archived, no worktree is cut, and the row on the board
+    /// never leaves `working`.
+    ///
+    /// Counted **before** the prompt and counted whatever the prompt reports,
+    /// for [`SyncEngine::warn_overrun`]'s reason: a chat that will not take a
+    /// prompt is a chat there is no point re-telling every cycle, and a resume
+    /// that only counted when it landed would let an unreachable chat be
+    /// restarted forever. The count is what bounds this
+    /// ([`runs::MAX_RESUMES`]), so it must move on every try.
+    ///
+    /// `Ok(None)` when there was nothing to prompt with — a cycle without a
+    /// runtime never reaches here through [`runs::decide`], but the type says
+    /// so rather than the reader having to.
+    fn resume(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+        chat_id: &str,
+    ) -> Result<Option<notify::Interrupted>> {
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let resume = self.db.note_resume(attempt.id)?;
+        self.log.warn(format!(
+            "{}: chat {chat_id} is still there but its run is not — restarting it in place \
+             ({resume}/{}), attempt {} unspent",
+            task.identifier,
+            runs::MAX_RESUMES,
+            attempt.id,
+        ));
+        if let Err(e) = runtime.prompt(chat_id, &runs::resume_prompt(resume)) {
+            self.log.warn(format!(
+                "{}: could not restart chat {chat_id}: {e:#}",
+                task.identifier
+            ));
+        }
+        Ok(Some(notify::Interrupted {
+            identifier: task.identifier.clone(),
+            chat: Some(chat_id.to_string()),
+            fate: notify::Fate::Resumed {
+                resume,
+                of: runs::MAX_RESUMES,
+            },
+        }))
+    }
+
+    /// Close an attempt whose run has died once too often (§gh#390).
+    ///
+    /// `failed`, never `orphaned`: nothing vanished. The chat is on its shelf
+    /// with the whole conversation in it, the branch is where the last run left
+    /// it, and what went wrong is that this box could not keep a run alive —
+    /// which is a red row somebody has to look at, not a row that quietly
+    /// returns to `ready` for the board to try again on the same broken box.
+    fn give_up(
+        &self,
+        runtime: Option<&dyn Runtime>,
+        task: &Task,
+        attempt: &Attempt,
+    ) -> Result<notify::Interrupted> {
+        let note = runs::gave_up_note(attempt.resumes);
+        self.db.close_attempt(attempt.id, Outcome::Failed)?;
+        self.enqueue_outcome_note(task, Outcome::Failed, None, Some(&note))?;
+        self.log
+            .error(format!("{}: attempt failed — {note}", task.identifier));
+        // The dispatcher waiting on this step hears it as the ending it is;
+        // the incident notice below adds what it means about the box.
+        self.announce(
+            runtime,
+            task,
+            attempt,
+            Signal::Settled {
+                outcome: Outcome::Failed,
+                evidence: None,
+                pr_url: None,
+                note: Some(note),
+            },
+        );
+        Ok(notify::Interrupted {
+            identifier: task.identifier.clone(),
+            chat: attempt.pane_id.clone(),
+            fate: notify::Fate::Ended,
+        })
+    }
+
+    /// Say the incident once, as itself (§gh#390).
+    ///
+    /// The third bug in gh#390, and the one that made the other two hard to
+    /// find: a restart that took down six runs surfaced only as six unrelated
+    /// settle notices, so the board never said the sentence "the engine
+    /// restarted and every live attempt was affected" — the sentence that would
+    /// have pointed at the cause instead of at six tasks.
+    ///
+    /// One notice per cycle covering everything that cycle found, to the
+    /// orchestrator and to the operator's webhook. Not to the dispatchers: a
+    /// restarted attempt has not ended, and the agents waiting on those steps
+    /// have nothing to do until it does.
+    fn report_interrupted(&self, runtime: Option<&dyn Runtime>, runs: &[notify::Interrupted]) {
+        if runs.is_empty() {
+            return;
+        }
+        self.log.warn(notify::interrupted_summary(runs));
+        self.tell_orchestrator(
+            "runs interrupted",
+            runtime,
+            &notify::interrupted_message(runs),
+        );
+        if let Some(url) = self.webhook_url("the interrupted runs") {
+            let body = notify::interrupted_payload(runs, &crate::db::now());
+            match self.webhook.post(&url, &body) {
+                Ok(()) => self.log.info(format!("interrupted runs posted to {url}")),
+                Err(e) => self
+                    .log
+                    .warn(format!("posting the interrupted runs to {url}: {e:#}")),
+            }
+        }
+    }
+
     /// End an attempt whose chat is gone, and tell everyone reading upstream.
     ///
     /// Notified on the same channels a settle is (gh#71): an attempt ending
@@ -3542,7 +3742,7 @@ impl SyncEngine {
         // their task settles (§gh#139), so a dispatcher that did not survive
         // its own child is ordinary rather than exceptional. Not an error —
         // just a notice that now needs a different addressee.
-        if !self.chat_can_be_told(runtime, task, "the chat that released it", chat) {
+        if !self.chat_can_be_told(runtime, &task.identifier, "the chat that released it", chat) {
             return Told::Unreachable;
         }
         let text = notify::dispatcher_message(task, attempt, signal);
@@ -3613,29 +3813,46 @@ impl SyncEngine {
             ));
             return Told::Itself;
         }
+        self.tell_orchestrator(
+            &task.identifier,
+            runtime,
+            &notify::orchestrator_message(task, attempt, event),
+        )
+    }
+
+    /// Queue one already-composed message into the pinned orchestrator's chat.
+    ///
+    /// The delivery half of [`SyncEngine::wake_orchestrator`], split out for
+    /// the notices that belong to no single attempt (§gh#390's incident line):
+    /// everything from "is anybody pinned" down is identical, and the half that
+    /// is not — refusing to prompt an orchestrator about its own attempt — is a
+    /// question only a per-attempt event can ask.
+    ///
+    /// `subject` is what the log lines name, so a reader greps a task
+    /// identifier or an incident and finds the same shape of line either way.
+    fn tell_orchestrator(&self, subject: &str, runtime: Option<&dyn Runtime>, text: &str) -> Told {
+        let Some(chat) = self.cfg.defaults.orchestrator() else {
+            return Told::NoOne;
+        };
         let Some(runtime) = runtime else {
             self.log.warn(format!(
-                "{}: no runtime to reach the orchestrator ({chat}) with",
-                task.identifier
+                "{subject}: no runtime to reach the orchestrator ({chat}) with"
             ));
             return Told::Unreachable;
         };
-        if !self.chat_can_be_told(runtime, task, "the pinned orchestrator", chat) {
+        if !self.chat_can_be_told(runtime, subject, "the pinned orchestrator", chat) {
             return Told::Unreachable;
         }
-        let text = notify::orchestrator_message(task, attempt, event);
-        match runtime.prompt(chat, &text) {
+        match runtime.prompt(chat, text) {
             Ok(()) => {
                 self.log.info(format!(
-                    "{}: queued into the orchestrator's chat {chat}",
-                    task.identifier
+                    "{subject}: queued into the orchestrator's chat {chat}"
                 ));
                 Told::Yes
             }
             Err(e) => {
                 self.log.warn(format!(
-                    "{}: could not reach the orchestrator ({chat}): {e}",
-                    task.identifier
+                    "{subject}: could not reach the orchestrator ({chat}): {e}"
                 ));
                 Told::Unreachable
             }
@@ -3653,21 +3870,24 @@ impl SyncEngine {
     /// about a chat id (gh#194) — an operator grepping a task's whole life
     /// should not have to hold the routing order in their head to know which
     /// notice went nowhere.
-    fn chat_can_be_told(&self, runtime: &dyn Runtime, task: &Task, role: &str, chat: &str) -> bool {
+    fn chat_can_be_told(
+        &self,
+        runtime: &dyn Runtime,
+        subject: &str,
+        role: &str,
+        chat: &str,
+    ) -> bool {
         match runtime.chat_alive(chat) {
             Ok(true) => true,
             Ok(false) => {
                 self.log.info(format!(
-                    "{}: {role} ({chat}) is gone — nothing delivered there",
-                    task.identifier
+                    "{subject}: {role} ({chat}) is gone — nothing delivered there"
                 ));
                 false
             }
             Err(e) => {
-                self.log.warn(format!(
-                    "{}: checking {role} ({chat}): {e}",
-                    task.identifier
-                ));
+                self.log
+                    .warn(format!("{subject}: checking {role} ({chat}): {e}"));
                 false
             }
         }
@@ -3678,19 +3898,10 @@ impl SyncEngine {
     /// The only channel that reaches somebody who is looking at neither the
     /// board nor the issue tracker — which at 02:00 is everybody.
     fn post_webhook(&self, task: &Task, attempt: &Attempt, signal: &Signal) {
-        if !self.cfg.defaults.notify {
-            return;
-        }
-        let Some(url) = self.cfg.defaults.notify_webhook.as_deref() else {
+        let Some(url) = self.webhook_url(&task.identifier) else {
             return;
         };
-        if let Some(problem) = notify::webhook_url_problem(url) {
-            self.log.warn(format!(
-                "[defaults] notify_webhook is unusable ({problem}); {} went unannounced",
-                task.identifier
-            ));
-            return;
-        }
+        let url = url.as_str();
         let body = notify::webhook_payload(task, attempt, signal, &crate::db::now());
         match self.webhook.post(url, &body) {
             Ok(()) => self.log.info(format!(
@@ -3709,6 +3920,26 @@ impl SyncEngine {
                 notify::webhook_host(url)
             )),
         }
+    }
+
+    /// Where the operator wants to be told, if they want to be told at all.
+    ///
+    /// Both refusals — the switch off, no URL set — are silent, because neither
+    /// is a failure. The third is not: a URL that is set and unusable is a
+    /// channel the operator believes they have, so it says so, naming what went
+    /// unannounced through it.
+    fn webhook_url(&self, subject: &str) -> Option<String> {
+        if !self.cfg.defaults.notify {
+            return None;
+        }
+        let url = self.cfg.defaults.notify_webhook.as_deref()?;
+        if let Some(problem) = notify::webhook_url_problem(url) {
+            self.log.warn(format!(
+                "[defaults] notify_webhook is unusable ({problem}); {subject} went unannounced"
+            ));
+            return None;
+        }
+        Some(url.to_string())
     }
 
     /// An attempt has just *entered* blocked: leave one comment upstream, and
@@ -5252,17 +5483,22 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
+        // The chat itself is gone, which since §gh#390 is what orphans — an
+        // absent session row on a chat that is still there is a dead run.
+        let rt = JournalFact::ending_without(None, &["chat-9"]);
         // The agent got going — absence after activity is what orphans.
-        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
 
-        e.reconcile_sessions(&statuses(&[])).unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
         assert!(
             live(&e).outcome.is_none(),
             "one missing tick must not orphan the attempt"
         );
 
-        e.reconcile_sessions(&statuses(&[])).unwrap();
+        e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+            .unwrap();
         assert_eq!(live(&e).outcome, Some(Outcome::Orphaned));
     }
 
@@ -5311,10 +5547,12 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
-        e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
+        let rt = JournalFact::ending_without(None, &["chat-9"]);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
         for _ in 0..5 {
-            e.reconcile_sessions(&statuses(&[])).unwrap();
+            e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+                .unwrap();
         }
         assert_eq!(e.db.pending_writeback_count().unwrap(), 1);
     }
@@ -5363,6 +5601,9 @@ mod tests {
         std::sync::Mutex<Option<crate::runtime::RunTokens>>,
         /// …and how full the window was, the other meter (gh#271).
         std::sync::Mutex<Option<comet_proto::ContextUsage>>,
+        /// Chats that have been deleted or archived — what an *orphan* is made
+        /// of since §gh#390, as opposed to a chat that simply lost its run.
+        std::sync::Mutex<Vec<String>>,
     );
 
     impl Meter {
@@ -5373,10 +5614,19 @@ mod tests {
                     model: model.map(str::to_string),
                 })),
                 std::sync::Mutex::new(None),
+                std::sync::Mutex::new(Vec::new()),
             )
         }
         fn silent() -> Meter {
-            Meter(std::sync::Mutex::new(None), std::sync::Mutex::new(None))
+            Meter(
+                std::sync::Mutex::new(None),
+                std::sync::Mutex::new(None),
+                std::sync::Mutex::new(Vec::new()),
+            )
+        }
+        /// The chat has been archived out from under its attempt.
+        fn lose_chat(&self, chat: &str) {
+            self.2.lock().unwrap().push(chat.to_string());
         }
         fn set(&self, usage: comet_proto::TokenUsage, model: Option<&str>) {
             *self.0.lock().unwrap() = Some(crate::runtime::RunTokens {
@@ -5402,8 +5652,8 @@ mod tests {
         fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
             Ok(None)
         }
-        fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
-            Ok(true)
+        fn chat_alive(&self, chat: &str) -> anyhow::Result<bool> {
+            Ok(!self.2.lock().unwrap().iter().any(|c| c == chat))
         }
         fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
@@ -5482,6 +5732,7 @@ mod tests {
         // Seen working once, then the chat vanishes for two ticks.
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
+        rt.lose_chat("chat-9");
         e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
             .unwrap();
         e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
@@ -5563,6 +5814,7 @@ mod tests {
         rt.set_context(Some(context(190_000)));
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
+        rt.lose_chat("chat-9");
         e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
             .unwrap();
         e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
@@ -5664,6 +5916,9 @@ mod tests {
         /// Chats that have been archived since — the ordinary shape of a
         /// dispatcher that did not survive its child (gh#165).
         gone: Vec<String>,
+        /// A runtime that cannot answer whether a chat is there at all
+        /// (§gh#390) — the third answer, which must end nothing.
+        blind: bool,
     }
 
     impl JournalFact {
@@ -5672,12 +5927,20 @@ mod tests {
                 end,
                 queued: Default::default(),
                 gone: Vec::new(),
+                blind: false,
             }
         }
         /// The same, with some chats already archived.
         fn ending_without(end: Option<RunEnd>, gone: &[&str]) -> JournalFact {
             JournalFact {
                 gone: gone.iter().map(|c| c.to_string()).collect(),
+                ..JournalFact::ending(end)
+            }
+        }
+        /// The same, and unable to say whether any chat is still there.
+        fn blind(end: Option<RunEnd>) -> JournalFact {
+            JournalFact {
+                blind: true,
                 ..JournalFact::ending(end)
             }
         }
@@ -5705,6 +5968,9 @@ mod tests {
             Ok(None)
         }
         fn chat_alive(&self, chat: &str) -> anyhow::Result<bool> {
+            if self.blind {
+                anyhow::bail!("the workspace could not be read");
+            }
             Ok(!self.gone.iter().any(|c| c == chat))
         }
         fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
@@ -6884,7 +7150,7 @@ mod tests {
         let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
-        let rt = JournalFact::ending(None);
+        let rt = JournalFact::ending_without(None, &["chat-9"]);
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
@@ -6899,6 +7165,206 @@ mod tests {
         assert_eq!(posts[0].1["event"], "on_settled");
         assert_eq!(posts[0].1["outcome"], "orphaned");
         assert_eq!(rt.prompts().len(), 1, "the dispatcher hears about it too");
+    }
+
+    // ---- a restart must not eat the attempts (§gh#390) --------------------
+
+    /// Two missing ticks on a chat that is still there.
+    fn lose_the_run(e: &SyncEngine, rt: &dyn Runtime) {
+        for _ in 0..runs::MISSING_TICKS {
+            e.reconcile_sessions_with(&statuses(&[]), Some(rt)).unwrap();
+        }
+    }
+
+    /// The bug, at its smallest. The engine restarts; the session mirror comes
+    /// back empty; the chat is exactly where it was. That is a dead run, not a
+    /// dead chat, and burying the attempt over it threw away a live agent's
+    /// whole context.
+    #[test]
+    fn a_chat_that_outlived_its_run_is_restarted_not_orphaned() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert!(a.outcome.is_none(), "the attempt is not over");
+        assert_eq!(a.resumes, 1, "its run was restarted once");
+        assert_eq!(a.missing_ticks, 0, "and the absence is spent");
+        let prompts = rt.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "chat-9", "restarted in its own chat");
+        assert!(prompts[0].1.contains("no attempt has been spent"));
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            0,
+            "nothing is written upstream about a run that is carrying on"
+        );
+    }
+
+    /// Nothing is re-created: same attempt row, same chat, same branch. A
+    /// retry would have made a second attempt in a second chat and thrown the
+    /// first one's context away, which is what the orphan sweep forced.
+    #[test]
+    fn a_restarted_run_keeps_its_attempt_its_chat_and_its_branch() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let id = dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt);
+
+        let attempts = e.db.attempts_for("linear:LIN-142").unwrap();
+        assert_eq!(attempts.len(), 1, "no second attempt was released");
+        assert_eq!(attempts[0].id, id);
+        assert_eq!(attempts[0].pane_id.as_deref(), Some("chat-9"));
+        assert_eq!(attempts[0].branch.as_deref(), Some("board/lin-142"));
+    }
+
+    /// The night this is about: six attempts, six chats, one restart. Six
+    /// settle notices said six things about six tasks and nothing at all about
+    /// the engine — so the incident is announced once, as itself.
+    #[test]
+    fn a_box_that_loses_every_run_at_once_says_so_once() {
+        let (mut e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
+        let chats: Vec<String> = (1..=6).map(|n| format!("chat-{n}")).collect();
+        for (n, chat) in chats.iter().enumerate() {
+            let id = format!("gh:o/r#{}", n + 1);
+            seed(&e, &id, &format!("o/r#{}", n + 1), UpstreamState::Started);
+            dispatch(&e, &id, chat);
+        }
+        let rt = JournalFact::ending(None);
+        let live_now: Vec<(&str, AgentStatus)> = chats
+            .iter()
+            .map(|c| (c.as_str(), AgentStatus::Working))
+            .collect();
+        e.reconcile_sessions_with(&statuses(&live_now), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt);
+
+        let prompts = rt.prompts();
+        let to_boss: Vec<&(String, String)> =
+            prompts.iter().filter(|(c, _)| c == "chat-boss").collect();
+        assert_eq!(to_boss.len(), 1, "one notice, not six");
+        assert!(
+            to_boss[0].1.contains("6 live attempts lost their runs"),
+            "and it says what happened to the box: {}",
+            to_boss[0].1
+        );
+        assert_eq!(
+            prompts.len(),
+            7,
+            "six restarts and the one notice — no settles at all"
+        );
+        let posts = hook.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1["event"], "on_runs_interrupted");
+        assert_eq!(posts[0].1["runs"].as_array().unwrap().len(), 6);
+    }
+
+    /// A box that cannot keep a run alive would otherwise be restarted forever.
+    /// Past the cap the attempt closes `failed` — not `orphaned`, because
+    /// nothing vanished, and a red row is what makes somebody look at the box.
+    #[test]
+    fn a_run_that_keeps_dying_closes_the_attempt_failed() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        for _ in 0..runs::MAX_RESUMES {
+            lose_the_run(&e, &rt);
+            assert!(live(&e).outcome.is_none(), "still worth restarting");
+        }
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert_eq!(a.outcome, Some(Outcome::Failed));
+        assert_eq!(a.resumes, runs::MAX_RESUMES);
+        assert_eq!(
+            e.db.pending_writeback_count().unwrap(),
+            1,
+            "and the issue is told once, when it is actually over"
+        );
+    }
+
+    /// The promise a block makes — "the chat still holds the whole task, so it
+    /// is a retry or a cancel, not a lost attempt" — was broken by the orphan
+    /// sweep taking the same row minutes later. The chat is there; it is still
+    /// the retry path it was said to be.
+    #[test]
+    fn an_errored_block_is_not_swept_away_behind_the_operators_back() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::ending(Some(RunEnd::Errored));
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).blocked_count, 1, "the block was announced");
+
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert!(
+            a.outcome.is_none(),
+            "the chat is still there, so the attempt is not lost"
+        );
+        assert_eq!(a.resumes, 1);
+    }
+
+    /// A runtime that cannot answer ends nothing — the rule a chat which had
+    /// never worked already lived by, now applied to one that had.
+    #[test]
+    fn a_chat_nobody_can_ask_about_is_left_alone() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::blind(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        for _ in 0..5 {
+            e.reconcile_sessions_with(&statuses(&[]), Some(&rt))
+                .unwrap();
+        }
+
+        let a = live(&e);
+        assert!(a.outcome.is_none(), "never ended on a failed lookup");
+        assert_eq!(a.resumes, 0, "and never restarted on one either");
+        assert_eq!(a.missing_ticks, 5, "but the absence is on the record");
+    }
+
+    /// A restart lands on attempts at every stage, including the one that had
+    /// just finished. Restarting an agent that already opened its pull request
+    /// would spend a turn undoing the work — so the settle check runs first.
+    #[test]
+    fn a_run_that_died_after_finishing_settles_instead_of_restarting() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+
+        lose_the_run(&e, &rt);
+
+        let a = live(&e);
+        assert_eq!(a.outcome, Some(Outcome::Done));
+        assert_eq!(a.resumes, 0, "nothing was restarted");
     }
 
     // ---- the settle the board got wrong (§settle-logic's inverse) ---------
