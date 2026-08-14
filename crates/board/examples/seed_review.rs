@@ -145,12 +145,109 @@ fn main() -> Result<()> {
     // Settled with a pull request open: `derive_state` reads that as `review`.
     db.close_attempt(attempt, Outcome::Done)?;
 
+    if std::env::var_os("COMET_SEED_STACK").is_some_and(|v| v == "1") {
+        seed_stack(&db)?;
+        println!("stacked: gh#138 is layer 2 of 3, under PR #210 (behind main)");
+    }
+
     println!(
         "seeded {} (attempt {attempt}, chat {CHAT_ID}) into {}",
         TASK_ID,
         data_dir.display()
     );
     println!("checkout: {}", checkout.display());
+    Ok(())
+}
+
+/// Make the fixture's pull request the middle layer of a three-layer stack
+/// (gh#389), behind `COMET_SEED_STACK=1`.
+///
+/// Off by default, deliberately: the canvas composes one pull request, and the
+/// captures `docs/design/review.md` is checked against are of that. This is the
+/// other composition — the one where the screen has to say that what you are
+/// looking at cannot land yet — and it is a different photograph rather than a
+/// change to the first.
+///
+/// The layer below is `behind main`, which is the case gh#337 wrote the whole
+/// read-path matrix around: GitHub says `clean` about gh#138's own pull request,
+/// because it *is* clean against the branch underneath it, and the screen has to
+/// refuse to pass that on as "ready to land".
+///
+/// The siblings are rows and nothing more — no attempt, no checkout, no chat.
+/// The map only ever needs their identifiers, numbers and merge state, and a
+/// fixture that built two more checkouts to draw two chips would be minutes of
+/// git for pixels that do not read them.
+fn seed_stack(db: &Db) -> Result<()> {
+    use comet_board::model::PrStack;
+
+    const STACK: i64 = 9;
+    let stack = |position: i64| PrStack {
+        number: STACK,
+        size: Some(3),
+        position: Some(position),
+        base_ref: Some("main".into()),
+    };
+    // (task id, number, identifier, title, pull request, branch, base, state)
+    let siblings = [
+        (
+            "gh:bredebjorhovd/comet-board#136",
+            "136",
+            "gh#136",
+            "One derivation decides where a chat's row is drawn",
+            210,
+            "board/gh-136-placement",
+            "main",
+            "behind",
+            1,
+        ),
+        (
+            "gh:bredebjorhovd/comet-board#141",
+            "141",
+            "gh#141",
+            "The shelf says so when Active holds every row",
+            213,
+            "board/gh-141-shelf",
+            "board/gh-138",
+            "clean",
+            3,
+        ),
+    ];
+    for (id, source_id, identifier, title, pr, branch, base, mergeable, position) in siblings {
+        db.upsert_task(&UpsertTask {
+            id: id.into(),
+            source: Source::Github,
+            source_id: source_id.into(),
+            identifier: identifier.into(),
+            title: title.into(),
+            body: None,
+            url: format!("https://github.com/bredebjorhovd/comet-board/issues/{source_id}"),
+            labels: vec!["board".into()],
+            source_state: Some("open".into()),
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Started,
+            updated_at: comet_board::db::now(),
+        })?;
+        db.set_pr(
+            id,
+            Some(&format!(
+                "https://github.com/bredebjorhovd/comet-board/pull/{pr}"
+            )),
+            Some(pr),
+            true,
+        )?;
+        db.set_pr_topology(id, Some(base), Some(branch), Some(&stack(position)))?;
+        db.set_pr_mergeable(id, Some(mergeable))?;
+    }
+    // And the fixture's own row takes its place in the middle of them: onto the
+    // layer below, not onto trunk.
+    db.set_pr_topology(
+        TASK_ID,
+        Some("board/gh-136-placement"),
+        Some("board/gh-138"),
+        Some(&stack(2)),
+    )?;
+    db.set_pr_mergeable(TASK_ID, Some("clean"))?;
     Ok(())
 }
 

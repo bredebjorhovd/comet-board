@@ -1943,7 +1943,11 @@ impl SyncEngine {
                 })?,
             None => match task.attempts.last().cloned() {
                 Some(attempt) => attempt,
-                None => return self.pull_request_review(task),
+                None => {
+                    let mut review = self.pull_request_review(task)?;
+                    crate::stacks::place_in_stack(&tasks, task, &mut review);
+                    return Ok(review);
+                }
             },
         };
         let (changed, effects, diff) = match self.branch_facts(&attempt) {
@@ -1979,6 +1983,7 @@ impl SyncEngine {
             self.db.attempt_sandbox(attempt.id)?,
         );
         self.count_call_sites(&attempt, &mut review);
+        crate::stacks::place_in_stack(&tasks, task, &mut review);
         Ok(review)
     }
 

@@ -35,6 +35,17 @@ Captures: `screenshots/review-{dark,light}-{before,after}.png`, plus
 exits (gh#311) are `screenshots/gh311-review-tab-{dark,light}.png` and
 `gh311-review-closed-dark.png` — the same window one click of the tab's ✕ later.
 
+The stack band (§gh#389) draws nothing on that fixture, because that fixture is
+one pull request. `COMET_SEED_STACK=1` seeds it as layer 2 of 3 with the layer
+below `behind main` — gh#337's case 2, where GitHub says `clean` about a pull
+request that cannot land — and the flag is read at seed time, so the board dir
+goes first:
+
+```sh
+rm -rf /tmp/comet-review-board
+COMET_SEED_STACK=1 scripts/review-demo.sh
+```
+
 The state *before* any of that is over in a blink against a local board, so it
 is photographed by holding the read open — `COMET_REVIEW_HOLD_MS=9000
 scripts/review-demo.sh` waits that long before issuing it, the same dev knob
@@ -226,6 +237,24 @@ other difference from the list is a bug.
   fill, the hue carried by the glyph and the copy. The screen's one loud block
   is F, and two blocks shouting the same number leaves it with nothing to shout
   with.
+
+- **A stacked pull request gets a band above the scroll, and a fourth fact in
+  the header** (§gh#389). The canvas composes one pull request, so it has no row
+  for the case where the pull request is one layer of three — and a reviewer who
+  is not told that is looking at an ordinary diff. The band is C/D's shape with
+  "Stack" in the 62px label column, drawn between the sandbox note and the body:
+  the line (`stack 2 of 3 · onto board/gh-44-packages · lands on main`), the map
+  as the peek panel's own chips (`#47 ↑ #48 ↑ #50`, this layer accented, one
+  GitHub objects to in `--blocked`, a landed one `--faint`, each a door to that
+  layer's pull request), and the order underneath in 11px `--muted`. It is
+  *pinned* rather than filed in the body for the reason the verdict strip is:
+  the fact that reframes everything below it must not be reachable only by
+  scrolling back past a long issue body. B5's facts line gains
+  `comet_proto::view::board::landing_note` beside the branch, because GitHub's
+  `mergeable_state` says `clean` about a mid-stack layer that cannot land, and
+  the header is where the reader would otherwise read it as "ready". Absent
+  entirely — band and fact both — on a pull request that is not a layer, and on
+  one nobody has asked GitHub about.
 
 - **The evidence section stays, has no canvas row of its own, and sits with
   Effects.** What the run executed and how it exited is the second half of
