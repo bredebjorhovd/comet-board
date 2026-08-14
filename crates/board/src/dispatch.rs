@@ -668,6 +668,15 @@ pub struct DispatchOverrides {
     /// dependents need: which *attempt* the child was cut from. Resolved by
     /// [`stack_parent`], which is also where a reference naming no task, no
     /// attempt or no branch is refused.
+    ///
+    /// The recorded edge is also what turns the chain into a **GitHub stack**
+    /// (gh#387), on a later cycle rather than here: a stack is made of pull
+    /// requests, and a dispatch that has not run yet has not opened one. See
+    /// [`crate::stacks::unlinked`] for the request and
+    /// [`crate::sync::SyncEngine::link_dispatched_stacks`] for the sweep that
+    /// sends it — which is why this field is not merely a nicer spelling of
+    /// [`base`](Self::base): a raw base leaves no edge, and a chain with no edge
+    /// is one nobody ever tells GitHub about.
     pub onto: Option<String>,
 }
 

@@ -190,7 +190,13 @@ is this board's `review`.
   from trunk. Wait for the parent to reach `review` (or check that it pushed)
   and dispatch then. `--base <branch>` is the same thing for a branch no task
   on the board holds; use `--onto` for a sibling, because that is what records
-  which attempt the follow-up was cut from. Passing both is refused.
+  which attempt the follow-up was cut from. Passing both is refused. Once every
+  layer's pull request is open, the board makes the chain a **GitHub stack** on
+  its own — you do not run `gh stack link`, and the layers group, order and
+  merge as a stack from that point on. It happens on a sync cycle rather than at
+  dispatch, because a stack is made of pull requests and at dispatch there is
+  not one yet; a chain whose top layer has not opened its request yet stacks the
+  layers below it and picks up the rest when they arrive.
 - **Accounts are the operator's choice, not yours.** `routing.toml` decides
   which teammate's Claude/Codex subscription a route's work is billed to.
   `dispatch --account <id>` overrides it; do not pass it unless you were told
