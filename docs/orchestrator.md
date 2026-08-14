@@ -55,7 +55,10 @@ ordinary chat again, with everything in it intact.
   — it is context for the next thing that looks strange. When it says an attempt
   was *closed*, that one had already been restarted three times: the box is not
   keeping runs alive, and `comet-board doctor`'s `runs` line is where to look
-  before releasing anything else there.
+  before releasing anything else there. Three counts every restart, including
+  the ones the engine's own boot recovery performed before the board saw the run
+  was gone (§gh#392) — so an attempt can be closed having been restarted by the
+  board once, or not at all.
 
 An **ending** here is any of the four, not only the settle: a run that finished,
 an attempt whose chat vanished, one somebody cancelled, and one the cap killed.

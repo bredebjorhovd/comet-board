@@ -410,6 +410,36 @@ pub trait Runtime {
     /// "does the pane still exist" check, minus the screen.
     fn chat_alive(&self, chat_id: &str) -> anyhow::Result<bool>;
 
+    /// How many times the *engine* has already revived this chat's run on its
+    /// own, before the board ever saw a dead run (gh#392).
+    ///
+    /// The other half of "how many times has this actually been started", and
+    /// the half the board cannot see from its own tables. Boot recovery
+    /// re-dispatches a run whose journal a crash left open, on a budget of its
+    /// own kept beside that journal; it spends all of it invisibly, and what it
+    /// hands over when it runs out — a live chat, a closed journal, no run — is
+    /// exactly the state [`crate::runs::decide`] resumes from. Without this the
+    /// two budgets sum instead of sharing, and the count the board reports is
+    /// the smaller half of what happened.
+    ///
+    /// `None` is "this runtime cannot say", and is never the same as `Some(0)`:
+    /// [`crate::runs::Restarts`] spends nothing for it and
+    /// [`crate::runs::gave_up_note`] claims no number for it. A chat this
+    /// device has never run answers `None` for that reason — a journal that is
+    /// not here is not a journal that says nothing happened.
+    ///
+    /// Consecutive by definition, matching the engine's own ledger: a turn that
+    /// completed cleanly clears it, because what both budgets are counting is a
+    /// run that cannot get going, not a run that has had a long life.
+    ///
+    /// Default `Ok(None)` rather than a refusal, like [`Runtime::run_tokens`]'s:
+    /// a runtime that cannot answer leaves the board exactly where it was
+    /// before the question existed.
+    fn chat_revivals(&self, chat_id: &str) -> anyhow::Result<Option<i64>> {
+        let _ = chat_id;
+        Ok(None)
+    }
+
     /// Where the chat runs — its row's cwd, recorded at creation. `None` when
     /// the chat is gone or never recorded one. Review delivery
     /// (§review-delivery) compares this against the authoring attempt's

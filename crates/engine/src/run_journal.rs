@@ -99,6 +99,21 @@ impl RunJournal {
             .unwrap_or(0)
     }
 
+    /// The same count, for a reader that is not the recovery loop — the board,
+    /// which spends one restart budget across both of them (gh#392).
+    ///
+    /// `None` when this device has no journal for the chat at all: a chat that
+    /// runs on another device, or one whose journal has been swept. The ledger
+    /// only ever exists beside a journal, so its absence *with* a journal is a
+    /// real zero and its absence *without* one is no answer, and the board
+    /// treats those two differently — it will not put a count in front of a
+    /// person that was taken from a file it never found.
+    pub fn revivals(&self, chat_id: &str) -> Option<u32> {
+        self.path_for(chat_id)
+            .exists()
+            .then(|| self.resume_attempts(chat_id))
+    }
+
     pub fn note_resume_attempt(&self, chat_id: &str) -> u32 {
         let next = self.resume_attempts(chat_id) + 1;
         if let Err(err) = std::fs::write(self.attempts_path(chat_id), next.to_string()) {
@@ -586,6 +601,34 @@ mod tests {
         assert_eq!(tokens.usage.cache_read_tokens, 1_500);
         assert_eq!(tokens.usage.cache_creation_tokens, 2);
         assert_eq!(tokens.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// The board spends one restart budget across the engine's revivals and
+    /// its own (gh#392), so what it reads here has to separate "this device
+    /// revived it twice" from "this device has never run this chat" — the
+    /// second is not a zero, and a zero is what would let the board claim a
+    /// count it never took.
+    #[test]
+    fn revivals_are_a_count_only_where_there_is_a_journal_to_count_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.revivals("elsewhere"), None, "no journal, no answer");
+
+        journal.append("chat-1", &started("mock")).unwrap();
+        assert_eq!(
+            journal.revivals("chat-1"),
+            Some(0),
+            "and this one is a zero"
+        );
+
+        journal.note_resume_attempt("chat-1");
+        journal.note_resume_attempt("chat-1");
+        assert_eq!(journal.revivals("chat-1"), Some(2));
+
+        // A turn that completed cleanly clears it — both budgets are counting
+        // a run that cannot get going, not one that has had a long life.
+        journal.clear_resume_attempts("chat-1");
+        assert_eq!(journal.revivals("chat-1"), Some(0));
     }
 
     /// A chat that reported nothing is `None`, never `Some(zero)`: the board
