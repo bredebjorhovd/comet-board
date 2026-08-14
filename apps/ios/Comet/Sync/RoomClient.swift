@@ -27,8 +27,10 @@ actor RoomClient {
     static let fragmentBytes = 200_000
     static let pingIntervalNs: UInt64 = 30_000_000_000
     static let silenceLeaseNs: UInt64 = 45_000_000_000
-    static let backoffBaseMs = 250
-    static let backoffCapMs = 30_000
+    // The redial ladder — its rungs, the lifetime that earns a reset, and the
+    // jitter on every wait — is `ReconnectBackoff` (gh#405). It is a value
+    // type so the decision can be asserted without a socket, which is why it
+    // is not three constants in this list.
     static let maxInvalidRejoins = 3
     static let maxFragmentCount: UInt64 = 4096
     static let maxReassembledBytes = 64 * 1024 * 1024
@@ -57,9 +59,15 @@ actor RoomClient {
     private var pending: [BatchId: [[UInt8]]] = [:]
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
+    /// Instant the FIRST `%LOR` join of THIS session was answered — a rejoin or
+    /// a liveness probe does not restart it (room.rs `Session::joined_at`). The
+    /// session's lifetime as a joined room is what earns a backoff reset; see
+    /// `ReconnectBackoff.healthySessionNs` for why the join answer alone does
+    /// not (gh#405).
+    private var joinedAt: DispatchTime?
     private var invalidRejoins = 0
     private var fullResyncRequested = false
-    private var backoffMs = RoomClient.backoffBaseMs
+    private var backoff = ReconnectBackoff()
     private var lastInbound = DispatchTime.now()
     private var closed = false
     private var generation = 0
@@ -109,6 +117,7 @@ actor RoomClient {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         joinedLor = false
+        joinedAt = nil
     }
 
     private func connect() {
@@ -116,6 +125,7 @@ actor RoomClient {
         generation += 1
         let gen = generation
         joinedLor = false
+        joinedAt = nil
         fullResyncRequested = false
         fragments.removeAll()
         joinSentAt = nil
@@ -184,7 +194,6 @@ actor RoomClient {
 
     private func onSocketError(gen: Int) {
         guard gen == generation, !closed else { return }
-        roomLog.warning("room \(self.roomId, privacy: .public): session ended (joined=\(self.joinedLor)); redialing in \(self.backoffMs)ms")
         events(.disconnected)
         scheduleReconnect(gen: gen)
     }
@@ -196,8 +205,18 @@ actor RoomClient {
         receiveTask?.cancel()
         pingTask?.cancel()
         livenessTask?.cancel()
-        let delay = backoffMs
-        backoffMs = min(backoffMs * 2, RoomClient.backoffCapMs)
+        // A session that did real work earns a fresh ladder; one that only got
+        // a join answer before dying does not, and neither does one that never
+        // reached a socket at all (no token). Before gh#405 the reset fired on
+        // the join answer itself, so a room whose DO accepted the join and then
+        // died redialed at 250ms with no ceiling — see
+        // `ReconnectBackoff.healthySessionNs`.
+        let healthy = ReconnectBackoff.isHealthy(joinedAt: joinedAt)
+        let delay = backoff.nextDelayMs(healthy: healthy)
+        // The decision, in the log, because "why is this room quiet" is
+        // answered by `healthy` and nothing else: a false there is a room that
+        // is climbing the ladder rather than stuck.
+        roomLog.warning("room \(self.roomId, privacy: .public): redialing in \(delay)ms (joined=\(self.joinedLor), healthy=\(healthy), rung=\(self.backoff.rungMs)ms)")
         Task {
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
             await self.connect()
@@ -353,7 +372,14 @@ actor RoomClient {
             let wasProbe = joinIsProbe
             joinIsProbe = false
             joinedLor = true
-            backoffMs = RoomClient.backoffBaseMs
+            // Note what the join answer is worth and NOT more: it starts the
+            // clock the reset is judged on, it is not the reset. This line used
+            // to be `backoffMs = backoffBaseMs` (gh#405) — a DO that answers
+            // the join and then dies answers it every dial, so the ladder was
+            // pinned at 250ms for as long as the room stayed sick. First join
+            // only: a probe answer or a rejoin mid-session must not restart the
+            // session's lifetime.
+            if joinedAt == nil { joinedAt = .now() }
             // Resubmit-from-VV: push everything the server lacks. Gated on
             // the VERSION VECTORS, not the export bytes: the export returns a
             // non-empty envelope even when there is nothing to say, so a

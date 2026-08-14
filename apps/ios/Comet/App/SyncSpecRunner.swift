@@ -1,0 +1,198 @@
+// The room's redial decision, asserted — launch with `-sync-spec` (or run
+// `scripts/ios-sync-spec.sh`, which does the whole loop).
+//
+// gh#405: `RoomClient.swift` is a port of `crates/sync/src/room.rs`, and when
+// room.rs fixed its reconnect loop (gh#396) the phone kept both defects for a
+// release — the ladder reset on the join answer, so a Durable Object that
+// accepted the join and then died put the phone in a 250ms redial loop with no
+// ceiling, and nothing was jittered, so every room the phone held redialed on
+// the same schedule.
+//
+// The decision now lives in `ReconnectBackoff`, a value type with no socket in
+// it, and this is what checks it. Deliberately NOT an end-to-end check: the
+// edge is failing requests on the Durable Objects free-tier duration cap, and a
+// reconnect loop is exactly the thing that cannot be honestly verified against
+// an edge that is down. These are the arithmetic — no network, no session.
+//
+// A launch-arg runner rather than XCTest for the reason `SpecRunner` gives at
+// length: one target, one shared scheme, and a test target means editing the
+// two files the operator keeps local changes in. What the simulator cannot
+// close is the CI gap, so the OTHER half of this check —
+// `crates/sync/tests/ios_room.rs` — reads both sources as text and fails in
+// `cargo test` when the constants drift apart again. That one is the guard
+// against gh#405 recurring; this one is the guard against the schedule being
+// wrong in the first place.
+
+import Foundation
+
+@MainActor
+enum SyncSpecRunner {
+    static var logURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("sync-spec.log")
+    }
+
+    private static var failures = 0
+    private static var checks = 0
+
+    static func log(_ line: String) {
+        print("SYNCSPEC: \(line)")
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            handle.seekToEndOfFile()
+            handle.write(Data("\(line)\n".utf8))
+            try? handle.close()
+        } else {
+            try? Data("\(line)\n".utf8).write(to: logURL)
+        }
+    }
+
+    /// One assertion. Records the mismatch rather than trapping, so one broken
+    /// rule does not hide the others.
+    private static func expect<T: Equatable>(_ actual: T, _ wanted: T, _ what: String) {
+        checks += 1
+        if actual != wanted {
+            failures += 1
+            log("FAIL \(what)\n       got:  \(actual)\n       want: \(wanted)")
+        }
+    }
+
+    private static func expectTrue(_ actual: Bool, _ what: String) {
+        expect(actual, true, what)
+    }
+
+    // MARK: The run
+
+    static func run() {
+        try? FileManager.default.removeItem(at: logURL)
+        failures = 0
+        checks = 0
+        log("sync spec start")
+
+        theLadderClimbsToTheCap()
+        everyWaitIsJittered()
+        aJoinThenDieRoomIsBounded()
+        aWorkingSessionEarnsAFreshLadder()
+        onlyALastingSessionCounts()
+
+        log(failures == 0
+            ? "OK \(checks) checks, no drift"
+            : "FAILED \(failures) of \(checks) checks")
+        log("done")
+    }
+
+    // MARK: The rules
+
+    /// The rungs themselves: doubling from 250ms, clamped at 30s, and the wait
+    /// drawn from the rung BEFORE it doubles. Pinned with the draw forced to
+    /// its floor and to its ceiling, so the interval is checked at both ends
+    /// rather than sampled.
+    private static func theLadderClimbsToTheCap() {
+        var floor = ReconnectBackoff()
+        let atFloor = (0..<9).map { _ in floor.nextDelayMs(healthy: false, spread: { _ in 0 }) }
+        expect(atFloor, [125, 250, 500, 1000, 2000, 4000, 8000, 15000, 15000],
+               "the floor of each rung")
+        expect(floor.rungMs, ReconnectBackoff.capMs, "the rung clamps at the cap")
+
+        var ceiling = ReconnectBackoff()
+        let atCeiling = (0..<9).map { _ in
+            ceiling.nextDelayMs(healthy: false, spread: { max(0, $0 - 1) })
+        }
+        expect(atCeiling, [249, 499, 999, 1999, 3999, 7999, 15999, 29999, 29999],
+               "the ceiling of each rung")
+        // The interval is half-open at the top: a wait never reaches the rung,
+        // so the cap is a real cap and not a value that can be exceeded.
+        expectTrue(atCeiling.allSatisfy { $0 < ReconnectBackoff.capMs },
+                   "no wait reaches the cap")
+    }
+
+    /// The whole point of the second half of gh#396: rooms that failed together
+    /// must not redial together. Thirty rooms holding the same rung draw
+    /// different waits, and every draw stays inside `[rung/2, rung)`.
+    private static func everyWaitIsJittered() {
+        var firstWaits: Set<Int> = []
+        for _ in 0..<30 {
+            var room = ReconnectBackoff()
+            firstWaits.insert(room.nextDelayMs(healthy: false))
+        }
+        // 125 possible values, 30 rooms: a handful of collisions is expected,
+        // a handful of DISTINCT values is not — that is the unjittered shape.
+        expectTrue(firstWaits.count >= 8,
+                   "thirty rooms draw distinct first waits (saw \(firstWaits.count))")
+        expectTrue(firstWaits.allSatisfy { (125..<250).contains($0) },
+                   "every first wait is in [125, 250): \(firstWaits.sorted())")
+
+        // The same claim at a climbed rung, where the spread is widest and the
+        // pile-up worst.
+        var climbed = ReconnectBackoff()
+        for _ in 0..<6 { _ = climbed.nextDelayMs(healthy: false) }
+        var wideWaits: Set<Int> = []
+        for _ in 0..<30 {
+            var room = climbed
+            wideWaits.insert(room.nextDelayMs(healthy: false))
+        }
+        expectTrue(wideWaits.count >= 20,
+                   "a climbed rung spreads too (saw \(wideWaits.count) of 30)")
+        expectTrue(wideWaits.allSatisfy { (8000..<16000).contains($0) },
+                   "every climbed wait is in [8000, 16000)")
+    }
+
+    /// gh#405's defect, as a count. A room whose DO answers the join and then
+    /// dies immediately: five virtual minutes of that, and the dials are
+    /// bounded because the ladder is allowed to climb.
+    private static func aJoinThenDieRoomIsBounded() {
+        let windowMs = 5 * 60 * 1000
+        var ladder = ReconnectBackoff()
+        var elapsed = 0
+        var dials = 0
+        while elapsed < windowMs {
+            // The session itself contributes nothing: joined, then dead. Not
+            // healthy, so it earns no reset.
+            elapsed += ladder.nextDelayMs(healthy: false)
+            dials += 1
+        }
+        // The unfixed schedule for the same five minutes, for the record: a
+        // reset on every join answer and no jitter is a flat 250ms.
+        let unfixed = windowMs / ReconnectBackoff.baseMs
+        log("join-then-die: \(dials) dials in 5 virtual minutes (was \(unfixed) before gh#405)")
+        expectTrue(dials <= 40, "a join-then-die room dials at most 40 times in 5 minutes")
+        expectTrue(ladder.rungMs == ReconnectBackoff.capMs,
+                   "the ladder reached the cap rather than sitting at the base")
+    }
+
+    /// The other direction, which is the one a fix like this breaks if it is
+    /// written carelessly: a room that actually worked must not be punished for
+    /// the outage that follows it.
+    private static func aWorkingSessionEarnsAFreshLadder() {
+        var ladder = ReconnectBackoff()
+        for _ in 0..<6 { _ = ladder.nextDelayMs(healthy: false) }
+        expect(ladder.rungMs, 16000, "the ladder climbed first")
+
+        let wait = ladder.nextDelayMs(healthy: true, spread: { _ in 0 })
+        expect(wait, 125, "a working session redials from the base")
+        expect(ladder.rungMs, ReconnectBackoff.baseMs * 2,
+               "and the ladder itself is back at the bottom")
+    }
+
+    /// What counts as a working session: the lifetime, not the join answer.
+    private static func onlyALastingSessionCounts() {
+        let joined = DispatchTime.now()
+        func after(_ ns: UInt64) -> DispatchTime {
+            DispatchTime(uptimeNanoseconds: joined.uptimeNanoseconds + ns)
+        }
+
+        expect(ReconnectBackoff.isHealthy(joinedAt: nil, now: after(60_000_000_000)), false,
+               "a session that never joined is never healthy")
+        expect(ReconnectBackoff.isHealthy(joinedAt: joined, now: joined), false,
+               "a join answered this instant is not a working session")
+        expect(ReconnectBackoff.isHealthy(joinedAt: joined, now: after(29_999_000_000)), false,
+               "just under the lifetime is still not")
+        expect(ReconnectBackoff.isHealthy(joinedAt: joined,
+                                          now: after(ReconnectBackoff.healthySessionNs)), true,
+               "exactly the lifetime is")
+        expect(ReconnectBackoff.isHealthy(joinedAt: joined, now: after(120_000_000_000)), true,
+               "and anything longer is")
+        // The subtraction is unsigned; an underflow would read as healthy.
+        expect(ReconnectBackoff.isHealthy(joinedAt: after(1_000_000_000), now: joined), false,
+               "a clock that ran backwards is not a working session")
+    }
+}

@@ -143,6 +143,37 @@ shared scheme, and a test target means editing `project.pbxproj` and
 would not close the gap either — what is missing is a macOS runner with a
 simulator, not a test framework.)
 
+### Keeping the redial schedule honest (gh#405)
+
+`Sync/RoomClient.swift` is a port of `crates/sync/src/room.rs`, and its own
+header says "Constants mirrored from room.rs" — mirrored by hand, with nothing
+checking the mirror. gh#396 changed two rules there (a session must outlive
+`HEALTHY_SESSION` before its end resets the backoff ladder; every redial wait is
+jittered) and the phone kept the old ones for a release: a room whose Durable
+Object answered the join and then died redialed four times a second, with no
+ceiling, on a battery, against an edge that was already failing.
+
+The decision now lives in `Sync/ReconnectBackoff.swift` — a value type with no
+socket in it, which is what makes it checkable at all — and two things hold it:
+
+```sh
+cargo test -p comet-sync --test ios_room   # the constants + the shape, read out
+                                           # of both sources as text — in CI
+scripts/ios-sync-spec.sh                   # the schedule they produce, in the
+                                           # simulator (`-sync-spec`)
+```
+
+Unlike the fixtures above, the first half needs no simulator, so this class of
+drift fails on the same runner that builds the desktop. It is not a blanket
+parity claim: the phone deliberately pings at half the desktop's rate and
+tolerates a longer silence, because a radio is a battery. It covers the three
+constants of the redial ladder and the shape of the decision.
+
+The second half is deliberately not an end-to-end check. A reconnect loop is
+exactly the thing that cannot be verified against an edge that is failing every
+request, which is the state the edge is in whenever the Durable Objects
+free-tier duration cap is tripped — the outage the schedule exists for.
+
 ### Keeping the design system honest (gh#181)
 
 `Theme/Theme.swift` is the other second implementation — the design system this
@@ -284,6 +315,11 @@ Sync/
   RoomClient.swift      room.rs port: join with oplog VV, snapshot backfill,
                         resubmit-from-server-VV, DocUpdate+Ack, fragments,
                         %EPH presence sub-room, ping/pong lease, backoff
+  ReconnectBackoff.swift  the redial schedule alone (gh#405), as a value type
+                        with no socket in it: the ladder, the session lifetime
+                        that earns a reset, and the jitter on every wait —
+                        room.rs + jitter.rs, and the only part of the port a
+                        test can reach without an edge
   WorkspaceStore.swift  ws4/{org}/{user} mirror: devices/spaces/chats/sessions
                         rows, presence heartbeats, viewer-side writes
                         (createChat, archive, lastSeenAt, own device row).
