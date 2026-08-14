@@ -9,6 +9,7 @@
 //! - [`DocsStore`]: snapshot persistence (the doc IS the outbox — commands + user entries
 //!   flush immediately) and the processed-command ledger with mark-BEFORE-execute semantics.
 
+pub mod jitter;
 mod room;
 mod store;
 pub mod wake;
