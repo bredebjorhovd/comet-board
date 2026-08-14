@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use comet_board::git_credentials::{install_askpass_shim, push_env};
+use comet_board::git_credentials::{install_askpass_shim, push_env, verify_askpass};
 use comet_engine::Repos;
 
 /// The token the fake helper prints — what a real installation token would be.
@@ -209,6 +209,12 @@ async fn origin_repo(dir: &Path) {
 async fn a_clone_onto_a_device_offers_the_boards_credential() {
     let dir = scratch("credential");
     let shim = install_askpass_shim(&dir.join("bin"), &fake_board(&dir)).expect("shim");
+    // What the engine does before handing a run its credential, and here for the
+    // second reason it does it (gh#385): the shim and the "comet-board" under it
+    // were both written by this test binary a moment ago, and git's own exec of
+    // them cannot be retried by anyone. A successful exec first proves the
+    // inodes have no writers left. See `verify_askpass`.
+    verify_askpass(&shim).expect("the path answers before git is asked to use it");
     let repos = Repos::with_worktrees_root(&dir.join("data"), "device-test", dir.join("worktrees"));
 
     let server = Unauthorized::start();
