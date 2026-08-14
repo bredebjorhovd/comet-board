@@ -236,6 +236,11 @@ impl EngineCore {
         if tokio::runtime::Handle::try_current().is_ok() {
             doc_host.warm_open_recent();
         }
+        // …and the sweep that gives them back (gh#395). The handle map is a
+        // cache: without this, every chat the engine touches keeps its edge
+        // socket for the life of the process, and per-chat rooms become the
+        // dominant load on the edge. Also runtime-gated (it spawns).
+        doc_host.spawn_idle_release();
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
