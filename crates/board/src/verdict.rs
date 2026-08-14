@@ -1122,6 +1122,10 @@ mod tests {
             branch: Some("board/gh-138".into()),
             worktree: Some("/wt/gh-138-1".into()),
             pr_url: Some("https://github.com/bredebjorhovd/comet-board/pull/212".into()),
+            pr_base_ref: None,
+            pr_mergeable: None,
+            changes_below: None,
+            stack: None,
             brief: Brief {
                 identifier: "gh#138".into(),
                 title: "Active owns a chat's row while its session is live".into(),

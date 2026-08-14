@@ -4,6 +4,13 @@
 #   scripts/review-demo.sh              # dark
 #   scripts/review-demo.sh light        # light
 #
+# `COMET_SEED_STACK=1` seeds the fixture as layer 2 of 3 instead (gh#389), so
+# the Stack band has something to draw. It is read at seed time, so a board dir
+# that already holds the unstacked fixture has to go first:
+#
+#   rm -rf /tmp/comet-review-board
+#   COMET_SEED_STACK=1 scripts/review-demo.sh
+#
 # What it takes to photograph this surface, and why each piece is here:
 #
 #   * `seed_review` writes the board AND the attempt's checkout — the review is

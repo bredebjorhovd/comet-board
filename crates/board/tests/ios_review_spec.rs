@@ -148,6 +148,10 @@ fn blank(task_id: &str, identifier: &str) -> AttemptReview {
         branch: Some("board/gh-1".into()),
         worktree: None,
         pr_url: Some("https://github.com/o/r/pull/9".into()),
+        pr_base_ref: None,
+        pr_mergeable: None,
+        changes_below: None,
+        stack: None,
         brief: Brief {
             identifier: identifier.into(),
             title: "A title".into(),

@@ -3737,10 +3737,7 @@ impl BoardPanel {
                     } else {
                         theme.text_muted
                     };
-                    let label = match layer.pr_number {
-                        Some(n) => format!("#{n}"),
-                        None => layer.identifier.clone(),
-                    };
+                    let label = board::layer_label(layer);
                     let target = layer.id.clone();
                     div()
                         .id(SharedString::from(format!("board-peek-layer-{}", layer.id)))

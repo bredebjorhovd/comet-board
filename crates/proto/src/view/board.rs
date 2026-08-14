@@ -1255,13 +1255,52 @@ impl Landing<'_> {
     }
 }
 
-/// Can this row's pull request land? (gh#283.)
+/// The half of a pull request this vocabulary reads (gh#389).
+///
+/// Every function below began as a function on [`TaskRow`], because the board's
+/// list was the only surface that drew a stack. The review screen is the other
+/// one, and what it holds is an `AttemptReview` — a different shape about the
+/// same pull request. Two implementations of "can this land" is precisely what
+/// this vocabulary exists to prevent, so the functions read these five facts
+/// and each shape says how it spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stacked<'a> {
+    /// The task id, which is how a row finds *itself* in its own map.
+    pub id: &'a str,
+    /// GitHub's stack object, with the siblings the board can see joined onto
+    /// it. `None` on a pull request that is not a layer of one.
+    pub stack: Option<&'a RowStack>,
+    /// The branch this pull request merges into — trunk for a standalone one,
+    /// the layer below mid-stack.
+    pub base_ref: Option<&'a str>,
+    /// GitHub's `mergeable_state` for this pull request **alone**, which is why
+    /// none of these functions renders it unqualified.
+    pub mergeable: Option<&'a str>,
+    /// The pull request number of the nearest open layer below that has been
+    /// asked to change (gh#289).
+    pub changes_below: Option<i64>,
+}
+
+impl<'a> From<&'a TaskRow> for Stacked<'a> {
+    fn from(row: &'a TaskRow) -> Self {
+        Stacked {
+            id: &row.id,
+            stack: row.stack.as_ref(),
+            base_ref: row.pr_base_ref.as_deref().filter(|b| !b.is_empty()),
+            mergeable: row.pr_mergeable.as_deref().filter(|s| !s.is_empty()),
+            changes_below: row.changes_below,
+        }
+    }
+}
+
+/// Can this pull request land? (gh#283.)
 ///
 /// The single implementation of the AND: the board fills
-/// [`TaskRow::landing`] with it so `list --json` carries the verdict, and both
-/// viewports call it for the words. A caller holding a row that came off the
+/// [`TaskRow::landing`] with it so `list --json` carries the verdict, and every
+/// viewport calls it for the words. A caller holding a row that came off the
 /// wire can call it too — it reads nothing but the row.
-pub fn landing(row: &TaskRow) -> Landing<'_> {
+pub fn landing<'a>(row: impl Into<Stacked<'a>>) -> Landing<'a> {
+    let row = row.into();
     // Ahead of GitHub's own answer, and ahead of "nobody has asked": a layer
     // below that has been asked to change is going to be rewritten, and every
     // fact about this pull request measured against the branch underneath it —
@@ -1271,16 +1310,16 @@ pub fn landing(row: &TaskRow) -> Landing<'_> {
     if let Some(number) = row.changes_below {
         return Landing::ChangesBelow(number);
     }
-    let Some(state) = row.pr_mergeable.as_deref().filter(|s| !s.is_empty()) else {
+    let Some(state) = row.mergeable.filter(|s| !s.is_empty()) else {
         return Landing::Unknown;
     };
     if state != MERGEABLE_CLEAN {
         return Landing::NotClean(state);
     }
-    let Some(stack) = row.stack.as_ref() else {
+    let Some(stack) = row.stack else {
         return Landing::Ready { below: 0 };
     };
-    let seen = stack.below(&row.id);
+    let seen = stack.below(row.id);
     // A layer that already landed is nobody's obstacle — which is exactly the
     // child whose parent merged and whose own PR GitHub retargeted onto trunk.
     let below: Vec<&StackLayer> = seen.iter().filter(|l| l.open).collect();
@@ -1313,11 +1352,8 @@ pub fn landing(row: &TaskRow) -> Landing<'_> {
 /// wording that has to name it. Falls back to a phrase rather than a branch:
 /// "conflicts with its base" is still true when the board never learned which
 /// branch that is.
-fn base_of(row: &TaskRow) -> &str {
-    row.pr_base_ref
-        .as_deref()
-        .filter(|b| !b.is_empty())
-        .unwrap_or("its base")
+fn base_of<'a>(row: Stacked<'a>) -> &'a str {
+    row.base_ref.filter(|b| !b.is_empty()).unwrap_or("its base")
 }
 
 /// How a layer of a stack is named in a sentence: its pull request number where
@@ -1329,13 +1365,24 @@ fn layer_name(layer: &StackLayer) -> String {
     }
 }
 
+/// How a layer is named in a *map*, where the word `PR` is already implied by
+/// every other entry beside it: `#12`, or the row's identifier for a layer that
+/// has no pull request number yet.
+pub fn layer_label(layer: &StackLayer) -> String {
+    match layer.pr_number {
+        Some(n) => format!("#{n}"),
+        None => layer.identifier.clone(),
+    }
+}
+
 /// What the board says about whether this pull request can land — the sentence
 /// [`landing`] earns.
 ///
 /// `None` when nobody has asked GitHub yet: a blank is honest and an invented
 /// verdict is not. Every other answer names the branch it is measured against,
 /// because that is the fact the flat `mergeable_state` was missing.
-pub fn landing_note(row: &TaskRow) -> Option<String> {
+pub fn landing_note<'a>(row: impl Into<Stacked<'a>>) -> Option<String> {
+    let row = row.into();
     let base = base_of(row);
     Some(match landing(row) {
         Landing::Unknown => return None,
@@ -1371,8 +1418,8 @@ pub fn landing_note(row: &TaskRow) -> Option<String> {
 ///
 /// `None` on a row that is not part of one. GitHub's own count, so a stack
 /// whose lower layers are outside the board's repos still reads its true size.
-pub fn stack_note(row: &TaskRow) -> Option<String> {
-    let stack = row.stack.as_ref()?;
+pub fn stack_note<'a>(row: impl Into<Stacked<'a>>) -> Option<String> {
+    let stack = row.into().stack?;
     Some(match (stack.position, stack.size) {
         (Some(p), Some(size)) => format!("{p} of {size}"),
         (Some(p), None) => format!("layer {p}"),
@@ -1389,11 +1436,12 @@ pub fn stack_note(row: &TaskRow) -> Option<String> {
 /// The middle fact appears only when it differs from the last one — for the
 /// bottom layer the branch it targets *is* where the stack lands, and saying
 /// that twice reads as two different branches.
-pub fn stack_line(row: &TaskRow) -> Option<String> {
-    let stack = row.stack.as_ref()?;
+pub fn stack_line<'a>(row: impl Into<Stacked<'a>>) -> Option<String> {
+    let row = row.into();
+    let stack = row.stack?;
     let mut parts = vec![format!("stack {}", stack_note(row)?)];
     let target = stack.base_ref.as_deref().filter(|b| !b.is_empty());
-    if let Some(base) = row.pr_base_ref.as_deref().filter(|b| !b.is_empty())
+    if let Some(base) = row.base_ref.filter(|b| !b.is_empty())
         && Some(base) != target
     {
         parts.push(format!("onto {base}"));
@@ -1441,7 +1489,7 @@ pub fn merge_confirmation(row: &TaskRow) -> String {
         .as_ref()
         .and_then(|s| s.base_ref.as_deref())
         .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| base_of(row));
+        .unwrap_or_else(|| base_of(row.into()));
     let below: Vec<&StackLayer> = row
         .stack
         .as_ref()
@@ -1475,10 +1523,62 @@ pub fn merge_confirmation(row: &TaskRow) -> String {
 ///
 /// Empty for a row that is not stacked, so a surface can call it
 /// unconditionally and draw nothing.
-pub fn stack_map(row: &TaskRow) -> &[StackLayer] {
-    row.stack
-        .as_ref()
+pub fn stack_map<'a>(row: impl Into<Stacked<'a>>) -> &'a [StackLayer] {
+    row.into()
+        .stack
         .map_or(&[], |stack| stack.layers.as_slice())
+}
+
+/// Which way a stack merges, said as a fact about *this* layer (gh#389).
+///
+/// The one sentence a reviewer needs that no per-pull-request fact carries.
+/// GitHub merges a stack bottom-up: a layer cannot land before the ones under
+/// it, and the layers over it land only after this one does. Both halves are
+/// invisible on a screen that has been handed a single pull request — which is
+/// the state the review screen was in until this issue — and getting the order
+/// wrong is the one mistake in a stack that is both easy and destructive.
+///
+/// The rule is named once, at the front, and then said in this layer's own
+/// numbers. Only *open* layers appear: a landed one is history in the chain
+/// rather than something still to be sequenced.
+///
+/// `None` for a pull request that is not a layer, and for a lone layer with
+/// nothing either side of it — there is no order to get wrong.
+pub fn merge_order<'a>(row: impl Into<Stacked<'a>>) -> Option<String> {
+    let row = row.into();
+    let stack = row.stack?;
+    let open = |layers: &[StackLayer]| -> Vec<String> {
+        layers.iter().filter(|l| l.open).map(layer_label).collect()
+    };
+    let below = open(stack.below(row.id));
+    let above = open(stack.above(row.id));
+    // One pull request lands, two land. The list is short and a reader is
+    // reading a sentence, not a table.
+    let lands = |layers: &[String]| match layers.len() {
+        1 => "lands",
+        _ => "land",
+    };
+    Some(match (below.is_empty(), above.is_empty()) {
+        (true, true) => return None,
+        // The bottom layer. Nothing is in its way, and saying only that would
+        // leave out the half that is about to depend on it.
+        (true, false) => format!(
+            "bottom-up: this is the bottom open layer — {} {} after it",
+            above.join(", "),
+            lands(&above),
+        ),
+        (false, true) => format!(
+            "bottom-up: {} {} before this one",
+            below.join(", "),
+            lands(&below),
+        ),
+        (false, false) => format!(
+            "bottom-up: {} {} before this one, {} after",
+            below.join(", "),
+            lands(&below),
+            above.join(", "),
+        ),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3101,6 +3201,47 @@ mod tests {
         );
         assert_eq!(landing(&r), Landing::Unknown);
         assert_eq!(landing_note(&r), None);
+    }
+
+    /// The fact no per-pull-request field carries (gh#389): a stack merges
+    /// bottom-up, and every layer's own sentence says what that means for it.
+    #[test]
+    fn the_order_is_said_from_wherever_in_the_chain_you_are_standing() {
+        assert_eq!(
+            merge_order(&stacked("s", 1, 3, "main")).as_deref(),
+            Some("bottom-up: this is the bottom open layer — #12, #13 land after it"),
+        );
+        assert_eq!(
+            merge_order(&stacked("s", 2, 3, "board/gh-11-lexer")).as_deref(),
+            Some("bottom-up: #11 lands before this one, #13 after"),
+        );
+        assert_eq!(
+            merge_order(&stacked("s", 3, 3, "board/gh-12-parser")).as_deref(),
+            Some("bottom-up: #11, #12 land before this one"),
+        );
+        // One pull request lands, two land.
+        assert_eq!(
+            merge_order(&stacked("s", 1, 2, "main")).as_deref(),
+            Some("bottom-up: this is the bottom open layer — #12 lands after it"),
+        );
+        // Not a layer of anything, so there is no order to get wrong.
+        assert_eq!(merge_order(&row("r", BoardState::Review)), None);
+    }
+
+    /// A layer that has landed is history in the chain, not something still to
+    /// be sequenced — the same rule [`landing`] applies, said in words.
+    #[test]
+    fn a_merged_layer_is_no_longer_part_of_the_order() {
+        let mut r = stacked("s", 3, 3, "board/gh-12-parser");
+        r.stack.as_mut().unwrap().layers[0].open = false;
+        assert_eq!(
+            merge_order(&r).as_deref(),
+            Some("bottom-up: #12 lands before this one"),
+        );
+        // And with everything under it gone there is nothing left to wait for,
+        // which is the retargeted child of a merged parent.
+        r.stack.as_mut().unwrap().layers[1].open = false;
+        assert_eq!(merge_order(&r), None);
     }
 
     /// The wire carries the new facts as absent rather than null on a row that

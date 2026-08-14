@@ -482,6 +482,25 @@ pub fn render_review(review: &AttemptReview) -> String {
     if let Some(pr) = &review.pr_url {
         let _ = writeln!(out, "  {pr}");
     }
+    // Whether it can land, and — for a layer of a stack — that it *is* one
+    // (§gh#389). Never the flat `mergeable_state`, which mid-stack says `clean`
+    // about a pull request nothing will let through until the ones below it go
+    // first. Silent on a pull request nobody has asked GitHub about, which is
+    // the ordinary state of a fresh row.
+    if let Some(note) = comet_proto::view::board::landing_note(review.stacked()) {
+        let _ = writeln!(out, "  {note}");
+    }
+    if let Some(line) = comet_proto::view::board::stack_line(review.stacked()) {
+        let _ = writeln!(out, "  {line}");
+        let map: Vec<String> = comet_proto::view::board::stack_map(review.stacked())
+            .iter()
+            .map(comet_proto::view::board::layer_label)
+            .collect();
+        let _ = writeln!(out, "    {}", map.join(" ↑ "));
+        if let Some(order) = comet_proto::view::board::merge_order(review.stacked()) {
+            let _ = writeln!(out, "    {order}");
+        }
+    }
     // The verdict, before any of the sections it was derived from. Read from
     // `claims::verdict` rather than phrased here, so this terminal and the
     // desktop review screen cannot come to different conclusions about the
@@ -2233,6 +2252,10 @@ mod tests {
             branch: Some("board/gh-183".into()),
             worktree: Some("/wt/gh-183".into()),
             pr_url: Some("https://github.com/o/r/pull/210".into()),
+            pr_base_ref: None,
+            pr_mergeable: None,
+            changes_below: None,
+            stack: None,
             brief: Brief {
                 identifier: "gh#183".into(),
                 title: "review backend".into(),
@@ -2425,6 +2448,73 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("Public API unchanged"), "{text}");
+    }
+
+    /// A layer of a stack says so, in the terminal too (§gh#389).
+    ///
+    /// The header block is where a reader learns what they are looking at, and
+    /// "an ordinary pull request" is the wrong answer for a layer: the map says
+    /// which siblings exist, the order says which way the chain merges, and the
+    /// landing note refuses to repeat GitHub's `clean` unqualified.
+    #[test]
+    fn a_stacked_review_says_which_layer_it_is_and_which_way_the_chain_merges() {
+        use comet_proto::view::board::{RowStack, StackLayer};
+        let layer = |n: i64, position: i64| StackLayer {
+            id: format!("gh:o/r!{n}"),
+            identifier: format!("gh!{n}"),
+            pr_number: Some(n),
+            position: Some(position),
+            open: true,
+            mergeable: Some("clean".into()),
+            changes_requested: false,
+        };
+        let mut review = review_of(Remainder::default(), vec![]);
+        review.task_id = "gh:o/r!48".into();
+        review.pr_url = Some("https://github.com/o/r/pull/48".into());
+        review.pr_base_ref = Some("board/gh-44-packages".into());
+        review.pr_mergeable = Some("clean".into());
+        review.stack = Some(RowStack {
+            number: 49,
+            position: Some(2),
+            size: Some(3),
+            base_ref: Some("main".into()),
+            layers: vec![layer(47, 1), layer(48, 2), layer(50, 3)],
+        });
+
+        let text = render_review(&review);
+        assert!(
+            text.contains("stack 2 of 3 · onto board/gh-44-packages · lands on main"),
+            "{text}"
+        );
+        assert!(text.contains("#47 ↑ #48 ↑ #50"), "{text}");
+        assert!(
+            text.contains("bottom-up: #47 lands before this one, #50 after"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ready to land with 1 below"),
+            "the AND across the layers below, never a bare `clean`: {text}"
+        );
+
+        // The same pull request with a stuck layer under it: GitHub still says
+        // `clean` about this one, and the terminal still refuses to.
+        review.stack.as_mut().unwrap().layers[0].mergeable = Some("dirty".into());
+        let text = render_review(&review);
+        assert!(
+            text.contains("clean against board/gh-44-packages · waiting on PR #47"),
+            "{text}"
+        );
+        assert!(!text.contains("ready to land"), "{text}");
+    }
+
+    /// A pull request that is not a layer of anything gains nothing: no map, no
+    /// order, and the header block it always had.
+    #[test]
+    fn an_unstacked_review_prints_no_stack_at_all() {
+        let text = render_review(&review_of(Remainder::default(), vec![]));
+        assert!(!text.contains("stack "), "{text}");
+        assert!(!text.contains("bottom-up"), "{text}");
+        assert!(!text.contains("↑"), "{text}");
     }
 
     /// The two states that would otherwise read as "nothing changed".

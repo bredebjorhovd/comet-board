@@ -133,6 +133,33 @@ fn stack_key(task: &Task) -> Option<StackKey> {
     Some((repo, number))
 }
 
+/// Put a review in its stack (gh#389): the map of siblings the board can see,
+/// and the nearest layer below that has been asked to change.
+///
+/// The review screen was the last surface that did not know a stack existed. It
+/// is handed one attempt, and every fact it was given was a fact about one pull
+/// request — so a reviewer opening layer 2 of 3 saw an ordinary pull request,
+/// with nothing saying which layers had to land before it and nothing linking
+/// to them. That is the whole of what this fills in, and it fills it from the
+/// indexes above rather than from a second query, so the screen and the board
+/// row can never come to disagree about which stack a pull request is in.
+///
+/// Applied to the assembled review rather than passed into
+/// [`crate::claims::review`], for the reason [`crate::rows::task_row`] takes its
+/// stack as an argument: a sibling is another row, and no amount of looking at
+/// one task finds it. `changes_below` carries the same `pr_open` gate the row
+/// applies — a layer that has landed is nobody's obstacle.
+///
+/// Quiet on an ordinary pull request: no stack object, no edge, nothing set,
+/// and every surface draws nothing.
+pub fn place_in_stack(tasks: &[Task], task: &Task, review: &mut crate::claims::AttemptReview) {
+    review.stack = Stacks::of(tasks).row_stack(task);
+    review.changes_below = Dependents::of(tasks)
+        .changes_below(&task.id)
+        .and_then(|d| d.pr_number)
+        .filter(|_| task.pr_open);
+}
+
 // ---- addressing the other layers (gh#289) -------------------------------
 
 /// One layer of a stack, as the layers around it need to see it.
@@ -515,6 +542,20 @@ mod tests {
         row
     }
 
+    /// The review a person opens on one layer, with the same join on it — what
+    /// [`crate::sync::SyncEngine::review`] hands back (gh#389). The diff is
+    /// beside the point here; the stack is the whole of what is being asserted.
+    fn review_of(tasks: &[Task], index: usize) -> crate::claims::AttemptReview {
+        let task = &tasks[index];
+        let mut review = crate::claims::pull_request_review(
+            task,
+            Vec::new(),
+            crate::claims::DiffSource::PullRequest,
+        );
+        place_in_stack(tasks, task, &mut review);
+        review
+    }
+
     /// The headline: five strangers become one chain, bottom first, whatever
     /// order the poll happened to return them in.
     #[test]
@@ -719,17 +760,81 @@ mod tests {
         );
     }
 
+    /// The review of one layer, with the whole chain on it (gh#389).
+    ///
+    /// The screen is handed one attempt, so until this it had no way to know
+    /// there was a chain at all — and it is the screen a person is on when they
+    /// decide whether this diff is worth approving. Every sentence here is the
+    /// same function the board row says it with; the review just has the facts
+    /// to call them with now.
+    #[test]
+    fn a_reviews_pull_request_carries_the_stack_it_is_a_layer_of() {
+        let tasks = three_layers([Some("clean"); 3]);
+        let review = review_of(&tasks, 1);
+
+        let stack = review.stack.as_ref().expect("layer 2 is in a stack");
+        assert_eq!((stack.position, stack.size), (Some(2), Some(3)));
+        assert_eq!(
+            stack.layers.iter().map(|l| l.pr_number).collect::<Vec<_>>(),
+            vec![Some(11), Some(12), Some(13)],
+            "every sibling the board can see, bottom first",
+        );
+        assert_eq!(
+            stack_line(review.stacked()).as_deref(),
+            Some("stack 2 of 3 · onto board/gh-11-lexer · lands on main"),
+        );
+        assert_eq!(
+            comet_proto::view::board::merge_order(review.stacked()).as_deref(),
+            Some("bottom-up: #11 lands before this one, #13 after"),
+        );
+        // The whole reason the position matters: `clean` on this pull request
+        // is clean against the layer below it, and the screen says which.
+        assert_eq!(
+            landing_note(review.stacked()).as_deref(),
+            Some("ready to land with 1 below"),
+        );
+        assert_eq!(review.pr_base_ref.as_deref(), Some("board/gh-11-lexer"));
+    }
+
+    /// A layer below asked to change (gh#289) reaches the review screen ahead
+    /// of GitHub's own verdict — the diff in front of the reader is about to be
+    /// replayed on a branch that moved, and approving it is the bad outcome.
+    #[test]
+    fn a_review_hears_about_a_rewrite_coming_from_underneath_it() {
+        let mut tasks = three_layers([Some("clean"); 3]);
+        tasks[0].pr_changes_requested = Some(900);
+        let review = review_of(&tasks, 2);
+        assert_eq!(review.changes_below, Some(11));
+        assert_eq!(
+            landing_note(review.stacked()).as_deref(),
+            Some("PR #11 below was asked to change · this rebases under it"),
+        );
+    }
+
     /// A standalone pull request has no stack and gains no vocabulary: the
     /// board says `ready to land` or GitHub's objection, and never a position.
     #[test]
     fn a_standalone_pull_request_is_unchanged() {
         let mut task = layer("o/r", 20, 1, 1, "main", Some("clean"));
         task.pr_stack = None;
-        let row = row_of(&[task], 0);
+        let tasks = vec![task];
+        let row = row_of(&tasks, 0);
         assert!(row.stack.is_none());
         assert_eq!(landing(&row), Landing::Ready { below: 0 });
         assert_eq!(stack_line(&row), None);
         assert_eq!(landing_note(&row).as_deref(), Some("ready to land"));
+
+        // And its review screen draws no band at all: the vocabulary is
+        // silent, not merely quiet, on a pull request that is not a layer.
+        let review = review_of(&tasks, 0);
+        assert_eq!(review.stack, None);
+        assert_eq!(review.changes_below, None);
+        assert_eq!(stack_line(review.stacked()), None);
+        assert_eq!(
+            comet_proto::view::board::merge_order(review.stacked()),
+            None
+        );
+        assert!(comet_proto::view::board::stack_map(review.stacked()).is_empty());
     }
 
     /// The map is what the board can see; the count is GitHub's. A stack whose

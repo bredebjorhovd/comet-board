@@ -2751,10 +2751,7 @@ fn draw_board_detail(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
             if ix > 0 {
                 spans.push(Span::styled(" ↑ ", theme.hint()));
             }
-            let label = match layer.pr_number {
-                Some(n) => format!("#{n}"),
-                None => layer.identifier.clone(),
-            };
+            let label = board::layer_label(layer);
             let style = if layer.id == row.id {
                 theme.body()
             } else if layer.mergeable.as_deref().is_some_and(|m| m != "clean") {

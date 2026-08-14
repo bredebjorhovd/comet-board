@@ -351,6 +351,40 @@ pub struct AttemptReview {
     pub branch: Option<String>,
     pub worktree: Option<String>,
     pub pr_url: Option<String>,
+    /// The branch this pull request merges *into* (§gh#389). Trunk for a
+    /// standalone one; mid-stack it is the branch of the layer below, which is
+    /// what makes [`Self::pr_mergeable`] mean less than it looks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_base_ref: Option<String>,
+    /// GitHub's `mergeable_state` for this pull request **alone**.
+    ///
+    /// Never rendered unqualified, here least of all: the review screen is
+    /// where somebody decides to merge, and for a layer of a stack `clean`
+    /// means clean *against the layer below*. Read through
+    /// [`comet_proto::view::board::landing`], which is the one implementation
+    /// of the AND across the layers underneath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_mergeable: Option<String>,
+    /// The pull request number of the nearest open layer below this one that
+    /// has been asked to change (§gh#289) — the fact that makes reading this
+    /// diff at all a waste, because GitHub is about to replay it on a branch
+    /// that has been rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_below: Option<i64>,
+    /// Where this pull request sits in its stack, and every sibling the board
+    /// can see (§gh#389).
+    ///
+    /// A reviewer opening a layer of a stack was, until this field, looking at
+    /// an ordinary pull request: nothing said it was layer 2 of 3, nothing
+    /// named the layers below it, and merging in the wrong order is the one
+    /// mistake in a stack that is both easy and destructive. The board has
+    /// grouped stacks since gh#283 — this carries that grouping onto the one
+    /// screen whose whole job is to make merging cheaper (gh#234).
+    ///
+    /// `None` on a pull request that is not a layer of one, which is the
+    /// ordinary case and draws nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<comet_proto::view::board::RowStack>,
     pub brief: Brief,
     /// When the agent submitted its claims. `None` with an empty claims list
     /// means it never answered the contract at all, which is a different fact
@@ -414,6 +448,23 @@ impl AttemptReview {
     /// somebody for missing a message nobody sent.
     pub fn undispatched(&self) -> bool {
         self.attempt == NO_ATTEMPT
+    }
+
+    /// How this review spells the five facts the stack vocabulary reads
+    /// (§gh#389).
+    ///
+    /// The board's list and this screen are two shapes about the same pull
+    /// request, and `landing`, `stack_line`, `stack_map` and `merge_order` are
+    /// one implementation each. This is what lets the review screen call them
+    /// rather than phrase a second opinion about whether a layer can land.
+    pub fn stacked(&self) -> comet_proto::view::board::Stacked<'_> {
+        comet_proto::view::board::Stacked {
+            id: &self.task_id,
+            stack: self.stack.as_ref(),
+            base_ref: self.pr_base_ref.as_deref().filter(|b| !b.is_empty()),
+            mergeable: self.pr_mergeable.as_deref().filter(|s| !s.is_empty()),
+            changes_below: self.changes_below,
+        }
     }
 }
 
@@ -947,6 +998,13 @@ pub fn review(
         branch: attempt.branch.clone(),
         worktree: attempt.worktree.clone(),
         pr_url: task.pr_url.clone(),
+        pr_base_ref: task.pr_base_ref.clone(),
+        pr_mergeable: task.pr_mergeable.clone(),
+        // Facts about this pull request's *neighbours*, and a function handed
+        // one task cannot find them — the same split [`crate::rows::task_row`]
+        // makes, and filled by the same indexes one call up (§gh#389).
+        changes_below: None,
+        stack: None,
         brief: Brief {
             identifier: task.identifier.clone(),
             title: task.title.clone(),
@@ -1000,6 +1058,14 @@ pub fn pull_request_review(
         branch: task.pr_head_ref.clone(),
         worktree: None,
         pr_url: task.pr_url.clone(),
+        pr_base_ref: task.pr_base_ref.clone(),
+        pr_mergeable: task.pr_mergeable.clone(),
+        // Filled one call up, from the indexes that can see the siblings
+        // (§gh#389). A pull request nobody dispatched is as likely to be a
+        // layer of a stack as any other — more so, since gh#387 means most
+        // stacks reach the board without the dispatch having made them.
+        changes_below: None,
+        stack: None,
         brief: Brief {
             identifier: task.identifier.clone(),
             title: task.title.clone(),

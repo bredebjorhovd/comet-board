@@ -1609,6 +1609,143 @@ impl ReviewPanel {
         }
     }
 
+    /// Where one layer of the stack lives on GitHub, derived off this review's
+    /// own pull request URL (gh#389).
+    ///
+    /// A stack is scoped to one repository — that is the key the board groups
+    /// on — so every layer is this URL with a different number on the end. The
+    /// map is otherwise a row of numbers a reader has to go and find by hand,
+    /// which is half of what "nothing links to them" meant.
+    ///
+    /// `None` unless the URL ends in a number, so nothing is derived off a
+    /// shape this did not recognise.
+    fn layer_url(pr_url: &str, number: i64) -> Option<String> {
+        let (base, tail) = pr_url.rsplit_once('/')?;
+        tail.parse::<i64>().ok()?;
+        Some(format!("{base}/{number}"))
+    }
+
+    /// The stack map, bottom layer first, this layer marked (gh#389).
+    ///
+    /// The same chips the board's peek panel draws — one hue per layer, saying
+    /// what the review already knows about it: the layer you are on is
+    /// accented, one GitHub objects to wears the failed colour, one that has
+    /// already landed is muted, because it is history in the chain rather than
+    /// something still in the way. The arrow points the way the chain merges,
+    /// so the row cannot be read as a set.
+    ///
+    /// Each chip is a door to that layer's pull request. The board's peek opens
+    /// the *sibling row*; there is no board here to open one on, and the
+    /// pull request is the thing a reviewer wants next anyway.
+    fn stack_ladder(review: &AttemptReview, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let layers = board::stack_map(review.stacked());
+        let here = review.task_id.clone();
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(4.0))
+            .children(layers.iter().enumerate().map(|(ix, layer)| {
+                let current = layer.id == here;
+                let stuck = layer
+                    .mergeable
+                    .as_deref()
+                    .is_some_and(|state| state != "clean");
+                let color = if current {
+                    theme.accent
+                } else if !layer.open {
+                    theme.text_faint
+                } else if stuck || layer.changes_requested {
+                    crate::board::state_color(board::BoardState::Failed, theme)
+                } else {
+                    theme.text_muted
+                };
+                let url = review
+                    .pr_url
+                    .as_deref()
+                    .zip(layer.pr_number)
+                    .and_then(|(pr, n)| Self::layer_url(pr, n));
+                div()
+                    .id(SharedString::from(format!(
+                        "review-stack-layer-{}",
+                        layer.id
+                    )))
+                    .flex_none()
+                    .px(px(6.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .bg(theme.wash(if current { 0.16 } else { 0.08 }))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(color)
+                    .when(url.is_some(), |el| {
+                        el.cursor_pointer().hover(|s| s.bg(theme.wash(0.18)))
+                    })
+                    .child(SharedString::from(match ix {
+                        0 => board::layer_label(layer),
+                        _ => format!("↑ {}", board::layer_label(layer)),
+                    }))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        // A layer with no pull request number — the board holds
+                        // the row, GitHub has not been given the branch — is
+                        // not a door. Nothing happens rather than a tab opening
+                        // on a guess.
+                        if let Some(url) = url.as_deref() {
+                            cx.open_url(url);
+                        }
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    /// The stack band (gh#389): that this pull request is a layer at all, which
+    /// layers are under it, and which way the chain merges.
+    ///
+    /// Absent on every pull request that is not one, which is nearly all of
+    /// them — and the reason it is pinned above the scroll with the verdict
+    /// rather than filed in the body when it is present. A reviewer who has not
+    /// been told this is layer 2 of 3 is reading an ordinary pull request, and
+    /// the mistake that follows is not a misreading of the diff: it is
+    /// approving one that is about to be replayed onto a branch that moved, or
+    /// merging out of an order GitHub will not let them take back.
+    ///
+    /// Three lines, and each is a different question. Where this sits and where
+    /// the chain lands ([`board::stack_line`]); the map, with a door on every
+    /// layer ([`Self::stack_ladder`]); and the order
+    /// ([`board::merge_order`]) — the one fact no per-pull-request field
+    /// carries, because it is not about this pull request at all.
+    fn render_stack(
+        review: &AttemptReview,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let line = board::stack_line(review.stacked())?;
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(Theme::SPACE_SM))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(line)),
+            )
+            .child(Self::stack_ladder(review, theme, cx))
+            .children(board::merge_order(review.stacked()).map(|order| {
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(order))
+            }))
+            .into_any_element();
+        Some(Self::band(theme, "Stack", GLYPH_NUDGE, false, body))
+    }
+
     /// The card's own header (review.md B): what this is, whose turn it is,
     /// and the ways out — over a line of facts about the run.
     fn render_header(
@@ -1652,6 +1789,14 @@ impl ReviewPanel {
         }
         if let Some(branch) = &review.branch {
             facts.push(Self::fact(theme, Some(icons::GIT_BRANCH), branch.clone(), None));
+        }
+        // Whether it can land, with the layers underneath taken into account
+        // (gh#283, gh#389) — never the flat `mergeable_state`, which mid-stack
+        // says `clean` about a pull request that cannot go anywhere. Silent
+        // until GitHub has been asked, which is the ordinary state of a fresh
+        // row: a blank is honest and an invented verdict is not.
+        if let Some(note) = board::landing_note(review.stacked()) {
+            facts.push(Self::fact(theme, None, note, None));
         }
         // What the board knows about the run itself. The canvas names the model
         // and how long it took; neither is on the wire (see review.md), and the
@@ -2224,6 +2369,7 @@ impl Render for ReviewPanel {
         let header = self.render_header(&review, &theme, cx);
         let verdict = Self::render_verdict(&review.verdict(), &theme);
         let sandbox = Self::render_sandbox(&review, &theme);
+        let stack = Self::render_stack(&review, &theme, cx);
         let brief = self.render_brief(&review, &theme, window);
         let effects = Self::render_effects(&review, &theme);
         let claims = Self::render_claims(&review, &theme);
@@ -2270,6 +2416,11 @@ impl Render for ReviewPanel {
             card.child(header)
                 .child(verdict)
                 .children(sandbox)
+                // Above the scroll, with the verdict, and for the same reason:
+                // what a reviewer is looking at is a layer of a stack, and that
+                // must not be reachable only by scrolling back past a long
+                // issue body (gh#389).
+                .children(stack)
                 .child(body)
                 .children(bar),
         )
@@ -2424,6 +2575,10 @@ mod tests {
             branch: Some("board/gh-138".into()),
             worktree: Some("/wt/gh-138-1".into()),
             pr_url: Some("https://github.com/o/r/pull/212".into()),
+            pr_base_ref: None,
+            pr_mergeable: None,
+            changes_below: None,
+            stack: None,
             brief: comet_board::claims::Brief {
                 identifier: "gh#138".into(),
                 title: "Active owns a chat's row while its session is live".into(),
@@ -2530,6 +2685,73 @@ mod tests {
             ..reviewed()
         };
         assert!(!ReviewPanel::diff_openable(&undispatched, Some("chat-1")));
+    }
+
+    /// The review that was three unrelated pull requests (§gh#389).
+    ///
+    /// Every sentence the band draws is the board's own, so this asserts the
+    /// screen calls them with the right facts rather than re-checking the
+    /// words. The one thing that is this module's is the door on each chip.
+    #[test]
+    fn a_stacked_review_says_which_layer_it_is_and_links_to_the_rest() {
+        let layer = |n: i64, position: i64| comet_proto::view::board::StackLayer {
+            id: format!("gh:o/r!{n}"),
+            identifier: format!("gh!{n}"),
+            pr_number: Some(n),
+            position: Some(position),
+            open: true,
+            mergeable: Some("clean".into()),
+            changes_requested: false,
+        };
+        let review = AttemptReview {
+            task_id: "gh:o/r!48".into(),
+            pr_url: Some("https://github.com/o/r/pull/48".into()),
+            pr_base_ref: Some("board/gh-44-packages".into()),
+            pr_mergeable: Some("clean".into()),
+            stack: Some(comet_proto::view::board::RowStack {
+                number: 49,
+                position: Some(2),
+                size: Some(3),
+                base_ref: Some("main".into()),
+                layers: vec![layer(47, 1), layer(48, 2), layer(50, 3)],
+            }),
+            ..reviewed()
+        };
+        assert_eq!(
+            board::stack_line(review.stacked()).as_deref(),
+            Some("stack 2 of 3 · onto board/gh-44-packages · lands on main"),
+        );
+        assert_eq!(board::stack_map(review.stacked()).len(), 3);
+        assert_eq!(
+            board::merge_order(review.stacked()).as_deref(),
+            Some("bottom-up: #47 lands before this one, #50 after"),
+        );
+        // The header's fact, and the whole reason the band is worth drawing:
+        // GitHub says `clean` about this pull request either way.
+        assert_eq!(
+            board::landing_note(review.stacked()).as_deref(),
+            Some("ready to land with 1 below"),
+        );
+
+        // Each chip is a door: a stack is scoped to one repository, so a
+        // sibling is this URL with a different number on the end.
+        assert_eq!(
+            ReviewPanel::layer_url("https://github.com/o/r/pull/48", 47).as_deref(),
+            Some("https://github.com/o/r/pull/47"),
+        );
+        // Nothing is derived off a shape this did not recognise.
+        assert_eq!(ReviewPanel::layer_url("https://github.com/o/r", 47), None);
+
+        // And an ordinary pull request draws none of it.
+        let plain = reviewed();
+        assert_eq!(board::stack_line(plain.stacked()), None);
+        assert!(board::stack_map(plain.stacked()).is_empty());
+        assert_eq!(board::merge_order(plain.stacked()), None);
+        assert_eq!(
+            board::landing_note(plain.stacked()),
+            None,
+            "nobody has asked GitHub, and a blank is honest",
+        );
     }
 
     /// The pill separates a review that wants a human from one already
