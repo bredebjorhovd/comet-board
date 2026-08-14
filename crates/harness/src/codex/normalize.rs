@@ -176,6 +176,76 @@ pub(crate) fn item_type(item: &Value) -> &str {
     item.get("type").and_then(Value::as_str).unwrap_or("")
 }
 
+/// What a command's output says when the *sandbox itself* could not be built
+/// (§gh#394). Matched case-insensitively as substrings.
+///
+/// Deliberately short, and every entry is a wrapper's own setup error rather
+/// than anything a program under the sandbox prints. `bwrap:` is the Linux
+/// sandbox helper's error prefix; the `mkdir parents` line is the one gh#394
+/// was reported with. These are not "the command was denied" — a denied write
+/// is the sandbox *working*, and a run that hits one carries on.
+const SANDBOX_SETUP_SIGNATURES: &[&str] = &[
+    "can't mkdir parents for",
+    "cannot mkdir parents for",
+    "bwrap:",
+    "failed to set up sandbox",
+    "failed to setup sandbox",
+    "sandbox setup failed",
+    "error setting up sandbox",
+    "failed to create sandbox",
+];
+
+/// The line to quote when a completed `commandExecution` shows the sandbox
+/// never came up (§gh#394) — `None` for every other item, and for every command
+/// that merely failed.
+///
+/// This exists because the alternative is what gh#394 actually looked like: the
+/// sandbox failed setup, so *no* command could start (not even `pwd` from
+/// `/tmp`), so the agent could not push, open a pull request or claim — and
+/// could not signal blocked either, because nothing had died. The chat stayed
+/// alive and the board row stayed `working`, indistinguishable from an attempt
+/// making progress, until a human read the agent's prose and noticed. A run
+/// that cannot execute anything must end, and end as errored.
+///
+/// Two guards keep an ordinary run out of this path: the command has to have
+/// **failed**, and its output has to carry a [`SANDBOX_SETUP_SIGNATURES`]
+/// entry. A build log or a `grep` that merely mentions one of those strings
+/// exits 0 and is ignored. The residual risk is asymmetric on purpose — a false
+/// positive ends a run that the board leaves live and retryable, a false
+/// negative is a paralyzed row nobody can see.
+pub(crate) fn sandbox_setup_failure(item: &Value) -> Option<String> {
+    if !matches!(item_type(item), "commandExecution" | "command_execution") {
+        return None;
+    }
+    let failed = str_field(item, &["status"]) == "failed"
+        || field(item, &["exitCode", "exit_code"])
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            != 0;
+    if !failed {
+        return None;
+    }
+    let output = ["aggregatedOutput", "aggregated_output", "output", "stderr"]
+        .iter()
+        .filter_map(|k| item.get(*k).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hit = SANDBOX_SETUP_SIGNATURES
+        .iter()
+        .find(|sig| output.to_lowercase().contains(**sig))?;
+    // The offending line, not the whole log: this text ends up in a `Done`
+    // error a human reads on a board row.
+    let line = output
+        .lines()
+        .find(|l| l.to_lowercase().contains(*hit))
+        .unwrap_or(&output)
+        .trim();
+    Some(match line.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_owned(),
+    })
+}
+
 /// Map one `item/started` or `item/completed` payload's item to events.
 /// `agentMessage` and `reasoning` flow through their delta channels and are
 /// handled by the session loop, not here.
@@ -476,5 +546,69 @@ mod tests {
         );
         assert_eq!(turn_error_message(&json!({"turn": {"id": "t"}})), None);
         assert_eq!(turn_error_message(&json!({"turn": {"error": null}})), None);
+    }
+
+    /// §gh#394, the reported line verbatim: the sandbox failed to come up, so
+    /// the command never ran. The quote a board row shows is the offending
+    /// line, not the whole log.
+    #[test]
+    fn a_sandbox_that_never_came_up_is_read_off_the_command_that_could_not_start() {
+        let item = json!({
+            "type": "commandExecution", "id": "c1", "command": "pwd", "status": "failed",
+            "exit_code": 1,
+            "aggregated_output":
+                "starting sandbox\nCan't mkdir parents for /home/comet/dev/tally/.git/\
+                 packed-refs/.git: Not a directory\n",
+        });
+        let line = sandbox_setup_failure(&item).expect("a setup failure");
+        assert!(line.starts_with("Can't mkdir parents for"), "{line}");
+        assert!(line.ends_with("Not a directory"), "{line}");
+        assert!(!line.contains("starting sandbox"), "one line, not the log");
+
+        // The Linux helper's own error prefix, under the other spelling and
+        // with `status` as the only sign of failure.
+        assert!(
+            sandbox_setup_failure(&json!({
+                "type": "command_execution", "status": "failed",
+                "aggregatedOutput": "bwrap: Can't bind mount: No such file or directory",
+            }))
+            .is_some()
+        );
+    }
+
+    /// The two guards, because the cost of getting this wrong is a killed run.
+    /// A command that succeeded is never a setup failure however it reads, and
+    /// a command that failed for its own reasons is a normal failed command.
+    #[test]
+    fn an_ordinary_failure_and_a_passing_grep_are_left_alone() {
+        // Exit 0 with the signature in the output: a `grep` over this very
+        // source, a build log, a test that asserts on the string.
+        assert_eq!(
+            sandbox_setup_failure(&json!({
+                "type": "commandExecution", "status": "completed", "exit_code": 0,
+                "aggregated_output": "normalize.rs: \"can't mkdir parents for\",",
+            })),
+            None
+        );
+        // A failure that is just a failure.
+        assert_eq!(
+            sandbox_setup_failure(&json!({
+                "type": "commandExecution", "status": "failed", "exit_code": 2,
+                "aggregated_output": "error[E0308]: mismatched types",
+            })),
+            None
+        );
+        // A failed command with no output at all, and a non-command item.
+        assert_eq!(
+            sandbox_setup_failure(&json!({"type": "commandExecution", "exit_code": 1})),
+            None
+        );
+        assert_eq!(
+            sandbox_setup_failure(&json!({
+                "type": "fileChange", "status": "failed",
+                "aggregated_output": "bwrap: nope",
+            })),
+            None
+        );
     }
 }
