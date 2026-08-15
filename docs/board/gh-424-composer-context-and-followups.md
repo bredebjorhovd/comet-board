@@ -67,7 +67,9 @@ navigation cannot replace it with the current checkout. Provenance is bound to
 each exact picker-inserted token occurrence, not its path. Editor replacement
 deltas shift unaffected occurrences and revoke every intersected occurrence,
 including an indistinguishable same-bytes replacement; a separately typed
-duplicate never inherits the selected occurrence's stamp. A successful Send,
+duplicate never inherits the selected occurrence's stamp. Exact-token checks
+require start/whitespace before and end/whitespace after, and an edit touching
+either endpoint revokes the occurrence. A successful Send,
 Steer, Queue, or edit draft clear removes the consumed provenance. Retyping or
 pasting the same path is therefore still plain text. Queue editing replaces
 normal-draft provenance and rehydrates only paths with exactly one durable ref
@@ -219,6 +221,7 @@ The repository tests cover:
 - command Loro JSON and snapshot reopen retaining non-empty typed context, and
   the engine passing restored refs into execution-time validation;
 - queue-edit provenance replacement, ambiguous duplicate fail-closed hydration,
+  exact token-boundary/prefix refusal, endpoint/delimiter revocation,
   edit/wizard clear revocation, and programmatic completion range shifting;
 - Queue fold edit/move/remove/pause/run-next and two-client deterministic fold;
 - exclusive unpaused/paused RunNext evaluation and removed-target cleanup;

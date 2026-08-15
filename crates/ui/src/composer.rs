@@ -58,6 +58,22 @@ struct ContextSelection {
     token_end: usize,
 }
 
+fn exact_token_at(text: &str, token: &str, start: usize) -> bool {
+    let end = start.saturating_add(token.len());
+    text.get(start..end) == Some(token)
+        && text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        && text[end..].chars().next().is_none_or(char::is_whitespace)
+}
+
+fn exact_token_occurrences<'a>(text: &'a str, token: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.match_indices(token)
+        .map(|(start, _)| start)
+        .filter(|start| exact_token_at(text, token, *start))
+}
+
 fn selected_context_refs(
     text: &str,
     selections: Option<&Vec<ContextSelection>>,
@@ -72,8 +88,9 @@ fn selected_context_refs(
                 checkout_id: None,
             }
             .token();
-            (text.get(selection.token_start..selection.token_end) == Some(expected.as_str()))
-                .then(|| selection.clone())
+            (selection.token_end == selection.token_start + expected.len()
+                && exact_token_at(text, &expected, selection.token_start))
+            .then(|| selection.clone())
         })
         .collect();
     selected.sort_by_key(|selection| selection.token_start);
@@ -97,12 +114,12 @@ fn apply_context_edit(selections: &mut Vec<ContextSelection>, edit: &ComposerTex
     let removed_len = edit.replaced.end.saturating_sub(edit.replaced.start);
     let delta = edit.inserted_len as isize - removed_len as isize;
     selections.retain_mut(|selection| {
-        if edit.replaced.end <= selection.token_start {
+        if edit.replaced.end < selection.token_start {
             selection.token_start = selection.token_start.saturating_add_signed(delta);
             selection.token_end = selection.token_end.saturating_add_signed(delta);
             true
         } else {
-            edit.replaced.start >= selection.token_end
+            edit.replaced.start > selection.token_end
         }
     });
 }
@@ -122,8 +139,8 @@ fn queued_context_selections(prompt: &str, context: &[ContextRef]) -> Vec<Contex
                 return None;
             }
             let token = reference.token();
-            let mut occurrences = prompt.match_indices(&token);
-            let (token_start, _) = occurrences.next()?;
+            let mut occurrences = exact_token_occurrences(prompt, &token);
+            let token_start = occurrences.next()?;
             if occurrences.next().is_some() {
                 return None;
             }
@@ -5181,7 +5198,7 @@ mod tests {
 
     #[test]
     fn one_picker_occurrence_never_authorizes_a_typed_duplicate() {
-        let selected_text = "@src/foo.rs";
+        let selected_text = "@src/foo.rs ";
         let mut selections = vec![ContextSelection {
             path: "src/foo.rs".into(),
             kind: comet_proto::ContextRefKind::File,
@@ -5189,7 +5206,7 @@ mod tests {
             token_start: 0,
             token_end: 11,
         }];
-        let typed = " and @src/foo.rs";
+        let typed = "and @src/foo.rs";
         apply_context_edit(
             &mut selections,
             &ComposerTextEdit {
@@ -5223,6 +5240,45 @@ mod tests {
             selected_context_refs(text, Some(&selections)).is_empty(),
             "an indistinguishable editor replacement fails closed"
         );
+    }
+
+    #[test]
+    fn extending_a_selected_token_at_its_endpoint_revokes_it() {
+        let selected = "@src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 0,
+            token_end: selected.len(),
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: selected.len()..selected.len(),
+                inserted_len: 1,
+            },
+        );
+        assert!(selected_context_refs("@src/foo.rsx ", Some(&selections)).is_empty());
+    }
+
+    #[test]
+    fn removing_the_preceding_delimiter_revokes_the_selected_token() {
+        let mut selections = vec![ContextSelection {
+            path: "foo".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 2,
+            token_end: 6,
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 1..2,
+                inserted_len: 0,
+            },
+        );
+        assert!(selected_context_refs("x@foo ", Some(&selections)).is_empty());
     }
 
     fn stamped_file(path: &str) -> ContextRef {
@@ -5260,6 +5316,16 @@ mod tests {
     fn ambiguous_duplicate_queue_context_requires_reselection() {
         let prompt = "typed @same.rs then selected @same.rs";
         assert!(queued_context_selections(prompt, &[stamped_file("same.rs")]).is_empty());
+    }
+
+    #[test]
+    fn queue_context_never_rehydrates_a_prefix_inside_a_longer_token() {
+        assert!(queued_context_selections("inspect @foobar", &[stamped_file("foo")]).is_empty());
+    }
+
+    #[test]
+    fn queue_context_never_rehydrates_a_midword_at_sign() {
+        assert!(queued_context_selections("inspect x@foo", &[stamped_file("foo")]).is_empty());
     }
 
     #[test]
