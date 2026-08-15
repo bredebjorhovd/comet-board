@@ -1373,7 +1373,7 @@ impl AccountsPage {
         let body: AnyElement = match login {
             LoginFlow::Starting { .. } => div()
                 .mt(px(8.0))
-                .child(popover::skeleton_rows("login-starting", &theme, 2))
+                .child(popover::skeleton_rows(&theme, 2, cx.entity_id(), cx))
                 .into_any_element(),
             LoginFlow::PasteCode {
                 start,
@@ -1526,7 +1526,12 @@ impl AccountsPage {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(crate::loaders::gradient_spinner("login-poll", &theme, 3.0))
+                                .child(crate::loaders::gradient_spinner(
+                                    &theme,
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                ))
                                 .child(
                                     div()
                                         .text_size(px(Theme::TEXT_DENSE))
@@ -1646,13 +1651,14 @@ impl AccountsPage {
     /// row so loaded data lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
         &self,
-        id: (&'static str, usize),
         dim: bool,
         first: bool,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::motion::{self, AnimationExt as _};
+        use crate::motion;
         use crate::settings::widgets;
+        let delta = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
         // One shape for every placeholder — the badge it stands in for stopped
         // being a full-round pill when the radii closed (gh#174).
         let ghost = |w: gpui::Length, h: f32| {
@@ -1723,11 +1729,7 @@ impl AccountsPage {
             .py(px(widgets::ROW_PAD_Y))
             .when(!first, |el| el.border_t_1().border_color(theme.border))
             .when(dim, |el| el.opacity(0.6))
-            .child(
-                inner.with_animation(id, motion::COMET_PULSE.repeating(), move |el, delta| {
-                    el.opacity(0.55 + 0.35 * motion::pulse_wave(delta))
-                }),
-            )
+            .child(inner.opacity(0.55 + 0.35 * motion::pulse_wave(delta)))
             .into_any_element()
     }
 }
@@ -1789,11 +1791,6 @@ impl Render for AccountsPage {
             Loadable::Idle | Loadable::Loading => PROVIDERS
                 .into_iter()
                 .map(|(harness, name, _cli)| {
-                    let skeleton_id = match harness {
-                        HarnessId::Codex => "accounts-skeleton-codex",
-                        HarnessId::Opencode => "accounts-skeleton-opencode",
-                        _ => "accounts-skeleton-claude",
-                    };
                     div()
                         .mt(px(widgets::BLOCK_GAP))
                         .flex()
@@ -1815,18 +1812,8 @@ impl Render for AccountsPage {
                             // so the card keeps its size while data develops.
                             widgets::section_card(&theme)
                                 .mt(px(0.0))
-                                .child(self.render_skeleton_row(
-                                    (skeleton_id, 0),
-                                    false,
-                                    true,
-                                    &theme,
-                                ))
-                                .child(self.render_skeleton_row(
-                                    (skeleton_id, 1),
-                                    true,
-                                    false,
-                                    &theme,
-                                )),
+                                .child(self.render_skeleton_row(false, true, &theme, cx))
+                                .child(self.render_skeleton_row(true, false, &theme, cx)),
                         )
                         .into_any_element()
                 })

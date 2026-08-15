@@ -1816,7 +1816,7 @@ impl Pickers {
         let body: AnyElement =
             match &self.refs {
                 Loadable::Loading | Loadable::Idle => {
-                    popover::skeleton_rows("branch-skeleton", &theme, 4)
+                    popover::skeleton_rows(&theme, 4, cx.entity_id(), cx)
                 }
                 Loadable::Error(message) => {
                     let message = message.clone();
@@ -2002,7 +2002,7 @@ impl Pickers {
         let rail: AnyElement = match &self.harnesses {
             Loadable::Loading | Loadable::Idle => div()
                 .p(px(4.0))
-                .child(popover::skeleton_rows("harness-skeleton", &theme, 3))
+                .child(popover::skeleton_rows(&theme, 3, cx.entity_id(), cx))
                 .into_any_element(),
             Loadable::Error(message) => {
                 let message = message.clone();
@@ -2305,7 +2305,7 @@ impl Pickers {
     fn render_traits_sections(&mut self, nav_offset: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
-            return popover::skeleton_rows("traits-skeleton", &theme, 3);
+            return popover::skeleton_rows(&theme, 3, cx.entity_id(), cx);
         };
         let levels = self.trait_ladder(cx);
         // Display the effective level (draft pick or the chat's config), so

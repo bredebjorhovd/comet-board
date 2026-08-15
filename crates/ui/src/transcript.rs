@@ -1560,16 +1560,15 @@ impl Transcript {
                     .bg(theme.white_alpha(0.025))
                     .into_any_element(),
                 // Loading: the pulsing skeleton (same wash as popover skeletons).
-                AttachmentSnapshot::Loading => frame
-                    .border_1()
-                    .border_color(theme.white_alpha(0.08))
-                    .bg(theme.white_alpha(0.055))
-                    .with_animation(
-                        SharedString::from(format!("{row_id}#att-pulse{aix}")),
-                        motion::COMET_PULSE.repeating(),
-                        move |el, delta| el.opacity(0.35 + 0.4 * motion::pulse_wave(delta)),
-                    )
-                    .into_any_element(),
+                AttachmentSnapshot::Loading => {
+                    let delta = motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
+                    frame
+                        .border_1()
+                        .border_color(theme.white_alpha(0.08))
+                        .bg(theme.white_alpha(0.055))
+                        .opacity(0.35 + 0.4 * motion::pulse_wave(delta))
+                        .into_any_element()
+                }
             };
             strip = strip.child(thumb);
         }
