@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use comet_board::evidence::RanCommand;
 use comet_board::runtime::{
-    DispatchHandle, DispatchSpec, ReviewCandidate, RunEnd, RunTokens, Runtime, RuntimeUnavailable,
+    DispatchHandle, DispatchSpec, RefusedBeforeCut, ReviewCandidate, RunEnd, RunTokens, Runtime,
+    RuntimeUnavailable,
 };
 use comet_doc::SessionCommandPayload;
 use comet_proto::{
@@ -82,14 +83,17 @@ impl Runtime for CometRuntime {
         // The checkout first: a failure here leaves nothing behind to clean up.
         // That includes an unreachable origin — `create_worktree_on` fetches
         // `spec.base` before cutting and refuses rather than branching from a
-        // stale local HEAD (gh#67).
+        // stale local HEAD (gh#67). Typed as `RefusedBeforeCut` (gh#410): no
+        // branch was cut and no chat made, so the board deletes the attempt
+        // row it opened instead of burning an attempt on a pre-flight refusal.
         let cwd = if spec.worktree {
             self.handle
                 .block_on(self.repos.create_worktree_on(
                     Path::new(&spec.repo_path),
                     &spec.branch,
                     &spec.base,
-                ))?
+                ))
+                .map_err(|e| anyhow::Error::new(RefusedBeforeCut(e.to_string())))?
                 .path
         } else {
             spec.repo_path.clone()

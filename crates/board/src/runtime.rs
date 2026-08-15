@@ -349,6 +349,31 @@ pub struct DispatchHandle {
     pub cwd: String,
 }
 
+/// A dispatch refused before it cut anything (gh#410): no branch, no worktree,
+/// no chat — the world is exactly as it was before the release was asked for.
+///
+/// A [`Runtime::dispatch`] that fails with this as the error tells the board
+/// the attempt row it opened records a dispatch that never happened, and the
+/// board *deletes* that row instead of closing it `failed`. An attempt is
+/// recorded when a branch is cut, not when a release is asked for: a pre-flight
+/// refusal — `--onto` a parent that has not pushed, an unreachable origin —
+/// must not burn an attempt, because the count is what a reader uses to judge
+/// whether a task is going badly, and the whole point of such a refusal is
+/// "fix the pre-condition and come back" (same class as gh#390's restart).
+///
+/// Carries the refusal as text: the message is the operator's whole repair
+/// path, and it prints exactly as the underlying error would have.
+#[derive(Debug)]
+pub struct RefusedBeforeCut(pub String);
+
+impl std::fmt::Display for RefusedBeforeCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RefusedBeforeCut {}
+
 /// A Comet chat whose checkout can be associated with a pull request.
 ///
 /// Board dispatches already create attempts before their chats exist. This is
