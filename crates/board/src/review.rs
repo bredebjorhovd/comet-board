@@ -572,7 +572,7 @@ pub fn compose_notice(
 }
 
 /// What a transitive dependent is told when a layer farther below it is asked
-/// to change (§gh#407).
+/// to change (gh#407).
 ///
 /// Still a notice rather than the review, but deliberately not an instruction
 /// to rebase: the direct child owns that command and cascades it through this
