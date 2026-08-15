@@ -108,6 +108,7 @@ struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    planned_worktrees: std::sync::Mutex<HashSet<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -155,6 +156,7 @@ impl Repos {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                planned_worktrees: std::sync::Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -317,6 +319,33 @@ impl Repos {
             .git(&["rev-parse", "--absolute-git-dir"], Some(path))
             .await?;
         Ok(PathBuf::from(git_dir).join("HEAD"))
+    }
+
+    /// The repository a checkout belongs to — the primary work tree's root,
+    /// asked of the checkout itself (gh#425).
+    ///
+    /// A linked worktree's *common* git dir is the primary checkout's `.git`,
+    /// so its parent is the repo root. That is the folder `git worktree add`
+    /// has to be run in, which is why forking a chat that already lives in a
+    /// worktree can cut a sibling rather than nesting inside it.
+    pub async fn repo_root(&self, path: &Path) -> Result<PathBuf, EngineError> {
+        let common = self
+            .git(
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                Some(path),
+            )
+            .await?;
+        PathBuf::from(&common)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| EngineError::Other(format!("{common} has no parent repository")))
+    }
+
+    /// The commit a checkout is standing on — a fork's start point, resolved to
+    /// a sha so the new worktree lands exactly where the source chat is rather
+    /// than wherever a branch name has since moved to.
+    pub async fn head_sha(&self, path: &Path) -> Result<String, EngineError> {
+        self.git(&["rev-parse", "HEAD"], Some(path)).await
     }
 
     /// Canonical identity shared by every chat operating in this exact worktree:
@@ -709,6 +738,17 @@ impl Repos {
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
+        let (path, branch_name, name) = self.plan_worktree(repo_path).await?;
+        self.create_planned_worktree(repo_path, branch, path, branch_name, name)
+            .await
+    }
+
+    /// Reserve the exact names a fork transaction records before invoking
+    /// `git worktree add`. Planning does not touch git or create the checkout.
+    pub(crate) async fn plan_worktree(
+        &self,
+        repo_path: &Path,
+    ) -> Result<(PathBuf, String, String), EngineError> {
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -734,7 +774,15 @@ impl Repos {
                 ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
                 NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
             );
-            if !base.join(&candidate).exists() && !existing.contains(&format!("comet/{candidate}"))
+            let candidate_path = base.join(&candidate);
+            let mut planned = self
+                .inner
+                .planned_worktrees
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !candidate_path.exists()
+                && !existing.contains(&format!("comet/{candidate}"))
+                && planned.insert(candidate_path)
             {
                 name = Some(candidate);
                 break;
@@ -744,19 +792,65 @@ impl Repos {
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
         let branch_name = format!("comet/{name}");
-        self.git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &path.to_string_lossy(),
-                branch,
-            ],
-            Some(repo_path),
-        )
-        .await?;
-        let checkout = self.checkout_identity(&path).await?;
+        Ok((path, branch_name, name))
+    }
+
+    pub(crate) async fn create_planned_worktree(
+        &self,
+        repo_path: &Path,
+        base: &str,
+        path: PathBuf,
+        branch_name: String,
+        name: String,
+    ) -> Result<Worktree, EngineError> {
+        struct Release<'a>(&'a std::sync::Mutex<HashSet<PathBuf>>, PathBuf);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&self.1);
+            }
+        }
+        let _release = Release(&self.inner.planned_worktrees, path.clone());
+        if let Err(error) = self
+            .git(
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name,
+                    &path.to_string_lossy(),
+                    base,
+                ],
+                Some(repo_path),
+            )
+            .await
+        {
+            if let Err(cleanup) = self
+                .delete_worktree(repo_path, &path, Some(&branch_name))
+                .await
+            {
+                return Err(EngineError::Other(format!(
+                    "{error}; rollback after git worktree add failed: {cleanup}"
+                )));
+            }
+            return Err(error);
+        }
+        let checkout = match self.checkout_identity(&path).await {
+            Ok(checkout) => checkout,
+            Err(error) => {
+                if let Err(cleanup) = self
+                    .delete_worktree(repo_path, &path, Some(&branch_name))
+                    .await
+                {
+                    return Err(EngineError::Other(format!(
+                        "{error}; rollback of allocated worktree also failed: {cleanup}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
             path: path.to_string_lossy().to_string(),
@@ -764,6 +858,14 @@ impl Repos {
             name,
             checkout_id: Some(checkout.id),
         })
+    }
+
+    pub(crate) fn release_planned_worktree(&self, path: &Path) {
+        self.inner
+            .planned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(path);
     }
 
     /// Cut a worktree on an exact branch name — the board's dispatch path
@@ -1026,12 +1128,21 @@ impl Repos {
                     Some(repo_path),
                 )
                 .await;
-            if removed.is_err() {
+            if let Err(git_error) = removed {
                 // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
+                match std::fs::remove_dir_all(worktree_path) {
+                    Ok(()) => {}
+                    Err(fs_error) if fs_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(fs_error) => {
+                        return Err(EngineError::Other(format!(
+                            "git could not remove {} ({git_error}); filesystem cleanup also failed: {fs_error}",
+                            worktree_path.display()
+                        )));
+                    }
+                }
             }
         }
-        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
+        self.git(&["worktree", "prune"], Some(repo_path)).await?;
         // `current` is empty when the checkout was already gone (or sat on a
         // detached HEAD), which is the case the vouched-for branch exists for.
         let ours = if current.starts_with("comet/") {
@@ -1039,8 +1150,10 @@ impl Repos {
         } else {
             branch.filter(|b| current.is_empty() || current == *b)
         };
-        if let Some(ours) = ours {
-            let _ = self.git(&["branch", "-D", ours], Some(repo_path)).await;
+        if let Some(ours) = ours
+            && self.branch_exists(repo_path, ours).await
+        {
+            self.git(&["branch", "-D", ours], Some(repo_path)).await?;
         }
         Ok(())
     }

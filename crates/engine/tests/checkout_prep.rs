@@ -431,7 +431,10 @@ async fn a_ready_checkout_is_not_prepared_twice_until_the_recipe_changes() {
     assert_eq!(ran.lines().count(), 2);
 
     // Edited: the digest moved, so it prepares again on its own.
-    set_recipe(&b, "version = 1\n[setup]\nrun = \"echo two >> generated/ran.txt\"\noutputs = [\"generated\"]\n");
+    set_recipe(
+        &b,
+        "version = 1\n[setup]\nrun = \"echo two >> generated/ran.txt\"\noutputs = [\"generated\"]\n",
+    );
     prep.prepare(b.request()).await;
     let ran = std::fs::read_to_string(b.worktree.join("generated/ran.txt")).unwrap();
     assert_eq!(ran.lines().count(), 3);
@@ -450,7 +453,10 @@ async fn a_failed_checkout_is_prepared_again_on_the_next_visit() {
     let second = prep.prepare(b.request()).await;
     assert_eq!(first.state, PrepState::Failed);
     assert_eq!(second.state, PrepState::Failed);
-    assert!(second.started_at >= first.started_at, "the failed setup ran again");
+    assert!(
+        second.started_at >= first.started_at,
+        "the failed setup ran again"
+    );
     assert!(
         std::fs::read_to_string(second.log.unwrap())
             .unwrap()
@@ -1119,9 +1125,7 @@ fn cancellation_reports_a_tombstone_write_failure() {
 
 #[tokio::test]
 async fn archive_removes_the_repositorys_approved_paths() {
-    let b = a_box(Some(
-        "version = 1\n[archive]\npaths = [\"build-output\"]\n",
-    ));
+    let b = a_box(Some("version = 1\n[archive]\npaths = [\"build-output\"]\n"));
     std::fs::create_dir_all(b.worktree.join("build-output")).unwrap();
     b.approve();
     let said = b
@@ -1129,7 +1133,10 @@ async fn archive_removes_the_repositorys_approved_paths() {
         .archive(&b.worktree, &b.repository_id, None)
         .await
         .expect("ran");
-    assert!(said.contains("removed archive paths build-output"), "{said}");
+    assert!(
+        said.contains("removed archive paths build-output"),
+        "{said}"
+    );
     assert!(!b.worktree.join("build-output").exists());
 
     // A repo with no `[archive]` says nothing, and the caller sweeps as before.
@@ -1145,9 +1152,7 @@ async fn archive_removes_the_repositorys_approved_paths() {
 
 #[tokio::test]
 async fn archive_uses_the_approved_contract_after_ordinary_agent_changes() {
-    let b = a_box(Some(
-        "version = 1\n[archive]\npaths = [\"build-output\"]\n",
-    ));
+    let b = a_box(Some("version = 1\n[archive]\npaths = [\"build-output\"]\n"));
     let prep = b.prep();
     b.approve();
     let ready = prep.prepare(b.request()).await;
@@ -1172,16 +1177,17 @@ async fn archive_uses_the_approved_contract_after_ordinary_agent_changes() {
         .archive(&b.worktree, &b.repository_id, None)
         .await
         .expect("approved archive remains available");
-    assert!(said.contains("removed archive paths build-output"), "{said}");
+    assert!(
+        said.contains("removed archive paths build-output"),
+        "{said}"
+    );
     assert!(!b.worktree.join("build-output").exists());
     assert!(b.worktree.join("replacement-ran").exists());
 }
 
 #[tokio::test]
 async fn an_archive_only_recipe_is_approved_before_the_agent_can_edit_it() {
-    let b = a_box(Some(
-        "version = 1\n[archive]\npaths = [\"build-output\"]\n",
-    ));
+    let b = a_box(Some("version = 1\n[archive]\npaths = [\"build-output\"]\n"));
     let unapproved = b
         .prep()
         .prepare(PrepareRequest {
@@ -1221,6 +1227,6 @@ async fn forgetting_a_checkout_removes_its_record() {
     let prep = b.prep();
     prep.prepare(b.request()).await;
     assert!(prep.status(&b.worktree).is_some());
-    prep.forget(&b.worktree);
+    prep.forget(&b.worktree).unwrap();
     assert!(prep.status(&b.worktree).is_none());
 }

@@ -3661,6 +3661,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: Some("space".into()),
             last_seen_at: None,
+            forked_from: None,
         }
     }
 

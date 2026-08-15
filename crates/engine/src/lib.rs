@@ -22,6 +22,7 @@ pub mod context_files;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod fork;
 pub mod instance_lock;
 pub mod org_devices;
 pub mod presence;
@@ -45,6 +46,7 @@ pub use board::{BoardService, board_enabled_from_env};
 pub use board_runtime::CometRuntime;
 pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use fork::{ForkDeps, ForkHandoff, fork_chat};
 pub use instance_lock::InstanceLock;
 pub use org_devices::{ORG_DEVICES_DOC_ID, OrgDevices, OrgDevicesConfig};
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -213,6 +215,12 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(&org_dir)?);
         let journal = Arc::new(RunJournal::open(org_dir.join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        // Where a fork's carried transcript waits for that fork's first run
+        // (gh#425) — identity-scoped like the journals beside it, because a
+        // carried transcript is transcript content and belongs to whoever's
+        // chats it came from.
+        let fork_handoff = fork::ForkHandoff::open(org_dir.join("handoff"))?;
+        sessions.set_handoff(fork_handoff.clone());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -233,10 +241,61 @@ impl EngineCore {
             },
         )?;
         let repos = Repos::new(data_dir, &device_id);
+        let checkout_prep = checkout_prep::CheckoutPrep::new(data_dir);
+        sessions.set_repos(repos.clone());
         doc_host.set_workspace(workspace.clone());
         doc_host.set_repos(repos.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        // Fork creation is a small durable transaction spanning git, the
+        // workspace doc and a session doc. Finish rollback before serving any
+        // caller, even when assembly itself happens inside an async runtime.
+        let recovered_forks = {
+            let handoff = fork_handoff.clone();
+            let workspace = workspace.clone();
+            let doc_host = doc_host.clone();
+            let repos = repos.clone();
+            let checkout_prep = checkout_prep.clone();
+            std::thread::spawn(move || -> Result<usize, EngineError> {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(handoff.recover_pending(
+                        &workspace,
+                        &doc_host,
+                        &repos,
+                        &checkout_prep,
+                    ))
+            })
+            .join()
+            .map_err(|_| EngineError::Other("fork recovery thread panicked".into()))??
+        };
+        if recovered_forks > 0 {
+            tracing::info!(recovered_forks, "unfinished forks recovered on boot");
+        }
+        for authority in fork_handoff.authorities()? {
+            if authority.device_id != device_id {
+                return Err(EngineError::Other(format!(
+                    "fork {} belongs to host {}, not {}",
+                    authority.chat_id, authority.device_id, device_id
+                )));
+            }
+            match workspace.doc().chat(&authority.chat_id)? {
+                Some(row) if authority.matches(&row) => {}
+                Some(_) => {
+                    return Err(EngineError::Other(format!(
+                        "fork {} conflicts with its host authority",
+                        authority.chat_id
+                    )));
+                }
+                None => {
+                    // Deletion is authoritative. A machine-local capsule must
+                    // never recreate a synced row the user removed while this
+                    // host was down.
+                    fork_handoff.clear_fork_state(&authority.chat_id)?;
+                }
+            }
+        }
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
@@ -274,7 +333,7 @@ impl EngineCore {
             doc_host,
             workspace,
             registry,
-            checkout_prep: checkout_prep::CheckoutPrep::new(data_dir),
+            checkout_prep,
             repos,
             terminals,
             diff_sync,

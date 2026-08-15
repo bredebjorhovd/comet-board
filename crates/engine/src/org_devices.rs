@@ -171,6 +171,7 @@ impl OrgDevices {
                     inner.reseed(replacement);
                 }
             }),
+            None,
             Arc::downgrade(&self.inner.room),
             Arc::new(move || {
                 let hook = weak

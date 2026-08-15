@@ -614,6 +614,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: space_id.map(str::to_string),
             last_seen_at: None,
+            forked_from: None,
         }
     }
 

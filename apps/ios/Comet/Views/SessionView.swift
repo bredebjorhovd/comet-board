@@ -8,6 +8,10 @@ struct SessionView: View {
     @Environment(AppModel.self) private var model
     let chatId: String
     @State private var showConfig = false
+    /// The fork strip's expanded sentence (gh#425) — collapsed by default: the
+    /// tags answer "what is this", the sentence answers "and what does that
+    /// mean for what I am looking at".
+    @State private var showForkDetail = false
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
 
@@ -207,9 +211,47 @@ struct SessionView: View {
         return parts.joined(separator: " · ")
     }
 
+    /// The strip that says this session is a fork (gh#425), above everything
+    /// else because it changes how the rest of the screen should be read: in a
+    /// shared checkout this agent is read-only while another session's edits
+    /// can still appear underneath it. Tapping expands the sentence.
+    @ViewBuilder
+    private func forkStrip(chat: Chat) -> some View {
+        if let lineage = chat.forkedFrom {
+            let sourceTitle = model.chat(id: lineage.sourceChatId)?.title
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.textSubtle)
+                    Text(lineage.compact(sourceTitle: sourceTitle))
+                        .font(Theme.sans(Theme.textCaption))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if showForkDetail {
+                    Text(lineage.explanation)
+                        .font(Theme.sans(Theme.textCaption))
+                        .foregroundStyle(Theme.textFaint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            // The shared-checkout fork is the one a reader can be misled by, so
+            // it is the one that is louder.
+            .background(lineage.isShared ? Theme.elementActive : Theme.surface)
+            .contentShape(Rectangle())
+            .onTapGesture { showForkDetail.toggle() }
+        }
+    }
+
     private func content(chat: Chat, store: SessionStore) -> some View {
         let status = liveStatus(chat: chat)
         return VStack(spacing: 0) {
+            forkStrip(chat: chat)
             // The status strip floats over the transcript's faded bottom edge
             // instead of stacking below it — the loader sits on the
             // transparent zone and content is never pushed around.

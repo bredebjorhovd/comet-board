@@ -235,7 +235,11 @@ impl Recipe {
                 }
             }
         }
-        if self.run.as_ref().is_some_and(|step| !step.outputs.is_empty()) {
+        if self
+            .run
+            .as_ref()
+            .is_some_and(|step| !step.outputs.is_empty())
+        {
             return Err("[run] may not declare `outputs`; only [setup] is host preparation".into());
         }
         if let Some(setup) = &self.setup {
@@ -1315,20 +1319,16 @@ impl CheckoutPrep {
 
         let log = self.log_path(&worktree);
         record.log = Some(log.to_string_lossy().into_owned());
-        let (execution, _) = match materialize_execution_snapshot(
-            self,
-            &worktree,
-            &snapshot,
-            req.repository_id,
-        ) {
-            Ok(execution) => execution,
-            Err(detail) => {
-                record.state = PrepState::Failed;
-                record.ended_at = Some(now_ms());
-                record.detail = Some(detail);
-                return self.write(record);
-            }
-        };
+        let (execution, _) =
+            match materialize_execution_snapshot(self, &worktree, &snapshot, req.repository_id) {
+                Ok(execution) => execution,
+                Err(detail) => {
+                    record.state = PrepState::Failed;
+                    record.ended_at = Some(now_ms());
+                    record.detail = Some(detail);
+                    return self.write(record);
+                }
+            };
         let outcome = run_step(
             &step.run,
             &execution.source,
@@ -1343,29 +1343,27 @@ impl CheckoutPrep {
         record.ended_at = Some(now_ms());
         record.exit_code = outcome.exit_code;
         match outcome.verdict {
-            Verdict::Ok => {
-                match self.ensure_tracked_inputs(&worktree, &snapshot.tree) {
-                    Ok(()) => {
-                        match promote_outputs(&execution, &worktree)
-                            .and_then(|_| project_links(&recipe.links, &locals, &worktree))
-                        {
-                            Ok(outcomes) => {
-                                record.links = outcomes;
-                                record.state = PrepState::Ready;
-                                record.detail = None;
-                            }
-                            Err(detail) => {
-                                record.state = PrepState::Failed;
-                                record.detail = Some(detail);
-                            }
+            Verdict::Ok => match self.ensure_tracked_inputs(&worktree, &snapshot.tree) {
+                Ok(()) => {
+                    match promote_outputs(&execution, &worktree)
+                        .and_then(|_| project_links(&recipe.links, &locals, &worktree))
+                    {
+                        Ok(outcomes) => {
+                            record.links = outcomes;
+                            record.state = PrepState::Ready;
+                            record.detail = None;
+                        }
+                        Err(detail) => {
+                            record.state = PrepState::Failed;
+                            record.detail = Some(detail);
                         }
                     }
-                    Err(detail) => {
-                        record.state = PrepState::Failed;
-                        record.detail = Some(detail);
-                    }
                 }
-            }
+                Err(detail) => {
+                    record.state = PrepState::Failed;
+                    record.detail = Some(detail);
+                }
+            },
             Verdict::Failed(detail) => {
                 record.state = PrepState::Failed;
                 record.detail = Some(detail);
@@ -1432,8 +1430,23 @@ impl CheckoutPrep {
     /// Forget a checkout's preparation state. Called when the checkout itself
     /// is reclaimed — the record is about a directory, and outliving it by a
     /// week helps nobody.
-    pub fn forget(&self, worktree: &Path) {
-        let _ = std::fs::remove_dir_all(self.state_dir(worktree));
+    pub fn forget(&self, worktree: &Path) -> std::io::Result<()> {
+        let state = self.state_dir(worktree);
+        match std::fs::remove_dir_all(&state) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if state.exists() {
+            return Err(std::io::Error::other(format!(
+                "checkout preparation state still exists at {}",
+                state.display()
+            )));
+        }
+        if let Some(parent) = state.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn write(&self, record: PrepRecord) -> PrepRecord {
@@ -1580,9 +1593,8 @@ fn materialize_execution_snapshot(
                     ));
                 }
                 let output = runtime.join(format!("output-{index}"));
-                std::fs::create_dir_all(&output).map_err(|error| {
-                    format!("creating writable setup output `{name}`: {error}")
-                })?;
+                std::fs::create_dir_all(&output)
+                    .map_err(|error| format!("creating writable setup output `{name}`: {error}"))?;
                 let prior = worktree.join(name);
                 if std::fs::symlink_metadata(&prior).is_ok() {
                     std::fs::remove_dir(&output).map_err(|error| {
@@ -1685,7 +1697,10 @@ fn promote_output(source: &Path, destination: &Path, worktree: &Path) -> Result<
     let had_destination = std::fs::symlink_metadata(destination).is_ok();
     if had_destination {
         std::fs::rename(destination, &backup).map_err(|error| {
-            format!("parking prior setup output {}: {error}", destination.display())
+            format!(
+                "parking prior setup output {}: {error}",
+                destination.display()
+            )
         })?;
     }
     if let Err(error) = std::fs::rename(&temporary, destination) {
@@ -1701,8 +1716,7 @@ fn promote_output(source: &Path, destination: &Path, worktree: &Path) -> Result<
     if had_destination {
         let _ = remove_path(&backup);
     }
-    sync_directory(worktree)
-        .map_err(|error| format!("syncing promoted setup output: {error}"))?;
+    sync_directory(worktree).map_err(|error| format!("syncing promoted setup output: {error}"))?;
     Ok(())
 }
 
@@ -1719,13 +1733,17 @@ fn copy_tree_without_escape(source: &Path, destination: &Path, root: &Path) -> R
             copy_tree_without_escape(&entry.path(), &destination.join(entry.file_name()), root)?;
         }
         std::fs::set_permissions(destination, metadata.permissions()).map_err(|error| {
-            format!("preserving setup output mode {}: {error}", destination.display())
+            format!(
+                "preserving setup output mode {}: {error}",
+                destination.display()
+            )
         })?;
         return Ok(());
     }
     if metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(source)
-            .map_err(|error| format!("reading setup output symlink {}: {error}", source.display()))?;
+        let target = std::fs::read_link(source).map_err(|error| {
+            format!("reading setup output symlink {}: {error}", source.display())
+        })?;
         normalize_relative(source.parent().unwrap_or(root), &target, root).ok_or_else(|| {
             format!(
                 "setup output symlink {} points outside its declared output",
@@ -1748,7 +1766,10 @@ fn copy_tree_without_escape(source: &Path, destination: &Path, root: &Path) -> R
     std::fs::copy(source, destination)
         .map_err(|error| format!("copying setup output {}: {error}", source.display()))?;
     std::fs::set_permissions(destination, metadata.permissions()).map_err(|error| {
-        format!("preserving setup output mode {}: {error}", destination.display())
+        format!(
+            "preserving setup output mode {}: {error}",
+            destination.display()
+        )
     })?;
     Ok(())
 }
