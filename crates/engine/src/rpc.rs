@@ -73,8 +73,8 @@ use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
 use comet_proto::view::stats::{
-    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe,
-    StatsProbeResult, aggregate_board_stats,
+    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe, StatsProbeResult,
+    aggregate_board_stats,
 };
 use comet_proto::{ChatConfig, HarnessId};
 use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
@@ -228,7 +228,7 @@ struct SearchContextParams {
     #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
-    cwd: Option<String>,
+    space_id: Option<String>,
     #[serde(default)]
     query: String,
     /// Rows wanted, capped host-side — a client asking for ten thousand is
@@ -718,22 +718,35 @@ impl EngineRpc {
 
     /// The `@` picker's rows, from the chat's own checkout (gh#424).
     ///
-    /// The root is the chat's `cwd` — the worktree the agent works in, which is
-    /// the only thing a reference can be relative to and still mean the same
-    /// on every device. `params.cwd` covers the new-chat canvas, where the
-    /// space's folder is all there is.
+    /// The root is derived from a chat or space row owned by this host. A
+    /// forwarded caller never supplies a filesystem path as authority.
     ///
     /// Never fails, for the same reason [`Self::list_skills`] never does: an
     /// unknown chat, a folder that is not there, an unreadable tree all produce
     /// an empty list, and a red box under a composer mid-keystroke helps nobody.
     fn search_context_files(&self, params: SearchContextParams) -> comet_proto::ContextSearch {
-        let root = params
+        let chat = params
             .chat_id
             .as_deref()
             .and_then(|id| self.workspace.chat(id))
-            .and_then(|chat| chat.cwd)
-            .filter(|cwd| !cwd.is_empty())
-            .or(params.cwd);
+            .filter(|chat| chat.device_id == self.workspace.device_id());
+        let chat_root = chat
+            .as_ref()
+            .and_then(|chat| chat.cwd.clone())
+            .filter(|cwd| !cwd.is_empty());
+        let space = params.space_id.as_deref().and_then(|id| {
+            self.workspace
+                .doc()
+                .space(id)
+                .ok()
+                .flatten()
+                .filter(|space| space.device_id == self.workspace.device_id())
+        });
+        let declared_checkout_id = chat
+            .as_ref()
+            .and_then(|chat| chat.checkout_id.clone())
+            .or_else(|| space.as_ref().and_then(|space| space.checkout_id.clone()));
+        let root = chat_root.or_else(|| space.map(|space| space.path));
         let Some(root) = root else {
             return comet_proto::ContextSearch::default();
         };
@@ -745,7 +758,14 @@ impl EngineRpc {
                 .clamp(1, MAX_CONTEXT_RESULTS),
             ..defaults
         };
-        crate::context_files::search(std::path::Path::new(&root), &params.query, limits)
+        let mut result =
+            crate::context_files::search(std::path::Path::new(&root), &params.query, limits);
+        result.checkout_id = Some(crate::context_files::checkout_identity(
+            self.workspace.device_id(),
+            std::path::Path::new(&root),
+            declared_checkout_id.as_deref(),
+        ));
+        result
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -2594,9 +2614,7 @@ impl RpcService for EngineRpc {
             }
             methods::CANCEL_CHECKOUT_PREPARATION => {
                 let p: PrepareCheckoutParams = parse_params(params)?;
-                let cancelled = self
-                    .prep
-                    .cancel(std::path::Path::new(&p.worktree_path));
+                let cancelled = self.prep.cancel(std::path::Path::new(&p.worktree_path));
                 RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
             }
             methods::APPROVE_CHECKOUT_PREPARATION => {

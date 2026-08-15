@@ -96,7 +96,11 @@ pub fn tokens(text: &str) -> Vec<ContextRef> {
     let mut ix = 0;
     while let Some(offset) = text[ix..].find('@') {
         let at = ix + offset;
-        let opens = at == 0 || text[..at].chars().next_back().is_some_and(char::is_whitespace);
+        let opens = at == 0
+            || text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
         let end = text[at + 1..]
             .find(char::is_whitespace)
             .map(|n| at + 1 + n)
@@ -110,7 +114,11 @@ pub fn tokens(text: &str) -> Vec<ContextRef> {
             // The same path twice is one reference: repeating it in the prose is
             // a normal thing to do, and resolving it twice would say "2 refs".
             if !found.iter().any(|r| r.path == path) {
-                found.push(ContextRef { path, kind });
+                found.push(ContextRef {
+                    path,
+                    kind,
+                    checkout_id: None,
+                });
             }
         }
         ix = end.max(at + 1);
@@ -160,7 +168,10 @@ pub fn filter(query: &str, rows: &[ContextMatch]) -> Vec<ContextMatch> {
         .filter_map(|(ix, row)| rank(query, row).map(|r| (r, row.path.len(), ix, row)))
         .collect();
     ranked.sort_by_key(|&(rank, len, ix, _)| (rank, len, ix));
-    ranked.into_iter().map(|(_, _, _, row)| row.clone()).collect()
+    ranked
+        .into_iter()
+        .map(|(_, _, _, row)| row.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -183,7 +194,10 @@ mod tests {
         );
         let token = at_token("look at @comp", 13).expect("after a space opens");
         assert_eq!((token.start, token.query.as_str()), (8, "comp"));
-        assert!(at_token("first\n@comp", 11).is_some(), "newline is whitespace");
+        assert!(
+            at_token("first\n@comp", 11).is_some(),
+            "newline is whitespace"
+        );
 
         // The cases that must stay quiet — all of them things people type.
         assert_eq!(at_token("brede@tally.no", 14), None, "an email address");
@@ -250,7 +264,11 @@ mod tests {
         assert_eq!(tokens("@a.rs and @a.rs again").len(), 1);
         // A token deleted from the buffer takes its reference with it — which
         // is the whole reason this reads the text instead of a side map.
-        assert!(tokens("compare  with @crates/ui/").iter().all(|r| r.path == "crates/ui"));
+        assert!(
+            tokens("compare  with @crates/ui/")
+                .iter()
+                .all(|r| r.path == "crates/ui")
+        );
     }
 
     #[test]

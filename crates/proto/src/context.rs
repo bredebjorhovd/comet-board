@@ -51,6 +51,8 @@ impl ContextRefKind {
 pub struct ContextRef {
     pub path: String,
     pub kind: ContextRefKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_id: Option<String>,
 }
 
 impl ContextRef {
@@ -58,6 +60,7 @@ impl ContextRef {
         Self {
             path: path.into(),
             kind: ContextRefKind::File,
+            checkout_id: None,
         }
     }
 
@@ -65,6 +68,7 @@ impl ContextRef {
         Self {
             path: path.into(),
             kind: ContextRefKind::Directory,
+            checkout_id: None,
         }
     }
 
@@ -106,6 +110,7 @@ impl ContextMatch {
         ContextRef {
             path: self.path.clone(),
             kind: self.kind,
+            checkout_id: None,
         }
     }
 }
@@ -124,6 +129,8 @@ pub struct ContextSearch {
     /// True when the scan hit its budget or the result cap — there are more.
     #[serde(default)]
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_id: Option<String>,
 }
 
 /// A reference after the host resolved it against the real checkout.

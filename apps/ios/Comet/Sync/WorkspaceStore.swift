@@ -345,6 +345,13 @@ final class WorkspaceStore {
         }
     }
 
+    func searchContext(deviceId: String, chatId: String, query: String) async -> ContextSearch? {
+        try? await relay(for: deviceId).call(
+            method: "SearchContextFiles",
+            params: ["chatId": chatId, "query": query, "limit": 30]
+        )
+    }
+
     /// SwitchRef — `git checkout` in the given folder on the target device.
     /// Returns git's error message on failure (dirty tree, held ref, …).
     func switchRef(deviceId: String, repoPath: String, refName: String) async -> String? {

@@ -86,6 +86,10 @@ pub enum SessionCommandPayload {
         /// Client-minted message id for the user entry this becomes, so the
         /// echo of a follow-up dedupes exactly like a send's.
         message_id: String,
+        /// Host-staged images owned by this follow-up. Defaulted for entries
+        /// written before queued attachments were supported.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
     },
     /// A mutation of the queued plan. Immutable like every other entry: what
     /// changes is what [`crate::queue::project`] computes from the log.
@@ -123,13 +127,21 @@ pub enum QueueOp {
         after: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
-    Remove { target: String },
+    Remove {
+        target: String,
+    },
     /// Drop everything queued *before this entry* — a later follow-up is not
     /// retroactively cleared by an earlier clear.
     Clear {},
     /// Hold the plan: the host stops dequeuing, and says so.
     Pause {},
     Resume {},
+    /// Explicitly run this row next. It does not resume the rest of a paused
+    /// queue and it never steers or interrupts a live turn.
+    #[serde(rename_all = "camelCase")]
+    RunNext {
+        target: String,
+    },
 }
 
 impl SessionCommandPayload {
@@ -276,7 +288,11 @@ pub fn evaluate_command(
         let Some(position) = cx.queue.position(&entry.id) else {
             return CommandDisposition::Cancelled; // removed, or cleared
         };
-        if cx.queue.paused.is_some() || cx.chat_is_running || position > 0 {
+        let explicitly_next = cx.queue.run_next.as_deref() == Some(entry.id.as_str());
+        if cx.chat_is_running
+            || (cx.queue.run_next.is_some() && !explicitly_next)
+            || (!explicitly_next && (cx.queue.paused.is_some() || position > 0))
+        {
             return CommandDisposition::Defer;
         }
         return CommandDisposition::Execute;
@@ -345,6 +361,7 @@ mod tests {
             SessionCommandPayload::Queue {
                 prompt: "then this".into(),
                 message_id: format!("m-{id}"),
+                attachments: Vec::new(),
             },
             issued_at,
         )
@@ -369,7 +386,8 @@ mod tests {
     }
 
     /// The queue-free context every pre-gh#424 rule is evaluated in.
-    static EMPTY_QUEUE: std::sync::LazyLock<QueueView> = std::sync::LazyLock::new(QueueView::default);
+    static EMPTY_QUEUE: std::sync::LazyLock<QueueView> =
+        std::sync::LazyLock::new(QueueView::default);
 
     const NEVER: fn(&str) -> bool = |_| false;
 
@@ -480,6 +498,28 @@ mod tests {
             CommandDisposition::Defer
         );
 
+        let mut selected = plan.clone();
+        selected.run_next = Some(entries[1].id.clone());
+        assert_eq!(
+            evaluate_command(&entries[0], &base(&entries, false, &selected)),
+            CommandDisposition::Defer,
+            "the ordinary head yields to an explicit later row"
+        );
+        assert_eq!(
+            evaluate_command(&entries[1], &base(&entries, false, &selected)),
+            CommandDisposition::Execute
+        );
+        selected.paused = Some(crate::queue::QueuePause::User);
+        assert_eq!(
+            evaluate_command(&entries[0], &base(&entries, false, &selected)),
+            CommandDisposition::Defer
+        );
+        assert_eq!(
+            evaluate_command(&entries[1], &base(&entries, false, &selected)),
+            CommandDisposition::Execute,
+            "run-next runs one selected row without resuming the queue"
+        );
+
         // Paused holds it too, whatever the position.
         let paused = QueueView {
             paused: Some(crate::queue::QueuePause::User),
@@ -556,8 +596,14 @@ mod tests {
             queue: &plan,
             chat_is_running: false,
         };
-        assert_eq!(evaluate_command(&entries[0], &cx1), CommandDisposition::Execute);
-        assert_eq!(evaluate_command(&entries[1], &cx1), CommandDisposition::Defer);
+        assert_eq!(
+            evaluate_command(&entries[0], &cx1),
+            CommandDisposition::Execute
+        );
+        assert_eq!(
+            evaluate_command(&entries[1], &cx1),
+            CommandDisposition::Defer
+        );
         // …whereas two steers leave only the newest.
         let steers = vec![steer("s1", 1_000), steer("s2", 2_000)];
         let cx2 = cx(&steers, &NEVER, &NEVER, 3_000, None);

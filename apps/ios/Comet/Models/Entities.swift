@@ -256,6 +256,31 @@ struct RepoRef: Codable, Hashable, Identifiable {
     var id: String { name }
 }
 
+enum ContextRefKind: String, Codable, Hashable {
+    case file, directory
+}
+
+struct ContextRef: Codable, Hashable, Identifiable {
+    var path: String
+    var kind: ContextRefKind
+    var checkoutId: String? = nil
+    var id: String { "\(kind.rawValue):\(path)" }
+}
+
+struct ContextSearch: Codable {
+    var matches: [ContextRef]
+    var truncated: Bool = false
+    var checkoutId: String? = nil
+}
+
+struct FollowupRow: Identifiable, Hashable {
+    var id: String
+    var prompt: String
+    var context: [ContextRef]
+    var messageId: String
+    var edited: Bool
+}
+
 // MARK: - Command ledger (commands.rs port)
 
 let commandDefaultTtlMs: Int64 = 86_400_000

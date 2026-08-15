@@ -37,6 +37,8 @@ pub struct QueueRow {
     /// The references as they stand now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
     /// Client-minted id for the user entry this becomes when it runs.
     pub message_id: String,
     /// Device that queued it.
@@ -69,6 +71,9 @@ pub struct QueueView {
     pub rows: Vec<QueueRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<QueuePause>,
+    /// A row explicitly selected for delivery ahead of ordinary queue order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_next: Option<String>,
 }
 
 impl QueueView {
@@ -101,12 +106,14 @@ impl QueueView {
 pub fn project(entries: &[SessionCommandEntry]) -> QueueView {
     let mut rows: Vec<QueueRow> = Vec::new();
     let mut paused: Option<QueuePause> = None;
+    let mut run_next: Option<String> = None;
 
     for entry in entries {
         match &entry.payload {
             SessionCommandPayload::Queue {
                 prompt,
                 message_id,
+                attachments,
             } => {
                 if entry.status != SessionCommandStatus::Pending {
                     continue;
@@ -115,6 +122,7 @@ pub fn project(entries: &[SessionCommandEntry]) -> QueueView {
                     id: entry.id.clone(),
                     prompt: prompt.clone(),
                     context: entry.context.clone(),
+                    attachments: attachments.clone(),
                     message_id: message_id.clone(),
                     issued_by: entry.issued_by.clone(),
                     issued_at: entry.issued_at,
@@ -147,12 +155,18 @@ pub fn project(entries: &[SessionCommandEntry]) -> QueueView {
                 QueueOp::Clear {} => rows.clear(),
                 QueueOp::Pause {} => paused = Some(QueuePause::User),
                 QueueOp::Resume {} => paused = None,
+                QueueOp::RunNext { target } => run_next = Some(target.clone()),
             },
             _ => {}
         }
     }
 
-    QueueView { rows, paused }
+    run_next = run_next.filter(|target| rows.iter().any(|row| &row.id == target));
+    QueueView {
+        rows,
+        paused,
+        run_next,
+    }
 }
 
 /// Lift `target` out and re-insert it after `after` (head when `None`).
@@ -212,6 +226,7 @@ mod tests {
             SessionCommandPayload::Queue {
                 prompt: prompt.into(),
                 message_id: format!("m-{id}"),
+                attachments: Vec::new(),
             },
             at,
         )
@@ -434,6 +449,33 @@ mod tests {
         log.push(control("c1", QueueOp::Pause {}, 2));
         log.push(entry("i1", SessionCommandPayload::Interrupt {}, 3));
         assert_eq!(project(&log).paused, Some(QueuePause::User));
+    }
+
+    #[test]
+    fn run_next_selects_a_live_row_and_drops_a_removed_target() {
+        let mut log = vec![queued("q1", "a", 1), queued("q2", "b", 2)];
+        log.push(control(
+            "next",
+            QueueOp::RunNext {
+                target: "q2".into(),
+            },
+            3,
+        ));
+        assert_eq!(project(&log).run_next.as_deref(), Some("q2"));
+
+        log.push(control("pause", QueueOp::Pause {}, 4));
+        let paused = project(&log);
+        assert_eq!(paused.paused, Some(QueuePause::User));
+        assert_eq!(paused.run_next.as_deref(), Some("q2"));
+
+        log.push(control(
+            "remove",
+            QueueOp::Remove {
+                target: "q2".into(),
+            },
+            5,
+        ));
+        assert_eq!(project(&log).run_next, None);
     }
 
     #[test]

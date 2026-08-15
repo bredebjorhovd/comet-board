@@ -367,7 +367,7 @@ impl ChatDocHandle {
 
     /// The plan as it stands, folded from this doc's ledger.
     pub fn queue_view(&self) -> QueueView {
-        match self.doc.read_commands() {
+        match self.with_current(|doc| doc.read_commands()) {
             Ok(commands) => queue::project(&commands),
             Err(err) => {
                 tracing::warn!(chat = %self.chat_id, error = %err, "command read failed");
@@ -796,7 +796,13 @@ impl DocHost {
     /// [`Self::release_idle`] with the clock and the bounds passed in — the seam
     /// the policy tests drive, so they need neither a five-minute wait nor 32
     /// chats.
-    fn release_idle_at(&self, now: i64, idle_ms: i64, max_open: usize, byte_budget: usize) -> usize {
+    fn release_idle_at(
+        &self,
+        now: i64,
+        idle_ms: i64,
+        max_open: usize,
+        byte_budget: usize,
+    ) -> usize {
         // Pass 1, under the lock: everything the cache itself knows. No call out
         // to another service from here — a dispatch on another thread walks
         // sessions → doc host, and this lock must never be held facing back.
@@ -943,8 +949,7 @@ impl DocHost {
             });
             // A queued follow-up (and any mutation of the plan) carries no
             // TTL: it was deliberately written to wait.
-            let expires_at = entry_expires(&payload)
-                .then_some(now + COMMAND_DEFAULT_TTL_MS);
+            let expires_at = entry_expires(&payload).then_some(now + COMMAND_DEFAULT_TTL_MS);
             doc.queue_command(&SessionCommandEntry {
                 id: id.to_string(),
                 payload,
@@ -989,7 +994,9 @@ impl DocHost {
         lock(&self.inner.durable_pending).remove(id);
         // The notification raised by the append may already have drained while
         // this id was gated. Raise another after the durable acknowledgement.
-        handle.changed_tx.send_modify(|value| *value = value.wrapping_add(1));
+        handle
+            .changed_tx
+            .send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -1303,8 +1310,7 @@ impl DocHost {
             matches!(
                 sessions.session_status(chat_id).map(|s| s.status),
                 Some(
-                    comet_proto::SessionStatus::Working
-                        | comet_proto::SessionStatus::AwaitingInput
+                    comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput
                 )
             )
         })
@@ -1368,7 +1374,8 @@ impl DocHost {
                 // about to start in — not where they were picked. That is what
                 // makes a file picked on a phone name the same file when the
                 // box runs the turn, and the only place an escape can be caught.
-                let context = self.apply_context(&request.cwd, &entry.context, &mut request.prompt)?;
+                let context =
+                    self.apply_context(chat_id, &request.cwd, &entry.context, &mut request.prompt)?;
                 let harness = self.harness_for(chat_id);
                 sessions
                     .dispatch(chat_id, harness, request, Some(message_id.clone()))
@@ -1378,6 +1385,7 @@ impl DocHost {
             SessionCommandPayload::Steer { prompt, message_id } => {
                 let mut prompt = prompt.clone();
                 let context = self.apply_context(
+                    chat_id,
                     &self.checkout_root(chat_id, sessions),
                     &entry.context,
                     &mut prompt,
@@ -1502,6 +1510,7 @@ impl DocHost {
             SessionCommandPayload::Queue {
                 prompt,
                 message_id,
+                attachments,
             } => {
                 // The PLAN's text, not the entry's: an edit is a later ledger
                 // entry, and running the original would run the version the user
@@ -1513,9 +1522,9 @@ impl DocHost {
                     .rows
                     .into_iter()
                     .find(|row| row.id == entry.id);
-                let (mut prompt, context) = match row {
-                    Some(row) => (row.prompt, row.context),
-                    None => (prompt.clone(), entry.context.clone()),
+                let (mut prompt, context, attachments) = match row {
+                    Some(row) => (row.prompt, row.context, row.attachments),
+                    None => (prompt.clone(), entry.context.clone(), attachments.clone()),
                 };
                 // Same config source as the steer→new-turn fallback: the live
                 // request when there is one (a parked persistent session is
@@ -1530,10 +1539,10 @@ impl DocHost {
                         Some("no run config for the queued follow-up".into()),
                     ));
                 };
-                let note = self.apply_context(&request.cwd, &context, &mut prompt)?;
+                let note = self.apply_context(chat_id, &request.cwd, &context, &mut prompt)?;
                 request.prompt = prompt;
                 request.resume = None; // dispatch re-derives the harness session
-                request.attachments = Vec::new(); // never the previous turn's images
+                request.attachments = attachments; // this row's images, never the previous turn's
                 sessions
                     .dispatch(
                         chat_id,
@@ -1581,6 +1590,7 @@ impl DocHost {
     /// trusted into a prompt.
     fn apply_context(
         &self,
+        chat_id: &str,
         root: &str,
         refs: &[ContextRef],
         prompt: &mut String,
@@ -1593,6 +1603,20 @@ impl DocHost {
                 "context references need a checkout, and this chat has no cwd".into(),
             ));
         }
+        let declared_checkout = self
+            .workspace()
+            .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
+            .and_then(|chat| chat.checkout_id);
+        let device_id = self
+            .workspace()
+            .map(|workspace| workspace.device_id().to_string())
+            .unwrap_or_default();
+        let expected_checkout = crate::context_files::checkout_identity(
+            &device_id,
+            std::path::Path::new(root),
+            declared_checkout.as_deref(),
+        );
+        crate::context_files::validate_checkout(refs, Some(&expected_checkout))?;
         let resolved = crate::context_files::resolve(std::path::Path::new(root), refs)?;
         if let Some(note) = crate::context_files::missing_note(&resolved) {
             prompt.push_str(&note);
@@ -1781,6 +1805,7 @@ fn control_note(op: &comet_doc::QueueOp) -> String {
         QueueOp::Clear {} => "cleared the queue".into(),
         QueueOp::Pause {} => "paused the queue".into(),
         QueueOp::Resume {} => "resumed the queue".into(),
+        QueueOp::RunNext { target } => format!("run {target} next"),
     }
 }
 
@@ -2023,7 +2048,14 @@ mod tests {
         let now = 1_000_000;
         assert!(rooms_to_release(Vec::new(), now, 30_000, 4, NO_BUDGET).is_empty());
         assert!(
-            rooms_to_release(vec![candidate("fresh", now, false)], now, 30_000, 4, NO_BUDGET).is_empty(),
+            rooms_to_release(
+                vec![candidate("fresh", now, false)],
+                now,
+                30_000,
+                4,
+                NO_BUDGET
+            )
+            .is_empty(),
             "a quiet, under-bound cache is left alone"
         );
     }
@@ -2166,6 +2198,7 @@ mod tests {
                     .queue_command(&SessionCommandEntry {
                         id: "boundary-command".into(),
                         payload: SessionCommandPayload::Interrupt {},
+                        context: Vec::new(),
                         issued_by: queue_handle.device_id.clone(),
                         issued_at: 1,
                         based_on: None,
@@ -2263,8 +2296,7 @@ mod tests {
             .read_commands()
             .unwrap();
         assert!(commands.iter().any(|command| {
-            command.id == "prep-release-durable"
-                && command.status == SessionCommandStatus::Pending
+            command.id == "prep-release-durable" && command.status == SessionCommandStatus::Pending
         }));
     }
 
@@ -2384,7 +2416,9 @@ mod tests {
         let host = host(dir.path());
 
         let handle = host.open("chat-doomed").expect("open");
-        handle.write_user_message("m1", "gone soon", 1).expect("write");
+        handle
+            .write_user_message("m1", "gone soon", 1)
+            .expect("write");
         host.flush_all(); // persist so the purge has a snapshot to delete
         drop(handle);
         settle().await;

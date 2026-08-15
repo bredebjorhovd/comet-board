@@ -48,6 +48,18 @@ use crate::theme::{Bed, ListRow as _, Theme};
 /// Expanded-mode textarea vertical padding: `pt-4 pb-1` (comet composer.tsx
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
+
+fn stamp_context_tokens(text: &str, stamps: Option<&HashMap<String, String>>) -> Vec<ContextRef> {
+    view_context::tokens(text)
+        .into_iter()
+        .map(|mut reference| {
+            reference.checkout_id = stamps
+                .and_then(|stamps| stamps.get(&reference.path))
+                .cloned();
+            reference
+        })
+        .collect()
+}
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
 /// 260)` (comet composer.tsx line 235). The 76px floor applies even when
@@ -1762,6 +1774,11 @@ pub struct Composer {
     /// Did the host's walk hit its budget? The menu says so rather than
     /// presenting a capped list as the whole tree.
     context_truncated: bool,
+    context_checkout_id: Option<String>,
+    /// Checkout stamps captured when a picker row was completed, per draft.
+    /// Search chrome may close or refresh; provenance belongs to the inserted
+    /// reference and must survive until that reference/draft is removed.
+    context_ref_checkouts: HashMap<String, HashMap<String, String>>,
     /// `(chat key, query)` the rows answer. Both halves matter: the same query
     /// means different files in a different checkout.
     context_key: Option<(String, String)>,
@@ -1883,6 +1900,8 @@ impl Composer {
             skill_dismissed: None,
             context_rows: Vec::new(),
             context_truncated: false,
+            context_checkout_id: None,
+            context_ref_checkouts: HashMap::new(),
             context_key: None,
             context_task: None,
             context_selected: 0,
@@ -2357,25 +2376,43 @@ impl Composer {
     /// what keeps the menu about what is on screen.
     fn ensure_context_rows(&mut self, cx: &mut Context<Self>) {
         let Some(token) = self.at_token(cx) else {
+            // Do not retain a filesystem answer after the token closes. The
+            // agent may create, delete, or rename the same path before the
+            // user types the same query again.
+            self.context_key = None;
+            self.context_checkout_id = None;
+            self.context_rows.clear();
+            self.context_task.take();
             return;
         };
         let state = self.state.read(cx);
         let chat = state.selected_chat_row().cloned();
-        let (chat_id, cwd, device) = match &chat {
-            Some(chat) => (Some(chat.id.clone()), None, Some(chat.device_id.clone())),
+        let (chat_id, space_id, device, scope) = match &chat {
+            Some(chat) => (
+                Some(chat.id.clone()),
+                None,
+                Some(chat.device_id.clone()),
+                format!(
+                    "chat:{}:{}:{}",
+                    chat.id,
+                    chat.cwd.as_deref().unwrap_or(""),
+                    chat.checkout_id.as_deref().unwrap_or("")
+                ),
+            ),
             None => match state.selected_space_row() {
                 Some(space) => (
                     None,
-                    Some(space.path.clone()),
+                    Some(space.id.clone()),
                     Some(space.device_id.clone()),
+                    format!(
+                        "space:{}:{}:{}",
+                        space.id,
+                        space.path,
+                        space.checkout_id.as_deref().unwrap_or("")
+                    ),
                 ),
-                None => (None, None, None),
+                None => return,
             },
-        };
-        let scope = match (&chat_id, &cwd) {
-            (Some(chat), _) => format!("chat:{chat}"),
-            (None, Some(cwd)) => format!("cwd:{cwd}"),
-            (None, None) => return, // nothing to search yet
         };
         let key = (scope, token.query.clone());
         if self.context_key.as_ref() == Some(&key) {
@@ -2397,7 +2434,9 @@ impl Composer {
             cx.background_executor()
                 .timer(Duration::from_millis(CONTEXT_SEARCH_DEBOUNCE_MS))
                 .await;
-            let alive = this.update(cx, |composer, _| composer.context_key.as_ref() == Some(&key));
+            let alive = this.update(cx, |composer, _| {
+                composer.context_key.as_ref() == Some(&key)
+            });
             if !matches!(alive, Ok(true)) {
                 return;
             }
@@ -2408,7 +2447,7 @@ impl Composer {
                 }
             };
             put("chatId", chat_id);
-            put("cwd", cwd);
+            put("spaceId", space_id);
             put("targetDeviceId", target);
             params.insert("query".into(), serde_json::Value::String(query));
             let result = engine
@@ -2427,12 +2466,15 @@ impl Composer {
                         Ok(found) => {
                             composer.context_rows = found.matches;
                             composer.context_truncated = found.truncated;
+                            composer.context_checkout_id = found.checkout_id;
                         }
                         // Never surfaced, for the same reason the skill picker
                         // stays quiet: an empty menu and a menu that could not
                         // load look identical to somebody typing, and a red
                         // notice under the composer for it would be noise.
-                        Err(err) => tracing::warn!(error = %err, "SearchContextFiles decode failed"),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "SearchContextFiles decode failed")
+                        }
                     },
                     Err(err) => tracing::warn!(error = %err, "SearchContextFiles failed"),
                 }
@@ -2489,6 +2531,12 @@ impl Composer {
         let Some(row) = rows.get(self.context_selected) else {
             return;
         };
+        if let Some(checkout_id) = self.context_checkout_id.clone() {
+            self.context_ref_checkouts
+                .entry(self.current_key.clone())
+                .or_default()
+                .insert(row.path.clone(), checkout_id);
+        }
         let (text, caret) =
             view_context::complete(self.input.read(cx).text(), &token, &row.to_ref());
         self.input
@@ -2613,6 +2661,10 @@ impl Composer {
         }
     }
 
+    fn context_tokens(&self, text: &str) -> Vec<ContextRef> {
+        stamp_context_tokens(text, self.context_ref_checkouts.get(&self.current_key))
+    }
+
     // ---- the follow-up queue (gh#424) ----
 
     /// Follow the selected chat's plan. Re-subscribed on navigation, dropped
@@ -2686,17 +2738,60 @@ impl Composer {
     /// anyway — and if it does not, that is the truth about a queue the engine
     /// did not accept.
     fn queue_follow_up(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.staged().is_empty() {
+            // Until queued rows own a host-staged upload lifecycle, refusing is
+            // safer than silently dropping images. Keep both draft and staged
+            // files exactly where the user left them.
+            self.failure = Some(
+                "Images can’t be queued yet — steer them now or wait for the turn to finish."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
-        let context = view_context::tokens(&text);
+        let context = self.context_tokens(&text);
         let payload = SessionCommandPayload::Queue {
-            prompt: text,
+            prompt: text.clone(),
             message_id: uuid::Uuid::new_v4().to_string(),
+            attachments: Vec::new(),
         };
-        self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
-        self.queue_command(&chat_id, payload, context, "Queue failed", cx);
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "command": payload,
+            "context": context,
+        });
+        self.sending = true;
+        self.failure = None;
+        self.queue_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok(_) => {
+                        // Do not erase keystrokes entered while the durable
+                        // append was in flight.
+                        if composer.input.read(cx).text().trim() == text {
+                            composer
+                                .input
+                                .update(cx, |input, cx| input.set_text("", cx));
+                            composer.drafts.remove(&composer.current_key);
+                            composer.context_ref_checkouts.remove(&composer.current_key);
+                        }
+                    }
+                    Err(err) => composer.failure = Some(format!("Queue failed: {err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Load a queued row back into the composer for editing.
@@ -2705,6 +2800,15 @@ impl Composer {
             return;
         };
         let prompt = row.prompt.clone();
+        let stamps = self
+            .context_ref_checkouts
+            .entry(self.current_key.clone())
+            .or_default();
+        for reference in &row.context {
+            if let Some(checkout_id) = &reference.checkout_id {
+                stamps.insert(reference.path.clone(), checkout_id.clone());
+            }
+        }
         self.editing = Some(row_id.to_string());
         self.input
             .update(cx, |input, cx| input.set_text(prompt, cx));
@@ -2731,14 +2835,37 @@ impl Composer {
         ) else {
             return;
         };
-        let context = view_context::tokens(&text);
+        let context = self.context_tokens(&text);
         let op = QueueOp::Edit {
             target,
-            prompt: text,
+            prompt: text.clone(),
             context,
         };
-        self.stop_editing(cx);
-        self.queue_control(&chat_id, op, cx);
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "command": SessionCommandPayload::QueueControl { op },
+        });
+        self.sending = true;
+        self.queue_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok(_) => composer.stop_editing(cx),
+                    Err(err) => {
+                        composer.failure = Some(format!("Queue update failed: {err}").into());
+                        // editing id and draft remain intact for retry.
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Move a row one place up or down: expressed as an anchor
@@ -2753,8 +2880,8 @@ impl Composer {
         };
         let after = match delta {
             d if d < 0 => match ix {
-                0 => return,               // already the head
-                1 => None,                 // to the head
+                0 => return, // already the head
+                1 => None,   // to the head
                 _ => Some(self.queue.rows[ix - 2].id.clone()),
             },
             _ => match self.queue.rows.get(ix + 1) {
@@ -2782,6 +2909,19 @@ impl Composer {
         self.queue_control(
             &chat_id,
             QueueOp::Remove {
+                target: row_id.to_string(),
+            },
+            cx,
+        );
+    }
+
+    fn run_next(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        self.queue_control(
+            &chat_id,
+            QueueOp::RunNext {
                 target: row_id.to_string(),
             },
             cx,
@@ -2937,6 +3077,10 @@ impl Composer {
         } else {
             text.clone()
         };
+        // Snapshot reference provenance with the draft. The async upload may
+        // outlive navigation to another chat, and the picker identity is the
+        // one captured at completion—not whichever checkout is current later.
+        let picked_context = self.context_tokens(&echo_text);
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -3127,12 +3271,10 @@ impl Composer {
                     .ok();
                 }
 
-                // The typed references, read back out of the text that is about
-                // to be sent (gh#424) — so a token the user deleted takes its
-                // reference with it, and one they typed by hand is checked
-                // against the checkout exactly like a picked one. The host
-                // resolves them; nothing here touches the filesystem.
-                let context = view_context::tokens(&content);
+                // Typed references were snapshotted with the draft before the
+                // async upload/navigation boundary. The host resolves them;
+                // nothing here touches the filesystem.
+                let context = picked_context.clone();
                 let command = if steer_cmd {
                     SessionCommandPayload::Steer {
                         prompt: content.clone(),
@@ -3699,50 +3841,54 @@ impl Composer {
             .flex()
             .flex_col()
             .p(px(Theme::NEST_GUTTER))
-            .children(rows.iter().enumerate().skip(first).take(visible).map(
-                |(ix, row)| {
-                    let active = ix == selected;
-                    let name: SharedString = match row.kind.is_dir() {
-                        true => format!("{}/", row.name()).into(),
-                        false => row.name().to_string().into(),
-                    };
-                    let parent: SharedString = row.parent().to_string().into();
-                    div()
-                        .id(SharedString::from(format!("context-row-{ix}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(Theme::RADIUS_ROW))
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .cursor_pointer()
-                        .list_row(&theme, Bed::Shell, active, format!("context-row-{ix}"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.context_selected = ix;
-                            this.accept_context(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(Theme::TEXT_BODY))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(if active { theme.text } else { theme.text_muted })
-                                .child(name),
-                        )
-                        .when(!parent.is_empty(), |el| {
-                            el.child(
+            .children(
+                rows.iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(visible)
+                    .map(|(ix, row)| {
+                        let active = ix == selected;
+                        let name: SharedString = match row.kind.is_dir() {
+                            true => format!("{}/", row.name()).into(),
+                            false => row.name().to_string().into(),
+                        };
+                        let parent: SharedString = row.parent().to_string().into();
+                        div()
+                            .id(SharedString::from(format!("context-row-{ix}")))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .cursor_pointer()
+                            .list_row(&theme, Bed::Shell, active, format!("context-row-{ix}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_selected = ix;
+                                this.accept_context(cx);
+                            }))
+                            .child(
                                 div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_size(px(Theme::TEXT_DENSE))
-                                    .text_color(theme.text_subtle)
-                                    .child(parent),
+                                    .flex_none()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if active { theme.text } else { theme.text_muted })
+                                    .child(name),
                             )
-                        })
-                },
-            ))
+                            .when(!parent.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(Theme::TEXT_DENSE))
+                                        .text_color(theme.text_subtle)
+                                        .child(parent),
+                                )
+                            })
+                    }),
+            )
             // Two different "there is more": more matches than fit the window,
             // and a host walk that stopped at its budget. Both are said, because
             // both mean the list on screen is not the whole answer.
@@ -3839,8 +3985,10 @@ impl Composer {
             );
 
         let rows = self.queue.rows.clone();
-        let list = div().flex().flex_col().children(rows.iter().enumerate().map(
-            |(ix, row)| {
+        let list = div()
+            .flex()
+            .flex_col()
+            .children(rows.iter().enumerate().map(|(ix, row)| {
                 let id = row.id.clone();
                 let being_edited = editing.as_deref() == Some(id.as_str());
                 let text: SharedString = one_line(&row.prompt, QUEUE_ROW_CHARS).into();
@@ -3914,12 +4062,15 @@ impl Composer {
                             move |this, _, _, cx| this.nudge_row(&id, 1, cx)
                         })))
                     })
+                    .child(button("run-next", "▶").on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.run_next(&id, cx)
+                    })))
                     .child(button("remove", "✕").on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, _, cx| this.remove_row(&id, cx)
                     })))
-            },
-        ));
+            }));
 
         Some(
             div()
@@ -4383,7 +4534,9 @@ impl Render for Composer {
         // The `@` picker shares the slot and the reasoning: above the pill,
         // opening upward, away from the caret.
         let container = match self.render_context_menu(cx) {
-            Some(menu) => container.child(motion::fade_quick("composer-context", div().child(menu))),
+            Some(menu) => {
+                container.child(motion::fade_quick("composer-context", div().child(menu)))
+            }
             None => container,
         };
         // The file dropzone lives in the shell (the whole conversation column,
@@ -4734,6 +4887,23 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn completed_context_keeps_the_checkout_it_was_picked_from() {
+        let input = "inspect @src/f";
+        let token = view_context::at_token(input, input.len()).expect("active picker token");
+        let row = ContextMatch {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+        };
+        let (completed, _) = view_context::complete(input, &token, &row.to_ref());
+        assert!(completed.ends_with(' '), "completion closes the picker");
+
+        let stamps = HashMap::from([("src/foo.rs".into(), "checkout-before".into())]);
+        let refs = stamp_context_tokens(&completed, Some(&stamps));
+        assert_eq!(refs[0].checkout_id.as_deref(), Some("checkout-before"));
+        assert_ne!(refs[0].checkout_id.as_deref(), Some("checkout-after"));
     }
 
     #[test]

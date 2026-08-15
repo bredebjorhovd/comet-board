@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use comet_proto::view::context::rank;
 use comet_proto::{ContextMatch, ContextRef, ContextRefKind, ContextSearch, ResolvedRef};
+use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 
@@ -88,6 +89,27 @@ const SKIP_DIRS: &[&str] = &[
     "Pods",
     "DerivedData",
 ];
+
+/// Opaque identity for the host checkout used by search and execution.
+///
+/// Include the canonical root even when the workspace row already carries a
+/// repository checkout id. That turns a stale row whose cwd was replaced into
+/// a refusal too, while keeping the wire value equality-only.
+pub fn checkout_identity(device_id: &str, root: &Path, declared: Option<&str>) -> String {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(b"comet-context-checkout-v1\0");
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(declared.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Search `root` for files and directories matching `query`.
 ///
@@ -167,6 +189,7 @@ pub fn search(root: &Path, query: &str, limits: SearchLimits) -> ContextSearch {
     ContextSearch {
         matches: ranked.into_iter().map(|(_, _, _, row)| row).collect(),
         truncated,
+        checkout_id: None,
     }
 }
 
@@ -191,11 +214,38 @@ pub fn resolve(root: &Path, refs: &[ContextRef]) -> Result<Vec<ResolvedRef>, Eng
             ))
         })?;
         let absolute = canonical_root.join(&normalized);
+        // Validate every existing ancestor, not only the full leaf. A missing
+        // `link/new.rs` must still be refused when `link` is a symlink outside
+        // the checkout.
+        let mut checked = canonical_root.clone();
+        for component in Path::new(&normalized).components() {
+            checked.push(component.as_os_str());
+            match std::fs::symlink_metadata(&checked) {
+                Ok(_) => {
+                    let real = std::fs::canonicalize(&checked).map_err(|err| {
+                        EngineError::Other(format!("context reference {normalized}: {err}"))
+                    })?;
+                    if !real.starts_with(&canonical_root) {
+                        return Err(EngineError::Other(format!(
+                            "context reference escapes the checkout: {normalized}"
+                        )));
+                    }
+                    checked = real;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) => {
+                    return Err(EngineError::Other(format!(
+                        "context reference {normalized}: {err}"
+                    )));
+                }
+            }
+        }
         let exists = absolute.exists();
         if exists {
             // The textual check cannot see a symlink; this can.
-            let real = std::fs::canonicalize(&absolute)
-                .map_err(|err| EngineError::Other(format!("context reference {normalized}: {err}")))?;
+            let real = std::fs::canonicalize(&absolute).map_err(|err| {
+                EngineError::Other(format!("context reference {normalized}: {err}"))
+            })?;
             if !real.starts_with(&canonical_root) {
                 return Err(EngineError::Other(format!(
                     "context reference escapes the checkout: {normalized}"
@@ -206,12 +256,30 @@ pub fn resolve(root: &Path, refs: &[ContextRef]) -> Result<Vec<ResolvedRef>, Eng
             reference: ContextRef {
                 path: normalized,
                 kind: reference.kind,
+                checkout_id: reference.checkout_id.clone(),
             },
             absolute: absolute.to_string_lossy().to_string(),
             exists,
         });
     }
     Ok(out)
+}
+
+/// Fence references to the exact checkout the host advertised when they were
+/// picked. Legacy references without a stamp remain readable; a stamped one
+/// never silently follows a chat that moved to another root/worktree.
+pub fn validate_checkout(
+    refs: &[ContextRef],
+    current_checkout_id: Option<&str>,
+) -> Result<(), EngineError> {
+    if refs.iter().any(|reference| {
+        reference.checkout_id.is_some() && reference.checkout_id.as_deref() != current_checkout_id
+    }) {
+        return Err(EngineError::Other(
+            "context reference belongs to a different checkout".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// What the agent is told about references that are not there.
@@ -319,16 +387,24 @@ mod tests {
 
         // An empty query browses; a query nothing matches is an empty answer,
         // never an error.
-        assert!(!search(tmp.path(), "", SearchLimits::default()).matches.is_empty());
+        assert!(
+            !search(tmp.path(), "", SearchLimits::default())
+                .matches
+                .is_empty()
+        );
         assert!(
             search(tmp.path(), "zzzzz", SearchLimits::default())
                 .matches
                 .is_empty()
         );
         assert!(
-            search(Path::new("/nonexistent-checkout"), "x", SearchLimits::default())
-                .matches
-                .is_empty()
+            search(
+                Path::new("/nonexistent-checkout"),
+                "x",
+                SearchLimits::default()
+            )
+            .matches
+            .is_empty()
         );
     }
 
@@ -345,7 +421,10 @@ mod tests {
             },
         );
         assert_eq!(found.matches.len(), 1);
-        assert!(found.truncated, "a capped list must not read as the whole list");
+        assert!(
+            found.truncated,
+            "a capped list must not read as the whole list"
+        );
 
         // A scan budget that runs out mid-walk truncates too.
         let found = search(
@@ -422,11 +501,38 @@ mod tests {
         let tmp = checkout("symlink");
         let outside = TempDir::new("symlink-target");
         write(outside.path(), "secrets.txt");
-        std::os::unix::fs::symlink(outside.path().join("secrets.txt"), tmp.path().join("link.txt"))
-            .expect("symlink");
+        std::os::unix::fs::symlink(
+            outside.path().join("secrets.txt"),
+            tmp.path().join("link.txt"),
+        )
+        .expect("symlink");
 
         let err = resolve(tmp.path(), &[ContextRef::file("link.txt")])
             .expect_err("a symlink out of the tree is an escape");
         assert!(err.to_string().contains("escapes the checkout"));
+
+        std::fs::remove_file(tmp.path().join("link.txt")).expect("remove leaf link");
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("outside-dir"))
+            .expect("directory symlink");
+        let err = resolve(
+            tmp.path(),
+            &[ContextRef::file("outside-dir/not-created-yet.rs")],
+        )
+        .expect_err("a missing leaf beneath an escaping symlink is still an escape");
+        assert!(err.to_string().contains("escapes the checkout"));
+    }
+
+    #[test]
+    fn a_picked_reference_refuses_a_checkout_change_before_execution() {
+        let first = checkout("identity-a");
+        let second = checkout("identity-b");
+        let picked = checkout_identity("device-a", first.path(), None);
+        let current = checkout_identity("device-a", second.path(), None);
+        let mut reference = ContextRef::file("src/main.rs");
+        reference.checkout_id = Some(picked.clone());
+        validate_checkout(&[reference.clone()], Some(&picked)).expect("same checkout");
+        let err = validate_checkout(&[reference], Some(&current))
+            .expect_err("a moved chat must not reinterpret the path");
+        assert!(err.to_string().contains("different checkout"));
     }
 }
