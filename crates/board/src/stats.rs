@@ -435,6 +435,12 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         tokens_by_runtime,
         tokens_by_account,
         context,
+        // Over every task and every attempt, never the window (gh#434): this
+        // is the pane's furniture question ("has anybody ever released work
+        // from this board?"), asked the way `rows.rs` counts — a row's
+        // `attempts` is `task.attempts.len()`, unfiltered — so the stats
+        // sweep and the board pane settle on the same host.
+        dispatched: tasks.iter().any(|t| !t.attempts.is_empty()),
     }
 }
 
@@ -709,6 +715,22 @@ mod tests {
         assert_eq!(s.attempts, 0);
         assert_eq!(s.completion_rate, None);
         assert_eq!(s.median_minutes, None);
+    }
+
+    /// The furniture bit (gh#434) is all-time, never windowed: a board idle
+    /// for a quiet week is still the org's board, and a board that only ever
+    /// collected rows never stops being furniture.
+    #[test]
+    fn dispatch_evidence_ignores_the_window() {
+        // An attempt well outside a 7-day window…
+        let worked = task("a", vec![attempt(60 * 24 * 30, 10, Some(Outcome::Done), None)]);
+        let s = gather(&[worked], Some(7));
+        assert_eq!(s.attempts, 0, "the window is empty");
+        assert!(s.dispatched, "…is still dispatch evidence");
+        // Rows with no attempts at all are furniture, whatever the window.
+        let collected = task("b", vec![]);
+        let s = gather(&[collected], None);
+        assert!(!s.dispatched);
     }
 
     #[test]

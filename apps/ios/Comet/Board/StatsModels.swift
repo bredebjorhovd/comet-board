@@ -445,6 +445,14 @@ struct BoardStats: Decodable, Hashable {
     /// reported" rather than make the whole screen unreadable.
     var context: ContextPressure?
 
+    /// Any attempt on record at all — all time, never windowed (gh#434): the
+    /// dispatch evidence a host sweep settles on (`board_dispatched`'s answer,
+    /// riding the stats reply). This screen leans on `BoardStore`'s own settled
+    /// host instead of asking; decoded rather than ignored so the phone's copy
+    /// of the shape stays the whole shape. Optional for `hoursByWorkspace`'s
+    /// reason: a board older than the field answers without it.
+    var dispatched: Bool?
+
     /// Whether any attempt in the window reported tokens — the gate the token
     /// half of the screen renders behind. A wall of zeroes would say the work
     /// was free rather than that it was never metered.

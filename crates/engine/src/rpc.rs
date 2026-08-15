@@ -908,7 +908,20 @@ impl EngineRpc {
                 .map_err(|e| RpcError::Failed(format!("detecting unadopted repos: {e}")))?
             }
         };
-        Ok(serde_json::json!({ "routing": routing, "unadopted": unadopted }))
+        // The furniture bit (gh#434): whether anybody has ever released work
+        // from this board — the same question the board pane's host sweep
+        // settles on, read off the same rows. A routing sweep that stopped at
+        // the first config to answer would settle on a viewer's stale local
+        // board and write routes into it.
+        let dispatched = self
+            .board()
+            .map(|board| comet_proto::view::board::board_dispatched(&board.watch_rows().borrow()))
+            .unwrap_or(false);
+        Ok(serde_json::json!({
+            "routing": routing,
+            "unadopted": unadopted,
+            "dispatched": dispatched,
+        }))
     }
 
     /// Perform one config write. Everything lands through

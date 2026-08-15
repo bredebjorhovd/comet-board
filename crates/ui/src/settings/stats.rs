@@ -353,9 +353,19 @@ impl StatsPrefs {
 /// Which of the answers the page shows.
 ///
 /// The pin wins while the board it names is still answering; the sweep's own
-/// answer — the first candidate that replied — is the default and the fallback.
-/// A pin that has not answered *yet* holds the page rather than flashing
-/// somebody else's numbers: mid-sweep is not evidence that the box is gone.
+/// answer is the default and the fallback. A pin that has not answered *yet*
+/// holds the page rather than flashing somebody else's numbers: mid-sweep is
+/// not evidence that the box is gone.
+///
+/// The sweep's answer follows the board pane's furniture rule (gh#125, taught
+/// to this page by gh#434): the first candidate **with dispatch evidence**
+/// wins, because a board somebody has released work from is the org's board
+/// and one that only ever collected rows is furniture. Local answers first —
+/// asking locally is free — so without this rule a leftover local `board.db`
+/// outranks the box forever, and its stale numbers present as the board. A
+/// furniture answer is held while the sweep keeps asking, and settles only
+/// when every candidate has been asked and nobody with evidence answered —
+/// so a lone device, and a genuinely fresh install, still see their own board.
 fn resolve(
     answers: &[(Option<String>, BoardStats)],
     pinned: Option<&HostChoice>,
@@ -373,7 +383,10 @@ fn resolve(
             return None;
         }
     }
-    (!answers.is_empty()).then_some(0)
+    if let Some(evidenced) = answers.iter().position(|(_, stats)| stats.dispatched) {
+        return Some(evidenced);
+    }
+    (swept && !answers.is_empty()).then_some(0)
 }
 
 pub struct StatsPage {
@@ -392,10 +405,10 @@ pub struct StatsPage {
     answers: Vec<(Option<String>, BoardStats)>,
     /// The remembered pick. `None` follows the sweep.
     pinned: Option<HostChoice>,
-    /// Every candidate has been asked. Until then, a pin with no answer yet is
-    /// still worth waiting for.
+    /// Every candidate has been asked. Until then, a pin with no answer yet —
+    /// and a sweep holding only a furniture answer — is still worth waiting
+    /// for.
     swept: bool,
-    loaded: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
 }
@@ -418,7 +431,6 @@ impl StatsPage {
             answers: Vec::new(),
             pinned,
             swept: false,
-            loaded: false,
             error: None,
             task: None,
         };
@@ -436,15 +448,19 @@ impl StatsPage {
     /// last error is what the page shows: "board unavailable" from every device
     /// is a true and useful thing to read.
     ///
-    /// Answers land one at a time and in sweep order, so the first board still
-    /// paints as soon as it replies rather than waiting on a device that is
-    /// asleep — and the numbers already on screen stay there until the first
-    /// new one lands, which is what makes a two-click window comparison
-    /// readable.
+    /// Answers land one at a time and in sweep order, so the first board
+    /// **with dispatch evidence** still paints as soon as it replies rather
+    /// than waiting on a device that is asleep — and the numbers already on
+    /// screen stay there until the first new one lands, which is what makes a
+    /// two-click window comparison readable. An answer *without* evidence is
+    /// held by [`resolve`] until the sweep ends (gh#434): painting the local
+    /// furniture board first and then flipping to the box is exactly the
+    /// "defaults to the mac board" the page was reported for.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
-            self.loaded = true;
+            // Nothing to sweep: the empty state must not read as mid-sweep.
+            self.swept = true;
             return;
         };
         let (devices, local) = {
@@ -469,7 +485,6 @@ impl StatsPage {
                             found.push((candidate, stats));
                             let answers = found.clone();
                             let _ = this.update(cx, |page, cx| {
-                                page.loaded = true;
                                 page.answers = answers;
                                 cx.notify();
                             });
@@ -483,7 +498,6 @@ impl StatsPage {
                 }
             }
             let _ = this.update(cx, |page, cx| {
-                page.loaded = true;
                 page.swept = true;
                 if page.answers.is_empty() {
                     page.error = Some(
@@ -2126,7 +2140,10 @@ impl Render for StatsPage {
         }
 
         let Some(stats) = stats else {
-            let note = if self.loaded {
+            // Keyed on `swept`, because a furniture answer held by `resolve`
+            // mid-sweep (gh#434) is the page still asking for something
+            // better — which is "reading", not "no board answered".
+            let note = if self.swept {
                 "No board answered."
             } else {
                 "Reading the board…"
@@ -2193,21 +2210,56 @@ mod tests {
     use super::*;
 
     /// One candidate's answer. Only the attempt count separates them here —
-    /// which board is which is the whole question.
+    /// which board is which is the whole question. The evidence bit rides
+    /// with the count: these tests' boards are either furniture or working,
+    /// never merely idle this window.
     fn answer(target: Option<&str>, attempts: usize) -> (Option<String>, BoardStats) {
         let mut stats = BoardStats::empty(Some(7));
         stats.attempts = attempts;
+        stats.dispatched = attempts > 0;
         (target.map(str::to_string), stats)
     }
 
     /// The default, and the behaviour every single-board install keeps: the
-    /// sweep's own answer, which is the first candidate that replied.
+    /// sweep's own answer, which is the first candidate that replied with
+    /// dispatch evidence.
     #[test]
     fn with_nothing_pinned_the_page_shows_the_sweep_s_answer() {
         let answers = vec![answer(None, 19), answer(Some("box"), 12)];
         assert_eq!(resolve(&answers, None, Some("mac"), true), Some(0));
         // And nothing at all before anybody has answered.
         assert_eq!(resolve(&[], None, Some("mac"), true), None);
+    }
+
+    /// gh#434, in one assertion: a leftover local `board.db` that only ever
+    /// collected rows answers first — local is first in sweep order — and
+    /// loses anyway to the board the org actually works from.
+    #[test]
+    fn a_furniture_board_never_outranks_one_with_dispatch_evidence() {
+        let answers = vec![answer(None, 0), answer(Some("box"), 12)];
+        assert_eq!(resolve(&answers, None, Some("mac"), true), Some(1));
+        // Mid-sweep too: the box's answer paints the moment it lands.
+        assert_eq!(resolve(&answers, None, Some("mac"), false), Some(1));
+    }
+
+    /// A furniture answer is held while the sweep keeps asking, and settles
+    /// only when every candidate has been asked — so a lone device, and a
+    /// genuinely fresh install, still see their own board.
+    #[test]
+    fn a_furniture_answer_is_held_until_the_sweep_ends() {
+        let answers = vec![answer(None, 0)];
+        assert_eq!(resolve(&answers, None, Some("mac"), false), None);
+        assert_eq!(resolve(&answers, None, Some("mac"), true), Some(0));
+    }
+
+    /// The pin outranks the furniture rule: an operator who picked a board
+    /// gets that board, whatever the evidence says. The rule decides only the
+    /// sweep's own default.
+    #[test]
+    fn a_pin_beats_the_furniture_rule() {
+        let answers = vec![answer(None, 0), answer(Some("box"), 12)];
+        let here = HostChoice::ThisDevice;
+        assert_eq!(resolve(&answers, Some(&here), Some("mac"), false), Some(0));
     }
 
     /// The fix, in one assertion: the operator picked the box, so the box is
