@@ -248,24 +248,39 @@ pub struct ChatDocHandle {
     _sub: Mutex<loro::Subscription>,
 }
 
-fn replay_unresolved_device_commands(
+fn reconcile_device_commands(
     stale: &SessionDoc,
     replacement: &SessionDoc,
     device_id: &str,
 ) -> Result<usize, DocError> {
-    let existing: HashSet<String> = replacement
+    let existing: HashMap<String, SessionCommandStatus> = replacement
         .read_commands()?
         .into_iter()
-        .map(|command| command.id)
+        .map(|command| (command.id, command.status))
         .collect();
     let mut replayed = 0;
-    for command in stale.read_commands()?.into_iter().filter(|command| {
-        command.status == SessionCommandStatus::Pending
-            && command.issued_by == device_id
-            && !existing.contains(&command.id)
-    }) {
-        replacement.queue_command(&command)?;
-        replayed += 1;
+    for command in stale
+        .read_commands()?
+        .into_iter()
+        .filter(|command| command.issued_by == device_id)
+    {
+        match existing.get(&command.id) {
+            None if command.status == SessionCommandStatus::Pending => {
+                replacement.queue_command(&command)?;
+                replayed += 1;
+            }
+            Some(SessionCommandStatus::Pending)
+                if command.status != SessionCommandStatus::Pending =>
+            {
+                replacement.set_command_status(
+                    &command.id,
+                    command.status,
+                    command.resolution.as_deref(),
+                )?;
+                replayed += 1;
+            }
+            _ => {}
+        }
     }
     Ok(replayed)
 }
@@ -318,7 +333,7 @@ impl ChatDocHandle {
         // command either finishes on the old owner and is copied below, or
         // starts after the replacement is visible and writes there directly.
         let mut owner = self.doc.write().unwrap_or_else(PoisonError::into_inner);
-        let replayed = replay_unresolved_device_commands(
+        let replayed = reconcile_device_commands(
             owner.as_ref(),
             replacement.as_ref(),
             &self.device_id,
@@ -1277,16 +1292,12 @@ impl DocHost {
                     Ok(outcome) => outcome,
                     Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                 };
-                if let Err(err) =
-                    handle
-                        .doc()
-                        .set_command_status(&entry.id, status, resolution.as_deref())
-                {
-                    tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
-                        "run outcome write failed; retaining command claim until restart");
-                    return;
-                }
-                if let Err(err) = self.persist_snapshot(handle) {
+                if let Err(err) = self.persist_command_outcome(
+                    handle,
+                    &entry.id,
+                    status,
+                    resolution.as_deref(),
+                ) {
                     tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
                         "run outcome snapshot failed; retaining command claim until restart");
                     return;
@@ -1740,6 +1751,41 @@ impl DocHost {
         self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
         handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
         Ok(bytes.len())
+    }
+
+    fn persist_command_outcome(
+        &self,
+        handle: &ChatDocHandle,
+        command_id: &str,
+        status: SessionCommandStatus,
+        resolution: Option<&str>,
+    ) -> Result<usize, EngineError> {
+        self.persist_command_outcome_with_hook(
+            handle,
+            command_id,
+            status,
+            resolution,
+            || {},
+        )
+    }
+
+    fn persist_command_outcome_with_hook(
+        &self,
+        handle: &ChatDocHandle,
+        command_id: &str,
+        status: SessionCommandStatus,
+        resolution: Option<&str>,
+        after_status: impl FnOnce(),
+    ) -> Result<usize, EngineError> {
+        let bytes_len = handle.with_current(|doc| -> Result<usize, EngineError> {
+            doc.set_command_status(command_id, status, resolution)?;
+            after_status();
+            let bytes = doc.export_snapshot()?;
+            self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+            Ok(bytes.len())
+        })?;
+        handle.snapshot_bytes.store(bytes_len, Ordering::Relaxed);
+        Ok(bytes_len)
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
@@ -2314,6 +2360,95 @@ mod tests {
             "boundary-command",
             "the owner swap must reconcile the final old-doc command delta"
         );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_outcome_crossing_reseed_never_reopens_pending_and_processed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_host = host(dir.path());
+        let chat_id = "chat-outcome-reseed";
+        let command_id = "outcome-reseed";
+        first_host.queue_command_with_id(
+            chat_id,
+            command_id,
+            SessionCommandPayload::Queue {
+                prompt: "already dispatched".into(),
+                message_id: "outcome-reseed-message".into(),
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+        let handle = first_host.open(chat_id).unwrap();
+
+        // The incoming room snapshot was cut while the command was Pending.
+        let replacement = SessionDoc::init(chat_id).unwrap();
+        let pending = handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|command| command.id == command_id)
+            .unwrap();
+        replacement.queue_command(&pending).unwrap();
+
+        let (outcome_written_tx, outcome_written_rx) = std::sync::mpsc::channel();
+        let (release_outcome_tx, release_outcome_rx) = std::sync::mpsc::channel();
+        let outcome_host = first_host.clone();
+        let outcome_handle = handle.clone();
+        let outcome = std::thread::spawn(move || {
+            outcome_host
+                .persist_command_outcome_with_hook(
+                    &outcome_handle,
+                    command_id,
+                    SessionCommandStatus::Applied,
+                    Some("dispatched"),
+                    || {
+                        outcome_written_tx.send(()).unwrap();
+                        release_outcome_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+            outcome_host
+                .inner
+                .store
+                .mark_processed(command_id)
+                .unwrap();
+        });
+        outcome_written_rx.recv().unwrap();
+
+        let (reseed_done_tx, reseed_done_rx) = std::sync::mpsc::channel();
+        let reseed_handle = handle.clone();
+        let reseed = std::thread::spawn(move || {
+            reseed_handle.reseed(replacement.doc().clone()).unwrap();
+            reseed_done_tx.send(()).unwrap();
+        });
+        assert!(
+            reseed_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "reseed waits until status mutation and exact snapshot save finish"
+        );
+        release_outcome_tx.send(()).unwrap();
+        outcome.join().unwrap();
+        reseed.join().unwrap();
+        reseed_done_rx.recv().unwrap();
+
+        let current = handle.doc().read_commands().unwrap();
+        assert!(current.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Applied
+        }));
+        first_host.persist_snapshot(&handle).unwrap();
+
+        let restarted = host(dir.path());
+        let reopened = restarted.open(chat_id).unwrap();
+        let commands = reopened.doc().read_commands().unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Applied
+        }));
+        assert!(restarted.inner.store.is_processed(command_id).unwrap());
+        assert!(!commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Pending
+        }));
     }
 
     #[tokio::test]

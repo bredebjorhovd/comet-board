@@ -63,7 +63,10 @@ The returned `ContextSearch.checkout_id` is a SHA-256 equality token over a
 version marker, host device, declared checkout identity, and canonical root.
 Desktop stores that token with each completed reference in per-draft state;
 closing the picker, its trailing completion space, async upload work, or chat
-navigation cannot replace it with the current checkout. iPhone mirrors the same
+navigation cannot replace it with the current checkout. Provenance is bound to
+the exact inserted token range: deleting/replacing that token revokes it, and a
+successful Send, Steer, Queue, or edit draft clear removes it. Retyping or
+pasting the same path is therefore still plain text. iPhone mirrors the same
 `checkoutId` field. Immediately before Run, Steer, or queued execution, the host
 re-resolves the current chat root through the same registered repository and
 worktree authority as search, recomputes the identity, and refuses an unstamped
@@ -151,7 +154,9 @@ processed. A process death before dispatch leaves the durable Pending command
 for restart; a death after the outcome snapshot reopens a visibly terminal row
 that evaluation will not dispatch again. A dispatch rejection records Rejected
 and the row is no longer part of the pending projection; the ledger retains the
-reason.
+reason. Status mutation, snapshot export, and saving those exact bytes share the
+current-document read guard; a concurrent room reseed waits and then carries a
+terminal local outcome over a stale Pending copy.
 
 Queued execution uses the row's current projected prompt/context and its own
 attachments, never the preceding request's images. It rebuilds run configuration
@@ -199,7 +204,8 @@ The repository tests cover:
 - execution refusing forged unstamped context and a stamped ref after mutable
   SetChatCwd points outside registered roots;
 - picker completion retaining the original checkout stamp and hand-typed
-  syntax remaining plain text;
+  syntax remaining plain text, including select → Send → retype and select →
+  delete → retype lifetime regressions;
 - Queue fold edit/move/remove/pause/run-next and two-client deterministic fold;
 - exclusive unpaused/paused RunNext evaluation and removed-target cleanup;
 - client-owned id deduplication, collision refusal, and add → treated-as-lost
@@ -209,7 +215,8 @@ The repository tests cover:
   and pause survive reopen;
 - acknowledged Queue snapshot reopening without a debounce flush;
 - the recoverable dispatch branch's pre-dispatch crash window and the
-  Queue-specific terminal-outcome-before-processed crash window;
+  Queue-specific terminal-outcome-before-processed crash window, plus a
+  deterministic terminal-outcome/reseed interleaving that reopens terminal;
 - a forwarded WatchDocQueue initial frame and changed pause frame;
 - iOS source contract that failed durable appends retain add/edit UI state and
   every queue control surfaces failure.

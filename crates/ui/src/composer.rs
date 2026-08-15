@@ -63,6 +63,42 @@ fn stamp_context_tokens(text: &str, stamps: Option<&HashMap<String, String>>) ->
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextSelection {
+    checkout_id: String,
+    token_start: usize,
+    token_end: usize,
+}
+
+fn selected_context_stamps(
+    text: &str,
+    selections: Option<&HashMap<String, ContextSelection>>,
+) -> HashMap<String, String> {
+    selections
+        .into_iter()
+        .flatten()
+        .filter_map(|(path, selection)| {
+            let expected = format!("@{path}");
+            (text.get(selection.token_start..selection.token_end) == Some(expected.as_str()))
+                .then(|| (path.clone(), selection.checkout_id.clone()))
+        })
+        .collect()
+}
+
+fn prune_context_selections(text: &str, selections: &mut HashMap<String, ContextSelection>) {
+    selections.retain(|path, selection| {
+        let expected = format!("@{path}");
+        text.get(selection.token_start..selection.token_end) == Some(expected.as_str())
+    });
+}
+
+fn take_context_selections(
+    all: &mut HashMap<String, HashMap<String, ContextSelection>>,
+    draft_key: &str,
+) -> Option<HashMap<String, ContextSelection>> {
+    all.remove(draft_key)
+}
+
 fn queue_add_gesture_key(chat_id: &str, prompt: &str, context: &[ContextRef]) -> String {
     serde_json::to_string(&(chat_id, prompt, context))
         .unwrap_or_else(|_| format!("{chat_id}:{prompt}"))
@@ -1785,7 +1821,7 @@ pub struct Composer {
     /// Checkout stamps captured when a picker row was completed, per draft.
     /// Search chrome may close or refresh; provenance belongs to the inserted
     /// reference and must survive until that reference/draft is removed.
-    context_ref_checkouts: HashMap<String, HashMap<String, String>>,
+    context_ref_checkouts: HashMap<String, HashMap<String, ContextSelection>>,
     /// `(chat key, query)` the rows answer. Both halves matter: the same query
     /// means different files in a different checkout.
     context_key: Option<(String, String)>,
@@ -1871,6 +1907,7 @@ impl Composer {
             // flag that lagged a frame would send the prompt on the Enter that
             // was meant to complete it.
             ComposerInputEvent::Edited => {
+                this.prune_context_provenance(cx);
                 this.sync_menus(cx);
                 cx.notify();
             }
@@ -2545,14 +2582,21 @@ impl Composer {
         let Some(row) = rows.get(self.context_selected) else {
             return;
         };
+        let (text, caret) =
+            view_context::complete(self.input.read(cx).text(), &token, &row.to_ref());
         if let Some(checkout_id) = self.context_checkout_id.clone() {
             self.context_ref_checkouts
                 .entry(self.current_key.clone())
                 .or_default()
-                .insert(row.path.clone(), checkout_id);
+                .insert(
+                    row.path.clone(),
+                    ContextSelection {
+                        checkout_id,
+                        token_start: token.start,
+                        token_end: token.start + 1 + row.path.len(),
+                    },
+                );
         }
-        let (text, caret) =
-            view_context::complete(self.input.read(cx).text(), &token, &row.to_ref());
         self.input
             .update(cx, |input, cx| input.set_text_with_caret(text, caret, cx));
         self.context_selected = 0;
@@ -2676,7 +2720,21 @@ impl Composer {
     }
 
     fn context_tokens(&self, text: &str) -> Vec<ContextRef> {
-        stamp_context_tokens(text, self.context_ref_checkouts.get(&self.current_key))
+        let stamps = selected_context_stamps(
+            text,
+            self.context_ref_checkouts.get(&self.current_key),
+        );
+        stamp_context_tokens(text, Some(&stamps))
+    }
+
+    fn prune_context_provenance(&mut self, cx: &App) {
+        let Some(selections) = self.context_ref_checkouts.get_mut(&self.current_key) else {
+            return;
+        };
+        prune_context_selections(self.input.read(cx).text(), selections);
+        if selections.is_empty() {
+            self.context_ref_checkouts.remove(&self.current_key);
+        }
     }
 
     fn queue_gesture_id(
@@ -2860,7 +2918,17 @@ impl Composer {
             .or_default();
         for reference in &row.context {
             if let Some(checkout_id) = &reference.checkout_id {
-                stamps.insert(reference.path.clone(), checkout_id.clone());
+                let token = format!("@{}", reference.path);
+                if let Some(token_start) = prompt.find(&token) {
+                    stamps.insert(
+                        reference.path.clone(),
+                        ContextSelection {
+                            checkout_id: checkout_id.clone(),
+                            token_start,
+                            token_end: token_start + token.len(),
+                        },
+                    );
+                }
             }
         }
         self.editing = Some(row_id.to_string());
@@ -3068,6 +3136,7 @@ impl Composer {
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
+        let draft_key = self.current_key.clone();
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
@@ -3147,6 +3216,8 @@ impl Composer {
         // outlive navigation to another chat, and the picker identity is the
         // one captured at completion—not whichever checkout is current later.
         let picked_context = self.context_tokens(&echo_text);
+        let picked_provenance =
+            take_context_selections(&mut self.context_ref_checkouts, &draft_key);
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -3171,7 +3242,7 @@ impl Composer {
         });
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        self.drafts.remove(&draft_key);
         self.failure = None;
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
@@ -3389,6 +3460,11 @@ impl Composer {
                         cx.notify();
                     });
                     composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if let Some(provenance) = picked_provenance {
+                        composer
+                            .context_ref_checkouts
+                            .insert(err_chat_id.clone(), provenance);
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.
@@ -4978,6 +5054,46 @@ mod tests {
     fn hand_typed_context_syntax_remains_plain_prompt_text() {
         assert!(stamp_context_tokens("inspect @src/forged.rs", None).is_empty());
         assert!(stamp_context_tokens("inspect @src/forged.rs", Some(&HashMap::new())).is_empty());
+    }
+
+    #[test]
+    fn successful_send_drops_selection_authority_before_the_same_path_is_typed_again() {
+        let text = "inspect @src/foo.rs";
+        let selections = HashMap::from([(
+            "src/foo.rs".into(),
+            ContextSelection {
+                checkout_id: "host-checkout".into(),
+                token_start: 8,
+                token_end: text.len(),
+            },
+        )]);
+        let selected = selected_context_stamps(text, Some(&selections));
+        assert_eq!(stamp_context_tokens(text, Some(&selected)).len(), 1);
+
+        // Successful Send/Steer consumes the draft provenance. Identical text
+        // in the next draft is only text until the picker selects it again.
+        let mut drafts = HashMap::from([("chat-a".into(), selections)]);
+        take_context_selections(&mut drafts, "chat-a");
+        let next = selected_context_stamps(text, drafts.get("chat-a"));
+        assert!(stamp_context_tokens(text, Some(&next)).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_selected_token_revokes_authority_before_retyping_it() {
+        let selected_text = "inspect @src/foo.rs";
+        let mut selections = HashMap::from([(
+            "src/foo.rs".into(),
+            ContextSelection {
+                checkout_id: "host-checkout".into(),
+                token_start: 8,
+                token_end: selected_text.len(),
+            },
+        )]);
+
+        prune_context_selections("inspect ", &mut selections);
+        assert!(selections.is_empty(), "deleting the exact token revokes it");
+        let retyped = selected_context_stamps(selected_text, Some(&selections));
+        assert!(stamp_context_tokens(selected_text, Some(&retyped)).is_empty());
     }
 
     #[test]
