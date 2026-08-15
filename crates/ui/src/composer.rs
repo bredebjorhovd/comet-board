@@ -60,6 +60,11 @@ fn stamp_context_tokens(text: &str, stamps: Option<&HashMap<String, String>>) ->
         })
         .collect()
 }
+
+fn queue_add_gesture_key(chat_id: &str, prompt: &str, context: &[ContextRef]) -> String {
+    serde_json::to_string(&(chat_id, prompt, context))
+        .unwrap_or_else(|_| format!("{chat_id}:{prompt}"))
+}
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
 /// 260)` (comet composer.tsx line 235). The 76px floor applies even when
@@ -1798,6 +1803,7 @@ pub struct Composer {
     /// The serialized intent is the key: editing it creates a new gesture;
     /// retrying it after response loss reuses the old id.
     pending_queue_gestures: HashMap<String, String>,
+    pending_queue_message_ids: HashMap<String, String>,
     /// The queued row the composer is editing, if any. Sending commits an edit
     /// against this id instead of queueing a new row.
     editing: Option<String>,
@@ -1916,6 +1922,7 @@ impl Composer {
             queue_task: None,
             queue_action_task: None,
             pending_queue_gestures: HashMap::new(),
+            pending_queue_message_ids: HashMap::new(),
             editing: None,
             sending: false,
             failure: None,
@@ -2672,17 +2679,38 @@ impl Composer {
 
     fn queue_gesture_id(
         &mut self,
+        chat_id: &str,
         payload: &SessionCommandPayload,
         context: &[ContextRef],
     ) -> (String, String) {
-        let key =
-            serde_json::to_string(&(payload, context)).unwrap_or_else(|_| format!("{payload:?}"));
+        let key = serde_json::to_string(&(chat_id, payload, context))
+            .unwrap_or_else(|_| format!("{chat_id}:{payload:?}"));
         let id = self
             .pending_queue_gestures
             .entry(key.clone())
             .or_insert_with(|| uuid::Uuid::new_v4().to_string())
             .clone();
         (key, id)
+    }
+
+    fn queue_add_ids(
+        &mut self,
+        chat_id: &str,
+        prompt: &str,
+        context: &[ContextRef],
+    ) -> (String, String, String) {
+        let key = queue_add_gesture_key(chat_id, prompt, context);
+        let command_id = self
+            .pending_queue_gestures
+            .entry(key.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        let message_id = self
+            .pending_queue_message_ids
+            .entry(key.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        (key, command_id, message_id)
     }
 
     // ---- the follow-up queue (gh#424) ----
@@ -2773,9 +2801,10 @@ impl Composer {
             return;
         };
         let context = self.context_tokens(&text);
+        let (gesture_key, command_id, message_id) = self.queue_add_ids(&chat_id, &text, &context);
         let payload = SessionCommandPayload::Queue {
             prompt: text.clone(),
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id,
             attachments: Vec::new(),
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -2783,7 +2812,6 @@ impl Composer {
             cx.notify();
             return;
         };
-        let (gesture_key, command_id) = self.queue_gesture_id(&payload, &context);
         let params = serde_json::json!({
             "chatId": chat_id,
             "commandId": command_id,
@@ -2799,6 +2827,7 @@ impl Composer {
                 match result {
                     Ok(_) => {
                         composer.pending_queue_gestures.remove(&gesture_key);
+                        composer.pending_queue_message_ids.remove(&gesture_key);
                         // Do not erase keystrokes entered while the durable
                         // append was in flight.
                         if composer.input.read(cx).text().trim() == text {
@@ -2870,7 +2899,7 @@ impl Composer {
             return;
         };
         let payload = SessionCommandPayload::QueueControl { op };
-        let (gesture_key, command_id) = self.queue_gesture_id(&payload, &[]);
+        let (gesture_key, command_id) = self.queue_gesture_id(&chat_id, &payload, &[]);
         let params = serde_json::json!({
             "chatId": chat_id,
             "commandId": command_id,
@@ -3001,7 +3030,7 @@ impl Composer {
                 return;
             }
         };
-        let (gesture_key, command_id) = self.queue_gesture_id(&payload, &context);
+        let (gesture_key, command_id) = self.queue_gesture_id(chat_id, &payload, &context);
         let params = serde_json::json!({
             "chatId": chat_id,
             "commandId": command_id,
@@ -4941,6 +4970,22 @@ mod tests {
         let refs = stamp_context_tokens(&completed, Some(&stamps));
         assert_eq!(refs[0].checkout_id.as_deref(), Some("checkout-before"));
         assert_ne!(refs[0].checkout_id.as_deref(), Some("checkout-after"));
+    }
+
+    #[test]
+    fn queued_add_retry_key_is_stable_and_chat_scoped() {
+        let context = vec![ContextRef::file("src/foo.rs")];
+        let first = queue_add_gesture_key("chat-a", "follow up", &context);
+        assert_eq!(
+            first,
+            queue_add_gesture_key("chat-a", "follow up", &context),
+            "a response-loss retry finds the same retained command/message ids"
+        );
+        assert_ne!(
+            first,
+            queue_add_gesture_key("chat-b", "follow up", &context)
+        );
+        assert_ne!(first, queue_add_gesture_key("chat-a", "changed", &context));
     }
 
     #[test]

@@ -63,7 +63,7 @@ CheckoutContext
   display_name       branch/worktree label safe for clients
   root               host-only absolute canonical path
 
-CheckoutContext::search(query, cursor?) -> PathSearchPage
+CheckoutContext::search(query) -> ContextSearch
 CheckoutContext::resolve(reference) -> ResolvedContext | ContextError
 ```
 
@@ -140,40 +140,31 @@ compatibility policy; upgraded readers render the chip.
 The host adds one forwardable unary RPC:
 
 ```text
-SearchCheckoutPaths {
-  chatId? | { spaceId, refName? },
+SearchContextFiles {
+  chatId? | spaceId?,
   query,
-  cursor?
+  limit?
 }
 
-PathSearchPage {
-  checkoutId,
-  displayName,
-  results: ContextReference[],
-  truncated,
-  cursor?
+ContextSearch {
+  checkoutId?,
+  matches: ContextMatch[],
+  truncated
 }
 ```
 
-The engine performs a fresh, ignored-aware walk rooted at the checkout. It
-does not install a watcher or build an index. The walk follows the repository's
-ignore rules and always excludes `.git`, Comet upload storage, and nested
-worktree administration files. Untracked non-ignored paths remain searchable.
+The engine performs a fresh walk rooted at the validated checkout. It does not
+install a watcher or build an index. A fixed heavy-directory list excludes
+`.git`, dependency/build caches, and similar trees; it does not parse gitignore.
 
 One request is bounded by all of:
 
 - 20,000 visited directory entries;
-- 50 returned matches;
-- 150 ms of filesystem work;
-- depth 32;
-- a 256-byte UTF-8 query and 4 KiB normalized result path.
+- 20 returned matches by default (caller limit capped at 100);
+- depth 12.
 
-The first limit reached sets `truncated`. A cursor is an opaque continuation
-valid only for the same checkout id and query and for 30 seconds. The engine
-may restart the walk when a cursor expires; correctness never depends on a
-complete scan. Clients debounce for 120 ms and cancel superseded requests.
-Empty `@` returns recent shallow matches only (maximum depth four), not the
-whole tree.
+The entry or result limit sets `truncated`. There is no cursor or index. The
+desktop debounces for 90 ms and discards replies whose chat/query key is stale.
 
 Matching is case-insensitive subsequence scoring over the relative path with
 bonuses for basename, component starts, and exact prefix. Results sort by
@@ -181,13 +172,13 @@ score, then fewer components, then bytewise path. Directories and files share
 the list; kind is always explicit. This ranking is part of the module so all
 clients show the same answer.
 
-The walk uses `symlink_metadata` and never descends through or returns a
-symbolic link. At resolution the engine rejects absolute paths, empty
-components, `.` and `..`, platform prefixes, NUL, separators foreign to the
-normalized `/` form, symlinks in every component, and a final canonical path
-outside the canonical root. It repeats this validation immediately before
-dispatch. A repository can of course mutate after a run starts; the harness's
-ordinary sandbox remains the authority for everything the agent later reads.
+The walk uses `DirEntry::file_type`, so it does not descend into directory
+symlinks; a symlink leaf may appear as a file result. Resolution rejects
+absolute and parent-traversing paths, canonicalizes every existing ancestor,
+and refuses any ancestor or final target outside the canonical checkout root.
+A symlink whose canonical target remains inside the checkout is accepted. The
+implementation does not promise file-vs-directory kind stability. It repeats
+checkout and containment validation immediately before dispatch.
 
 ### Live, stale, and deleted
 
@@ -196,21 +187,10 @@ carrying the snapshot, would make large-file selection expensive, and would
 turn a directory into an undefined hash tree. Image attachments already own
 the snapshot/upload use case.
 
-Resolution has four user-visible failures:
-
-```text
-checkout_changed    This reference belongs to a different checkout.
-missing             “path” no longer exists in this checkout.
-kind_changed        “path” is now a file/directory, not the selected kind.
-unsafe              “path” no longer resolves safely inside this checkout.
-```
-
-All references in an instruction validate as one set before a user message is
-appended or a harness side effect starts. One failure rejects the command; the
-composer restores the draft and chips for an immediate repair. A queued row
-stays visible in an `attention` state with the failure and is not automatically
-discarded. Editing it creates a new queue operation and makes it eligible
-again.
+Checkout mismatch and containment escape reject the command with the engine's
+error text. A missing leaf is not fatal: the engine appends a visible note to
+the prompt and records the missing count in the command resolution. This also
+supports instructions that intentionally name a file the agent should create.
 
 A file whose bytes changed is not stale. The chip continues to point at its
 path and the agent sees the execution-time contents. That is the useful
@@ -323,50 +303,26 @@ not itself call the harness. The host queue scheduler asks `next_action` after:
 - the host opens or restores a session document;
 - resume or run-next is applied.
 
-`run_state` must distinguish an actively producing/awaiting-input turn from a
-steerable harness parked between turns. Today's `chat_is_busy` is too coarse
-for that decision. `SessionsEngine` therefore exposes `TurnState` as
-`active`, `awaitingInput`, `parked`, or `absent`, and a watch notification when
-it changes. The queue scheduler is the only caller that translates `parked`
-or `absent` plus a ready item into a new turn.
+Automatic delivery is allowed when no run is live, the queue is unpaused, and
+the row is the projected head. `RunNext` may name one live row while paused;
+while that target exists every non-target row defers. It still waits for the
+current run to end and never steers or interrupts it.
 
-Automatic delivery is allowed only when the queue is not paused, no queue item
-is already `starting`, and state is `parked` or `absent`. `awaitingInput` is
-still the current turn and does not drain the queue. `active` never drains it.
-Pause affects automatic delivery only. `RunNext` is explicit and may select
-the head while paused, but still waits for active/awaiting-input work to become
-safe; it never steers or interrupts that work.
-
-To consume an item without a crash gap, the host uses the existing recoverable
-Run protocol:
-
-1. for automatic delivery, append/ensure a host-issued `RunNext` queue
-   operation whose id is deterministically derived from the item id and
-   revision; explicit delivery already has that operation;
-2. deterministically derive a child run command id from the item id and the
-   consuming `RunNext` operation;
-3. validate its checkout and context references;
-4. append/ensure that ordinary `Run` command under that stable id;
-5. leave the item projected as `starting` while the Run is pending;
-6. let the existing Run executor persist its snapshot, claim it in-process,
-   dispatch, and mark it processed;
-7. project the item consumed only when the child Run is `applied`.
-
-A crash before step 3 leaves a ready queue row. A crash after step 3 finds the
-same stable Run id and does not append another. A crash during dispatch uses
-today's pending-Run recovery. A rejected Run leaves the item in `attention`
-with its body intact. The next item cannot pass it automatically; the user may
-edit, remove, or explicitly run a different item.
+The queued command itself uses the recoverable Run path. It remains Pending
+and is claimed in-process while `SessionsEngine::dispatch` accepts the turn;
+only then is its processed bit and Applied outcome written. A crash before
+dispatch therefore leaves the same durable Queue command available after
+restart. A dispatch rejection records Rejected and removes the non-pending row
+from the projection; its reason remains in the command ledger.
 
 The derived Run rebuilds model, reasoning, sandbox, and resume from the chat's
 current row exactly as today's dead-steer fallback does. A queued follow-up
 does not freeze model configuration. It does freeze the user's prompt,
 references, and uploaded image identities.
 
-Stopping a run does not consume, flush, pause, or resume the queue. When the
-interrupted run reaches terminal state, normal automatic-drain rules apply.
-The UI offers **Stop and pause queue** as a two-command convenience only if a
-later design needs it; it is not an overloaded interrupt command here.
+Stopping a run does not consume or clear rows. If rows exist, the Interrupt
+entry projects the queue as stopped/paused until an explicit Resume. With no
+rows it leaves no latent pause behind.
 
 ### RPC surface
 
@@ -445,9 +401,7 @@ opens a bottom sheet with edit, move up/down, remove, run-next, pause, and
 resume. Drag reorder may be added, but move up/down is the required behavior
 and emits the same Move operation as desktop.
 
-Transcript chips wrap under the user text. File and directory references use
-the same labels as desktop. A stale queue row uses inline attention styling,
-not a modal alert.
+File and directory references use the same relative-path labels as desktop.
 
 ### TUI, if retained
 
@@ -490,12 +444,13 @@ renderer-only optimization.
 - A caller cannot provide an absolute root for an existing chat.
 - Results and references contain paths, which are workspace metadata, but
   never file contents or content-derived previews.
-- Symlinks are neither searched nor referenceable.
-- Every execution revalidates checkout id, lexical path, component kinds, and
-  canonical containment before appending the user message.
+- Search does not descend into directory symlinks. Resolution accepts only
+  symlink targets canonically contained by the checkout.
+- Every execution revalidates checkout id, lexical path, and canonical
+  containment before appending the user message.
 - Directory references do not enumerate contents into a document or prompt.
-- The engine-authored harness trailer contains relative paths only. The
-  harness already receives the checkout as cwd.
+- Reference tokens remain relative paths in the user's prompt; the harness
+  receives the same checkout as cwd. Only missing-path diagnostics are added.
 - Queue commands follow existing session-room authorization and host-only
   execution. Queue control does not grant a viewer more filesystem access than
   ordinary Send already grants.
@@ -510,16 +465,17 @@ renderer-only optimization.
 | Chat checkout differs by send time | Whole command rejects `checkout_changed`; no harness starts. |
 | Picked file is deleted | Command reports the missing path to the agent and command ledger. |
 | Picked file changes bytes | Command runs against the new bytes. |
-| Path becomes a symlink | Command rejects `unsafe`. |
+| Path becomes an escaping symlink | Command rejects the containment escape. |
+| Path becomes an internal symlink | Command follows it within the same checkout. |
 | Two clients edit one row | Document order decides; both clients project the same last edit. |
 | Edit retry after response loss | Same client-owned command id appends once. |
 | Remove races run-next | Document order decides; exactly one effect applies. |
 | Reorder races reorder | Document order plus the missing-anchor-to-tail rule yields one order. |
 | Host restarts with three rows | Fold restores all three; scheduler resumes only if not paused. |
 | Viewer is offline | Its operations remain in its session doc and converge on reconnect. |
-| Host crashes while starting queued row | Stable child Run id recovers through existing pending-Run protocol. |
+| Host crashes while starting queued row | Pending Queue command recovers through the Run dispatch protocol. |
 | User steers with rows queued | Steer affects current turn; queue order is unchanged. |
-| User stops with rows queued | Current run interrupts; queue is neither cleared nor implicitly paused. |
+| User stops with rows queued | Current run interrupts; rows remain and project paused until Resume. |
 | Run awaits input | Queue does not drain until the input turn settles. |
 
 ## Verification contract
@@ -532,12 +488,11 @@ prove:
 
 - the same chat searched from another device produces references bound to the
   host's worktree, not the viewer's similarly named repository;
-- lexical escape, absolute paths, symlink files, symlink directories, kind
-  changes, and checkout replacement reject; deletion is reported;
+- lexical escape, absolute paths, escaping symlink ancestors/leaves, and
+  checkout replacement reject; contained symlinks work and deletion is reported;
 - changed bytes remain valid;
-- ignored files and `.git` never appear;
-- entry, result, depth, time, query, and path bounds set truncation without
-  blocking later RPCs;
+- `.git` and the fixed heavy-directory list never appear;
+- entry, result, and depth bounds set truncation;
 - a directory selection causes no recursive metadata or content write;
 - serialized commands, messages, and edge snapshots contain no file bytes or
   absolute reference paths.
@@ -555,7 +510,6 @@ Follow-up queue fixture tests fold the same JSON in Rust and Swift and prove:
   outcomes in the decision table;
 - crash injection before child Run append, after append, before dispatch, and
   after dispatch never loses or duplicates a turn;
-- an attention row blocks automatic pass-through to later rows;
 - shallow snapshots and causal backfill preserve the command log and every
   row still live under its deterministic fold.
 

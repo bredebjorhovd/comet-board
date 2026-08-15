@@ -901,6 +901,53 @@ async fn rpc_dispatch_for_m5_methods() {
         .await
         .expect("chatId-only worktree search");
     assert_eq!(worktree_search["matches"][0]["path"], "file.txt");
+
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": "chat-term", "commandId": "pause-before-lost-add",
+                "command": { "kind": "queueControl", "op": { "op": "pause" } },
+            }),
+        )
+        .await
+        .expect("pause queue");
+    let lost_add = serde_json::json!({
+        "chatId": "chat-term", "commandId": "lost-add-gesture",
+        "command": {
+            "kind": "queue", "prompt": "original", "messageId": "lost-add-message",
+            "attachments": [],
+        },
+    });
+    client
+        .call(methods::QUEUE_COMMAND, lost_add.clone())
+        .await
+        .expect("append whose response is treated as lost");
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": "chat-term", "commandId": "intervening-edit",
+                "command": {
+                    "kind": "queueControl",
+                    "op": { "op": "edit", "target": "lost-add-gesture", "prompt": "edited" },
+                },
+            }),
+        )
+        .await
+        .expect("intervening edit");
+    client
+        .call(methods::QUEUE_COMMAND, lost_add)
+        .await
+        .expect("same composer gesture retries idempotently");
+    let queue = core.doc_host.open("chat-term").unwrap().queue_view();
+    assert_eq!(queue.rows.len(), 1);
+    assert_eq!(
+        queue.rows[0].prompt, "edited",
+        "retry did not undo the edit"
+    );
+    assert_eq!(queue.rows[0].message_id, "lost-add-message");
+
     client
         .call(
             methods::DELETE_WORKTREE,
