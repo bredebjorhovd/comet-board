@@ -499,7 +499,9 @@ prove:
 
 Rust tests in `crates/doc/src/queue.rs` and `crates/doc/src/commands.rs` prove:
 
-- several adds survive snapshot export/import and app restart in order;
+- `queue::tests::multiple_followups_and_controls_survive_session_snapshot_reopen`
+  proves three rows plus edit/move/pause state survive session snapshot
+  export/import and reopen in order;
 - transport retries carrying the same command id append once;
 - concurrent edit, move, and remove logs project identically on both clients;
 - failed durable appends retain the draft or edit for retry;

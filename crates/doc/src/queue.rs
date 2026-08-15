@@ -204,7 +204,9 @@ pub fn is_queue_entry(entry: &SessionCommandEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionDoc;
     use crate::commands::SessionCommandPayload;
+    use loro::LoroDoc;
 
     fn entry(id: &str, payload: SessionCommandPayload, at: i64) -> SessionCommandEntry {
         SessionCommandEntry {
@@ -476,6 +478,56 @@ mod tests {
             5,
         ));
         assert_eq!(project(&log).run_next, None);
+    }
+
+    #[test]
+    fn multiple_followups_and_controls_survive_session_snapshot_reopen() {
+        let doc = SessionDoc::init("chat-queue-restart").unwrap();
+        let commands = vec![
+            queued("q1", "one", 1),
+            queued("q2", "two", 2),
+            queued("q3", "three", 3),
+            control(
+                "edit-q2",
+                QueueOp::Edit {
+                    target: "q2".into(),
+                    prompt: "two edited".into(),
+                    context: Vec::new(),
+                },
+                4,
+            ),
+            control(
+                "move-q3",
+                QueueOp::Move {
+                    target: "q3".into(),
+                    after: None,
+                },
+                5,
+            ),
+            control("pause", QueueOp::Pause {}, 6),
+        ];
+        for command in &commands {
+            doc.queue_command(command).unwrap();
+        }
+        let before = project(&doc.read_commands().unwrap());
+
+        let snapshot = doc.export_snapshot().unwrap();
+        let reopened = LoroDoc::new();
+        reopened.import(&snapshot).unwrap();
+        let reopened = SessionDoc::from_doc(reopened);
+        let after = project(&reopened.read_commands().unwrap());
+
+        assert_eq!(after, before);
+        assert_eq!(
+            after
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["q3", "q1", "q2"]
+        );
+        assert_eq!(after.rows[2].prompt, "two edited");
+        assert_eq!(after.paused, Some(QueuePause::User));
     }
 
     #[test]
