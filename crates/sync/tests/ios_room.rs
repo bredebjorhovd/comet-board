@@ -79,8 +79,12 @@ fn ios_followup_drafts_survive_a_failed_durable_append() {
     assert!(
         composer.contains("guard store.queueFollowup(prompt: prompt, context: context) else")
             && composer.contains("if store.editFollowup(id: row.id, prompt: editText")
+            && composer.contains("saveQueueControl(store.moveFollowup")
+            && composer.contains("saveQueueControl(store.removeFollowup")
+            && composer.contains("saveQueueControl(store.runNext")
+            && composer.contains("saveQueueControl(store.setFollowupsPaused")
             && composer.contains("followupFailure ="),
-        "Composer must retain queue drafts/edits and surface failed appends"
+        "Composer must retain drafts/edits and surface every failed queue write"
     );
 }
 

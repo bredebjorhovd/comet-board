@@ -399,15 +399,19 @@ final class SessionStore {
                       "context": context.map(encodableJSON)])
     }
 
-    func moveFollowup(id: String, after: String?) {
+    @discardableResult
+    func moveFollowup(id: String, after: String?) -> Bool {
         var op: [String: Any] = ["op": "move", "target": id]
         if let after { op["after"] = after }
-        queueControl(op)
+        return queueControl(op)
     }
 
-    func removeFollowup(id: String) { queueControl(["op": "remove", "target": id]) }
-    func runNext(id: String) { queueControl(["op": "runNext", "target": id]) }
-    func setFollowupsPaused(_ paused: Bool) {
+    @discardableResult
+    func removeFollowup(id: String) -> Bool { queueControl(["op": "remove", "target": id]) }
+    @discardableResult
+    func runNext(id: String) -> Bool { queueControl(["op": "runNext", "target": id]) }
+    @discardableResult
+    func setFollowupsPaused(_ paused: Bool) -> Bool {
         queueControl(["op": paused ? "pause" : "resume"])
     }
 

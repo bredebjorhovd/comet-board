@@ -8,9 +8,9 @@
 //! - on every doc change (local commit or remote import) the handle re-emits the joined
 //!   transcript to watchers, drains pending commands, and schedules a snapshot save;
 //! - command drain: evaluate via `evaluate_command` (with the DocsStore processed
-//!   ledger), execute `Run` commands before marking them processed so a crash cannot
-//!   strand a paid turn before spawn, retain mark-before-execute for non-Run side
-//!   effects, then write the outcome status back as the sole outcome writer.
+//!   ledger), execute recoverable Run/Queue commands, durably snapshot their terminal
+//!   outcome, and only then mark them processed so neither crash window can strand or
+//!   duplicate a paid turn; other side effects retain mark-before-execute.
 //!
 //! Chat ownership is gated on the workspace doc (`chats[chat_id].deviceId`), with
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
@@ -80,6 +80,8 @@ const RELEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// must therefore run the command.
 #[cfg(test)]
 static FAIL_BEFORE_RUN_DISPATCH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static FAIL_AFTER_OUTCOME_PERSIST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
 /// columnar+compressed; the in-memory doc plus mirror runs well above the blob
@@ -197,6 +199,7 @@ struct DocHostInner {
     config: DocHostConfig,
     sessions: OnceLock<SessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
+    repos: OnceLock<crate::Repos>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
     /// Commands whose session snapshot must be durable before the executor may
     /// see them. Checkout-preparation handoff is the only producer.
@@ -541,6 +544,7 @@ impl DocHost {
                 config,
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
+                repos: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
                 durable_pending: Mutex::new(HashSet::new()),
                 starting_runs: Mutex::new(HashSet::new()),
@@ -562,6 +566,10 @@ impl DocHost {
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
     pub fn set_workspace(&self, workspace: WorkspaceHost) {
         let _ = self.inner.workspace.set(workspace);
+    }
+
+    pub fn set_repos(&self, repos: crate::Repos) {
+        let _ = self.inner.repos.set(repos);
     }
 
     /// The workspace host, once wired (tests may assemble a DocHost without one).
@@ -990,8 +998,18 @@ impl DocHost {
         id: &str,
         payload: SessionCommandPayload,
     ) -> Result<(), EngineError> {
+        self.queue_command_with_id_and_context_durable(chat_id, id, payload, Vec::new())
+    }
+
+    pub fn queue_command_with_id_and_context_durable(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+    ) -> Result<(), EngineError> {
         lock(&self.inner.durable_pending).insert(id.to_string());
-        if let Err(error) = self.queue_command_with_id(chat_id, id, payload) {
+        if let Err(error) = self.queue_command_with_id_and_context(chat_id, id, payload, context) {
             lock(&self.inner.durable_pending).remove(id);
             return Err(error);
         }
@@ -1259,6 +1277,29 @@ impl DocHost {
                     Ok(outcome) => outcome,
                     Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                 };
+                if let Err(err) =
+                    handle
+                        .doc()
+                        .set_command_status(&entry.id, status, resolution.as_deref())
+                {
+                    tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
+                        "run outcome write failed; retaining command claim until restart");
+                    return;
+                }
+                if let Err(err) = self.persist_snapshot(handle) {
+                    tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
+                        "run outcome snapshot failed; retaining command claim until restart");
+                    return;
+                }
+                #[cfg(test)]
+                {
+                    let failpoint = FAIL_AFTER_OUTCOME_PERSIST.get_or_init(|| Mutex::new(None));
+                    let mut command = lock(failpoint);
+                    if command.as_deref() == Some(entry.id.as_str()) {
+                        command.take();
+                        return;
+                    }
+                }
                 if let Err(err) = self.inner.store.mark_processed(&entry.id) {
                     // Retain the in-process claim. Re-running after Sessions
                     // has accepted the prompt would duplicate a turn; restart
@@ -1269,7 +1310,6 @@ impl DocHost {
                     return;
                 }
                 lock(&self.inner.starting_runs).remove(&entry.id);
-                self.resolve_command(handle, &entry.id, status, resolution.as_deref());
                 continue;
             }
 
@@ -1383,8 +1423,9 @@ impl DocHost {
                 // about to start in — not where they were picked. That is what
                 // makes a file picked on a phone name the same file when the
                 // box runs the turn, and the only place an escape can be caught.
-                let context =
-                    self.apply_context(chat_id, &request.cwd, &entry.context, &mut request.prompt)?;
+                let context = self
+                    .apply_context(chat_id, &request.cwd, &entry.context, &mut request.prompt)
+                    .await?;
                 let harness = self.harness_for(chat_id);
                 sessions
                     .dispatch(chat_id, harness, request, Some(message_id.clone()))
@@ -1393,12 +1434,14 @@ impl DocHost {
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
                 let mut prompt = prompt.clone();
-                let context = self.apply_context(
-                    chat_id,
-                    &self.checkout_root(chat_id, sessions),
-                    &entry.context,
-                    &mut prompt,
-                )?;
+                let context = self
+                    .apply_context(
+                        chat_id,
+                        &self.checkout_root(chat_id, sessions),
+                        &entry.context,
+                        &mut prompt,
+                    )
+                    .await?;
                 let prompt = &prompt;
                 match sessions.steer(chat_id, prompt, message_id.clone()).await? {
                     SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, context)),
@@ -1548,7 +1591,9 @@ impl DocHost {
                         Some("no run config for the queued follow-up".into()),
                     ));
                 };
-                let note = self.apply_context(chat_id, &request.cwd, &context, &mut prompt)?;
+                let note = self
+                    .apply_context(chat_id, &request.cwd, &context, &mut prompt)
+                    .await?;
                 request.prompt = prompt;
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = attachments; // this row's images, never the previous turn's
@@ -1597,7 +1642,7 @@ impl DocHost {
     /// rather than dropping the reference, because the picker cannot produce one
     /// and a client that did is not a client whose other references should be
     /// trusted into a prompt.
-    fn apply_context(
+    async fn apply_context(
         &self,
         chat_id: &str,
         root: &str,
@@ -1612,21 +1657,40 @@ impl DocHost {
                 "context references need a checkout, and this chat has no cwd".into(),
             ));
         }
-        let declared_checkout = self
-            .workspace()
-            .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
-            .and_then(|chat| chat.checkout_id);
-        let device_id = self
-            .workspace()
-            .map(|workspace| workspace.device_id().to_string())
-            .unwrap_or_default();
+        let workspace = self.workspace().ok_or_else(|| {
+            EngineError::Other("context references require a workspace host".into())
+        })?;
+        let chat = workspace
+            .doc()
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other("context references require a chat row".into()))?;
+        let space_id = chat.space_id.as_deref().ok_or_else(|| {
+            EngineError::Other("context references require an owning space".into())
+        })?;
+        let space = workspace
+            .doc()
+            .space(space_id)?
+            .filter(|space| space.device_id == workspace.device_id())
+            .ok_or_else(|| {
+                EngineError::Other("context checkout is not owned by this host".into())
+            })?;
+        let repos =
+            self.inner.repos.get().ok_or_else(|| {
+                EngineError::Other("context checkout registry is unavailable".into())
+            })?;
+        let validated_root = repos
+            .validated_checkout_root(&space.path, root)
+            .await
+            .ok_or_else(|| EngineError::Other("context checkout is not registered".into()))?;
+        let declared_checkout = chat.checkout_id.or(space.checkout_id);
+        let device_id = workspace.device_id().to_string();
         let expected_checkout = crate::context_files::checkout_identity(
             &device_id,
-            std::path::Path::new(root),
+            &validated_root,
             declared_checkout.as_deref(),
         );
         crate::context_files::validate_checkout(refs, Some(&expected_checkout))?;
-        let resolved = crate::context_files::resolve(std::path::Path::new(root), refs)?;
+        let resolved = crate::context_files::resolve(&validated_root, refs)?;
         if let Some(note) = crate::context_files::missing_note(&resolved) {
             prompt.push_str(&note);
         }
@@ -2322,12 +2386,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = host(dir.path());
         first
-            .queue_command_with_id_durable(
+            .queue_command_with_id_and_context_durable(
                 "chat-durable-command",
                 "prep-release-durable",
-                SessionCommandPayload::Interrupt {},
+                SessionCommandPayload::Queue {
+                    prompt: "survive acknowledged crash".into(),
+                    message_id: "durable-message".into(),
+                    attachments: Vec::new(),
+                },
+                Vec::new(),
             )
-            .expect("durable queue acknowledged");
+            .expect("durable follow-up acknowledged");
 
         // Do not flush or wait for the ordinary debounce. A new host reading
         // only the store models a crash immediately after the acknowledgement.
@@ -2341,6 +2410,96 @@ mod tests {
         assert!(commands.iter().any(|command| {
             command.id == "prep-release-durable" && command.status == SessionCommandStatus::Pending
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_dispatch_snapshots_its_terminal_outcome_before_processed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let command_id = "queue-crash-after-outcome";
+        let chat_id = "chat-queue-crash-after-outcome";
+        let assemble = || {
+            let registry = crate::HarnessRegistry::new();
+            registry.register(Arc::new(comet_harness::mock::MockHarness {
+                script: vec![comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }],
+            }));
+            crate::EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+                .expect("engine assembles")
+        };
+
+        let core = assemble();
+        core.workspace
+            .create_space(
+                "space-queue-outcome",
+                &core.device_id,
+                &dir.path().to_string_lossy(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat(chat_id, "space-queue-outcome", None, None)
+            .unwrap();
+        *lock(FAIL_AFTER_OUTCOME_PERSIST.get_or_init(|| Mutex::new(None))) =
+            Some(command_id.into());
+        core.doc_host
+            .queue_command_with_id_and_context_durable(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Queue {
+                    prompt: "one durable follow-up".into(),
+                    message_id: "one-durable-message".into(),
+                    attachments: Vec::new(),
+                },
+                Vec::new(),
+            )
+            .expect("queue acknowledgement is durable");
+
+        let handle = core.doc_host.open(chat_id).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle.doc().read_commands().unwrap().iter().any(|command| {
+                command.id == command_id && command.status == SessionCommandStatus::Applied
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "outcome crash point not reached"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!core.doc_host.inner.store.is_processed(command_id).unwrap());
+
+        core.shutdown().await;
+        drop(core);
+        let restarted = assemble();
+        let reopened = restarted
+            .doc_host
+            .open(chat_id)
+            .expect("terminal outcome reopens");
+        restarted.doc_host.drain_commands(&reopened).await;
+        let commands = reopened.doc().read_commands().unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Applied
+        }));
+        assert_eq!(
+            reopened
+                .doc()
+                .read_entries()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.role == MessageRole::User)
+                .count(),
+            1,
+            "a terminal queued command is not dispatched again after restart"
+        );
+        restarted.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -52,11 +52,13 @@ pub const TEXTAREA_PAD_V: f32 = 20.0;
 fn stamp_context_tokens(text: &str, stamps: Option<&HashMap<String, String>>) -> Vec<ContextRef> {
     view_context::tokens(text)
         .into_iter()
-        .map(|mut reference| {
-            reference.checkout_id = stamps
-                .and_then(|stamps| stamps.get(&reference.path))
-                .cloned();
-            reference
+        .filter_map(|mut reference| {
+            let checkout_id = stamps?.get(&reference.path)?.trim();
+            if checkout_id.is_empty() {
+                return None;
+            }
+            reference.checkout_id = Some(checkout_id.to_string());
+            Some(reference)
         })
         .collect()
 }
@@ -4970,6 +4972,12 @@ mod tests {
         let refs = stamp_context_tokens(&completed, Some(&stamps));
         assert_eq!(refs[0].checkout_id.as_deref(), Some("checkout-before"));
         assert_ne!(refs[0].checkout_id.as_deref(), Some("checkout-after"));
+    }
+
+    #[test]
+    fn hand_typed_context_syntax_remains_plain_prompt_text() {
+        assert!(stamp_context_tokens("inspect @src/forged.rs", None).is_empty());
+        assert!(stamp_context_tokens("inspect @src/forged.rs", Some(&HashMap::new())).is_empty());
     }
 
     #[test]

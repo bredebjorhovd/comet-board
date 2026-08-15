@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse as WsErrorResponse, Request as WsRequest, Response as WsResponse,
 };
 
-use comet_doc::SessionCommandPayload;
+use comet_doc::{QueueOp, SessionCommandPayload};
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
@@ -434,6 +434,37 @@ async fn target_device_id_routes_over_the_relay() {
             break;
         }
     }
+
+    // Queue watches are streams too: the relay must proxy the initial frame
+    // and a later mutation rather than attempting a unary call.
+    let mut queue_stream = client
+        .subscribe(
+            methods::WATCH_DOC_QUEUE,
+            serde_json::json!({ "chatId": "chat-remote", "targetDeviceId": "device-b" }),
+        )
+        .await
+        .expect("remote queue subscribe");
+    let initial = tokio::time::timeout(Duration::from_secs(5), queue_stream.recv())
+        .await
+        .expect("initial remote queue frame")
+        .expect("queue stream alive");
+    assert!(initial.get("paused").is_none() || initial["paused"].is_null());
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": "chat-remote",
+                "targetDeviceId": "device-b",
+                "command": SessionCommandPayload::QueueControl { op: QueueOp::Pause {} },
+            }),
+        )
+        .await
+        .expect("pause remote queue");
+    let changed = tokio::time::timeout(Duration::from_secs(5), queue_stream.recv())
+        .await
+        .expect("changed remote queue frame")
+        .expect("queue stream alive");
+    assert_eq!(changed["paused"], "user");
 
     // Unary forward with side effects: QueueCommand lands (and executes) on B.
     let command = serde_json::to_value(SessionCommandPayload::Run {

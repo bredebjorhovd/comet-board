@@ -232,7 +232,9 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         )?;
+        let repos = Repos::new(data_dir, &device_id);
         doc_host.set_workspace(workspace.clone());
+        doc_host.set_repos(repos.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {
@@ -252,7 +254,6 @@ impl EngineCore {
         // socket for the life of the process, and per-chat rooms become the
         // dominant load on the edge. Also runtime-gated (it spawns).
         doc_host.spawn_idle_release();
-        let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));

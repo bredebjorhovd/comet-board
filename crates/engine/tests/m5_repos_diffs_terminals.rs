@@ -854,6 +854,123 @@ async fn rpc_dispatch_for_m5_methods() {
         .expect("registered checkout search");
     assert_eq!(search["matches"][0]["path"], "file.txt");
     assert!(search["checkoutId"].is_string());
+    let checkout_stamp = search["checkoutId"].as_str().unwrap().to_string();
+
+    // Execution, not only search, treats a picker stamp plus a registered root
+    // as authority. A forged unstamped ref is rejected even on a valid root.
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": "chat-term", "commandId": "unstamped-context-run",
+                "command": {
+                    "kind": "run", "messageId": "unstamped-context-message",
+                    "request": {
+                        "prompt": "inspect @file.txt", "cwd": repo_path,
+                        "sandbox": "workspace-write", "autoApprove": true,
+                    },
+                },
+                "context": [{ "path": "file.txt", "kind": "file" }],
+            }),
+        )
+        .await
+        .expect("unstamped command is durably accepted before host evaluation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let commands = core
+            .doc_host
+            .open("chat-term")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        if commands.iter().any(|command| {
+            command.id == "unstamped-context-run"
+                && command.status == comet_doc::SessionCommandStatus::Rejected
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unstamped context was not rejected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        core.doc_host
+            .open("chat-term")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .is_empty(),
+        "an unstamped context command never reaches the harness"
+    );
+
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "setChatCwd", "chatId": "chat-term", "cwd": tmp.path() }),
+        )
+        .await
+        .expect("poison cwd before execution");
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": "chat-term", "commandId": "poisoned-context-run",
+                "command": {
+                    "kind": "run", "messageId": "poisoned-context-message",
+                    "request": {
+                        "prompt": "inspect @file.txt", "cwd": tmp.path(),
+                        "sandbox": "workspace-write", "autoApprove": true,
+                    },
+                },
+                "context": [{
+                    "path": "file.txt", "kind": "file", "checkoutId": checkout_stamp,
+                }],
+            }),
+        )
+        .await
+        .expect("stamped command is accepted before host evaluation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let commands = core
+            .doc_host
+            .open("chat-term")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        if commands.iter().any(|command| {
+            command.id == "poisoned-context-run"
+                && command.status == comet_doc::SessionCommandStatus::Rejected
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unregistered execution root was not rejected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        core.doc_host
+            .open("chat-term")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .is_empty(),
+        "a poisoned execution root never reaches the harness"
+    );
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "setChatCwd", "chatId": "chat-term", "cwd": repo_path }),
+        )
+        .await
+        .expect("restore registered checkout after execution fences");
 
     client
         .call(

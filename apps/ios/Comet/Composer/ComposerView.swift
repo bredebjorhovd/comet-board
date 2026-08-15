@@ -284,7 +284,7 @@ struct ComposerView: View {
                     .font(Theme.sans(Theme.textCaption, weight: .medium))
                 Spacer()
                 Button(store.followupsPaused ? "Resume" : "Pause") {
-                    store.setFollowupsPaused(!store.followupsPaused)
+                    saveQueueControl(store.setFollowupsPaused(!store.followupsPaused))
                 }
                 .font(Theme.sans(Theme.textCaption))
             }
@@ -299,9 +299,9 @@ struct ComposerView: View {
                         .disabled(index == 0)
                     Button { move(row, index: index, delta: 1) } label: { Image(systemName: "arrow.down") }
                         .disabled(index + 1 == store.followups.count)
-                    Button { store.runNext(id: row.id) } label: { Image(systemName: "play") }
+                    Button { saveQueueControl(store.runNext(id: row.id)) } label: { Image(systemName: "play") }
                         .accessibilityLabel("Run next")
-                    Button(role: .destructive) { store.removeFollowup(id: row.id) } label: {
+                    Button(role: .destructive) { saveQueueControl(store.removeFollowup(id: row.id)) } label: {
                         Image(systemName: "xmark")
                     }
                 }
@@ -317,7 +317,13 @@ struct ComposerView: View {
         let target = index + delta
         guard store.followups.indices.contains(target) else { return }
         let after: String? = target == 0 ? nil : store.followups[target - (delta > 0 ? 0 : 1)].id
-        store.moveFollowup(id: row.id, after: after)
+        saveQueueControl(store.moveFollowup(id: row.id, after: after))
+    }
+
+    private func saveQueueControl(_ saved: Bool) {
+        if !saved {
+            followupFailure = "The queue change was not saved. Try again after reconnecting."
+        }
     }
 
     private func editSheet(_ row: FollowupRow) -> some View {

@@ -272,9 +272,12 @@ pub fn validate_checkout(
     refs: &[ContextRef],
     current_checkout_id: Option<&str>,
 ) -> Result<(), EngineError> {
-    if refs.iter().any(|reference| {
-        reference.checkout_id.is_some() && reference.checkout_id.as_deref() != current_checkout_id
-    }) {
+    if current_checkout_id.is_none()
+        || refs.iter().any(|reference| {
+            reference.checkout_id.as_deref().is_none_or(str::is_empty)
+                || reference.checkout_id.as_deref() != current_checkout_id
+        })
+    {
         return Err(EngineError::Other(
             "context reference belongs to a different checkout".into(),
         ));
@@ -533,6 +536,14 @@ mod tests {
         validate_checkout(&[reference.clone()], Some(&picked)).expect("same checkout");
         let err = validate_checkout(&[reference], Some(&current))
             .expect_err("a moved chat must not reinterpret the path");
+        assert!(err.to_string().contains("different checkout"));
+    }
+
+    #[test]
+    fn an_unstamped_reference_is_never_authority() {
+        let reference = ContextRef::file("src/forged.rs");
+        let err = validate_checkout(&[reference], Some("host-issued"))
+            .expect_err("unstamped reference must be refused");
         assert!(err.to_string().contains("different checkout"));
     }
 }

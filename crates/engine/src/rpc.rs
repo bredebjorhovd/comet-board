@@ -765,7 +765,11 @@ impl EngineRpc {
         let (Some(space), Some(candidate)) = (space.as_ref(), candidate) else {
             return comet_proto::ContextSearch::default();
         };
-        let Some(root) = self.validated_context_root(space, &candidate).await else {
+        let Some(root) = self
+            .repos
+            .validated_checkout_root(&space.path, &candidate)
+            .await
+        else {
             tracing::warn!(candidate, space = %space.id, "context search refused an unregistered checkout");
             return comet_proto::ContextSearch::default();
         };
@@ -785,35 +789,6 @@ impl EngineRpc {
             declared_checkout_id.as_deref(),
         ));
         result
-    }
-
-    /// Resolve a synced row back to a checkout this host explicitly knows.
-    /// Mutable workspace paths are display/state, never filesystem authority.
-    async fn validated_context_root(
-        &self,
-        space: &comet_proto::Space,
-        candidate: &str,
-    ) -> Option<std::path::PathBuf> {
-        if space.device_id != self.workspace.device_id() {
-            return None;
-        }
-        let space_root = std::fs::canonicalize(&space.path).ok()?;
-        let candidate_root = std::fs::canonicalize(candidate).ok()?;
-        for repo in self.repos.list().await {
-            let repo_root = std::fs::canonicalize(&repo.path).ok()?;
-            let mut registered = vec![repo_root];
-            if let Ok(refs) = self.repos.refs(std::path::Path::new(&repo.path)).await {
-                registered.extend(
-                    refs.into_iter()
-                        .filter_map(|reference| reference.worktree_path)
-                        .filter_map(|path| std::fs::canonicalize(path).ok()),
-                );
-            }
-            if registered.contains(&space_root) && registered.contains(&candidate_root) {
-                return Some(candidate_root);
-            }
-        }
-        None
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1889,6 +1864,7 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_DOC_QUEUE
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
@@ -2160,23 +2136,30 @@ impl RpcService for EngineRpc {
             methods::LIST_SKILLS => RpcReply::value(&self.list_skills(parse_params(params)?)),
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
-                let command_id = match p.command_id {
-                    Some(command_id) => {
-                        self.doc_host
-                            .queue_command_with_id_and_context(
-                                &p.chat_id,
-                                &command_id,
-                                p.command,
-                                p.context,
-                            )
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        command_id
-                    }
-                    None => self
-                        .doc_host
-                        .queue_command_with_context(&p.chat_id, p.command, p.context)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                let command_id = p
+                    .command_id
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let durable = matches!(
+                    &p.command,
+                    SessionCommandPayload::Queue { .. }
+                        | SessionCommandPayload::QueueControl { .. }
+                );
+                let result = if durable {
+                    self.doc_host.queue_command_with_id_and_context_durable(
+                        &p.chat_id,
+                        &command_id,
+                        p.command,
+                        p.context,
+                    )
+                } else {
+                    self.doc_host.queue_command_with_id_and_context(
+                        &p.chat_id,
+                        &command_id,
+                        p.command,
+                        p.context,
+                    )
                 };
+                result.map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::WATCH_DOC_MESSAGES => {
@@ -2975,6 +2958,8 @@ mod tests {
         assert!(!forwardable(methods::APPROVE_TASK_PREPARATION));
         assert!(forwardable(methods::CANCEL_CHECKOUT_PREPARATION));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        assert!(forwardable(methods::WATCH_DOC_QUEUE));
+        assert!(is_stream_method(methods::WATCH_DOC_QUEUE));
         // Skills are files on the chat's host, and which files depends on the
         // agent account that chat names (gh#134).
         assert!(forwardable(methods::LIST_SKILLS));
