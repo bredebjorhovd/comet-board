@@ -45,17 +45,20 @@
 //! stack that is incomplete: `changes requested` on layer 2 is not only about
 //! layer 2, because layers 3..N are built on code that is now wrong. Layer 2's
 //! agent gets the review and starts fixing; when it force-pushes, GitHub leaves
-//! every layer above it on the old base, with dirty pull requests their authors
-//! must replay before those diffs are reviewable again.
+//! every layer above it on the old base. The direct child must launch one
+//! ordered upstack replay that carries the whole path above it forward before
+//! those diffs are reviewable again.
 //!
 //! So this module addresses the other layers too, in one direction only:
 //! [`Dependents`] is the edge, and it points up. Each dependent gets a *notice*
-//! and never the review body ([`compose_notice`]) — the review is not theirs to
-//! answer, and pasting it into their chats is how five agents end up editing one
-//! branch. That is different from a lower layer merging, when GitHub does
-//! replay the upper branch and [`crate::rebased::rewritten_notice`] tells its
-//! author to bring the checkout across. Two more things follow, and both are
-//! about the human rather than the agent:
+//! and never the review body — the review is not theirs to answer, and pasting
+//! it into their chats is how five agents end up editing one branch. The direct
+//! child gets the actionable [`compose_notice`]; every layer farther up
+//! gets [`compose_hold_notice`] and waits for that one ordered replay to reach
+//! it. That is different from a lower layer merging, when GitHub does replay the
+//! upper branch and [`crate::rebased::rewritten_notice`] tells its author to
+//! bring the checkout across. Two more things follow, and both are about the
+//! human rather than the agent:
 //!
 //! - **The row leaves review.** A diff that is about to be rebased is not
 //!   reviewable in good faith, and the bad outcome is not wasted reading, it is
@@ -522,15 +525,15 @@ pub fn compose(task: &Task, pr: &PullRequest, items: &[Feedback]) -> String {
     s
 }
 
-/// What a dependent layer is told when the layer below it is asked to change
-/// (§gh#289).
+/// What the direct child is told when the layer below it is asked to change
+/// (§gh#289, gh#407).
 ///
 /// **A notice, not the review.** The review below is not this agent's to answer:
 /// it is about code on another branch, and an agent handed somebody else's
 /// feedback either edits a branch that is not its own or replies on a pull
 /// request that is not its own. What it needs is the one fact its own chat cannot
-/// see — that the ground under its branch is about to move, and that it must
-/// replay its branch after the fix rather than wait for GitHub to do it.
+/// see — that the ground under its branch is about to move, and that it owns the
+/// one ordered replay which carries every layer above it across too.
 ///
 /// It opens in [`reviewed_header`]'s register but deliberately not with its
 /// sentence: "your pull request has been reviewed" would be false, and an agent
@@ -547,15 +550,54 @@ pub fn compose_notice(
          Your own pull request — {mine} · PR #{number} on {branch} — is stacked on \
          {below_branch}. When its author force-pushes the fix, GitHub leaves your \
          branch on the old history and your pull request may become dirty. This is \
-         different from the lower layer merging: after a merge, GitHub replays the \
+         different from a lower-layer merge: after a merge, GitHub replays the \
          branches above it itself.\n\n\
          The review below is not yours to answer — do not write on {below_url} or \
-         touch {below_branch}. Wait for its author to push the fix; then, from your \
-         own branch, replay it and every layer above it with `gh stack rebase \
-         --upstack`. Your diff moves when that replay is pushed, and so does whatever \
-         a reviewer of yours has already read. If you are mid-task, carry on and \
-         commit as you go: the rebase carries committed work across, and uncommitted \
-         work in your worktree is yours to keep safe.\n",
+         touch {below_branch}. You own the ordered replay for this path through the \
+         stack. Wait for its author to push the fix; then, from your own branch, run \
+         `gh stack rebase --upstack` to carry this layer and every layer above it \
+         forward. Layers farther up are waiting on this replay; their authors are not \
+         asked to start their own. Your diff moves when that replay is pushed, and so \
+         does whatever a reviewer of yours has already read. If you are mid-task, \
+         carry on and commit as you go: the rebase carries committed work across, and \
+         uncommitted work in your worktree is yours to keep safe.\n",
+        below_id = below.identifier,
+        title = below.title,
+        below_url = below_pr.url,
+        below_branch = below_pr.head_ref,
+        mine = task.identifier,
+        number = pr.number,
+        branch = pr.head_ref,
+    )
+}
+
+/// What a transitive dependent is told when a layer farther below it is asked
+/// to change (§gh#407).
+///
+/// Still a notice rather than the review, but deliberately not an instruction
+/// to rebase: the direct child owns that command and cascades it through this
+/// layer. Giving every author the same command races the ordered replay and can
+/// put an upper layer onto a still-stale parent.
+pub fn compose_hold_notice(
+    task: &Task,
+    pr: &PullRequest,
+    below: &Task,
+    below_pr: &PullRequest,
+) -> String {
+    format!(
+        "comet-board: a lower layer in your stack was asked to change.\n\n  \
+         {below_id} · {title}\n  {below_url} · {below_branch}\n\n\
+         Your own pull request — {mine} · PR #{number} on {branch} — sits above \
+         {below_branch} in the same stack. When its author force-pushes the fix, \
+         GitHub leaves the upper branches on their old history and their pull \
+         requests may become dirty.\n\n\
+         The direct child on your path above {below_branch} owns the ordered replay \
+         and will carry your layer forward with the layers between them. Do not start \
+         a separate rebase from this branch or race that replay. The review below is \
+         not yours to answer — do not write on {below_url} or touch {below_branch}. \
+         If you are mid-task, carry on and commit as you go: the rebase carries \
+         committed work across, and uncommitted work in your worktree is yours to \
+         keep safe.\n",
         below_id = below.identifier,
         title = below.title,
         below_url = below_pr.url,
@@ -775,7 +817,8 @@ impl SyncEngine {
     }
 
     /// Tell every layer built on this pull request that it has been asked to
-    /// change (§gh#289).
+    /// change (§gh#289): its direct child owns the ordered replay, while every
+    /// transitive dependent waits for that replay to reach it (gh#407).
     ///
     /// Runs off the standing verdict rather than off a review just read, so the
     /// two ways a `changes requested` reaches the board — noticed on GitHub by
@@ -836,7 +879,11 @@ impl SyncEngine {
             };
             match address(runtime, child, child_pr)? {
                 Some(at) => {
-                    let text = compose_notice(child, child_pr, task, pr);
+                    let text = if deps.is_direct_child(&task.id, &dep.id) {
+                        compose_notice(child, child_pr, task, pr)
+                    } else {
+                        compose_hold_notice(child, child_pr, task, pr)
+                    };
                     if let Err(e) = runtime.prompt(at.chat_id, &text) {
                         // Nothing arrived, so nothing is recorded: the next cycle
                         // tries this dependent again, and the ones already told
@@ -1955,6 +2002,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// gh#21's pull request, stacked on gh#20: the third layer that proves only
+    /// the direct child of a changed layer owns the ordered upstack rebase.
+    fn grandchild_pull() -> PullRequest {
+        PullRequest {
+            number: 16,
+            url: "https://github.com/o/r/pull/16".into(),
+            title: "Render the emitted groups".into(),
+            base_ref: "board/gh-20".into(),
+            ..pull("board/gh-21")
+        }
+    }
+
     /// A second dispatched row whose branch was cut from gh#13's attempt — the
     /// edge GitHub is never told about (gh#285), and the one this fan-out has to
     /// work along whether or not there is a `stack` object anywhere.
@@ -2008,6 +2067,60 @@ pub(crate) mod tests {
         e.rederive_all().unwrap();
         assert_eq!(
             e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Review,
+        );
+    }
+
+    fn seed_stacked_grandchild(e: &SyncEngine, chat: &str) {
+        let parent = e.db.attempts_for("gh:o/r#20").unwrap()[0].id;
+        e.db.upsert_task(&crate::db::UpsertTask {
+            id: "gh:o/r#21".into(),
+            source: Source::Github,
+            source_id: "n21".into(),
+            identifier: "gh#21".into(),
+            title: "Render the emitted groups".into(),
+            body: None,
+            url: "https://github.com/o/r/issues/21".into(),
+            labels: vec![],
+            source_state: Some("open".into()),
+            linear_team: None,
+            linear_project: None,
+            upstream: UpstreamState::Unstarted,
+            updated_at: crate::db::now(),
+        })
+        .unwrap();
+        let a =
+            e.db.insert_attempt(&crate::db::NewAttempt {
+                stacked_on: Some(parent),
+                task_id: "gh:o/r#21".into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: Some("/wt/gh-21-1".into()),
+                branch: Some("board/gh-21".into()),
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        e.db.set_attempt_pane(a, chat).unwrap();
+        e.db.close_attempt(a, Outcome::Done).unwrap();
+        e.db.set_pr(
+            "gh:o/r#21",
+            Some("https://github.com/o/r/pull/16"),
+            Some(16),
+            true,
+        )
+        .unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("gh:o/r#21").unwrap().unwrap().state,
             BoardState::Review,
         );
     }
@@ -2085,6 +2198,60 @@ pub(crate) mod tests {
             None,
             "the fact belongs to the layer that was asked, not to its dependents",
         );
+    }
+
+    /// In A ← B ← C, B owns the one ordered replay that carries both B and C
+    /// onto A's fix. C still hears why its diff is held, but a second actionable
+    /// command there would race B or try to replay C onto stale B.
+    #[test]
+    fn only_the_direct_child_owns_the_ordered_upstack_rebase() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+        seed_stacked_grandchild(&e, "chat-3");
+        let runtime = FakeRuntime::holding_each(&[
+            ("chat-1", "/wt/gh-13-1"),
+            ("chat-2", "/wt/gh-20-1"),
+            ("chat-3", "/wt/gh-21-1"),
+        ]);
+
+        e.deliver_reviews(
+            &runtime,
+            &[pull("board/gh-13"), child_pull(), grandchild_pull()],
+        );
+
+        let owner = runtime
+            .said_to("chat-2")
+            .expect("the direct child was told");
+        let farther = runtime
+            .said_to("chat-3")
+            .expect("the farther dependent was told");
+        assert!(
+            owner.contains("gh stack rebase --upstack"),
+            "the direct child owns the ordered replay: {owner}",
+        );
+        assert!(
+            farther.contains("direct child") && farther.contains("owns the ordered replay"),
+            "the farther layer knows which part of the stack will carry it: {farther}",
+        );
+        assert!(
+            !farther.contains("gh stack rebase --upstack"),
+            "the farther layer must not race or repeat the owner's replay: {farther}",
+        );
+        assert_eq!(
+            runtime
+                .prompts
+                .borrow()
+                .iter()
+                .filter(|(_, text)| text.contains("gh stack rebase --upstack"))
+                .count(),
+            1,
+            "one changed stack path has exactly one actionable rebase owner",
+        );
+        let state = state_of(&e);
+        assert_eq!(state.fanned_out.get("gh:o/r#20"), Some(&900));
+        assert_eq!(state.fanned_out.get("gh:o/r#21"), Some(&900));
     }
 
     /// The `hold` half of the answer: the layer above leaves the review section

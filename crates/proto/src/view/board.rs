@@ -288,10 +288,11 @@ pub struct StackLayer {
     /// since (gh#289).
     ///
     /// The other fact about a layer that is a fact about every layer above it:
-    /// when this one pushes its fix, GitHub replays theirs on top of it. Carried
-    /// beside [`mergeable`](Self::mergeable) because it is read the same way —
-    /// ANDed down the chain by [`landing`] — and so a map can mark the layer the
-    /// stack is waiting on rather than only counting it.
+    /// when this one pushes its fix, its direct child must launch one ordered
+    /// upstack rebase that carries them all forward. Carried beside
+    /// [`mergeable`](Self::mergeable) because it is read the same way — ANDed
+    /// down the chain by [`landing`] — and so a map can mark the layer the stack
+    /// is waiting on rather than only counting it.
     #[serde(default)]
     pub changes_requested: bool,
 }
@@ -421,12 +422,12 @@ pub struct TaskRow {
     /// request number of the nearest such layer, or absent when none has.
     ///
     /// The one fact about a stack that is not about merging: this pull request
-    /// may be perfectly clean and still be unreviewable, because the branch
-    /// underneath it is about to be rewritten and GitHub will replay these
-    /// commits on top of the new one. A human who reads the diff now is reading
-    /// a diff that is going to move, and the worse outcome is that they approve
-    /// it. So [`landing`] answers with it before it answers anything else, and
-    /// the row leaves the review section while it stands.
+    /// may be perfectly clean and still be unreviewable, because the changed
+    /// layer's direct child must replay this path onto rewritten history. A
+    /// human who reads the diff now is reading a diff that is going to move,
+    /// and the worse outcome is that they approve it. So [`landing`] answers
+    /// with it before it answers anything else, and the row leaves the review
+    /// section while it stands.
     ///
     /// Derived board-side rather than read off [`stack`](Self::stack), because
     /// the dependency edge is wider than GitHub's own stack object: a layer the
@@ -3340,7 +3341,7 @@ mod tests {
     }
 
     /// gh#289's headline, as the row words it. A layer GitHub calls `clean` is
-    /// not reviewable while the branch under it is about to be rewritten, and the
+    /// not reviewable while the stack under it needs an ordered replay, and the
     /// answer has to outrank `clean` — that is the one answer that gets somebody
     /// to press merge, or worse, to approve a diff that then moves.
     #[test]

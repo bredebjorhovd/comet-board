@@ -176,12 +176,12 @@ pub struct Derivation {
     /// A pull request is linked to this task and still open.
     pub open_pr: bool,
     /// A layer below this one has been asked to change (gh#289), so this row's
-    /// pull request is about to be rebased and is not reviewable in good faith.
+    /// pull request needs an ordered rebase and is not reviewable in good faith.
     ///
     /// The one fact in here that is not about this task at all. It is here for
     /// the reason the stack changed what `clean` means: a `review` row is a
     /// claim somebody can act on, and acting on this one — reading the diff,
-    /// approving it — is work that the next force-push undoes.
+    /// approving it — is work that the resulting upstack replay invalidates.
     pub changes_below: bool,
     /// Operator pressed `d mark done`. Survives re-derivation until the task is
     /// re-dispatched; without it, a derived state would silently undo the key.
@@ -265,10 +265,10 @@ pub fn derive_state(d: Derivation) -> BoardState {
 /// been asked to change (gh#289).
 ///
 /// `review` on the board means one thing — finished work, waiting on a human to
-/// read it. A layer whose parent is about to be rewritten is not that: whatever
-/// the reader concludes, GitHub is going to replay these commits onto a different
-/// base and the diff they read will not be the diff that lands. Worse, if they
-/// approve it, the approval outlives the diff it was given to.
+/// read it. A layer whose parent is about to be rewritten is not that: the
+/// direct child must replay this path onto a different base, so the diff being
+/// read will not be the diff that lands. Worse, if somebody approves it, the
+/// approval outlives the diff it was given to.
 ///
 /// So the row comes out of the review section and says it is waiting — `blocked`
 /// rather than a seventh state, because `blocked` is already the board's word for
@@ -278,8 +278,8 @@ pub fn derive_state(d: Derivation) -> BoardState {
 ///
 /// **Only a settled layer.** A child still `working` never reaches here — rule 3
 /// answers `working` for it — because its run may produce work that survives the
-/// rebase, and killing an in-flight agent to save it a rebase spends a context
-/// to save a `git rebase`.
+/// ordered rebase, and killing an in-flight agent to save it a rebase spends a
+/// context to save a `git rebase`.
 fn reviewable(d: Derivation) -> BoardState {
     if d.changes_below {
         BoardState::Blocked
@@ -362,9 +362,10 @@ pub struct Task {
     /// asked, or asked and since approved or merged.
     ///
     /// A fact about this row that the rows *above* it read: when this branch
-    /// pushes its fix, GitHub replays theirs on top of it. The id rather than a
-    /// flag, because the fan-out is watermarked against it — one review reaches
-    /// each dependent once.
+    /// pushes its fix, its direct child must launch one ordered upstack rebase
+    /// that carries every layer above it forward. The id rather than a flag,
+    /// because the fan-out is watermarked against it — one review reaches each
+    /// dependent once.
     pub pr_changes_requested: Option<i64>,
     pub updated_at: String,
     pub synced_at: String,
@@ -913,10 +914,10 @@ pub(crate) mod tests {
     }
 
     /// gh#289. A layer whose parent was asked to change is not reviewable in
-    /// good faith: GitHub is about to replay these commits onto a different base,
-    /// so the diff a human reads now is not the diff that lands — and the bad
-    /// outcome is not wasted reading, it is an approval that outlives the diff it
-    /// was given to.
+    /// good faith: the ordered upstack rebase will move these commits onto a
+    /// different base, so the diff a human reads now is not the diff that lands
+    /// — and the bad outcome is not wasted reading, it is an approval that
+    /// outlives the diff it was given to.
     #[test]
     fn a_layer_whose_parent_was_asked_to_change_comes_out_of_review() {
         for live in [None, Some(AgentStatus::Idle), Some(AgentStatus::Done)] {
@@ -945,8 +946,8 @@ pub(crate) mod tests {
     }
 
     /// The other half of gh#289's answer: an agent still working is *informed*,
-    /// not stopped. Its run may produce work that survives the replay, and
-    /// stopping it to save a rebase spends a context to save a `git rebase`.
+    /// not stopped. Its run may produce work that survives the ordered rebase,
+    /// and stopping it to save a rebase spends a context to save a `git rebase`.
     #[test]
     fn a_working_layer_is_not_stopped_by_a_parent_asked_to_change() {
         assert_eq!(

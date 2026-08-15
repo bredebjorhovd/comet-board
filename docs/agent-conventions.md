@@ -140,12 +140,16 @@ mergeability costs a call per open pull request and rides the full sweep. It nev
 means ready.
 
 `changes-below` outranks all of the others, including `clean`: nothing about this
-pull request is wrong, but GitHub is about to replay its commits onto a rewritten
-base, so neither its diff nor its `mergeable_state` is worth acting on. **Do not
-review, approve or merge a `changes-below` row**, and do not send its agent to
-rebase — the replay is GitHub's to do when the layer below repushes. Such a row
-derives to `blocked` rather than `review` while the request stands, and returns to
-`review` by itself once the layer below is approved, merged or closed.
+pull request is wrong, but a lower force-push leaves it on stale history, so
+neither its diff nor its `mergeable_state` is worth acting on. **Do not review,
+approve or merge a `changes-below` row.** After the lower fix is pushed, the
+direct child of that changed layer owns one `gh stack rebase --upstack`; it
+carries every layer above it forward in order. Farther-layer agents wait for
+that replay and must not start competing rebases. A lower layer merging is a
+different event: GitHub replays the upper branches server-side, and their agents
+only sync those rewritten branches into their checkouts. A `changes-below` row
+derives to `blocked` rather than `review` while the request stands, and returns
+to `review` by itself once the layer below is approved, merged or closed.
 
 States: `blocked` (agent waiting on input, or a layer waiting on the one below
 it) → `working` → `ready` (nothing running) → `review` (finished or PR open) →

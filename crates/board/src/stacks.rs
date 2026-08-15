@@ -209,9 +209,10 @@ pub struct Dependent {
 /// **Direction is the whole design.** Dependency points one way, so this does
 /// too. `changes requested` on layer 2 genuinely invalidates layers 3..N: their
 /// base is about to be rewritten, and when layer 2 force-pushes its fix GitHub
-/// leaves their commits on the old history until their authors replay them.
-/// `changes requested` on layer 3 invalidates **nothing** about layer 2 — it is
-/// still correct, still mergeable, still reviewable — so nothing goes down.
+/// leaves their commits on the old history until layer 3 launches the one
+/// ordered replay that carries the whole path above it forward. `changes
+/// requested` on layer 3 invalidates **nothing** about layer 2 — it is still
+/// correct, still mergeable, still reviewable — so nothing goes down.
 ///
 /// **Two edges, unioned**, because a stack reaches the board two ways and the
 /// dependency is real either way:
@@ -299,9 +300,10 @@ impl Dependents {
     ///
     /// Nearest first because that is the order a rebase reaches them in, and the
     /// order a reader would name them. Transitive because the invalidation is:
-    /// rewriting layer 2 moves layer 3, which moves layer 4, and a notice that
-    /// stopped at the direct child would leave every layer above it wondering
-    /// why its diff moved — the bug this exists to close, one layer up.
+    /// rewriting layer 2 requires layer 3 to replay itself and layer 4 in one
+    /// ordered cascade, and a notice that stopped at the direct child would
+    /// leave every layer above it wondering why its diff is held and later
+    /// moves — the bug this exists to close, one layer up.
     pub fn above(&self, id: &str) -> Vec<&Dependent> {
         let mut out: Vec<&Dependent> = Vec::new();
         let mut queue: Vec<&str> = vec![id];
@@ -323,6 +325,15 @@ impl Dependents {
             }
         }
         out
+    }
+
+    /// Whether `dependent` is stacked immediately on `id` rather than merely
+    /// somewhere above it. The direct child owns the one ordered rebase for its
+    /// path through the stack; transitive dependents only wait for that replay.
+    pub fn is_direct_child(&self, id: &str, dependent: &str) -> bool {
+        self.parent
+            .get(dependent)
+            .is_some_and(|parent| parent == id)
     }
 
     /// The nearest layer below `id` that has been asked to change and is still
