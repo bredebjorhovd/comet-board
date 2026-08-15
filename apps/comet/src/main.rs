@@ -87,26 +87,26 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // The TUI owns its own tracing (to a file — a line on stdout would land
-    // inside the alternate screen and corrupt it), so skip the global stdout
-    // subscriber entirely for it. Everything else logs to stdout: long-running
-    // modes at info, one-shot CLI commands at warn (RUST_LOG overrides either).
-    if !matches!(cli.command, Some(Command::Tui(_))) {
-        // loro's internal block-encode diagnostics log at info and flood
-        // journald on every snapshot export — enough to fill a disk on a
-        // long-running headless host. Quiet them by default (RUST_LOG still
-        // overrides the whole filter).
-        let default_filter = match &cli.command {
-            None | Some(Command::Headless) => "info,loro_internal=warn,loro=warn",
-            Some(_) => "warn",
-        };
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| default_filter.into()),
-            )
-            .init();
-    }
+    // Everything logs to stdout: long-running modes at info, one-shot CLI
+    // commands at warn (RUST_LOG overrides either). This used to be skipped
+    // for the TUI, which owned its own file tracing because a line on stdout
+    // landed inside the alternate screen and corrupted it; with the TUI gone
+    // (gh#416) no command needs the exemption.
+    //
+    // loro's internal block-encode diagnostics log at info and flood journald
+    // on every snapshot export — enough to fill a disk on a long-running
+    // headless host. Quiet them by default (RUST_LOG still overrides the whole
+    // filter).
+    let default_filter = match &cli.command {
+        None | Some(Command::Headless) => "info,loro_internal=warn,loro=warn",
+        Some(_) => "warn",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
+        )
+        .init();
 
     match cli.command {
         Some(Command::Headless) => {
