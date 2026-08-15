@@ -422,6 +422,23 @@ pub fn pr_repo(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// The number the same URL names — `…/tally/pull/507` → `507`.
+///
+/// [`pr_repo`]'s other half, for the one surface that holds a review rather
+/// than a row (gh#408): an `AttemptReview` carries the pull request as its URL,
+/// and a merge confirmation has to give the address as a number a reader can
+/// match against GitHub.
+pub fn pr_url_number(url: &str) -> Option<i64> {
+    let rest = url.split("github.com/").nth(1)?;
+    let mut parts = rest.split('/');
+    let _owner = parts.next().filter(|p| !p.is_empty())?;
+    let _repo = parts.next().filter(|p| !p.is_empty())?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
 #[derive(Debug, Clone)]
 pub struct Attempt {
     pub id: i64,
@@ -805,6 +822,26 @@ pub(crate) mod tests {
         // is unique across every project the board watches.
         assert_eq!(gh_repo("linear:LIN-142"), None);
         assert_eq!(gh_repo_name("linear:LIN-142"), None);
+    }
+
+    #[test]
+    fn a_pull_request_url_says_its_number() {
+        assert_eq!(
+            pr_url_number("https://github.com/Florin-AS/tally/pull/507"),
+            Some(507)
+        );
+        // The tabs of the same page still name the same pull request.
+        assert_eq!(
+            pr_url_number("https://github.com/Florin-AS/tally/pull/507/files"),
+            Some(507)
+        );
+        // An issue URL is not a pull request, and inventing a number off one
+        // would put the wrong address in a merge confirmation.
+        assert_eq!(
+            pr_url_number("https://github.com/Florin-AS/tally/issues/507"),
+            None
+        );
+        assert_eq!(pr_url_number("https://example.com/pull/507"), None);
     }
 
     #[test]

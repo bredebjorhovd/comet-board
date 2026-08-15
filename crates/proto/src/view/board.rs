@@ -1454,6 +1454,43 @@ pub fn stack_line<'a>(row: impl Into<Stacked<'a>>) -> Option<String> {
     Some(parts.join(" · "))
 }
 
+/// What a merge confirmation names, beyond the five facts [`Stacked`] carries
+/// (gh#408).
+///
+/// The confirmation is the one sentence that has to say *which work* is about
+/// to land, not only whether it can — so it reads the row's name and address on
+/// top of the stack facts. Two surfaces spell it: the board's list holds a
+/// [`TaskRow`], the review screen holds an `AttemptReview`, and both feed this
+/// shape so the sentence a reader confirms cannot depend on which screen they
+/// pressed the key on.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeSubject<'a> {
+    /// The row's name — `gh#353`, `LIN-142` — which is what the reader knows
+    /// the work as (gh#357).
+    pub identifier: &'a str,
+    /// The pull request that merges. The confirmation still works without one
+    /// — the engine will refuse the merge itself — but it cannot name the
+    /// address.
+    pub pr_number: Option<i64>,
+    /// Whether the row *is* its pull request (gh#344's adopted rows). For
+    /// those, naming the row and naming the pull request are the same act, and
+    /// the sentence says one instead of both.
+    pub is_pull_request: bool,
+    /// The stack facts, spelled the way every landing derivation reads them.
+    pub stacked: Stacked<'a>,
+}
+
+impl<'a> From<&'a TaskRow> for MergeSubject<'a> {
+    fn from(row: &'a TaskRow) -> Self {
+        MergeSubject {
+            identifier: &row.identifier,
+            pr_number: row.pr_number,
+            is_pull_request: row.is_pull_request(),
+            stacked: row.into(),
+        }
+    }
+}
+
 /// What a merge confirmation has to say before the board takes the one action
 /// it cannot undo (gh#290).
 ///
@@ -1473,29 +1510,29 @@ pub fn stack_line<'a>(row: impl Into<Stacked<'a>>) -> Option<String> {
 /// opened the confirm on a pull request the board does not think can land is the
 /// reader most in need of the sentence, and GitHub evaluates the rules at
 /// execution time rather than at submission, so nothing upstream will stop them.
-pub fn merge_confirmation(row: &TaskRow) -> String {
+pub fn merge_confirmation<'a>(row: impl Into<MergeSubject<'a>>) -> String {
+    let subject = row.into();
     // Named, then located (gh#357). The reader confirming this opened it from a
     // row called `gh#353`, and a dialog that answers "merge PR #13" is asking
     // them to match up two numbers before they can tell whether it is the same
     // work. The pull request still has to appear — it is what merges — but as
     // the address, in parentheses after the name.
-    let what = match row.pr_number {
-        Some(n) if !row.is_pull_request() => format!("{} (PR #{n})", row.identifier),
-        _ => row.identifier.clone(),
+    let what = match subject.pr_number {
+        Some(n) if !subject.is_pull_request => format!("{} (PR #{n})", subject.identifier),
+        _ => subject.identifier.to_string(),
     };
     // Where the merge lands: for a stack that is the stack's target, which is
     // trunk, and not this layer's base — the branch below it disappears into
     // the group merge.
+    let row = subject.stacked;
     let target = row
         .stack
-        .as_ref()
         .and_then(|s| s.base_ref.as_deref())
         .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| base_of(row.into()));
+        .unwrap_or_else(|| base_of(row));
     let below: Vec<&StackLayer> = row
         .stack
-        .as_ref()
-        .map(|s| s.below(&row.id))
+        .map(|s| s.below(row.id))
         .unwrap_or_default()
         .iter()
         .filter(|l| l.open)

@@ -121,6 +121,15 @@ enum Msg {
         reviewer: Option<String>,
         reply: oneshot::Sender<anyhow::Result<VerdictReceipt>>,
     },
+    /// Merge a task's pull request (gh#408) — GitHub's asynchronous merge,
+    /// submitted and waited out (gh#290). On this thread because a merge that
+    /// lands moves the row, and one writer of `board.db` is the rule. The wait
+    /// holds the loop for up to the poll budget, which is the same order as a
+    /// dispatch's clone — and a board mid-merge has nothing more urgent to do.
+    Merge {
+        task_id: String,
+        reply: oneshot::Sender<anyhow::Result<String>>,
+    },
     Shutdown,
 }
 
@@ -425,6 +434,26 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-verdict"))?
     }
 
+    /// Merge a task's pull request (gh#408), answering with the one sentence
+    /// the surface shows: `o/r#87 merged`, or where the merge got to instead.
+    ///
+    /// The confirmation happened before this call — it is the caller's
+    /// keypress this executes, and the engine adds no second question. What it
+    /// does add is the refusal path: a task with no pull request, or a merge
+    /// GitHub will not take, comes back as the call's error with GitHub's own
+    /// sentence in it (gh#338).
+    pub async fn merge_task(&self, task_id: &str) -> anyhow::Result<String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Merge {
+                task_id: task_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-merge"))?
+    }
+
     /// Stop the loop and wait for the in-flight cycle to finish, so shutdown
     /// never truncates a SQLite write mid-transaction.
     pub fn shutdown(&self) {
@@ -619,6 +648,23 @@ fn run_loop(
                     &comment,
                     reviewer.as_deref(),
                 );
+                let _ = reply.send(result);
+            }
+            // The one key that cannot be undone (gh#408). The operator just
+            // pressed it, so a merge that lands is published now rather than on
+            // the next cycle — `merge_pull_request` has already moved the row.
+            Ok(Msg::Merge { task_id, reply }) => {
+                let result = engine
+                    .db
+                    .get_task(&task_id)
+                    .and_then(|task| {
+                        task.ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))
+                    })
+                    .and_then(|task| engine.merge_pull_request(&task));
+                if let Err(e) = &result {
+                    log.error(format!("merge of {task_id} failed: {e:#}"));
+                }
+                publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

@@ -1501,6 +1501,10 @@ fn forwardable(method: &str) -> bool {
             // when the box holds one (gh#369), else the board's — and the chat
             // the box is hosting (§gh#239).
             | methods::SUBMIT_VERDICT
+            // The merge (gh#408) executes where the board's store and GitHub
+            // credential are — the box — and is pressed where the review is
+            // read, which is anywhere else.
+            | methods::MERGE_TASK
             | methods::LIST_BOARD_RUNTIMES
             // Throughput is read off `board.db`, which only the box has
             // (gh#143) — a laptop's stats page is asking about the board, not
@@ -2018,6 +2022,25 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&receipt)
+            }
+            // The one key that cannot be undone (gh#408). The confirmation
+            // already happened on the surface that called this; what the engine
+            // owes back is one sentence about what actually happened — merged,
+            // queued, or still running (gh#290) — or the refusal, carrying
+            // GitHub's own words (gh#338).
+            methods::MERGE_TASK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let line = self
+                    .board()?
+                    .merge_task(&p.task_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&serde_json::json!({ "line": line }))
             }
             // The routing surface (gh#75). Served off the board's own paths, so
             // this answers about the config the running loop reads — and keeps
