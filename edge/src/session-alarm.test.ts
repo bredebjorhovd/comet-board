@@ -1,3 +1,8 @@
+// vitest 3's bundled types referenced @types/node ambiently; vitest 4 stopped,
+// so the node:sqlite module declaration must be pulled in here explicitly.
+// Scoped to this file on purpose: src/ is workers-typed, and putting "node" in
+// tsconfig's types field would mix Node globals into every DO module.
+/// <reference types="node" />
 import { DatabaseSync } from "node:sqlite";
 import { LoroDoc } from "loro-crdt";
 import { CrdtType, MessageType, encode } from "loro-protocol";
