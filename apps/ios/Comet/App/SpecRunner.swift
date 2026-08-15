@@ -135,6 +135,10 @@ enum SpecRunner {
             /// collapse into a zero.
             var hasSpend: Bool
             var spendLabel: String
+            /// gh#426. Per-agent rows carry raw identity and estimates over
+            /// the wire; these pin the phone's display derivations.
+            var agentLabels: [String]
+            var agentPriceLabels: [String?]
             /// gh#228. The landing bar: four bands whatever the window did,
             /// the two losses among them, and shares taken over what landed
             /// rather than over what was touched.
@@ -209,6 +213,10 @@ enum SpecRunner {
             expect(peakTokens(s.dailyTokens), c.expect.peakTokens, "\(what): peak tokens")
             expect(s.hasSpend, c.expect.hasSpend, "\(what): hasSpend")
             expect(s.spendLabel, c.expect.spendLabel, "\(what): spend label")
+            expect((s.agentUsage ?? []).map(\.label), c.expect.agentLabels,
+                   "\(what): agent labels")
+            expect((s.agentUsage ?? []).map(\.priceLabel), c.expect.agentPriceLabels,
+                   "\(what): agent price labels")
             // gh#228: four bands, always, and the shares are of what landed.
             expect(s.landing.headline, c.expect.landingHeadline, "\(what): landing headline")
             expect(s.landing.segments, c.expect.landingSegments, "\(what): landing segments")

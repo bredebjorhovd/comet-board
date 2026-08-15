@@ -23,8 +23,8 @@ use std::sync::Arc;
 pub use comet_proto::TokenUsage;
 pub use comet_proto::view::rates::human_usd;
 pub use comet_proto::view::stats::{
-    BREAKDOWN_ROWS, BoardStats as Stats, Breakdown, BreakdownRow, DayBucket, Dimension, Friction,
-    HOURS, Landing, Ranking, TokenDay, human_tokens, rank_breakdown,
+    AgentSpend, BREAKDOWN_ROWS, BoardStats as Stats, Breakdown, BreakdownRow, DayBucket, Dimension,
+    Friction, HOURS, Landing, Ranking, TokenDay, human_tokens, rank_breakdown,
 };
 
 /// Whose subscription a dispatch that named no slot spent (gh#101).
@@ -135,6 +135,28 @@ fn token_day_series(days: &[String], counts: &BTreeMap<String, TokenUsage>) -> V
         .collect()
 }
 
+/// The model slices to use for pricing one attempt (gh#426).
+///
+/// A new journal carries an exact result-level split. Older attempts fall back
+/// to the one model they announced, preserving their previous estimate. A
+/// malformed split that does not add back to the authoritative total also
+/// falls back rather than silently losing or inventing tokens.
+fn attempt_models(a: &Attempt, fallback: &str) -> Vec<comet_proto::ModelTokenUsage> {
+    let Some(total) = a.tokens else {
+        return Vec::new();
+    };
+    if let Some(rows) = &a.token_models
+        && !rows.is_empty()
+        && rows.iter().map(|row| row.usage).sum::<TokenUsage>() == total
+    {
+        return rows.clone();
+    }
+    vec![comet_proto::ModelTokenUsage {
+        model: fallback.to_string(),
+        usage: total,
+    }]
+}
+
 /// The window's numbers, unpriced.
 ///
 /// Kept for callers that have no rates to hand and want the throughput half —
@@ -184,6 +206,9 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
     // rather than adding a zero that would quietly deflate every total.
     let mut tokens = TokenUsage::default();
     let mut attempts_with_tokens = 0usize;
+    let mut attempts_with_agent_usage = 0usize;
+    let mut agent_totals: BTreeMap<(comet_proto::AgentKind, Option<String>, String), TokenUsage> =
+        BTreeMap::new();
     let mut tokens_by_model: BTreeMap<String, TokenUsage> = BTreeMap::new();
     let mut tokens_by_runtime: BTreeMap<String, TokenUsage> = BTreeMap::new();
     let mut tokens_by_account: BTreeMap<String, TokenUsage> = BTreeMap::new();
@@ -222,8 +247,8 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         // inside the token block below because a dispatch belongs under its
         // model whether or not the harness got round to metering it.
         let model = a.model.clone().unwrap_or_else(|| UNNAMED_MODEL.to_string());
+        let model_rows = attempt_models(a, &model);
         for (dimension, label) in [
-            (Dimension::Model, &model),
             (Dimension::Runtime, &a.runtime),
             (Dimension::Space, &a.workspace),
             (Dimension::Tracker, &source),
@@ -233,7 +258,32 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
             cut.dispatches += 1;
             if let Some(usage) = a.tokens {
                 cut.usage.add(usage);
-                cut.by_model.entry(model.clone()).or_default().add(usage);
+                for row in &model_rows {
+                    cut.by_model
+                        .entry(row.model.clone())
+                        .or_default()
+                        .add(row.usage);
+                }
+            }
+        }
+        // A mixed-model attempt belongs to each model it actually ran. With no
+        // usage detail it still belongs to the announced model as a dispatch,
+        // exactly as before gh#426.
+        if model_rows.is_empty() {
+            cuts.entry((Dimension::Model, model.clone()))
+                .or_default()
+                .dispatches += 1;
+        } else {
+            for row in &model_rows {
+                let cut = cuts
+                    .entry((Dimension::Model, row.model.clone()))
+                    .or_default();
+                cut.dispatches += 1;
+                cut.usage.add(row.usage);
+                cut.by_model
+                    .entry(row.model.clone())
+                    .or_default()
+                    .add(row.usage);
             }
         }
         // An agent, by either name it can be known under. Counting only
@@ -259,7 +309,12 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         if let Some(usage) = a.tokens {
             tokens.add(usage);
             attempts_with_tokens += 1;
-            tokens_by_model.entry(model.clone()).or_default().add(usage);
+            for row in &model_rows {
+                tokens_by_model
+                    .entry(row.model.clone())
+                    .or_default()
+                    .add(row.usage);
+            }
             tokens_by_runtime
                 .entry(a.runtime.clone())
                 .or_default()
@@ -270,10 +325,21 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
                 .entry(payer.clone())
                 .or_default()
                 .add(usage);
-            tokens_by_account_model
-                .entry((payer, model))
-                .or_default()
-                .add(usage);
+            for row in &model_rows {
+                tokens_by_account_model
+                    .entry((payer.clone(), row.model.clone()))
+                    .or_default()
+                    .add(row.usage);
+            }
+            if let Some(rows) = a.token_agents.as_ref().filter(|rows| !rows.is_empty()) {
+                attempts_with_agent_usage += 1;
+                for row in rows {
+                    agent_totals
+                        .entry((row.agent, row.name.clone(), row.model.clone()))
+                        .or_default()
+                        .add(row.usage);
+                }
+            }
         }
         // …and how full its window was when anybody last looked (gh#271). The
         // reading is the *last* one the attempt reported, so for a finished
@@ -373,6 +439,28 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         )
     });
 
+    let mut agent_usage: Vec<AgentSpend> = agent_totals
+        .into_iter()
+        .map(|((agent, name, model), usage)| {
+            let by_model = BTreeMap::from([(model.clone(), usage)]);
+            let priced = prices.and_then(|p| p.price(&by_model));
+            AgentSpend {
+                agent,
+                name,
+                model,
+                usage,
+                list_price_api_estimate: priced.map(|(cost, _)| cost),
+                unpriced_tokens: priced.map_or(0, |(_, unpriced)| unpriced),
+            }
+        })
+        .collect();
+    agent_usage.sort_by(|a, b| {
+        b.list_price_api_estimate
+            .cmp(&a.list_price_api_estimate)
+            .then_with(|| b.usage.total().cmp(&a.usage.total()))
+            .then_with(|| a.label().cmp(&b.label()))
+    });
+
     // The five cuts, priced and ranked (gh#227). A dimension this window has
     // nothing under is left out of the vector entirely rather than sent as an
     // empty one: the toggle is built from what is here, and a segment that
@@ -418,6 +506,8 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         // nothing and a board that is not counting.
         token_coverage: (!attempts.is_empty())
             .then(|| attempts_with_tokens as f64 / attempts.len() as f64),
+        attempts_with_agent_usage,
+        agent_usage,
         landing,
         friction,
         daily: day_series(&calendar, &days),
@@ -546,7 +636,8 @@ pub fn print(s: &Stats) {
             s.context.near_compaction, s.context.attempts_reported,
         );
     }
-    // What that cost, at list price (gh#182) — and, when the rates could not
+    // What that would cost at public API list prices (gh#182/gh#426) — and,
+    // when the rates could not
     // price everything, what the figure leaves out. Never a bare total: a
     // number that silently dropped a model is the one failure this half of the
     // page is designed against.
@@ -556,17 +647,34 @@ pub fn print(s: &Stats) {
         }
         Some(spend) if spend.has_price() => {
             println!(
-                "  {} at list price ({})",
+                "  {} list-price API estimate ({}, from {}/{} attempts that reported usage; not a bill)",
                 human_usd(spend.list_price),
-                spend.rates.provenance()
+                spend.rates.provenance(),
+                s.attempts_with_tokens,
+                s.attempts,
             );
             for row in spend.by_model.iter().take(4) {
                 println!(
-                    "    {} {} on {}",
+                    "    {} list-price API estimate · {} on {}",
                     human_usd(row.cost),
                     human_tokens(row.usage.total()),
                     row.label
                 );
+            }
+            if !s.agent_usage.is_empty() {
+                println!(
+                    "    by agent/model list-price API estimate (detail from {}/{} attempts that reported usage):",
+                    s.attempts_with_agent_usage, s.attempts_with_tokens
+                );
+                for row in s.agent_usage.iter().take(4) {
+                    println!(
+                        "      {} · {} · {}",
+                        row.price_label()
+                            .unwrap_or_else(|| "rates not configured".to_string()),
+                        human_tokens(row.usage.total()),
+                        row.label()
+                    );
+                }
             }
             if !spend.is_complete() {
                 println!(
@@ -589,7 +697,7 @@ pub fn print(s: &Stats) {
                 let name = plan.label.as_deref().unwrap_or("subscription");
                 match (account.plan_in_window, account.subsidy()) {
                     (Some(window), Some(ratio)) => println!(
-                        "    {}: {} of list price against {} of {} ({name}, {}/month) — {:.0}%",
+                        "    {}: {} list-price API estimate against {} of {} ({name}, {}/month) — {:.0}%",
                         account.label,
                         human_usd(account.list_price),
                         human_usd(window),
@@ -598,7 +706,7 @@ pub fn print(s: &Stats) {
                         ratio * 100.0,
                     ),
                     _ => println!(
-                        "    {}: {} of list price, on a {name} at {}/month",
+                        "    {}: {} list-price API estimate, on a {name} at {}/month",
                         account.label,
                         human_usd(account.list_price),
                         human_usd(plan.monthly),
@@ -723,7 +831,10 @@ mod tests {
     #[test]
     fn dispatch_evidence_ignores_the_window() {
         // An attempt well outside a 7-day window…
-        let worked = task("a", vec![attempt(60 * 24 * 30, 10, Some(Outcome::Done), None)]);
+        let worked = task(
+            "a",
+            vec![attempt(60 * 24 * 30, 10, Some(Outcome::Done), None)],
+        );
         let s = gather(&[worked], Some(7));
         assert_eq!(s.attempts, 0, "the window is empty");
         assert!(s.dispatched, "…is still dispatch evidence");
@@ -1285,6 +1396,83 @@ mod tests {
         assert!(s.has_spend());
         // The headline never stands alone while something is missing from it.
         assert!(s.spend_label().contains("unpriced"), "{}", s.spend_label());
+    }
+
+    #[test]
+    fn a_mixed_model_attempt_is_priced_and_split_by_the_agents_that_ran_it() {
+        let mut mixed = spent(30, "claude-opus-5", None, usage(2_000_000, 0, 0, 0));
+        mixed.token_models = Some(vec![
+            comet_proto::ModelTokenUsage {
+                model: "claude-opus-5".into(),
+                usage: usage(1_000_000, 0, 0, 0),
+            },
+            comet_proto::ModelTokenUsage {
+                model: "claude-haiku-4-5".into(),
+                usage: usage(1_000_000, 0, 0, 0),
+            },
+        ]);
+        mixed.token_agents = Some(vec![
+            comet_proto::AgentTokenUsage {
+                agent: comet_proto::AgentKind::Main,
+                name: None,
+                model: "claude-opus-5".into(),
+                usage: usage(1_000_000, 0, 0, 0),
+            },
+            comet_proto::AgentTokenUsage {
+                agent: comet_proto::AgentKind::Subagent,
+                name: Some("Explore".into()),
+                model: "claude-haiku-4-5".into(),
+                usage: usage(1_000_000, 0, 0, 0),
+            },
+        ]);
+
+        let s = gather_priced(
+            &[task("t1", vec![mixed])],
+            Some(7),
+            &crate::prices::Prices::builtin(),
+        );
+        assert_eq!(
+            s.spend.as_ref().expect("priced").list_price,
+            Usd::from_dollars(6.0),
+            "one million Opus input tokens plus one million Haiku input tokens"
+        );
+        assert_eq!(s.tokens_by_model["claude-opus-5"].total(), 1_000_000);
+        assert_eq!(s.tokens_by_model["claude-haiku-4-5"].total(), 1_000_000);
+        assert_eq!(s.attempts_with_agent_usage, 1);
+        assert_eq!(s.agent_usage.len(), 2);
+        assert_eq!(s.agent_usage[0].label(), "Main · claude-opus-5");
+        assert_eq!(
+            s.agent_usage[0].list_price_api_estimate,
+            Some(Usd::from_dollars(5.0))
+        );
+        assert_eq!(s.agent_usage[1].label(), "Explore · claude-haiku-4-5");
+        assert_eq!(
+            s.agent_usage[1].list_price_api_estimate,
+            Some(Usd::from_dollars(1.0))
+        );
+        assert_eq!(s.token_coverage, Some(1.0));
+    }
+
+    #[test]
+    fn a_model_split_that_does_not_reconcile_falls_back_to_the_attempt_model() {
+        let mut attempt = spent(30, "claude-opus-5", None, usage(2_000_000, 0, 0, 0));
+        attempt.token_models = Some(vec![comet_proto::ModelTokenUsage {
+            model: "claude-haiku-4-5".into(),
+            usage: usage(1_000_000, 0, 0, 0),
+        }]);
+
+        let s = gather_priced(
+            &[task("t1", vec![attempt])],
+            Some(7),
+            &crate::prices::Prices::builtin(),
+        );
+        assert_eq!(s.tokens_by_model.len(), 1);
+        assert_eq!(s.tokens_by_model["claude-opus-5"].total(), 2_000_000);
+        assert_eq!(
+            s.spend.as_ref().expect("priced").list_price,
+            Usd::from_dollars(10.0),
+            "a partial attribution may not make one million tokens disappear"
+        );
     }
 
     #[test]

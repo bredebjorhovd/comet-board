@@ -12,8 +12,8 @@ use comet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, AgentKind, AgentTokenUsage, DoneStatus, HarnessId, ModelTokenUsage, RunRequest,
+    SandboxLevel, TokenUsage, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 mod common;
@@ -225,6 +225,50 @@ async fn happy_path_normalizes_events_and_accounts_for_subagents() {
         cache_creation_tokens: 300,
         cache_read_tokens: 4000,
     })));
+    assert!(events.contains(&AgentEvent::AgentUsage(AgentTokenUsage {
+        agent: AgentKind::Main,
+        name: None,
+        model: "claude-fable-5".into(),
+        usage: TokenUsage {
+            input_tokens: 4,
+            output_tokens: 2,
+            cache_creation_tokens: 100,
+            cache_read_tokens: 1000,
+        },
+    })));
+    assert!(events.contains(&AgentEvent::AgentUsage(AgentTokenUsage {
+        agent: AgentKind::Subagent,
+        name: Some("Explore".into()),
+        model: "claude-spark-5".into(),
+        usage: TokenUsage {
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_creation_tokens: 50,
+            cache_read_tokens: 1500,
+        },
+    })));
+    assert!(events.contains(&AgentEvent::ModelUsage {
+        models: vec![
+            ModelTokenUsage {
+                model: "claude-fable-5".into(),
+                usage: TokenUsage {
+                    input_tokens: 8,
+                    output_tokens: 16,
+                    cache_creation_tokens: 250,
+                    cache_read_tokens: 2500,
+                },
+            },
+            ModelTokenUsage {
+                model: "claude-spark-5".into(),
+                usage: TokenUsage {
+                    input_tokens: 2,
+                    output_tokens: 4,
+                    cache_creation_tokens: 50,
+                    cache_read_tokens: 1500,
+                },
+            },
+        ],
+    }));
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -568,7 +612,9 @@ async fn real_claude_answers_the_context_poll_mid_turn() {
     // The CLI's own auto-compact point, which is the number the board counts
     // down to. (Absent only if the operator turned auto-compaction off.)
     assert!(
-        level.compact_at_tokens.is_none_or(|at| at <= level.max_tokens),
+        level
+            .compact_at_tokens
+            .is_none_or(|at| at <= level.max_tokens),
         "{level:?}"
     );
     // …and never after the turn ended.

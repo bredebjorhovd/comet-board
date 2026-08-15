@@ -49,8 +49,7 @@ pinned by tests:
   reported usage (8 of 13)" as its aside. A total read without it is a total
   read wrong. `token_coverage` is `None` when nothing ran and `Some(0.0)` when
   attempts ran and none reported — those are different facts.
-- **Counts only; pricing is a separate ticket.** What a token costs depends on
-  a seat, a plan and a price table the board does not have, and a number that
-  looks like money is read as money. When that ticket comes: work absorbed by a
-  Claude Max seat did not cost a per-token figure, so whatever is shown must be
-  labelled a list-price estimate of the same usage on the API, not a bill.
+- **Counts first; pricing followed separately.** gh#182 added the dated API
+  list-price table and gh#426 added exact mixed-model and agent attribution.
+  Work absorbed by a Claude Max seat did not cost a per-token figure, so every
+  money surface labels the result a list-price API estimate, not a bill.

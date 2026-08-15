@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::TokenUsage;
 use crate::view::rates::{ModelRate, RateSource, RateTable, Usd, human_usd};
+use crate::{AgentKind, TokenUsage};
 
 /// One day's dispatches, for the throughput chart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +352,52 @@ pub struct ModelSpend {
     pub cost: Usd,
 }
 
+/// One agent/model slice of the window, with its list-price API estimate
+/// (gh#426).
+///
+/// These rows are present only for attempts whose harness emitted per-message
+/// attribution. They are therefore read beside
+/// [`BoardStats::attempts_with_agent_usage`], never as a complete rewrite of
+/// the window total. `list_price_api_estimate: None` is rates not configured; `Some(0)` with
+/// `unpriced_tokens > 0` is an unknown model, never free work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSpend {
+    pub agent: AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub model: String,
+    pub usage: TokenUsage,
+    /// What this slice's usage would cost at public API list prices. This is
+    /// deliberately verbose on the JSON wire: subscription runs are not billed
+    /// per token, and a bare `cost` field would imply otherwise.
+    pub list_price_api_estimate: Option<Usd>,
+    pub unpriced_tokens: u64,
+}
+
+impl AgentSpend {
+    /// Compact, stable row label shared by the CLI and viewports.
+    pub fn label(&self) -> String {
+        let agent = match self.agent {
+            AgentKind::Main => "Main",
+            AgentKind::Subagent => self.name.as_deref().unwrap_or("Subagent"),
+        };
+        format!("{agent} · {}", self.model)
+    }
+
+    /// Money column wording. No configured rates stays blank at the data
+    /// level; an unknown model says `unpriced` instead of inventing `$0.00`.
+    pub fn price_label(&self) -> Option<String> {
+        self.list_price_api_estimate.map(|cost| {
+            if self.unpriced_tokens > 0 && cost.is_zero() {
+                UNPRICED.to_string()
+            } else {
+                human_usd(cost)
+            }
+        })
+    }
+}
+
 /// What one agent-account's work would have cost at the meter, beside what its
 /// subscription actually costs.
 ///
@@ -451,15 +497,15 @@ impl BoardSpend {
         !self.by_model.is_empty()
     }
 
-    /// The headline, said once: `$12.40 at list price`, with what it could not
+    /// The headline, said once: `$12.40 list-price API estimate`, with what it could not
     /// account for attached rather than left implied.
     pub fn headline(&self) -> String {
         let price = human_usd(self.list_price);
         if self.is_complete() {
-            format!("{price} at list price")
+            format!("{price} list-price API estimate")
         } else {
             format!(
-                "{price} at list price, plus {} unpriced token(s) across {} model(s)",
+                "{price} list-price API estimate, plus {} unpriced token(s) across {} model(s)",
                 human_tokens(self.unpriced_tokens),
                 self.unpriced.len()
             )
@@ -771,7 +817,7 @@ impl Ranking {
     /// How the card names it, beside its title.
     pub fn caption(self) -> &'static str {
         match self {
-            Ranking::Spend => "by spend",
+            Ranking::Spend => "by list-price API estimate",
             Ranking::Tokens => "by tokens",
             Ranking::Dispatches => "by dispatches",
         }
@@ -1000,6 +1046,15 @@ pub struct BoardStats {
     /// the same reason: a zero here would read as "nothing reported" when what
     /// happened is that nothing ran.
     pub token_coverage: Option<f64>,
+    /// How many attempts exposed per-agent detail (gh#426). Read beside
+    /// [`attempts_with_tokens`](Self::attempts_with_tokens): a harness can
+    /// report an exact total without exposing who inside the run spent it.
+    #[serde(default)]
+    pub attempts_with_agent_usage: usize,
+    /// Main/subagent/model rows over the attempts that exposed them. Absent on
+    /// older boxes and empty rather than zero-valued when nothing attributed.
+    #[serde(default)]
+    pub agent_usage: Vec<AgentSpend>,
 
     pub landing: Landing,
     pub friction: Friction,
@@ -1057,7 +1112,8 @@ pub struct BoardStats {
     /// the per-account price is computed from.
     pub tokens_by_account: BTreeMap<String, TokenUsage>,
 
-    /// What it cost, at list price, and what the plans behind it cost (gh#182).
+    /// Its list-price API estimate, beside what the plans behind it cost
+    /// (gh#182).
     ///
     /// `None` is **rates not configured** — said out loud rather than rendered
     /// as a confident `$0.00`, which is gh#96's lesson applied to money. A
@@ -1143,6 +1199,8 @@ impl BoardStats {
             tokens: TokenUsage::default(),
             attempts_with_tokens: 0,
             token_coverage: None,
+            attempts_with_agent_usage: 0,
+            agent_usage: Vec::new(),
             landing: Landing::default(),
             friction: Friction::default(),
             daily: Vec::new(),
@@ -2848,6 +2906,11 @@ mod spec {
                 // collapsed any two of them would be inventing a zero.
                 "hasSpend": stats.has_spend(),
                 "spendLabel": stats.spend_label(),
+                // gh#426. The agent/model rows use an explicitly estimated
+                // wire field, and the phone owns the same compact labels as
+                // desktop rather than receiving pre-rendered prose.
+                "agentLabels": stats.agent_usage.iter().map(AgentSpend::label).collect::<Vec<_>>(),
+                "agentPriceLabels": stats.agent_usage.iter().map(AgentSpend::price_label).collect::<Vec<_>>(),
                 // gh#228. The bar both viewports draw: four bands, the two
                 // losses among them, and shares taken over what landed rather
                 // than over what was touched.
@@ -3086,6 +3149,25 @@ mod spec {
                 },
             ],
         ));
+        priced.attempts_with_agent_usage = 1;
+        priced.agent_usage = vec![
+            AgentSpend {
+                agent: AgentKind::Main,
+                name: None,
+                model: "claude-opus-5".into(),
+                usage: usage(1_000, 200, 10_000, 300),
+                list_price_api_estimate: Some(Usd::from_dollars(0.016_875)),
+                unpriced_tokens: 0,
+            },
+            AgentSpend {
+                agent: AgentKind::Subagent,
+                name: Some("Explore".into()),
+                model: "gpt-5.6-luna".into(),
+                usage: usage(400, 100, 0, 500),
+                list_price_api_estimate: Some(Usd::ZERO),
+                unpriced_tokens: 1_000,
+            },
+        ];
 
         // Rates configured, and not one of them matched: a real answer, and not
         // the same one as "no rates configured" above.

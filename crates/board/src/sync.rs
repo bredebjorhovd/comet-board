@@ -1522,13 +1522,20 @@ impl SyncEngine {
         // journal only grows between turns, so a chat mid-thought reports the
         // same numbers every time it is asked.
         let model_settled = run.model.is_none() || attempt.model == run.model;
-        if attempt.tokens == Some(run.usage) && model_settled {
+        if attempt.tokens == Some(run.usage)
+            && model_settled
+            && attempt.token_models == run.by_model
+            && attempt.token_agents == run.by_agent
+        {
             return;
         }
-        if let Err(e) = self
-            .db
-            .set_attempt_tokens(attempt.id, run.usage, run.model.as_deref())
-        {
+        if let Err(e) = self.db.set_attempt_tokens(
+            attempt.id,
+            run.usage,
+            run.model.as_deref(),
+            run.by_model.as_deref(),
+            run.by_agent.as_deref(),
+        ) {
             self.log.warn(format!(
                 "recording tokens for attempt {}: {e:#}",
                 attempt.id
@@ -5799,6 +5806,8 @@ mod tests {
                 std::sync::Mutex::new(Some(crate::runtime::RunTokens {
                     usage,
                     model: model.map(str::to_string),
+                    by_model: None,
+                    by_agent: None,
                 })),
                 std::sync::Mutex::new(None),
                 std::sync::Mutex::new(Vec::new()),
@@ -5819,10 +5828,22 @@ mod tests {
             *self.0.lock().unwrap() = Some(crate::runtime::RunTokens {
                 usage,
                 model: model.map(str::to_string),
+                by_model: None,
+                by_agent: None,
             });
         }
         fn set_context(&self, context: Option<comet_proto::ContextUsage>) {
             *self.1.lock().unwrap() = context;
+        }
+        fn set_attribution(
+            &self,
+            by_model: Vec<comet_proto::ModelTokenUsage>,
+            by_agent: Vec<comet_proto::AgentTokenUsage>,
+        ) {
+            let mut run = self.0.lock().unwrap();
+            let run = run.as_mut().expect("meter is saying");
+            run.by_model = Some(by_model);
+            run.by_agent = Some(by_agent);
         }
     }
 
@@ -5871,12 +5892,25 @@ mod tests {
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = Meter::saying(tokens(100, 10), Some("claude-opus-5"));
+        let by_model = vec![comet_proto::ModelTokenUsage {
+            model: "claude-haiku-4-5".into(),
+            usage: tokens(100, 10),
+        }];
+        let by_agent = vec![comet_proto::AgentTokenUsage {
+            agent: comet_proto::AgentKind::Subagent,
+            name: Some("Explore".into()),
+            model: "claude-haiku-4-5".into(),
+            usage: tokens(100, 10),
+        }];
+        rt.set_attribution(by_model.clone(), by_agent.clone());
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
         let a = live(&e);
         assert_eq!(a.tokens, Some(tokens(100, 10)));
         assert_eq!(a.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(a.token_models, Some(by_model));
+        assert_eq!(a.token_agents, Some(by_agent));
 
         // The next turn's total replaces it — the journal's figure is already
         // a run total, so this is a copy and never an accumulation on top of

@@ -490,6 +490,8 @@ impl Runtime for CometRuntime {
         Ok(self.journal.tokens(chat_id)?.map(|t| RunTokens {
             usage: t.usage,
             model: t.model,
+            by_model: t.by_model,
+            by_agent: t.by_agent,
         }))
     }
 

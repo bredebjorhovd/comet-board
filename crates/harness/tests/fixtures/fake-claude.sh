@@ -19,18 +19,18 @@ case "$first" in
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"pondering"}}}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}'
   # The parent delegates; every frame below carries the Task's id as parent.
-  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"sub-1","name":"Task","input":{"description":"scan the tree","subagent_type":"Explore","prompt":"a long brief"}}]}}'
+  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg-main-1","model":"claude-fable-5","usage":{"input_tokens":4,"output_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000},"content":[{"type":"tool_use","id":"sub-1","name":"Task","input":{"description":"scan the tree","subagent_type":"Explore","prompt":"a long brief"}}]}}'
   # Subagent frames (parent_tool_use_id set): never parent transcript content —
   # the token stream beats as liveness, its tool calls count as steps (gh#280).
   emit '{"type":"stream_event","parent_tool_use_id":"sub-1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"SUBAGENT"}}}'
-  emit '{"type":"assistant","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_use","id":"sub-tool","name":"Bash","input":{"command":"echo sub"}}]}}'
+  emit '{"type":"assistant","parent_tool_use_id":"sub-1","message":{"id":"msg-sub-1","model":"claude-spark-5","usage":{"input_tokens":2,"output_tokens":4,"cache_creation_input_tokens":50,"cache_read_input_tokens":1500},"content":[{"type":"tool_use","id":"sub-tool","name":"Bash","input":{"command":"echo sub"}}]}}'
   emit '{"type":"user","parent_tool_use_id":"sub-1","message":{"content":[{"type":"tool_result","tool_use_id":"sub-tool","is_error":false}]}}'
   emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"sub-1","is_error":false}]}}'
-  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"ls -la"}},{"type":"tool_use","id":"tool-2","name":"mcp__linear__search","input":{"q":"bug"}}]}}'
+  emit '{"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg-main-2","model":"claude-fable-5","usage":{"input_tokens":4,"output_tokens":14,"cache_creation_input_tokens":150,"cache_read_input_tokens":1500},"content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"ls -la"}},{"type":"tool_use","id":"tool-2","name":"mcp__linear__search","input":{"q":"bug"}}]}}'
   emit '{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":false},{"type":"tool_result","tool_use_id":"tool-2","is_error":true}]}}'
   # Informational rate-limit status: stays quiet.
   emit '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}'
-  emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"session_id":"sess-1","total_cost_usd":0.01}'
+  emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000},"modelUsage":{"claude-fable-5":{"inputTokens":8,"outputTokens":16,"cacheCreationInputTokens":250,"cacheReadInputTokens":2500},"claude-spark-5":{"inputTokens":2,"outputTokens":4,"cacheCreationInputTokens":50,"cacheReadInputTokens":1500}},"session_id":"sess-1","total_cost_usd":0.01}'
   ;;
 
 *scenario:askuser*)

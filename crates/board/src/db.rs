@@ -23,7 +23,8 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      chat_archivable_at, chat_archived_at, \
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
-     context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes";
+     context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes, \
+     token_models, token_agents";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -108,6 +109,14 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         },
         stacked_on: r.get(48)?,
         resumes: r.get(49)?,
+        // JSON metadata beside the authoritative four-column total. NULL is
+        // "this harness did not attribute it", not an empty breakdown.
+        token_models: r
+            .get::<_, Option<String>>(50)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
+        token_agents: r
+            .get::<_, Option<String>>(51)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
@@ -308,6 +317,11 @@ impl Db {
               -- none, so the column would be NULL exactly where the breakdown
               -- needs it most.
               model TEXT,
+              -- Exact per-model result totals and per-agent assistant-step
+              -- attribution (gh#426). JSON and nullable: old attempts, and
+              -- harnesses that expose no split, honestly have no rows here.
+              token_models TEXT,
+              token_agents TEXT,
               -- When the build output inside this checkout became nobody's, and
               -- when the board last deleted it (gh#186). Kept apart from
               -- `collectable_at`/`collected_at` because they mean different
@@ -531,6 +545,10 @@ impl Db {
                 ("cache_read_tokens", "INTEGER"),
                 ("cache_creation_tokens", "INTEGER"),
                 ("model", "TEXT"),
+                // Model/agent attribution (gh#426). Existing rows keep NULL:
+                // their totals cannot be split after the journals are gone.
+                ("token_models", "TEXT"),
+                ("token_agents", "TEXT"),
                 // Context fullness (gh#271), on the tokens' terms exactly:
                 // nullable, no default, existing rows keep NULL and read as
                 // "reported nothing". Backfilling is impossible here too — the
@@ -1237,11 +1255,12 @@ impl Db {
 
     /// Record what an attempt has spent, and what spent it (gh#151).
     ///
-    /// All five columns in one statement, so `input_tokens IS NULL` is a sound
-    /// witness for "this attempt reported nothing" — the reader keys the whole
-    /// [`Attempt::tokens`] option on it. Written on every reconcile of a live
-    /// attempt, and the totals only ever grow, so a run that ends between two
-    /// ticks keeps the last figure its journal gave.
+    /// The authoritative four buckets and model are written in the same
+    /// statement as their two optional attribution views, so `input_tokens IS
+    /// NULL` remains a sound witness for "this attempt reported nothing" — the
+    /// reader keys the whole [`Attempt::tokens`] option on it. Written on every
+    /// reconcile of a live attempt, and the totals only ever grow, so a run
+    /// that ends between two ticks keeps the last figure its journal gave.
     ///
     /// `model` is left alone when the run did not name one, rather than
     /// overwriting a model a previous tick did learn.
@@ -1250,11 +1269,15 @@ impl Db {
         attempt_id: i64,
         usage: comet_proto::TokenUsage,
         model: Option<&str>,
+        by_model: Option<&[comet_proto::ModelTokenUsage]>,
+        by_agent: Option<&[comet_proto::AgentTokenUsage]>,
     ) -> Result<()> {
+        let by_model = by_model.map(serde_json::to_string).transpose()?;
+        let by_agent = by_agent.map(serde_json::to_string).transpose()?;
         self.conn.execute(
             "UPDATE attempts SET input_tokens = ?2, output_tokens = ?3,
                  cache_read_tokens = ?4, cache_creation_tokens = ?5,
-                 model = COALESCE(?6, model)
+                 model = COALESCE(?6, model), token_models = ?7, token_agents = ?8
                WHERE id = ?1",
             params![
                 attempt_id,
@@ -1263,6 +1286,8 @@ impl Db {
                 usage.cache_read_tokens as i64,
                 usage.cache_creation_tokens as i64,
                 model,
+                by_model,
+                by_agent,
             ],
         )?;
         Ok(())

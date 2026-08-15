@@ -624,6 +624,14 @@ pub struct Attempt {
     /// Refreshed on every reconcile while the attempt is live, so one that is
     /// cancelled or orphaned keeps what it had spent up to the last tick.
     pub tokens: Option<comet_proto::TokenUsage>,
+    /// Exact per-model slices reported beside [`tokens`](Self::tokens)
+    /// (gh#426). `None` means this attempt's harness/journal exposed no model
+    /// attribution; it is not an empty or zero-valued breakdown.
+    pub token_models: Option<Vec<comet_proto::ModelTokenUsage>>,
+    /// Assistant-step usage attributed to the main agent or a named subagent,
+    /// per model (gh#426). Additive metadata beside `tokens`, never another
+    /// total to sum into it. `None` means attribution was not reported.
+    pub token_agents: Option<Vec<comet_proto::AgentTokenUsage>>,
     /// How full this attempt's context window was when its harness last said
     /// (gh#271).
     ///
@@ -794,6 +802,8 @@ pub(crate) mod tests {
             chat_archivable_at: None,
             chat_archived_at: None,
             tokens: None,
+            token_models: None,
+            token_agents: None,
             context: None,
             model: None,
             claims: Vec::new(),

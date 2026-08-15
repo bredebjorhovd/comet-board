@@ -4,6 +4,8 @@
 //! [`Frame::Other`], so a newer CLI never breaks parsing — we only read the
 //! fields the normalizer needs (spec: docs/research/harness.md).
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -77,6 +79,13 @@ pub(crate) struct MessageFrame {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageBody {
+    /// Stable across duplicate assistant frames for one API step.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub usage: UsageBody,
     /// Either a plain string or an array of content blocks.
     #[serde(default)]
     pub content: Value,
@@ -138,6 +147,10 @@ pub(crate) struct ResultFrame {
     pub errors: Vec<Value>,
     #[serde(default)]
     pub usage: UsageBody,
+    /// Exact per-model totals for this result. The CLI uses the Agent SDK's
+    /// TypeScript spelling even though the token fields above are snake_case.
+    #[serde(rename = "modelUsage", alias = "model_usage", default)]
+    pub model_usage: BTreeMap<String, ModelUsageBody>,
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -147,7 +160,7 @@ pub(crate) struct ResultFrame {
 /// session they are the overwhelming majority of what the turn read. Reading
 /// only the first two (which is what shipped) under-reported a run by an order
 /// of magnitude; gh#151.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub(crate) struct UsageBody {
     #[serde(default)]
     pub input_tokens: u64,
@@ -159,6 +172,43 @@ pub(crate) struct UsageBody {
     /// Input this turn read back out of it.
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+}
+
+impl UsageBody {
+    pub fn normalized(&self) -> comet_proto::TokenUsage {
+        comet_proto::TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_input_tokens,
+            cache_creation_tokens: self.cache_creation_input_tokens,
+        }
+    }
+}
+
+/// A row inside the result frame's `modelUsage` map. These names are passed
+/// through from the Agent SDK and are camelCase even on the CLI JSON wire.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelUsageBody {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl ModelUsageBody {
+    pub fn normalized(&self) -> comet_proto::TokenUsage {
+        comet_proto::TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_input_tokens,
+            cache_creation_tokens: self.cache_creation_input_tokens,
+        }
+    }
 }
 
 /// A CLI→client control request (`can_use_tool` is the one we act on).
