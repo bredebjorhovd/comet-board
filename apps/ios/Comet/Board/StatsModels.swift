@@ -395,6 +395,13 @@ struct BoardSpend: Decodable, Hashable {
     }
 }
 
+/// The semantic basis for every compatible `listPrice` / `cost` money field
+/// in a stats reply. Optional on `BoardStats` only so a new phone can still
+/// read an older box; every newly emitted reply carries this discriminator.
+enum PricingBasis: String, Decodable, Hashable {
+    case listPriceApiEstimate
+}
+
 /// Everything the board can say about its own throughput over a window.
 ///
 /// Strictly decoded — no per-field defaults. A field whose name skewed would
@@ -470,6 +477,7 @@ struct BoardStats: Decodable, Hashable {
     /// arrives with a `spend` whose total is zero, and those are different
     /// facts.
     var spend: BoardSpend?
+    var pricingBasis: PricingBasis?
 
     /// How close this window's attempts ran to filling their agents' context
     /// windows (gh#271) — the other meter, and the one the spend cannot stand

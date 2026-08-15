@@ -67,6 +67,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 7 days"
@@ -137,6 +138,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": null,
         "tasksTouched": 0,
@@ -193,6 +195,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "all time"
@@ -263,6 +266,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": null,
         "spend": null,
         "tasksTouched": 0,
@@ -319,6 +323,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 24 hours"
@@ -389,6 +394,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 1,
         "spend": null,
         "tasksTouched": 0,
@@ -445,6 +451,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 30 days"
@@ -515,6 +522,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 30,
         "spend": null,
         "tasksTouched": 0,
@@ -571,6 +579,7 @@
         ],
         "peakDispatches": 8,
         "peakTokens": 440,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 185000,
         "windowLabel": "last 7 days"
@@ -758,6 +767,7 @@
         "medianMinutes": 18,
         "outcomes": {},
         "p90Minutes": 74,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": null,
         "tasksTouched": 11,
@@ -833,6 +843,7 @@
         ],
         "peakDispatches": 8,
         "peakTokens": 440,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "$0.40 list-price API estimate, plus 1.0k unpriced token(s) across 1 model(s)",
         "tokenTotal": 185000,
         "windowLabel": "last 7 days"
@@ -1112,6 +1123,7 @@
         "medianMinutes": 18,
         "outcomes": {},
         "p90Minutes": 74,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": {
           "accounts": [
@@ -1369,6 +1381,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "no rate for any model in this window (1.0k unpriced token(s))",
         "tokenTotal": 1000,
         "windowLabel": "last 7 days"
@@ -1439,6 +1452,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": {
           "accounts": [],
@@ -1626,6 +1640,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "$0.40 list-price API estimate, plus 2.90M unpriced token(s) across 1 model(s)",
         "tokenTotal": 3084000,
         "windowLabel": "last 7 days"
@@ -1728,6 +1743,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": {
           "accounts": [],

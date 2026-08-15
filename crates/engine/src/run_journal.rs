@@ -223,6 +223,15 @@ impl RunJournal {
         let mut reported = false;
         let mut models: BTreeMap<String, TokenUsage> = BTreeMap::new();
         let mut agents: BTreeMap<(AgentKind, Option<String>, String), TokenUsage> = BTreeMap::new();
+        // Attribution arrives before the result-level Usage that authorizes
+        // it. Keep one pending result boundary so a cancelled resume cannot
+        // add assistant-message usage to an older authoritative total.
+        let mut pending_models: BTreeMap<String, TokenUsage> = BTreeMap::new();
+        let mut pending_agents: BTreeMap<(AgentKind, Option<String>, String), TokenUsage> =
+            BTreeMap::new();
+        let mut pending_models_reported = false;
+        let mut models_complete = true;
+        let mut agents_complete = true;
         let mut models_reported = false;
         let mut agents_reported = false;
         for line in BufReader::new(file).lines() {
@@ -241,16 +250,41 @@ impl RunJournal {
                 AgentEvent::Usage(usage) => {
                     out.usage.add(usage);
                     reported = true;
+                    let pending_model_total = pending_models.values().copied().sum::<TokenUsage>();
+                    if pending_models_reported
+                        && !pending_models.is_empty()
+                        && pending_model_total == usage
+                    {
+                        models_reported = true;
+                        for (model, usage) in std::mem::take(&mut pending_models) {
+                            models.entry(model).or_default().add(usage);
+                        }
+                    } else {
+                        models_complete = false;
+                        pending_models.clear();
+                    }
+                    pending_models_reported = false;
+
+                    let pending_agent_total = pending_agents.values().copied().sum::<TokenUsage>();
+                    if !pending_agents.is_empty() && pending_agent_total == usage {
+                        agents_reported = true;
+                        for (key, usage) in std::mem::take(&mut pending_agents) {
+                            agents.entry(key).or_default().add(usage);
+                        }
+                    } else {
+                        agents_complete = false;
+                        pending_agents.clear();
+                    }
                 }
                 AgentEvent::ModelUsage { models: rows } => {
-                    models_reported = true;
+                    pending_models_reported = true;
+                    pending_models.clear();
                     for row in rows {
-                        models.entry(row.model).or_default().add(row.usage);
+                        pending_models.entry(row.model).or_default().add(row.usage);
                     }
                 }
                 AgentEvent::AgentUsage(row) => {
-                    agents_reported = true;
-                    agents
+                    pending_agents
                         .entry((row.agent, row.name, row.model))
                         .or_default()
                         .add(row.usage);
@@ -266,13 +300,13 @@ impl RunJournal {
                 _ => {}
             }
         }
-        out.by_model = models_reported.then(|| {
+        out.by_model = (models_complete && models_reported).then(|| {
             models
                 .into_iter()
                 .map(|(model, usage)| ModelTokenUsage { model, usage })
                 .collect()
         });
-        out.by_agent = agents_reported.then(|| {
+        out.by_agent = (agents_complete && agents_reported).then(|| {
             agents
                 .into_iter()
                 .map(|((agent, name, model), usage)| AgentTokenUsage {
@@ -669,7 +703,8 @@ mod tests {
                         usage: TokenUsage {
                             input_tokens: input,
                             output_tokens: 5,
-                            ..Default::default()
+                            cache_read_tokens: input * 10,
+                            cache_creation_tokens: 1,
                         },
                     }),
                 )
@@ -683,7 +718,8 @@ mod tests {
                             usage: TokenUsage {
                                 input_tokens: input,
                                 output_tokens: 5,
-                                ..Default::default()
+                                cache_read_tokens: input * 10,
+                                cache_creation_tokens: 1,
                             },
                         }],
                     },
@@ -706,7 +742,8 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 150,
                     output_tokens: 10,
-                    ..Default::default()
+                    cache_read_tokens: 1_500,
+                    cache_creation_tokens: 2,
                 },
             }])
         );
@@ -719,10 +756,60 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 150,
                     output_tokens: 10,
-                    ..Default::default()
+                    cache_read_tokens: 1_500,
+                    cache_creation_tokens: 2,
                 },
             }])
         );
+    }
+
+    /// A resumed turn can emit complete assistant-message usage before it
+    /// reaches its result frame. Until that authoritative boundary arrives,
+    /// the prior completed result remains the attempt's whole accounting
+    /// record; cancelling the resume must not make its attribution exceed it.
+    #[test]
+    fn an_unfinished_resumed_turn_does_not_enter_completed_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &started("claude-opus-5")).unwrap();
+        let completed = AgentTokenUsage {
+            agent: AgentKind::Main,
+            name: None,
+            model: "claude-opus-5".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 1_000,
+                cache_creation_tokens: 1,
+            },
+        };
+        journal
+            .append("chat-1", &AgentEvent::AgentUsage(completed.clone()))
+            .unwrap();
+        journal.append("chat-1", &usage(100, 10)).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+
+        // The resumed turn produced a billable assistant step, then was
+        // cancelled before its result/Usage event reached the journal.
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::AgentUsage(AgentTokenUsage {
+                    agent: AgentKind::Subagent,
+                    name: Some("Explore".into()),
+                    model: "claude-haiku-4-5".into(),
+                    usage: TokenUsage {
+                        input_tokens: 30,
+                        output_tokens: 3,
+                        ..Default::default()
+                    },
+                }),
+            )
+            .unwrap();
+
+        let tokens = journal.tokens("chat-1").unwrap().expect("reported");
+        assert_eq!(tokens.usage.input_tokens, 100);
+        assert_eq!(tokens.by_agent, Some(vec![completed]));
     }
 
     /// The board spends one restart budget across the engine's revivals and

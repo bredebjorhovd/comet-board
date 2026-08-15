@@ -10,8 +10,9 @@ meaning of the old total.
 - **One total, two attribution views.** `AgentEvent::Usage` remains the only
   event added into an attempt's authoritative token total. Claude result frames
   additionally emit `ModelUsage`, and complete assistant messages emit
-  `AgentUsage`. The journal scanner aggregates those views separately, so
-  adding attribution can never double the total.
+  `AgentUsage`. The journal scanner holds those views until the corresponding
+  result-level `Usage` arrives and accepts only a four-bucket exact match, so a
+  cancelled resumed turn cannot add partial attribution to an older total.
 - **Claude message ids are the accounting boundary.** The CLI may repeat a
   complete assistant frame for one API step. Its stable message id is deduped
   before an agent row is emitted. A null `parent_tool_use_id` means the main
@@ -29,9 +30,12 @@ meaning of the old total.
   never rewritten as an empty main-agent row.
 - **Coverage travels with both numbers.** The total list-price API estimate is
   qualified by token reporting coverage. The agent/model section separately
-  says how many token-reporting attempts exposed agent detail. Desktop, iOS,
-  and the CLI use the same `BoardStats` fields; JSON names the new money field
-  `listPriceApiEstimate` rather than the billing-shaped word `cost`.
+  says how many token-reporting attempts exposed an exact whole-attempt agent
+  split. Desktop, iOS, and the CLI use the same `BoardStats` fields. JSON keeps
+  the compatible `listPrice` and `cost` names, while the response-level
+  `pricingBasis: listPriceApiEstimate` discriminator states that every one is
+  an estimate rather than a bill; the new agent-row money field is also named
+  `listPriceApiEstimate`.
 - **An estimate, never a bill.** Every rendered dollar total or row is labelled
   a list-price API estimate and the cards state that subscription runs do not
   pay per token. Plan amounts remain a separate user-entered fact and are never

@@ -331,6 +331,18 @@ impl Friction {
 
 // -- spend (gh#182) ----------------------------------------------------------
 
+/// Semantic label for every dollar-valued estimate in [`BoardStats`] JSON.
+///
+/// The legacy field names (`listPrice`, `cost`) remain for wire compatibility;
+/// this discriminator makes explicit that none of them is a bill. Older boxes
+/// omit it and deserialize to the same only-supported basis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PricingBasis {
+    #[default]
+    ListPriceApiEstimate,
+}
+
 /// One model's tokens, priced.
 ///
 /// Carries the rate it was priced at, not only the answer: a figure with no
@@ -349,6 +361,8 @@ pub struct ModelSpend {
     pub source: RateSource,
     pub rate: ModelRate,
     pub usage: TokenUsage,
+    /// Legacy-compatible wire name. Its semantics are declared by
+    /// [`BoardStats::pricing_basis`].
     pub cost: Usd,
 }
 
@@ -413,8 +427,8 @@ pub struct AccountSpend {
     pub label: String,
     pub attempts: usize,
     pub usage: TokenUsage,
-    /// List price of this account's metered work. Unpriced models are excluded
-    /// and counted in [`unpriced_tokens`](Self::unpriced_tokens).
+    /// List-price API estimate of this account's metered work. Unpriced models
+    /// are excluded and counted in [`unpriced_tokens`](Self::unpriced_tokens).
     pub list_price: Usd,
     pub unpriced_tokens: u64,
     /// What the operator says this account's plan costs per month, from
@@ -468,7 +482,9 @@ pub struct AccountPlan {
 pub struct BoardSpend {
     /// The rate set these figures were computed from, date and all.
     pub rates: RateTable,
-    /// List price of everything the board could price in this window.
+    /// List-price API estimate of everything the board could price in this
+    /// window. The compatible JSON field remains `listPrice`; the response's
+    /// [`BoardStats::pricing_basis`] states its semantics explicitly.
     pub list_price: Usd,
     /// Per model, biggest first. Ties alphabetical, like every other tally
     /// here, so an unchanged board redraws identically.
@@ -852,8 +868,10 @@ pub struct BreakdownRow {
     pub dispatches: usize,
     /// What the metered ones spent.
     pub usage: TokenUsage,
-    /// List price of that usage, priced per model so a bucket that ran two
-    /// models is priced at both their rates rather than at an average.
+    /// List-price API estimate of that usage, priced per model so a bucket that
+    /// ran two models is priced at both their rates rather than at an average.
+    /// The compatible JSON field remains `cost`; see
+    /// [`BoardStats::pricing_basis`].
     pub cost: Option<Usd>,
     /// Tokens in this row the rate table could not price, and which are
     /// therefore *not* in [`cost`](Self::cost). Carried rather than dropped:
@@ -1122,6 +1140,12 @@ pub struct BoardStats {
     #[serde(default)]
     pub spend: Option<BoardSpend>,
 
+    /// Applies to every dollar-valued `listPrice` / `cost` field in this
+    /// response. Serde-defaulted so a newer viewport can still read an older
+    /// box, while every newly emitted JSON response labels the figures.
+    #[serde(default)]
+    pub pricing_basis: PricingBasis,
+
     /// How close this window's attempts came to filling their context windows
     /// (gh#271). Defaulted on the wire, like every field added after the
     /// first release: an older board answers without it and the page simply
@@ -1217,6 +1241,7 @@ impl BoardStats {
             tokens_by_runtime: BTreeMap::new(),
             tokens_by_account: BTreeMap::new(),
             spend: None,
+            pricing_basis: PricingBasis::ListPriceApiEstimate,
             context: ContextPressure::default(),
             dispatched: false,
         }
@@ -2778,6 +2803,7 @@ mod tests {
         assert!(json.get("tokenCoverage").is_some());
         assert!(json.get("tokensByModel").is_some());
         assert!(json.get("tokensByRuntime").is_some());
+        assert_eq!(json["pricingBasis"], "listPriceApiEstimate");
         assert_eq!(json["tokens"]["cacheReadTokens"], 40_000);
         assert_eq!(
             json["dailyTokens"][0]["usage"]["cacheCreationTokens"],
@@ -2795,9 +2821,14 @@ mod tests {
             .as_object_mut()
             .expect("an object")
             .remove("hoursByWorkspace");
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("pricingBasis");
         let back: BoardStats =
             serde_json::from_value(older.clone()).expect("deserializes without it");
         assert!(back.hours_by_workspace.is_empty());
+        assert_eq!(back.pricing_basis, PricingBasis::ListPriceApiEstimate);
         assert_eq!(back.attempts, 4);
 
         // Same for a board that predates the in-flight split (gh#228): the
@@ -2906,6 +2937,9 @@ mod spec {
                 // collapsed any two of them would be inventing a zero.
                 "hasSpend": stats.has_spend(),
                 "spendLabel": stats.spend_label(),
+                // gh#426. Legacy money field names stay wire-compatible, but
+                // every reply declares that they are list-price API estimates.
+                "pricingBasis": stats.pricing_basis,
                 // gh#426. The agent/model rows use an explicitly estimated
                 // wire field, and the phone owns the same compact labels as
                 // desktop rather than receiving pre-rendered prose.

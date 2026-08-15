@@ -444,8 +444,12 @@ struct StatsView: View {
                             factRow(row.label,
                                     "\(row.priceLabel) · \(humanTokens(row.usage.total))")
                         }
+                        let remainingAgents = max(0, agents.count - Self.tallyRows)
                         Text("Agent detail from \(stats.attemptsWithAgentUsage ?? 0) "
-                             + "of \(stats.attemptsWithTokens) attempts that reported usage.")
+                             + "of \(stats.attemptsWithTokens) attempts that reported usage."
+                             + (remainingAgents > 0
+                                ? " Showing \(Self.tallyRows); \(remainingAgents) more row(s)."
+                                : ""))
                             .font(Theme.sans(Theme.textCaption))
                             .foregroundStyle(Theme.textFaint)
                             .fixedSize(horizontal: false, vertical: true)

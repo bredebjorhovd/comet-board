@@ -149,12 +149,36 @@ fn attempt_models(a: &Attempt, fallback: &str) -> Vec<comet_proto::ModelTokenUsa
         && !rows.is_empty()
         && rows.iter().map(|row| row.usage).sum::<TokenUsage>() == total
     {
-        return rows.clone();
+        // One model can appear in more than one completed result frame. Fold
+        // those frames here so a mixed-model attempt contributes one dispatch
+        // to each model it used, while retaining the exact token split.
+        let mut by_model: BTreeMap<String, TokenUsage> = BTreeMap::new();
+        for row in rows {
+            by_model
+                .entry(row.model.clone())
+                .or_default()
+                .add(row.usage);
+        }
+        return by_model
+            .into_iter()
+            .map(|(model, usage)| comet_proto::ModelTokenUsage { model, usage })
+            .collect();
     }
     vec![comet_proto::ModelTokenUsage {
         model: fallback.to_string(),
         usage: total,
     }]
+}
+
+/// A complete agent split for one authoritative attempt total (gh#426).
+///
+/// Persistence deliberately retains journal evidence even while a resumed
+/// turn is unfinished. Stats are stricter: a whole-attempt coverage count is
+/// earned only when every attributed bucket adds back to the attempt total.
+fn attempt_agents(a: &Attempt) -> Option<&[comet_proto::AgentTokenUsage]> {
+    let total = a.tokens?;
+    let rows = a.token_agents.as_deref().filter(|rows| !rows.is_empty())?;
+    (rows.iter().map(|row| row.usage).sum::<TokenUsage>() == total).then_some(rows)
 }
 
 /// The window's numbers, unpriced.
@@ -266,9 +290,10 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
                 }
             }
         }
-        // A mixed-model attempt belongs to each model it actually ran. With no
-        // usage detail it still belongs to the announced model as a dispatch,
-        // exactly as before gh#426.
+        // Model rows describe attempts that actually used each model, so a
+        // mixed-model attempt contributes once to each row. Their dispatch
+        // counts intentionally overlap; their usage and cost remain an exact,
+        // non-overlapping split of the authoritative attempt total.
         if model_rows.is_empty() {
             cuts.entry((Dimension::Model, model.clone()))
                 .or_default()
@@ -331,7 +356,7 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
                     .or_default()
                     .add(row.usage);
             }
-            if let Some(rows) = a.token_agents.as_ref().filter(|rows| !rows.is_empty()) {
+            if let Some(rows) = attempt_agents(a) {
                 attempts_with_agent_usage += 1;
                 for row in rows {
                     agent_totals
@@ -521,6 +546,7 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         breakdown,
         agent_dispatched,
         spend,
+        pricing_basis: comet_proto::view::stats::PricingBasis::ListPriceApiEstimate,
         tokens_by_model,
         tokens_by_runtime,
         tokens_by_account,
@@ -544,6 +570,33 @@ pub fn run(paths: &Paths, _log: Arc<Logger>, since_days: Option<i64>) -> Result<
         .map(|cfg| Prices::from_config(&cfg))
         .unwrap_or_else(|_| Prices::builtin());
     Ok(gather_priced(&db.load_tasks()?, since_days, &prices))
+}
+
+/// CLI rows for the attribution section, independent of whether any model had
+/// a matching rate. Unknown models are evidence too, and say `unpriced`
+/// instead of disappearing behind the aggregate spend branch (gh#426).
+fn agent_usage_lines(s: &Stats, max_rows: usize) -> Vec<String> {
+    if s.agent_usage.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "    by agent/model list-price API estimate (detail from {}/{} attempts that reported usage):",
+        s.attempts_with_agent_usage, s.attempts_with_tokens
+    )];
+    lines.extend(s.agent_usage.iter().take(max_rows).map(|row| {
+        format!(
+            "      {} · {} · {}",
+            row.price_label()
+                .unwrap_or_else(|| "rates not configured".to_string()),
+            human_tokens(row.usage.total()),
+            row.label()
+        )
+    }));
+    let remaining = s.agent_usage.len().saturating_sub(max_rows);
+    if remaining > 0 {
+        lines.push(format!("      … {remaining} more agent/model row(s)"));
+    }
+    lines
 }
 
 pub fn print(s: &Stats) {
@@ -661,21 +714,6 @@ pub fn print(s: &Stats) {
                     row.label
                 );
             }
-            if !s.agent_usage.is_empty() {
-                println!(
-                    "    by agent/model list-price API estimate (detail from {}/{} attempts that reported usage):",
-                    s.attempts_with_agent_usage, s.attempts_with_tokens
-                );
-                for row in s.agent_usage.iter().take(4) {
-                    println!(
-                        "      {} · {} · {}",
-                        row.price_label()
-                            .unwrap_or_else(|| "rates not configured".to_string()),
-                        human_tokens(row.usage.total()),
-                        row.label()
-                    );
-                }
-            }
             if !spend.is_complete() {
                 println!(
                     "    {} token(s) on {} model(s) with no rate, and so not in that total: {}",
@@ -717,6 +755,9 @@ pub fn print(s: &Stats) {
         // Rates configured, and still no price: every metered model was one
         // the table has never heard of. `spend_label` is the sentence for it.
         Some(_) => println!("  {}", s.spend_label()),
+    }
+    for line in agent_usage_lines(s, 4) {
+        println!("{line}");
     }
     let line = |label: &str, m: &BTreeMap<String, usize>| {
         if m.len() > 1 {
@@ -1438,6 +1479,24 @@ mod tests {
         );
         assert_eq!(s.tokens_by_model["claude-opus-5"].total(), 1_000_000);
         assert_eq!(s.tokens_by_model["claude-haiku-4-5"].total(), 1_000_000);
+        let models = s
+            .breakdown
+            .iter()
+            .find(|cut| cut.dimension == Dimension::Model)
+            .expect("model breakdown");
+        for (label, estimate) in [
+            ("claude-opus-5", Usd::from_dollars(5.0)),
+            ("claude-haiku-4-5", Usd::from_dollars(1.0)),
+        ] {
+            let row = models
+                .rows
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap_or_else(|| panic!("actual model row {label}"));
+            assert_eq!(row.dispatches, 1, "one attempt used {label}");
+            assert_eq!(row.usage.total(), 1_000_000);
+            assert_eq!(row.cost, Some(estimate));
+        }
         assert_eq!(s.attempts_with_agent_usage, 1);
         assert_eq!(s.agent_usage.len(), 2);
         assert_eq!(s.agent_usage[0].label(), "Main · claude-opus-5");
@@ -1451,6 +1510,23 @@ mod tests {
             Some(Usd::from_dollars(1.0))
         );
         assert_eq!(s.token_coverage, Some(1.0));
+
+        // `comet-board stats --json` serializes this value directly. Keep the
+        // compatible money names, but never emit them without the response's
+        // explicit estimate basis beside them.
+        let json = serde_json::to_value(&s).expect("stats JSON");
+        assert_eq!(json["pricingBasis"], "listPriceApiEstimate");
+        assert!(json["spend"].get("listPrice").is_some());
+        assert!(
+            json["spend"]["byModel"]
+                .as_array()
+                .is_some_and(|rows| { rows.iter().all(|row| row.get("cost").is_some()) })
+        );
+        assert!(json["breakdown"].as_array().is_some_and(|cuts| {
+            cuts.iter()
+                .flat_map(|cut| cut["rows"].as_array())
+                .any(|rows| rows.iter().any(|row| row.get("cost").is_some()))
+        }));
     }
 
     #[test]
@@ -1473,6 +1549,48 @@ mod tests {
             Usd::from_dollars(10.0),
             "a partial attribution may not make one million tokens disappear"
         );
+    }
+
+    #[test]
+    fn agent_attribution_that_exceeds_the_attempt_total_is_not_reported_as_covered() {
+        let mut attempt = spent(30, "claude-opus-5", None, usage(100, 10, 0, 0));
+        attempt.token_agents = Some(vec![comet_proto::AgentTokenUsage {
+            agent: comet_proto::AgentKind::Subagent,
+            name: Some("Explore".into()),
+            model: "claude-haiku-4-5".into(),
+            usage: usage(130, 13, 0, 0),
+        }]);
+
+        let s = gather_priced(
+            &[task("t1", vec![attempt])],
+            Some(7),
+            &crate::prices::Prices::builtin(),
+        );
+        assert_eq!(s.attempts_with_tokens, 1);
+        assert_eq!(s.attempts_with_agent_usage, 0);
+        assert!(s.agent_usage.is_empty());
+    }
+
+    #[test]
+    fn cli_agent_rows_keep_an_all_unpriced_model_visible() {
+        let mut attempt = spent(30, "unknown-main", None, usage(100, 10, 0, 0));
+        attempt.token_agents = Some(vec![comet_proto::AgentTokenUsage {
+            agent: comet_proto::AgentKind::Subagent,
+            name: Some("Explore".into()),
+            model: "unknown-research-model".into(),
+            usage: usage(100, 10, 0, 0),
+        }]);
+        let s = gather_priced(
+            &[task("t1", vec![attempt])],
+            Some(7),
+            &crate::prices::Prices::builtin(),
+        );
+        assert!(!s.spend.as_ref().expect("rates configured").has_price());
+
+        let text = agent_usage_lines(&s, 4).join("\n");
+        assert!(text.contains("by agent/model list-price API estimate"));
+        assert!(text.contains("Explore · unknown-research-model"));
+        assert!(text.contains("unpriced"));
     }
 
     #[test]
