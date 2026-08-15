@@ -110,8 +110,9 @@ jobs:
   # reason — a change to the steps it runs re-runs this job to check the two
   # still agree.
   #
-  # Read a green `edge` check carefully: it means *either* the 74 tests passed
-  # *or* the pull request never touched edge/ and the steps were skipped. A
+  # Read a green `edge` check carefully: it means *either* both vitest tiers
+  # (Node unit + workerd, gh#413) passed *or* the pull request never touched
+  # edge/ and the steps were skipped. A
   # skipped step reports success like any other, so the check alone does not
   # tell you the tests ran — look for `changed=true` in the detect step, or for
   # the install/typecheck/test steps having a non-zero duration.
@@ -164,7 +165,16 @@ jobs:
         if: steps.changed.outputs.changed == 'true'
         working-directory: edge
         run: npm run typecheck
-      - name: test
+      # Two tiers, two steps: `npm test` runs both, but a workerd failure
+      # buried inside one step reads as "the edge tests failed" — split, the
+      # step name says whether pure logic broke or the runtime disagreed with
+      # our fakes (gh#413). deploy.yml keeps its single `npm test`, which runs
+      # the same two tiers in the same order, so the gates still agree.
+      - name: test (unit)
         if: steps.changed.outputs.changed == 'true'
         working-directory: edge
-        run: npm test
+        run: npm run test:unit
+      - name: test (workerd)
+        if: steps.changed.outputs.changed == 'true'
+        working-directory: edge
+        run: npm run test:workerd
