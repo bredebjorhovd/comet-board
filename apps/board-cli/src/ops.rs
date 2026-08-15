@@ -208,6 +208,36 @@ pub async fn board_rows(board: &Board) -> Result<Vec<TaskRow>> {
     snapshot(&mut stream, board.host()).await
 }
 
+/// The row named by a canonical id or an unambiguous display identifier.
+///
+/// This is the wire-row twin of `comet_board::dispatch::task_by_reference`:
+/// exact ids win, while a short identifier shared by repositories is refused
+/// with every canonical candidate named. RPC consumers only have [`TaskRow`]
+/// values, so they cannot call the board-core helper over stored `Task`s.
+pub fn task_row_by_reference<'a>(rows: &'a [TaskRow], reference: &str) -> Result<&'a TaskRow> {
+    let reference = reference.trim();
+    if let Some(row) = rows.iter().find(|row| row.id == reference) {
+        return Ok(row);
+    }
+    let named: Vec<&TaskRow> = rows
+        .iter()
+        .filter(|row| row.identifier.eq_ignore_ascii_case(reference))
+        .collect();
+    match named.as_slice() {
+        [] => bail!("`{reference}` is not a task on the board"),
+        [only] => Ok(only),
+        several => bail!(
+            "`{reference}` names {} tasks on the board — pass the task id to say which: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|row| format!("`{}`", row.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 // ---- list ---------------------------------------------------------------
 
 /// Reject an unknown filter rather than returning an empty list: to a caller,
@@ -864,11 +894,25 @@ pub async fn cross_billing_warning(
     // Nobody to compare against: an unattributed dispatch names no wronged
     // party, and asking the box two more questions could not change that.
     let me = opts.via_user?;
-    let row = board_rows(board)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|r| r.id == task_id)?;
+    let rows = board_rows(board).await.ok()?;
+    let row = task_row_by_reference(&rows, task_id).ok()?;
+    cross_billing_warning_for_row(board, row, opts, Some(me)).await
+}
+
+/// Whether dispatching `row` under `opts` would move work onto another
+/// person's subscription, compared with an explicitly supplied payer.
+///
+/// Human frontends pass their signed-in identity through
+/// [`cross_billing_warning`]. The board MCP consumer instead passes the parent
+/// attempt's recorded `billed_to`: that is budget provenance, not a claim that
+/// the parent agent is the human who released its child.
+pub async fn cross_billing_warning_for_row(
+    board: &Board,
+    row: &TaskRow,
+    opts: DispatchOpts<'_>,
+    payer: Option<&str>,
+) -> Option<String> {
+    let payer = payer?;
     // Exactly the chain `build_spec` walks: `--bill <slot>`, then `--account`,
     // then the route's own — which is what the row reports for a task nothing
     // has run on yet.
@@ -888,7 +932,7 @@ pub async fn cross_billing_warning(
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())?;
     let billed = view::billed_email(&accounts.accounts, harness, slot)?;
-    view::cross_billed(Some(billed), Some(me)).then(|| view::bills_warning(billed, harness))
+    view::cross_billed(Some(billed), Some(payer)).then(|| view::bills_warning(billed, harness))
 }
 
 /// One model a dispatch can be pointed at, as `ListModels` reports it for a

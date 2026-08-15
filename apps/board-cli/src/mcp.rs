@@ -128,7 +128,7 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "Board id or identifier, for example gh:owner/repo#14 or gh#14. Omit for this chat's task."
+                        "description": "Canonical board id or an unambiguous identifier, for example gh:owner/repo#14 or gh#14. Omit for this chat's task."
                     }
                 },
                 "additionalProperties": false
@@ -153,7 +153,6 @@ fn tool_definitions() -> Vec<Value> {
                     "runtime": { "type": "string" },
                     "model": { "type": "string" },
                     "account": { "type": "string" },
-                    "bill": { "type": "string" },
                     "stack": { "type": "boolean", "default": false },
                     "decompose": { "type": "boolean", "default": false },
                     "onto": { "type": "string" },
@@ -193,9 +192,7 @@ async fn task_status(board: &Board, chat_id: Option<&str>, arguments: Value) -> 
     let args: StatusArgs = serde_json::from_value(arguments).context("task_status arguments")?;
     let rows = ops::board_rows(board).await?;
     let row = match args.task.as_deref() {
-        Some(task) => rows
-            .iter()
-            .find(|row| row.id == task || row.identifier == task),
+        Some(task) => Some(ops::task_row_by_reference(&rows, task)?),
         None => {
             let chat = chat_id.ok_or_else(|| {
                 anyhow!("this is not a board-dispatched chat; pass `task` explicitly")
@@ -260,7 +257,6 @@ struct DispatchArgs {
     runtime: Option<String>,
     model: Option<String>,
     account: Option<String>,
-    bill: Option<String>,
     stack: bool,
     decompose: bool,
     onto: Option<String>,
@@ -278,23 +274,45 @@ async fn dispatch_task(board: &Board, chat_id: Option<&str>, arguments: Value) -
             "a dispatch cannot request both stack and decompose"
         ));
     }
-    let me = ops::signed_in_email(board).await;
+    let chat_id = chat_id.ok_or_else(|| {
+        anyhow!("dispatch_task is only available inside a board-dispatched agent chat")
+    })?;
+    let rows = ops::board_rows(board).await?;
+    let current = rows
+        .iter()
+        .find(|row| row_belongs_to_chat(row, chat_id))
+        .ok_or_else(|| anyhow!("this chat no longer belongs to a task on the board"))?;
+    let target = ops::task_row_by_reference(&rows, &args.task)?;
     let opts = DispatchOpts {
-        via: chat_id,
+        via: Some(chat_id),
         runtime: args.runtime.as_deref(),
         model: args.model.as_deref(),
         account: args.account.as_deref(),
-        bill: args.bill.as_deref(),
-        via_user: me.as_deref(),
+        // An MCP call is released by the parent agent, not by the host's
+        // signed-in frontend user. Keep its chat provenance and carry no human
+        // attribution or payer acknowledgement the model could manufacture.
+        bill: None,
+        via_user: None,
         onto: args.onto.as_deref(),
         base: args.base.as_deref(),
         replace: false,
         stack: args.stack,
         decompose: args.decompose,
     };
-    let warning = ops::cross_billing_warning(board, &args.task, opts).await;
-    let dispatched = ops::dispatch_checked(board, &args.task, opts).await?;
-    Ok(json!({ "dispatch": dispatched, "warning": warning }))
+    if let Some(warning) = ops::cross_billing_warning_for_row(
+        board,
+        target,
+        opts,
+        current.billed_to.as_deref(),
+    )
+    .await
+    {
+        return Err(anyhow!(
+            "{warning}; an agent cannot acknowledge a different payer — ask a human to dispatch this task from the board, desktop, or CLI"
+        ));
+    }
+    let dispatched = ops::dispatch_checked(board, &target.id, opts).await?;
+    Ok(json!({ "dispatch": dispatched }))
 }
 
 #[cfg(test)]
