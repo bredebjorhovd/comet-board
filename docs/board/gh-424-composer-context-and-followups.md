@@ -69,7 +69,12 @@ deltas shift unaffected occurrences and revoke every intersected occurrence,
 including an indistinguishable same-bytes replacement; a separately typed
 duplicate never inherits the selected occurrence's stamp. A successful Send,
 Steer, Queue, or edit draft clear removes the consumed provenance. Retyping or
-pasting the same path is therefore still plain text. iPhone mirrors the same
+pasting the same path is therefore still plain text. Queue editing replaces
+normal-draft provenance and rehydrates only paths with exactly one durable ref
+and one prompt occurrence; ambiguous duplicates require picker reselection.
+Wizard advance/finish and edit cancel/success clear provenance with their shared
+input. Programmatic `@` and `/` completions apply the same range deltas as editor
+events. iPhone mirrors the same
 `checkoutId` field. Immediately before Run, Steer, or queued execution, the host
 re-resolves the current chat root through the same registered repository and
 worktree authority as search, recomputes the identity, and refuses an unstamped
@@ -211,6 +216,10 @@ The repository tests cover:
   syntax remaining plain text, including select → Send → retype, select →
   delete → retype, selected plus typed duplicate, and identical paste-over
   editor-event regressions;
+- command Loro JSON and snapshot reopen retaining non-empty typed context, and
+  the engine passing restored refs into execution-time validation;
+- queue-edit provenance replacement, ambiguous duplicate fail-closed hydration,
+  edit/wizard clear revocation, and programmatic completion range shifting;
 - Queue fold edit/move/remove/pause/run-next and two-client deterministic fold;
 - exclusive unpaused/paused RunNext evaluation and removed-target cleanup;
 - client-owned id deduplication, collision refusal, and add → treated-as-lost

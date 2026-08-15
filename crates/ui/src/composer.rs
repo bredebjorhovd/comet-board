@@ -30,8 +30,8 @@ use comet_doc::{
 use comet_proto::view::context as view_context;
 use comet_proto::view::skills as view_skills;
 use comet_proto::{
-    ContextMatch, ContextRef, ContextSearch, RunRequest, SandboxLevel, SkillDescriptor,
-    UserInputAnswer, UserInputQuestion,
+    ContextMatch, ContextRef, ContextRefKind, ContextSearch, RunRequest, SandboxLevel,
+    SkillDescriptor, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::methods;
 
@@ -66,7 +66,12 @@ fn selected_context_refs(
         .into_iter()
         .flatten()
         .filter_map(|selection| {
-            let expected = format!("@{}", selection.path);
+            let expected = ContextRef {
+                path: selection.path.clone(),
+                kind: selection.kind,
+                checkout_id: None,
+            }
+            .token();
             (text.get(selection.token_start..selection.token_end) == Some(expected.as_str()))
                 .then(|| selection.clone())
         })
@@ -100,6 +105,60 @@ fn apply_context_edit(selections: &mut Vec<ContextSelection>, edit: &ComposerTex
             edit.replaced.start >= selection.token_end
         }
     });
+}
+
+fn queued_context_selections(prompt: &str, context: &[ContextRef]) -> Vec<ContextSelection> {
+    context
+        .iter()
+        .filter_map(|reference| {
+            let checkout_id = reference.checkout_id.as_deref()?.trim();
+            if checkout_id.is_empty()
+                || context
+                    .iter()
+                    .filter(|other| other.path == reference.path)
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            let token = reference.token();
+            let mut occurrences = prompt.match_indices(&token);
+            let (token_start, _) = occurrences.next()?;
+            if occurrences.next().is_some() {
+                return None;
+            }
+            Some(ContextSelection {
+                path: reference.path.clone(),
+                kind: reference.kind,
+                checkout_id: checkout_id.to_string(),
+                token_start,
+                token_end: token_start + token.len(),
+            })
+        })
+        .collect()
+}
+
+fn replace_with_queued_context(
+    all: &mut HashMap<String, Vec<ContextSelection>>,
+    draft_key: &str,
+    prompt: &str,
+    context: &[ContextRef],
+) {
+    let selections = queued_context_selections(prompt, context);
+    if selections.is_empty() {
+        all.remove(draft_key);
+    } else {
+        all.insert(draft_key.to_string(), selections);
+    }
+}
+
+fn clear_draft_provenance(
+    drafts: &mut HashMap<String, String>,
+    context: &mut HashMap<String, Vec<ContextSelection>>,
+    draft_key: &str,
+) {
+    drafts.remove(draft_key);
+    context.remove(draft_key);
 }
 
 fn take_context_selections(
@@ -2602,8 +2661,13 @@ impl Composer {
         let Some(row) = rows.get(self.context_selected) else {
             return;
         };
-        let (text, caret) =
-            view_context::complete(self.input.read(cx).text(), &token, &row.to_ref());
+        let reference = row.to_ref();
+        let inserted = reference.token();
+        let (text, caret) = view_context::complete(self.input.read(cx).text(), &token, &reference);
+        self.apply_context_edit(&ComposerTextEdit {
+            replaced: token.start..token.end,
+            inserted_len: inserted.len() + usize::from(reference.kind == ContextRefKind::File),
+        });
         if let Some(checkout_id) = self.context_checkout_id.clone() {
             self.context_ref_checkouts
                 .entry(self.current_key.clone())
@@ -2613,7 +2677,7 @@ impl Composer {
                     kind: row.kind,
                     checkout_id,
                     token_start: token.start,
-                    token_end: token.start + 1 + row.path.len(),
+                    token_end: token.start + inserted.len(),
                 });
         }
         self.input
@@ -2660,6 +2724,10 @@ impl Composer {
             return;
         };
         let (text, caret) = view_skills::complete(self.input.read(cx).text(), &token, &skill.name);
+        self.apply_context_edit(&ComposerTextEdit {
+            replaced: token.start..token.end,
+            inserted_len: 1 + skill.name.len() + 1,
+        });
         self.input
             .update(cx, |input, cx| input.set_text_with_caret(text, caret, cx));
         self.skill_selected = 0;
@@ -2740,6 +2808,15 @@ impl Composer {
 
     fn context_tokens(&self, text: &str) -> Vec<ContextRef> {
         selected_context_refs(text, self.context_ref_checkouts.get(&self.current_key))
+    }
+
+    fn clear_input_and_provenance(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        clear_draft_provenance(
+            &mut self.drafts,
+            &mut self.context_ref_checkouts,
+            &self.current_key,
+        );
     }
 
     fn apply_context_edit(&mut self, edit: &ComposerTextEdit) {
@@ -2906,11 +2983,7 @@ impl Composer {
                         // Do not erase keystrokes entered while the durable
                         // append was in flight.
                         if composer.input.read(cx).text().trim() == text {
-                            composer
-                                .input
-                                .update(cx, |input, cx| input.set_text("", cx));
-                            composer.drafts.remove(&composer.current_key);
-                            composer.context_ref_checkouts.remove(&composer.current_key);
+                            composer.clear_input_and_provenance(cx);
                         }
                     }
                     Err(err) => composer.failure = Some(format!("Queue failed: {err}").into()),
@@ -2927,24 +3000,12 @@ impl Composer {
             return;
         };
         let prompt = row.prompt.clone();
-        let stamps = self
-            .context_ref_checkouts
-            .entry(self.current_key.clone())
-            .or_default();
-        for reference in &row.context {
-            if let Some(checkout_id) = &reference.checkout_id {
-                let token = format!("@{}", reference.path);
-                if let Some(token_start) = prompt.find(&token) {
-                    stamps.push(ContextSelection {
-                        path: reference.path.clone(),
-                        kind: reference.kind,
-                        checkout_id: checkout_id.clone(),
-                        token_start,
-                        token_end: token_start + token.len(),
-                    });
-                }
-            }
-        }
+        replace_with_queued_context(
+            &mut self.context_ref_checkouts,
+            &self.current_key,
+            &prompt,
+            &row.context,
+        );
         self.editing = Some(row_id.to_string());
         self.input
             .update(cx, |input, cx| input.set_text(prompt, cx));
@@ -2958,7 +3019,7 @@ impl Composer {
         if self.editing.take().is_none() {
             return;
         }
-        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.clear_input_and_provenance(cx);
         self.input
             .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
         cx.notify();
@@ -3565,7 +3626,7 @@ impl Composer {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
                 // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.clear_input_and_provenance(cx);
                 cx.notify();
             }
         }
@@ -3585,8 +3646,8 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
+        self.clear_input_and_provenance(cx);
         self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
         });
@@ -5162,6 +5223,81 @@ mod tests {
             selected_context_refs(text, Some(&selections)).is_empty(),
             "an indistinguishable editor replacement fails closed"
         );
+    }
+
+    fn stamped_file(path: &str) -> ContextRef {
+        ContextRef {
+            path: path.into(),
+            kind: ContextRefKind::File,
+            checkout_id: Some("host-checkout".into()),
+        }
+    }
+
+    #[test]
+    fn starting_queue_edit_replaces_prior_draft_provenance() {
+        let mut all = HashMap::from([(
+            "chat-a".into(),
+            vec![ContextSelection {
+                path: "old.rs".into(),
+                kind: ContextRefKind::File,
+                checkout_id: "host-checkout".into(),
+                token_start: 0,
+                token_end: 7,
+            }],
+        )]);
+        replace_with_queued_context(
+            &mut all,
+            "chat-a",
+            "edit @new.rs",
+            &[stamped_file("new.rs")],
+        );
+        let selections = all.get("chat-a").unwrap();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].path, "new.rs");
+    }
+
+    #[test]
+    fn ambiguous_duplicate_queue_context_requires_reselection() {
+        let prompt = "typed @same.rs then selected @same.rs";
+        assert!(queued_context_selections(prompt, &[stamped_file("same.rs")]).is_empty());
+    }
+
+    #[test]
+    fn clearing_an_edit_or_wizard_draft_also_revokes_provenance() {
+        let text = "edit @same.rs";
+        let selection = ContextSelection {
+            path: "same.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 5,
+            token_end: text.len(),
+        };
+        let mut drafts = HashMap::from([("chat-a".into(), text.into())]);
+        let mut context = HashMap::from([("chat-a".into(), vec![selection])]);
+        clear_draft_provenance(&mut drafts, &mut context, "chat-a");
+        assert!(!drafts.contains_key("chat-a"));
+        assert!(selected_context_refs(text, context.get("chat-a")).is_empty());
+    }
+
+    #[test]
+    fn programmatic_completion_shifts_later_selected_occurrences() {
+        let before = "/x @src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 3,
+            token_end: before.len(),
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 0..2,
+                inserted_len: "/longer-skill ".len(),
+            },
+        );
+        let after = "/longer-skill  @src/foo.rs";
+        assert_eq!(selected_context_refs(after, Some(&selections)).len(), 1);
     }
 
     #[test]

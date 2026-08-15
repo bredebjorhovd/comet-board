@@ -333,11 +333,8 @@ impl ChatDocHandle {
         // command either finishes on the old owner and is copied below, or
         // starts after the replacement is visible and writes there directly.
         let mut owner = self.doc.write().unwrap_or_else(PoisonError::into_inner);
-        let replayed = reconcile_device_commands(
-            owner.as_ref(),
-            replacement.as_ref(),
-            &self.device_id,
-        )?;
+        let replayed =
+            reconcile_device_commands(owner.as_ref(), replacement.as_ref(), &self.device_id)?;
         let changed_tx = self.changed_tx.clone();
         let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
@@ -1292,12 +1289,9 @@ impl DocHost {
                     Ok(outcome) => outcome,
                     Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                 };
-                if let Err(err) = self.persist_command_outcome(
-                    handle,
-                    &entry.id,
-                    status,
-                    resolution.as_deref(),
-                ) {
+                if let Err(err) =
+                    self.persist_command_outcome(handle, &entry.id, status, resolution.as_deref())
+                {
                     tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
                         "run outcome snapshot failed; retaining command claim until restart");
                     return;
@@ -1760,13 +1754,7 @@ impl DocHost {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) -> Result<usize, EngineError> {
-        self.persist_command_outcome_with_hook(
-            handle,
-            command_id,
-            status,
-            resolution,
-            || {},
-        )
+        self.persist_command_outcome_with_hook(handle, command_id, status, resolution, || {})
     }
 
     fn persist_command_outcome_with_hook(
@@ -2368,16 +2356,17 @@ mod tests {
         let first_host = host(dir.path());
         let chat_id = "chat-outcome-reseed";
         let command_id = "outcome-reseed";
-        first_host.queue_command_with_id(
-            chat_id,
-            command_id,
-            SessionCommandPayload::Queue {
-                prompt: "already dispatched".into(),
-                message_id: "outcome-reseed-message".into(),
-                attachments: Vec::new(),
-            },
-        )
-        .unwrap();
+        first_host
+            .queue_command_with_id(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Queue {
+                    prompt: "already dispatched".into(),
+                    message_id: "outcome-reseed-message".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
         let handle = first_host.open(chat_id).unwrap();
 
         // The incoming room snapshot was cut while the command was Pending.
@@ -2408,11 +2397,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            outcome_host
-                .inner
-                .store
-                .mark_processed(command_id)
-                .unwrap();
+            outcome_host.inner.store.mark_processed(command_id).unwrap();
         });
         outcome_written_rx.recv().unwrap();
 
@@ -2435,7 +2420,9 @@ mod tests {
 
         let current = handle.doc().read_commands().unwrap();
         assert!(current.iter().any(|command| {
-            command.id == command_id && command.status == SessionCommandStatus::Applied
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
         }));
         first_host.persist_snapshot(&handle).unwrap();
 
@@ -2443,7 +2430,9 @@ mod tests {
         let reopened = restarted.open(chat_id).unwrap();
         let commands = reopened.doc().read_commands().unwrap();
         assert!(commands.iter().any(|command| {
-            command.id == command_id && command.status == SessionCommandStatus::Applied
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
         }));
         assert!(restarted.inner.store.is_processed(command_id).unwrap());
         assert!(!commands.iter().any(|command| {
@@ -2490,11 +2479,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            outcome_host
-                .inner
-                .store
-                .mark_processed(command_id)
-                .unwrap();
+            outcome_host.inner.store.mark_processed(command_id).unwrap();
         });
         outcome_written_rx.recv().unwrap();
 
@@ -2518,7 +2503,9 @@ mod tests {
         assert!(first_host.inner.store.is_processed(command_id).unwrap());
         let current = handle.doc().read_commands().unwrap();
         assert!(current.iter().any(|command| {
-            command.id == command_id && command.status == SessionCommandStatus::Applied
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
         }));
         first_host.persist_snapshot(&handle).unwrap();
 
@@ -2530,12 +2517,60 @@ mod tests {
             .read_commands()
             .unwrap();
         assert!(commands.iter().any(|command| {
-            command.id == command_id && command.status == SessionCommandStatus::Applied
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
         }));
         assert!(restarted.inner.store.is_processed(command_id).unwrap());
         assert!(!commands.iter().any(|command| {
             command.id == command_id && command.status == SessionCommandStatus::Pending
         }));
+    }
+
+    #[tokio::test]
+    async fn typed_context_reaches_execution_validation_after_snapshot_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_host = host(dir.path());
+        let chat_id = "chat-context-restart";
+        let context = vec![ContextRef {
+            path: "src/main.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: Some("host-checkout".into()),
+        }];
+        first_host
+            .queue_command_with_id_and_context(
+                chat_id,
+                "context-restart",
+                SessionCommandPayload::Steer {
+                    prompt: "inspect @src/main.rs".into(),
+                    message_id: None,
+                },
+                context.clone(),
+            )
+            .unwrap();
+        let handle = first_host.open(chat_id).unwrap();
+        first_host.persist_snapshot(&handle).unwrap();
+
+        let restarted = host(dir.path());
+        let entry = restarted
+            .open(chat_id)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|command| command.id == "context-restart")
+            .unwrap();
+        assert_eq!(entry.context, context, "snapshot preserves typed authority");
+        let mut prompt = "inspect @src/main.rs".to_string();
+        let err = restarted
+            .apply_context(chat_id, "/registered/checkout", &entry.context, &mut prompt)
+            .await
+            .expect_err("the restored non-empty context reaches host validation");
+        assert!(
+            err.to_string().contains("workspace host"),
+            "validation was reached after restart: {err}"
+        );
     }
 
     #[tokio::test]

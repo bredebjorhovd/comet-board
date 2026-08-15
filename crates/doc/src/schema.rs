@@ -295,6 +295,12 @@ impl SessionDoc {
             "payload",
             loro_value_from_json(&serde_json::to_value(&entry.payload)?),
         )?;
+        if !entry.context.is_empty() {
+            map.insert(
+                "context",
+                loro_value_from_json(&serde_json::to_value(&entry.context)?),
+            )?;
+        }
         map.insert("issuedBy", entry.issued_by.as_str())?;
         map.insert("issuedAt", entry.issued_at)?;
         if let Some(based_on) = &entry.based_on {
@@ -312,6 +318,9 @@ impl SessionDoc {
                 .as_str()
                 .ok_or_else(|| DocError::Schema("status not a string".into()))?,
         )?;
+        if let Some(resolution) = &entry.resolution {
+            map.insert("resolution", resolution.as_str())?;
+        }
         self.doc.commit();
         Ok(())
     }
@@ -982,7 +991,13 @@ mod tests {
     #[test]
     fn command_queue_and_outcome_round_trip() {
         use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        use comet_proto::{ContextRef, ContextRefKind};
         let doc = SessionDoc::init("chat-1").unwrap();
+        let context = vec![ContextRef {
+            path: "src/main.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: Some("host-checkout".into()),
+        }];
         let entry = SessionCommandEntry {
             id: "c1".into(),
             payload: SessionCommandPayload::Steer {
@@ -995,15 +1010,27 @@ mod tests {
             expires_at: None,
             status: SessionCommandStatus::Pending,
             resolution: None,
-            context: Vec::new(),
+            context: context.clone(),
         };
         doc.queue_command(&entry).unwrap();
-        doc.set_command_status("c1", SessionCommandStatus::Applied, None)
-            .unwrap();
+        doc.set_command_status(
+            "c1",
+            SessionCommandStatus::Applied,
+            Some("resolved context"),
+        )
+        .unwrap();
         let commands = doc.read_commands().unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+        assert_eq!(commands[0].context, context);
+        assert_eq!(commands[0].resolution.as_deref(), Some("resolved context"));
+
+        let reopened = LoroDoc::new();
+        reopened.import(&doc.export_snapshot().unwrap()).unwrap();
+        let commands = SessionDoc::from_doc(reopened).read_commands().unwrap();
+        assert_eq!(commands[0].context, entry.context);
+        assert_eq!(commands[0].resolution.as_deref(), Some("resolved context"));
     }
 
     #[test]
