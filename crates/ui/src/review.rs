@@ -2307,7 +2307,7 @@ impl ReviewPanel {
     /// The sentence stays under it. A loader alone says something is happening
     /// but not what, and "reading" is the honest verb here — the board is doing
     /// the reading, and the reader is being told whose work they are waiting on.
-    fn render_loading(theme: &Theme) -> AnyElement {
+    fn render_loading(theme: &Theme, view: gpui::EntityId, cx: &mut gpui::App) -> AnyElement {
         div()
             .size_full()
             .flex()
@@ -2315,7 +2315,7 @@ impl ReviewPanel {
             .items_center()
             .justify_center()
             .gap(px(Theme::SPACE_MD))
-            .child(loaders::comet_loader("review-loading", theme, LOADER_CELL))
+            .child(loaders::comet_loader(theme, LOADER_CELL, view, cx))
             .child(
                 div()
                     .text_size(px(Theme::TEXT_DENSE))
@@ -2362,7 +2362,7 @@ impl Render for ReviewPanel {
                     SharedString::from("No review for this task."),
                 )
             } else {
-                Self::render_loading(&theme)
+                Self::render_loading(&theme, cx.entity_id(), cx)
             };
         };
 

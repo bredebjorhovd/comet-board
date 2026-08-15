@@ -22,3 +22,6 @@ uuid.workspace = true
 [dev-dependencies]
 # The org e2e driver stands in for the board's own `POST /share/{chatId}`.
 reqwest.workspace = true
+# The e2e drivers materialize WatchDocMessages delta frames (gh#414) the same
+# way both viewports do.
+comet-doc.workspace = true

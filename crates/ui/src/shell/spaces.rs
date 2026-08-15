@@ -1439,10 +1439,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                ))
+                .child(loaders::mini_gradient_spinner(2.0, cx.entity_id(), cx))
                 .into_any_element()
         } else {
             div()
@@ -1795,10 +1792,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("orch-working-{}", slot.chat_id),
-                    2.0,
-                ))
+                .child(loaders::mini_gradient_spinner(2.0, cx.entity_id(), cx))
                 .into_any_element()
         } else {
             div()
@@ -2002,9 +1996,10 @@ impl Shell {
     /// glyph can), the board's own glyph otherwise — so a row means the same
     /// thing here as it does one keystroke away in the board pane.
     fn render_agent_rail(
-        key: &str,
         state: comet_proto::view::board::AgentState,
         accent: gpui::Hsla,
+        view: gpui::EntityId,
+        cx: &mut gpui::App,
     ) -> AnyElement {
         use comet_proto::view::board::AgentState;
         if state == AgentState::Working {
@@ -2014,7 +2009,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(loaders::mini_gradient_spinner(key.to_string(), 2.0))
+                .child(loaders::mini_gradient_spinner(2.0, view, cx))
                 .into_any_element()
         } else {
             div()
@@ -2042,11 +2037,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let accent = crate::board::agent_state_color(row.state, theme);
-        let rail = Self::render_agent_rail(
-            &format!("running-working-{}", row.chat_id),
-            row.state,
-            accent,
-        );
+        let rail = Self::render_agent_rail(row.state, accent, cx.entity_id(), cx);
         let subline = theme.text_subtle;
         let fade_key = format!("running-row-{}", row.chat_id);
         let chat_id = row.chat_id.clone();
@@ -2113,11 +2104,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let accent = crate::board::agent_state_color(agent.state, theme);
-        let rail = Self::render_agent_rail(
-            &format!("agent-working-{}", agent.chat_id),
-            agent.state,
-            accent,
-        );
+        let rail = Self::render_agent_rail(agent.state, accent, cx.entity_id(), cx);
 
         let subline = theme.text_subtle;
         let fade_key = format!("agent-row-{}", agent.chat_id);
@@ -3349,7 +3336,7 @@ impl Shell {
                 div()
                     .px(px(8.0))
                     .py(px(10.0))
-                    .child(popover::skeleton_rows("add-space-repo-skeleton", theme, 6))
+                    .child(popover::skeleton_rows(theme, 6, cx.entity_id(), cx))
                     .into_any_element()
             } else {
                 div()
@@ -3595,7 +3582,7 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .child(if connecting {
-                        loaders::mini_gradient_spinner(format!("add-space-connecting-{ix}"), 2.0)
+                        loaders::mini_gradient_spinner(2.0, cx.entity_id(), cx)
                             .into_any_element()
                     } else if row.slug.is_some() {
                         icon(icons::GITHUB_MARK)
@@ -3717,7 +3704,7 @@ impl Shell {
                         "Board"
                     }))
                     .when(sweeping, |el| {
-                        el.child(loaders::mini_gradient_spinner("add-space-sweep", 2.0))
+                        el.child(loaders::mini_gradient_spinner(2.0, cx.entity_id(), cx))
                     }),
             );
 
@@ -4042,7 +4029,7 @@ impl Shell {
             div()
                 .px(px(8.0))
                 .py(px(6.0))
-                .child(popover::skeleton_rows("add-space-skeleton", theme, 6))
+                .child(popover::skeleton_rows(theme, 6, cx.entity_id(), cx))
                 .into_any_element()
         } else if let Some(message) = load_error {
             let device_line = device

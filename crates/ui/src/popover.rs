@@ -13,7 +13,7 @@
 
 use gpui::{Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px};
 
-use crate::motion::{self, AnimationExt as _, COMET_PULSE};
+use crate::motion::{self, COMET_PULSE};
 use crate::theme::{Bed, ListRow as _, Theme};
 
 // ---------------------------------------------------------------------------
@@ -616,22 +616,26 @@ pub fn btn_danger(_theme: &Theme, label: &str) -> gpui::Div {
 
 /// Pulsing skeleton rows shown while a list loads (comet:
 /// `h-7 animate-pulse rounded-md bg-white/[0.04]`).
-pub fn skeleton_rows(id: &'static str, theme: &Theme, count: usize) -> AnyElement {
+pub fn skeleton_rows(
+    theme: &Theme,
+    count: usize,
+    view: gpui::EntityId,
+    cx: &mut gpui::App,
+) -> AnyElement {
     let wash = theme.white_alpha(0.04);
+    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
     div()
         .flex()
         .flex_col()
         .gap(px(6.0))
         .py(px(4.0))
         .children((0..count).map(move |i| {
+            let phase = motion::staggered_phase(delta, i, 0.08);
             div()
                 .h(px(28.0))
                 .rounded(px(Theme::RADIUS_CHIP))
                 .bg(wash)
-                .with_animation((id, i), COMET_PULSE.repeating(), move |el, delta| {
-                    let phase = motion::staggered_phase(delta, i, 0.08);
-                    el.opacity(0.35 + 0.4 * motion::pulse_wave(phase))
-                })
+                .opacity(0.35 + 0.4 * motion::pulse_wave(phase))
         }))
         .into_any_element()
 }

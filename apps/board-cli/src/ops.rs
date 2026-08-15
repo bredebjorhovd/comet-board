@@ -166,7 +166,7 @@ fn device_list(devices: &[Device]) -> String {
 /// reachable engine whose board is not running: the RPC layer folds the
 /// server's error into end-of-stream, so name the likely cause here.
 async fn snapshot(
-    stream: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    stream: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
     host: Option<&str>,
 ) -> Result<Vec<TaskRow>> {
     let first = tokio::time::timeout(SNAPSHOT_TIMEOUT, stream.recv())

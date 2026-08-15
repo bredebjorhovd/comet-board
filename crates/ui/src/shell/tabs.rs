@@ -343,10 +343,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(loaders::mini_gradient_spinner(
-                            format!("tab-working-{id}"),
-                            2.0,
-                        ))
+                        .child(loaders::mini_gradient_spinner(2.0, cx.entity_id(), cx))
                         .into_any_element()
                 } else {
                     div()
