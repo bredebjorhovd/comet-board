@@ -209,10 +209,9 @@ pub struct Dependent {
 /// **Direction is the whole design.** Dependency points one way, so this does
 /// too. `changes requested` on layer 2 genuinely invalidates layers 3..N: their
 /// base is about to be rewritten, and when layer 2 force-pushes its fix GitHub
-/// replays their commits on top of it, so their diffs move under both their
-/// authors and their reviewers with no explanation in either place. `changes
-/// requested` on layer 3 invalidates **nothing** about layer 2 — it is still
-/// correct, still mergeable, still reviewable — so nothing goes down.
+/// leaves their commits on the old history until their authors replay them.
+/// `changes requested` on layer 3 invalidates **nothing** about layer 2 — it is
+/// still correct, still mergeable, still reviewable — so nothing goes down.
 ///
 /// **Two edges, unioned**, because a stack reaches the board two ways and the
 /// dependency is real either way:

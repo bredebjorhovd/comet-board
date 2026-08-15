@@ -44,16 +44,18 @@
 //! The contract above is one pull request, one authoring attempt, one chat. In a
 //! stack that is incomplete: `changes requested` on layer 2 is not only about
 //! layer 2, because layers 3..N are built on code that is now wrong. Layer 2's
-//! agent gets the review and starts fixing; when it force-pushes, GitHub replays
-//! every layer above it on the new base — so their diffs move under their authors
-//! *and* under their reviewers, with no explanation in either place.
+//! agent gets the review and starts fixing; when it force-pushes, GitHub leaves
+//! every layer above it on the old base, with dirty pull requests their authors
+//! must replay before those diffs are reviewable again.
 //!
 //! So this module addresses the other layers too, in one direction only:
 //! [`Dependents`] is the edge, and it points up. Each dependent gets a *notice*
 //! and never the review body ([`compose_notice`]) — the review is not theirs to
 //! answer, and pasting it into their chats is how five agents end up editing one
-//! branch. Two more things follow, and both are about the human rather than the
-//! agent:
+//! branch. That is different from a lower layer merging, when GitHub does
+//! replay the upper branch and [`crate::rebased::rewritten_notice`] tells its
+//! author to bring the checkout across. Two more things follow, and both are
+//! about the human rather than the agent:
 //!
 //! - **The row leaves review.** A diff that is about to be rebased is not
 //!   reviewable in good faith, and the bad outcome is not wasted reading, it is
@@ -527,8 +529,8 @@ pub fn compose(task: &Task, pr: &PullRequest, items: &[Feedback]) -> String {
 /// it is about code on another branch, and an agent handed somebody else's
 /// feedback either edits a branch that is not its own or replies on a pull
 /// request that is not its own. What it needs is the one fact its own chat cannot
-/// see — that the ground under its branch is about to move, and why the diff it
-/// is looking at will not be the diff that lands.
+/// see — that the ground under its branch is about to move, and that it must
+/// replay its branch after the fix rather than wait for GitHub to do it.
 ///
 /// It opens in [`reviewed_header`]'s register but deliberately not with its
 /// sentence: "your pull request has been reviewed" would be false, and an agent
@@ -543,15 +545,17 @@ pub fn compose_notice(
         "comet-board: the layer below yours was asked to change.\n\n  \
          {below_id} · {title}\n  {below_url} · {below_branch}\n\n\
          Your own pull request — {mine} · PR #{number} on {branch} — is stacked on \
-         {below_branch}. When its author pushes the fix, GitHub replays your commits \
-         on top of the new one: your diff moves, and so does whatever a reviewer of \
-         yours has already read.\n\n\
-         Nothing on your branch is wrong and there is nothing here to fix. The review \
-         below is not yours to answer — do not write on {below_url}, do not touch \
-         {below_branch}, and do not rebase ahead of it; the replay is GitHub's to do. \
-         If you are mid-task, carry on and commit as you go: a replay carries \
-         committed work across, and uncommitted work in your worktree is yours to \
-         keep safe.\n",
+         {below_branch}. When its author force-pushes the fix, GitHub leaves your \
+         branch on the old history and your pull request may become dirty. This is \
+         different from the lower layer merging: after a merge, GitHub replays the \
+         branches above it itself.\n\n\
+         The review below is not yours to answer — do not write on {below_url} or \
+         touch {below_branch}. Wait for its author to push the fix; then, from your \
+         own branch, replay it and every layer above it with `gh stack rebase \
+         --upstack`. Your diff moves when that replay is pushed, and so does whatever \
+         a reviewer of yours has already read. If you are mid-task, carry on and \
+         commit as you go: the rebase carries committed work across, and uncommitted \
+         work in your worktree is yours to keep safe.\n",
         below_id = below.identifier,
         title = below.title,
         below_url = below_pr.url,
@@ -2052,6 +2056,14 @@ pub(crate) mod tests {
         assert!(
             notice.contains("PR #15"),
             "and this agent's own pull request: {notice}"
+        );
+        assert!(
+            notice.contains("gh stack rebase --upstack"),
+            "the child has to replay its own branch after the fix is pushed: {notice}",
+        );
+        assert!(
+            !notice.contains("the replay is GitHub's to do"),
+            "GitHub only replays an upper branch when the lower layer merges: {notice}",
         );
         assert!(
             !notice.contains("Split the watermark per endpoint."),
