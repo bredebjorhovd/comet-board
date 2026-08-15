@@ -1458,11 +1458,36 @@ pub(crate) mod tests {
     /// countable claim however many identities were involved.
     pub(crate) use crate::sources::github::SharedFixture as Shared;
 
+    /// A `SyncEngine` that owns its scratch directory. Dropping the fixture
+    /// removes the directory — on the box `/tmp` is RAM, and the old
+    /// leave-it-behind helpers had stacked up 151k directories there (gh#430).
+    /// Derefs to the engine, so tests read exactly as before.
+    pub(crate) struct TestEngine {
+        pub(crate) e: SyncEngine,
+        pub(crate) _tmp: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestEngine {
+        type Target = SyncEngine;
+        fn deref(&self) -> &SyncEngine {
+            &self.e
+        }
+    }
+
+    impl std::ops::DerefMut for TestEngine {
+        fn deref_mut(&mut self) -> &mut SyncEngine {
+            &mut self.e
+        }
+    }
+
     /// An engine over an in-memory board and a recorded GitHub.
-    pub(crate) fn engine(rest: std::rc::Rc<crate::sources::github::FixtureRest>) -> SyncEngine {
-        let dir = std::env::temp_dir().join(format!("cb-review-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        SyncEngine {
+    pub(crate) fn engine(rest: std::rc::Rc<crate::sources::github::FixtureRest>) -> TestEngine {
+        let tmp = tempfile::Builder::new()
+            .prefix("cb-review-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
+        let e = SyncEngine {
             db: Db::open_in_memory().unwrap(),
             cfg: crate::config::RoutingConfig::default(),
             credentials: Default::default(),
@@ -1477,7 +1502,8 @@ pub(crate) mod tests {
             // (gh#369); a board that holds none never asks for a client.
             as_user: std::rc::Rc::new(crate::sources::github::FixtureAsUser::default()),
             webhook: std::sync::Arc::new(crate::notify::HttpWebhook),
-        }
+        };
+        TestEngine { e, _tmp: tmp }
     }
 
     /// A finished attempt on gh#13, with an open pull request — the row this

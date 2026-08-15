@@ -1149,14 +1149,40 @@ mod tests {
     /// A board of this test's own. `Paths::under` is pure since gh#190, so the
     /// directory named here is the one the loop opens — under a dispatched
     /// agent's environment it used to be the box's live board.
-    fn scratch_paths() -> Paths {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "comet-board-service-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        Paths::under(&base).unwrap()
+    fn scratch_paths() -> ScratchPaths {
+        let tmp = tempfile::Builder::new()
+            .prefix("comet-board-service-")
+            .tempdir()
+            .unwrap();
+        let paths = Paths::under(tmp.path()).unwrap();
+        ScratchPaths { paths, _tmp: tmp }
+    }
+
+    /// `Paths` plus ownership of the directory under them: dropping the
+    /// fixture removes the tree, where the old bare-`Paths` version left one
+    /// directory behind per test on the box's RAM-backed /tmp (gh#430).
+    /// Derefs to `Paths`, so tests use it exactly as before.
+    struct ScratchPaths {
+        paths: Paths,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for ScratchPaths {
+        type Target = Paths;
+        fn deref(&self) -> &Paths {
+            &self.paths
+        }
+    }
+
+    /// gh#430: dropping the fixture removes the directory — the leak this
+    /// pins against held 6 GB of the box's RAM-backed /tmp.
+    #[test]
+    fn a_dropped_scratch_removes_its_directory() {
+        let paths = scratch_paths();
+        let dir = paths.state_dir.clone();
+        assert!(dir.exists());
+        drop(paths);
+        assert!(!dir.exists(), "{} survived its fixture", dir.display());
     }
 
     /// Records what the board asked of comet; answers like a healthy engine.
