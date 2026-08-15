@@ -37,6 +37,16 @@ struct ChatConfig: Hashable, Codable {
     var model: String?
     var reasoning: String?
     var sandbox: String?
+    /// Process-local tool servers stamped onto a dispatched chat (gh#273).
+    /// Optional keeps old workspace rows decodable; edits preserve the list
+    /// even though the iOS picker does not configure it.
+    var mcpServers: [MCPServer]? = nil
+}
+
+struct MCPServer: Hashable, Codable {
+    var name: String
+    var command: String
+    var args: [String]
 }
 
 struct Chat: Identifiable, Hashable {

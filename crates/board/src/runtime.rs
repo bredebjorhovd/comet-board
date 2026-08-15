@@ -257,6 +257,11 @@ pub struct DispatchSpec {
     /// carries.
     #[serde(default)]
     pub turn_limits: comet_proto::TurnLimits,
+    /// MCP stdio servers resolved from the route / `[defaults]` (gh#273).
+    /// Carried into the chat so every later turn receives the same tools
+    /// without any harness having to know about routing.toml.
+    #[serde(default)]
+    pub mcp_servers: Vec<comet_proto::McpServer>,
     /// Whether this attempt's runtime is handed the board's conventions in the
     /// instruction file it reads on its own — `CLAUDE.md` in the Claude config
     /// dir, `AGENTS.md` in `CODEX_HOME` (gh#272). The route's
@@ -841,6 +846,7 @@ mod tests {
             push_repo: None,
             git_author: None,
             turn_limits: Default::default(),
+            mcp_servers: Vec::new(),
             agent_instructions: true,
             prompt: String::new(),
         }

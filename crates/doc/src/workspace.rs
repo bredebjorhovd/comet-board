@@ -743,6 +743,7 @@ mod tests {
                 push_repo: None,
                 git_author: None,
                 turn_limits: Default::default(),
+                mcp_servers: Vec::new(),
             }),
             last_message_preview: None,
             last_message_at: None,
@@ -815,6 +816,11 @@ mod tests {
                 tool_failures: Some(10),
                 tool_calls: Some(2000),
             },
+            mcp_servers: vec![comet_proto::McpServer {
+                name: "comet-board".into(),
+                command: "comet-board".into(),
+                args: vec!["mcp".into()],
+            }],
         };
         assert!(ws.set_chat_config("chat-1", &config).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");

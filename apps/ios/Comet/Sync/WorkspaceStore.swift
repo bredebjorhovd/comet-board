@@ -199,10 +199,18 @@ final class WorkspaceStore {
                   let deviceId = m["deviceId"]?.stringValue else { return nil }
             var chatConfig: ChatConfig?
             if let c = m["config"]?.mapValue {
+                let mcpServers = (c["mcpServers"]?.listValue ?? []).compactMap { value -> MCPServer? in
+                    guard let server = value.mapValue,
+                          let name = server["name"]?.stringValue,
+                          let command = server["command"]?.stringValue else { return nil }
+                    let args = (server["args"]?.listValue ?? []).compactMap(\.stringValue)
+                    return MCPServer(name: name, command: command, args: args)
+                }
                 chatConfig = ChatConfig(harness: c["harness"]?.stringValue ?? "claude-code",
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
-                                        sandbox: c["sandbox"]?.stringValue)
+                                        sandbox: c["sandbox"]?.stringValue,
+                                        mcpServers: mcpServers.isEmpty ? nil : mcpServers)
             }
             return Chat(id: id, deviceId: deviceId,
                         title: m["title"]?.stringValue,

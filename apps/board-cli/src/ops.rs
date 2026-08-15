@@ -736,7 +736,7 @@ fn remainder_section(review: &AttemptReview, out: &mut String) {
 // ---- dispatch / retry / cancel ------------------------------------------
 
 /// What `DispatchTask` answers: the attempt's address.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dispatched {
     pub chat_id: String,

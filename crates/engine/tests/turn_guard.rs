@@ -133,6 +133,7 @@ fn chat_config(turn_limits: TurnLimits) -> ChatConfig {
         push_repo: None,
         git_author: None,
         turn_limits,
+        mcp_servers: Vec::new(),
     }
 }
 

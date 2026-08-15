@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod mcp;
 mod ops;
 // Test-only: it renders the shipped skill's verb table from the clap tree
 // below and fails the build when the committed file disagrees. Nothing at
@@ -86,6 +87,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve the board's agent tools over Model Context Protocol stdio.
+    ///
+    /// Started by harness MCP configuration, not by people. It inherits the
+    /// dispatched chat's identity and talks to the same engine RPC as the
+    /// ordinary CLI verbs.
+    #[command(hide = true)]
+    Mcp,
     /// List what is on the board. `--json` for orchestrating agents.
     List {
         /// Only this state: blocked, working, ready, review, failed, done.
@@ -777,6 +785,7 @@ fn main() -> Result<()> {
         // Also answered without the engine: the skill is compiled in, and a
         // laptop installing it has no board of its own to dial (gh#133).
         Command::Skill { command } => skill(command),
+        Command::Mcp => runtime.block_on(mcp::serve(port, device)),
         Command::List {
             state,
             source,

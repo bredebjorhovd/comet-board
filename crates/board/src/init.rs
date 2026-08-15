@@ -255,6 +255,13 @@ archive_chats = "on-settle"
 # off on a box where a dispatch names no account — that one reads your own
 # ~/.claude/CLAUDE.md, so the block lands there. Also settable per route.
 # agent_instructions = true
+# MCP stdio servers injected into every dispatched run. The board server below
+# is the implicit default: it exposes typed task status, related attempts and
+# dispatch without an agent shelling out to this CLI. Write the list explicitly
+# to add or replace servers; `mcp_servers = []` on a `[[route]]` opts that route
+# out. Values contain launch metadata only — keep credentials in the process
+# environment so the harness child can pass them without writing secrets here.
+# mcp_servers = [{{ name = "comet-board", command = "comet-board", args = ["mcp"] }}]
 
 [linear]
 # Which state means "finished, waiting on a human". Uncomment and Linear moves

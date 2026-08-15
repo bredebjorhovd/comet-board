@@ -149,6 +149,10 @@ pub struct RunControls {
     /// Applied *before* [`PushCredentials`], whose `gh` shim has to stay in
     /// front of everything.
     pub bin_dirs: Vec<std::path::PathBuf>,
+    /// Process-local MCP stdio servers for this chat (gh#273). Harness
+    /// adapters translate this one shared description into their native
+    /// launch configuration; account config dirs remain untouched.
+    pub mcp_servers: Vec<comet_proto::McpServer>,
 }
 
 #[async_trait]

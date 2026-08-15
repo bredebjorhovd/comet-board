@@ -115,6 +115,7 @@ fn chat_config(push_repo: Option<&str>, git_author: Option<GitAuthor>) -> ChatCo
         push_repo: push_repo.map(str::to_string),
         git_author,
         turn_limits: Default::default(),
+        mcp_servers: Vec::new(),
     }
 }
 
