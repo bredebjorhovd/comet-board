@@ -617,6 +617,11 @@ enum RoutesCommand {
     Edit,
 }
 
+/// Same allocator as the `comet` binary (see its note) — `wait`/`watch` are
+/// long-lived attachments to the same stream plumbing.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let port = cli

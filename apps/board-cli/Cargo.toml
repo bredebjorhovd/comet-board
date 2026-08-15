@@ -19,6 +19,7 @@ comet-update.workspace = true
 chrono.workspace = true
 clap.workspace = true
 tokio.workspace = true
+mimalloc.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
