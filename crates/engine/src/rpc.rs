@@ -356,6 +356,11 @@ struct DispatchTaskParams {
     /// key sends nothing — the brief is the only thing it changes.
     #[serde(default)]
     stack: bool,
+    /// Ask the agent to split this task into tickets released to agents of
+    /// their own (gh#340). Off by default on the stack key's rule, and refused
+    /// together with it — the pair is an ambiguous ask, not a bigger one.
+    #[serde(default)]
+    decompose: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1897,6 +1902,7 @@ impl RpcService for EngineRpc {
                     account: p.account,
                     bill: p.bill,
                     stack: p.stack,
+                    decompose: p.decompose,
                     base: p.base,
                     onto: p.onto,
                 };

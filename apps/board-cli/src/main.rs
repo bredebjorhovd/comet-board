@@ -146,6 +146,18 @@ enum Command {
         /// install it if it is missing.
         #[arg(long)]
         stack: bool,
+        /// Ask for a decomposition: have the agent split the task into tickets
+        /// and release each to an agent of its own with `comet-board new
+        /// --dispatch` (gh#340), keeping for itself the part that needed the
+        /// whole picture.
+        ///
+        /// Off unless asked for, like `--stack` and for its reason: several
+        /// agents where one was expected is a surprise worth opting into. The
+        /// brief is the only thing it changes. Cannot be combined with
+        /// `--stack` — a stack is one attempt's layered pull requests, a
+        /// decomposition is other agents' tickets.
+        #[arg(long, conflicts_with = "stack")]
+        decompose: bool,
         /// Stack this release on another task (gh#285): cut its branch from
         /// the branch that task's attempt holds, and open its pull request
         /// against that branch instead of trunk. Takes a task id or the
@@ -203,6 +215,11 @@ enum Command {
         /// exactly what is being reconsidered.
         #[arg(long)]
         stack: bool,
+        /// Ask for a decomposition on this attempt — see `dispatch
+        /// --decompose` (gh#340). Per attempt, not remembered, on the stack
+        /// flag's rule: a retry is a fresh brief.
+        #[arg(long, conflicts_with = "stack")]
+        decompose: bool,
         /// Stack this attempt on another task's branch (gh#285) — see
         /// `dispatch --onto`. A retry only re-reads this when the branch is
         /// actually cut: an existing branch is reused as it stands, so a
@@ -783,6 +800,7 @@ fn main() -> Result<()> {
             account,
             bill,
             stack,
+            decompose,
             onto,
             base,
         } => {
@@ -794,6 +812,7 @@ fn main() -> Result<()> {
                 account: account.as_deref(),
                 bill: bill.as_deref(),
                 stack,
+                decompose,
                 onto: onto.as_deref(),
                 base: base.as_deref(),
                 // Filled in from the engine below — this shell has no way to
@@ -832,6 +851,7 @@ fn main() -> Result<()> {
             account,
             bill,
             stack,
+            decompose,
             onto,
             base,
         } => {
@@ -843,6 +863,7 @@ fn main() -> Result<()> {
                 account: account.as_deref(),
                 bill: bill.as_deref(),
                 stack,
+                decompose,
                 onto: onto.as_deref(),
                 base: base.as_deref(),
                 // `replace` is not set here: `retry` reads the row and decides,
