@@ -56,11 +56,13 @@ use crate::theme::{Bed, ListRow as _, Theme};
 use crate::transcript::{self, Transcript};
 
 mod account;
+mod fork;
 // `pub(crate)` for one thing only: `spaces::status_dot_color`, the sidebar's
 // half of the status-colour contract the board pane's test asserts (gh#173).
 pub(crate) mod spaces;
 mod tabs;
 
+use fork::ForkDialog;
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
@@ -493,6 +495,11 @@ pub struct Shell {
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
+    /// The fork menu (gh#425): open on a message of the selected chat.
+    fork_dialog: Option<ForkDialog>,
+    /// The fork call itself, and the harness probe that precedes it.
+    fork_task: Option<Task<()>>,
+    fork_models_task: Option<Task<()>>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
     /// Space-row context menu: (space id, window position).
@@ -605,6 +612,8 @@ pub struct Shell {
     /// The board panel's one outward verb: "review this attempt" (gh#180).
     _board_events: Subscription,
     _composer_events: Subscription,
+    /// "Fork from here", raised by the transcript row under the pointer.
+    _transcript_events: Subscription,
 }
 
 impl Shell {
@@ -615,6 +624,16 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        // The transcript's one outward verb: "fork this conversation here"
+        // (gh#425). The menu it opens is shell chrome — a modal over the whole
+        // window that ends by selecting another chat.
+        let transcript_events = cx.subscribe(&transcript, |this: &mut Shell, _, event, cx| {
+            match event {
+                transcript::TranscriptEvent::ForkAt { message_id } => {
+                    this.open_fork(message_id.to_string(), cx)
+                }
+            }
+        });
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
@@ -740,6 +759,9 @@ impl Shell {
             appearance_sub: None,
             chat_menu: None,
             rename_dialog: None,
+            fork_dialog: None,
+            fork_task: None,
+            fork_models_task: None,
             delete_confirm: None,
             space_menu: None,
             rename_space_dialog: None,
@@ -793,6 +815,7 @@ impl Shell {
             _board_observation: board_observation,
             _board_events: board_events,
             _composer_events: composer_events,
+            _transcript_events: transcript_events,
         }
     }
 
@@ -1424,6 +1447,7 @@ impl Shell {
     fn overlay_open(&self) -> bool {
         self.chat_menu.is_some()
             || self.rename_dialog.is_some()
+            || self.fork_dialog.is_some()
             || self.delete_confirm.is_some()
             || self.space_menu.is_some()
             || self.rename_space_dialog.is_some()
@@ -2871,6 +2895,10 @@ impl Shell {
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
+        if let Some(overlay) = self.render_fork_dialog(viewport, cx) {
+            overlays.push(overlay);
+        }
+
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
@@ -3195,7 +3223,20 @@ impl Shell {
         // → the onboarding card. The composer sits below the first two
         // (new-chat mode mints the chat id on first send).
         let outlet: AnyElement = if has_selection {
-            self.transcript.clone().into_any_element()
+            // A fork says so above its own transcript (gh#425): in a shared
+            // checkout the diff below is not only this session's work, and a
+            // reader who cannot see that will read two agents as one.
+            match self.render_lineage_strip(cx) {
+                Some(strip) => div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .child(strip)
+                    .child(div().flex_1().min_h_0().child(self.transcript.clone()))
+                    .into_any_element(),
+                None => self.transcript.clone().into_any_element(),
+            }
         } else if !has_spaces {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.

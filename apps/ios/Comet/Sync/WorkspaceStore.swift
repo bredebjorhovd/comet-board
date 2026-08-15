@@ -232,6 +232,24 @@ final class WorkspaceStore {
                                         pushContract: pushContract,
                                         mcpServers: mcpServers.isEmpty ? nil : mcpServers)
             }
+            // gh#425: written once by the host that made the fork, read here
+            // by a client that cannot make one.
+            var lineage: ChatLineage?
+            if let f = m["forkedFrom"]?.mapValue,
+               let sourceChatId = f["sourceChatId"]?.stringValue,
+               let checkoutRaw = f["checkout"]?.stringValue,
+               let checkout = ForkCheckout(rawValue: checkoutRaw),
+               let contextRaw = f["context"]?.stringValue,
+               let context = ForkContext(rawValue: contextRaw) {
+                lineage = ChatLineage(
+                    sourceChatId: sourceChatId,
+                    sourceMessageId: f["sourceMessageId"]?.stringValue,
+                    checkout: checkout,
+                    context: context,
+                    carriedMessages: f["carriedMessages"]?.i64Value.map { Int($0) },
+                    truncated: f["truncated"]?.boolValue ?? false,
+                    truncation: f["truncation"]?.stringValue.flatMap(TranscriptTruncation.init(rawValue:)))
+            }
             return Chat(id: id, deviceId: deviceId,
                         title: m["title"]?.stringValue,
                         archived: m["archived"]?.boolValue ?? false,
@@ -243,7 +261,8 @@ final class WorkspaceStore {
                         lastMessageAt: m["lastMessageAt"]?.i64Value,
                         createdAt: m["createdAt"]?.i64Value ?? 0,
                         spaceId: m["spaceId"]?.stringValue,
-                        lastSeenAt: m["lastSeenAt"]?.i64Value)
+                        lastSeenAt: m["lastSeenAt"]?.i64Value,
+                        forkedFrom: lineage)
         }
 
         var rows: [String: SessionRow] = [:]

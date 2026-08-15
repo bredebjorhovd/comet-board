@@ -59,6 +59,76 @@ struct MCPServer: Hashable, Codable {
     var args: [String]
 }
 
+/// Where a chat came from, when it was forked from another one (gh#425 —
+/// `comet_proto::ChatLineage`).
+///
+/// The phone cannot make a fork yet. It can very much be *reading* one, and a
+/// shared-checkout fork is the case where not knowing is actively misleading:
+/// the files under it are another session's too, and the edits arriving in them
+/// are not all this agent's. So the row syncs and this renders it.
+enum ForkCheckout: String, Codable { case shared, isolated }
+enum ForkContext: String, Codable { case nativeResume, transcriptCopy }
+enum TranscriptTruncation: String, Codable {
+    case oldestMessagesDropped, newestMessageTruncated, oldestDroppedAndNewestTruncated
+}
+
+struct ChatLineage: Hashable {
+    var sourceChatId: String
+    var sourceMessageId: String?
+    /// `shared` | `isolated`.
+    var checkout: ForkCheckout
+    /// `nativeResume` | `transcriptCopy`.
+    var context: ForkContext
+    var carriedMessages: Int?
+    var truncated: Bool
+    var truncation: TranscriptTruncation?
+
+    var isShared: Bool { checkout == .shared }
+
+    /// view/fork.rs `destination_tag` — the two must not share a word.
+    var checkoutTag: String { isShared ? "shared read-only" : "own worktree" }
+
+    /// view/fork.rs — `resumed` is legacy synced-row vocabulary; new forks
+    /// always say `copy` because only the visible transcript came across.
+    var contextTag: String { context == .nativeResume ? "resumed" : "copy" }
+
+    var truncationExplanation: String {
+        switch truncation {
+        case .oldestMessagesDropped:
+            return "Oldest messages dropped at the size budget."
+        case .newestMessageTruncated:
+            return "Newest message truncated at the size budget."
+        case .oldestDroppedAndNewestTruncated:
+            return "Oldest messages dropped and newest message truncated at the size budget."
+        case nil:
+            return truncated ? "Some transcript content was omitted at the size budget." : ""
+        }
+    }
+
+    /// view/fork.rs `compact`.
+    func compact(sourceTitle: String?) -> String {
+        let source: String
+        if let sourceTitle, !sourceTitle.trimmingCharacters(in: .whitespaces).isEmpty {
+            source = "\u{201c}\(sourceTitle)\u{201d}"
+        } else {
+            source = "a deleted chat"
+        }
+        return "fork of \(source) · \(checkoutTag) · \(contextTag)"
+    }
+
+    /// The sentence behind the tag, for a surface with room for one.
+    var explanation: String {
+        let where_: String = isShared
+            ? "Same folder as the session it came from: this fork is read-only, while source edits still appear here."
+            : "Its own worktree and branch: nothing here can reach the source's files."
+        let what: String = context == .nativeResume
+            ? "The provider session was resumed, so this agent holds the whole conversation."
+            : "The visible transcript was copied into its first prompt; hidden provider state was not."
+        let truncationNote = truncationExplanation.isEmpty ? "" : " \(truncationExplanation)"
+        return "\(where_) \(what)\(truncationNote)"
+    }
+}
+
 struct Chat: Identifiable, Hashable {
     var id: String
     var deviceId: String
@@ -73,6 +143,9 @@ struct Chat: Identifiable, Hashable {
     var createdAt: Int64
     var spaceId: String?
     var lastSeenAt: Int64?
+    /// Defaulted so every existing construction (demo data, E2E fixtures) is
+    /// untouched: a chat nobody forked has no lineage.
+    var forkedFrom: ChatLineage? = nil
 
     var displayTitle: String {
         if let title, !title.isEmpty { return title }

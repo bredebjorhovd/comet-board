@@ -22,6 +22,7 @@ use crate::{AuthState, Chat, ChatIndicator, EdgeHealth, Session, SessionStatus, 
 pub mod account;
 pub mod board;
 pub mod context;
+pub mod fork;
 pub mod needs;
 pub mod rates;
 pub mod repos;

@@ -10,6 +10,7 @@
 
 pub mod commands;
 pub mod constants;
+pub mod handoff;
 pub mod parts;
 pub mod queue;
 pub mod schema;
@@ -18,6 +19,7 @@ pub mod workspace;
 
 pub use commands::*;
 pub use constants::*;
+pub use handoff::{Handoff, HANDOFF_BUDGET_BYTES, build_handoff};
 pub use parts::*;
 pub use queue::{QueuePause, QueueRow, QueueView, project as project_queue};
 pub use schema::*;

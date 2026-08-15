@@ -155,6 +155,9 @@ scripts/ios-stats-spec.sh                     # the Swift half, in the simulator
 
 cargo test -p comet-board --test ios_review_spec  # the same pair for the review
 scripts/ios-review-spec.sh                    # reading (gh#256)
+
+cargo test -p comet-proto rust_and_swift_share_the_checked_in_fork_vocabulary_cases
+# Launch the simulator with -fork-spec for the Swift half.
 ```
 
 `crates/proto/src/view/stats.rs` (mod `spec`) generates

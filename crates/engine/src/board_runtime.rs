@@ -310,7 +310,9 @@ pub(crate) fn settle_preparation(
         )
     }) {
         Ok(true) => {}
-        Ok(false) => tracing::info!(chat = %parked.chat_id, "prepared brief was revoked before release"),
+        Ok(false) => {
+            tracing::info!(chat = %parked.chat_id, "prepared brief was revoked before release")
+        }
         Err(e) => {
             // Dropping the claim rolls the durable payload back for retry.
             tracing::error!(chat = %parked.chat_id, error = %e, "releasing the prepared brief");
@@ -329,10 +331,7 @@ pub(crate) fn reconcile_prepared_checkouts(prep: &CheckoutPrep, doc_host: &DocHo
     }
 }
 
-fn peek_parked(
-    prep: &crate::checkout_prep::CheckoutPrep,
-    worktree: &Path,
-) -> Option<ParkedBrief> {
+fn peek_parked(prep: &crate::checkout_prep::CheckoutPrep, worktree: &Path) -> Option<ParkedBrief> {
     let text = prep.parked(worktree)?;
     serde_json::from_str(&text).ok()
 }
@@ -522,27 +521,32 @@ impl Runtime for CometRuntime {
                     ));
                 }
                 if spec.worktree {
-                    self.prep.forget(Path::new(&cwd));
+                    self.prep.forget(Path::new(&cwd)).map_err(|cleanup| {
+                        anyhow::anyhow!(
+                            "{error}; forgetting checkout preparation also failed: {cleanup}"
+                        )
+                    })?;
                 }
                 return Err(error);
             }
         };
-        let preparation_view = preparation.as_ref().map(|_| {
-            comet_proto::view::board::CheckoutPreparation {
-                state: comet_proto::view::board::CheckoutPreparationState::Preparing,
-                recipe_digest: None,
-                execution_digest: None,
-                detail: Some("preparing checkout before the agent starts".to_string()),
-                log: None,
-                log_excerpt: None,
-                run_command: None,
-                setup_command: None,
-                setup_outputs: Vec::new(),
-                archive_paths: Vec::new(),
-                requires_approval: false,
-                projections: Vec::new(),
-            }
-        });
+        let preparation_view =
+            preparation
+                .as_ref()
+                .map(|_| comet_proto::view::board::CheckoutPreparation {
+                    state: comet_proto::view::board::CheckoutPreparationState::Preparing,
+                    recipe_digest: None,
+                    execution_digest: None,
+                    detail: Some("preparing checkout before the agent starts".to_string()),
+                    log: None,
+                    log_excerpt: None,
+                    run_command: None,
+                    setup_command: None,
+                    setup_outputs: Vec::new(),
+                    archive_paths: Vec::new(),
+                    requires_approval: false,
+                    projections: Vec::new(),
+                });
         if let Some(repository_id) = preparation {
             self.start_preparation(&chat_id, &cwd, repository_id);
         } else {
@@ -747,6 +751,16 @@ impl Runtime for CometRuntime {
         let local_device = self.workspace.device_id();
         Ok(chats
             .into_iter()
+            // A fork is never the author of anything (gh#425). It shares its
+            // source's branch (shared checkout) or copies its source's words
+            // into its own journal (transcript copy), so on branch, repo and
+            // even quoted pull-request URL it looks exactly like the chat that
+            // opened the pull request — and, being newer, it would outrank it
+            // in `explicit.last()` and take the attempt's chat link with it.
+            // The conversation that did the work is the one review has to
+            // reach; a second opinion standing in the same checkout is not a
+            // second attempt at the task.
+            .filter(|chat| chat.forked_from.is_none())
             .filter_map(|chat| {
                 // A checkout path belongs to its host device. Keep the remote
                 // chat as provenance, but never run local git against its path.
@@ -859,7 +873,7 @@ impl Runtime for CometRuntime {
         // stale `ready` that would short-circuit the next checkout to land on
         // the same path — the state dir is keyed by path, and paths are reused
         // (`board/gh-422-…` cut again after a retry).
-        self.prep.forget(worktree);
+        self.prep.forget(worktree)?;
         Ok(())
     }
 
@@ -887,9 +901,9 @@ impl Runtime for CometRuntime {
         // the problem: one refused path must not keep the 36 GB.
         match self.handle.block_on(self.repos.repository_identity(path)) {
             Ok(repository_id) => {
-                if let Some(said) = self
-                    .handle
-                    .block_on(self.prep.archive(path, &repository_id, None))
+                if let Some(said) =
+                    self.handle
+                        .block_on(self.prep.archive(path, &repository_id, None))
                 {
                     tracing::info!(worktree, outcome = %said, "checkout archive step");
                 }
@@ -1140,15 +1154,16 @@ mod review_candidate_tests {
             .unwrap();
         reconcile_prepared_checkouts(&prep, &core.doc_host);
         assert!(prep.parked(&repo).is_none());
-        assert!(core
-            .doc_host
-            .open("chat-ready-parked")
-            .unwrap()
-            .doc()
-            .read_commands()
-            .unwrap()
-            .iter()
-            .any(|command| command.id == "ready-parked"));
+        assert!(
+            core.doc_host
+                .open("chat-ready-parked")
+                .unwrap()
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|command| command.id == "ready-parked")
+        );
 
         prep.park(&repo, &payload("chat-ready-claimed", "ready-claimed"))
             .unwrap();
@@ -1157,14 +1172,15 @@ mod review_candidate_tests {
         let restarted = CheckoutPrep::new(&dir.path().join("data"));
         reconcile_prepared_checkouts(&restarted, &core.doc_host);
         assert!(restarted.parked(&repo).is_none());
-        assert!(core
-            .doc_host
-            .open("chat-ready-claimed")
-            .unwrap()
-            .doc()
-            .read_commands()
-            .unwrap()
-            .iter()
-            .any(|command| command.id == "ready-claimed"));
+        assert!(
+            core.doc_host
+                .open("chat-ready-claimed")
+                .unwrap()
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|command| command.id == "ready-claimed")
+        );
     }
 }

@@ -21,6 +21,7 @@
 //! belief is made of, and why it is no longer a 15s heartbeat, is
 //! [`crate::presence`] (gh#145).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use chrono::Utc;
@@ -84,6 +85,10 @@ const RELAY_PROBE_INTERVAL_MS: u64 = 30_000;
 const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+#[cfg(test)]
+static RESEED_INTERLEAVE: Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = Mutex::new(None);
 /// Initial-join retry backoff (base, cap). A first workspace-room join that
 /// fails must not strand the device offline until an app restart — retry until
 /// it lands. Jittered so N devices restarting together don't resynchronize
@@ -142,6 +147,12 @@ struct WorkspaceHostInner {
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
+    /// Exact host-owned rows that a shallow remote reseed may not erase or
+    /// partially rewrite. Fork execution authority is machine-local.
+    staged_chats: Mutex<HashMap<String, Chat>>,
+    /// Serializes row publication, staged-row reseed reconciliation, commit,
+    /// and deletion. No operation may snapshot one side then mutate the other.
+    owner_gate: Arc<Mutex<()>>,
     room: Arc<Mutex<Option<RoomClient>>>,
     /// Which devices this engine believes are connected, and on what evidence
     /// ([`crate::presence`]). Sticky by design: a room that says nothing —
@@ -164,11 +175,29 @@ impl WorkspaceHostInner {
             .clone()
     }
 
+    #[cfg(test)]
     fn reseed(&self, raw: loro::LoroDoc) {
-        let replacement = Arc::new(WorkspaceDoc::from_doc(raw));
-        if let Err(error) = replacement.reconcile_github_push_states() {
-            tracing::warn!(error = %error, "workspace reseed could not reconcile GitHub push state");
+        let _gate = lock(&self.owner_gate);
+        self.reseed_with_gate_held(raw);
+    }
+
+    /// Install a room replacement while the caller owns `owner_gate`.
+    /// `RoomActor::try_reseed` holds that gate across its doc/subscription cut
+    /// and callback, so taking it again here would deadlock.
+    fn reseed_with_gate_held(&self, raw: loro::LoroDoc) {
+        let staged: Vec<_> = lock(&self.staged_chats).values().cloned().collect();
+        #[cfg(test)]
+        if let Some((reached, release)) = lock(&RESEED_INTERLEAVE).take() {
+            let _ = reached.send(());
+            let _ = release.recv();
         }
+        let replacement = match prepare_reseed(raw, &staged) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                tracing::error!(%error, "workspace reseed refused: host-owned rows could not be reconciled");
+                return;
+            }
+        };
         let changed_tx = self.changed_tx.clone();
         let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|value| *value = value.wrapping_add(1));
@@ -178,6 +207,24 @@ impl WorkspaceHostInner {
         self.changed_tx
             .send_modify(|value| *value = value.wrapping_add(1));
     }
+}
+
+fn prepare_reseed(
+    raw: loro::LoroDoc,
+    protected: &[Chat],
+) -> Result<Arc<WorkspaceDoc>, EngineError> {
+    let replacement = Arc::new(WorkspaceDoc::from_doc(raw));
+    replacement.reconcile_github_push_states()?;
+    for chat in protected {
+        replacement.upsert_chat(chat)?;
+        if replacement.chat(&chat.id)?.as_ref() != Some(chat) {
+            return Err(EngineError::Other(format!(
+                "host-owned chat {} did not verify during reseed",
+                chat.id
+            )));
+        }
+    }
+    Ok(replacement)
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -239,6 +286,7 @@ pub(crate) fn spawn_room_join(
     doc: loro::LoroDoc,
     local_device_id: Option<String>,
     on_reseed: Arc<dyn Fn(loro::LoroDoc) + Send + Sync>,
+    mutation_gate: Option<Arc<Mutex<()>>>,
     slot: Weak<Mutex<Option<RoomClient>>>,
     on_event: Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -262,10 +310,13 @@ pub(crate) fn spawn_room_join(
                 *reseed_slot.write().unwrap_or_else(PoisonError::into_inner) = replacement.clone();
                 reseed_owner(replacement);
             });
-            let recovery = match local_device_id.as_deref() {
+            let mut recovery = match local_device_id.as_deref() {
                 Some(device_id) => DocRecovery::for_device(device_id, reseed),
                 None => DocRecovery::replacing(reseed),
             };
+            if let Some(gate) = mutation_gate.clone() {
+                recovery = recovery.with_mutation_gate(gate);
+            }
             match RoomClient::connect_via(url.clone(), &room_id, doc, recovery).await {
                 Ok(client) => {
                     // Health handles are taken BEFORE the client moves into the
@@ -387,6 +438,17 @@ pub struct WorkspaceHost {
 }
 
 impl WorkspaceHost {
+    /// Callback handed to `RoomActor`: the actor owns `owner_gate` for the
+    /// entire replacement cut, so this callback must use the gate-held entry.
+    fn room_reseed_callback(&self) -> Arc<dyn Fn(loro::LoroDoc) + Send + Sync> {
+        let reseed_owner = Arc::downgrade(&self.inner);
+        Arc::new(move |replacement| {
+            if let Some(inner) = reseed_owner.upgrade() {
+                inner.reseed_with_gate_held(replacement);
+            }
+        })
+    }
+
     /// Load (or init) the workspace doc, upsert this device's registry row, start the
     /// change-driven task, and join the edge workspace room when configured.
     pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
@@ -474,6 +536,8 @@ impl WorkspaceHost {
                 devices_tx,
                 sessions_tx,
                 spaces_tx,
+                staged_chats: Mutex::new(HashMap::new()),
+                owner_gate: Arc::new(Mutex::new(())),
                 room: Arc::new(Mutex::new(None)),
                 presence: Mutex::new(PresenceBelief::default()),
                 peer_alive: Mutex::new(None),
@@ -528,17 +592,13 @@ impl WorkspaceHost {
         // skew that DID matter would be a silent outage, not an error.
         let room_id = format!("ws4/{}/{}", org_id, self.inner.config.user_id);
         let weak = Arc::downgrade(&self.inner);
-        let reseed_owner = weak.clone();
         spawn_room_join(
             url,
             room_id,
             self.inner.doc().doc().clone(),
             None,
-            Arc::new(move |replacement| {
-                if let Some(inner) = reseed_owner.upgrade() {
-                    inner.reseed(replacement);
-                }
-            }),
+            self.room_reseed_callback(),
+            Some(self.inner.owner_gate.clone()),
             Arc::downgrade(&self.inner.room),
             // Presence rides `%EPH`, never the doc — the room's answer must
             // re-publish the device watch itself (the signal that distinguishes
@@ -685,6 +745,7 @@ impl WorkspaceHost {
             harness_session_cwd: None,
             space_id,
             last_seen_at: None,
+            forked_from: None,
         })?;
         Ok(())
     }
@@ -836,8 +897,69 @@ impl WorkspaceHost {
             harness_session_cwd: None,
             space_id: Some(space.id),
             last_seen_at: None,
+            forked_from: None,
         })?;
         Ok(())
+    }
+
+    /// Publish one exact host-owned chat while holding the workspace document
+    /// owner gate across upsert, verification, and durable snapshot.
+    pub(crate) fn publish_host_owned_chat(&self, chat: &Chat) -> Result<(), EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        lock(&self.inner.staged_chats).insert(chat.id.clone(), chat.clone());
+        let published = (|| {
+            let owner = self
+                .inner
+                .doc
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            owner.upsert_chat(chat)?;
+            let observed = owner.chat(&chat.id)?;
+            if observed.as_ref() != Some(chat) {
+                return Err(EngineError::Other(format!(
+                    "host-owned chat {} did not verify after publication: expected {chat:?}, got {observed:?}",
+                    chat.id,
+                )));
+            }
+            let bytes = owner.export_snapshot()?;
+            self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+            Ok(())
+        })();
+        if published.is_err() {
+            lock(&self.inner.staged_chats).remove(&chat.id);
+        }
+        published
+    }
+
+    /// Validate the staged row and durably commit its external transaction
+    /// while holding the same gate used by publication and reseed.
+    pub(crate) fn commit_host_owned_chat<T>(
+        &self,
+        source_chat_id: &str,
+        expected_source_host: &str,
+        chat_id: &str,
+        validate: impl FnOnce(&Chat) -> Result<(), EngineError>,
+        commit: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        let source = self.inner.doc().chat(source_chat_id)?.ok_or_else(|| {
+            EngineError::Other(format!("source chat {source_chat_id} disappeared"))
+        })?;
+        if source.device_id != expected_source_host {
+            return Err(EngineError::Other(format!(
+                "source chat {source_chat_id} moved to {} while the fork was being created",
+                source.device_id
+            )));
+        }
+        let row = self
+            .inner
+            .doc()
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other(format!("staged chat {chat_id} disappeared")))?;
+        validate(&row)?;
+        let result = commit()?;
+        lock(&self.inner.staged_chats).remove(chat_id);
+        Ok(result)
     }
 
     // ── spaces (Mutate surface + owner stamps) ──────────────────────────────
@@ -882,7 +1004,13 @@ impl WorkspaceHost {
     /// Hard-delete a space and its chats (doc cascade). The caller (rpc layer)
     /// tears down live runs / doc-host handles for the returned chat ids.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        Ok(self.inner.doc().delete_space(space_id)?)
+        let _gate = lock(&self.inner.owner_gate);
+        let deleted = self.inner.doc().delete_space(space_id)?;
+        let mut staged = lock(&self.inner.staged_chats);
+        for chat_id in &deleted.chat_ids {
+            staged.remove(chat_id);
+        }
+        Ok(deleted)
     }
 
     /// Synced seen marker (any device; LWW + monotonic guard in the doc layer).
@@ -958,9 +1086,23 @@ impl WorkspaceHost {
     /// migration flow will drive this). Returns false when the chat doesn't
     /// exist.
     pub fn set_chat_host(&self, chat_id: &str, device_id: &str) -> Result<bool, EngineError> {
+        self.set_chat_host_checked(chat_id, device_id, |_| Ok(()))
+    }
+
+    /// Validate and re-home a chat as one owner-gated decision. Fork authority
+    /// validation must not happen before this lock: creation commits under the
+    /// same gate and must see either the old host or the new one, never a gap.
+    pub(crate) fn set_chat_host_checked(
+        &self,
+        chat_id: &str,
+        device_id: &str,
+        validate: impl FnOnce(&Chat) -> Result<(), EngineError>,
+    ) -> Result<bool, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
         let Some(mut chat) = self.inner.doc().chat(chat_id)? else {
             return Ok(false);
         };
+        validate(&chat)?;
         chat.device_id = device_id.to_string();
         self.inner.doc().upsert_chat(&chat)?;
         Ok(true)
@@ -986,6 +1128,7 @@ impl WorkspaceHost {
     /// sets these, and no surface can express clearing them, so an incoming
     /// `off` is an uninformed writer rather than a decision.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
         let mut config = config.clone();
         if let Some(existing) = self.chat_config(chat_id) {
             if config.turn_limits.is_off() {
@@ -1012,6 +1155,8 @@ impl WorkspaceHost {
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
     /// doc remains untouched.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        lock(&self.inner.staged_chats).remove(chat_id);
         Ok(self.inner.doc().delete_chat(chat_id)?)
     }
 
@@ -1056,11 +1201,13 @@ impl WorkspaceHost {
     /// Retarget a chat onto another folder (mid-session switch to an existing
     /// worktree). Resume is cwd-scoped — the next run there starts fresh.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
         Ok(self.inner.doc().set_chat_cwd(chat_id, cwd)?)
     }
 
     /// Canonical checkout identity for the chat's cwd (diff grouping key).
     pub fn set_chat_checkout(&self, chat_id: &str, checkout_id: &str) -> Result<bool, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
         Ok(self.inner.doc().set_chat_checkout(chat_id, checkout_id)?)
     }
 
@@ -1069,6 +1216,12 @@ impl WorkspaceHost {
     /// Persist the snapshot now (shutdown path; bypasses the debounce).
     pub fn flush(&self) {
         self.inner.save_snapshot();
+    }
+
+    pub fn flush_checked(&self) -> Result<(), EngineError> {
+        let bytes = self.inner.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+        Ok(())
     }
 
     /// Shutdown: stamp our `lastSeenAt` (the only periodic-ish map write besides
@@ -1356,6 +1509,177 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
 #[cfg(test)]
 mod room_supervision_tests {
     use super::*;
+
+    #[test]
+    fn a_live_reseed_preserves_the_exact_host_owned_fork_row() {
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "fork-1",
+            "deviceId": "host-1",
+            "title": "Fork",
+            "archived": false,
+            "cwd": "/checkout",
+            "branch": "comet/fork",
+            "checkoutId": "checkout-1",
+            "config": null,
+            "lastMessagePreview": null,
+            "lastMessageAt": null,
+            "createdAt": "2026-08-17T00:00:00Z",
+            "harnessSessionId": null,
+            "harnessSessionCwd": null,
+            "spaceId": "space-1",
+            "lastSeenAt": null,
+            "forkedFrom": null
+        }))
+        .unwrap();
+        let replacement = prepare_reseed(loro::LoroDoc::new(), std::slice::from_ref(&chat))
+            .expect("reseed reconciles protected row");
+        assert_eq!(replacement.chat("fork-1").unwrap(), Some(chat));
+    }
+
+    #[tokio::test]
+    async fn publication_cannot_land_between_reseed_snapshot_and_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(
+            store,
+            WorkspaceHostConfig {
+                device_id: "host-1".into(),
+                device_name: "Host".into(),
+                platform: "test".into(),
+                org_id: "org".into(),
+                user_id: "user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "fork-interleaving", "deviceId": "host-1", "title": "Fork",
+            "archived": false, "cwd": "/checkout", "branch": null,
+            "checkoutId": "checkout-1", "config": null,
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-08-17T00:00:00Z", "harnessSessionId": null,
+            "harnessSessionCwd": null, "spaceId": "space-1", "lastSeenAt": null,
+            "forkedFrom": null
+        }))
+        .unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *lock(&RESEED_INTERLEAVE) = Some((reached_tx, release_rx));
+        let inner = host.inner.clone();
+        let reseed = std::thread::spawn(move || inner.reseed(loro::LoroDoc::new()));
+        reached_rx.recv().unwrap();
+
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let publisher = host.clone();
+        let expected = chat.clone();
+        let publish = std::thread::spawn(move || {
+            let result = publisher.publish_host_owned_chat(&expected);
+            let _ = published_tx.send(result);
+        });
+        assert!(
+            published_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "publication waits behind the reseed owner gate"
+        );
+        release_tx.send(()).unwrap();
+        reseed.join().unwrap();
+        published_rx.recv().unwrap().unwrap();
+        publish.join().unwrap();
+        assert_eq!(host.doc().chat(&chat.id).unwrap(), Some(chat));
+    }
+
+    #[tokio::test]
+    async fn policy_mutation_cannot_land_after_validation_before_commit_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(
+            store,
+            WorkspaceHostConfig {
+                device_id: "host-1".into(),
+                device_name: "Host".into(),
+                platform: "test".into(),
+                org_id: "org".into(),
+                user_id: "user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "fork-policy-fence", "deviceId": "host-1", "title": "Fork",
+            "archived": false, "cwd": "/safe", "branch": null,
+            "checkoutId": "checkout-1", "config": null,
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-08-17T00:00:00Z", "harnessSessionId": null,
+            "harnessSessionCwd": null, "spaceId": "space-1", "lastSeenAt": null,
+            "forkedFrom": null
+        }))
+        .unwrap();
+        host.publish_host_owned_chat(&chat).unwrap();
+        let (validated_tx, validated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let committer = host.clone();
+        let commit = std::thread::spawn(move || {
+            committer.commit_host_owned_chat(
+                "fork-policy-fence",
+                "host-1",
+                "fork-policy-fence",
+                |_| Ok(()),
+                || {
+                    validated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        validated_rx.recv().unwrap();
+        let (mutated_tx, mutated_rx) = std::sync::mpsc::channel();
+        let mutator = host.clone();
+        let mutation = std::thread::spawn(move || {
+            let result = mutator.set_chat_cwd("fork-policy-fence", "/poison");
+            mutated_tx.send(result).unwrap();
+        });
+        assert!(
+            mutated_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "policy writes wait behind validation and durable commit"
+        );
+        release_tx.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+        mutated_rx.recv().unwrap().unwrap();
+        mutation.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn room_actor_gate_and_real_workspace_reseed_callback_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(
+            store,
+            WorkspaceHostConfig {
+                device_id: "host-1".into(),
+                device_name: "Host".into(),
+                platform: "test".into(),
+                org_id: "org".into(),
+                user_id: "user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let gate = host.inner.owner_gate.clone();
+        let callback = host.room_reseed_callback();
+        let completed = tokio::task::spawn_blocking(move || {
+            // This is the exact ownership order in RoomActor::try_reseed:
+            // actor gate first, production WorkspaceHost callback second.
+            let _actor_guard = lock(&gate);
+            callback(loro::LoroDoc::new());
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed)
+            .await
+            .expect("the real room/workspace callback composition must not deadlock")
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn malformed_protocol_parks_the_supervisor_instead_of_rebuilding() {

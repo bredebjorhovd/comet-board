@@ -77,6 +77,10 @@ final class AppModel {
             SpecRunner.run()
             return
         }
+        if args.contains("-fork-spec") {
+            ForkSpecRunner.run()
+            return
+        }
         // The ported review reading against the fixture Rust generated
         // (gh#256). Same shape, same reason, its own file.
         if args.contains("-review-spec") {

@@ -1621,6 +1621,9 @@ impl EngineRpc {
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {
                 let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
+                for chat_id in &deleted.chat_ids {
+                    self.sessions.clear_fork_state(chat_id).map_err(failed)?;
+                }
                 // Best-effort teardown of live runs we host for the deleted chats
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
@@ -1647,11 +1650,15 @@ impl EngineRpc {
                 .set_chat_branch(&chat_id, &branch)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatCwd { chat_id, cwd } => self
-                .workspace
-                .set_chat_cwd(&chat_id, &cwd)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatCwd { chat_id, cwd } => {
+                self.sessions
+                    .validate_fork_cwd_change(&chat_id, &cwd)
+                    .map_err(failed)?;
+                self.workspace
+                    .set_chat_cwd(&chat_id, &cwd)
+                    .map_err(failed)
+                    .map(drop)
+            }
             MutateParams::SetChatActivity {
                 chat_id,
                 last_message_at,
@@ -1663,7 +1670,10 @@ impl EngineRpc {
                 .map(drop),
             MutateParams::SetChatHost { chat_id, device_id } => self
                 .workspace
-                .set_chat_host(&chat_id, &device_id)
+                .set_chat_host_checked(&chat_id, &device_id, |_| {
+                    self.sessions
+                        .validate_fork_host_change(&chat_id, &device_id)
+                })
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatArchived { chat_id, archived } => self
@@ -1671,13 +1681,18 @@ impl EngineRpc {
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatConfig { chat_id, config } => self
-                .workspace
-                .set_chat_config(&chat_id, &config)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatConfig { chat_id, config } => {
+                self.sessions
+                    .validate_fork_config_change(&chat_id, &config)
+                    .map_err(failed)?;
+                self.workspace
+                    .set_chat_config(&chat_id, &config)
+                    .map_err(failed)
+                    .map(drop)
+            }
             MutateParams::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
+                self.sessions.clear_fork_state(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
                 Ok(())
             }
@@ -1776,6 +1791,10 @@ fn forwardable(method: &str) -> bool {
             | methods::PREPARE_CHECKOUT
             | methods::CANCEL_CHECKOUT_PREPARATION
             | methods::CHECKOUT_PREP
+            // A fork is made where the source chat's transcript, checkout and
+            // provider session are — which is its host device, not the laptop
+            // the fork menu was opened on (gh#425).
+            | methods::FORK_CHAT
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             // Terminals live on the chat's host device.
@@ -2591,7 +2610,9 @@ impl RpcService for EngineRpc {
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                self.prep.forget(std::path::Path::new(&p.worktree_path));
+                self.prep
+                    .forget(std::path::Path::new(&p.worktree_path))
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             // gh#422. Deliberately a verb rather than something `CreateWorktree`
@@ -2702,6 +2723,23 @@ impl RpcService for EngineRpc {
                     "recipe": recipe.as_ref().ok().and_then(|r| r.as_ref()),
                     "recipeError": recipe.as_ref().err(),
                 }))
+            }
+            methods::FORK_CHAT => {
+                let p: comet_proto::ForkRequest = parse_params(params)?;
+                let result = crate::fork::fork_chat(
+                    crate::fork::ForkDeps {
+                        workspace: &self.workspace,
+                        doc_host: &self.doc_host,
+                        repos: &self.repos,
+                        checkout_prep: &self.prep,
+                        handoff: self.sessions.handoff(),
+                        default_harness: self.doc_host.default_harness(),
+                    },
+                    &p,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&result)
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;

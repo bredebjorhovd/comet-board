@@ -10,7 +10,7 @@
 //!   gitDetected, gitCheckedAt?, checkoutId?, branch?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
 //!   branch?, checkoutId?, config?(json), boardPush?(json), lastMessagePreview?, lastMessageAt?, createdAt,
-//!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
+//!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?, forkedFrom?(json)}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
 //!   updatedAt}
 //! - `meta`: LoroMap {schemaVersion} — in-band detection for future destructive changes
@@ -279,6 +279,16 @@ impl WorkspaceDoc {
         )?;
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
+        // Preserved on full-row upserts for the same reason the harness-session
+        // pair above is — and one more (gh#425): a lineage is written once, at
+        // creation, so a later `set_chat_host`-style read-modify-upsert that
+        // dropped it would erase the only record that this chat is a fork.
+        match &chat.forked_from {
+            Some(lineage) => {
+                row.insert("forkedFrom", LoroValue::from(serde_json::to_value(lineage)?))?
+            }
+            None => row.delete("forkedFrom")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -471,6 +481,25 @@ impl WorkspaceDoc {
             self.doc.commit();
         }
         Ok(repaired)
+    }
+
+    /// Stamp where a chat was forked from (gh#425). Written once by the host
+    /// that made the fork; `false` when no such row.
+    ///
+    /// A set and not an upsert field for the same reason the branch and the
+    /// harness session are: the row is created first (so the fork exists even
+    /// if what follows fails), and this lands on it a moment later.
+    pub fn set_chat_forked_from(
+        &self,
+        chat_id: &str,
+        lineage: &comet_proto::ChatLineage,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert("forkedFrom", LoroValue::from(serde_json::to_value(lineage)?))?;
+        self.doc.commit();
+        Ok(true)
     }
 
     /// Host-side resume continuity: the harness-native session id of the chat's
@@ -792,6 +821,8 @@ struct RawChat {
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
+    #[serde(default)]
+    forked_from: Option<comet_proto::ChatLineage>,
 }
 
 impl From<RawChat> for Chat {
@@ -818,6 +849,7 @@ impl From<RawChat> for Chat {
             harness_session_cwd: raw.harness_session_cwd,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
+            forked_from: raw.forked_from,
         }
     }
 }
@@ -895,6 +927,7 @@ mod tests {
             harness_session_cwd: None,
             space_id: None,
             last_seen_at: None,
+            forked_from: None,
         }
     }
 

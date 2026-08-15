@@ -646,6 +646,10 @@ async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_comm
     let edge = FakeEdge::with_doc(shallow_server);
     let replacement_owner = Arc::new(Mutex::new(None));
     let replacement_owner_for_callback = replacement_owner.clone();
+    let mutation_gate = Arc::new(Mutex::new(()));
+    let publication_landed = Arc::new(AtomicBool::new(false));
+    let publication_gate = mutation_gate.clone();
+    let publication_landed_from_callback = publication_landed.clone();
     let client = RoomClient::connect_with_recovery(
         edge.connector(),
         "room-1",
@@ -653,15 +657,28 @@ async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_comm
         DocRecovery::for_device(
             "phone-1",
             Arc::new(move |replacement| {
+                let gate = publication_gate.clone();
+                let landed = publication_landed_from_callback.clone();
+                std::thread::spawn(move || {
+                    let _guard = gate.lock().unwrap();
+                    landed.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(25));
+                assert!(
+                    !publication_landed_from_callback.load(Ordering::SeqCst),
+                    "RoomActor holds the owner gate before switching its doc/subscription"
+                );
                 *replacement_owner_for_callback.lock().unwrap() = Some(replacement);
             }),
-        ),
+        )
+        .with_mutation_gate(mutation_gate),
     )
     .await
     .expect("connect");
 
     wait_until(|| client.doc().get_list("messages").len() == 5).await;
     wait_until(|| edge.doc.get_list("commands").len() == 1).await;
+    wait_until(|| publication_landed.load(Ordering::SeqCst)).await;
     let replacement = replacement_owner
         .lock()
         .unwrap()

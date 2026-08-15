@@ -486,6 +486,18 @@ impl ChatDocHandle {
         })
     }
 
+    /// Write a complete system message, idempotent by id, and publish it.
+    pub fn write_system_message(
+        &self,
+        message_id: &str,
+        text: &str,
+        created_at: i64,
+    ) -> Result<(), DocError> {
+        self.write_notice(message_id, text, false, created_at)?;
+        self.publish_messages();
+        Ok(())
+    }
+
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
     /// `note` as a visible error part so the transcript says WHY the turn
     /// ended (comet folded "Run interrupted by backend restart" the same
@@ -587,6 +599,12 @@ impl DocHost {
     /// The workspace host, once wired (tests may assemble a DocHost without one).
     pub fn workspace(&self) -> Option<&WorkspaceHost> {
         self.inner.workspace.get()
+    }
+
+    /// The harness a run in a chat with no `config` row uses — what a fork of
+    /// such a chat inherits when its caller names none either (gh#425).
+    pub fn default_harness(&self) -> comet_proto::HarnessId {
+        self.inner.config.default_harness
     }
 
     pub fn device_id(&self) -> &str {
@@ -707,6 +725,7 @@ impl DocHost {
                             "failed to reconcile device commands during room reseed");
                     }
                 }),
+                None,
                 Arc::downgrade(&handle.room),
                 Arc::new(|| {}),
             );
@@ -894,11 +913,22 @@ impl DocHost {
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
     pub fn purge_chat(&self, chat_id: &str) {
-        let removed = lock(&self.inner.handles).remove(chat_id);
-        drop(removed);
-        if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
+        if let Err(err) = self.purge_chat_checked(chat_id) {
             tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
         }
+    }
+
+    pub fn purge_chat_checked(&self, chat_id: &str) -> Result<(), EngineError> {
+        let removed = lock(&self.inner.handles).remove(chat_id);
+        drop(removed);
+        self.inner.store.delete_snapshot(chat_id)?;
+        Ok(())
+    }
+
+    pub fn persist_chat_snapshot(&self, chat_id: &str) -> Result<(), EngineError> {
+        let handle = self.open(chat_id)?;
+        self.persist_snapshot(&handle)?;
+        Ok(())
     }
 
     /// Is a run live on this chat? Unwired sessions (bare-DocHost tests) means
@@ -1209,6 +1239,12 @@ impl DocHost {
         let Some(sessions) = self.inner.sessions.get() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
+        // Fork commands may already be durable while the workspace row is
+        // being published. Leave them Pending until the creation intent is
+        // committed; rejecting a staged Run would consume the first prompt.
+        if sessions.fork_is_staged(&handle.chat_id) {
+            return;
+        }
         if !self.is_host(handle) {
             return;
         }

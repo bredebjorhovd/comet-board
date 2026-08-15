@@ -346,6 +346,17 @@ pub struct Chat {
     /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// The chat this one was forked from, and on what terms (gh#425). Written
+    /// once, by the host that made the fork, and never again — a lineage is a
+    /// fact about a chat's creation, not a state it moves through.
+    ///
+    /// On the synced row rather than in the session doc because *every* client
+    /// has to be able to see it: a phone that will never grow a fork menu still
+    /// has to show that the chat it is reading is a shared-checkout reviewer of
+    /// another one, and a reader who cannot see that will read the two chats'
+    /// edits as one agent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<crate::fork::ChatLineage>,
 }
 
 impl Chat {
