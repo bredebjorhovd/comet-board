@@ -104,11 +104,20 @@ pub fn prompt_vars<'a>(
 /// `stack` is [`DispatchOverrides::stack`], and it is appended for the same
 /// reason and one more: [`crate::stacks::stack_brief`] answers the base
 /// sentence above it, so it has to come after the sentence it answers.
+/// `decompose` ([`DispatchOverrides::decompose`]) sits in the same seat — the
+/// two never appear together ([`build_spec`] refuses the pair).
 ///
 /// [`crate::claims::brief`] closes it, on the same rule and for the failure
 /// gh#339 opened on: a brief that asked for a commit, a push and a pull request
 /// and never mentioned the review contract got exactly what it asked for.
-pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str, stack: bool) -> String {
+pub fn resolve_prompt(
+    route: &Route,
+    task: &Task,
+    branch: &str,
+    base: &str,
+    stack: bool,
+    decompose: bool,
+) -> String {
     let vars = prompt_vars(task, branch, &route.workspace);
     let template = route.prompt.clone().unwrap_or_else(|| {
         // A route with no prompt still needs to say something useful.
@@ -126,6 +135,9 @@ pub fn resolve_prompt(route: &Route, task: &Task, branch: &str, base: &str, stac
     }
     if stack {
         prompt.push_str(&crate::stacks::stack_brief(branch, pr_base(base)));
+    }
+    if decompose {
+        prompt.push_str(&decompose_brief(task));
     }
     // Last, because it is the last thing the agent does — and unconditional,
     // because the review contract is what the board dispatched for (§gh#339).
@@ -197,6 +209,67 @@ fn pr_base_line(base: &str) -> String {
          branch: `gh pr create --base {base}`. Your branch was cut from \
          `{base}`, so a request that targets anything else carries commits \
          that are not yours."
+    )
+}
+
+/// The block [`resolve_prompt`] appends when a dispatch asks for a
+/// decomposition (gh#340).
+///
+/// The standing rule already reaches every dispatched runtime: the conventions
+/// block (gh#272) says work you delegate goes through the board and in-chat
+/// subagents are for reading — and, a bullet down, that nothing is dispatched
+/// speculatively; an explicit instruction is what releases work. What no
+/// channel carried was that instruction for a *specific* task. Nothing in a
+/// brief ever said "this one is bigger than one agent", so a well-behaved
+/// agent that suspected as much was still bound to do the work alone, and the
+/// operator's only way to say otherwise was prompt prose in the ticket —
+/// workable for whoever knows the tool, invisible to anyone else. Same
+/// resolution as `--stack` (gh#287), for the same reason on its other face: an
+/// agent deciding on its own to open five tickets is a surprise worth opting
+/// into, so the deciding stays a human's and the flag is how it is said.
+///
+/// The `--repo` in the example is interpolated when the task names one, and
+/// only then: a piece filed into a different repository is a piece the parent
+/// issue's tracker never shows, and on a box that watches several repos a bare
+/// `new` needs the flag anyway. A Linear task gets the bare command — where a
+/// new ticket lands is `[defaults] new_source`'s answer, and guessing a team
+/// key here would be worse than the CLI's own refusal naming the keys.
+fn decompose_brief(task: &Task) -> String {
+    let repo_flag = crate::model::gh_repo(&task.id)
+        .map(|repo| format!(" --repo {repo}"))
+        .unwrap_or_default();
+    let identifier = &task.identifier;
+    format!(
+        "\n\nThis dispatch asks you to **decompose**: whoever released it \
+         judged this task bigger than one agent. Split it into pieces that \
+         stand alone, write each piece up as a ticket, and release it to an \
+         agent of its own:\
+         \n\n```\
+         \ncomet-board new \"<piece title>\"{repo_flag} --body - --dispatch <<'EOF'\
+         \n<the brief that piece's agent starts from: the goal, the \
+         constraints, the seam it must honour. Say it is part of {identifier}, \
+         so the tracker shows the fan-out.>\
+         \nEOF\
+         \n```\
+         \n\nThe body is everything its agent will know, so write it for a \
+         stranger. Provenance rides along on its own — the board reads your \
+         chat id from COMET_BOARD_CHAT_ID and records each release as yours — \
+         and this chat is prompted when a piece settles or blocks. After \
+         releasing, wait for the pieces (`comet-board wait \
+         --blocked-is-settled --timeout <secs>`) or say plainly that you are \
+         leaving them running.\
+         \n\nKeep for yourself the part that needed the whole picture — the \
+         shared foundation, the seam the pieces meet at, the integration — and \
+         commit and push it here as usual. Your own attempt still settles the \
+         ordinary way, on a pull request or pushed commits: a chat that \
+         releases everything and pushes nothing reads as an agent still \
+         working, until the clock cap ends it as failed. A piece that builds \
+         on what you keep is written without `--dispatch` and released with \
+         `comet-board dispatch --task <its id> --onto {identifier}` after you \
+         have pushed.\
+         \n\nIf the work does not honestly split into pieces a stranger could \
+         carry, do it all here and say in the pull request description why it \
+         did not."
     )
 }
 
@@ -521,6 +594,19 @@ pub fn build_spec(
     overrides: &DispatchOverrides,
     by_user: Option<&str>,
 ) -> Result<DispatchSpec> {
+    // Two decomposition asks in two different dimensions is not a bigger ask,
+    // it is an ambiguous one: `--stack` layers this attempt's own pull
+    // requests, `--decompose` releases pieces to other agents, and a brief
+    // carrying both blocks reads as "split this twice" with no rule for which
+    // cut comes first. Refused like `--base` with `--onto`, and for the same
+    // reason: the pair is a contradiction, not a combination.
+    if overrides.stack && overrides.decompose {
+        bail!(
+            "this dispatch asks for a stack and a decomposition at once — \
+             `--stack` layers one attempt's own pull requests, `--decompose` \
+             releases pieces to other agents; ask for one shape at a time"
+        );
+    }
     let runtime = overrides.runtime.as_deref().unwrap_or(&route.runtime);
     let harness = harness_for_runtime(runtime).ok_or_else(|| {
         anyhow::anyhow!(
@@ -564,7 +650,14 @@ pub fn build_spec(
         push_repo,
         git_author,
         repo_path,
-        prompt: resolve_prompt(route, task, &branch, &base, overrides.stack),
+        prompt: resolve_prompt(
+            route,
+            task,
+            &branch,
+            &base,
+            overrides.stack,
+            overrides.decompose,
+        ),
         branch,
         base,
         worktree: true,
@@ -639,6 +732,21 @@ pub struct DispatchOverrides {
     /// describes. A size threshold could come later; it would need a board that
     /// has watched this work first.
     pub stack: bool,
+    /// `--decompose`: split this task into tickets and release each to an
+    /// agent of its own (gh#340). All it does is add [`decompose_brief`] to
+    /// the brief — the pieces are the agent's to design and `comet-board new
+    /// --dispatch`'s to release.
+    ///
+    /// [`stack`](Self::stack)'s twin, one level up: a stack is one attempt's
+    /// own pull requests layered, a decomposition is other agents' tickets.
+    /// Off by default on the stack flag's own reasoning — five tickets where
+    /// one agent was expected is a surprise worth opting into — and per
+    /// dispatch because task size is a property of the work. The conventions
+    /// block (gh#272) already tells every runtime that delegation goes through
+    /// the board *and* that nothing is dispatched without explicit
+    /// instruction; this is that instruction, as a flag instead of prompt
+    /// prose. Asking for both shapes at once is refused ([`build_spec`]).
+    pub decompose: bool,
     /// Cut this dispatch from that branch instead of the route's `base`, and
     /// point its pull request at it (gh#285).
     ///
@@ -972,6 +1080,99 @@ mod tests {
         assert!(!spec.prompt.contains("gh stack"));
     }
 
+    // ---- the brief authorizes a fan-out only when asked (§gh#340) ---------
+
+    /// gh#340. Same shape as `--stack`: the flag's whole effect is the brief.
+    /// The command it hands over names this task's own repo and identifier,
+    /// because those are the two things a piece's ticket must carry that the
+    /// decomposing agent cannot be trusted to guess.
+    #[test]
+    fn a_dispatch_that_asks_for_decomposition_says_so_in_the_brief() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides {
+                decompose: true,
+                ..DispatchOverrides::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            spec.prompt.contains("asks you to **decompose**"),
+            "{}",
+            spec.prompt
+        );
+        // The command, with the task's own repo interpolated so the pieces
+        // land beside the parent issue on a box that watches several.
+        assert!(
+            spec.prompt
+                .contains("--repo owner/widget --body - --dispatch"),
+            "{}",
+            spec.prompt
+        );
+        // The follow-up spelling names this task, so a piece that builds on
+        // the kept slice stacks on it rather than on a guess.
+        assert!(spec.prompt.contains("--onto gh#7"), "{}", spec.prompt);
+        // And the task's own brief is still in front of it.
+        assert!(spec.prompt.contains("Fix the flaky retry (gh#7)"));
+    }
+
+    /// An ordinary dispatch never carries the authorization: the conventions'
+    /// standing rule — nothing is dispatched without explicit instruction —
+    /// stays in force, and this brief is silent rather than half-permitting.
+    #[test]
+    fn an_ordinary_dispatch_never_authorizes_a_fan_out() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(!spec.prompt.contains("decompose"), "{}", spec.prompt);
+        assert!(!spec.prompt.contains("--dispatch"), "{}", spec.prompt);
+    }
+
+    /// A Linear task names no repo, so the command stays bare — where a new
+    /// ticket lands is `[defaults] new_source`'s answer, not a guess here.
+    #[test]
+    fn a_linear_decomposition_gets_the_bare_command() {
+        let mut task = task();
+        task.id = "linear:AGE-14".into();
+        task.identifier = "AGE-14".into();
+        let prompt = resolve_prompt(&route(), &task, "board/age-14", "origin/HEAD", false, true);
+        assert!(
+            prompt.contains("comet-board new \"<piece title>\" --body - --dispatch"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("--repo"), "{prompt}");
+    }
+
+    /// Both shapes at once is an ambiguous ask, not a bigger one — refused
+    /// before anything is created, like `--base` with `--onto`.
+    #[test]
+    fn a_stack_and_a_decomposition_at_once_are_refused() {
+        let err = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides {
+                stack: true,
+                decompose: true,
+                ..DispatchOverrides::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("one shape at a time"), "{err}");
+    }
+
     // ---- the review contract reaches the agent (§gh#339) -----------------
 
     /// The headline. Twenty-three settled attempts on the box claimed nothing,
@@ -1017,7 +1218,7 @@ mod tests {
     fn a_route_with_its_own_prompt_is_still_asked() {
         let mut route = route();
         route.prompt = Some("Do {title}. Commit, push, open a PR.".into());
-        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false);
+        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false, false);
         assert!(prompt.starts_with("Do Fix the flaky retry."), "{prompt}");
         assert!(
             prompt.contains("comet-board claim --task gh:owner/widget#7"),
@@ -1030,7 +1231,7 @@ mod tests {
     /// opens with is a different string.
     #[test]
     fn the_brief_names_the_id_the_verb_takes_and_not_the_identifier() {
-        let prompt = resolve_prompt(&route(), &task(), "board/gh-7", "origin/HEAD", false);
+        let prompt = resolve_prompt(&route(), &task(), "board/gh-7", "origin/HEAD", false, false);
         let asked = prompt.split("--task ").nth(1).expect("the verb");
         assert!(asked.starts_with("gh:owner/widget#7"), "{asked}");
     }
@@ -1040,7 +1241,7 @@ mod tests {
     fn a_template_can_name_the_task_id() {
         let mut route = route();
         route.prompt = Some("claim against {task_id} when done".into());
-        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false);
+        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false, false);
         assert!(
             prompt.starts_with("claim against gh:owner/widget#7 when done"),
             "{prompt}"

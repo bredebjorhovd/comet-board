@@ -782,6 +782,11 @@ pub struct DispatchOpts<'a> {
     /// pull requests (gh#287). Adds a block to the brief and nothing else — the
     /// layers are the agent's to design and `gh stack`'s to create.
     pub stack: bool,
+    /// `--decompose`: ask the agent to split the task into tickets and release
+    /// each to an agent of its own (gh#340). Adds a block to the brief and
+    /// nothing else; naming it together with `--stack` is refused by the
+    /// engine (and by clap before that).
+    pub decompose: bool,
 }
 
 /// Whether `retry` on a row in this state has to replace a live attempt.
@@ -1122,6 +1127,9 @@ fn dispatch_params(task_id: &str, opts: DispatchOpts<'_>) -> serde_json::Value {
     }
     if opts.stack {
         object.insert("stack".into(), serde_json::Value::Bool(true));
+    }
+    if opts.decompose {
+        object.insert("decompose".into(), serde_json::Value::Bool(true));
     }
     params
 }
@@ -2145,6 +2153,7 @@ mod tests {
                     base: None,
                     replace: true,
                     stack: false,
+                    decompose: false,
                 }
             ),
             serde_json::json!({
@@ -2167,6 +2176,17 @@ mod tests {
                 }
             ),
             serde_json::json!({ "taskId": "gh:o/r#1", "via": null, "stack": true })
+        );
+        // gh#340: the same rule for the other decomposition ask.
+        assert_eq!(
+            dispatch_params(
+                "gh:o/r#1",
+                DispatchOpts {
+                    decompose: true,
+                    ..DispatchOpts::default()
+                }
+            ),
+            serde_json::json!({ "taskId": "gh:o/r#1", "via": null, "decompose": true })
         );
     }
 

@@ -181,6 +181,18 @@ is this board's `review`.
   the row stays one row, linked to the bottom layer, `merged` only once the
   whole stack has landed. Feedback on the upper layers does not reach the
   agent's chat yet; only the bottom layer's does.
+- **Ask for a decomposition when the task is more than one agent's**, with
+  `dispatch --decompose` (gh#340). The agent then splits its task into tickets
+  and releases each with `comet-board new --dispatch`, keeping for itself the
+  part that needed the whole picture — the shared foundation, the seam, the
+  integration — and the fan-out is on the board: every piece a row, a branch,
+  a pull request, a bill. This is the explicit instruction the
+  never-dispatch-speculatively rule asks for, said per task instead of written
+  into the ticket as prompt prose; without the flag an agent that suspects its
+  task is too big for one chat is still bound to do the work alone. Off unless
+  asked for, on `--stack`'s reasoning one level up: several agents where one
+  was expected is a surprise. Naming both flags is refused — a stack is one
+  attempt's layered pull requests, a decomposition is other agents' tickets.
 - **Stack a follow-up with `dispatch --onto <task>`.** The new task's branch is
   cut from the branch that task's attempt holds, and its pull request targets
   that branch instead of trunk — so the child's diff is only the child's work.

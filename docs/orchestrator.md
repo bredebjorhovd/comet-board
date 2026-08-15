@@ -150,6 +150,16 @@ the agent will find some. Feedback on the bottom layer reaches its chat as
 usual; feedback on the layers above it does not yet, so a stacked task is one
 you read rather than one you relay.
 
+**Ask for a fan-out when the task is more than one agent's.** `dispatch
+--decompose` (gh#340) tells the agent to split its task into tickets, release
+each with `comet-board new --dispatch`, and keep for itself the part that
+needed the whole picture. Without the flag an agent that suspects as much is
+still bound by the no-speculative-dispatch rule to do the work alone — the flag
+is that rule's explicit instruction, said per task. Same judgement as `--stack`,
+one level up, and refused together with it: pass it when the pieces are already
+visible in the ticket, and expect the pieces to arrive as rows released by that
+agent's chat.
+
 **Review what comes back.** A task in `review` keeps its chat, and comments on
 its pull request are delivered back into it — so say what is wrong *on the pull
 request*, where the agent that wrote it is still sitting with the whole task in
