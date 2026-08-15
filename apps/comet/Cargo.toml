@@ -22,6 +22,7 @@ comet-tui.workspace = true
 comet-update.workspace = true
 tokio.workspace = true
 clap.workspace = true
+mimalloc.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

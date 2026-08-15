@@ -71,7 +71,10 @@ impl MessagePart {
     }
 }
 
-/// Immutably fold one agent event into a parts accumulator.
+/// Fold one agent event into a parts accumulator, in place.
+///
+/// In place because the fold runs once per streamed event: rebuilding the
+/// accumulator each time made long turns O(n²) in allocations.
 ///
 /// Semantics from comet `foldEventIntoParts`:
 /// - `SessionStarted` / `Steered` reset the accumulator (turn boundary — makes replay safe).
@@ -81,11 +84,10 @@ impl MessagePart {
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
 /// - `Error` and `Done{error}` become visible error parts.
-pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<MessagePart> {
-    let mut out: Vec<MessagePart> = parts.to_vec();
+pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
-            return Vec::new();
+            out.clear();
         }
         AgentEvent::TextDelta { text } => {
             if let Some(MessagePart::Text { text: tail, .. }) = out.last_mut() {
@@ -225,7 +227,6 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
         | AgentEvent::Sandbox(_)
         | AgentEvent::ContextUsage(_) => {}
     }
-    out
 }
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
@@ -337,11 +338,11 @@ mod tests {
     #[test]
     fn text_deltas_merge_until_broken_by_tool() {
         let mut parts = Vec::new();
-        parts = fold_event_into_parts(&parts, &text_delta("Hello "));
-        parts = fold_event_into_parts(&parts, &text_delta("world"));
+        fold_event_into_parts(&mut parts, &text_delta("Hello "));
+        fold_event_into_parts(&mut parts, &text_delta("world"));
         assert_eq!(parts.len(), 1);
-        parts = fold_event_into_parts(
-            &parts,
+        fold_event_into_parts(
+            &mut parts,
             &AgentEvent::ToolCall {
                 id: "tool-1".into(),
                 call: ToolCall::Exec {
@@ -349,7 +350,7 @@ mod tests {
                 },
             },
         );
-        parts = fold_event_into_parts(&parts, &text_delta("after"));
+        fold_event_into_parts(&mut parts, &text_delta("after"));
         assert_eq!(parts.len(), 3);
         match &parts[2] {
             MessagePart::Text { text, .. } => assert_eq!(text, "after"),
@@ -359,9 +360,10 @@ mod tests {
 
     #[test]
     fn session_started_resets_accumulator() {
-        let parts = fold_event_into_parts(&[], &text_delta("junk"));
-        let reset = fold_event_into_parts(
-            &parts,
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &text_delta("junk"));
+        fold_event_into_parts(
+            &mut parts,
             &AgentEvent::SessionStarted {
                 harness: comet_proto::HarnessId::Mock,
                 model: "m".into(),
@@ -371,7 +373,7 @@ mod tests {
                 assistant_message_id: "a".into(),
             },
         );
-        assert!(reset.is_empty());
+        assert!(parts.is_empty());
     }
 
     #[test]
@@ -382,8 +384,10 @@ mod tests {
                 command: "ls".into(),
             },
         };
-        let once = fold_event_into_parts(&[], &call);
-        let twice = fold_event_into_parts(&once, &call);
+        let mut once = Vec::new();
+        fold_event_into_parts(&mut once, &call);
+        let mut twice = once.clone();
+        fold_event_into_parts(&mut twice, &call);
         assert_eq!(once, twice);
     }
 
@@ -410,12 +414,13 @@ mod tests {
 
     #[test]
     fn subagent_activity_counts_steps_on_its_task_row() {
-        let mut parts = fold_event_into_parts(&[], &task_call("toolu_1"));
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &task_call("toolu_1"));
         // A second delegation must not collect the first one's steps.
-        parts = fold_event_into_parts(&parts, &task_call("toolu_2"));
+        fold_event_into_parts(&mut parts, &task_call("toolu_2"));
         for _ in 0..3 {
-            parts = fold_event_into_parts(
-                &parts,
+            fold_event_into_parts(
+                &mut parts,
                 &AgentEvent::SubagentActivity {
                     parent_tool_use_id: "toolu_1".into(),
                 },
@@ -426,15 +431,15 @@ mod tests {
 
         // A background Task resolves the moment it is launched and keeps
         // working — its steps must keep counting after the row resolved.
-        parts = fold_event_into_parts(
-            &parts,
+        fold_event_into_parts(
+            &mut parts,
             &AgentEvent::ToolResult {
                 id: "toolu_1".into(),
                 is_error: false,
             },
         );
-        parts = fold_event_into_parts(
-            &parts,
+        fold_event_into_parts(
+            &mut parts,
             &AgentEvent::SubagentActivity {
                 parent_tool_use_id: "toolu_1".into(),
             },
@@ -442,14 +447,15 @@ mod tests {
         assert_eq!(steps_of(&parts[0]), 4);
 
         // A re-emitted call refreshes the row without losing its progress.
-        parts = fold_event_into_parts(&parts, &task_call("toolu_1"));
+        fold_event_into_parts(&mut parts, &task_call("toolu_1"));
         assert_eq!(steps_of(&parts[0]), 4);
 
         // Activity for a Task this segment never saw (a background subagent
         // still working after its turn's parts were finalized) folds to
         // nothing rather than inventing a row.
-        let orphan = fold_event_into_parts(
-            &[],
+        let mut orphan = Vec::new();
+        fold_event_into_parts(
+            &mut orphan,
             &AgentEvent::SubagentActivity {
                 parent_tool_use_id: "toolu_9".into(),
             },
@@ -459,8 +465,9 @@ mod tests {
 
     #[test]
     fn tool_result_marks_resolution() {
-        let mut parts = fold_event_into_parts(
-            &[],
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
             &AgentEvent::ToolCall {
                 id: "t".into(),
                 call: ToolCall::Exec {
@@ -468,8 +475,8 @@ mod tests {
                 },
             },
         );
-        parts = fold_event_into_parts(
-            &parts,
+        fold_event_into_parts(
+            &mut parts,
             &AgentEvent::ToolResult {
                 id: "t".into(),
                 is_error: true,

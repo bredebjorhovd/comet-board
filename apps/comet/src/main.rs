@@ -88,6 +88,12 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     }
 }
 
+/// mimalloc: system malloc (macOS libmalloc especially) never returns the
+/// streaming churn's high-water pages, so transient allocation became
+/// permanent RSS (gh#414).
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // The TUI owns its own tracing (to a file — a line on stdout would land

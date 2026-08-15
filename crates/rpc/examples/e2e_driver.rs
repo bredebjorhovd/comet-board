@@ -79,6 +79,30 @@ async fn wait_stream<T>(
     }
 }
 
+/// [`wait_stream`] over `WatchDocMessages`, materializing its delta frames
+/// (gh#414) so the predicate keeps seeing the whole transcript as a JSON array.
+async fn wait_transcript<T>(
+    client: &RpcClient,
+    chat_id: &str,
+    what: &str,
+    predicate: impl Fn(&serde_json::Value) -> Option<T>,
+) -> T {
+    let entries = std::cell::RefCell::new(Vec::<comet_doc::SessionMessageEntry>::new());
+    wait_stream(
+        client,
+        methods::WATCH_DOC_MESSAGES,
+        serde_json::json!({ "chatId": chat_id }),
+        what,
+        move |item| {
+            let frame: comet_doc::TranscriptFrame = serde_json::from_value(item.clone()).ok()?;
+            let mut entries = entries.borrow_mut();
+            comet_doc::apply_transcript_frame(&mut entries, frame).ok()?;
+            predicate(&serde_json::to_value(&*entries).ok()?)
+        },
+    )
+    .await
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -210,10 +234,9 @@ async fn main() {
     pass("run command queued on B via the doc command queue");
 
     // 5a. Assistant entry executed by A arrives back on B, complete, with the mock text.
-    let (by_device, text) = wait_stream(
+    let (by_device, text) = wait_transcript(
         &b,
-        methods::WATCH_DOC_MESSAGES,
-        serde_json::json!({ "chatId": chat_id }),
+        &chat_id,
         "assistant transcript on B",
         |item| {
             let entry = item.as_array()?.iter().find(|entry| {

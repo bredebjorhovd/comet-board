@@ -27,7 +27,7 @@
 //! socket.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -72,6 +72,15 @@ const MAX_OPEN_CHATS: usize = 32;
 
 /// How often [`DocHost::spawn_idle_release`] sweeps.
 const RELEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
+/// columnar+compressed; the in-memory doc plus mirror runs well above the blob
+/// size. A rough multiplier is enough here — the byte budget is a safety
+/// ceiling, the idle sweep and [`MAX_OPEN_CHATS`] do the day-to-day work.
+const RESIDENT_BYTES_PER_SNAPSHOT_BYTE: usize = 6;
+
+/// Floor per open doc (room socket buffers, tasks) regardless of content size.
+const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
 
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
@@ -206,6 +215,11 @@ pub struct ChatDocHandle {
     /// change (a local commit, or an import from the room). The idle sweep's
     /// clock — see [`DocHost::release_idle`].
     last_used: AtomicI64,
+    /// True when the doc changed while nobody watched: the mirror rebuild is
+    /// deferred to the next `watch_messages` attach instead of paid per commit.
+    mirror_dirty: AtomicBool,
+    /// Last known snapshot blob size — the release byte budget's input.
+    snapshot_bytes: AtomicUsize,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -241,8 +255,20 @@ impl ChatDocHandle {
     }
 
     /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
+    ///
+    /// Attach-time refresh: the mirror is only maintained while watched, so a
+    /// doc that changed unwatched materializes here, once, instead of on every
+    /// commit it sat through in the background.
     pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
-        self.messages_tx.subscribe()
+        self.touch();
+        // Subscribe BEFORE the dirty check: a commit racing this attach then
+        // sees a live receiver and publishes, instead of re-marking dirty
+        // after our refresh and leaving the new watcher a cleared mirror.
+        let rx = self.messages_tx.subscribe();
+        if self.mirror_dirty.load(Ordering::Acquire) {
+            self.publish_messages();
+        }
+        rx
     }
 
     /// Is this chat's session room joined RIGHT NOW? (Not "do we hold a client"
@@ -307,6 +333,7 @@ impl ChatDocHandle {
     }
 
     fn publish_messages(&self) {
+        self.mirror_dirty.store(false, Ordering::Release);
         match self.doc.read_entries() {
             Ok(entries) => {
                 let joined = join_continuation_entries(entries);
@@ -318,6 +345,25 @@ impl ChatDocHandle {
                 tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
             }
         }
+    }
+
+    /// Per-commit publish path: unwatched docs just mark the mirror dirty —
+    /// rebuilding a full transcript nobody reads was a per-tick cost on every
+    /// open doc (and kept a second transcript copy hot).
+    fn publish_messages_if_watched(&self) {
+        if self.messages_tx.receiver_count() == 0 {
+            self.mirror_dirty.store(true, Ordering::Release);
+            // Shrink the stale mirror: watch_messages rebuilds on attach.
+            self.messages_tx.send_replace(Vec::new());
+        } else {
+            self.publish_messages();
+        }
+    }
+
+    /// Rough resident cost for the release byte budget.
+    fn resident_estimate(&self) -> usize {
+        (self.snapshot_bytes.load(Ordering::Relaxed) * RESIDENT_BYTES_PER_SNAPSHOT_BYTE)
+            .max(DOC_RESIDENT_FLOOR_BYTES)
     }
 }
 
@@ -399,8 +445,10 @@ impl DocHost {
             handle.touch();
             return Ok(handle.clone());
         }
+        let mut snapshot_len = 0usize;
         let doc = match self.inner.store.load_snapshot(chat_id)? {
             Some(bytes) => {
+                snapshot_len = bytes.len();
                 let raw = loro::LoroDoc::new();
                 raw.import(&bytes)
                     .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
@@ -414,8 +462,10 @@ impl DocHost {
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        let joined = join_continuation_entries(doc.read_entries()?);
-        let (messages_tx, _) = watch::channel(joined);
+        // The mirror starts dirty and empty: many opens (command queueing,
+        // drains, nudges) never watch the transcript, and the first
+        // watch_messages attach materializes it on demand.
+        let (messages_tx, _) = watch::channel(Vec::new());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -424,6 +474,8 @@ impl DocHost {
             messages_tx,
             room: Arc::new(Mutex::new(None)),
             last_used: AtomicI64::new(now_ms()),
+            mirror_dirty: AtomicBool::new(true),
+            snapshot_bytes: AtomicUsize::new(snapshot_len),
             _sub: sub,
         });
         {
@@ -551,13 +603,18 @@ impl DocHost {
     /// has been idle for [`IDLE_RELEASE_MS`], and the least recently used go
     /// early when more than [`MAX_OPEN_CHATS`] are open.
     pub fn release_idle(&self) -> usize {
-        self.release_idle_at(now_ms(), IDLE_RELEASE_MS, MAX_OPEN_CHATS)
+        self.release_idle_at(
+            now_ms(),
+            IDLE_RELEASE_MS,
+            MAX_OPEN_CHATS,
+            comet_doc::DOC_LRU_BYTE_BUDGET,
+        )
     }
 
     /// [`Self::release_idle`] with the clock and the bounds passed in — the seam
     /// the policy tests drive, so they need neither a five-minute wait nor 32
     /// chats.
-    fn release_idle_at(&self, now: i64, idle_ms: i64, max_open: usize) -> usize {
+    fn release_idle_at(&self, now: i64, idle_ms: i64, max_open: usize, byte_budget: usize) -> usize {
         // Pass 1, under the lock: everything the cache itself knows. No call out
         // to another service from here — a dispatch on another thread walks
         // sessions → doc host, and this lock must never be held facing back.
@@ -571,6 +628,7 @@ impl DocHost {
                     // `strong_count == 1` is the map's own reference: anything
                     // more is a caller mid-write holding the handle.
                     pinned: handle.watched() || Arc::strong_count(handle) > 1,
+                    resident: handle.resident_estimate(),
                 })
                 .collect()
         };
@@ -578,7 +636,7 @@ impl DocHost {
         for candidate in &mut candidates {
             candidate.pinned = candidate.pinned || self.chat_is_busy(&candidate.chat_id);
         }
-        let releasing = rooms_to_release(candidates, now, idle_ms, max_open);
+        let releasing = rooms_to_release(candidates, now, idle_ms, max_open, byte_budget);
         if releasing.is_empty() {
             return 0;
         }
@@ -622,6 +680,17 @@ impl DocHost {
             );
         }
         count
+    }
+
+    /// Drop a chat's doc unconditionally and delete its local snapshot — the
+    /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
+    /// stream end; a racing writer keeps its orphaned doc until the run ends.
+    pub fn purge_chat(&self, chat_id: &str) {
+        let removed = lock(&self.inner.handles).remove(chat_id);
+        drop(removed);
+        if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
+            tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
+        }
     }
 
     /// Is a run live on this chat? Unwired sessions (bare-DocHost tests) means
@@ -1111,20 +1180,25 @@ impl DocHost {
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
-        self.save_doc(&handle.chat_id, &handle.doc);
+        if let Some(bytes) = self.save_doc(&handle.chat_id, &handle.doc) {
+            handle.snapshot_bytes.store(bytes, Ordering::Relaxed);
+        }
     }
 
     /// [`Self::save_snapshot`] against the doc alone — the release path, which
     /// has let go of the handle (and with it the room) before it exports.
-    fn save_doc(&self, chat_id: &str, doc: &SessionDoc) {
+    /// Returns the exported blob size (the byte budget's freshest input).
+    fn save_doc(&self, chat_id: &str, doc: &SessionDoc) -> Option<usize> {
         match doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.inner.store.save_snapshot(chat_id, &bytes) {
                     tracing::warn!(chat = %chat_id, error = %err, "snapshot save failed");
                 }
+                Some(bytes.len())
             }
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "snapshot export failed");
+                None
             }
         }
     }
@@ -1147,20 +1221,26 @@ struct RoomCandidate {
     /// Something outside the cache is using this chat right now — a watcher, a
     /// live run, a caller holding the handle. Never released, at any age.
     pinned: bool,
+    /// [`ChatDocHandle::resident_estimate`] — the byte-budget rule's input.
+    resident: usize,
 }
 
 /// Which chats to release, and the `last_used` each decision was made on (the
 /// sweep re-checks that stamp before it actually removes anything).
 ///
-/// Two rules, in order: anything unpinned and idle for `idle_ms` goes, and then
+/// Three rules, in order: anything unpinned and idle for `idle_ms` goes; then
 /// — if more than `max_open` chats would still be open — the least recently used
-/// unpinned chats go until the cache is back under the bound. Pure, so the
-/// policy is testable without a clock, a socket or a doc.
+/// unpinned chats go until the cache is back under the bound; and then — if the
+/// survivors' resident estimate still exceeds `byte_budget` (a few genuinely
+/// huge docs, gh#414) — the least recently used unpinned chats keep going until
+/// it does not. Pure, so the policy is testable without a clock, a socket or a
+/// doc.
 fn rooms_to_release(
     candidates: Vec<RoomCandidate>,
     now: i64,
     idle_ms: i64,
     max_open: usize,
+    byte_budget: usize,
 ) -> Vec<(String, i64)> {
     let mut by_age = candidates;
     // Oldest first; chat id breaks ties so a sweep is deterministic.
@@ -1170,28 +1250,32 @@ fn rooms_to_release(
             .then_with(|| a.chat_id.cmp(&b.chat_id))
     });
     let mut open = by_age.len();
+    let mut resident: usize = by_age.iter().map(|c| c.resident).sum();
     let mut releasing = Vec::new();
-    let mut idle = vec![false; by_age.len()];
+    let mut taken = vec![false; by_age.len()];
     for (i, candidate) in by_age.iter().enumerate() {
         if candidate.pinned || now.saturating_sub(candidate.last_used) < idle_ms {
             continue;
         }
-        idle[i] = true;
+        taken[i] = true;
         releasing.push((candidate.chat_id.clone(), candidate.last_used));
         open -= 1;
+        resident = resident.saturating_sub(candidate.resident);
     }
-    // Over the bound: keep taking from the oldest end. A pinned chat is never
+    // Over a bound: keep taking from the oldest end. A pinned chat is never
     // eligible, so a device with more than `max_open` LIVE chats simply stays
     // over the bound — cutting a live run's socket is not a trade worth making.
     for (i, candidate) in by_age.iter().enumerate() {
-        if open <= max_open {
+        if open <= max_open && resident <= byte_budget {
             break;
         }
-        if candidate.pinned || idle[i] {
+        if candidate.pinned || taken[i] {
             continue;
         }
+        taken[i] = true;
         releasing.push((candidate.chat_id.clone(), candidate.last_used));
         open -= 1;
+        resident = resident.saturating_sub(candidate.resident);
     }
     releasing
 }
@@ -1223,10 +1307,10 @@ pub fn respond_input_prompt(
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
 async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
-    // Initial pass: the snapshot may already carry pending commands.
+    // Initial pass: the snapshot may already carry pending commands. The
+    // mirror stays lazy — it materializes on the first watch attach.
     {
         let Some(handle) = weak.upgrade() else { return };
-        handle.publish_messages();
         host.drain_commands(&handle).await;
     }
     let mut save_deadline: Option<tokio::time::Instant> = None;
@@ -1241,7 +1325,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 // A change is use: a local commit, or an import from the room.
                 // Keeps a chat that is quietly syncing out of the idle sweep.
                 handle.touch();
-                handle.publish_messages();
+                handle.publish_messages_if_watched();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(
@@ -1275,11 +1359,24 @@ mod tests {
 
     use super::*;
 
+    /// No byte budget: the tests that predate it drive the first two rules.
+    const NO_BUDGET: usize = usize::MAX;
+
     fn candidate(chat_id: &str, last_used: i64, pinned: bool) -> RoomCandidate {
+        sized_candidate(chat_id, last_used, pinned, 0)
+    }
+
+    fn sized_candidate(
+        chat_id: &str,
+        last_used: i64,
+        pinned: bool,
+        resident: usize,
+    ) -> RoomCandidate {
         RoomCandidate {
             chat_id: chat_id.to_string(),
             last_used,
             pinned,
+            resident,
         }
     }
 
@@ -1303,6 +1400,7 @@ mod tests {
             now,
             30_000,
             100,
+            NO_BUDGET,
         );
         assert_eq!(released_ids(released), vec!["idle".to_string()]);
     }
@@ -1321,6 +1419,7 @@ mod tests {
             now,
             30_000,
             100,
+            NO_BUDGET,
         );
         assert_eq!(released_ids(released), vec!["nobody".to_string()]);
     }
@@ -1332,7 +1431,7 @@ mod tests {
         let candidates: Vec<RoomCandidate> = (0..6)
             .map(|i| candidate(&format!("chat-{i}"), now - (6 - i) * 1_000, false))
             .collect();
-        let released = rooms_to_release(candidates, now, 30_000, 4);
+        let released = rooms_to_release(candidates, now, 30_000, 4, NO_BUDGET);
         assert_eq!(
             released_ids(released),
             vec!["chat-0".to_string(), "chat-1".to_string()],
@@ -1349,7 +1448,7 @@ mod tests {
             .map(|i| candidate(&format!("live-{i}"), now - (6 - i) * 1_000, true))
             .collect();
         candidates.push(candidate("spare", now - 500, false));
-        let released = rooms_to_release(candidates, now, 30_000, 4);
+        let released = rooms_to_release(candidates, now, 30_000, 4, NO_BUDGET);
         assert_eq!(
             released_ids(released),
             vec!["spare".to_string()],
@@ -1366,7 +1465,7 @@ mod tests {
             .map(|i| candidate(&format!("idle-{i}"), now - 90_000, false))
             .collect();
         candidates.extend((0..3).map(|i| candidate(&format!("fresh-{i}"), now - 100, false)));
-        let released = rooms_to_release(candidates, now, 30_000, 4);
+        let released = rooms_to_release(candidates, now, 30_000, 4, NO_BUDGET);
         assert_eq!(
             released_ids(released),
             vec![
@@ -1378,11 +1477,63 @@ mod tests {
     }
 
     #[test]
+    fn the_byte_budget_releases_oldest_first_even_under_the_count_bound() {
+        // Three fresh chats, all inside the idle window and under the count
+        // bound — only the byte budget can act. Two 40MB docs and one 1MB one
+        // (81MB resident) against a 40MB budget: releasing the oldest alone
+        // leaves 41MB, still over, so the sweep keeps going from the oldest
+        // end and takes `small` too — 40MB fits and it stops there, leaving
+        // the newest huge doc resident (gh#414 — a handful of genuinely huge
+        // docs). The budget has to sit under 41MB for the second release to
+        // be necessary at all; at 60MB the first release already fits and
+        // taking `small` would be gratuitous.
+        let now = 1_000_000;
+        let mb = 1024 * 1024;
+        let released = rooms_to_release(
+            vec![
+                sized_candidate("huge-old", now - 3_000, false, 40 * mb),
+                sized_candidate("huge-new", now - 1_000, false, 40 * mb),
+                sized_candidate("small", now - 2_000, false, mb),
+            ],
+            now,
+            30_000,
+            100,
+            40 * mb,
+        );
+        assert_eq!(
+            released_ids(released),
+            vec!["huge-old".to_string(), "small".to_string()],
+            "oldest unpinned go until the resident estimate fits the budget"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_never_takes_a_pinned_chat() {
+        let now = 1_000_000;
+        let mb = 1024 * 1024;
+        let released = rooms_to_release(
+            vec![
+                sized_candidate("huge-live", now - 3_000, true, 100 * mb),
+                sized_candidate("small", now - 1_000, false, mb),
+            ],
+            now,
+            30_000,
+            100,
+            50 * mb,
+        );
+        assert_eq!(
+            released_ids(released),
+            vec!["small".to_string()],
+            "a watched/running doc stays resident even over the budget"
+        );
+    }
+
+    #[test]
     fn nothing_to_do_is_nothing_released() {
         let now = 1_000_000;
-        assert!(rooms_to_release(Vec::new(), now, 30_000, 4).is_empty());
+        assert!(rooms_to_release(Vec::new(), now, 30_000, 4, NO_BUDGET).is_empty());
         assert!(
-            rooms_to_release(vec![candidate("fresh", now, false)], now, 30_000, 4).is_empty(),
+            rooms_to_release(vec![candidate("fresh", now, false)], now, 30_000, 4, NO_BUDGET).is_empty(),
             "a quiet, under-bound cache is left alone"
         );
     }
@@ -1422,7 +1573,7 @@ mod tests {
         settle().await;
         assert_eq!(host.open_chats(), vec!["chat-a".to_string()]);
 
-        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100, NO_BUDGET), 1);
         assert!(
             host.open_chats().is_empty(),
             "the cache entry ended, so the room census stops counting it"
@@ -1439,6 +1590,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_lazy_mirror_materializes_on_attach() {
+        // gh#414: unwatched docs no longer maintain the transcript mirror per
+        // commit — the first watch attach must still see the whole transcript.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+
+        let handle = host.open("chat-lazy").expect("open");
+        handle
+            .write_user_message("m1", "written while unwatched", 1)
+            .expect("write");
+        settle().await;
+        // Nobody watched: the mirror is deliberately empty…
+        assert!(handle.messages_tx.borrow().is_empty());
+        // …and attaching rebuilds it before the first borrow.
+        let rx = handle.watch_messages();
+        let seen = rx.borrow().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].id, "m1");
+    }
+
+    #[tokio::test]
+    async fn a_purged_chat_loses_handle_and_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+
+        let handle = host.open("chat-doomed").expect("open");
+        handle.write_user_message("m1", "gone soon", 1).expect("write");
+        host.flush_all(); // persist so the purge has a snapshot to delete
+        drop(handle);
+        settle().await;
+
+        host.purge_chat("chat-doomed");
+        assert!(host.open_chats().is_empty(), "handle dropped");
+        // A re-open starts from nothing: the snapshot is gone too.
+        let reopened = host.open("chat-doomed").expect("re-open");
+        assert!(reopened.doc().read_entries().expect("entries").is_empty());
+    }
+
+    #[tokio::test]
     async fn a_watched_chat_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = host(dir.path());
@@ -1450,7 +1640,7 @@ mod tests {
         host.open("chat-quiet").expect("open");
         settle().await;
 
-        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100, NO_BUDGET), 1);
         assert_eq!(
             host.open_chats(),
             vec!["chat-watched".to_string()],
@@ -1459,7 +1649,7 @@ mod tests {
 
         // …and once the viewer leaves, it goes like any other.
         drop(watcher);
-        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100, NO_BUDGET), 1);
         assert!(host.open_chats().is_empty());
     }
 
@@ -1472,10 +1662,10 @@ mod tests {
         host.open("chat-loose").expect("open");
         settle().await;
 
-        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100, NO_BUDGET), 1);
         assert_eq!(host.open_chats(), vec!["chat-held".to_string()]);
         drop(held);
-        assert_eq!(host.release_idle_at(now_ms(), 0, 100), 1);
+        assert_eq!(host.release_idle_at(now_ms(), 0, 100, NO_BUDGET), 1);
         assert!(host.open_chats().is_empty());
     }
 
@@ -1491,13 +1681,13 @@ mod tests {
 
         let window = latest - first;
         assert_eq!(
-            host.release_idle_at(first + window, window, 100),
+            host.release_idle_at(first + window, window, 100, NO_BUDGET),
             0,
             "idle by the FIRST open's clock, but it has been used since"
         );
         assert_eq!(host.open_chats(), vec!["chat-a".to_string()]);
         assert_eq!(
-            host.release_idle_at(latest + window, window, 100),
+            host.release_idle_at(latest + window, window, 100, NO_BUDGET),
             1,
             "the window has now passed since the last use"
         );
@@ -1517,7 +1707,7 @@ mod tests {
         settle().await;
 
         // Nothing is idle (window of an hour), so only the bound can act.
-        assert_eq!(host.release_idle_at(now_ms(), 3_600_000, 3), 2);
+        assert_eq!(host.release_idle_at(now_ms(), 3_600_000, 3, NO_BUDGET), 2);
         assert_eq!(
             host.open_chats(),
             vec![

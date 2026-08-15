@@ -433,6 +433,9 @@ async fn session(
         Some(chat_id) => open_transcript(client, chat_id).await,
         None => None,
     };
+    // The link materializes delta frames into the full transcript here, so the
+    // app keeps receiving complete `Update::Transcript`s.
+    let mut transcript_entries: Vec<SessionMessageEntry> = Vec::new();
 
     // The board is best-effort: an engine built without the board, or with
     // `COMET_BOARD=0`, refuses the stream and the chat viewport must keep
@@ -476,6 +479,7 @@ async fn session(
                 Some(Command::WatchTranscript(target)) => {
                     if *transcript_target != target {
                         *transcript_target = target.clone();
+                        transcript_entries.clear();
                         // Dropping the receiver cancels the stream server-side
                         // (comet-rpc sends `{id, cancel}` on the next frame),
                         // so the engine stops serializing the old doc.
@@ -639,10 +643,24 @@ async fn session(
             frame = recv_optional(&mut transcript) => {
                 let (chat_id, frame) = frame;
                 match frame {
-                    Some(value) => match serde_json::from_value::<Vec<SessionMessageEntry>>(value) {
-                        Ok(entries) => if updates.send(Update::Transcript { chat_id, entries }).is_err() {
-                            return SessionEnd::AppGone;
-                        },
+                    Some(value) => match serde_json::from_value::<comet_doc::TranscriptFrame>(value) {
+                        Ok(frame) => {
+                            match comet_doc::apply_transcript_frame(&mut transcript_entries, frame) {
+                                Ok(()) => {
+                                    let entries = transcript_entries.clone();
+                                    if updates.send(Update::Transcript { chat_id, entries }).is_err() {
+                                        return SessionEnd::AppGone;
+                                    }
+                                }
+                                Err(err) => {
+                                    // Diverged copy: resubscribe — the fresh
+                                    // stream's reset frame heals it.
+                                    tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
+                                    transcript_entries.clear();
+                                    transcript = open_transcript(client, chat_id).await;
+                                }
+                            }
+                        }
                         Err(err) => tracing::warn!(error = %err, "dropping malformed transcript frame"),
                     },
                     None => {
@@ -822,7 +840,7 @@ const BOARD_RETRY: Duration = Duration::from_secs(2);
 async fn open_board(
     client: &Arc<RpcClient>,
     target: Option<&str>,
-) -> Option<mpsc::UnboundedReceiver<serde_json::Value>> {
+) -> Option<mpsc::Receiver<serde_json::Value>> {
     subscribe_board(client, target, methods::WATCH_BOARD).await
 }
 
@@ -838,8 +856,8 @@ async fn open_board_pair(
     client: &Arc<RpcClient>,
     target: Option<&str>,
 ) -> (
-    Option<mpsc::UnboundedReceiver<serde_json::Value>>,
-    Option<mpsc::UnboundedReceiver<serde_json::Value>>,
+    Option<mpsc::Receiver<serde_json::Value>>,
+    Option<mpsc::Receiver<serde_json::Value>>,
 ) {
     (
         open_board(client, target).await,
@@ -851,7 +869,7 @@ async fn subscribe_board(
     client: &Arc<RpcClient>,
     target: Option<&str>,
     method: &'static str,
-) -> Option<mpsc::UnboundedReceiver<serde_json::Value>> {
+) -> Option<mpsc::Receiver<serde_json::Value>> {
     let mut params = serde_json::json!({});
     if let (Some(device), Some(object)) = (target, params.as_object_mut()) {
         object.insert(
@@ -880,7 +898,7 @@ async fn wait_until(at: Option<tokio::time::Instant>) {
 /// `recv` on an optional stream, pending forever when there is none, so it can
 /// sit in the `select!` unconditionally. For streams that carry no chat id.
 async fn recv_maybe(
-    slot: &mut Option<mpsc::UnboundedReceiver<serde_json::Value>>,
+    slot: &mut Option<mpsc::Receiver<serde_json::Value>>,
 ) -> Option<serde_json::Value> {
     match slot {
         Some(stream) => stream.recv().await,
@@ -893,7 +911,7 @@ async fn recv_maybe(
 async fn open_transcript(
     client: &Arc<RpcClient>,
     chat_id: String,
-) -> Option<(String, mpsc::UnboundedReceiver<serde_json::Value>)> {
+) -> Option<(String, mpsc::Receiver<serde_json::Value>)> {
     match client
         .subscribe(
             methods::WATCH_DOC_MESSAGES,
@@ -912,7 +930,7 @@ async fn open_transcript(
 /// `recv` on the optional transcript stream, pending forever when there is
 /// none, so it can sit in the `select!` unconditionally.
 async fn recv_optional(
-    slot: &mut Option<(String, mpsc::UnboundedReceiver<serde_json::Value>)>,
+    slot: &mut Option<(String, mpsc::Receiver<serde_json::Value>)>,
 ) -> (String, Option<serde_json::Value>) {
     match slot {
         Some((chat_id, stream)) => {
