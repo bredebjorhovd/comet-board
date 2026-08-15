@@ -193,11 +193,19 @@ impl Delivered {
 
     /// Adopt whatever verdict this batch of feedback ends on (§gh#289).
     ///
-    /// Only `changes_requested` and `approved` count. A `commented` review says
-    /// nothing about whether the objection stands — GitHub's own review decision
-    /// treats it the same way — and swallowing an outstanding request because
-    /// somebody wrote a paragraph afterwards is the failure this whole file is
-    /// about, one layer up.
+    /// Only `changes_requested`, `approved` and `dismissed` count. A `commented`
+    /// review says nothing about whether the objection stands — GitHub's own
+    /// review decision treats it the same way — and swallowing an outstanding
+    /// request because somebody wrote a paragraph afterwards is the failure this
+    /// whole file is about, one layer up.
+    ///
+    /// `dismissed` counts as a clear (gh#411): GitHub rewrites the dismissed
+    /// review's own state in place rather than appending anything, so the
+    /// rewritten review is the *only* record that the objection was withdrawn.
+    /// Skipping it would leave the standing request pointing at a review that no
+    /// longer requests anything — and, since a bot reviewer is refused `APPROVE`
+    /// outright, leave merging the pull request as the only way out of the
+    /// derived `blocked` above it.
     ///
     /// A batch with no verdict in it leaves the standing one alone: nothing was
     /// said, so nothing changed. Read off the raw fetch and not off the delivered
@@ -206,7 +214,10 @@ impl Delivered {
     fn record_verdict(&mut self, feedback: &[Feedback]) {
         let Some(last) = feedback.iter().rfind(|f| {
             f.kind == FeedbackKind::Review
-                && matches!(f.state.as_deref(), Some("changes_requested" | "approved"))
+                && matches!(
+                    f.state.as_deref(),
+                    Some("changes_requested" | "approved" | "dismissed")
+                )
         }) else {
             return;
         };
@@ -239,6 +250,12 @@ pub enum Decision {
 /// author-blind filtering *can* recognise, because the board wrote them.
 pub fn is_actionable(f: &Feedback) -> bool {
     if is_the_boards_own(&f.body) {
+        return false;
+    }
+    // A dismissed review's body is the objection somebody explicitly withdrew.
+    // It is in the fetch for [`Delivered::record_verdict`]'s sake (gh#411), and
+    // delivering it would hand an agent work that no longer stands.
+    if f.state.as_deref() == Some("dismissed") {
         return false;
     }
     // A verdict of `changes requested` is actionable with or without prose. An
@@ -1186,6 +1203,14 @@ pub(crate) mod tests {
         )));
         // And a verdict of changes requested is actionable with or without it.
         assert!(is_actionable(&verdict(3, "changes_requested", "", "t")));
+        // A dismissed review's body is an objection somebody withdrew, so its
+        // prose is exactly what must not be handed to an agent (gh#411).
+        assert!(!is_actionable(&verdict(
+            5,
+            "dismissed",
+            "Split the watermark per endpoint.",
+            "t"
+        )));
         // An empty comment is nothing at all.
         assert!(!is_actionable(&feedback(
             FeedbackKind::Issue,
@@ -1888,6 +1913,65 @@ pub(crate) mod tests {
         );
     }
 
+    /// The `release` half, the way gh#411 met it on a real stack: the standing
+    /// review is *dismissed* — rewritten in place, so the fetch returns the same
+    /// id below the watermark with nothing appended — and the layer above comes
+    /// back into review in the same cycle. Before the fix the only exits from
+    /// the derived `blocked` were an approval and the pull request closing, and
+    /// a bot reviewer is refused the first.
+    #[test]
+    fn a_dismissed_review_unblocks_the_layer_above_in_the_same_cycle() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![
+            (
+                "/repos/o/r/issues/14/comments".into(),
+                serde_json::json!([]),
+            ),
+            ("/repos/o/r/pulls/14/comments".into(), serde_json::json!([])),
+            (
+                "/repos/o/r/pulls/14/reviews".into(),
+                serde_json::json!([{ "id": 900, "state": "DISMISSED",
+                                     "body": "Split the watermark per endpoint.",
+                                     "submitted_at": "2999-01-01T00:00:00Z",
+                                     "user": { "login": "b" } }]),
+            ),
+        ]));
+        let e = engine(rest.clone());
+        seed_reviewed_task(&e, "board/gh-13", "chat-1");
+        seed_stacked_child(&e, "chat-2");
+
+        // An earlier cycle delivered review 900, recorded the request and told
+        // the layer above; the child has been sitting in `blocked` since.
+        let mut state = seen("2026-07-28T11:00:00Z");
+        state.review = 900;
+        state.changes_requested = Some(900);
+        state.fanned_out.insert("gh:o/r#20".into(), 900);
+        store(&e.db, "gh:o/r#13", &state).unwrap();
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Blocked,
+        );
+
+        let runtime = runtime_for_the_pair();
+        e.deliver_reviews(&runtime, &stacked_pulls());
+
+        assert_eq!(
+            state_of(&e).changes_requested,
+            None,
+            "the dismissal ends the objection",
+        );
+        assert!(
+            runtime.prompts.borrow().is_empty(),
+            "and the withdrawn review interrupts nobody: {:?}",
+            runtime.prompts.borrow(),
+        );
+        assert_eq!(
+            e.db.get_task("gh:o/r#20").unwrap().unwrap().state,
+            BoardState::Review,
+            "the layer above is reviewable again without waiting for a merge",
+        );
+    }
+
     /// One review, one notice per layer. The watermark is what makes the second
     /// cycle silent — and the `updated_at` gate means it costs no call either.
     #[test]
@@ -2099,6 +2183,59 @@ pub(crate) mod tests {
             vec![verdict(902, "approved", "", "2026-07-28T11:50:00Z")],
         );
         assert_eq!(withdrawn.changes_requested, None);
+    }
+
+    /// So does dismissing the review (gh#411) — the only withdrawal a bot
+    /// reviewer has, since Actions is refused `APPROVE` outright. GitHub
+    /// rewrites the review's own state in place, so what the next fetch returns
+    /// is the *same* review, now `dismissed`, and nothing new at all: the batch
+    /// must read as "the objection is over", not as "nothing was said".
+    #[test]
+    fn a_dismissed_review_withdraws_a_standing_request() {
+        let asked = verdict(
+            900,
+            "changes_requested",
+            "Split the watermark.",
+            "2026-07-28T11:30:00Z",
+        );
+        let mut state = seen("2026-07-28T11:00:00Z");
+        plan(&mut state, "2026-07-28T11:30:00Z", vec![asked]);
+        assert_eq!(state.changes_requested, Some(900));
+
+        let d = plan(
+            &mut state,
+            "2026-07-28T11:50:00Z",
+            vec![verdict(
+                900,
+                "dismissed",
+                "Split the watermark.",
+                "2026-07-28T11:30:00Z",
+            )],
+        );
+        assert_eq!(state.changes_requested, None, "the objection is over");
+        assert_eq!(
+            d,
+            Decision::NothingNew,
+            "and the withdrawn prose interrupts nobody",
+        );
+
+        // A dismissal of an *older* review does not swallow a request written
+        // after it: the last verdict in the batch is still the one that stands.
+        let mut state = seen("2026-07-28T11:00:00Z");
+        plan(
+            &mut state,
+            "2026-07-28T12:00:00Z",
+            vec![
+                verdict(900, "dismissed", "Too strict.", "2026-07-28T11:30:00Z"),
+                verdict(
+                    903,
+                    "changes_requested",
+                    "Still: split it.",
+                    "2026-07-28T11:55:00Z",
+                ),
+            ],
+        );
+        assert_eq!(state.changes_requested, Some(903));
     }
 
     /// The verdict is not a message, so the two filters delivery applies have no

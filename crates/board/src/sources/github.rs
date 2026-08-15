@@ -565,7 +565,9 @@ pub struct Feedback {
     /// `original_line` against the commit that was reviewed; a comment on a
     /// line that has since moved keeps only the latter.
     pub line: Option<i64>,
-    /// Review submissions only: `changes_requested`, `approved`, `commented`.
+    /// Review submissions only: `changes_requested`, `approved`, `commented`,
+    /// or `dismissed` — the last being a verdict GitHub rewrote in place when
+    /// somebody withdrew it (gh#411).
     pub state: Option<String>,
 }
 
@@ -1227,9 +1229,13 @@ fn parse_feedback(kind: FeedbackKind, n: &Value) -> Option<Feedback> {
         .map(str::to_ascii_lowercase);
     if kind == FeedbackKind::Review {
         // `pending` is a review its author has not submitted — GitHub only
-        // returns your own, and it is not feedback until it is sent. `dismissed`
-        // is a verdict somebody explicitly withdrew.
-        if matches!(state.as_deref(), Some("pending") | Some("dismissed")) {
+        // returns your own, and it is not feedback until it is sent. A
+        // `dismissed` review stays (gh#411): dismissal rewrites the review's
+        // state in place rather than appending anything, so the rewritten
+        // review is the only record that a standing `changes requested` was
+        // withdrawn. It never reaches a chat — `review::is_actionable` drops
+        // it — but the verdict bookkeeping has to see it to clear.
+        if state.as_deref() == Some("pending") {
             return None;
         }
     }
@@ -2392,6 +2398,7 @@ mod tests {
                 (FeedbackKind::Review, 900),
                 (FeedbackKind::Inline, 77),
                 (FeedbackKind::Issue, 41),
+                (FeedbackKind::Review, 902),
             ]
         );
         assert!(f[0].requests_changes());
@@ -2403,12 +2410,19 @@ mod tests {
     }
 
     #[test]
-    fn unsubmitted_and_withdrawn_reviews_are_not_feedback() {
+    fn an_unsubmitted_review_is_not_feedback_but_a_dismissed_one_is() {
         let g = reviewed_pr();
         let f = g.pr_feedback("o/r", 14).unwrap();
         assert!(
-            !f.iter().any(|x| x.id == 901 || x.id == 902),
-            "pending and dismissed reviews must not reach a pane"
+            !f.iter().any(|x| x.id == 901),
+            "a pending review is not feedback until it is sent"
+        );
+        // A dismissal rewrites the review in place, so this is the only record
+        // that the objection was withdrawn — the verdict bookkeeping needs it
+        // (gh#411). `review::is_actionable` is what keeps it out of a pane.
+        assert_eq!(
+            f.iter().find(|x| x.id == 902).unwrap().state.as_deref(),
+            Some("dismissed"),
         );
     }
 
