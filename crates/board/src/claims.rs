@@ -367,8 +367,8 @@ pub struct AttemptReview {
     pub pr_mergeable: Option<String>,
     /// The pull request number of the nearest open layer below this one that
     /// has been asked to change (§gh#289) — the fact that makes reading this
-    /// diff at all a waste, because GitHub is about to replay it on a branch
-    /// that has been rewritten.
+    /// diff at all a waste, because the ordered upstack rebase will move it
+    /// onto rewritten history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes_below: Option<i64>,
     /// Where this pull request sits in its stack, and every sibling the board

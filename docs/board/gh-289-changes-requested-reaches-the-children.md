@@ -4,13 +4,23 @@ Stacks 8/9. Review delivery was strictly one pull request → one authoring atte
 → one chat. In a stack that contract is incomplete: `changes requested` on layer 2
 is not only about layer 2, because layers 3..N are built on code that is now
 wrong. Layer 2's agent got the review and started fixing; when it force-pushed,
-GitHub replayed every layer above it on the new base — so their diffs moved under
-their authors *and* under their reviewers, with no explanation in either place.
+the implementation assumed GitHub replayed every layer above it on the new base
+— so their diffs moved under their authors *and* under their reviewers, with no
+explanation in either place.
 
 Landed as [`crate::stacks::Dependents`], [`crate::review::address`] and
 [`crate::review::compose_notice`] in `crates/board/src/{stacks,review}.rs`, a
 `changes-below` verdict in [`comet_proto::view::board::landing`], and one arm in
 [`crate::model::derive_state`].
+
+### Later correction: a force-push is not a merge
+
+The real-stack run in §gh#337 disproved that replay assumption. GitHub replays
+the layers above a merged pull request, but a force-push leaves every upper
+branch on its old history and its pull request can become `dirty`. §gh#407
+corrected the notice and gave the direct child one ordered `gh stack rebase
+--upstack`; farther dependents receive an informational hold notice. The rest of
+this write-up records gh#289's model and implementation as they landed.
 
 ### The mechanism, not the notice
 
@@ -59,12 +69,12 @@ edge is an attempt id and not a branch string for gh#285's reason — a parent t
 merges has its branch deleted, and this is one of the two places that needs the
 edge precisely then.
 
-`above` is transitive and nearest-first. Transitive because rewriting layer 2
-moves layer 3, which moves layer 4: a notice that stopped at the direct child
-would leave every layer above it wondering why its diff moved, which is this bug
-one layer up. Both walks are bounded by the number of rows, so a malformed edge —
-two rows each recorded as the other's parent — costs a short answer and never a
-hung sync cycle.
+`above` is transitive and nearest-first. Under the original replay assumption,
+rewriting layer 2 moved layer 3, which moved layer 4: a notice that stopped at
+the direct child would leave every layer above it wondering why its diff moved,
+which is this bug one layer up. Both walks are bounded by the number of rows, so
+a malformed edge — two rows each recorded as the other's parent — costs a short
+answer and never a hung sync cycle.
 
 ### Question 1 — hold or inform: split by state
 
