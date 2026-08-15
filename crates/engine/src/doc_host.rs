@@ -1479,9 +1479,14 @@ mod tests {
     #[test]
     fn the_byte_budget_releases_oldest_first_even_under_the_count_bound() {
         // Three fresh chats, all inside the idle window and under the count
-        // bound — only the byte budget can act. Two 40MB docs and one small
-        // one against an 80MB budget: the two oldest go until the survivors
-        // fit (gh#414 — a handful of genuinely huge docs).
+        // bound — only the byte budget can act. Two 40MB docs and one 1MB one
+        // (81MB resident) against a 40MB budget: releasing the oldest alone
+        // leaves 41MB, still over, so the sweep keeps going from the oldest
+        // end and takes `small` too — 40MB fits and it stops there, leaving
+        // the newest huge doc resident (gh#414 — a handful of genuinely huge
+        // docs). The budget has to sit under 41MB for the second release to
+        // be necessary at all; at 60MB the first release already fits and
+        // taking `small` would be gratuitous.
         let now = 1_000_000;
         let mb = 1024 * 1024;
         let released = rooms_to_release(
@@ -1493,7 +1498,7 @@ mod tests {
             now,
             30_000,
             100,
-            60 * mb,
+            40 * mb,
         );
         assert_eq!(
             released_ids(released),
