@@ -80,6 +80,14 @@
 //! exist and its cwd must still be the attempt's checkout, because delivering
 //! somebody else's review into an unrelated session is worse than not
 //! delivering.
+//!
+//! The author check gates the delivery and nothing else (gh#409). The fetch
+//! runs for every row still in `review` with an open pull request, because the
+//! standing verdict it computes is not a message: it is the row's own fact,
+//! read by the layers stacked on the pull request and by the human about to
+//! open the diff. A pull request nobody dispatched (§gh#344) has no chat and
+//! never will — gating the fetch on one left such a row unable to acquire a
+//! verdict at all, so a stack of them propagated nothing.
 
 use crate::db::Db;
 use crate::model::{Attempt, BoardState, Task};
@@ -286,7 +294,9 @@ pub(crate) fn is_the_boards_own(body: &str) -> bool {
 /// `floor` is the authoring attempt's end (or start, if it is somehow still
 /// live). It applies only on first sight, and only to stop the board delivering
 /// a pull request's entire back catalogue the first time it looks at one:
-/// nothing written before the agent finished can be a review of its work.
+/// nothing written before the agent finished can be a review of its work. A
+/// pull request nobody dispatched has no attempt and nothing is delivered for
+/// it, so its caller passes an empty floor, which sits below every timestamp.
 pub fn plan_delivery(
     state: &mut Delivered,
     pr_updated_at: &str,
@@ -648,68 +658,97 @@ impl SyncEngine {
         }
 
         // `review` is the whole precondition for the rest: finished work with an
-        // open pull request, whose chat nothing has disposed of yet.
+        // open pull request.
         if task.state != BoardState::Review || !task.pr_open {
             return Ok(false);
         }
         let Some(pr) = pull_request_for(task, pulls) else {
             return Ok(false);
         };
-        // A pull request nobody dispatched has no author sitting in a chat, and
-        // no chat to have lost: it is not the gone case below, it is a row this
-        // whole path has nothing to say about.
-        if authoring_attempt(task, pr).is_none() {
-            return Ok(false);
-        }
         let mut state = load(&self.db, &task.id);
 
-        // A task whose chat is gone is skipped quietly. There is nothing to
-        // deliver to and nothing to do about it — re-dispatching would be a
-        // second agent on work that is already written. A runtime error inside
-        // `address` propagates instead: not knowing is not the same as gone, and
-        // the next cycle asks again.
-        let Some(author) = address(runtime, task, pr)? else {
-            if !state.noted_gone {
-                self.log.info(format!(
-                    "{}: no live chat still holds the agent that wrote {} — \
-                     review comments will not be delivered",
-                    task.identifier, pr.url
-                ));
-                state.noted_gone = true;
-                store(&self.db, &task.id, &state)?;
-            }
-            return Ok(false);
+        // Who the delivery would go to — and only the delivery (gh#409). The
+        // fetch below is not gated on an author, because the standing verdict
+        // it computes is not a message: it is the row's own fact, the one the
+        // layers stacked on this pull request and the human about to open the
+        // diff both read. Gating the fetch on a chat was the bug — an
+        // undispatched pull request could never acquire a verdict, so a stack
+        // of them propagated nothing.
+        let attempt = authoring_attempt(task, pr);
+        let author = match attempt {
+            // A pull request nobody dispatched has no author sitting in a chat,
+            // and no chat to have lost: it is not the gone case below, just a
+            // row with nobody to prompt.
+            None => None,
+            // A task whose chat is gone is delivered to nobody, quietly. There
+            // is nothing to do about that — re-dispatching would be a second
+            // agent on work that is already written. A runtime error inside
+            // `address` propagates instead: not knowing is not the same as
+            // gone, and the next cycle asks again.
+            Some(_) => match address(runtime, task, pr)? {
+                Some(author) => {
+                    state.noted_gone = false;
+                    Some(author)
+                }
+                None => {
+                    if !state.noted_gone {
+                        self.log.info(format!(
+                            "{}: no live chat still holds the agent that wrote {} — \
+                             review comments will not be delivered",
+                            task.identifier, pr.url
+                        ));
+                        state.noted_gone = true;
+                        store(&self.db, &task.id, &state)?;
+                    }
+                    None
+                }
+            },
         };
-        let (attempt, chat_id) = (author.attempt, author.chat_id);
-        state.noted_gone = false;
 
+        // The floor exists to stop a first look handing an agent its pull
+        // request's back catalogue. With no attempt there is no catalogue to
+        // withhold — nothing is delivered at all — and an empty floor sits
+        // below every timestamp.
         let floor = attempt
-            .ended_at
-            .clone()
-            .unwrap_or_else(|| attempt.started_at.clone());
+            .map(|a| a.ended_at.clone().unwrap_or_else(|| a.started_at.clone()))
+            .unwrap_or_default();
 
         let decision = plan_delivery(&mut state, &pr.updated_at, &pr.base_ref, &floor, || {
             gh.pr_feedback(&pr.repo, pr.number)
         })?;
 
         if let Decision::Deliver(items) = &decision {
-            let text = compose(task, pr, items);
-            if let Err(e) = runtime.prompt(chat_id, &text) {
-                // Nothing arrived, so nothing was consumed: dropping the state
-                // here is what makes the next cycle try again.
-                self.log.warn(format!(
-                    "{}: could not queue {} review comment(s) into chat {chat_id}: {e}",
+            if let Some(author) = &author {
+                let chat_id = author.chat_id;
+                let text = compose(task, pr, items);
+                if let Err(e) = runtime.prompt(chat_id, &text) {
+                    // Nothing arrived, so nothing was consumed: dropping the state
+                    // here is what makes the next cycle try again.
+                    self.log.warn(format!(
+                        "{}: could not queue {} review comment(s) into chat {chat_id}: {e}",
+                        task.identifier,
+                        items.len()
+                    ));
+                    return Ok(false);
+                }
+                self.log.info(format!(
+                    "{}: delivered {} review comment(s) on {} into chat {chat_id}",
                     task.identifier,
-                    items.len()
+                    items.len(),
+                    pr.url
                 ));
-                return Ok(false);
+            } else {
+                // Consumed unspoken: there is no chat to hand these to, and
+                // holding them back would hold the verdict back with them. The
+                // row carries what matters.
+                self.log.info(format!(
+                    "{}: {} review comment(s) on {} had no chat to go to — the row \
+                     carries the verdict",
+                    task.identifier,
+                    items.len(),
+                    pr.url
+                ));
             }
-            self.log.info(format!(
-                "{}: delivered {} review comment(s) on {} into chat {chat_id}",
-                task.identifier,
-                items.len(),
-                pr.url
-            ));
         }
         if decision == Decision::Retargeted {
             // Said once per retarget, so an operator watching a stack land can
@@ -1592,37 +1631,53 @@ pub(crate) mod tests {
     /// The chat the agent was in is gone — archived, or deleted with its
     /// workspace. Nothing to deliver to, and nothing to do about it: a
     /// re-dispatch would be a second agent on work that is already written.
+    /// The verdict is another matter (gh#409): the fetch that computes it is
+    /// not delivery, and the row still learns what the reviewer said.
     #[test]
-    fn a_task_whose_chat_is_gone_is_skipped_quietly() {
-        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![]));
+    fn a_task_whose_chat_is_gone_is_told_nothing_but_its_row_still_learns() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
         let e = engine(rest.clone());
         seed_reviewed_task(&e, "board/gh-13", "chat-1");
 
-        e.deliver_reviews(&FakeRuntime::gone(), &[pull("board/gh-13")]);
+        let runtime = FakeRuntime::gone();
+        e.deliver_reviews(&runtime, &[pull("board/gh-13")]);
 
         assert!(
-            rest.asked.borrow().is_empty(),
-            "a chat that is gone costs no GitHub call: {:?}",
-            rest.asked.borrow()
+            runtime.prompts.borrow().is_empty(),
+            "there is nobody to tell: {:?}",
+            runtime.prompts.borrow()
         );
         assert!(
             state_of(&e).noted_gone,
             "and it is said once, not every tick"
         );
+        assert_eq!(
+            e.db.get_task("gh:o/r#13")
+                .unwrap()
+                .unwrap()
+                .pr_changes_requested,
+            Some(900),
+            "the standing verdict lands on the row anyway",
+        );
+
+        // And the steady state still costs nothing: an unchanged pull request
+        // asks no endpoint, chat or no chat.
+        let asked = rest.asked.borrow().len();
+        e.deliver_reviews(&runtime, &[pull("board/gh-13")]);
+        assert_eq!(rest.asked.borrow().len(), asked, "the updated_at gate held");
     }
 
     /// A live chat whose cwd is somebody else's checkout is the same verdict
     /// as a gone chat: the author is not there to deliver to.
     #[test]
     fn a_chat_repointed_at_another_checkout_is_not_delivered_into() {
-        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![]));
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
         let e = engine(rest.clone());
         seed_reviewed_task(&e, "board/gh-13", "chat-1");
 
         let runtime = FakeRuntime::holding("/wt/lin-140-1");
         e.deliver_reviews(&runtime, &[pull("board/gh-13")]);
 
-        assert!(rest.asked.borrow().is_empty());
         assert!(runtime.prompts.borrow().is_empty());
         assert!(state_of(&e).noted_gone);
     }
@@ -1751,10 +1806,13 @@ pub(crate) mod tests {
     }
 
     /// A pull request nobody dispatched has no author sitting in a chat. It is
-    /// a `review` row like any other, and there is no one to tell.
+    /// a `review` row like any other, and there is no one to tell — but the
+    /// row itself is still owed the verdict (gh#409): the fetch that computes
+    /// it is not delivery, and gating it on a chat left an undispatched row
+    /// unable to acquire a verdict at all.
     #[test]
-    fn a_pull_request_row_the_board_never_dispatched_tells_nobody() {
-        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(vec![]));
+    fn an_undispatched_pull_request_tells_nobody_and_still_acquires_the_verdict() {
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(feedback_fixture()));
         let e = engine(rest.clone());
         let pr = pull("someone/elses-branch");
         e.db.upsert_task(&pr.to_upsert()).unwrap();
@@ -1762,8 +1820,121 @@ pub(crate) mod tests {
             .unwrap();
         e.rederive_all().unwrap();
 
-        e.deliver_reviews(&FakeRuntime::holding("/wt/gh-13-1"), &[pr]);
-        assert!(rest.asked.borrow().is_empty());
+        let runtime = FakeRuntime::holding("/wt/gh-13-1");
+        e.deliver_reviews(&runtime, std::slice::from_ref(&pr));
+
+        assert_eq!(
+            rest.asked.borrow().len(),
+            3,
+            "all three endpoints are read: {:?}",
+            rest.asked.borrow()
+        );
+        assert!(
+            runtime.prompts.borrow().is_empty(),
+            "and nobody is prompted: {:?}",
+            runtime.prompts.borrow()
+        );
+        let row = e.db.get_task(&pr.task_id()).unwrap().unwrap();
+        assert_eq!(
+            row.pr_changes_requested,
+            Some(900),
+            "the row carries the standing verdict",
+        );
+        assert!(
+            !load(&e.db, &pr.task_id()).noted_gone,
+            "an undispatched row is not a lost chat, and is not mourned as one",
+        );
+
+        // The steady state is as cheap as ever: nothing moved, nothing asked.
+        e.deliver_reviews(&runtime, &[pr]);
+        assert_eq!(rest.asked.borrow().len(), 3, "the updated_at gate held");
+    }
+
+    /// The measured failure (gh#409): a stack of undispatched pull requests —
+    /// the rows gh#344 deliberately made reviewable — with a real `changes
+    /// requested` on the bottom layer, and 27 poll cycles in which nothing
+    /// moved. The layer above must leave `review` in the same cycle, exactly
+    /// as it does when the stack was dispatched: a diff about to be rebased is
+    /// not reviewable in good faith, and there is no chat anywhere in this
+    /// stack to carry the fact instead of the rows.
+    #[test]
+    fn changes_requested_on_an_undispatched_layer_moves_the_stack_above_it() {
+        // The bottom layer's endpoints carry the review; the top layer is
+        // fetched too now — it is a review row with an open pull request —
+        // and has nothing to say.
+        let mut routes = feedback_fixture();
+        routes.extend([
+            (
+                "/repos/o/r/issues/15/comments".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "/repos/o/r/pulls/15/comments".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "/repos/o/r/pulls/15/reviews".to_string(),
+                serde_json::json!([]),
+            ),
+        ]);
+        let rest = std::rc::Rc::new(crate::sources::github::FixtureRest::new(routes));
+        let e = engine(rest.clone());
+
+        // Two undispatched pull requests GitHub reports as one stack.
+        let bottom = pull("stack/layer-1");
+        let mut top = pull("stack/layer-2");
+        top.number = 15;
+        top.url = "https://github.com/o/r/pull/15".into();
+        top.base_ref = "stack/layer-1".into();
+        for (pr, position) in [(&bottom, 1), (&top, 2)] {
+            e.db.upsert_task(&pr.to_upsert()).unwrap();
+            e.db.set_pr(&pr.task_id(), Some(&pr.url), Some(pr.number), true)
+                .unwrap();
+            e.db.set_pr_topology(
+                &pr.task_id(),
+                Some(&pr.base_ref),
+                Some(&pr.head_ref),
+                Some(&crate::model::PrStack {
+                    number: 7,
+                    size: Some(2),
+                    position: Some(position),
+                    base_ref: Some("main".into()),
+                }),
+            )
+            .unwrap();
+        }
+        e.rederive_all().unwrap();
+        assert_eq!(
+            e.db.get_task("gh:o/r!15").unwrap().unwrap().state,
+            BoardState::Review,
+        );
+
+        let runtime = FakeRuntime::holding("/nowhere");
+        e.deliver_reviews(&runtime, &[bottom, top]);
+
+        assert!(
+            runtime.prompts.borrow().is_empty(),
+            "no chat anywhere in this stack: {:?}",
+            runtime.prompts.borrow()
+        );
+        assert_eq!(
+            e.db.get_task("gh:o/r!14")
+                .unwrap()
+                .unwrap()
+                .pr_changes_requested,
+            Some(900),
+            "the reviewed layer's row carries the verdict",
+        );
+        assert_eq!(
+            e.db.get_task("gh:o/r!15").unwrap().unwrap().state,
+            BoardState::Blocked,
+            "and the layer above left review in the same cycle",
+        );
+        // The row says why, in the words both viewports already render.
+        let rows = crate::rows::board_rows(&e.db, &e.cfg).unwrap();
+        let above = rows.iter().find(|r| r.id == "gh:o/r!15").unwrap();
+        assert_eq!(above.changes_below, Some(14));
+        assert_eq!(above.landing.as_deref(), Some("changes-below"));
     }
 
     // ---- the fan-out down the stack (§gh#289) ----------------------------
