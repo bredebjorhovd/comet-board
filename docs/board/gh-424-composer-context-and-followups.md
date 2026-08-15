@@ -210,15 +210,15 @@ in `commands`, and one pure fold derives the visible queue from those entries.
 The module interface is deliberately small:
 
 ```text
-FollowupQueue::fold(commands, now) -> QueueProjection
-FollowupQueue::next_action(projection, run_state) -> QueueAction?
+queue::project(commands) -> QueueView
+commands::evaluate_command(command, context) -> CommandDisposition
 ```
 
-The engine, desktop, iOS, edge compatibility fixture, and tests use the same
-serialized command shapes. Rust owns the normative fold. Swift ports the pure
-rules for offline display and checks parity against shared JSON fixtures. If a
-web or retained TUI surface exists, it consumes `QueueProjection` from the host
-instead of inventing another reducer.
+The engine and desktop use the Rust command shapes. Rust owns the normative
+fold. Swift mirrors those wire fields and a small projection for offline
+display; this slice has source-contract coverage for durable-write failure but
+no cross-language shared queue fixture or parity runner. A future web or TUI
+surface should consume the host projection rather than invent another reducer.
 
 ### Command shapes
 
@@ -497,7 +497,7 @@ prove:
 - serialized commands, messages, and edge snapshots contain no file bytes or
   absolute reference paths.
 
-Follow-up queue fixture tests fold the same JSON in Rust and Swift and prove:
+Rust tests in `crates/doc/src/queue.rs` and `crates/doc/src/commands.rs` prove:
 
 - several adds survive snapshot export/import and app restart in order;
 - transport retries carrying the same command id append once;
@@ -505,18 +505,21 @@ Follow-up queue fixture tests fold the same JSON in Rust and Swift and prove:
 - failed durable appends retain the draft or edit for retry;
 - pause survives restart and blocks automatic drain;
 - explicit run-next while paused consumes only its named item;
-- active and awaiting-input states never drain, while parked and absent do;
+- a live chat defers delivery and an idle chat permits the selected row;
 - stop, steer, queued delivery, and idle send produce the four separate
   outcomes in the decision table;
-- crash injection before child Run append, after append, before dispatch, and
-  after dispatch never loses or duplicates a turn;
+- a pending turn stays outside the processed ledger until dispatch owns it;
+  `doc_host::a_crash_before_run_dispatch_leaves_the_durable_turn_for_restart`
+  injects the pre-dispatch crash in the shared recoverable-turn branch. This
+  slice does not claim a separate Queue-specific process-crash fixture;
 - shallow snapshots and causal backfill preserve the command log and every
   row still live under its deterministic fold.
 
-Desktop and iOS interaction tests additionally prove `@` and `/` discovery do
-not steal each other's input, image-only sends still work, reference chips
-round-trip without parsing prompt text, drag/move emits one operation, and the
-two active-run choices carry distinct accessible names.
+Desktop unit tests cover token completion, checkout-stamp retention, and
+chat-scoped add retry keys alongside the existing image/send decision tests.
+The changed Swift sources parse with `swiftc`; `crates/sync/tests/ios_room.rs`
+source-checks that failed durable appends retain queue drafts and edits. There
+is no simulator interaction suite claimed by this slice.
 
 ## Implementation map
 
@@ -525,11 +528,10 @@ renderers:
 
 - `crates/proto`: `ContextReference`, request fields, search/projection wire
   types, and capability flags;
-- `crates/doc`: queue operation types, context message parts, deterministic
-  queue fold, checkpoint rules, and shared fixtures;
+- `crates/doc`: queue command types, deterministic projection, and evaluator
+  tests;
 - `crates/engine`: checkout-context search/resolution, forwardable RPCs,
-  command validation, queue scheduler, stable child Run handoff, and turn-state
-  watch;
+  command validation, queue scheduling, and recoverable Queue dispatch;
 - `edge`: compatibility preservation and causally complete ledger checkpoint
   retention only;
 - `crates/ui`: typed draft spans, host picker, delivery split, transcript
