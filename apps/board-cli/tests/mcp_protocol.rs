@@ -18,6 +18,7 @@ enum DispatchReply {
 struct FakeBoard {
     rows: Value,
     accounts: Value,
+    accounts_error: Option<String>,
     dispatch_reply: DispatchReply,
     dispatches: Arc<Mutex<Vec<Value>>>,
     auth_status_calls: Arc<Mutex<usize>>,
@@ -28,10 +29,16 @@ impl FakeBoard {
         Self {
             rows: Value::Array(rows),
             accounts,
+            accounts_error: None,
             dispatch_reply,
             dispatches: Arc::new(Mutex::new(Vec::new())),
             auth_status_calls: Arc::new(Mutex::new(0)),
         }
+    }
+
+    fn with_accounts_error(mut self, message: &str) -> Self {
+        self.accounts_error = Some(message.to_string());
+        self
     }
 }
 
@@ -42,7 +49,10 @@ impl RpcService for FakeBoard {
             methods::WATCH_BOARD => Ok(RpcReply::Stream(
                 futures::stream::iter([self.rows.clone()]).boxed(),
             )),
-            methods::LIST_AGENT_ACCOUNTS => Ok(RpcReply::Value(self.accounts.clone())),
+            methods::LIST_AGENT_ACCOUNTS => match &self.accounts_error {
+                Some(message) => Err(RpcError::Failed(message.clone())),
+                None => Ok(RpcReply::Value(self.accounts.clone())),
+            },
             methods::DISPATCH_TASK => {
                 self.dispatches.lock().unwrap().push(params);
                 match self.dispatch_reply {
@@ -280,6 +290,91 @@ async fn warn_mode_cross_billing_is_refused_before_dispatch() {
         .as_str()
         .unwrap();
     assert!(error.contains("bob@example.com"), "{error}");
+    assert!(error.contains("human"), "{error}");
+    assert!(observed.dispatches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dispatch_is_refused_when_the_parent_attempt_has_no_recorded_payer() {
+    let service = FakeBoard::new(
+        vec![
+            row(
+                "gh:owner/repo#1",
+                "gh#1",
+                Some("parent-chat"),
+                Some("alice"),
+                None,
+            ),
+            row(
+                "gh:owner/repo#2",
+                "gh#2",
+                None,
+                Some("alice"),
+                None,
+            ),
+        ],
+        accounts(&[("alice", "alice@example.com", true)]),
+        DispatchReply::Success,
+    );
+    let observed = service.clone();
+    let mut mcp = McpSession::start(service, "parent-chat").await;
+
+    let response = mcp
+        .request(
+            1,
+            "tools/call",
+            tool_call("dispatch_task", json!({ "task": "gh:owner/repo#2" })),
+        )
+        .await;
+
+    assert_eq!(response["result"]["isError"], true, "{response:#}");
+    let error = response["result"]["structuredContent"]["error"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("recorded payer"), "{error}");
+    assert!(error.contains("human"), "{error}");
+    assert!(observed.dispatches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dispatch_is_refused_when_the_account_list_cannot_be_read() {
+    let service = FakeBoard::new(
+        vec![
+            row(
+                "gh:owner/repo#1",
+                "gh#1",
+                Some("parent-chat"),
+                Some("alice"),
+                Some("alice@example.com"),
+            ),
+            row(
+                "gh:owner/repo#2",
+                "gh#2",
+                None,
+                Some("alice"),
+                None,
+            ),
+        ],
+        accounts(&[("alice", "alice@example.com", true)]),
+        DispatchReply::Success,
+    )
+    .with_accounts_error("account catalog unavailable");
+    let observed = service.clone();
+    let mut mcp = McpSession::start(service, "parent-chat").await;
+
+    let response = mcp
+        .request(
+            1,
+            "tools/call",
+            tool_call("dispatch_task", json!({ "task": "gh:owner/repo#2" })),
+        )
+        .await;
+
+    assert_eq!(response["result"]["isError"], true, "{response:#}");
+    let error = response["result"]["structuredContent"]["error"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("agent accounts"), "{error}");
     assert!(error.contains("human"), "{error}");
     assert!(observed.dispatches.lock().unwrap().is_empty());
 }

@@ -299,7 +299,7 @@ async fn dispatch_task(board: &Board, chat_id: Option<&str>, arguments: Value) -
         stack: args.stack,
         decompose: args.decompose,
     };
-    if let Some(warning) = ops::cross_billing_warning_for_row(
+    match ops::cross_billing_preflight_for_row(
         board,
         target,
         opts,
@@ -307,9 +307,17 @@ async fn dispatch_task(board: &Board, chat_id: Option<&str>, arguments: Value) -
     )
     .await
     {
-        return Err(anyhow!(
-            "{warning}; an agent cannot acknowledge a different payer — ask a human to dispatch this task from the board, desktop, or CLI"
-        ));
+        ops::CrossBillingPreflight::SamePayer => {}
+        ops::CrossBillingPreflight::DifferentPayer(warning) => {
+            return Err(anyhow!(
+                "{warning}; an agent cannot acknowledge a different payer — ask a human to dispatch this task from the board, desktop, or CLI"
+            ));
+        }
+        ops::CrossBillingPreflight::Unknown(reason) => {
+            return Err(anyhow!(
+                "cannot verify this dispatch's payer: {reason}; ask a human to dispatch this task from the board, desktop, or CLI"
+            ));
+        }
     }
     let dispatched = ops::dispatch_checked(board, &target.id, opts).await?;
     Ok(json!({ "dispatch": dispatched }))
