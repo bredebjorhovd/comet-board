@@ -146,6 +146,7 @@ struct ComposerView: View {
     @State private var showContextPicker = false
     @State private var editing: FollowupRow?
     @State private var editText = ""
+    @State private var followupFailure: String?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -178,6 +179,14 @@ struct ComposerView: View {
         .onChange(of: text) { _, value in searchAtToken(value) }
         .sheet(isPresented: $showContextPicker) { contextPicker }
         .sheet(item: $editing) { row in editSheet(row) }
+        .alert("Couldn’t save follow-up", isPresented: Binding(
+            get: { followupFailure != nil },
+            set: { if !$0 { followupFailure = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(followupFailure ?? "The durable command could not be written.")
+        }
     }
 
     private func send() {
@@ -203,7 +212,10 @@ struct ComposerView: View {
     private func queue() {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
-        store.queueFollowup(prompt: prompt, context: context)
+        guard store.queueFollowup(prompt: prompt, context: context) else {
+            followupFailure = "Your draft is still here. Try again after reconnecting."
+            return
+        }
         text = ""
         context = []
         Task { @MainActor in text = "" }
@@ -318,8 +330,11 @@ struct ComposerView: View {
                     }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Save") {
-                            store.editFollowup(id: row.id, prompt: editText, context: row.context)
-                            editing = nil
+                            if store.editFollowup(id: row.id, prompt: editText, context: row.context) {
+                                editing = nil
+                            } else {
+                                followupFailure = "Your edit is still open. Try again after reconnecting."
+                            }
                         }
                     }
                 }

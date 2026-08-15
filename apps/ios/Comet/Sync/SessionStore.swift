@@ -383,7 +383,8 @@ final class SessionStore {
         ])
     }
 
-    func queueFollowup(prompt: String, context: [ContextRef] = []) {
+    @discardableResult
+    func queueFollowup(prompt: String, context: [ContextRef] = []) -> Bool {
         queueCommand(kind: "queue", payload: [
             "kind": "queue",
             "prompt": prompt,
@@ -392,7 +393,8 @@ final class SessionStore {
         ], context: context, expires: false)
     }
 
-    func editFollowup(id: String, prompt: String, context: [ContextRef] = []) {
+    @discardableResult
+    func editFollowup(id: String, prompt: String, context: [ContextRef] = []) -> Bool {
         queueControl(["op": "edit", "target": id, "prompt": prompt,
                       "context": context.map(encodableJSON)])
     }
@@ -409,15 +411,17 @@ final class SessionStore {
         queueControl(["op": paused ? "pause" : "resume"])
     }
 
-    private func queueControl(_ op: [String: Any]) {
+    @discardableResult
+    private func queueControl(_ op: [String: Any]) -> Bool {
         queueCommand(kind: "queueControl", payload: ["kind": "queueControl", "op": op],
                      expires: false)
     }
 
     /// schema.rs queue_command, field for field.
+    @discardableResult
     private func queueCommand(kind: String, payload: [String: Any],
-                              context: [ContextRef] = [], expires: Bool = true) {
-        document.withCurrent { doc in
+                              context: [ContextRef] = [], expires: Bool = true) -> Bool {
+        let queued = document.withCurrent { doc -> Bool in
             let commands = doc.getList(id: "commands")
             do {
                 let map = try commands.pushContainer(child: LoroMap())
@@ -438,11 +442,14 @@ final class SessionStore {
                 }
                 try map.insert(key: "status", v: "pending")
                 doc.commit()
+                return true
             } catch {
                 roomLog.error("session \(self.chatId, privacy: .public): failed to queue \(kind, privacy: .public) command")
+                return false
             }
         }
-        nudgeHost()
+        if queued { nudgeHost() }
+        return queued
     }
 
     /// Durable-nudge the host device so a cold host opens the doc and drains

@@ -589,6 +589,7 @@ async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_comm
     let local_command = comet_doc::SessionCommandEntry {
         id: "local-command".into(),
         payload: comet_doc::SessionCommandPayload::Interrupt {},
+        context: Vec::new(),
         issued_by: "phone-1".into(),
         issued_at: 1,
         based_on: None,
@@ -1438,8 +1439,10 @@ async fn a_swallowed_presence_join_is_retried_until_presence_flows() {
     // retries live at virtual t=15s/30s — beyond `wait_until`'s 10s budget —
     // so this wait carries its own, wider one.
     tokio::time::timeout(Duration::from_secs(120), async {
-        while !matches!(edge.eph.get("presence/dev-a"), Some(loro::LoroValue::I64(1)))
-            || !client.presence_joined()
+        while !matches!(
+            edge.eph.get("presence/dev-a"),
+            Some(loro::LoroValue::I64(1))
+        ) || !client.presence_joined()
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
