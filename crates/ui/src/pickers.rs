@@ -380,8 +380,10 @@ impl Pickers {
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
             // Pasted images/files don't apply to a search box, and a palette
-            // hosts no `/` picker, so no menu events reach here either.
-            ComposerInputEvent::Menu(_)
+            // hosts no `/` or `@` picker, so neither menu events nor the
+            // queue-submit chord reach here.
+            ComposerInputEvent::QueueSubmitted
+            | ComposerInputEvent::Menu(_)
             | ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_) => {}
         });

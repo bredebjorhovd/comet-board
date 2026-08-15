@@ -995,6 +995,7 @@ mod tests {
             expires_at: None,
             status: SessionCommandStatus::Pending,
             resolution: None,
+            context: Vec::new(),
         };
         doc.queue_command(&entry).unwrap();
         doc.set_command_status("c1", SessionCommandStatus::Applied, None)

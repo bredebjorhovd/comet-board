@@ -77,6 +77,7 @@ fn main() {
         expires_at: None,
         status: SessionCommandStatus::Pending,
         resolution: None,
+        context: Vec::new(),
     })
     .expect("queue command");
     doc.set_command_status("cmd-1", SessionCommandStatus::Applied, None)

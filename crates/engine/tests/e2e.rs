@@ -165,6 +165,7 @@ fn queue_as_viewer(doc: impl AsRef<SessionDoc>, id: &str, payload: SessionComman
         expires_at: None,
         status: SessionCommandStatus::Pending,
         resolution: None,
+        context: Vec::new(),
     })
     .expect("queue command");
 }

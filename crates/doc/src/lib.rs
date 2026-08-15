@@ -11,6 +11,7 @@
 pub mod commands;
 pub mod constants;
 pub mod parts;
+pub mod queue;
 pub mod schema;
 pub mod transcript_delta;
 pub mod workspace;
@@ -18,6 +19,7 @@ pub mod workspace;
 pub use commands::*;
 pub use constants::*;
 pub use parts::*;
+pub use queue::{QueuePause, QueueRow, QueueView, project as project_queue};
 pub use schema::*;
 pub use transcript_delta::*;
 pub use workspace::*;

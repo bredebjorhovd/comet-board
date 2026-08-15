@@ -29,6 +29,7 @@ fn run_request_attachments_survive_command_round_trip() {
         expires_at: None,
         status: SessionCommandStatus::Pending,
         resolution: None,
+        context: Vec::new(),
     })
     .unwrap();
     match &doc.read_commands().unwrap()[0].payload {

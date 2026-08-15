@@ -36,11 +36,11 @@ use tokio::sync::watch;
 
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
+    MessagePart, MessageRole, MessageStatus, QueueView, SessionCommandEntry, SessionCommandPayload,
     SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
-    join_continuation_entries,
+    join_continuation_entries, queue,
 };
-use comet_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
+use comet_proto::{ContextRef, HarnessId, UserInputAnswer, UserInputQuestion};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
@@ -225,6 +225,9 @@ pub struct ChatDocHandle {
     doc: RwLock<Arc<SessionDoc>>,
     changed_tx: watch::Sender<u64>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    /// The follow-up plan, folded from the command ledger (gh#424) and
+    /// republished on every commit that anybody is watching for.
+    queue_tx: watch::Sender<QueueView>,
     /// The session room, supervised by [`crate::workspace_host::spawn_room_join`].
     /// An `Arc` because the supervisor holds a `Weak` to it: dropping the handle
     /// is what ends the supervision (and, with it, the room client).
@@ -283,7 +286,10 @@ impl ChatDocHandle {
     /// watched chat would cut a live viewer's transcript off — the sweep pins on
     /// this rather than letting the UI discover it.
     fn watched(&self) -> bool {
-        self.messages_tx.receiver_count() > 0
+        // The plan watch counts too: it is fed the same way and ends the same
+        // way, so releasing a chat somebody has a queue tray open on would cut
+        // that tray off exactly as it would cut a transcript off.
+        self.messages_tx.receiver_count() > 0 || self.queue_tx.receiver_count() > 0
     }
 
     pub fn doc(&self) -> Arc<SessionDoc> {
@@ -343,6 +349,44 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         rx
+    }
+
+    /// The follow-up plan watch — the projection, re-sent on every doc change
+    /// (`WatchDocQueue`, gh#424).
+    ///
+    /// A watch of the *derived* plan rather than of the raw ledger: every
+    /// viewport would otherwise fold the same log itself, and a device that
+    /// folded a beat differently would show a different plan for the same doc.
+    /// The fold is pure and cheap, so the host does it once.
+    pub fn watch_queue(&self) -> watch::Receiver<QueueView> {
+        self.touch();
+        let rx = self.queue_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
+    /// The plan as it stands, folded from this doc's ledger.
+    pub fn queue_view(&self) -> QueueView {
+        match self.doc.read_commands() {
+            Ok(commands) => queue::project(&commands),
+            Err(err) => {
+                tracing::warn!(chat = %self.chat_id, error = %err, "command read failed");
+                QueueView::default()
+            }
+        }
+    }
+
+    fn publish_queue(&self) {
+        self.queue_tx.send_replace(self.queue_view());
+    }
+
+    /// Per-commit publish path, watched-only for the same reason the transcript
+    /// mirror is: folding a plan nobody is looking at is per-commit work on
+    /// every open doc, and the fold is rebuilt on attach anyway.
+    fn publish_queue_if_watched(&self) {
+        if self.queue_tx.receiver_count() > 0 {
+            self.publish_queue();
+        }
     }
 
     /// Is this chat's session room joined RIGHT NOW? (Not "do we hold a client"
@@ -591,6 +635,7 @@ impl DocHost {
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
         let (messages_tx, _) = watch::channel(Vec::new());
+        let (queue_tx, _) = watch::channel(QueueView::default());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -598,6 +643,7 @@ impl DocHost {
             doc: RwLock::new(doc.clone()),
             changed_tx: changed_tx.clone(),
             messages_tx,
+            queue_tx,
             room: Arc::new(Mutex::new(None)),
             last_used: AtomicI64::new(now_ms()),
             mirror_dirty: AtomicBool::new(true),
@@ -846,8 +892,23 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
+        self.queue_command_with_context(chat_id, payload, Vec::new())
+    }
+
+    /// [`Self::queue_command`] carrying typed `@` references (gh#424).
+    ///
+    /// The references ride the entry rather than the prompt text because the
+    /// text is a text: it can be edited, pasted, re-wrapped, and a renderer's
+    /// chip decoration cannot survive any of that, let alone a surface that
+    /// draws no chips. What the host resolves at execute time is this list.
+    pub fn queue_command_with_context(
+        &self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+    ) -> Result<String, EngineError> {
         let id = new_id();
-        self.queue_command_with_id(chat_id, &id, payload)?;
+        self.queue_command_with_id_and_context(chat_id, &id, payload, context)?;
         Ok(id)
     }
 
@@ -860,6 +921,16 @@ impl DocHost {
         id: &str,
         payload: SessionCommandPayload,
     ) -> Result<(), EngineError> {
+        self.queue_command_with_id_and_context(chat_id, id, payload, Vec::new())
+    }
+
+    fn queue_command_with_id_and_context(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+    ) -> Result<(), EngineError> {
         let handle = self.open(chat_id)?;
         let now = now_ms();
         handle.with_current(|doc| {
@@ -870,15 +941,20 @@ impl DocHost {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
+            // A queued follow-up (and any mutation of the plan) carries no
+            // TTL: it was deliberately written to wait.
+            let expires_at = entry_expires(&payload)
+                .then_some(now + COMMAND_DEFAULT_TTL_MS);
             doc.queue_command(&SessionCommandEntry {
                 id: id.to_string(),
                 payload,
                 issued_by: self.inner.config.device_id.clone(),
                 issued_at: now,
                 based_on,
-                expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
+                expires_at,
                 status: SessionCommandStatus::Pending,
                 resolution: None,
+                context,
             })
         })?;
         // §7 durable delivery: when another device hosts this chat, nudge its device
@@ -1118,6 +1194,7 @@ impl DocHost {
             let messages = doc.read_entries().unwrap_or_default();
             let current_turn_id = messages.last().map(|m| m.id.clone());
             let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
+            let plan = queue::project(&commands);
             let disposition = evaluate_command(
                 &entry,
                 &EvaluationContext {
@@ -1126,8 +1203,17 @@ impl DocHost {
                     entries: &commands,
                     current_turn_id: current_turn_id.as_deref(),
                     turn_is_past: &turn_is_past,
+                    queue: &plan,
+                    chat_is_running: self.chat_is_running(&handle.chat_id),
                 },
             );
+            // A deferred follow-up remains durable and pending. It must not
+            // enter the processed ledger until its turn is actually owned.
+            if disposition == CommandDisposition::Defer {
+                skipped.insert(entry.id.clone());
+                continue;
+            }
+
             // A Run is different from every other command side effect. The
             // sessions engine installs its RunHandle before dispatch returns,
             // and engine death tears that run down. Marking it processed
@@ -1135,7 +1221,10 @@ impl DocHost {
             // hole for checkout recovery. Keep the durable command Pending,
             // claim it in-process, and mark only after Sessions owns the run.
             let recoverable_run = matches!(disposition, CommandDisposition::Execute)
-                && matches!(&entry.payload, SessionCommandPayload::Run { .. });
+                && matches!(
+                    &entry.payload,
+                    SessionCommandPayload::Run { .. } | SessionCommandPayload::Queue { .. }
+                );
             if recoverable_run {
                 if !lock(&self.inner.starting_runs).insert(entry.id.clone()) {
                     skipped.insert(entry.id.clone());
@@ -1175,6 +1264,7 @@ impl DocHost {
                 return;
             }
             match disposition {
+                CommandDisposition::Defer => unreachable!("handled above"),
                 CommandDisposition::Skip => {
                     skipped.insert(entry.id.clone());
                 }
@@ -1183,6 +1273,14 @@ impl DocHost {
                 }
                 CommandDisposition::Superseded => {
                     self.resolve_command(handle, &entry.id, SessionCommandStatus::Superseded, None);
+                }
+                CommandDisposition::Cancelled => {
+                    self.resolve_command(
+                        handle,
+                        &entry.id,
+                        SessionCommandStatus::Cancelled,
+                        Some("removed from the queue"),
+                    );
                 }
                 CommandDisposition::Execute => {
                     let (status, resolution) = match self.execute(sessions, handle, &entry).await {
@@ -1193,6 +1291,23 @@ impl DocHost {
                 }
             }
         }
+    }
+
+    /// Is a turn live on this chat? Distinct from [`Self::chat_is_busy`], which
+    /// answers "may the handle be released" and stays true for a PARKED
+    /// persistent session — a follow-up gated on that would never run, because a
+    /// steerable harness parks for thirty minutes after every completed turn.
+    /// What a follow-up waits for is the turn, not the process.
+    fn chat_is_running(&self, chat_id: &str) -> bool {
+        self.inner.sessions.get().is_some_and(|sessions| {
+            matches!(
+                sessions.session_status(chat_id).map(|s| s.status),
+                Some(
+                    comet_proto::SessionStatus::Working
+                        | comet_proto::SessionStatus::AwaitingInput
+                )
+            )
+        })
     }
 
     /// Host-only outcome write (ledger rule 2).
@@ -1249,15 +1364,27 @@ impl DocHost {
                 {
                     request.cwd = cwd;
                 }
+                // References resolve HERE, against the checkout this run is
+                // about to start in — not where they were picked. That is what
+                // makes a file picked on a phone name the same file when the
+                // box runs the turn, and the only place an escape can be caught.
+                let context = self.apply_context(&request.cwd, &entry.context, &mut request.prompt)?;
                 let harness = self.harness_for(chat_id);
                 sessions
                     .dispatch(chat_id, harness, request, Some(message_id.clone()))
                     .await?;
-                Ok((SessionCommandStatus::Applied, None))
+                Ok((SessionCommandStatus::Applied, context))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
+                let mut prompt = prompt.clone();
+                let context = self.apply_context(
+                    &self.checkout_root(chat_id, sessions),
+                    &entry.context,
+                    &mut prompt,
+                )?;
+                let prompt = &prompt;
                 match sessions.steer(chat_id, prompt, message_id.clone()).await? {
-                    SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
+                    SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, context)),
                     SteerOutcome::NotSteerable => {
                         // No live steerable run: the durable command still delivers —
                         // run it as the next turn (comet's fallback, executor-side).
@@ -1291,7 +1418,10 @@ impl DocHost {
                             .await?;
                         Ok((
                             SessionCommandStatus::Applied,
-                            Some("queued as new turn".into()),
+                            Some(match context {
+                                Some(context) => format!("queued as new turn; {context}"),
+                                None => "queued as new turn".into(),
+                            }),
                         ))
                     }
                 }
@@ -1367,7 +1497,107 @@ impl DocHost {
                     Some("answered as new turn".into()),
                 ))
             }
+            // A follow-up whose turn has come (the drain only reaches this once
+            // the plan says so — head of an unpaused queue, nothing running).
+            SessionCommandPayload::Queue {
+                prompt,
+                message_id,
+            } => {
+                // The PLAN's text, not the entry's: an edit is a later ledger
+                // entry, and running the original would run the version the user
+                // replaced. Falls back to the entry for a plan that no longer
+                // lists it, which the drain should have cancelled instead — a
+                // belt-and-braces path, never the normal one.
+                let row = handle
+                    .queue_view()
+                    .rows
+                    .into_iter()
+                    .find(|row| row.id == entry.id);
+                let (mut prompt, context) = match row {
+                    Some(row) => (row.prompt, row.context),
+                    None => (prompt.clone(), entry.context.clone()),
+                };
+                // Same config source as the steer→new-turn fallback: the live
+                // request when there is one (a parked persistent session is
+                // reused — the follow-up becomes its next turn on the warm
+                // child), else the chat's workspace row after a restart.
+                let request = sessions
+                    .last_request(chat_id)
+                    .or_else(|| self.request_from_chat_row(chat_id, &prompt));
+                let Some(mut request) = request else {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("no run config for the queued follow-up".into()),
+                    ));
+                };
+                let note = self.apply_context(&request.cwd, &context, &mut prompt)?;
+                request.prompt = prompt;
+                request.resume = None; // dispatch re-derives the harness session
+                request.attachments = Vec::new(); // never the previous turn's images
+                sessions
+                    .dispatch(
+                        chat_id,
+                        self.harness_for(chat_id),
+                        request,
+                        Some(message_id.clone()),
+                    )
+                    .await?;
+                Ok((
+                    SessionCommandStatus::Applied,
+                    Some(match note {
+                        Some(note) => format!("ran from the queue; {note}"),
+                        None => "ran from the queue".into(),
+                    }),
+                ))
+            }
+            // A mutation of the plan has no side effect to execute: its effect
+            // IS the entry, which every reader of the ledger already folds
+            // ([`comet_doc::queue::project`]). Marking it applied is what stops
+            // the drain from re-examining it, and what tells the client its
+            // optimistic edit landed durably.
+            SessionCommandPayload::QueueControl { op } => {
+                Ok((SessionCommandStatus::Applied, Some(control_note(op))))
+            }
         }
+    }
+
+    /// The checkout a chat's `@` references resolve against: the workspace row's
+    /// cwd (what the run will actually use), falling back to the live request's.
+    fn checkout_root(&self, chat_id: &str, sessions: &SessionsEngine) -> String {
+        self.workspace()
+            .and_then(|ws| ws.doc().chat(chat_id).ok().flatten())
+            .and_then(|chat| chat.cwd)
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| sessions.last_request(chat_id).map(|r| r.cwd))
+            .unwrap_or_default()
+    }
+
+    /// Resolve an instruction's references against `root`, appending the
+    /// staleness note to `prompt`. Returns the one-line account for the ledger.
+    ///
+    /// `Err` for a reference that escapes the checkout — which fails the command
+    /// rather than dropping the reference, because the picker cannot produce one
+    /// and a client that did is not a client whose other references should be
+    /// trusted into a prompt.
+    fn apply_context(
+        &self,
+        root: &str,
+        refs: &[ContextRef],
+        prompt: &mut String,
+    ) -> Result<Option<String>, EngineError> {
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        if root.is_empty() {
+            return Err(EngineError::Other(
+                "context references need a checkout, and this chat has no cwd".into(),
+            ));
+        }
+        let resolved = crate::context_files::resolve(std::path::Path::new(root), refs)?;
+        if let Some(note) = crate::context_files::missing_note(&resolved) {
+            prompt.push_str(&note);
+        }
+        Ok(crate::context_files::resolution_note(&resolved))
     }
 
     /// A steer-turned-run with no in-process `last_request` (engine restarted
@@ -1539,6 +1769,29 @@ pub fn respond_input_prompt(
     lines.join("\n")
 }
 
+/// What a plan mutation writes into the ledger's `resolution` — the line a
+/// client renders next to the entry, and the only trace an op leaves once its
+/// effect has been folded into the plan.
+fn control_note(op: &comet_doc::QueueOp) -> String {
+    use comet_doc::QueueOp;
+    match op {
+        QueueOp::Edit { target, .. } => format!("edited {target}"),
+        QueueOp::Move { target, .. } => format!("reordered {target}"),
+        QueueOp::Remove { target } => format!("removed {target}"),
+        QueueOp::Clear {} => "cleared the queue".into(),
+        QueueOp::Pause {} => "paused the queue".into(),
+        QueueOp::Resume {} => "resumed the queue".into(),
+    }
+}
+
+/// Does this command kind get the send TTL?
+fn entry_expires(payload: &SessionCommandPayload) -> bool {
+    !matches!(
+        payload,
+        SessionCommandPayload::Queue { .. } | SessionCommandPayload::QueueControl { .. }
+    )
+}
+
 /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
@@ -1562,6 +1815,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 // Keeps a chat that is quietly syncing out of the idle sweep.
                 handle.touch();
                 handle.publish_messages_if_watched();
+                handle.publish_queue_if_watched();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(

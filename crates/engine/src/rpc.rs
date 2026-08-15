@@ -103,6 +103,10 @@ use comet_board::dispatch::{DispatchOrigin, DispatchOverrides, VerifiedCaller};
 /// not answered in five seconds is one this write proceeds without.
 const PEER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Ceiling on what one `SearchContextFiles` call may ask for (gh#424). The
+/// picker wants seven rows; this is the bound on a client asking for the disk.
+const MAX_CONTEXT_RESULTS: usize = 100;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
@@ -208,6 +212,29 @@ struct ListSkillsParams {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    /// Typed `@` references the instruction was written against (gh#424).
+    /// Defaulted: every caller that predates the picker sends none.
+    #[serde(default)]
+    context: Vec<comet_proto::ContextRef>,
+}
+
+/// `SearchContextFiles` (gh#424). Shaped like [`ListSkillsParams`] and for the
+/// same reason: the composer on the new-chat canvas has no chat yet and asks
+/// with the space's folder, while an open chat names itself and lets the host
+/// resolve the checkout.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchContextParams {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    query: String,
+    /// Rows wanted, capped host-side — a client asking for ten thousand is
+    /// asking the box to walk its disk for a menu.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,6 +714,38 @@ impl EngineRpc {
             .or(params.cwd)
             .map(std::path::PathBuf::from);
         crate::skills::list(&crate::skills::SkillRoots { config_dir, cwd })
+    }
+
+    /// The `@` picker's rows, from the chat's own checkout (gh#424).
+    ///
+    /// The root is the chat's `cwd` — the worktree the agent works in, which is
+    /// the only thing a reference can be relative to and still mean the same
+    /// on every device. `params.cwd` covers the new-chat canvas, where the
+    /// space's folder is all there is.
+    ///
+    /// Never fails, for the same reason [`Self::list_skills`] never does: an
+    /// unknown chat, a folder that is not there, an unreadable tree all produce
+    /// an empty list, and a red box under a composer mid-keystroke helps nobody.
+    fn search_context_files(&self, params: SearchContextParams) -> comet_proto::ContextSearch {
+        let root = params
+            .chat_id
+            .as_deref()
+            .and_then(|id| self.workspace.chat(id))
+            .and_then(|chat| chat.cwd)
+            .filter(|cwd| !cwd.is_empty())
+            .or(params.cwd);
+        let Some(root) = root else {
+            return comet_proto::ContextSearch::default();
+        };
+        let defaults = crate::context_files::SearchLimits::default();
+        let limits = crate::context_files::SearchLimits {
+            max_results: params
+                .limit
+                .unwrap_or(defaults.max_results)
+                .clamp(1, MAX_CONTEXT_RESULTS),
+            ..defaults
+        };
+        crate::context_files::search(std::path::Path::new(&root), &params.query, limits)
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1647,8 +1706,15 @@ fn forwardable(method: &str) -> bool {
             // the agent account that chat names (gh#134) — a laptop answering
             // from its own `~/.claude` would offer what the run cannot invoke.
             | methods::LIST_SKILLS
+            // The `@` picker searches the chat's checkout, and the checkout is
+            // a directory on the host device (gh#424) — the sharper case of the
+            // same rule: a laptop answering from its own disk would offer paths
+            // that do not exist where the turn runs.
+            | methods::SEARCH_CONTEXT_FILES
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
+            // The follow-up plan lives in the chat's doc, hosted where the chat is.
+            | methods::WATCH_DOC_QUEUE
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -2028,7 +2094,7 @@ impl RpcService for EngineRpc {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
                     .doc_host
-                    .queue_command(&p.chat_id, p.command)
+                    .queue_command_with_context(&p.chat_id, p.command, p.context)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
@@ -2041,6 +2107,17 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                 )))
+            }
+            methods::WATCH_DOC_QUEUE => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(watch_stream(handle.watch_queue())))
+            }
+            methods::SEARCH_CONTEXT_FILES => {
+                RpcReply::value(&self.search_context_files(parse_params(params)?))
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))

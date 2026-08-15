@@ -791,6 +791,41 @@ impl Inner {
         if let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
+        self.kick_queue_on_settle(chat_id, status);
+    }
+
+    /// A settled turn is what a queued follow-up has been waiting for (gh#424).
+    ///
+    /// The drain is otherwise driven by doc CHANGES, and a turn ending changes
+    /// nothing in the doc's command ledger — so without this the plan would sit
+    /// until the next commit happened to wake it, which on a chat nobody is
+    /// typing into is never. Fire-and-forget and cheap: the drain re-reads the
+    /// plan and finds nothing to do on every chat that has no queue, which is
+    /// almost all of them.
+    ///
+    /// A parked persistent session settles to `Idle` too, and that is exactly
+    /// right: the follow-up becomes the warm child's next turn rather than a
+    /// cold restart.
+    fn kick_queue_on_settle(&self, chat_id: &str, status: SessionStatus) {
+        if matches!(status, SessionStatus::Working | SessionStatus::AwaitingInput) {
+            return;
+        }
+        let Some(host) = self.doc_host.get().cloned() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return; // bare sync callers (unit tests) — the next commit drains
+        };
+        let chat_id = chat_id.to_string();
+        runtime.spawn(async move {
+            let Ok(handle) = host.open(&chat_id) else {
+                return;
+            };
+            if handle.queue_view().is_empty() {
+                return;
+            }
+            host.drain_commands(&handle).await;
+        });
     }
 
     fn workspace(&self) -> Option<&crate::workspace_host::WorkspaceHost> {

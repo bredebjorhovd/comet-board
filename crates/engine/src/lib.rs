@@ -18,6 +18,7 @@ pub mod board;
 pub mod board_runtime;
 pub mod checkout_prep;
 mod checkout_prep_sandbox;
+pub mod context_files;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;

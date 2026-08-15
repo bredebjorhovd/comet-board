@@ -6,11 +6,13 @@
 //! run journal and summed onto the board's own attempt rows for the stats page (gh#151).
 
 pub mod agent;
+pub mod context;
 pub mod entities;
 pub mod health;
 pub mod motion;
 pub mod view;
 
 pub use agent::*;
+pub use context::*;
 pub use entities::*;
 pub use health::EdgeHealth;
