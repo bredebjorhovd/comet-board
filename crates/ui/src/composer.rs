@@ -49,53 +49,63 @@ use crate::theme::{Bed, ListRow as _, Theme};
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
 
-fn stamp_context_tokens(text: &str, stamps: Option<&HashMap<String, String>>) -> Vec<ContextRef> {
-    view_context::tokens(text)
-        .into_iter()
-        .filter_map(|mut reference| {
-            let checkout_id = stamps?.get(&reference.path)?.trim();
-            if checkout_id.is_empty() {
-                return None;
-            }
-            reference.checkout_id = Some(checkout_id.to_string());
-            Some(reference)
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextSelection {
+    path: String,
+    kind: comet_proto::ContextRefKind,
     checkout_id: String,
     token_start: usize,
     token_end: usize,
 }
 
-fn selected_context_stamps(
+fn selected_context_refs(
     text: &str,
-    selections: Option<&HashMap<String, ContextSelection>>,
-) -> HashMap<String, String> {
-    selections
+    selections: Option<&Vec<ContextSelection>>,
+) -> Vec<ContextRef> {
+    let mut selected: Vec<_> = selections
         .into_iter()
         .flatten()
-        .filter_map(|(path, selection)| {
-            let expected = format!("@{path}");
+        .filter_map(|selection| {
+            let expected = format!("@{}", selection.path);
             (text.get(selection.token_start..selection.token_end) == Some(expected.as_str()))
-                .then(|| (path.clone(), selection.checkout_id.clone()))
+                .then(|| selection.clone())
+        })
+        .collect();
+    selected.sort_by_key(|selection| selection.token_start);
+    selected
+        .into_iter()
+        .map(|selection| ContextRef {
+            path: selection.path,
+            kind: selection.kind,
+            checkout_id: Some(selection.checkout_id),
         })
         .collect()
 }
 
-fn prune_context_selections(text: &str, selections: &mut HashMap<String, ContextSelection>) {
-    selections.retain(|path, selection| {
-        let expected = format!("@{path}");
-        text.get(selection.token_start..selection.token_end) == Some(expected.as_str())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerTextEdit {
+    replaced: Range<usize>,
+    inserted_len: usize,
+}
+
+fn apply_context_edit(selections: &mut Vec<ContextSelection>, edit: &ComposerTextEdit) {
+    let removed_len = edit.replaced.end.saturating_sub(edit.replaced.start);
+    let delta = edit.inserted_len as isize - removed_len as isize;
+    selections.retain_mut(|selection| {
+        if edit.replaced.end <= selection.token_start {
+            selection.token_start = selection.token_start.saturating_add_signed(delta);
+            selection.token_end = selection.token_end.saturating_add_signed(delta);
+            true
+        } else {
+            edit.replaced.start >= selection.token_end
+        }
     });
 }
 
 fn take_context_selections(
-    all: &mut HashMap<String, HashMap<String, ContextSelection>>,
+    all: &mut HashMap<String, Vec<ContextSelection>>,
     draft_key: &str,
-) -> Option<HashMap<String, ContextSelection>> {
+) -> Option<Vec<ContextSelection>> {
     all.remove(draft_key)
 }
 
@@ -741,7 +751,7 @@ pub enum ComposerInputEvent {
     Submitted,
     /// ⌘/Ctrl-Enter — send as a queued follow-up (gh#424).
     QueueSubmitted,
-    Edited,
+    Edited(Option<ComposerTextEdit>),
     /// A navigation key arrived while a completion menu was up — the wrapper
     /// owns the menu, so the input only reports the intent.
     Menu(MenuNav),
@@ -888,7 +898,7 @@ impl ComposerInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(None));
         cx.notify();
     }
 
@@ -926,7 +936,7 @@ impl ComposerInput {
         self.marked_range = None;
         self.scroll_top = 0.0;
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(None));
         cx.notify();
     }
 
@@ -1456,13 +1466,17 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let edit = ComposerTextEdit {
+            replaced: range.clone(),
+            inserted_len: new_text.len(),
+        };
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range.take();
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(Some(edit)));
         cx.notify();
     }
 
@@ -1479,6 +1493,10 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let edit = ComposerTextEdit {
+            replaced: range.clone(),
+            inserted_len: new_text.len(),
+        };
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         if new_text.is_empty() {
@@ -1492,7 +1510,7 @@ impl EntityInputHandler for ComposerInput {
             .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(Some(edit)));
         cx.notify();
     }
 
@@ -1821,7 +1839,7 @@ pub struct Composer {
     /// Checkout stamps captured when a picker row was completed, per draft.
     /// Search chrome may close or refresh; provenance belongs to the inserted
     /// reference and must survive until that reference/draft is removed.
-    context_ref_checkouts: HashMap<String, HashMap<String, ContextSelection>>,
+    context_ref_checkouts: HashMap<String, Vec<ContextSelection>>,
     /// `(chat key, query)` the rows answer. Both halves matter: the same query
     /// means different files in a different checkout.
     context_key: Option<(String, String)>,
@@ -1906,8 +1924,10 @@ impl Composer {
             // asks `menu_active` while dispatching the NEXT keystroke, so a
             // flag that lagged a frame would send the prompt on the Enter that
             // was meant to complete it.
-            ComposerInputEvent::Edited => {
-                this.prune_context_provenance(cx);
+            ComposerInputEvent::Edited(edit) => {
+                if let Some(edit) = edit {
+                    this.apply_context_edit(edit);
+                }
                 this.sync_menus(cx);
                 cx.notify();
             }
@@ -2588,14 +2608,13 @@ impl Composer {
             self.context_ref_checkouts
                 .entry(self.current_key.clone())
                 .or_default()
-                .insert(
-                    row.path.clone(),
-                    ContextSelection {
-                        checkout_id,
-                        token_start: token.start,
-                        token_end: token.start + 1 + row.path.len(),
-                    },
-                );
+                .push(ContextSelection {
+                    path: row.path.clone(),
+                    kind: row.kind,
+                    checkout_id,
+                    token_start: token.start,
+                    token_end: token.start + 1 + row.path.len(),
+                });
         }
         self.input
             .update(cx, |input, cx| input.set_text_with_caret(text, caret, cx));
@@ -2720,18 +2739,14 @@ impl Composer {
     }
 
     fn context_tokens(&self, text: &str) -> Vec<ContextRef> {
-        let stamps = selected_context_stamps(
-            text,
-            self.context_ref_checkouts.get(&self.current_key),
-        );
-        stamp_context_tokens(text, Some(&stamps))
+        selected_context_refs(text, self.context_ref_checkouts.get(&self.current_key))
     }
 
-    fn prune_context_provenance(&mut self, cx: &App) {
+    fn apply_context_edit(&mut self, edit: &ComposerTextEdit) {
         let Some(selections) = self.context_ref_checkouts.get_mut(&self.current_key) else {
             return;
         };
-        prune_context_selections(self.input.read(cx).text(), selections);
+        apply_context_edit(selections, edit);
         if selections.is_empty() {
             self.context_ref_checkouts.remove(&self.current_key);
         }
@@ -2920,14 +2935,13 @@ impl Composer {
             if let Some(checkout_id) = &reference.checkout_id {
                 let token = format!("@{}", reference.path);
                 if let Some(token_start) = prompt.find(&token) {
-                    stamps.insert(
-                        reference.path.clone(),
-                        ContextSelection {
-                            checkout_id: checkout_id.clone(),
-                            token_start,
-                            token_end: token_start + token.len(),
-                        },
-                    );
+                    stamps.push(ContextSelection {
+                        path: reference.path.clone(),
+                        kind: reference.kind,
+                        checkout_id: checkout_id.clone(),
+                        token_start,
+                        token_end: token_start + token.len(),
+                    });
                 }
             }
         }
@@ -5044,56 +5058,110 @@ mod tests {
         let (completed, _) = view_context::complete(input, &token, &row.to_ref());
         assert!(completed.ends_with(' '), "completion closes the picker");
 
-        let stamps = HashMap::from([("src/foo.rs".into(), "checkout-before".into())]);
-        let refs = stamp_context_tokens(&completed, Some(&stamps));
+        let refs = selected_context_refs(
+            &completed,
+            Some(&vec![ContextSelection {
+                path: "src/foo.rs".into(),
+                kind: comet_proto::ContextRefKind::File,
+                checkout_id: "checkout-before".into(),
+                token_start: token.start,
+                token_end: token.start + "@src/foo.rs".len(),
+            }]),
+        );
         assert_eq!(refs[0].checkout_id.as_deref(), Some("checkout-before"));
         assert_ne!(refs[0].checkout_id.as_deref(), Some("checkout-after"));
     }
 
     #[test]
     fn hand_typed_context_syntax_remains_plain_prompt_text() {
-        assert!(stamp_context_tokens("inspect @src/forged.rs", None).is_empty());
-        assert!(stamp_context_tokens("inspect @src/forged.rs", Some(&HashMap::new())).is_empty());
+        assert!(selected_context_refs("inspect @src/forged.rs", None).is_empty());
+        assert!(selected_context_refs("inspect @src/forged.rs", Some(&Vec::new())).is_empty());
     }
 
     #[test]
     fn successful_send_drops_selection_authority_before_the_same_path_is_typed_again() {
         let text = "inspect @src/foo.rs";
-        let selections = HashMap::from([(
-            "src/foo.rs".into(),
-            ContextSelection {
-                checkout_id: "host-checkout".into(),
-                token_start: 8,
-                token_end: text.len(),
-            },
-        )]);
-        let selected = selected_context_stamps(text, Some(&selections));
-        assert_eq!(stamp_context_tokens(text, Some(&selected)).len(), 1);
+        let selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 8,
+            token_end: text.len(),
+        }];
+        assert_eq!(selected_context_refs(text, Some(&selections)).len(), 1);
 
         // Successful Send/Steer consumes the draft provenance. Identical text
         // in the next draft is only text until the picker selects it again.
         let mut drafts = HashMap::from([("chat-a".into(), selections)]);
         take_context_selections(&mut drafts, "chat-a");
-        let next = selected_context_stamps(text, drafts.get("chat-a"));
-        assert!(stamp_context_tokens(text, Some(&next)).is_empty());
+        assert!(selected_context_refs(text, drafts.get("chat-a")).is_empty());
     }
 
     #[test]
     fn deleting_a_selected_token_revokes_authority_before_retyping_it() {
-        let selected_text = "inspect @src/foo.rs";
-        let mut selections = HashMap::from([(
-            "src/foo.rs".into(),
-            ContextSelection {
-                checkout_id: "host-checkout".into(),
-                token_start: 8,
-                token_end: selected_text.len(),
-            },
-        )]);
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 8,
+            token_end: 19,
+        }];
 
-        prune_context_selections("inspect ", &mut selections);
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 8..19,
+                inserted_len: 0,
+            },
+        );
         assert!(selections.is_empty(), "deleting the exact token revokes it");
-        let retyped = selected_context_stamps(selected_text, Some(&selections));
-        assert!(stamp_context_tokens(selected_text, Some(&retyped)).is_empty());
+        assert!(selected_context_refs("inspect @src/foo.rs", Some(&selections)).is_empty());
+    }
+
+    #[test]
+    fn one_picker_occurrence_never_authorizes_a_typed_duplicate() {
+        let selected_text = "@src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 0,
+            token_end: 11,
+        }];
+        let typed = " and @src/foo.rs";
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: selected_text.len()..selected_text.len(),
+                inserted_len: typed.len(),
+            },
+        );
+        let text = format!("{selected_text}{typed}");
+        let refs = selected_context_refs(&text, Some(&selections));
+        assert_eq!(refs.len(), 1, "only the picker-selected span is typed");
+    }
+
+    #[test]
+    fn editor_paste_over_identical_selected_bytes_revokes_the_occurrence() {
+        let text = "inspect @src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 8,
+            token_end: text.len(),
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 8..text.len(),
+                inserted_len: "@src/foo.rs".len(),
+            },
+        );
+        assert!(
+            selected_context_refs(text, Some(&selections)).is_empty(),
+            "an indistinguishable editor replacement fails closed"
+        );
     }
 
     #[test]

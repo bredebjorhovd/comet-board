@@ -265,7 +265,7 @@ fn reconcile_device_commands(
         .filter(|command| command.issued_by == device_id)
     {
         match existing.get(&command.id) {
-            None if command.status == SessionCommandStatus::Pending => {
+            None => {
                 replacement.queue_command(&command)?;
                 replayed += 1;
             }
@@ -2442,6 +2442,93 @@ mod tests {
         let restarted = host(dir.path());
         let reopened = restarted.open(chat_id).unwrap();
         let commands = reopened.doc().read_commands().unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Applied
+        }));
+        assert!(restarted.inner.store.is_processed(command_id).unwrap());
+        assert!(!commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Pending
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_absent_terminal_command_crossing_reseed_survives_processed_and_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_host = host(dir.path());
+        let chat_id = "chat-absent-outcome-reseed";
+        let command_id = "absent-outcome-reseed";
+        first_host
+            .queue_command_with_id(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Queue {
+                    prompt: "already dispatched before server saw it".into(),
+                    message_id: "absent-outcome-message".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        let handle = first_host.open(chat_id).unwrap();
+
+        // This incoming snapshot predates the command entirely, not merely its
+        // outcome. It must receive the locally issued terminal row at reseed.
+        let replacement = SessionDoc::init(chat_id).unwrap();
+        let (outcome_written_tx, outcome_written_rx) = std::sync::mpsc::channel();
+        let (release_outcome_tx, release_outcome_rx) = std::sync::mpsc::channel();
+        let outcome_host = first_host.clone();
+        let outcome_handle = handle.clone();
+        let outcome = std::thread::spawn(move || {
+            outcome_host
+                .persist_command_outcome_with_hook(
+                    &outcome_handle,
+                    command_id,
+                    SessionCommandStatus::Applied,
+                    Some("dispatched"),
+                    || {
+                        outcome_written_tx.send(()).unwrap();
+                        release_outcome_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+            outcome_host
+                .inner
+                .store
+                .mark_processed(command_id)
+                .unwrap();
+        });
+        outcome_written_rx.recv().unwrap();
+
+        let (reseed_done_tx, reseed_done_rx) = std::sync::mpsc::channel();
+        let reseed_handle = handle.clone();
+        let reseed = std::thread::spawn(move || {
+            reseed_handle.reseed(replacement.doc().clone()).unwrap();
+            reseed_done_tx.send(()).unwrap();
+        });
+        assert!(
+            reseed_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "missing-snapshot reseed waits for the exact terminal snapshot"
+        );
+        release_outcome_tx.send(()).unwrap();
+        outcome.join().unwrap();
+        reseed.join().unwrap();
+        reseed_done_rx.recv().unwrap();
+
+        assert!(first_host.inner.store.is_processed(command_id).unwrap());
+        let current = handle.doc().read_commands().unwrap();
+        assert!(current.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Applied
+        }));
+        first_host.persist_snapshot(&handle).unwrap();
+
+        let restarted = host(dir.path());
+        let commands = restarted
+            .open(chat_id)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
         assert!(commands.iter().any(|command| {
             command.id == command_id && command.status == SessionCommandStatus::Applied
         }));

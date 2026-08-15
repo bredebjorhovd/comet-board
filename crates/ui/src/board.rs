@@ -1033,7 +1033,7 @@ impl BoardPanel {
         // first match (the Edited event fires on every keystroke).
         let dispatch_search_events =
             cx.subscribe(&dispatch_search, |this: &mut Self, _, event, cx| match event {
-                ComposerInputEvent::Edited => {
+                ComposerInputEvent::Edited(_) => {
                     if let Some(draft) = this.dispatch.as_mut() {
                         draft.active_model = 0;
                     }
@@ -2174,7 +2174,7 @@ impl BoardPanel {
                 ComposerInput::with_context("Search the board…", "PaletteSearch", cx)
             });
             let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-                if matches!(event, ComposerInputEvent::Edited)
+                if matches!(event, ComposerInputEvent::Edited(_))
                     && let Some(q) = this.find.as_ref().map(|f| f.read(cx).text().to_string())
                 {
                     this.model.filter = Filter::Text(q);

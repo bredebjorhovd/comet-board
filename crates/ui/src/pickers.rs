@@ -374,7 +374,7 @@ impl Pickers {
         // the same convention the branch picker and the add-space palette use.
         let search = cx.new(|cx| ComposerInput::with_context("Search…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
-            ComposerInputEvent::Edited => {
+            ComposerInputEvent::Edited(_) => {
                 this.active = 0;
                 cx.notify();
             }
