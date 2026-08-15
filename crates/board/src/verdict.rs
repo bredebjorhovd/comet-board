@@ -2116,7 +2116,7 @@ mod tests {
         board: std::rc::Rc<crate::sources::github::FixtureRest>,
         hers: std::rc::Rc<crate::sources::github::FixtureRest>,
     ) -> (
-        SyncEngine,
+        crate::review::tests::TestEngine,
         std::rc::Rc<crate::sources::github::FixtureAsUser>,
     ) {
         let mut e = engine(board);

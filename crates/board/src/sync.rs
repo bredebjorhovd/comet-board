@@ -5324,27 +5324,28 @@ mod tests {
     use crate::sources::github::FixtureRest;
     use crate::sources::linear::FixtureTransport;
 
-    fn engine(linear: Option<Linear<Box<dyn GraphQl>>>) -> SyncEngine {
+    use crate::review::tests::TestEngine;
+
+    fn engine(linear: Option<Linear<Box<dyn GraphQl>>>) -> TestEngine {
         engine_with(linear, None)
     }
 
     fn engine_with(
         linear: Option<Linear<Box<dyn GraphQl>>>,
         github: Option<Github<Box<dyn Rest>>>,
-    ) -> SyncEngine {
+    ) -> TestEngine {
         let mut e = engine_inner(linear);
         e.github = github;
         e
     }
 
-    fn engine_inner(linear: Option<Linear<Box<dyn GraphQl>>>) -> SyncEngine {
-        let tmp = std::env::temp_dir().join(format!(
-            "comet-board-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        SyncEngine {
+    fn engine_inner(linear: Option<Linear<Box<dyn GraphQl>>>) -> TestEngine {
+        let tmp = tempfile::Builder::new()
+            .prefix("comet-board-test-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
+        let e = SyncEngine {
             db: Db::open_in_memory().unwrap(),
             cfg: RoutingConfig {
                 defaults: Defaults::default(),
@@ -5352,15 +5353,28 @@ mod tests {
             },
             credentials: Default::default(),
             paths: Paths {
-                config_dir: tmp.clone(),
-                state_dir: tmp,
+                config_dir: dir.clone(),
+                state_dir: dir,
             },
             log: Arc::new(Logger::new("", false)),
             linear,
             github: None,
             as_user: Rc::new(crate::sources::github::FixtureAsUser::default()),
             webhook: Arc::new(RecordingWebhook::default()),
-        }
+        };
+        TestEngine { e, _tmp: tmp }
+    }
+
+    /// gh#430: the box's /tmp is RAM, and 151,476 leftover test directories
+    /// were 6 GB of it. The fixture now owns its directory; this pins that
+    /// dropping the fixture is what removes it.
+    #[test]
+    fn a_dropped_fixture_removes_its_scratch_directory() {
+        let e = engine(None);
+        let dir = e.paths.state_dir.clone();
+        assert!(dir.exists());
+        drop(e);
+        assert!(!dir.exists(), "{} survived its fixture", dir.display());
     }
 
     /// The webhook the tests watch instead of a listening socket. Shared by
@@ -5387,7 +5401,7 @@ mod tests {
     }
 
     /// An engine wired to a webhook the test can read back.
-    fn engine_with_webhook(url: &str, fail: bool) -> (SyncEngine, Arc<RecordingWebhook>) {
+    fn engine_with_webhook(url: &str, fail: bool) -> (TestEngine, Arc<RecordingWebhook>) {
         let hook = Arc::new(RecordingWebhook {
             fail,
             ..Default::default()
@@ -5397,8 +5411,6 @@ mod tests {
         e.webhook = hook.clone();
         (e, hook)
     }
-
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn seed(e: &SyncEngine, id: &str, identifier: &str, upstream: UpstreamState) {
         e.db.upsert_task(&UpsertTask {
@@ -6218,8 +6230,15 @@ mod tests {
     /// asked — a commit the agent made after it, pushed or not. Built on the
     /// AGE-19 fixture so the operator's own unpushed commit is always present
     /// underneath, proving every settle here measures from the attempt's base.
-    fn agent_worked_in(e: &SyncEngine, attempt: i64, did: Work) -> std::path::PathBuf {
-        let work = repo_ahead_of_its_remote();
+    ///
+    /// The `TempDir` owns the checkout — hold it as long as the settle needs
+    /// the tree; dropping it is the cleanup.
+    fn agent_worked_in(
+        e: &SyncEngine,
+        attempt: i64,
+        did: Work,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (repo, work) = repo_ahead_of_its_remote();
         let head = std::process::Command::new("git")
             .args(["-C", &work.to_string_lossy(), "rev-parse", "HEAD"])
             .output()
@@ -6238,7 +6257,7 @@ mod tests {
         e.db.set_attempt_worktree(attempt, &work.to_string_lossy())
             .unwrap();
         e.db.set_attempt_base_sha(attempt, &base).unwrap();
-        work
+        (repo, work)
     }
 
     fn outcome_payload(e: &SyncEngine) -> Value {
@@ -6289,7 +6308,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Pushed);
+        let _work = agent_worked_in(&e, a, Work::Pushed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -6299,7 +6318,6 @@ mod tests {
         // Commits are the evidence, and no PR is claimed — the payload says
         // null, which delivery renders as the log-pointer comment.
         assert!(outcome_payload(&e)["pr_url"].is_null());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// gh#69, end to end: the agent committed, `gh pr create` never happened
@@ -6311,7 +6329,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Committed);
+        let (_repo, work) = agent_worked_in(&e, a, Work::Committed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -6340,7 +6358,6 @@ mod tests {
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
             .unwrap();
         assert_eq!(live(&e).outcome, Some(Outcome::Done));
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// The crash variant. Recovery stamps an aborted run `Interrupted`, so the
@@ -6352,7 +6369,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Committed);
+        let _work = agent_worked_in(&e, a, Work::Committed);
         let rt = JournalFact::ending(Some(RunEnd::Interrupted));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
@@ -6360,7 +6377,6 @@ mod tests {
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
             .unwrap();
         assert!(live(&e).outcome.is_none());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// A push straight to a URL — what an agent carrying the board's
@@ -6369,7 +6385,7 @@ mod tests {
     /// on origin. The event path asks GitHub, once, and settles.
     #[test]
     fn a_branch_pushed_without_a_tracking_ref_is_found_by_asking_github() {
-        let work_dir = repo_ahead_of_its_remote();
+        let (_repo, work_dir) = repo_ahead_of_its_remote();
         let wt = work_dir.to_string_lossy().into_owned();
         let base = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
         std::fs::write(work_dir.join("agent"), "work").unwrap();
@@ -6419,14 +6435,13 @@ mod tests {
             Commits::Pushed,
             "the event path asks GitHub and finds the branch"
         );
-        std::fs::remove_dir_all(work_dir.parent().unwrap()).ok();
     }
 
     /// The bar is containment, not a name: a retry reuses its predecessor's
     /// branch, and the push that branch already carries is not this attempt's.
     #[test]
     fn a_retrys_own_commits_are_what_must_be_on_origin() {
-        let work_dir = repo_ahead_of_its_remote();
+        let (_repo, work_dir) = repo_ahead_of_its_remote();
         let wt = work_dir.to_string_lossy().into_owned();
         // The previous attempt's work, pushed under the shared branch name.
         std::fs::write(work_dir.join("first"), "1").unwrap();
@@ -6467,7 +6482,6 @@ mod tests {
             Commits::Unpushed,
             "a branch on origin at somebody else's commit settles nothing"
         );
-        std::fs::remove_dir_all(work_dir.parent().unwrap()).ok();
     }
 
     #[test]
@@ -6478,14 +6492,13 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::None);
+        let _work = agent_worked_in(&e, a, Work::None);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
             .unwrap();
         assert!(live(&e).outcome.is_none());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -6498,7 +6511,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Pushed);
+        let _work = agent_worked_in(&e, a, Work::Pushed);
         let rt = JournalFact::ending(Some(RunEnd::Errored));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
@@ -6525,7 +6538,6 @@ mod tests {
         assert_eq!(task.attempts.len(), 1);
         assert_eq!(task.attempts[0].outcome, Some(Outcome::Done));
         assert_eq!(task.attempts[0].reopened, 0, "a retry is not a reopen");
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -6584,11 +6596,10 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Pushed);
+        let _work = agent_worked_in(&e, a, Work::Pushed);
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Unknown)]))
             .unwrap();
         assert!(live(&e).outcome.is_none());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     // ---- notification (gh#71) --------------------------------------------
@@ -7231,7 +7242,7 @@ mod tests {
 
     /// Settle a dispatched attempt on a pull request, having first written
     /// `ledger` into the board's credential record for its chat.
-    fn settle_with_ledger(ledger: impl FnOnce(&Paths)) -> (SyncEngine, Arc<RecordingWebhook>) {
+    fn settle_with_ledger(ledger: impl FnOnce(&Paths)) -> (TestEngine, Arc<RecordingWebhook>) {
         let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -7697,15 +7708,16 @@ mod tests {
 
     // ---- the settle the board got wrong (§settle-logic's inverse) ---------
 
-    /// Settle an attempt on commits, returning its checkout for cleanup.
-    fn settled_on_commits(e: &SyncEngine, attempt: i64) -> std::path::PathBuf {
-        let work = agent_worked_in(e, attempt, Work::Pushed);
+    /// Settle an attempt on commits, returning the checkout's handle — the
+    /// tree lives exactly as long as the test holds it.
+    fn settled_on_commits(e: &SyncEngine, attempt: i64) -> tempfile::TempDir {
+        let (repo, _work) = agent_worked_in(e, attempt, Work::Pushed);
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
             .unwrap();
         assert_eq!(live(e).outcome, Some(Outcome::Done), "fixture must settle");
-        work
+        repo
     }
 
     #[test]
@@ -7717,7 +7729,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = settled_on_commits(&e, a);
+        let _work = settled_on_commits(&e, a);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -7727,7 +7739,6 @@ mod tests {
         assert_eq!(attempt.agent_status, Some(AgentStatus::Working));
         let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
         assert_eq!(task.attempts.len(), 1, "re-opened, not re-dispatched");
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -7736,7 +7747,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = settled_on_commits(&e, a);
+        let _work = settled_on_commits(&e, a);
         for _ in 0..3 {
             e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
                 .unwrap();
@@ -7744,7 +7755,6 @@ mod tests {
         let attempt = live(&e);
         assert_eq!(attempt.outcome, Some(Outcome::Done));
         assert_eq!(attempt.reopened, 0);
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -7754,7 +7764,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = settled_on_commits(&e, a);
+        let _work = settled_on_commits(&e, a);
         dispatch(&e, "linear:LIN-142", "chat-10");
 
         e.reconcile_sessions(&statuses(&[
@@ -7766,7 +7776,6 @@ mod tests {
         assert_eq!(task.attempts[0].outcome, Some(Outcome::Done));
         assert_eq!(task.attempts[0].reopened, 0);
         assert!(task.attempts[1].outcome.is_none());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -7776,28 +7785,27 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = settled_on_commits(&e, a);
+        let _work = settled_on_commits(&e, a);
         e.db.set_local_done("linear:LIN-142", true).unwrap();
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
         assert_eq!(live(&e).outcome, Some(Outcome::Done));
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     // ---- a settle announced twice with nothing behind it (gh#356) --------
 
     /// Settle an attempt `chat-parent` released, on a real checkout, so the
     /// notice has a dispatcher to reach. Returns the checkout.
-    fn settled_for_its_dispatcher(e: &SyncEngine, rt: &JournalFact) -> std::path::PathBuf {
+    fn settled_for_its_dispatcher(e: &SyncEngine, rt: &JournalFact) -> tempfile::TempDir {
         let a = dispatch_via(e, "linear:LIN-142", "chat-9", "chat-parent");
-        let work = agent_worked_in(e, a, Work::Pushed);
+        let (repo, _work) = agent_worked_in(e, a, Work::Pushed);
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(rt))
             .unwrap();
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(rt))
             .unwrap();
         assert_eq!(live(e).outcome, Some(Outcome::Done), "fixture must settle");
-        work
+        repo
     }
 
     /// Wake the settled chat and let its run end again, settling the attempt a
@@ -7822,7 +7830,7 @@ mod tests {
         let log = logging(&mut e);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
-        let work = settled_for_its_dispatcher(&e, &rt);
+        let _work = settled_for_its_dispatcher(&e, &rt);
         assert_eq!(rt.prompts().len(), 1, "the first settle is news");
 
         woke_and_settled_again(&e, &rt);
@@ -7838,7 +7846,6 @@ mod tests {
             log.contains("on_settled says what the last one said"),
             "and the log says why nobody was told: {log}"
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// The repeat that *is* the feature. The review landed, the agent pushed a
@@ -7850,7 +7857,8 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
-        let work = settled_for_its_dispatcher(&e, &rt);
+        let repo = settled_for_its_dispatcher(&e, &rt);
+        let work = repo.path().join("work");
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
             .unwrap();
@@ -7868,7 +7876,6 @@ mod tests {
             "a new commit is news: {:?}",
             rt.prompts()
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// The operator's endpoint has the same complaint as the orchestrator: a
@@ -7879,13 +7886,12 @@ mod tests {
         let (e, hook) = engine_with_webhook("https://hook.test/x", false);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
-        let work = settled_for_its_dispatcher(&e, &rt);
+        let _work = settled_for_its_dispatcher(&e, &rt);
         assert_eq!(hook.posts.lock().unwrap().len(), 1);
 
         woke_and_settled_again(&e, &rt);
 
         assert_eq!(hook.posts.lock().unwrap().len(), 1, "one close, one POST");
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// A cancel on top of a settle is a different fact about the attempt, and
@@ -7897,7 +7903,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
-        let work = settled_for_its_dispatcher(&e, &rt);
+        let _work = settled_for_its_dispatcher(&e, &rt);
         let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
         let attempt = live(&e);
 
@@ -7910,7 +7916,6 @@ mod tests {
         );
 
         assert_eq!(rt.prompts().len(), 2, "{:?}", rt.prompts());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     // ---- the event path --------------------------------------------------
@@ -7950,7 +7955,7 @@ mod tests {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = settled_on_commits(&e, a);
+        let _work = settled_on_commits(&e, a);
 
         assert!(
             e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
@@ -7964,7 +7969,6 @@ mod tests {
             BoardState::Working,
             "this same pass's derivation already reads the row as working"
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -7989,7 +7993,7 @@ mod tests {
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Pushed);
+        let _work = agent_worked_in(&e, a, Work::Pushed);
 
         e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -8005,7 +8009,6 @@ mod tests {
             "the settle carries the PR rather than asserting an absence"
         );
         assert_eq!(task.state, BoardState::Review);
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -8028,7 +8031,7 @@ mod tests {
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Pushed);
+        let _work = agent_worked_in(&e, a, Work::Pushed);
 
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
             .unwrap();
@@ -8036,7 +8039,6 @@ mod tests {
             .unwrap();
         assert_eq!(live(&e).outcome, Some(Outcome::Done));
         assert!(outcome_payload(&e)["pr_url"].is_null());
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     // ---- the wall-clock cap (gh#70) --------------------------------------
@@ -8349,7 +8351,7 @@ max_duration = "{max_duration}"
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        let work = agent_worked_in(&e, a, Work::Pushed);
+        let _work = agent_worked_in(&e, a, Work::Pushed);
         age_attempt(&e, a, 5 * 3600, Some(overrun::MAX_GRACE_SECS as i64));
 
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
@@ -8359,7 +8361,6 @@ max_duration = "{max_duration}"
             rt.cancels.borrow().is_empty(),
             "a finished run is not killed"
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     /// The cap is a property of the work, so it is per route: the refactor
@@ -8708,7 +8709,7 @@ max_duration = "{max_duration}"
         stack_49_board(snapshot).1
     }
 
-    fn stack_49_board(snapshot: &str) -> (SyncEngine, Vec<comet_proto::view::board::TaskRow>) {
+    fn stack_49_board(snapshot: &str) -> (TestEngine, Vec<comet_proto::view::board::TaskRow>) {
         let fixture: Value = serde_json::from_str(STACK_49).unwrap();
         let repo = STACK_49_REPO;
         // Most specific first: `FixtureRest` answers on a path prefix, and
@@ -8993,7 +8994,7 @@ max_duration = "{max_duration}"
     #[test]
     fn a_pr_from_an_ordinary_comet_chat_gets_an_attempt_backed_review() {
         let e = engine(None);
-        let work = repo_ahead_of_its_remote();
+        let (_repo, work) = repo_ahead_of_its_remote();
         git_in(
             &work,
             &["remote", "set-url", "origin", "https://github.com/o/r.git"],
@@ -9845,7 +9846,7 @@ max_duration = "{max_duration}"
 
     /// An engine with GitHub writeback enabled — it is off by default, so a
     /// test about writeback has to ask for it.
-    fn engine_with_gh_writeback() -> SyncEngine {
+    fn engine_with_gh_writeback() -> TestEngine {
         let mut e = engine_with(None, Some(gh_client()));
         e.cfg.github.writeback = true;
         e
@@ -10079,7 +10080,7 @@ max_duration = "{max_duration}"
     // ---- one writeback flag cannot answer for every repo -----------------
 
     /// Writeback on globally, off for the production repo.
-    fn engine_with_one_read_only_repo() -> SyncEngine {
+    fn engine_with_one_read_only_repo() -> TestEngine {
         let mut e = engine_with(None, Some(gh_client()));
         e.cfg.github.repos = vec!["bredebjorhovd/OIOS".into(), "Florin-AS/Tally".into()];
         e.cfg.github.writeback = true;
@@ -10264,11 +10265,11 @@ max_duration = "{max_duration}"
     }
 
     /// A Linear engine that has been told which state means review.
-    fn engine_with_review_state(responses: Vec<Value>) -> SyncEngine {
+    fn engine_with_review_state(responses: Vec<Value>) -> TestEngine {
         recording_engine(responses).0
     }
 
-    fn recording_engine(responses: Vec<Value>) -> (SyncEngine, std::rc::Rc<FixtureTransport>) {
+    fn recording_engine(responses: Vec<Value>) -> (TestEngine, std::rc::Rc<FixtureTransport>) {
         let transport = std::rc::Rc::new(FixtureTransport::new(responses));
         let mut e = engine(Some(Linear::new(
             Box::new(Shared(transport.clone())) as Box<dyn GraphQl>
@@ -10538,16 +10539,17 @@ max_duration = "{max_duration}"
     /// Builds a real repo with an "origin" it is one commit ahead of, then asks
     /// the same question two ways: against the remote, and against the commit
     /// the attempt actually started from.
-    fn repo_ahead_of_its_remote() -> std::path::PathBuf {
+    ///
+    /// The `TempDir` owns both checkouts — keep it alive as long as the paths
+    /// are in use.
+    fn repo_ahead_of_its_remote() -> (tempfile::TempDir, std::path::PathBuf) {
         use std::process::Command;
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "cb-ahead-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        let remote = root.join("remote.git");
-        let work = root.join("work");
+        let root = tempfile::Builder::new()
+            .prefix("cb-ahead-")
+            .tempdir()
+            .unwrap();
+        let remote = root.path().join("remote.git");
+        let work = root.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
             let out = Command::new("git")
@@ -10582,7 +10584,7 @@ max_duration = "{max_duration}"
         std::fs::write(work.join("b"), "2").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "operator's unpushed work"]);
-        work
+        (root, work)
     }
 
     #[test]
@@ -10591,7 +10593,7 @@ max_duration = "{max_duration}"
         // same branch, marked `done` 62 seconds later while its agent was still
         // working. The base recorded before dispatch is the *repo* HEAD, and
         // the reused branch was already four commits ahead of it.
-        let work = repo_ahead_of_its_remote();
+        let (_repo, work) = repo_ahead_of_its_remote();
         let e = engine(None);
         let wt = work.to_string_lossy().into_owned();
         let sha = |r: &str| {
@@ -10631,12 +10633,11 @@ max_duration = "{max_duration}"
             "measuring from the repo HEAD is what made it look finished — pinned \
              so the regression is recognisable if it returns"
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
     fn an_operators_unpushed_commit_is_not_the_agents_output() {
-        let work = repo_ahead_of_its_remote();
+        let (_repo, work) = repo_ahead_of_its_remote();
         let e = engine(None);
         let wt = work.to_string_lossy().into_owned();
 
@@ -10671,7 +10672,6 @@ max_duration = "{max_duration}"
             e.attempt_has_commits(Some(&wt), Some(&base)),
             "a commit made after the attempt started is the agent's output"
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     #[test]
@@ -10680,13 +10680,12 @@ max_duration = "{max_duration}"
         // produced something" for a repo where nothing has been dispatched at
         // all. Attempts predating the column keep this weaker behaviour, so it
         // is documented rather than fixed.
-        let work = repo_ahead_of_its_remote();
+        let (_repo, work) = repo_ahead_of_its_remote();
         let e = engine(None);
         assert!(
             e.attempt_has_commits(Some(&work.to_string_lossy()), None),
             "the remote-relative count is fooled by unpushed work — this is the bug"
         );
-        std::fs::remove_dir_all(work.parent().unwrap()).ok();
     }
 
     // ---- reclaiming checkouts (gh#72) ------------------------------------
@@ -11762,14 +11761,15 @@ max_duration = "{max_duration}"
 
     /// A checkout with one commit on it, and an attempt whose base is that
     /// commit — the shape every dispatched agent starts from.
-    fn checkout_with_a_base() -> (std::path::PathBuf, String) {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "cb-claims-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    ///
+    /// The `TempDir` owns the checkout; dropping it is the cleanup (a test
+    /// that removes `dir` itself is simulating gc, which the drop tolerates).
+    fn checkout_with_a_base() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tmp = tempfile::Builder::new()
+            .prefix("cb-claims-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
         let git = |args: &[&str]| {
             let out = Command::new("git")
                 .arg("-C")
@@ -11792,7 +11792,7 @@ max_duration = "{max_duration}"
         git(&["add", "."]);
         git(&["commit", "-m", "base"]);
         let base = git(&["rev-parse", "HEAD"]);
-        (dir, base)
+        (tmp, dir, base)
     }
 
     /// An attempt in `dir` measured from `base`, with a chat to read a journal
@@ -11825,7 +11825,7 @@ max_duration = "{max_duration}"
     /// touched four, and the board — not the agent — names the other two.
     #[test]
     fn the_board_computes_what_the_agent_did_not_account_for() {
-        let (dir, base) = checkout_with_a_base();
+        let (_repo, dir, base) = checkout_with_a_base();
         let e = engine(None);
         attempt_in(&e, &dir, &base);
 
@@ -11863,7 +11863,6 @@ max_duration = "{max_duration}"
         let lock = &review.remainder.unclaimed[0];
         assert_eq!(lock.status, "A");
         assert_eq!(lock.added, 1);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// §gh#236, end to end: every chip on the row comes off the checkout and
@@ -11875,7 +11874,7 @@ max_duration = "{max_duration}"
     /// something the agent did not write stands behind it.
     #[test]
     fn the_board_derives_the_effects_of_a_branch_without_asking_the_agent() {
-        let (dir, _) = checkout_with_a_base();
+        let (_repo, dir, _) = checkout_with_a_base();
         std::fs::write(
             dir.join("Cargo.toml"),
             "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n",
@@ -12006,7 +12005,6 @@ max_duration = "{max_duration}"
             review.claim_mark(moved),
             crate::claims::ClaimMark::Corroborated
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The one way an empty remainder could mislead: an agent that claims
@@ -12014,7 +12012,7 @@ max_duration = "{max_duration}"
     /// would be the friendliest possible lie.
     #[test]
     fn work_that_is_not_committed_yet_is_reported_beside_the_remainder() {
-        let (dir, base) = checkout_with_a_base();
+        let (_repo, dir, base) = checkout_with_a_base();
         let e = engine(None);
         attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// written, not committed\n").unwrap();
@@ -12037,7 +12035,6 @@ max_duration = "{max_duration}"
         assert_eq!(review.changed.len(), 2);
         assert_eq!(review.uncommitted, Some(0));
         assert_eq!(review.remainder.unclaimed[0].path, "src/new.rs");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Submitting again is the agent correcting itself, not adding to a pile —
@@ -12045,7 +12042,7 @@ max_duration = "{max_duration}"
     /// worse than one that showed neither.
     #[test]
     fn a_second_submission_replaces_the_first() {
-        let (dir, base) = checkout_with_a_base();
+        let (_repo, dir, base) = checkout_with_a_base();
         let e = engine(None);
         let a = attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
@@ -12060,7 +12057,6 @@ max_duration = "{max_duration}"
         assert_eq!(review.remainder.claims[0].text, "Right");
         assert!(review.remainder.complete());
         assert_eq!(e.db.get_attempt(a).unwrap().unwrap().claims.len(), 1);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The verb takes the name the brief handed over (§gh#339). A dispatched
@@ -12071,7 +12067,7 @@ max_duration = "{max_duration}"
     /// no repair in it either.
     #[test]
     fn claims_and_the_review_answer_to_the_identifier_the_agent_was_given() {
-        let (dir, base) = checkout_with_a_base();
+        let (_repo, dir, base) = checkout_with_a_base();
         let e = engine(None);
         let a = attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
@@ -12090,14 +12086,13 @@ max_duration = "{max_duration}"
         for spelling in ["LIN-142", "linear:LIN-142"] {
             assert_eq!(e.review(spelling, None).unwrap().task_id, "linear:LIN-142");
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Prose is refused where it is submitted, and nothing is recorded — the
     /// contract is enforced by the board, not by the agent remembering it.
     #[test]
     fn prose_is_refused_and_leaves_the_attempt_unclaimed() {
-        let (dir, base) = checkout_with_a_base();
+        let (_repo, dir, base) = checkout_with_a_base();
         let e = engine(None);
         let a = attempt_in(&e, &dir, &base);
         let err = e
@@ -12108,14 +12103,13 @@ max_duration = "{max_duration}"
         let attempt = e.db.get_attempt(a).unwrap().unwrap();
         assert!(attempt.claims.is_empty());
         assert_eq!(attempt.claims_at, None, "and it still owes an answer");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The reason the snapshot exists: gc reclaims the checkout (gh#72) and the
     /// review still has to be able to name the unclaimed set.
     #[test]
     fn the_remainder_survives_the_checkout_being_reclaimed() {
-        let (dir, base) = checkout_with_a_base();
+        let (_repo, dir, base) = checkout_with_a_base();
         let e = engine(None);
         let a = attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
@@ -12351,11 +12345,11 @@ max_duration = "{max_duration}"
     /// With a real checkout under it, because a review with no diff to read
     /// reports only that (§gh#183) and would drown out every claim finding
     /// these tests are here for.
-    fn settled_with(rt: &dyn Runtime) -> (SyncEngine, i64) {
+    fn settled_with(rt: &dyn Runtime) -> (TestEngine, i64, tempfile::TempDir) {
         let e = engine(None);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        agent_worked_in(&e, a, Work::Pushed);
+        let (repo, _work) = agent_worked_in(&e, a, Work::Pushed);
         e.db.set_pr(
             "linear:LIN-142",
             Some("https://github.com/o/r/pull/18"),
@@ -12365,12 +12359,12 @@ max_duration = "{max_duration}"
         .unwrap();
         e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(rt))
             .unwrap();
-        (e, a)
+        (e, a, repo)
     }
 
     #[test]
     fn a_closing_message_with_a_claims_block_is_read_onto_the_attempt() {
-        let (e, a) = settled_with(&Closing(
+        let (e, a, _work) = settled_with(&Closing(
             "All done, PR is up.\n\n\
              ```claims\n\
              Storage lives on the attempt :: crates/board/src/db.rs\n\
@@ -12390,7 +12384,7 @@ max_duration = "{max_duration}"
     /// finished run and its pull request.
     #[test]
     fn an_attempt_that_claimed_nothing_settles_exactly_as_it_always_did() {
-        let (e, a) = settled_with(&Closing("Done. The tests pass and the PR is open."));
+        let (e, a, _work) = settled_with(&Closing("Done. The tests pass and the PR is open."));
         let attempt = e.db.get_attempt(a).unwrap().unwrap();
         assert_eq!(attempt.outcome, Some(Outcome::Done));
         assert!(attempt.claims.is_empty());
@@ -12408,7 +12402,7 @@ max_duration = "{max_duration}"
     /// Reported, never dropped — and it still does not hold up the settle.
     #[test]
     fn a_malformed_block_is_recorded_against_the_attempt_rather_than_dropped() {
-        let (e, a) = settled_with(&Closing(
+        let (e, a, _work) = settled_with(&Closing(
             "Finished.\n\n```claims\nI rewrote the storage layer\n```\n",
         ));
         let attempt = e.db.get_attempt(a).unwrap().unwrap();
@@ -12458,7 +12452,7 @@ max_duration = "{max_duration}"
     /// review would show a draft beside its correction.
     #[test]
     fn submitting_claims_clears_an_earlier_refusal() {
-        let (e, a) = settled_with(&Closing("```claims\nno anchor here\n```"));
+        let (e, a, _work) = settled_with(&Closing("```claims\nno anchor here\n```"));
         assert!(e.db.get_attempt(a).unwrap().unwrap().claims_error.is_some());
 
         e.submit_claims(None, "linear:LIN-142", "Said properly :: src/a.rs")
@@ -12480,6 +12474,8 @@ max_duration = "{max_duration}"
     struct Stacked {
         work: std::path::PathBuf,
         parent_tip: String,
+        /// Owns the checkout `work` points into.
+        _repo: tempfile::TempDir,
     }
 
     impl Stacked {
@@ -12487,7 +12483,7 @@ max_duration = "{max_duration}"
         const CHILD: &'static str = "board/gh-12-child";
 
         fn cut() -> Stacked {
-            let work = repo_ahead_of_its_remote();
+            let (_repo, work) = repo_ahead_of_its_remote();
             git_in(&work, &["checkout", "-b", Stacked::PARENT]);
             std::fs::write(work.join("parent.rs"), "the layer below").unwrap();
             git_in(&work, &["add", "."]);
@@ -12497,7 +12493,11 @@ max_duration = "{max_duration}"
             std::fs::write(work.join("child.rs"), "the layer above").unwrap();
             git_in(&work, &["add", "."]);
             git_in(&work, &["commit", "-m", "the child's work"]);
-            Stacked { work, parent_tip }
+            Stacked {
+                work,
+                parent_tip,
+                _repo,
+            }
         }
 
         fn sha(work: &std::path::Path, rev: &str) -> String {
@@ -12619,7 +12619,6 @@ max_duration = "{max_duration}"
         );
         // The settle's commit count agrees: one commit, not two.
         assert!(e.attempt_has_commits(Some(&s.path()), e.attempt_base(&attempt(&e)).as_deref()));
-        std::fs::remove_dir_all(s.work.parent().unwrap()).ok();
     }
 
     /// A runtime that answers the two questions the rewrite notice asks — is
@@ -12755,7 +12754,6 @@ max_duration = "{max_duration}"
             Some(rewritten.as_str()),
             "and what was said about is on the record",
         );
-        std::fs::remove_dir_all(s.work.parent().unwrap()).ok();
     }
 
     /// A read-only caller must not consume the one notice the agent gets, and
@@ -12810,7 +12808,7 @@ max_duration = "{max_duration}"
 
     /// An engine whose GitHub answers a stack create, and the fixture the test
     /// reads the request back off.
-    fn engine_that_can_stack() -> (SyncEngine, std::rc::Rc<FixtureRest>) {
+    fn engine_that_can_stack() -> (TestEngine, std::rc::Rc<FixtureRest>) {
         let rest = std::rc::Rc::new(FixtureRest::new(vec![(
             "POST /repos/o/r/stacks".into(),
             json!({ "id": 334176, "number": 49, "base": { "ref": "main" } }),

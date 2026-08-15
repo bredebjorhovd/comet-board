@@ -270,21 +270,26 @@ pub fn for_chat(paths: &Paths, chat: &str) -> ChatRecord {
 mod tests {
     use super::*;
 
-    fn paths(name: &str) -> Paths {
-        let dir = std::env::temp_dir().join(format!("comet-ledger-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Paths {
+    /// A ledger directory that dies with the test — the returned `TempDir`
+    /// owns it, so keep it bound for the test's lifetime (gh#430).
+    fn paths(name: &str) -> (tempfile::TempDir, Paths) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("comet-ledger-{name}-"))
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
+        let paths = Paths {
             config_dir: dir.clone(),
             state_dir: dir,
-        }
+        };
+        (tmp, paths)
     }
 
     /// The gh#233 shape, as the ledger sees it: a run the board wired up, a
     /// helper nobody could reach, and a push that happened anyway.
     #[test]
     fn a_run_that_was_handed_a_credential_and_never_used_it_is_visible_as_such() {
-        let p = paths("unused");
+        let (_tmp, p) = paths("unused");
         handed(&p, "o/r", Some("chat-1"));
         let record = for_chat(&p, "chat-1");
         assert!(record.handed);
@@ -304,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_kept_with_its_reason_and_read_back_as_the_latest_one() {
-        let p = paths("failures");
+        let (_tmp, p) = paths("failures");
         unusable(&p, "o/r", Some("chat-1"), "cannot exec\n  the shim");
         failed(
             &p,
@@ -330,7 +335,7 @@ mod tests {
     /// read by whoever else is on the box (gh#55).
     #[test]
     fn a_ledger_line_carries_no_credential() {
-        let p = paths("nosecret");
+        let (_tmp, p) = paths("nosecret");
         minted(&p, "git-askpass", "o/r", Some("chat-1"));
         failed(
             &p,
@@ -352,7 +357,7 @@ mod tests {
     /// processes share. It must cost the last line, not the file.
     #[test]
     fn a_half_written_line_does_not_hide_the_ones_before_it() {
-        let p = paths("torn");
+        let (_tmp, p) = paths("torn");
         handed(&p, "o/r", Some("chat-1"));
         {
             use std::io::Write;
