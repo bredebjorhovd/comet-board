@@ -276,6 +276,18 @@ pub(crate) fn review_tab_title(identifier: Option<&str>, task_id: &str) -> Strin
     format!("Review · {name}")
 }
 
+/// Whether the merge key is drawn at all (gh#408): there is a pull request to
+/// merge, and the work has not already landed.
+///
+/// Deliberately not gated on [`board::landing`] being `Ready`: the board's
+/// reservation rides *inside* the confirmation instead, because GitHub
+/// evaluates the rules at execution time and a board that hid the key on a
+/// stale poll would be refusing a merge GitHub takes. Done is different — a
+/// merged pull request has nothing left to press.
+pub(crate) fn merge_available(review: &AttemptReview) -> bool {
+    review.pr_url.is_some() && review.state != board::BoardState::Done.as_str()
+}
+
 /// The identifier a task id spells — `<source>:<scope><sep><number>` keeps the
 /// source and the number, and anything this shape cannot parse is returned as
 /// it came (a made-up identifier would be worse than a literal id).
@@ -329,6 +341,19 @@ pub struct ReviewPanel {
     receipt: Option<VerdictReceipt>,
     submit_error: Option<SharedString>,
     submit_task: Option<Task<()>>,
+    // -- the merge key (gh#408) ----------------------------------------------
+    /// The confirm is up. The one control on this screen that interposes a
+    /// dialog, because it is the one action that cannot be undone — and for a
+    /// layer of a stack the dialog names every open layer that merges along.
+    merge_confirming: bool,
+    merging: bool,
+    /// What the merge answered — the engine's sentence, kept on screen the way
+    /// the verdict's receipt is: `o/r#87 merged` and `o/r#87 is in the merge
+    /// queue` are both outcomes a reviewer has to know about, and only one of
+    /// them moves the row.
+    merge_line: Option<SharedString>,
+    merge_error: Option<SharedString>,
+    merge_task: Option<Task<()>>,
     /// The comment box's events: every edit, so the preview follows the
     /// typing, and Enter, which submits here as it does everywhere else in
     /// this app (shift-Enter is the newline).
@@ -377,6 +402,11 @@ impl ReviewPanel {
             receipt: None,
             submit_error: None,
             submit_task: None,
+            merge_confirming: false,
+            merging: false,
+            merge_line: None,
+            merge_error: None,
+            merge_task: None,
             _edits: edits,
         };
         panel.reload(cx);
@@ -538,6 +568,59 @@ impl ReviewPanel {
                         panel.submit_error = Some(format!("Unreadable receipt: {err}").into());
                     }
                     Err(err) => panel.submit_error = Some(err.to_string().into()),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The one key that cannot be undone (gh#408): merge the pull request, on
+    /// the device that answered the read — a write, like the verdict's, and a
+    /// merge that wandered to a second board would land somebody else's row.
+    ///
+    /// Only ever reached through the confirm: the sentence the reader agreed
+    /// to is [`board::merge_confirmation`]'s, which for a layer of a stack has
+    /// already named every open layer below as cargo. The engine adds no
+    /// second question.
+    fn merge(&mut self, cx: &mut Context<Self>) {
+        if self.merging {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.merge_error = Some("Engine not connected".into());
+            self.merge_confirming = false;
+            cx.notify();
+            return;
+        };
+        let mut params = serde_json::json!({ "taskId": self.task_id });
+        if let Some(object) = params.as_object_mut()
+            && let Some(host) = self.host.as_deref()
+        {
+            object.insert("targetDeviceId".into(), serde_json::json!(host));
+        }
+        self.merging = true;
+        self.merge_confirming = false;
+        self.merge_error = None;
+        self.merge_line = None;
+        cx.notify();
+        self.merge_task = Some(cx.spawn(async move |this, cx| {
+            let reply = engine.client().call(methods::MERGE_TASK, params).await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.merging = false;
+                match reply {
+                    Ok(value) => {
+                        let line = value
+                            .get("line")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("merged")
+                            .to_string();
+                        panel.merge_line = Some(line.into());
+                        // A merge that landed moved the row's state and its
+                        // stack's shape; re-read rather than guess which of
+                        // the screen's facts moved with it.
+                        panel.reload(cx);
+                    }
+                    Err(err) => panel.merge_error = Some(err.to_string().into()),
                 }
                 cx.notify();
             });
@@ -2189,6 +2272,30 @@ impl ReviewPanel {
                         cx.notify();
                     }))
             }));
+        // The merge key (gh#408), leftmost and quiet: landing the row is the
+        // bar's other act, and the one solid control stays the verdict's
+        // Submit. The ellipsis is the promise that a confirmation follows —
+        // this click arms the dialog, never the merge.
+        let merge = merge_available(review).then(|| {
+            let merging = self.merging;
+            popover::btn_ghost(
+                theme,
+                if merging { "Merging…" } else { "Merge…" },
+                "review-merge",
+            )
+            .id("review-merge")
+            .h(px(VERDICT_H))
+            .flex()
+            .items_center()
+            .when(merging, |el| el.opacity(0.5))
+            .on_click(cx.listener(|panel, _, _, cx| {
+                if panel.merging {
+                    return;
+                }
+                panel.merge_confirming = true;
+                cx.notify();
+            }))
+        });
         let bar = div()
             .flex_none()
             .flex()
@@ -2219,6 +2326,7 @@ impl ReviewPanel {
                     .flex_row()
                     .items_center()
                     .gap(px(BAND_GAP))
+                    .children(merge)
                     .child(
                         div()
                             .flex_1()
@@ -2265,6 +2373,30 @@ impl ReviewPanel {
                             theme.text_muted
                         })
                         .child(SharedString::from(Self::receipt_line(receipt))),
+                )
+            })
+            .when_some(self.merge_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.warning)
+                        .child(error),
+                )
+            })
+            .when_some(self.merge_line.clone(), |el, line| {
+                // Settled green only for the merge that landed: `in the merge
+                // queue` and `still merging` are answers, not arrivals — the
+                // poll that sees them land is what moves the row (gh#290).
+                let landed = line.ends_with("merged");
+                el.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(if landed {
+                            theme.settled
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(line),
                 )
             });
         Some(bar.into_any_element())
@@ -2378,6 +2510,44 @@ impl Render for ReviewPanel {
         let strip = self.render_diff_strip(&review, &theme, cx);
         let host = self.render_host(&theme, cx);
         let bar = self.render_verdict_bar(&review, &theme, cx);
+        // The merge confirm (gh#408), over everything. The sentence is the
+        // row's own ([`board::merge_confirmation`]): for a layer of a stack it
+        // names every open layer that merges along, and the board's own
+        // reservation rides last — the reader most in need of it is the one
+        // confirming a merge the board does not think can land.
+        let confirm = (self.merge_confirming && merge_available(&review)).then(|| {
+            let sentence = board::merge_confirmation(review.merge_subject());
+            let dialog = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Merge?"))
+                .child(
+                    div()
+                        .mt(px(6.0))
+                        .child(popover::dialog_body(&theme, sentence)),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "merge-cancel")
+                                .id("merge-cancel")
+                                .on_click(cx.listener(|panel, _, _, cx| {
+                                    panel.merge_confirming = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Merge")
+                                .id("merge-confirm")
+                                .on_click(cx.listener(|panel, _, _, cx| panel.merge(cx))),
+                        ),
+                )
+                .into_any_element();
+            popover::modal("merge-confirm-dialog", window.viewport_size(), dialog)
+        });
 
         // The question in order — what was asked, what the branch did, what the
         // board saw the run do, what the agent says it did, and what nobody
@@ -2422,7 +2592,8 @@ impl Render for ReviewPanel {
                 // issue body (gh#389).
                 .children(stack)
                 .child(body)
-                .children(bar),
+                .children(bar)
+                .children(confirm),
         )
         .into_any_element()
     }
@@ -2751,6 +2922,34 @@ mod tests {
             board::landing_note(plain.stacked()),
             None,
             "nobody has asked GitHub, and a blank is honest",
+        );
+    }
+
+    /// The merge key (gh#408): drawn while there is a pull request still to
+    /// land, and worded by the board's own confirmation — the same sentence
+    /// the row's confirm carries, off the review's facts alone.
+    #[test]
+    fn the_merge_key_is_drawn_only_while_there_is_something_to_press() {
+        assert!(merge_available(&reviewed()));
+        // A merged pull request has nothing left to press…
+        let done = AttemptReview {
+            state: "done".into(),
+            ..reviewed()
+        };
+        assert!(!merge_available(&done));
+        // …and a row with no pull request has nothing to merge.
+        let no_pr = AttemptReview {
+            pr_url: None,
+            ..reviewed()
+        };
+        assert!(!merge_available(&no_pr));
+        // Deliberately not gated on `landing`: nobody has asked GitHub about
+        // this fixture, the key is drawn anyway, and the confirmation carries
+        // the blank honestly — named row, addressed pull request, no verdict
+        // invented.
+        assert_eq!(
+            board::merge_confirmation(reviewed().merge_subject()),
+            "merge gh#138 (PR #212) into its base",
         );
     }
 

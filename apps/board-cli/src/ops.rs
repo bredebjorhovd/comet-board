@@ -1137,6 +1137,25 @@ pub async fn cancel(board: &Board, task_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Merge the task's pull request (gh#408) — the confirmed keypress, executed
+/// where the board's store and GitHub credential are. The answer is the
+/// engine's one sentence about what actually happened: `o/r#87 merged`,
+/// `o/r#87 is in the merge queue`, `o/r#87 is still merging`.
+pub async fn merge(board: &Board, task_id: &str) -> Result<String> {
+    let reply = board
+        .client
+        .call(
+            methods::MERGE_TASK,
+            board.params(serde_json::json!({ "taskId": task_id })),
+        )
+        .await?;
+    reply
+        .get("line")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("the engine's merge reply carried no line: {reply}"))
+}
+
 // ---- wait ---------------------------------------------------------------
 
 /// The states that count as settled for one `wait` call.

@@ -1153,6 +1153,27 @@ mod tests {
         );
     }
 
+    /// The review screen's confirm and the board row's confirm are one
+    /// sentence (gh#408): both shapes feed [`merge_confirmation`] the same
+    /// subject, so which screen the key was pressed on cannot change what the
+    /// reader was told they agreed to.
+    #[test]
+    fn the_review_confirms_a_merge_in_the_rows_own_words() {
+        let tasks = three_layers([Some("clean"); 3]);
+        for index in 0..tasks.len() {
+            assert_eq!(
+                merge_confirmation(review_of(&tasks, index).merge_subject()),
+                merge_confirmation(&row_of(&tasks, index)),
+            );
+        }
+        // And the top layer's sentence names the cargo, off the review alone.
+        assert_eq!(
+            merge_confirmation(review_of(&tasks, 2).merge_subject()),
+            "merge gh!13 into main · this lands PR #11, PR #12 with it — \
+             GitHub merges the group or none of it",
+        );
+    }
+
     /// The review of one layer, with the whole chain on it (gh#389).
     ///
     /// The screen is handed one attempt, so until this it had no way to know

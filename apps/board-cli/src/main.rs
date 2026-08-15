@@ -72,7 +72,8 @@ struct Cli {
     /// engine, which passes the call on. Applies to the verbs that ask the
     /// engine — list, dispatch, retry, cancel, wait, `new --dispatch`,
     /// `claim` and `review`, whose attempt rows and checkouts live on the host
-    /// (§gh#183), `routes`, which reads and writes the host's routing.toml
+    /// (§gh#183), `merge`, which runs under the host's GitHub credential
+    /// (gh#408), `routes`, which reads and writes the host's routing.toml
     /// (gh#75), and `onboard`, whose clone, space and route all land on the
     /// host (gh#97).
     /// The rest (doctor, init, adopt, stats) read this device's own files
@@ -314,6 +315,27 @@ enum Command {
         #[arg(long = "request-changes")]
         changes: bool,
         /// Print the receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Merge a task's pull request. Asks first, on the row's own words: merging
+    /// a layer of a stack merges every open layer beneath it as one group, and
+    /// the confirmation names them.
+    ///
+    /// The merge is GitHub's asynchronous one: the answer says what actually
+    /// happened — merged, in the merge queue, or still running. Only a merge
+    /// GitHub confirms moves the row; a queued or still-running one lands on
+    /// the board when the poll sees it, exactly as a merge made on the web
+    /// does.
+    Merge {
+        /// The task whose pull request to merge.
+        #[arg(long)]
+        task: String,
+        /// Skip the confirmation — for orchestrating agents. Without a
+        /// terminal to ask on, this flag is required rather than assumed.
+        #[arg(long)]
+        yes: bool,
+        /// Print the outcome as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -937,6 +959,31 @@ fn main() -> Result<()> {
             })?;
             ops::print_verdict(&receipt, json)
         }
+        Command::Merge { task, yes, json } => {
+            runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                // The row first: the confirmation is worded off it, and a task
+                // the board does not hold has nothing to confirm about. Not
+                // best-effort like `cancel`'s read — without the row there is
+                // no sentence, and without the sentence no merge.
+                let row = ops::board_rows(&board)
+                    .await?
+                    .into_iter()
+                    .find(|r| r.id == task)
+                    .ok_or_else(|| anyhow::anyhow!("{task} is not on the board"))?;
+                if !yes && !confirm_merge(&comet_proto::view::board::merge_confirmation(&row))? {
+                    println!("nothing merged");
+                    return Ok(());
+                }
+                let line = ops::merge(&board, &task).await?;
+                if json {
+                    println!("{}", serde_json::json!({ "task": task, "line": line }));
+                } else {
+                    println!("{line}");
+                }
+                Ok(())
+            })
+        }
         Command::New {
             title,
             body,
@@ -1251,6 +1298,29 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The question before the one action the board cannot undo (gh#408).
+///
+/// The wording is the row's own [`comet_proto::view::board::merge_confirmation`]
+/// — for a layer of a stack it names every open layer that merges along, so
+/// what is being agreed to is spelled out before the key, not discovered after.
+/// On stderr, like every prompt: stdout is the outcome, and a `--json` caller
+/// pipes it.
+///
+/// Refused without a terminal rather than assumed: a script that wants no
+/// question passes `--yes`, and a hang on a pipe nobody is writing to is not a
+/// question.
+fn confirm_merge(sentence: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        bail!("no terminal to confirm on — pass --yes to merge without one");
+    }
+    eprint!("{sentence}\nmerge? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
 /// The claim block to submit: the `--claim` flags if there are any, else

@@ -466,6 +466,33 @@ impl AttemptReview {
             changes_below: self.changes_below,
         }
     }
+
+    /// How this review spells what a merge confirmation names (gh#408) — the
+    /// same shape a [`comet_proto::view::board::TaskRow`] feeds it, so the
+    /// sentence the review screen asks a reader to confirm is the board row's
+    /// sentence, word for word.
+    ///
+    /// The pull request number is read off the review's own URL: a review
+    /// carries the pull request as where to open it, and the confirmation needs
+    /// it as an address. The row-is-its-own-pull-request test is the row's
+    /// (gh#357): `gh:o/r!508` *is* PR #508, and naming it twice would read as
+    /// two things.
+    pub fn merge_subject(&self) -> comet_proto::view::board::MergeSubject<'_> {
+        let pr_number = self
+            .pr_url
+            .as_deref()
+            .and_then(crate::model::pr_url_number);
+        let is_pull_request = match (self.task_id.rsplit_once('!'), pr_number) {
+            (Some((_, tail)), Some(number)) => tail == number.to_string(),
+            _ => false,
+        };
+        comet_proto::view::board::MergeSubject {
+            identifier: &self.brief.identifier,
+            pr_number,
+            is_pull_request,
+            stacked: self.stacked(),
+        }
+    }
 }
 
 /// The `attempt` id of a review with no attempt behind it (§gh#344).

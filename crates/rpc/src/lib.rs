@@ -207,6 +207,24 @@ pub mod methods {
     /// half failed rather than posting a second review. A caller that times out
     /// should re-send exactly what it sent.
     pub const SUBMIT_VERDICT: &str = "SubmitVerdict";
+    /// Merge the pull request on a board row (gh#408): submit GitHub's
+    /// asynchronous merge, wait out the poll, and answer what actually happened
+    /// — merged, queued, or still running (gh#290). Params: `{taskId}` →
+    /// `{line}`, one sentence a surface can show verbatim: `o/r#87 merged`,
+    /// `o/r#87 is in the merge queue`.
+    ///
+    /// Only ever called from an explicit keypress with a confirmation. The
+    /// confirmation is the *caller's* job —
+    /// `comet_proto::view::board::merge_confirmation` is its wording — because
+    /// merging a layer of a stack merges every open layer beneath it as one
+    /// group, and the reader has to be told which ones before the call, not
+    /// after.
+    ///
+    /// A merge that entered the queue or is still running when the wait is
+    /// over leaves the row where it is: the same poll that notices a merge
+    /// made on the web is what moves it, so the board never records a merge
+    /// GitHub can still reject.
+    pub const MERGE_TASK: &str = "MergeTask";
     /// The board's `routing.toml` as it stands on its host: the text, its
     /// parse, and everything wrong with it — plus the repos that have a space
     /// on that device but nothing on the board watching them (gh#75). Params:

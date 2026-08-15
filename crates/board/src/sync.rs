@@ -4840,7 +4840,9 @@ impl SyncEngine {
         self.db.set_pr_merged(&task.id, true)?;
         self.finish_on_merge(task, &repo, number)?;
         self.rederive_all()?;
-        Ok(format!("{repo}#{number}"))
+        // A sentence, like every other outcome: the caller shows this to the
+        // person who pressed the key, whichever surface that was (gh#408).
+        Ok(format!("{repo}#{number} merged"))
     }
 
     /// What a merged pull request means for the task that owns it.
