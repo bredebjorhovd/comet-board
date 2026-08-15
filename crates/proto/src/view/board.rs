@@ -4,9 +4,11 @@
 //! that both viewports draw from.
 //!
 //! This lives in proto, not in `comet-board`, for the same reason the rest of
-//! [`crate::view`] does: the viewports (`comet-tui` today, the gpui app later)
-//! render board rows without depending on the board crate, and a glyph, section
-//! order or filter position that differs between surfaces is a real bug.
+//! [`crate::view`] does: the viewports (the gpui app's board panel, and the
+//! iOS board screen, which mirrors these derivations against the same
+//! `TaskRow` wire shape) render board rows without depending on the board
+//! crate, and a glyph, section order or filter position that differs between
+//! surfaces is a real bug.
 //! `comet-board` re-exports `BoardState` and `TaskRow`, so board-side code and
 //! its tests are unchanged.
 
@@ -3242,6 +3244,28 @@ mod tests {
         // which is the retargeted child of a merged parent.
         r.stack.as_mut().unwrap().layers[1].open = false;
         assert_eq!(merge_order(&r), None);
+    }
+
+    /// The map a detail surface draws is every sibling the board can see,
+    /// bottom layer first and this row included — and each entry is named `#N`
+    /// by its pull request, falling back to the row's identifier for a layer
+    /// whose request has not opened yet. Asserted here because the map itself
+    /// is drawn per viewport (the board panel draws chips, the review screen
+    /// joins with `↑`): the *order* and the *names* are the shared contract.
+    #[test]
+    fn the_stack_map_is_every_layer_bottom_first_and_empty_for_an_unstacked_row() {
+        let r = stacked("s", 2, 3, "board/gh-11-lexer");
+        let map: Vec<String> = stack_map(&r).iter().map(layer_label).collect();
+        assert_eq!(map, ["#11", "#12", "#13"], "bottom first, this row included");
+
+        // A layer with no pull request yet is still on the map, by name.
+        let mut r = stacked("s", 2, 3, "board/gh-11-lexer");
+        r.stack.as_mut().unwrap().layers[2].pr_number = None;
+        let map: Vec<String> = stack_map(&r).iter().map(layer_label).collect();
+        assert_eq!(map, ["#11", "#12", "gh!13"]);
+
+        // Unconditionally callable: an unstacked row draws nothing.
+        assert!(stack_map(&row("r", BoardState::Review)).is_empty());
     }
 
     /// The wire carries the new facts as absent rather than null on a row that

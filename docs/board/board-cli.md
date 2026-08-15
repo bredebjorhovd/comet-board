@@ -4,7 +4,7 @@ Landed as `apps/board-cli` (the `comet-board` binary §adopt-doctor-init started
 `doctor`/`init`/`adopt`), grown into the full surface — `list [--state
 --source --json]`, `dispatch --task`, `retry --task` (§gh#68), `cancel --task`,
 `wait`, `new`, `stats` — speaking the existing typed RPC to the local IPC port
-exactly as `comet-tui` attaches, at the board host named by `--device` (§gh#68).
+exactly as any viewport attaches, at the board host named by `--device` (§gh#68).
 `apps/board-cli/src/ops.rs` is the agent-facing half:
 - `list --json` prints herdr-board's contract verbatim, modulo the two renames
   the port dictates (`pane_id` → `chat_id`, `dispatched_by_pane` →

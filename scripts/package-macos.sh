@@ -7,8 +7,8 @@
 # The bundle carries `comet-board` beside `comet` in Contents/MacOS (gh#156):
 # they are the same release and must not be able to drift apart. Nothing on
 # macOS puts either on PATH — there is no installer here, only a dmg — so this
-# ships the CLI where `comet` can find it (crates/tui's sibling-then-PATH
-# lookup) rather than pretending it is installed.
+# ships the CLI where `comet` can find it (the sibling-then-PATH lookup in
+# `crates/board/src/board_cli.rs`) rather than pretending it is installed.
 #
 # Two signing outcomes, and they are very different for whoever downloads it:
 #

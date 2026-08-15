@@ -19,7 +19,7 @@ struct BoardView: View {
 
     /// One tick a second while a live attempt is on screen. The rows carry the
     /// start instant, not the age, so this moves the counter without anything
-    /// being rebuilt — the same trade the TUI makes (`App::counting`).
+    /// being rebuilt — every viewport makes this trade (§gh#103).
     @State private var now = Date()
     @State private var dispatching: DispatchTarget?
     /// The row opened for reading (gh#132). A task id, not a row: the sheet

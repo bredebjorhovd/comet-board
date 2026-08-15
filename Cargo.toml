@@ -10,9 +10,7 @@ members = [
     "crates/rpc",
     "crates/update",
     "crates/ui",
-    "crates/tui",
     "apps/comet",
-    "apps/tui",
     "apps/board-cli",
 ]
 
@@ -32,7 +30,6 @@ comet-engine = { path = "crates/engine" }
 comet-rpc = { path = "crates/rpc" }
 comet-update = { path = "crates/update" }
 comet-ui = { path = "crates/ui" }
-comet-tui = { path = "crates/tui" }
 
 # CRDT
 loro = "1.13"
@@ -90,17 +87,6 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSString",
     "objc2-core-foundation",
     "std",
-] }
-
-# ratatui — the terminal viewport (`comet-tui`). Deliberately narrow features:
-# `widget-calendar` (a default) drags in `time`, and we render no calendar.
-# `layout-cache` memoizes the cassowary solve, which is the one per-frame cost
-# in ratatui that isn't already diffed away.
-ratatui = { version = "0.30", default-features = false, features = [
-    "std",
-    "crossterm",
-    "layout-cache",
-    "underline-color",
 ] }
 
 # async / net

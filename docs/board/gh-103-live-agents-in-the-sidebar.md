@@ -8,7 +8,8 @@ three of them are three rows somewhere in a recency-sorted list, indistinguishab
 from the session you opened yesterday, and tracking them meant the board pane or
 nothing.
 
-Both sidebars grew an **Agents** section between Spaces and the sessions. One
+Both of the day's sidebars (desktop and TUI) grew an **Agents** section
+between Spaces and the sessions. One
 row per live attempt: the issue identifier as the title, the branch underneath,
 and elapsed against the route's cap on the right. Pure presentation — everything
 it draws was already streamed, and nothing here dispatches, settles or decides.
@@ -38,14 +39,15 @@ it draws was already streamed, and nothing here dispatches, settles or decides.
 - **The desktop's board subscription is now standing.** It was lazy — no RPC
   until the dock was first opened — and a presence list that only works after
   you have visited the board is not presence. `BoardPanel` is built with the
-  shell and observed by it; the host sweep is unchanged and bounded, and it is
-  what `comet-tui` has always done (its board stream has been standing since
-  §board-view).
-- **The TUI pays one wake-up a second** while a live agent row is on screen
-  (`App::counting`), which `animating` does not cover: a *blocked* agent
-  animates nothing, and its age would otherwise sit at whatever the last frame
-  happened to catch. The row carries the start instant, not the age, so the
-  draw reads the clock and nothing rebuilds.
+  shell and observed by it; the host sweep is unchanged and bounded, and a
+  standing stream is what §board-view's pane always had (in the TUI, until
+  gh#416 removed it).
+- **A viewport pays one wake-up a second** while a live agent row is on
+  screen, which its animation clock does not cover: a *blocked* agent animates
+  nothing, and its age would otherwise sit at whatever the last frame happened
+  to catch. The row carries the start instant, not the age, so the draw reads
+  the clock and nothing rebuilds. (The TUI made this trade in `App::counting`;
+  the phone makes the same one in `BoardView.swift`.)
 
 Deliberately not here: acting on a row. Enter/click opens the chat and that is
 all — retry, cancel and dispatch stay in the board pane, which is the deep view

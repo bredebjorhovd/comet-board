@@ -4,8 +4,8 @@
 //!
 //! The *derivations* all live in `comet_proto::view::board` — the section
 //! grouping, the `f`/`/` filter cycle, what each row says — so this panel
-//! renders exactly the rows the TUI (`comet-tui`) renders, with the same
-//! vocabulary. This module holds only the interactive state the derivations
+//! renders exactly the rows the iOS board screen renders (its Swift mirrors
+//! read the same `TaskRow` wire shape), with the same vocabulary. This module holds only the interactive state the derivations
 //! need a home for: the rows as they streamed, the selection, the filter, the
 //! folded sections, and the dispatch/cancel/open-chat verbs.
 //!

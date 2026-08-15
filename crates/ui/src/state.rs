@@ -313,9 +313,10 @@ impl EngineHandle {
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
 // grouping, the boot gate, relative times) live in `comet_proto::view` so the
-// terminal viewport (`comet-tui`) shares one implementation and one test suite
-// with this one — a sort order that differs per surface is a bug. Re-exported
-// here because every call site in this crate reads them as `state::…`.
+// other viewport — the iOS app, whose Swift mirrors are held to the same
+// rules — shares one implementation and one test suite with this one; a sort
+// order that differs per surface is a bug. Re-exported here because every call
+// site in this crate reads them as `state::…`.
 pub use comet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, HostPresence, Indicator, SESSION_STALE_MS,
     attention_rank, chat_location, display_status, effective_indicator, format_time_ago,
@@ -1225,7 +1226,8 @@ mod tests {
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
 
-        // Attach the way `comet-tui` does, and speak the same protocol.
+        // Attach the way any second viewport (`comet-board`, another window)
+        // does, and speak the same protocol.
         let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
             .await
             .expect("a second viewport must be able to attach");

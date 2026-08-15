@@ -33,16 +33,16 @@ Board code lives in `crates/board`; the port's status and design mapping are in
 
 ## Local (edge-less) mode — the fork's primary deployment
 
-This fork is built to run on a single box: the daemon and the TUI talk over
-localhost IPC, and you reach the box over mosh or Tailscale. No edge service,
-no account, no sync — the box is the whole system.
+This fork is built to run on a single box: the daemon and its viewports talk
+over localhost IPC, and you reach the box over mosh or Tailscale. No edge
+service, no account, no sync — the box is the whole system.
 
 Set `COMET_EDGE_URL=off` to make that a stated configuration instead of an
 accident:
 
 ```bash
 COMET_EDGE_URL=off comet headless        # or: COMET_EDGE_URL=off comet daemon install
-comet tui                                # attaches over localhost IPC
+comet-board list                         # attaches over localhost IPC
 ```
 
 With the edge off, the engine skips every edge transport — no session-room
@@ -90,7 +90,6 @@ No configuration needed. Day-to-day:
 ```bash
 comet status      # signed in? engine running? edge rooms actually connected?
 comet update      # update to the latest release
-comet tui         # terminal UI, attaches to the daemon
 comet daemon start|stop|restart|status
 ```
 

@@ -2,7 +2,8 @@
 
 Three gaps that only bite when the board is not on the machine you are typing
 on, and the desktop app is not the only frontend. All three are in
-`apps/board-cli` (the third also in `crates/tui`):
+`apps/board-cli` (the third also reached the TUI's board pane, while that
+existed — removed in gh#416):
 
 - **`--device`.** §gh#55 relay-forwarded the *frontends*; the CLI still hardcoded
   `ws://127.0.0.1:{port}` with no passthrough, so a laptop's `comet-board list`
@@ -33,9 +34,9 @@ on, and the desktop app is not the only frontend. All three are in
   which names the chat. Reading the row is not optional: sending `replace`
   unconditionally would let `retry` end a *working* agent nobody asked to
   interrupt. Same rule as the desktop panel (`crates/ui/src/board.rs`), so a
-  row retried from a shell and from the panel takes the same path.
-  `crates/tui` gained the pane's half: `R` retries (replacing on blocked), and
-  `enter` now retries a `failed` row as the panel's does.
+  row retried from a shell and from the panel takes the same path. (The TUI's
+  board pane gained the same half — `R` retried, replacing on blocked — and
+  left with it in gh#416.)
 - **`wait --blocked-is-settled`.** `wait`'s default settle set is
   review/failed/done, which is right — an agent pausing for an approval is not
   a result. But a child that asks a question and is never answered reaches none

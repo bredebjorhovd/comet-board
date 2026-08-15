@@ -152,15 +152,17 @@ nearly verbatim — it never depended on herdr:
   derivations — `BoardState` (moved from `comet-board`, glyphs included),
   `TaskRow` (moved, wire contract), plus `Filter`, `sections`,
   `routes_present`/`filter_cycle`, `finished_today`, `row_metadata` — so the
-  TUI and the gpui app derive the same rows. `AgentState`/`agent_rows`
+  gpui app and the phone derive the same rows. `AgentState`/`agent_rows`
   (gh#103) joins those rows to the chats and the session watch;
   `active_rows` (gh#123) merges them with gh#117's `running_rows` into the
   one **Active** group every frontend's sidebar draws.
-- `crates/tui/src/board.rs` + the board section of `crates/tui/src/render.rs` —
-  **new** (§board-view): the board pane (`B`), consuming `WatchBoard`, dispatching over
-  `DispatchTask`. See §board-view. The same stream also feeds the sidebar's
-  Active group in both frontends (`Row::Agent` here,
-  `Shell::render_active_section` in `crates/ui/src/shell/spaces.rs` — §gh#97).
+- The board pane that first consumed `WatchBoard` was the TUI's
+  (`crates/tui/src/board.rs`, §board-view) — removed with the TUI in gh#416.
+  The surfaces that draw the stream now are the desktop panel
+  (`crates/ui/src/board.rs`, §gh#70) and the phone
+  (`apps/ios/Comet/Board/`). The same stream also feeds the sidebar's Active
+  group (`Shell::render_active_section` in `crates/ui/src/shell/spaces.rs` —
+  §gh#97).
 
 RPC surface: `WatchBoard` (stream of `TaskRow`s, current value first),
 `DispatchTask {taskId, via?, viaDevice?, viaUser?, runtime?, model?, account?,
@@ -302,28 +304,29 @@ git resolves it silently — and each resolution is git picking a side of a
 product argument nobody asked it to arbitrate.
 
 - **Upstream deleted the TUI.** `7b52ce1` (2026-08-04) — *"Remove the TUI:
-  crates/tui, apps/tui, comet tui subcommand, scripts, docs"*. A merge deletes
-  it here. We depend on it three ways: `ARCHITECTURE.md` calls it *"a peer of
-  the gpui app rather than a subset of it"*, which is the whole reason
-  `comet_proto::view` exists as pure derivations two viewports share (see the
-  module docs in `crates/proto/src/view/spaces.rs` — "so both viewports agree");
-  it carries 87 render tests in `crates/tui/tests/render.rs` (226 in the crate),
-  which is the only place the derivations are asserted against rendered frames;
-  and it is the attach surface for the fork's **primary deployment** — the
-  edge-less single-box mode README.md documents as `COMET_EDGE_URL=off comet
-  headless` + `comet tui`. `docs/orchestrator.md` and `docs/teammate.md` both
-  give operator steps in terms of it.
+  crates/tui, apps/tui, comet tui subcommand, scripts, docs"*. A merge would
+  have deleted it here silently, at a time when we depended on it three ways:
+  it was the second viewport that justified `comet_proto::view` as pure
+  derivations two surfaces share, it carried the only tests asserting those
+  derivations against rendered frames, and it was the attach surface for the
+  edge-less single-box mode. All three dependencies have since dissolved — the
+  iOS app is the second viewport, the derivations are asserted in proto's own
+  suite, and the box is driven by `comet-board` and the apps — so gh#416
+  **adopted the deletion** deliberately (ours was larger: we had added
+  `crates/tui/src/board.rs` after the fork). The point of this bullet stands
+  as history: git would have arbitrated this product argument silently in
+  2026-08, two months before the answer was actually yes.
 - **Upstream reversed gh#124 on the session row.** `ff124f4` (2026-08-03) —
   *"Show owning device in session rows: space@device"* — restores exactly the
   string gh#124 removed as information said twice with different truncation.
-  Our side of that argument is written down where the code is
-  (`crates/tui/src/app.rs:211`, `:271`, `crates/tui/src/render.rs:737`) and the
-  derivation that replaced it is `view::spaces::device_groups` — the device name
-  once, as a group header, instead of riding along on every row.
+  Our side of that argument lives in the derivation that replaced it,
+  `view::spaces::device_groups` — the device name once, as a group header,
+  instead of riding along on every row (it was also written down in the TUI's
+  sources while those existed).
 - **Light mode was built twice, independently.** `b6fb19e` (2026-08-03) upstream;
   ours is `efa52ea` (§gh#73), now Settings → Appearance
-  (`crates/ui/src/settings/appearance.rs`) and `crates/tui/src/theme.rs`. Two
-  implementations of one feature, and a merge keeps whichever one it wins.
+  (`crates/ui/src/settings/appearance.rs`). Two implementations of one
+  feature, and a merge keeps whichever one it wins.
 
 The first is a deletion, the second a reversal, the third a duplicate. Nothing
 about them shows up as a conflict marker, which is the point: the failure mode
@@ -336,9 +339,9 @@ these is declined by default, and the decline belongs in the ledger below.
 
 | Divergence | Ours | Upstream | Why we hold it |
 |---|---|---|---|
-| The TUI | kept: `crates/tui`, `apps/tui`, `comet tui` | deleted (`7b52ce1`) | peer frontend, 87 render tests, the edge-less box's only viewport |
+| The TUI | ~~kept~~ → deleted in gh#416, once iOS was viewport two | deleted (`7b52ce1`) | **resolved** — held while it was the second viewport and the only attach surface; both roles moved (iOS, `comet-board`) and the divergence closed |
 | Session rows | space and device said once, device as a group header (gh#124, gh#138) | `space@device` on every row (`ff124f4`) | the old row spent its loudest pixels on its least differentiating fact |
-| Light mode | ours (`efa52ea`, Settings → Appearance) | theirs (`b6fb19e`) | same feature, two implementations; ours is the one the TUI shares |
+| Light mode | ours (`efa52ea`, Settings → Appearance) | theirs (`b6fb19e`) | same feature, two implementations; ours is the one the shared status anchors were built for |
 | The board | `crates/board`, `apps/board-cli`, the board RPCs | none | the fork's reason to exist |
 
 ### The SHA ledger — what we have taken

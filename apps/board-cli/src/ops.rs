@@ -2,7 +2,7 @@
 //! wait / new — §board-cli.
 //!
 //! Everything that reads or moves the live board goes through the engine's
-//! typed RPC on the localhost IPC port, exactly as `comet-tui` attaches: the
+//! typed RPC on the localhost IPC port, exactly as any viewport attaches: the
 //! engine owns `board.db` and the board loop, and `WatchBoard` streams the rows
 //! it derives. The JSON these commands print is herdr-board's `list --json`
 //! contract verbatim (modulo the pane→chat renames documented on

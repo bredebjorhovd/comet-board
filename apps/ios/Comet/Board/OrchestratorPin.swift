@@ -24,8 +24,8 @@
 
 import SwiftUI
 
-/// One spelling on all three surfaces (`shell.rs`, `tui/app.rs`): the same act
-/// with three names is three acts as far as a reader is concerned.
+/// One spelling on every surface (the desktop's `shell.rs` and here): the same
+/// act with two names is two acts as far as a reader is concerned.
 let pinAsOrchestratorLabel = "Pin as orchestrator"
 let unpinAsOrchestratorLabel = "Unpin as orchestrator"
 /// The confirmation's title. The label itself would read as the button under it

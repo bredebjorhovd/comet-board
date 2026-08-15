@@ -1,17 +1,17 @@
 //! Loader motion — the pure math behind comet's loading indicators.
 //!
 //! These are the curves and constants the gpui viewport animates with
-//! (`comet-ui/src/motion.rs`, `comet-ui/src/loaders.rs`), lifted here so the
-//! terminal viewport animates the *same* loaders rather than inventing its own
-//! spinner. A loading indicator is a brand surface; two of them that disagree
-//! read as two products.
+//! (`comet-ui/src/motion.rs`, `comet-ui/src/loaders.rs`), kept here so every
+//! viewport animates the *same* loaders rather than inventing its own spinner —
+//! the iOS app mirrors these constants in `Theme/Motion.swift` and
+//! `Views/Loaders.swift`. A loading indicator is a brand surface; two of them
+//! that disagree read as two products.
 //!
 //! Everything is a pure function of a phase in `0..1`, so a caller can drive it
 //! from any clock and get identical output — the gpui viewport reads one
 //! shared wall-clock pulse ticking at ~30fps (`comet-ui`'s
-//! `motion::pulse_delta`, gh#415), a terminal redraw reads elapsed time
-//! directly. Opacity translates to a terminal as a blend toward the
-//! background — see `comet-tui`'s `loaders` module.
+//! `motion::pulse_delta`, gh#415), the iOS app reads wall-clock elapsed time
+//! through SwiftUI's `TimelineView`.
 
 /// Comet loader pulse period.
 pub const COMET_PULSE_MS: u64 = 2_400;
