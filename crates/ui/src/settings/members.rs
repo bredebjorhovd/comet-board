@@ -428,7 +428,7 @@ impl MembersPage {
             Loadable::Idle | Loadable::Loading => div()
                 .px(px(20.0))
                 .py(px(14.0))
-                .child(popover::skeleton_rows("invites-skeleton", &theme, 2))
+                .child(popover::skeleton_rows(&theme, 2, cx.entity_id(), cx))
                 .into_any_element(),
             Loadable::Error(message) => popover::error_row(&theme, message)
                 .px(px(20.0))
@@ -528,7 +528,7 @@ impl Render for MembersPage {
                     div()
                         .px(px(20.0))
                         .py(px(14.0))
-                        .child(popover::skeleton_rows("members-skeleton", &theme, 3)),
+                        .child(popover::skeleton_rows(&theme, 3, cx.entity_id(), cx)),
                 )
                 .into_any_element(),
             Loadable::Error(message) => widgets::section_card(&theme)

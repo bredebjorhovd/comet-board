@@ -7,9 +7,11 @@
 //! read as two products.
 //!
 //! Everything is a pure function of a phase in `0..1`, so a caller can drive it
-//! from a frame delta (gpui) or from wall-clock elapsed time (a terminal
-//! redraw) and get identical output. Opacity translates to a terminal as a
-//! blend toward the background — see `comet-tui`'s `loaders` module.
+//! from any clock and get identical output — the gpui viewport reads one
+//! shared wall-clock pulse ticking at ~30fps (`comet-ui`'s
+//! `motion::pulse_delta`, gh#415), a terminal redraw reads elapsed time
+//! directly. Opacity translates to a terminal as a blend toward the
+//! background — see `comet-tui`'s `loaders` module.
 
 /// Comet loader pulse period.
 pub const COMET_PULSE_MS: u64 = 2_400;
