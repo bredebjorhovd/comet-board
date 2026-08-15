@@ -930,7 +930,7 @@ impl DocHost {
         self.queue_command_with_id_and_context(chat_id, id, payload, Vec::new())
     }
 
-    fn queue_command_with_id_and_context(
+    pub fn queue_command_with_id_and_context(
         &self,
         chat_id: &str,
         id: &str,
@@ -940,8 +940,17 @@ impl DocHost {
         let handle = self.open(chat_id)?;
         let now = now_ms();
         handle.with_current(|doc| {
-            if doc.read_commands()?.iter().any(|command| command.id == id) {
-                return Ok(());
+            if let Some(existing) = doc
+                .read_commands()?
+                .into_iter()
+                .find(|command| command.id == id)
+            {
+                if existing.payload == payload && existing.context == context {
+                    return Ok(());
+                }
+                return Err(comet_doc::DocError::Schema(format!(
+                    "command id collision: {id} already names different intent"
+                )));
             }
             let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
                 turn_id: Some(m.id.clone()),
@@ -2247,18 +2256,35 @@ mod tests {
     async fn a_caller_owned_command_id_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = host(dir.path());
-        host.queue_command_with_id(
+        let queued = SessionCommandPayload::Queue {
+            prompt: "first".into(),
+            message_id: "message-first".into(),
+            attachments: Vec::new(),
+        };
+        host.queue_command_with_id_and_context(
             "chat-fixed-command",
             "prep-release-1",
-            SessionCommandPayload::Interrupt {},
+            queued.clone(),
+            Vec::new(),
         )
         .unwrap();
+        // The append committed but its response was lost. Another client's
+        // operation lands before the original gesture retries.
         host.queue_command_with_id(
             "chat-fixed-command",
-            "prep-release-1",
-            SessionCommandPayload::Interrupt {},
+            "intervening-control",
+            SessionCommandPayload::QueueControl {
+                op: comet_doc::QueueOp::Pause {},
+            },
         )
         .unwrap();
+        host.queue_command_with_id_and_context(
+            "chat-fixed-command",
+            "prep-release-1",
+            queued,
+            Vec::new(),
+        )
+        .expect("same gesture retry is acknowledged without a second append");
         let commands = host
             .open("chat-fixed-command")
             .unwrap()
@@ -2271,6 +2297,23 @@ mod tests {
                 .filter(|command| command.id == "prep-release-1")
                 .count(),
             1
+        );
+        assert_eq!(
+            commands.len(),
+            2,
+            "retry did not append after intervening work"
+        );
+
+        let collision = host.queue_command_with_id(
+            "chat-fixed-command",
+            "prep-release-1",
+            SessionCommandPayload::Interrupt {},
+        );
+        assert!(
+            collision
+                .expect_err("same id cannot acknowledge different intent")
+                .to_string()
+                .contains("collision")
         );
     }
 

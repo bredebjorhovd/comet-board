@@ -211,6 +211,10 @@ struct ListSkillsParams {
 #[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
     chat_id: String,
+    /// Client-owned idempotency key. Old clients may omit it; queue-aware
+    /// clients retain it when retrying the same user gesture.
+    #[serde(default)]
+    command_id: Option<String>,
     command: SessionCommandPayload,
     /// Typed `@` references the instruction was written against (gh#424).
     /// Defaulted: every caller that predates the picker sends none.
@@ -724,7 +728,10 @@ impl EngineRpc {
     /// Never fails, for the same reason [`Self::list_skills`] never does: an
     /// unknown chat, a folder that is not there, an unreadable tree all produce
     /// an empty list, and a red box under a composer mid-keystroke helps nobody.
-    fn search_context_files(&self, params: SearchContextParams) -> comet_proto::ContextSearch {
+    async fn search_context_files(
+        &self,
+        params: SearchContextParams,
+    ) -> comet_proto::ContextSearch {
         let chat = params
             .chat_id
             .as_deref()
@@ -734,7 +741,15 @@ impl EngineRpc {
             .as_ref()
             .and_then(|chat| chat.cwd.clone())
             .filter(|cwd| !cwd.is_empty());
-        let space = params.space_id.as_deref().and_then(|id| {
+        let owning_space_id = chat.as_ref().and_then(|chat| chat.space_id.clone());
+        if chat.is_some()
+            && params.space_id.is_some()
+            && params.space_id.as_deref() != owning_space_id.as_deref()
+        {
+            return comet_proto::ContextSearch::default();
+        }
+        let space_id = owning_space_id.or(params.space_id);
+        let space = space_id.as_deref().and_then(|id| {
             self.workspace
                 .doc()
                 .space(id)
@@ -746,8 +761,12 @@ impl EngineRpc {
             .as_ref()
             .and_then(|chat| chat.checkout_id.clone())
             .or_else(|| space.as_ref().and_then(|space| space.checkout_id.clone()));
-        let root = chat_root.or_else(|| space.map(|space| space.path));
-        let Some(root) = root else {
+        let candidate = chat_root.or_else(|| space.as_ref().map(|space| space.path.clone()));
+        let (Some(space), Some(candidate)) = (space.as_ref(), candidate) else {
+            return comet_proto::ContextSearch::default();
+        };
+        let Some(root) = self.validated_context_root(space, &candidate).await else {
+            tracing::warn!(candidate, space = %space.id, "context search refused an unregistered checkout");
             return comet_proto::ContextSearch::default();
         };
         let defaults = crate::context_files::SearchLimits::default();
@@ -762,10 +781,39 @@ impl EngineRpc {
             crate::context_files::search(std::path::Path::new(&root), &params.query, limits);
         result.checkout_id = Some(crate::context_files::checkout_identity(
             self.workspace.device_id(),
-            std::path::Path::new(&root),
+            &root,
             declared_checkout_id.as_deref(),
         ));
         result
+    }
+
+    /// Resolve a synced row back to a checkout this host explicitly knows.
+    /// Mutable workspace paths are display/state, never filesystem authority.
+    async fn validated_context_root(
+        &self,
+        space: &comet_proto::Space,
+        candidate: &str,
+    ) -> Option<std::path::PathBuf> {
+        if space.device_id != self.workspace.device_id() {
+            return None;
+        }
+        let space_root = std::fs::canonicalize(&space.path).ok()?;
+        let candidate_root = std::fs::canonicalize(candidate).ok()?;
+        for repo in self.repos.list().await {
+            let repo_root = std::fs::canonicalize(&repo.path).ok()?;
+            let mut registered = vec![repo_root];
+            if let Ok(refs) = self.repos.refs(std::path::Path::new(&repo.path)).await {
+                registered.extend(
+                    refs.into_iter()
+                        .filter_map(|reference| reference.worktree_path)
+                        .filter_map(|path| std::fs::canonicalize(path).ok()),
+                );
+            }
+            if registered.contains(&space_root) && registered.contains(&candidate_root) {
+                return Some(candidate_root);
+            }
+        }
+        None
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -2112,10 +2160,23 @@ impl RpcService for EngineRpc {
             methods::LIST_SKILLS => RpcReply::value(&self.list_skills(parse_params(params)?)),
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
-                let command_id = self
-                    .doc_host
-                    .queue_command_with_context(&p.chat_id, p.command, p.context)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let command_id = match p.command_id {
+                    Some(command_id) => {
+                        self.doc_host
+                            .queue_command_with_id_and_context(
+                                &p.chat_id,
+                                &command_id,
+                                p.command,
+                                p.context,
+                            )
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        command_id
+                    }
+                    None => self
+                        .doc_host
+                        .queue_command_with_context(&p.chat_id, p.command, p.context)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                };
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::WATCH_DOC_MESSAGES => {
@@ -2137,7 +2198,7 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(watch_stream(handle.watch_queue())))
             }
             methods::SEARCH_CONTEXT_FILES => {
-                RpcReply::value(&self.search_context_files(parse_params(params)?))
+                RpcReply::value(&self.search_context_files(parse_params(params)?).await)
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))

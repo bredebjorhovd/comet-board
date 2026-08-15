@@ -800,6 +800,124 @@ async fn rpc_dispatch_for_m5_methods() {
         )
         .await
         .expect("createChat");
+
+    // Context search treats synced cwd strings as claims, not authority. A
+    // forwarded client can write both shapes through Mutate; neither may turn
+    // an arbitrary host folder into a searchable checkout.
+    std::fs::write(tmp.path().join("host-secret.txt"), "do not expose").unwrap();
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat", "chatId": "chat-poisoned-create",
+                "spaceId": "space-term", "cwd": tmp.path(),
+            }),
+        )
+        .await
+        .expect("the workspace mutation itself remains compatible");
+    for chat_id in ["chat-poisoned-create", "chat-term"] {
+        if chat_id == "chat-term" {
+            client
+                .call(
+                    methods::MUTATE,
+                    serde_json::json!({
+                        "op": "setChatCwd", "chatId": chat_id, "cwd": tmp.path(),
+                    }),
+                )
+                .await
+                .expect("setChatCwd");
+        }
+        let search = client
+            .call(
+                methods::SEARCH_CONTEXT_FILES,
+                serde_json::json!({ "chatId": chat_id, "query": "host-secret" }),
+            )
+            .await
+            .expect("SearchContextFiles");
+        assert_eq!(search["matches"].as_array().map(Vec::len), Some(0));
+        assert!(search["checkoutId"].is_null());
+    }
+
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "setChatCwd", "chatId": "chat-term", "cwd": repo_path }),
+        )
+        .await
+        .expect("restore registered checkout");
+    let search = client
+        .call(
+            methods::SEARCH_CONTEXT_FILES,
+            serde_json::json!({ "chatId": "chat-term", "query": "file.txt" }),
+        )
+        .await
+        .expect("registered checkout search");
+    assert_eq!(search["matches"][0]["path"], "file.txt");
+    assert!(search["checkoutId"].is_string());
+
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createSpace", "spaceId": "space-other",
+                "deviceId": core.device_id, "path": repo_path, "gitDetected": true,
+            }),
+        )
+        .await
+        .expect("second space");
+    let mismatched = client
+        .call(
+            methods::SEARCH_CONTEXT_FILES,
+            serde_json::json!({
+                "chatId": "chat-term", "spaceId": "space-other", "query": "file.txt",
+            }),
+        )
+        .await
+        .expect("mismatched owning space is an empty answer");
+    assert_eq!(mismatched["matches"].as_array().map(Vec::len), Some(0));
+
+    let context_worktree = client
+        .call(
+            methods::CREATE_WORKTREE,
+            serde_json::json!({ "repoPath": repo_path, "branch": "main" }),
+        )
+        .await
+        .expect("registered linked worktree");
+    let context_worktree_path = context_worktree["path"].as_str().unwrap().to_string();
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "setChatCwd", "chatId": "chat-term", "cwd": context_worktree_path,
+            }),
+        )
+        .await
+        .expect("retarget to registered worktree");
+    let worktree_search = client
+        .call(
+            methods::SEARCH_CONTEXT_FILES,
+            serde_json::json!({ "chatId": "chat-term", "query": "file.txt" }),
+        )
+        .await
+        .expect("chatId-only worktree search");
+    assert_eq!(worktree_search["matches"][0]["path"], "file.txt");
+    client
+        .call(
+            methods::DELETE_WORKTREE,
+            serde_json::json!({
+                "repoPath": repo_path, "worktreePath": context_worktree_path,
+            }),
+        )
+        .await
+        .expect("delete context worktree");
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "setChatCwd", "chatId": "chat-term", "cwd": repo_path }),
+        )
+        .await
+        .expect("restore terminal checkout");
+
     let session = client
         .call(
             methods::OPEN_TERMINAL,

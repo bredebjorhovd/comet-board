@@ -1794,6 +1794,10 @@ pub struct Composer {
     queue_chat: Option<String>,
     queue_task: Option<Task<()>>,
     queue_action_task: Option<Task<()>>,
+    /// Client-owned ids retained while an append's acknowledgement is unknown.
+    /// The serialized intent is the key: editing it creates a new gesture;
+    /// retrying it after response loss reuses the old id.
+    pending_queue_gestures: HashMap<String, String>,
     /// The queued row the composer is editing, if any. Sending commits an edit
     /// against this id instead of queueing a new row.
     editing: Option<String>,
@@ -1911,6 +1915,7 @@ impl Composer {
             queue_chat: None,
             queue_task: None,
             queue_action_task: None,
+            pending_queue_gestures: HashMap::new(),
             editing: None,
             sending: false,
             failure: None,
@@ -2665,6 +2670,21 @@ impl Composer {
         stamp_context_tokens(text, self.context_ref_checkouts.get(&self.current_key))
     }
 
+    fn queue_gesture_id(
+        &mut self,
+        payload: &SessionCommandPayload,
+        context: &[ContextRef],
+    ) -> (String, String) {
+        let key =
+            serde_json::to_string(&(payload, context)).unwrap_or_else(|_| format!("{payload:?}"));
+        let id = self
+            .pending_queue_gestures
+            .entry(key.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        (key, id)
+    }
+
     // ---- the follow-up queue (gh#424) ----
 
     /// Follow the selected chat's plan. Re-subscribed on navigation, dropped
@@ -2763,8 +2783,10 @@ impl Composer {
             cx.notify();
             return;
         };
+        let (gesture_key, command_id) = self.queue_gesture_id(&payload, &context);
         let params = serde_json::json!({
             "chatId": chat_id,
+            "commandId": command_id,
             "command": payload,
             "context": context,
         });
@@ -2776,6 +2798,7 @@ impl Composer {
                 composer.sending = false;
                 match result {
                     Ok(_) => {
+                        composer.pending_queue_gestures.remove(&gesture_key);
                         // Do not erase keystrokes entered while the durable
                         // append was in flight.
                         if composer.input.read(cx).text().trim() == text {
@@ -2846,9 +2869,12 @@ impl Composer {
             cx.notify();
             return;
         };
+        let payload = SessionCommandPayload::QueueControl { op };
+        let (gesture_key, command_id) = self.queue_gesture_id(&payload, &[]);
         let params = serde_json::json!({
             "chatId": chat_id,
-            "command": SessionCommandPayload::QueueControl { op },
+            "commandId": command_id,
+            "command": payload,
         });
         self.sending = true;
         self.queue_action_task = Some(cx.spawn(async move |this, cx| {
@@ -2856,7 +2882,10 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 composer.sending = false;
                 match result {
-                    Ok(_) => composer.stop_editing(cx),
+                    Ok(_) => {
+                        composer.pending_queue_gestures.remove(&gesture_key);
+                        composer.stop_editing(cx)
+                    }
                     Err(err) => {
                         composer.failure = Some(format!("Queue update failed: {err}").into());
                         // editing id and draft remain intact for retry.
@@ -2972,21 +3001,27 @@ impl Composer {
                 return;
             }
         };
+        let (gesture_key, command_id) = self.queue_gesture_id(&payload, &context);
         let params = serde_json::json!({
             "chatId": chat_id,
+            "commandId": command_id,
             "command": command,
             "context": context,
         });
         self.failure = None;
         cx.notify();
         self.queue_action_task = Some(cx.spawn(async move |this, cx| {
-            if let Err(err) = engine.client().call(methods::QUEUE_COMMAND, params).await {
-                this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("{failure}: {err}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            this.update(cx, |composer, cx| {
+                match result {
+                    Ok(_) => {
+                        composer.pending_queue_gestures.remove(&gesture_key);
+                    }
+                    Err(err) => composer.failure = Some(format!("{failure}: {err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
         }));
     }
 
@@ -3300,6 +3335,7 @@ impl Composer {
                     .map_err(|e| format!("Send failed: {e}"))?;
                 let params = serde_json::json!({
                     "chatId": chat_id,
+                    "commandId": uuid::Uuid::new_v4().to_string(),
                     "command": command,
                     "context": context,
                 });
@@ -3349,6 +3385,7 @@ impl Composer {
         };
         let params = serde_json::json!({
             "chatId": chat_id,
+            "commandId": uuid::Uuid::new_v4().to_string(),
             "command": { "kind": "interrupt" },
         });
         self.send_task = Some(cx.spawn(async move |this, cx| {

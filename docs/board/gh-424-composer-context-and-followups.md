@@ -242,47 +242,22 @@ instead of inventing another reducer.
 
 ### Command shapes
 
-`SessionCommandKind` gains `Queue`. Queue operations live under one payload
-kind so existing steer supersession rules cannot accidentally supersede them:
+`SessionCommandKind` gains `Queue` and `QueueControl`. They are immutable
+session-ledger entries, separate from steer supersession:
 
 ```text
-SessionCommandPayload::Queue { operation }
-
-QueueOperation =
-  Add {
-    operation_id,
-    item_id,
-    after_item_id?,
-    body: { prompt, context_references, attachment_refs[] },
-    expected_checkout_id
-  }
-  Edit {
-    operation_id,
-    item_id,
-    base_revision,
-    body
-  }
-  Move {
-    operation_id,
-    item_id,
-    after_item_id?,
-    base_revision
-  }
-  Remove {
-    operation_id,
-    item_id,
-    base_revision
-  }
-  Pause { operation_id }
-  Resume { operation_id }
-  RunNext { operation_id, item_id?, base_revision? }
+Queue { prompt, message_id, attachments[] }
+QueueControl = Edit { target, prompt, context[] }
+             | Move { target, after? }
+             | Remove { target }
+             | Clear | Pause | Resume | RunNext { target }
 ```
 
-The outer command id is still the durable processed-ledger id.
-`operation_id` is a client-minted idempotency key retained across retries of
-the same user gesture. `item_id` is stable for the life of a row. `revision`
-is the id of the last applied operation affecting that item, not an integer a
-client can increment independently.
+The command id is both the durable processed-ledger id and the queued row id
+for `Queue`. Queue-aware RPC clients mint it before sending and retain it if
+the transport retries that same gesture. The host refuses to append a second
+entry with the same id. A later explicit click is a new gesture and therefore
+a new command id.
 
 The first release supports context references in queued rows. Image
 attachments keep today's upload behavior and are represented by their existing
@@ -299,40 +274,20 @@ operation that created it.
 
 ### Deterministic fold and convergence
 
-Commands have a deterministic document order from Loro. The fold considers
-all well-formed queue operations in that order and applies these rules:
+Commands have a deterministic document order from Loro. Every client folds
+that same ordered list. `Queue` appends a row. Edit is last-writer-wins for a
+row still present. Remove and Clear affect rows already present at their fold
+position. Move removes the target and inserts it after a live anchor; `None`
+means the head, a self-anchor is a no-op, and an anchor concurrently removed
+falls back to the tail. Pause/Resume are last-writer-wins. RunNext names one
+currently live row and is cleared by projection if that row disappears.
 
-1. Duplicate `operation_id` values apply once; the earliest document position
-   wins and later duplicates project as `superseded`.
-2. `Add` creates `item_id` once. A duplicate add is an idempotent success only
-   when its body and anchor are identical; otherwise it is rejected.
-3. `Edit`, `Move`, and `Remove` apply only when `base_revision` equals the
-   item's current revision at that fold position. A stale operation is
-   rejected with the current row in its resolution.
-4. A missing `after_item_id` means the front. An unknown, removed, or
-   self-referential anchor rejects the move; it never guesses another place.
-5. Each successful add or move removes the item from its prior position and
-   inserts it after the anchor in the current folded order. Concurrent moves
-   therefore have one order: the command document order.
-6. Remove is a tombstone. Later operations cannot resurrect that item id.
-7. Pause and Resume are last-operation-wins in document order and are
-   idempotent when already in the requested state.
-8. `RunNext` names the item it intends to consume. An omitted id means the head
-   at that fold position. Replaying it cannot consume a second item.
-
-Every operation produces `applied`, `rejected`, or `superseded` through the
-existing host-only command outcome fields. The host's processed-id store still
-guards side effects. Pure folding uses the outcome when present; while an
-operation is pending it tentatively includes a locally valid result. Thus two
-offline viewers may briefly show their own tentative order, but after their
-documents merge they compute the same Loro order, and after host evaluation
-they show the same accepted order and rejection messages.
-
-Optimistic edit is not silent last-write-wins. If two clients edit revision R,
-the earlier merged operation advances the row to E1 and the later operation is
-rejected as based on R. Both clients converge on E1 and the second editor sees
-their still-recoverable text in the rejected operation. Reorder and delete use
-the same rule. This makes conflict visible without a queue-specific merge UI.
+This is deliberately not a CAS/conflict-reporting protocol. Concurrent edits
+or moves converge by document order; they do not surface a rejected revision.
+Idempotency is at the command boundary: a retry carrying the same client-owned
+command id cannot append after an intervening operation and undo it. There are
+no stored rank values, renderer-local mutations, or queue-specific tombstone
+objects.
 
 The projection returned by `WatchFollowupQueue` contains no absolute context
 paths or file bytes. Existing image attachment paths retain today's transport
@@ -340,26 +295,23 @@ contract and are not treated as checkout context:
 
 ```text
 QueueProjection
-  chat_id
   paused
-  revision             last folded queue operation id
-  items[]
-  pending_operations[] only this client's recoverable failures when known
+  run_next?
+  rows[]
 
-QueueItem
+QueueRow
   id
-  revision
-  position
-  body
-  state                ready | starting | attention
-  resolution?
-  created_at
-  created_by
+  prompt
+  context[]
+  attachments[]
+  message_id
+  issued_at
+  issued_by
+  edited
 ```
 
-`position` is a projection, not stored rank data. Clients reorder by item ids,
-not floating-point or fractional keys. This avoids rank exhaustion and makes
-the ledger's existing total order the only conflict arbiter.
+Position is the row's index in the projection, not stored rank data. Clients
+reorder by row ids and neighbour anchors.
 
 ### Starting the next turn
 
@@ -556,13 +508,13 @@ renderer-only optimization.
 | --- | --- |
 | Device A searches a chat hosted on B | Search forwards to B; returned refs carry B's checkout id. |
 | Chat checkout differs by send time | Whole command rejects `checkout_changed`; no harness starts. |
-| Picked file is deleted | Command rejects `missing`; queued row remains repairable. |
+| Picked file is deleted | Command reports the missing path to the agent and command ledger. |
 | Picked file changes bytes | Command runs against the new bytes. |
 | Path becomes a symlink | Command rejects `unsafe`. |
-| Two clients edit one row | First in document order applies; stale base revision rejects visibly. |
-| Edit retry after response loss | Same operation id is an idempotent success. |
+| Two clients edit one row | Document order decides; both clients project the same last edit. |
+| Edit retry after response loss | Same client-owned command id appends once. |
 | Remove races run-next | Document order decides; exactly one effect applies. |
-| Reorder races reorder | Document order plus revision check yields one order and one visible conflict. |
+| Reorder races reorder | Document order plus the missing-anchor-to-tail rule yields one order. |
 | Host restarts with three rows | Fold restores all three; scheduler resumes only if not paused. |
 | Viewer is offline | Its operations remain in its session doc and converge on reconnect. |
 | Host crashes while starting queued row | Stable child Run id recovers through existing pending-Run protocol. |
@@ -581,7 +533,7 @@ prove:
 - the same chat searched from another device produces references bound to the
   host's worktree, not the viewer's similarly named repository;
 - lexical escape, absolute paths, symlink files, symlink directories, kind
-  changes, checkout replacement, and deletion reject;
+  changes, and checkout replacement reject; deletion is reported;
 - changed bytes remain valid;
 - ignored files and `.git` never appear;
 - entry, result, depth, time, query, and path bounds set truncation without
@@ -593,9 +545,9 @@ prove:
 Follow-up queue fixture tests fold the same JSON in Rust and Swift and prove:
 
 - several adds survive snapshot export/import and app restart in order;
-- add/edit/move/remove/pause/resume/run-next retries are idempotent;
-- every pairwise concurrent edit, move, and remove ordering converges;
-- rejected optimistic operations restore the attempted body;
+- transport retries carrying the same command id append once;
+- concurrent edit, move, and remove logs project identically on both clients;
+- failed durable appends retain the draft or edit for retry;
 - pause survives restart and blocks automatic drain;
 - explicit run-next while paused consumes only its named item;
 - active and awaiting-input states never drain, while parked and absent do;
@@ -604,8 +556,8 @@ Follow-up queue fixture tests fold the same JSON in Rust and Swift and prove:
 - crash injection before child Run append, after append, before dispatch, and
   after dispatch never loses or duplicates a turn;
 - an attention row blocks automatic pass-through to later rows;
-- shallow snapshots and causal backfill preserve every live row and tombstone
-  across an offline client's later merge.
+- shallow snapshots and causal backfill preserve the command log and every
+  row still live under its deterministic fold.
 
 Desktop and iOS interaction tests additionally prove `@` and `/` discovery do
 not steal each other's input, image-only sends still work, reference chips
@@ -633,9 +585,9 @@ renderers:
 
 The checkout module earns depth by hiding routing, root choice, bounds,
 normalization, containment, and stale detection behind `search` and `resolve`.
-The queue module earns depth by hiding CRDT order, optimistic projection,
-idempotency, conflict rejection, scheduling, and crash recovery behind `fold`
-and `next_action`. Deleting either module would spread those rules across every
+The queue module earns depth by hiding CRDT order, command-id deduplication,
+projection, scheduling, and crash recovery behind `project` and command
+evaluation. Deleting either module would spread those rules across every
 composer and executor, which is precisely the duplication this design avoids.
 
 ## Explicit non-goals
