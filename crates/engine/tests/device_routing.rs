@@ -269,6 +269,7 @@ fn board_service(
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
         core.agent_accounts.clone(),
+        core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
     comet_engine::BoardService::spawn_at(

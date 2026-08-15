@@ -99,6 +99,18 @@ pub mod methods {
     pub const LIST_FOLDERS: &str = "ListFolders";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    /// The repository's own recipe for a checkout, and its lifecycle (gh#422).
+    /// Device-addressed like every other checkout verb: a recipe is executed
+    /// where the working tree is, never where the button was pressed.
+    ///
+    /// `PrepareCheckout` is the verb a person presses after a preparation
+    /// failed — it re-runs the recipe against the same checkout and, if that
+    /// succeeds, releases whatever brief the failure was holding. That is the
+    /// retry that does not mint a second attempt.
+    pub const PREPARE_CHECKOUT: &str = "PrepareCheckout";
+    /// Read-only: the last thing known about a checkout's preparation, plus the
+    /// recipe's `run` command so a viewport can offer it.
+    pub const CHECKOUT_PREP: &str = "CheckoutPrep";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";

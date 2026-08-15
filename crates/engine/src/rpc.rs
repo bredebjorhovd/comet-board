@@ -81,6 +81,8 @@ use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, pars
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
+use crate::board_runtime::repo_of_checkout;
+use crate::checkout_prep::CheckoutPrep;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
@@ -240,6 +242,24 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+}
+
+/// `PrepareCheckout` / `CheckoutPrep` params (gh#422).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareCheckoutParams {
+    /// The checkout. A chat's `cwd` is exactly this, which is what a frontend
+    /// has in hand.
+    #[serde(alias = "path", alias = "cwd")]
+    worktree_path: String,
+    /// The repository it was cut from — only needed to resolve `[[link]]`
+    /// sources, and derived from the checkout when omitted.
+    #[serde(default)]
+    repo_path: Option<String>,
+    /// Prepare even if the record says ready. Defaults to *true* on this verb;
+    /// see the handler for why a hand-pressed retry is never a cache read.
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +552,10 @@ pub struct EngineRpc {
     workspace: WorkspaceHost,
     registry: std::sync::Arc<HarnessRegistry>,
     repos: Repos,
+    /// The repository recipe primitive (gh#422) — the same object the board's
+    /// runtime holds, so `PrepareCheckout` from a laptop and an automatic
+    /// preparation from a dispatch read and write one record.
+    prep: CheckoutPrep,
     terminals: Terminals,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
@@ -558,6 +582,7 @@ impl EngineRpc {
         workspace: WorkspaceHost,
         registry: std::sync::Arc<HarnessRegistry>,
         repos: Repos,
+        prep: CheckoutPrep,
         terminals: Terminals,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
@@ -569,6 +594,7 @@ impl EngineRpc {
             workspace,
             registry,
             repos,
+            prep,
             terminals,
             diff_sync,
             uploads,
@@ -1629,6 +1655,12 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_FOLDERS
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            // A recipe is executed where the working tree is (gh#422), never
+            // where the button was pressed — the same rule as every other
+            // verb in this group, and the one that lets a laptop retry a
+            // failed preparation on the box.
+            | methods::PREPARE_CHECKOUT
+            | methods::CHECKOUT_PREP
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             // Terminals live on the chat's host device.
@@ -2392,7 +2424,75 @@ impl RpcService for EngineRpc {
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.prep.forget(std::path::Path::new(&p.worktree_path));
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            // gh#422. Deliberately a verb rather than something `CreateWorktree`
+            // does on its own: preparation runs the repository's code, and a
+            // checkout appearing in a sidebar is not a moment to start doing
+            // that behind somebody. A board dispatch prepares automatically
+            // because it is about to start an agent that would run that code
+            // anyway; a person gets asked.
+            methods::PREPARE_CHECKOUT => {
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let worktree = std::path::PathBuf::from(&p.worktree_path);
+                if !worktree.is_dir() {
+                    return Err(RpcError::Failed(format!(
+                        "{} is not a directory",
+                        worktree.display()
+                    )));
+                }
+                // The repo the checkout belongs to decides which box-local
+                // directory a `[[link]]` resolves under, so every worktree of
+                // one repo shares one set of machine-local files. Derived from
+                // the checkout when the caller does not say, which is what a
+                // frontend holding only a chat's cwd can do.
+                let repo = p
+                    .repo_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| repo_of_checkout(&worktree))
+                    .unwrap_or_else(|| worktree.clone());
+                let record = self
+                    .prep
+                    .prepare(crate::checkout_prep::PrepareRequest {
+                        worktree: &worktree,
+                        repo_path: &repo,
+                        // A retry is always a real retry: the caller pressed
+                        // this because the last answer was wrong, and handing
+                        // back the cached `ready` would be the one reply that
+                        // helps nobody. `force: false` is the automatic path's.
+                        force: p.force.unwrap_or(true),
+                        cancel: None,
+                    })
+                    .await;
+                // Same ending as the automatic path, by sharing its code: a
+                // preparation that succeeds releases the brief its failure was
+                // holding, so the attempt continues instead of being re-cut.
+                crate::board_runtime::settle_preparation(
+                    &self.prep,
+                    &self.doc_host,
+                    &worktree,
+                    &record,
+                );
+                RpcReply::value(&record)
+            }
+            methods::CHECKOUT_PREP => {
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let worktree = std::path::PathBuf::from(&p.worktree_path);
+                let recipe = self.prep.recipe(&worktree);
+                RpcReply::value(&serde_json::json!({
+                    "worktreePath": p.worktree_path,
+                    // Absent = this checkout has never been prepared, which is
+                    // a different answer from "prepared and ready".
+                    "prep": self.prep.status(&worktree),
+                    // Said out loud rather than left as an empty recipe: a
+                    // viewport offering nothing because the file is malformed
+                    // and one offering nothing because there is no file are
+                    // not the same thing to the person looking at it.
+                    "recipe": recipe.as_ref().ok().and_then(|r| r.as_ref()),
+                    "recipeError": recipe.as_ref().err(),
+                }))
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;

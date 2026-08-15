@@ -16,6 +16,7 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod board;
 pub mod board_runtime;
+pub mod checkout_prep;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
@@ -129,6 +130,11 @@ pub struct EngineCore {
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
+    /// The repository recipe primitive (gh#422). On the core rather than built
+    /// per caller so that the board's runtime and the RPC surface share one
+    /// view of every checkout's lifecycle — a `PrepareCheckout` from a laptop
+    /// has to be able to release a brief a dispatch parked.
+    pub checkout_prep: checkout_prep::CheckoutPrep,
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -265,6 +271,7 @@ impl EngineCore {
             doc_host,
             workspace,
             registry,
+            checkout_prep: checkout_prep::CheckoutPrep::new(data_dir),
             repos,
             terminals,
             diff_sync,
@@ -434,6 +441,7 @@ impl EngineCore {
             self.workspace.clone(),
             self.registry.clone(),
             self.repos.clone(),
+            self.checkout_prep.clone(),
             self.terminals.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
@@ -675,6 +683,7 @@ impl Engine {
                 sessions_watch.clone(),
                 core.sessions.journal(),
                 core.agent_accounts.clone(),
+                core.checkout_prep.clone(),
                 tokio::runtime::Handle::current(),
             ));
             // A dispatched agent pushes as the board's GitHub App rather than

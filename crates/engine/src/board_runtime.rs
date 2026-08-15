@@ -30,6 +30,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::agent_accounts::AgentAccounts;
+use crate::checkout_prep::CheckoutPrep;
 use crate::doc_host::DocHost;
 use crate::repos::Repos;
 use crate::run_journal::RunJournal;
@@ -51,6 +52,12 @@ pub struct CometRuntime {
     /// The exact resolver also wired into `Sessions`, so dispatch preflights
     /// the handoff later runs will receive rather than only GitHub metadata.
     push: OnceLock<Arc<crate::push_credentials::PushCredentials>>,
+    /// The repository's own recipe for turning a fresh checkout into an
+    /// environment that can build (gh#422). An engine primitive, held rather
+    /// than reimplemented: the same object serves the `PrepareCheckout` RPC an
+    /// ordinary (undispatched) session uses, so a repo writes one recipe and
+    /// both paths obey it.
+    prep: CheckoutPrep,
     handle: Handle,
 }
 
@@ -63,6 +70,7 @@ impl CometRuntime {
         sessions: watch::Receiver<Vec<Session>>,
         journal: Arc<RunJournal>,
         accounts: AgentAccounts,
+        prep: CheckoutPrep,
         handle: Handle,
     ) -> Self {
         Self {
@@ -73,6 +81,7 @@ impl CometRuntime {
             journal,
             accounts,
             push: OnceLock::new(),
+            prep,
             handle,
         }
     }
@@ -90,6 +99,201 @@ impl CometRuntime {
             return Ok(());
         };
         self.verify_push_credentials(&push.repo, push.contract)
+    }
+
+    /// Hold the brief until the checkout says it is ready (gh#422).
+    ///
+    /// Three shapes, and the first is every repository that has not written a
+    /// recipe yet: **no recipe, no change** — the brief is queued inline
+    /// exactly as it was before this existed, at the same cost.
+    ///
+    /// With a recipe, the brief is *parked* and preparation is spawned rather
+    /// than awaited. Awaited would be simpler and is wrong twice over: this
+    /// runs on the board's single loop thread, where a five-minute
+    /// `npm install` would stall every other task's status, cancel and sync
+    /// behind it; and `handle_dispatch`'s caller is a frontend holding a
+    /// button. So `dispatch` returns with a chat that exists, is shared, and
+    /// says what it is waiting for — and the run that costs money starts when
+    /// (and only when) the checkout is ready.
+    ///
+    /// A failure queues nothing. The attempt is live with a chat nobody is
+    /// billing, which is precisely the state that a `PrepareCheckout` retry
+    /// resolves without minting a second attempt: the parked brief is still
+    /// there, and the retry releases it.
+    fn release_when_ready(
+        &self,
+        chat_id: &str,
+        repo_path: &Path,
+        cwd: &str,
+        brief: SessionCommandPayload,
+    ) -> anyhow::Result<()> {
+        let worktree = std::path::PathBuf::from(cwd);
+        // The inline path: no recipe, or one that gates nothing — a repo that
+        // wrote only `[run]`/`[archive]` has said "here is how to drive me",
+        // not "wait for me", and its dispatches must not grow a parked brief
+        // and a "preparing…" notice for a no-op. A recipe that does not
+        // *parse* is neither: it must reach `prepare`, which writes it down as
+        // a failure instead of starting an agent in a checkout whose
+        // repository asked for something we could not read.
+        let gates = match self.prep.recipe(&worktree) {
+            Ok(None) => false,
+            Ok(Some(recipe)) => recipe.setup.is_some() || !recipe.links.is_empty(),
+            Err(_) => true,
+        };
+        if !gates {
+            self.doc_host.queue_command(chat_id, brief)?;
+            return Ok(());
+        }
+
+        let parked = serde_json::to_string(&ParkedBrief {
+            chat_id: chat_id.to_string(),
+            command: brief.clone(),
+        })?;
+        if let Err(e) = self.prep.park(&worktree, &parked) {
+            // Parking is what makes recovery possible, not what makes the
+            // dispatch work. Losing it costs a retry the ability to release
+            // this brief; it must not cost the dispatch the checkout.
+            tracing::warn!(chat = chat_id, error = %e, "parking the brief for gh#422 recovery");
+        }
+        notice(
+            &self.doc_host,
+            chat_id,
+            &format!(
+                "Preparing this checkout before starting — {}/{}. \
+                 The run has not started and nothing is being billed yet.",
+                cwd,
+                crate::checkout_prep::RECIPE_PATH
+            ),
+            false,
+        );
+
+        let prep = self.prep.clone();
+        let doc_host = self.doc_host.clone();
+        let repo = repo_path.to_path_buf();
+        self.handle.spawn(async move {
+            let record = prep
+                .prepare(crate::checkout_prep::PrepareRequest {
+                    worktree: &worktree,
+                    repo_path: &repo,
+                    force: false,
+                    cancel: None,
+                })
+                .await;
+            settle_preparation(&prep, &doc_host, &worktree, &record);
+        });
+        Ok(())
+    }
+}
+
+/// The work a preparation is holding back, with the chat it belongs to.
+///
+/// Parked as opaque JSON in the checkout's own state directory rather than
+/// held in memory, so that a retry after the engine restarted still knows what
+/// it is releasing — a box that reboots mid-`npm install` should not cost an
+/// attempt.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ParkedBrief {
+    chat_id: String,
+    command: SessionCommandPayload,
+}
+
+/// What to do with a finished preparation: release the parked work, or say why
+/// it is still parked.
+///
+/// Shared with the `PrepareCheckout` RPC (`crate::rpc`) on purpose — a retry
+/// and a first attempt must end the same way, or the recovery path is a second
+/// implementation of the thing it is recovering.
+pub(crate) fn settle_preparation(
+    prep: &crate::checkout_prep::CheckoutPrep,
+    doc_host: &DocHost,
+    worktree: &Path,
+    record: &crate::checkout_prep::PrepRecord,
+) {
+    for link in &record.links {
+        // Said before the agent starts, every time, including on the
+        // short-circuit: what a checkout can read is the operator's business
+        // and belongs in the log they already tail, not in a file they would
+        // have to know to open.
+        tracing::info!(
+            from = %link.from,
+            to = %link.to,
+            result = %link.result,
+            mode = link.mode.as_deref().unwrap_or("-"),
+            "checkout link"
+        );
+    }
+    if !record.is_ready() {
+        tracing::error!(summary = %record.summary(), "checkout preparation failed");
+        // The parked brief stays parked. Whoever reads this can retry the
+        // preparation, and the same attempt continues.
+        if let Some(parked) = peek_parked(prep, worktree) {
+            let log = record
+                .log
+                .as_deref()
+                .map(|p| format!("\n\nOutput: {p}"))
+                .unwrap_or_default();
+            let head = prep
+                .log_head(worktree, 2000)
+                .map(|t| format!("\n\n```\n{}\n```", t.trim_end()))
+                .unwrap_or_default();
+            notice(
+                doc_host,
+                &parked.chat_id,
+                &format!(
+                    "This checkout could not be prepared, so the run has not started \
+                     and nothing has been billed.\n\n{}{log}{head}\n\nThe checkout is \
+                     intact at {}. Fix the cause and prepare it again — the brief is \
+                     held and will be sent as soon as preparation succeeds.",
+                    record.summary(),
+                    worktree.display(),
+                ),
+                true,
+            );
+        }
+        return;
+    }
+    tracing::info!(summary = %record.summary(), "checkout ready");
+    let Some(parked) = take_parked(prep, worktree) else {
+        return;
+    };
+    if let Err(e) = doc_host.queue_command(&parked.chat_id, parked.command.clone()) {
+        // The brief is out of the park and did not land. Put it back rather
+        // than lose it: an attempt with no brief is an agent that never starts
+        // and never says why.
+        tracing::error!(chat = %parked.chat_id, error = %e, "releasing the prepared brief");
+        if let Ok(text) = serde_json::to_string(&parked) {
+            let _ = prep.park(worktree, &text);
+        }
+    }
+}
+
+fn peek_parked(
+    prep: &crate::checkout_prep::CheckoutPrep,
+    worktree: &Path,
+) -> Option<ParkedBrief> {
+    let text = prep.parked(worktree)?;
+    serde_json::from_str(&text).ok()
+}
+
+fn take_parked(
+    prep: &crate::checkout_prep::CheckoutPrep,
+    worktree: &Path,
+) -> Option<ParkedBrief> {
+    let text = prep.take_parked(worktree)?;
+    serde_json::from_str(&text).ok()
+}
+
+/// A line in the transcript from the engine rather than from either party.
+/// Best-effort throughout: a doc that cannot be opened is not a reason to
+/// abandon a checkout that prepared fine.
+fn notice(doc_host: &DocHost, chat_id: &str, text: &str, is_error: bool) {
+    match doc_host.open(chat_id) {
+        Ok(handle) => {
+            if let Err(e) = handle.write_notice(&crate::new_id(), text, is_error, crate::now_ms()) {
+                tracing::warn!(chat = chat_id, error = %e, "writing a checkout notice");
+            }
+        }
+        Err(e) => tracing::warn!(chat = chat_id, error = %e, "opening a chat for a notice"),
     }
 }
 
@@ -218,29 +422,31 @@ impl Runtime for CometRuntime {
         // entry is in the session doc — the ledger guarantees delivery, which
         // is the property herdr-board's nudge-and-verify loop approximated.
         // `prompt_at` resolves `{worktree}` now that the checkout exists.
-        self.doc_host.queue_command(
-            &chat_id,
-            SessionCommandPayload::Run {
-                request: RunRequest {
-                    prompt: spec.prompt_at(&cwd),
-                    model: spec.model.clone(),
-                    reasoning: None,
-                    model_options: Default::default(),
-                    cwd: cwd.clone(),
-                    sandbox: SandboxLevel::WorkspaceWrite,
-                    auto_approve: false,
-                    resume: None,
-                    attachments: Vec::new(),
-                },
-                message_id: crate::new_id(),
+        let brief = SessionCommandPayload::Run {
+            request: RunRequest {
+                prompt: spec.prompt_at(&cwd),
+                model: spec.model.clone(),
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: cwd.clone(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
+                resume: None,
+                attachments: Vec::new(),
             },
-        )?;
+            message_id: crate::new_id(),
+        };
         // The board dispatches on the TEAM's behalf, so its chats are the one
         // kind that is org-visible (gh#66): every member may open the
         // transcript and steer the agent, while private chats on the same box
         // stay private. Best-effort — a chat that failed to share is still a
         // running attempt, just one only its owner can open.
+        //
+        // Before the brief since gh#422, because the brief may now be held
+        // back for a minute while the checkout prepares, and the transcript
+        // saying so is no use to a teammate who cannot open it.
         self.doc_host.share_chat(&chat_id);
+        self.release_when_ready(&chat_id, Path::new(&spec.repo_path), &cwd, brief)?;
         Ok(DispatchHandle { chat_id, cwd })
     }
 
@@ -462,7 +668,13 @@ impl Runtime for CometRuntime {
             })?;
         self.handle
             .block_on(self.repos.delete_worktree(&repo, worktree, branch))
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // The preparation record is about a directory. Outliving it costs a
+        // stale `ready` that would short-circuit the next checkout to land on
+        // the same path — the state dir is keyed by path, and paths are reused
+        // (`board/gh-422-…` cut again after a retry).
+        self.prep.forget(worktree);
+        Ok(())
     }
 
     /// Sweep the build output out of a finished attempt's checkout (gh#186),
@@ -477,7 +689,22 @@ impl Runtime for CometRuntime {
     /// inside them, so a read-only board process keeps the clock and sweeps
     /// nothing.
     fn reclaim_build_output(&self, worktree: &str) -> anyhow::Result<comet_board::gc::Swept> {
-        Ok(comet_board::gc::sweep_build_output(Path::new(worktree)))
+        let path = Path::new(worktree);
+        // The repository's own `[archive]` first (gh#422), then the sweep.
+        //
+        // In that order and not instead of it. `BUILD_OUTPUT_DIRS` is a list of
+        // names the board knows; `[archive]` is what the *repository* knows —
+        // the generated directory nothing outside it could have guessed, the
+        // container it should stop, the cache its own tool is authoritative
+        // about. Neither subsumes the other, and a repo that runs `cargo clean`
+        // has simply left the sweep nothing to find in `target/`.
+        //
+        // Best-effort, because the caller is reclaiming a disk that is already
+        // the problem: a `clean` that fails or hangs must not keep the 36 GB.
+        if let Some(said) = self.handle.block_on(self.prep.archive(path, None)) {
+            tracing::info!(worktree, outcome = %said, "checkout archive step");
+        }
+        Ok(comet_board::gc::sweep_build_output(path))
     }
 
     /// Whose subscription a dispatch would spend (gh#101) — the slot's login,
@@ -603,6 +830,30 @@ fn github_pull_request_urls(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The repo a linked worktree belongs to, asked of the checkout itself.
+///
+/// The fallback for attempts dispatched before the board recorded the repo
+/// (gh#72). A linked worktree's *common* git dir is the primary checkout's
+/// `.git`, so its parent is the repo root — the same relationship
+/// `crate::adopt`-side code reads to tell a worktree from a project.
+pub(crate) fn repo_of_checkout(worktree: &Path) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            &worktree.to_string_lossy(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    common.parent().map(|p| p.to_path_buf())
+}
+
 #[cfg(test)]
 mod review_candidate_tests {
     use super::*;
@@ -631,28 +882,4 @@ mod review_candidate_tests {
         };
         assert!(!ran_gh_pr_create(&failed));
     }
-}
-
-/// The repo a linked worktree belongs to, asked of the checkout itself.
-///
-/// The fallback for attempts dispatched before the board recorded the repo
-/// (gh#72). A linked worktree's *common* git dir is the primary checkout's
-/// `.git`, so its parent is the repo root — the same relationship
-/// `crate::adopt`-side code reads to tell a worktree from a project.
-fn repo_of_checkout(worktree: &Path) -> Option<std::path::PathBuf> {
-    let out = std::process::Command::new("git")
-        .args([
-            "-C",
-            &worktree.to_string_lossy(),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let common = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    common.parent().map(|p| p.to_path_buf())
 }

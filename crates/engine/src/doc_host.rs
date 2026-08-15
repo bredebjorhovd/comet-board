@@ -362,6 +362,53 @@ impl ChatDocHandle {
         })
     }
 
+    /// Write a notice into the transcript: something the *engine* did, in the
+    /// place a person is already looking.
+    ///
+    /// `System` rather than `User` because nobody typed it — the composers'
+    /// echo logic and the sidebar preview both key on `User`, so a notice that
+    /// borrowed that role would show up as a message the operator sent and
+    /// would displace the last real one in the sidebar. `is_error` picks the
+    /// part kind, which is what makes a failure read as one.
+    ///
+    /// Deduped by id like [`Self::write_user_message`], so a retried write —
+    /// or a second engine holding the same doc — leaves one entry.
+    ///
+    /// gh#422's visible surface: a checkout preparing, and a checkout that
+    /// could not be prepared, are both things the chat says out loud rather
+    /// than facts you find in a log on the box.
+    pub fn write_notice(
+        &self,
+        message_id: &str,
+        text: &str,
+        is_error: bool,
+        created_at: i64,
+    ) -> Result<(), DocError> {
+        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
+            return Ok(());
+        }
+        let part = if is_error {
+            MessagePart::Error {
+                id: "e0".into(),
+                message: text.to_string(),
+            }
+        } else {
+            MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }
+        };
+        self.doc.push_message(&SessionMessageEntry {
+            id: message_id.to_string(),
+            role: MessageRole::System,
+            parts: vec![part],
+            created_at,
+            device_id: self.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+    }
+
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
     /// `note` as a visible error part so the transcript says WHY the turn
     /// ended (comet folded "Run interrupted by backend restart" the same
