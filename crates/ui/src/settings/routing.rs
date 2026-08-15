@@ -16,9 +16,14 @@
 //! Same contract the board panel sweeps on (`crate::board`, gh#55): the engine
 //! refuses the board methods outright when it hosts no board, so a candidate
 //! that errors has answered "not me". This walks
-//! [`comet_proto::view::board::host_candidates`] until one answers, which needs
-//! no configuration and no coupling to whether the board panel has ever been
-//! opened.
+//! [`comet_proto::view::board::host_candidates`], which needs no configuration
+//! and no coupling to whether the board panel has ever been opened — and it
+//! settles the way the panel does (gh#125, taught to this page by gh#434): a
+//! config from a board nobody has ever released work from is *furniture*, held
+//! as a fallback while the sweep keeps asking, and shown only when no board
+//! with dispatch evidence answers. Local answers first because asking locally
+//! is free; without the rule, a leftover local `board.db` would be the config
+//! this page reads — and writes routes into.
 
 use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
@@ -43,6 +48,13 @@ struct BoardConfig {
     routing: RoutingView,
     #[serde(default)]
     unadopted: Vec<Unadopted>,
+    /// Whether anybody has ever released work from this board (gh#434) — the
+    /// board pane's furniture question, riding the config reply so the host
+    /// sweep can ask it without a second call. Defaulted on the wire: an
+    /// older board answers without it and reads as furniture, which costs it
+    /// only the tie against a board that says otherwise.
+    #[serde(default)]
+    dispatched: bool,
 }
 
 /// One route key this page can set, and what to call it.
@@ -204,6 +216,14 @@ impl RoutingPage {
     /// engine's contract for every board method — so the sweep moves on. When
     /// nobody answers, the last error is what the page shows: "board
     /// unavailable" from every device is a true and useful thing to read.
+    ///
+    /// A candidate that answers **without dispatch evidence** is furniture
+    /// (gh#434): its config is held as a fallback while the sweep keeps
+    /// asking, and settles only when no board somebody has released work from
+    /// answers. The sweep used to stop on the first answer, and local is
+    /// asked first — so a stale local board's `routing.toml` was what a Mac
+    /// read, and what its edits were written into, whenever a local board
+    /// existed at all.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
@@ -217,6 +237,7 @@ impl RoutingPage {
         self.error = None;
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut last: Option<String> = None;
+            let mut furniture: Option<(Option<String>, BoardConfig)> = None;
             for candidate in candidates {
                 let mut params = serde_json::json!({});
                 if let (Some(host), Some(object)) = (candidate.as_deref(), params.as_object_mut()) {
@@ -227,36 +248,51 @@ impl RoutingPage {
                     .call(methods::READ_BOARD_CONFIG, params)
                     .await
                 {
-                    Ok(value) => {
-                        let parsed = serde_json::from_value::<BoardConfig>(value);
-                        let updated = this.update(cx, |page, cx| {
-                            page.loaded = true;
-                            match parsed {
-                                Ok(config) => {
-                                    page.host = candidate;
-                                    page.config = Some(config);
-                                }
-                                Err(err) => {
-                                    page.error = Some(format!("Unreadable config: {err}").into())
-                                }
+                    Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
+                        Ok(config) if config.dispatched => {
+                            let _ = this.update(cx, |page, cx| {
+                                page.loaded = true;
+                                page.host = candidate;
+                                page.config = Some(config);
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        // First held answer wins the fallback slot — it is
+                        // the earliest in sweep order, which is the old
+                        // tie-break.
+                        Ok(config) => {
+                            if furniture.is_none() {
+                                furniture = Some((candidate, config));
                             }
-                            cx.notify();
-                        });
-                        let _ = updated;
-                        return;
-                    }
+                        }
+                        // A board that answered unreadably has still
+                        // answered, but there is nothing to draw from it —
+                        // carry it as the error the page falls back to.
+                        Err(err) => last = Some(format!("Unreadable config: {err}")),
+                    },
                     Err(err) => last = Some(err.to_string()),
                 }
             }
             this.update(cx, |page, cx| {
                 page.loaded = true;
-                page.error = Some(
-                    match last {
-                        Some(err) => format!("No device here hosts a board ({err})"),
-                        None => "No device here hosts a board".to_string(),
+                // Everyone has been asked. A config held for want of dispatch
+                // evidence is the best answer there is — settle on it.
+                match furniture {
+                    Some((host, config)) => {
+                        page.host = host;
+                        page.config = Some(config);
                     }
-                    .into(),
-                );
+                    None => {
+                        page.error = Some(
+                            match last {
+                                Some(err) => format!("No device here hosts a board ({err})"),
+                                None => "No device here hosts a board".to_string(),
+                            }
+                            .into(),
+                        );
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -1022,6 +1058,25 @@ mod tests {
             "runtime": "claude-code",
         }))
         .unwrap()
+    }
+
+    /// An older board answers without the evidence bit and must still parse —
+    /// as furniture, which only ever costs it the tie against a board that
+    /// says otherwise (gh#434).
+    #[test]
+    fn a_config_reply_without_the_evidence_bit_reads_as_furniture() {
+        let config: BoardConfig = serde_json::from_value(serde_json::json!({
+            "routing": {
+                "path": "/data/routing.toml",
+                "exists": false,
+                "text": "",
+                "problems": [],
+                "backup": false,
+            }
+        }))
+        .unwrap();
+        assert!(!config.dispatched);
+        assert!(config.unadopted.is_empty());
     }
 
     /// The row's readings of a route (`match_summary`, `cap_summary`) are the

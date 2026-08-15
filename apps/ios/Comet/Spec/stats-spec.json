@@ -87,6 +87,7 @@
         },
         "daily": [],
         "dailyTokens": [],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 0,
           "earlySettles": 0,
@@ -208,6 +209,7 @@
         },
         "daily": [],
         "dailyTokens": [],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 0,
           "earlySettles": 0,
@@ -329,6 +331,7 @@
         },
         "daily": [],
         "dailyTokens": [],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 0,
           "earlySettles": 0,
@@ -450,6 +453,7 @@
         },
         "daily": [],
         "dailyTokens": [],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 0,
           "earlySettles": 0,
@@ -635,6 +639,7 @@
             }
           }
         ],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 4,
           "earlySettles": 1,
@@ -952,6 +957,7 @@
             }
           }
         ],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 4,
           "earlySettles": 1,
@@ -1327,6 +1333,7 @@
         },
         "daily": [],
         "dailyTokens": [],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 0,
           "earlySettles": 0,
@@ -1611,6 +1618,7 @@
         },
         "daily": [],
         "dailyTokens": [],
+        "dispatched": false,
         "friction": {
           "blockedEntries": 0,
           "earlySettles": 0,

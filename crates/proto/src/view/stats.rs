@@ -1072,6 +1072,22 @@ pub struct BoardStats {
     /// does not draw the line.
     #[serde(default)]
     pub context: ContextPressure,
+
+    /// Any attempt on record at all — all time, never windowed (gh#434).
+    ///
+    /// The same evidence [`crate::view::board::board_dispatched`] reads off
+    /// the rows: a board somebody has released work from is the org's board,
+    /// and one that only ever collected rows is furniture. A host sweep holds
+    /// a furniture answer as a fallback and keeps asking rather than settling
+    /// on it — which is why this cannot be read off
+    /// [`attempts`](Self::attempts): the box's board on a quiet week is not
+    /// furniture, and a windowed count would say it was.
+    ///
+    /// Defaulted on the wire: a board that predates this field answers
+    /// without it and reads as furniture, which costs it only the tie
+    /// against a board that says otherwise.
+    #[serde(default)]
+    pub dispatched: bool,
 }
 
 /// The context half of the page: not what the window's work cost, but how
@@ -1144,6 +1160,7 @@ impl BoardStats {
             tokens_by_account: BTreeMap::new(),
             spend: None,
             context: ContextPressure::default(),
+            dispatched: false,
         }
     }
 
