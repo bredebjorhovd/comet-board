@@ -1177,12 +1177,14 @@ name = "comet-board-bin"
 version = "0.7.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "comet-board",
  "comet-proto",
  "comet-rpc",
  "comet-update",
+ "futures",
  "mimalloc",
  "serde",
  "serde_json",

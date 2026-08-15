@@ -208,6 +208,36 @@ pub async fn board_rows(board: &Board) -> Result<Vec<TaskRow>> {
     snapshot(&mut stream, board.host()).await
 }
 
+/// The row named by a canonical id or an unambiguous display identifier.
+///
+/// This is the wire-row twin of `comet_board::dispatch::task_by_reference`:
+/// exact ids win, while a short identifier shared by repositories is refused
+/// with every canonical candidate named. RPC consumers only have [`TaskRow`]
+/// values, so they cannot call the board-core helper over stored `Task`s.
+pub fn task_row_by_reference<'a>(rows: &'a [TaskRow], reference: &str) -> Result<&'a TaskRow> {
+    let reference = reference.trim();
+    if let Some(row) = rows.iter().find(|row| row.id == reference) {
+        return Ok(row);
+    }
+    let named: Vec<&TaskRow> = rows
+        .iter()
+        .filter(|row| row.identifier.eq_ignore_ascii_case(reference))
+        .collect();
+    match named.as_slice() {
+        [] => bail!("`{reference}` is not a task on the board"),
+        [only] => Ok(only),
+        several => bail!(
+            "`{reference}` names {} tasks on the board — pass the task id to say which: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|row| format!("`{}`", row.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 // ---- list ---------------------------------------------------------------
 
 /// Reject an unknown filter rather than returning an empty list: to a caller,
@@ -736,7 +766,7 @@ fn remainder_section(review: &AttemptReview, out: &mut String) {
 // ---- dispatch / retry / cancel ------------------------------------------
 
 /// What `DispatchTask` answers: the attempt's address.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dispatched {
     pub chat_id: String,
@@ -864,11 +894,40 @@ pub async fn cross_billing_warning(
     // Nobody to compare against: an unattributed dispatch names no wronged
     // party, and asking the box two more questions could not change that.
     let me = opts.via_user?;
-    let row = board_rows(board)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|r| r.id == task_id)?;
+    let rows = board_rows(board).await.ok()?;
+    let row = task_row_by_reference(&rows, task_id).ok()?;
+    match cross_billing_preflight_for_row(board, row, opts, Some(me)).await {
+        CrossBillingPreflight::DifferentPayer(warning) => Some(warning),
+        CrossBillingPreflight::SamePayer | CrossBillingPreflight::Unknown(_) => None,
+    }
+}
+
+/// What the available account evidence says about a pending dispatch's payer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossBillingPreflight {
+    SamePayer,
+    DifferentPayer(String),
+    Unknown(String),
+}
+
+/// Whether dispatching `row` under `opts` keeps or changes an explicitly
+/// supplied payer, without collapsing unavailable evidence into permission.
+///
+/// Human frontends pass their signed-in identity through
+/// [`cross_billing_warning`]. The board MCP consumer instead passes the parent
+/// attempt's recorded `billed_to`: that is budget provenance, not a claim that
+/// the parent agent is the human who released its child.
+pub async fn cross_billing_preflight_for_row(
+    board: &Board,
+    row: &TaskRow,
+    opts: DispatchOpts<'_>,
+    payer: Option<&str>,
+) -> CrossBillingPreflight {
+    let Some(payer) = payer.filter(|payer| !payer.trim().is_empty()) else {
+        return CrossBillingPreflight::Unknown(
+            "the parent attempt has no recorded payer".to_string(),
+        );
+    };
     // Exactly the chain `build_spec` walks: `--bill <slot>`, then `--account`,
     // then the route's own — which is what the row reports for a task nothing
     // has run on yet.
@@ -877,18 +936,51 @@ pub async fn cross_billing_warning(
         .filter(|b| comet_board::billing::bill_names_a_slot(b))
         .or(opts.account)
         .or(row.account.as_deref());
-    let harness = harness_for_runtime(opts.runtime.or(row.runtime.as_deref())?)?;
-    let accounts: comet_proto::AgentAccountsSnapshot = board
+    let Some(runtime) = opts.runtime.or(row.runtime.as_deref()) else {
+        return CrossBillingPreflight::Unknown(
+            "the target task has no resolved runtime".to_string(),
+        );
+    };
+    let Some(harness) = harness_for_runtime(runtime) else {
+        return CrossBillingPreflight::Unknown(format!(
+            "the target runtime `{runtime}` does not identify a known agent harness"
+        ));
+    };
+    let accounts = match board
         .client
         .call(
             methods::LIST_AGENT_ACCOUNTS,
             board.params(serde_json::json!({})),
         )
         .await
-        .ok()
-        .and_then(|v| serde_json::from_value(v).ok())?;
-    let billed = view::billed_email(&accounts.accounts, harness, slot)?;
-    view::cross_billed(Some(billed), Some(me)).then(|| view::bills_warning(billed, harness))
+    {
+        Ok(value) => match serde_json::from_value::<comet_proto::AgentAccountsSnapshot>(value) {
+            Ok(accounts) => accounts,
+            Err(err) => {
+                return CrossBillingPreflight::Unknown(format!(
+                    "the agent accounts reply was malformed: {err}"
+                ));
+            }
+        },
+        Err(err) => {
+            return CrossBillingPreflight::Unknown(format!(
+                "the agent accounts could not be read: {err}"
+            ));
+        }
+    };
+    let Some(billed) = view::billed_email(&accounts.accounts, harness, slot) else {
+        let account = slot
+            .map(|slot| format!("account `{slot}`"))
+            .unwrap_or_else(|| "the active account".to_string());
+        return CrossBillingPreflight::Unknown(format!(
+            "the agent accounts do not identify a payer for {account} under runtime `{runtime}`"
+        ));
+    };
+    if view::cross_billed(Some(billed), Some(payer)) {
+        CrossBillingPreflight::DifferentPayer(view::bills_warning(billed, harness))
+    } else {
+        CrossBillingPreflight::SamePayer
+    }
 }
 
 /// One model a dispatch can be pointed at, as `ListModels` reports it for a

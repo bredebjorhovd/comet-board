@@ -84,6 +84,7 @@ fn fake_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -357,6 +358,37 @@ async fn the_serve_child_gets_the_credential_environment_byte_for_byte() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_opencode_receives_the_route_mcp_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut controls, _steer, _token) = fake_controls();
+    controls.mcp_servers = vec![common::board_mcp_server()];
+
+    run_to_end(
+        &harness(),
+        fake_request("scenario:stream-end", &dir),
+        controls,
+    )
+    .await;
+
+    let env = std::fs::read_to_string(dir.path().join("fake-opencode.env"))
+        .expect("spawned OpenCode environment");
+    let config = env
+        .lines()
+        .find_map(|line| line.strip_prefix("OPENCODE_CONFIG_CONTENT="))
+        .expect("OpenCode inline config reached the server");
+    let config: serde_json::Value = serde_json::from_str(config).unwrap();
+    assert_eq!(
+        config["mcp"]["comet-board"],
+        serde_json::json!({
+            "type": "local",
+            "command": ["comet-board", "mcp"],
+            "enabled": true
+        })
+    );
+}
+
 /// A serve that actually dies mid-run must STILL surface as an Errored crash
 /// (with the real exit status, not a "still running" shrug) and be reaped.
 #[cfg(unix)]
@@ -581,6 +613,7 @@ fn real_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     (controls, steer_tx, token)
 }

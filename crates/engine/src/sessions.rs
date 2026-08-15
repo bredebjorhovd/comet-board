@@ -393,6 +393,12 @@ impl SessionsEngine {
             account,
             push: self.inner.push_for(chat_id),
             bin_dirs: self.inner.agent_bin_dirs.clone(),
+            mcp_servers: self
+                .inner
+                .workspace()
+                .and_then(|ws| ws.chat_config(chat_id))
+                .map(|c| c.mcp_servers)
+                .unwrap_or_default(),
         };
 
         lock(&self.inner.runs).insert(

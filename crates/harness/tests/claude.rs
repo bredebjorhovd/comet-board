@@ -79,6 +79,7 @@ fn controls(
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -280,6 +281,31 @@ async fn happy_path_normalizes_events_and_accounts_for_subagents() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_claude_receives_the_route_mcp_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (wrapper, argv_file) = common::recording_wrapper(&fixture_path(), &dir);
+    let harness = ClaudeHarness::new().with_executable(wrapper);
+    let (mut controls, _steer, _token) = controls("A");
+    controls.mcp_servers = vec![common::board_mcp_server()];
+
+    run_to_end(&harness, request("scenario:happy"), controls).await;
+
+    let argv = std::fs::read_to_string(argv_file).expect("spawned Claude argv");
+    let argv: Vec<&str> = argv.lines().collect();
+    let config = argv
+        .iter()
+        .position(|arg| *arg == "--mcp-config")
+        .and_then(|index| argv.get(index + 1))
+        .expect("--mcp-config followed by its JSON value");
+    let config: serde_json::Value = serde_json::from_str(config).unwrap();
+    assert_eq!(
+        config["mcpServers"]["comet-board"],
+        serde_json::json!({"command": "comet-board", "args": ["mcp"]})
+    );
+}
+
 /// Context fullness over the control channel (gh#271): polled while the turn
 /// is live, reported when the level moves, and silent once the turn is over.
 #[tokio::test]
@@ -375,6 +401,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;
 

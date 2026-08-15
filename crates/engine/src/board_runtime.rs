@@ -167,6 +167,9 @@ impl Runtime for CometRuntime {
             // (gh#270). Same reasoning a third time: a later turn in this chat
             // is the same unattended agent, working under the same policy.
             turn_limits: spec.turn_limits,
+            // The route's MCP tools (gh#273), on the chat so review follow-ups
+            // receive the same capabilities as the original attempt.
+            mcp_servers: spec.mcp_servers.clone(),
         };
         self.workspace
             .create_chat(&chat_id, &spec.space_id, Some(config), Some(cwd.clone()))?;

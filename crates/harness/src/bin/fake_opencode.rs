@@ -76,7 +76,11 @@ async fn main() -> std::io::Result<()> {
     let _ = std::fs::write(
         cwd.join("fake-opencode.env"),
         std::env::vars()
-            .filter(|(k, _)| k.starts_with("GIT_") || k.starts_with("COMET_BOARD_"))
+            .filter(|(k, _)| {
+                k.starts_with("GIT_")
+                    || k.starts_with("COMET_BOARD_")
+                    || k == "OPENCODE_CONFIG_CONTENT"
+            })
             .map(|(k, v)| format!("{k}={v}\n"))
             .collect::<String>(),
     );

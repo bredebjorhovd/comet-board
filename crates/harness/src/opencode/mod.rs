@@ -209,7 +209,7 @@ impl Harness for OpencodeHarness {
             return Ok(models.clone());
         }
         let exe = self.resolve_executable()?;
-        let (mut child, base, _stderr) = spawn_server(&exe, None, None, None, &[]).await?;
+        let (mut child, base, _stderr) = spawn_server(&exe, None, None, None, &[], &[]).await?;
         let models = {
             let client = Client::new(base);
             client
@@ -243,6 +243,7 @@ impl Harness for OpencodeHarness {
             controls.chat_id.as_deref(),
             controls.push.as_ref(),
             &controls.bin_dirs,
+            &controls.mcp_servers,
         )
         .await?;
         let client = Client::with_timeouts(base, self.request_timeout, client::STREAM_READ_TIMEOUT);
@@ -336,12 +337,19 @@ async fn spawn_server(
     chat_id: Option<&str>,
     push: Option<&crate::PushCredentials>,
     bin_dirs: &[std::path::PathBuf],
+    mcp_servers: &[comet_proto::McpServer],
 ) -> Result<(Child, String, crate::StderrTail), HarnessError> {
     let mut cmd = Command::new(exe);
     cmd.arg("serve").arg("--port").arg("0").arg("--hostname").arg("127.0.0.1");
     crate::prepend_exe_dir_to_path(&mut cmd, exe);
     if let Some(chat_id) = chat_id {
         cmd.env("COMET_BOARD_CHAT_ID", chat_id);
+    }
+    if let Some(config) = opencode_inline_config(
+        std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
+        mcp_servers,
+    )? {
+        cmd.env("OPENCODE_CONFIG_CONTENT", config);
     }
     // The server is what runs the agent's tools, so the credentials — and the
     // directories the tools themselves live in — belong on it; opencode's own
@@ -416,6 +424,49 @@ async fn spawn_server(
     Err(HarnessError::Protocol(format!(
         "opencode serve never became ready: {message}"
     )))
+}
+
+/// Merge route-specific MCP servers into opencode's highest-precedence inline
+/// config (gh#273). Existing inline settings — including values supplied by an
+/// operator through the environment — survive value-for-value; only same-named
+/// MCP entries are replaced. Nothing is written to the checkout or user config.
+fn opencode_inline_config(
+    existing: Option<&str>,
+    servers: &[comet_proto::McpServer],
+) -> Result<Option<String>, HarnessError> {
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let mut config = match existing {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+            HarnessError::Protocol(format!("OPENCODE_CONFIG_CONTENT is not valid JSON: {e}"))
+        })?,
+        None => serde_json::json!({}),
+    };
+    let root = config.as_object_mut().ok_or_else(|| {
+        HarnessError::Protocol("OPENCODE_CONFIG_CONTENT must be a JSON object".into())
+    })?;
+    let mcp = root
+        .entry("mcp")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            HarnessError::Protocol("OPENCODE_CONFIG_CONTENT.mcp must be an object".into())
+        })?;
+    for server in servers {
+        let mut command = Vec::with_capacity(server.args.len() + 1);
+        command.push(server.command.clone());
+        command.extend(server.args.iter().cloned());
+        mcp.insert(
+            server.name.clone(),
+            serde_json::json!({
+                "type": "local",
+                "command": command,
+                "enabled": true,
+            }),
+        );
+    }
+    Ok(Some(config.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +681,7 @@ async fn run_session(session: Session) {
         // credentials and the tool directories are already on the child.
         push: _,
         bin_dirs: _,
+        mcp_servers: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -1106,5 +1158,31 @@ mod tests {
             Some(("opencode".into(), "big-pickle".into()))
         );
         assert_eq!(split_model(&None), None);
+    }
+
+    #[test]
+    fn mcp_servers_merge_into_opencode_inline_config() {
+        let config = opencode_inline_config(
+            Some(r#"{"theme":"nord","mcp":{"mine":{"type":"remote","url":"https://example.test","enabled":true}}}"#),
+            &[comet_proto::McpServer {
+                name: "comet-board".into(),
+                command: "comet-board".into(),
+                args: vec!["mcp".into()],
+            }],
+        )
+        .unwrap()
+        .expect("one server produces config");
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["theme"], "nord");
+        assert_eq!(config["mcp"]["mine"]["type"], "remote");
+        assert_eq!(
+            config["mcp"]["comet-board"],
+            serde_json::json!({
+                "type": "local",
+                "command": ["comet-board", "mcp"],
+                "enabled": true,
+            })
+        );
+        assert!(opencode_inline_config(None, &[]).unwrap().is_none());
     }
 }

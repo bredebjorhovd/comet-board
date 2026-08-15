@@ -45,7 +45,9 @@ nearly verbatim — it never depended on herdr:
   runtimes validate against comet harnesses; the herdr pane-layout knobs
   (`split_direction`, `max_panes_per_tab`) and `nudge_stalled` are gone.
   `Route.workspace` now names a comet **space** — the config key keeps its
-  spelling so ported routing.toml files load.
+  spelling so ported routing.toml files load. MCP stdio servers resolve from
+  `[defaults]` or a whole-list route override and cross the runtime seam
+  (§gh#273).
 - `stats.rs`, `log.rs` — unchanged.
 - `runtime.rs` — **new**, the seam. `Runtime` trait (dispatch / prompt /
   cancel / session / chat_alive / chat_cwd), `DispatchSpec`/`DispatchHandle`, the

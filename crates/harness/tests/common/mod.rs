@@ -78,3 +78,40 @@ pub fn events_so_far<T: std::fmt::Debug>(events: &[T]) -> String {
         .map(|(i, ev)| format!("    {i:>3}. {ev:?}\n"))
         .collect()
 }
+
+/// A real executable boundary that records argv before chaining to a harness
+/// fixture. This keeps adapter integration tests outside private command
+/// builders: the assertion sees exactly what the spawned process received.
+#[cfg(unix)]
+pub fn recording_wrapper(
+    target: &std::path::Path,
+    dir: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+    }
+
+    let wrapper = dir.path().join("record-argv.sh");
+    let record = dir.path().join("argv.txt");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n: > {record}\nfor arg do printf '%s\\n' \"$arg\" >> {record}; done\nexec {target} \"$@\"\n",
+            record = quote(&record),
+            target = quote(target),
+        ),
+    )
+    .expect("write argv wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("make argv wrapper executable");
+    (wrapper, record)
+}
+
+pub fn board_mcp_server() -> comet_proto::McpServer {
+    comet_proto::McpServer {
+        name: "comet-board".into(),
+        command: "comet-board".into(),
+        args: vec!["mcp".into()],
+    }
+}

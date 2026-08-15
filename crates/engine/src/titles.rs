@@ -266,6 +266,7 @@ async fn collect_text(
         push: None,
         // …and it runs no tools at all, so it needs none of them on its PATH.
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     let mut stream = harness.run(request, controls).await?;
     let mut text = String::new();

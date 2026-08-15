@@ -1675,6 +1675,7 @@ mod tests {
             push_repo: None,
             git_author: None,
             turn_limits: Default::default(),
+            mcp_servers: Vec::new(),
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -1703,6 +1704,7 @@ mod tests {
                 push_repo: None,
                 git_author: None,
                 turn_limits: Default::default(),
+                mcp_servers: Vec::new(),
             },
         );
     }

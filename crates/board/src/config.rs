@@ -938,6 +938,15 @@ pub struct Defaults {
     /// [`crate::conventions`].
     #[serde(default = "default_true")]
     pub agent_instructions: bool,
+    /// MCP stdio servers every dispatched chat receives (gh#273).
+    ///
+    /// The shipped default is the board itself: agents can inspect their task,
+    /// related attempts, and release work through typed tools instead of
+    /// shelling out. A route can replace the whole list — including with `[]`
+    /// to opt out — because route-specific tools must not bleed into another
+    /// route sharing the same account slot.
+    #[serde(default = "default_mcp_servers")]
+    pub mcp_servers: Vec<comet_proto::McpServer>,
     /// Per-model rate overrides for the spend figures (gh#182), in US dollars
     /// per million tokens:
     ///
@@ -1092,6 +1101,14 @@ fn default_base() -> String {
     "origin/HEAD".into()
 }
 
+fn default_mcp_servers() -> Vec<comet_proto::McpServer> {
+    vec![comet_proto::McpServer {
+        name: "comet-board".into(),
+        command: "comet-board".into(),
+        args: vec!["mcp".into()],
+    }]
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
@@ -1111,6 +1128,7 @@ impl Default for Defaults {
             archive_chats: default_archive_chats(),
             billing_guard: default_billing_guard(),
             agent_instructions: true,
+            mcp_servers: default_mcp_servers(),
             rates: BTreeMap::new(),
         }
     }
@@ -1382,6 +1400,10 @@ pub struct Route {
     /// being able to answer separately.
     #[serde(default)]
     pub agent_instructions: Option<bool>,
+    /// Replace `[defaults].mcp_servers` for this route (gh#273). `None`
+    /// inherits; an explicit empty list disables MCP injection.
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<comet_proto::McpServer>>,
 }
 
 impl Route {
@@ -1571,7 +1593,15 @@ impl RoutingConfig {
                     r.display_name()
                 ));
             }
+            if let Some(servers) = &r.mcp_servers {
+                mcp_server_problems(
+                    &format!("route {} ({})", i + 1, r.display_name()),
+                    servers,
+                    &mut out,
+                );
+            }
         }
+        mcp_server_problems("[defaults]", &self.defaults.mcp_servers, &mut out);
         if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
             out.push(format!("[defaults] max_duration {e}"));
         }
@@ -1889,6 +1919,58 @@ impl RoutingConfig {
         route
             .and_then(|r| r.agent_instructions)
             .unwrap_or(self.defaults.agent_instructions)
+    }
+
+    /// MCP servers for a dispatch on `route` (gh#273): the route's whole list
+    /// when it has one, else `[defaults]`. Returning the stored slice keeps the
+    /// routing interface small; the dispatch spec takes the one owned copy
+    /// that crosses into the engine.
+    pub fn mcp_servers<'a>(&'a self, route: Option<&'a Route>) -> &'a [comet_proto::McpServer] {
+        route
+            .and_then(|r| r.mcp_servers.as_deref())
+            .unwrap_or(&self.defaults.mcp_servers)
+    }
+}
+
+/// MCP names have to survive three configuration syntaxes and three tool-name
+/// normalizers. Keep the common spelling deliberately small, and reject names
+/// that collapse onto the same prefix (`foo-bar` / `foo_bar`) before a harness
+/// gets to pick one silently.
+fn mcp_server_problems(scope: &str, servers: &[comet_proto::McpServer], out: &mut Vec<String>) {
+    let mut names = std::collections::BTreeSet::new();
+    for (i, server) in servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty()
+            || name != server.name
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            out.push(format!(
+                "{scope} MCP server {} has name `{}`; use only letters, numbers, `-`, and `_`, with no surrounding whitespace",
+                i + 1,
+                server.name
+            ));
+        }
+        let normalized = name
+            .bytes()
+            .map(|b| match b {
+                b'-' | b'_' => b'_',
+                _ => b.to_ascii_lowercase(),
+            })
+            .collect::<Vec<_>>();
+        if !name.is_empty() && !names.insert(normalized) {
+            out.push(format!(
+                "{scope} MCP server name `{}` collides with an earlier name after tool-name normalization",
+                server.name
+            ));
+        }
+        if server.command.trim().is_empty() || server.command.trim() != server.command {
+            out.push(format!(
+                "{scope} MCP server `{}` has an empty command or surrounding whitespace",
+                server.name
+            ));
+        }
     }
 }
 
@@ -2735,6 +2817,71 @@ runtime = "claude"
         // that never mentioned it.
         let off = github("[defaults]\nagent_instructions = false\n");
         assert!(!off.agent_instructions(None));
+    }
+
+    // ---- MCP servers (gh#273) --------------------------------------------
+
+    #[test]
+    fn a_board_that_says_nothing_gives_dispatches_the_board_server() {
+        assert_eq!(
+            RoutingConfig::default().mcp_servers(None),
+            [comet_proto::McpServer {
+                name: "comet-board".into(),
+                command: "comet-board".into(),
+                args: vec!["mcp".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_route_replaces_or_disables_the_default_mcp_list() {
+        let c = github(
+            r#"
+[defaults]
+mcp_servers = [{ name = "board", command = "comet-board", args = ["mcp"] }]
+
+[[route]]
+match = { label = "custom" }
+workspace = "w"
+repo = "/tmp"
+runtime = "codex"
+mcp_servers = [{ name = "repo", command = "repo-mcp", args = ["--stdio"] }]
+
+[[route]]
+match = { label = "none" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+mcp_servers = []
+
+[[route]]
+workspace = "w"
+repo = "/tmp"
+runtime = "opencode"
+"#,
+        );
+        assert_eq!(c.mcp_servers(Some(&c.routes[0]))[0].name, "repo");
+        assert!(c.mcp_servers(Some(&c.routes[1])).is_empty());
+        assert_eq!(c.mcp_servers(Some(&c.routes[2]))[0].name, "board");
+    }
+
+    #[test]
+    fn invalid_or_colliding_mcp_names_are_refused_before_dispatch() {
+        let c: RoutingConfig = toml::from_str(
+            r#"
+[defaults]
+mcp_servers = [
+  { name = "same-name", command = "one" },
+  { name = "same_name", command = "two" },
+  { name = " bad ", command = "" },
+]
+"#,
+        )
+        .unwrap();
+        let problems = c.problems().join("\n");
+        assert!(problems.contains("collides"), "{problems}");
+        assert!(problems.contains("use only letters"), "{problems}");
+        assert!(problems.contains("empty command"), "{problems}");
     }
 
     #[test]

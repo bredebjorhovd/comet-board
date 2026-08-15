@@ -162,6 +162,11 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
             tool_failures: Some(9),
             tool_calls: Some(900),
         },
+        mcp_servers: vec![comet_proto::McpServer {
+            name: "comet-board".into(),
+            command: "comet-board".into(),
+            args: vec!["mcp".into()],
+        }],
         // On, as a real route's dispatch is (gh#272). The mock harness reads
         // no instruction file, so this one writes nothing — which is also what
         // keeps the test off the box user's own `~/.claude`.
@@ -225,6 +230,17 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
             .and_then(|c| c.git_author.as_ref())
             .map(|a| a.email.as_str()),
         Some("22494697+ana@users.noreply.github.com")
+    );
+    assert_eq!(
+        chat.config
+            .as_ref()
+            .map(|c| c.mcp_servers.as_slice())
+            .unwrap_or_default(),
+        [comet_proto::McpServer {
+            name: "comet-board".into(),
+            command: "comet-board".into(),
+            args: vec!["mcp".into()],
+        }]
     );
 
     // The brief is not just queued — the host executor runs it.
@@ -305,6 +321,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         push_repo: None,
         git_author: None,
         turn_limits: Default::default(),
+        mcp_servers: Vec::new(),
         agent_instructions: true,
         prompt: "should never be sent".into(),
     };

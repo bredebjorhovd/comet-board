@@ -79,6 +79,7 @@ fn controls(
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -308,6 +309,29 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_codex_receives_the_route_mcp_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (wrapper, argv_file) = common::recording_wrapper(&fixture_path(), &dir);
+    let harness = CodexHarness::new().with_executable(wrapper);
+    let (mut controls, _steer, _token) = controls("Yes");
+    controls.mcp_servers = vec![common::board_mcp_server()];
+
+    run_to_end(&harness, request("scenario:happy"), controls).await;
+
+    let argv = std::fs::read_to_string(argv_file).expect("spawned Codex argv");
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        argv,
+        [
+            "-c",
+            r#"mcp_servers."comet-board"={ command = "comet-board", args = ["mcp"] }"#,
+            "app-server"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn steering_uses_turn_steer_with_expected_turn_id() {
     let (controls, steer, _token) = controls("Yes");
@@ -426,6 +450,7 @@ async fn approvals_round_trip_as_input_requests() {
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        mcp_servers: Vec::new(),
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;

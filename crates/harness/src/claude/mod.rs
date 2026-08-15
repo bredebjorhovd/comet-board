@@ -227,6 +227,28 @@ impl ClaudeHarness {
     }
 }
 
+/// Claude's process-local MCP configuration. The CLI accepts this JSON string
+/// directly through `--mcp-config`, which keeps route-specific tools out of
+/// the reused `CLAUDE_CONFIG_DIR` (gh#273).
+fn mcp_config_json(servers: &[comet_proto::McpServer]) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    let configured = servers
+        .iter()
+        .map(|server| {
+            (
+                server.name.clone(),
+                serde_json::json!({
+                    "command": server.command,
+                    "args": server.args,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Some(serde_json::json!({ "mcpServers": configured }).to_string())
+}
+
 #[async_trait]
 impl Harness for ClaudeHarness {
     fn id(&self) -> HarnessId {
@@ -271,6 +293,9 @@ impl Harness for ClaudeHarness {
         }
         if let Some(account) = &controls.account {
             account.apply(&mut cmd, HarnessId::ClaudeCode);
+        }
+        if let Some(config) = mcp_config_json(&controls.mcp_servers) {
+            cmd.arg("--mcp-config").arg(config);
         }
         // Before the push credentials, whose `gh` shim has to stay in front.
         crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
@@ -507,6 +532,7 @@ async fn run_session(session: Session) {
         // credentials and the tool directories are already on the child.
         push: _,
         bin_dirs: _,
+        mcp_servers: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -915,5 +941,21 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+
+    #[test]
+    fn mcp_servers_are_one_inline_claude_config() {
+        let config = mcp_config_json(&[comet_proto::McpServer {
+            name: "comet-board".into(),
+            command: "comet-board".into(),
+            args: vec!["mcp".into()],
+        }])
+        .expect("one server produces config");
+        let config: Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(
+            config["mcpServers"]["comet-board"],
+            json!({"command": "comet-board", "args": ["mcp"]})
+        );
+        assert!(mcp_config_json(&[]).is_none());
     }
 }

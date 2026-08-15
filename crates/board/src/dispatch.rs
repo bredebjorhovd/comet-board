@@ -668,6 +668,10 @@ pub fn build_spec(
         // (gh#270). Resolved here because the route is here — the loop that
         // enforces it sees events, not config.
         turn_limits: cfg.turn_limits(Some(route)),
+        // The route's process-local tool servers (gh#273). This owned copy is
+        // the seam between routing.toml and the engine; harness adapters never
+        // parse board configuration themselves.
+        mcp_servers: cfg.mcp_servers(Some(route)).to_vec(),
         // And whether its runtime is handed the board's conventions in the file
         // it reads on its own (gh#272) — same reasoning again: the executor
         // writes the file, and the executor has no `routing.toml`.
@@ -1492,6 +1496,29 @@ mod tests {
         let mut opted_out = route();
         opted_out.agent_instructions = Some(false);
         assert!(!spec(&opted_out));
+    }
+
+    /// gh#273: the engine and harnesses have no routing.toml to consult, so the
+    /// effective list crosses the same dispatch seam as the turn limits.
+    #[test]
+    fn a_dispatch_carries_its_routes_mcp_servers() {
+        let cfg = RoutingConfig::default();
+        let mut r = route();
+        r.mcp_servers = Some(vec![comet_proto::McpServer {
+            name: "repo".into(),
+            command: "repo-mcp".into(),
+            args: vec!["--stdio".into()],
+        }]);
+        let spec = build_spec(
+            &cfg,
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.mcp_servers, r.mcp_servers.unwrap());
     }
 
     /// gh#107: the teammate who released the work is the author of what comes

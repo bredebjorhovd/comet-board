@@ -116,6 +116,7 @@ impl ResolvedRunConfig {
             // …and the turn guardrails are the board's too (gh#270): a chat
             // somebody is sitting in front of is not one that needs watching.
             turn_limits: Default::default(),
+            mcp_servers: Vec::new(),
         })
     }
 }
@@ -129,6 +130,22 @@ impl ResolvedRunConfig {
 /// the same row here).
 pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
+}
+
+/// Carry the parts of a chat config the model/reasoning pickers do not own
+/// across their full-row replacement.
+///
+/// Board-dispatched chats attach credentials, guardrails and MCP capability to
+/// the chat itself so later/review runs inherit them. Re-resolving the visible
+/// model controls must not turn that dispatched chat into a composer-created
+/// one with those fields reset to defaults.
+fn preserve_picker_unowned_fields(existing: &ChatConfig, replacement: &mut ChatConfig) {
+    replacement.sandbox = existing.sandbox;
+    replacement.account.clone_from(&existing.account);
+    replacement.push_repo.clone_from(&existing.push_repo);
+    replacement.git_author.clone_from(&existing.git_author);
+    replacement.turn_limits = existing.turn_limits;
+    replacement.mcp_servers.clone_from(&existing.mcp_servers);
 }
 
 /// Indices of a harness's catalog models matching the search query — matched
@@ -1141,7 +1158,7 @@ impl Pickers {
             .selected_chat_row()
             .and_then(|c| c.config.as_ref())
         {
-            config.sandbox = existing.sandbox;
+            preserve_picker_unowned_fields(existing, &mut config);
         }
         change(&mut config);
         // Reasoning must stay concrete for whatever model the row now names —
@@ -2857,6 +2874,26 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[test]
+    fn picker_edit_preserves_dispatched_mcp_servers() {
+        let resolved = ResolvedRunConfig {
+            harness: Some(HarnessId::ClaudeCode),
+            model: Some("sonnet".into()),
+            ..ResolvedRunConfig::default()
+        };
+        let mut existing = resolved.chat_config().unwrap();
+        existing.mcp_servers = vec![comet_proto::McpServer {
+            name: "comet-board".into(),
+            command: "comet-board".into(),
+            args: vec!["mcp".into()],
+        }];
+        let mut replacement = resolved.chat_config().unwrap();
+
+        preserve_picker_unowned_fields(&existing, &mut replacement);
+
+        assert_eq!(replacement.mcp_servers, existing.mcp_servers);
     }
 
     #[test]

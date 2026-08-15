@@ -136,6 +136,34 @@ pub struct ChatConfig {
     /// a thing to impose on somebody sitting at their own session.
     #[serde(default, skip_serializing_if = "TurnLimits::is_off")]
     pub turn_limits: TurnLimits,
+    /// MCP stdio servers this chat's harness starts for every run (gh#273).
+    ///
+    /// On the chat rather than in a harness-owned config directory because
+    /// routes can carry different servers while account slots are reused — and
+    /// can be live concurrently. Each harness serializes this same description
+    /// into its process-local configuration, so no dispatch edits the checkout
+    /// or overwrites another chat's tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
+}
+
+/// One local Model Context Protocol server a harness starts over stdio.
+///
+/// Deliberately transport-small for the first seam (gh#273): all three
+/// harnesses share `command + args`, while HTTP authentication differs enough
+/// between them that pretending it is uniform would only leak adapter details
+/// into routing.toml. A later transport earns a second variant when it has a
+/// concrete consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    /// Stable name used to namespace the server's tools.
+    pub name: String,
+    /// Executable resolved in the harness child's PATH.
+    pub command: String,
+    /// Arguments passed to [`Self::command`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 /// How much a single turn may spin before the board intervenes (gh#270).

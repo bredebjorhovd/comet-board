@@ -463,6 +463,12 @@ impl Harness for CodexHarness {
             Vec::new()
         };
         let mut cmd = Command::new(&exe);
+        // Global `-c` overrides must precede the app-server subcommand. Each
+        // value is one complete inline table, so a route cannot inherit stale
+        // args from a same-named server in the reused CODEX_HOME (gh#273).
+        for config in mcp_config_overrides(&controls.mcp_servers) {
+            cmd.arg("-c").arg(config);
+        }
         cmd.arg("app-server");
         crate::prepend_exe_dir_to_path(&mut cmd, &exe);
         if let Some(chat_id) = &controls.chat_id {
@@ -532,6 +538,21 @@ impl Harness for CodexHarness {
         })
         .boxed())
     }
+}
+
+/// Codex CLI `-c` values for stdio MCP servers. Values are parsed as TOML; JSON
+/// strings and arrays are valid TOML values, and quoting the dotted-key segment
+/// prevents a server name from changing which setting is overridden.
+fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
+    servers
+        .iter()
+        .map(|server| {
+            let name = serde_json::to_string(&server.name).expect("a string serializes");
+            let command = serde_json::to_string(&server.command).expect("a string serializes");
+            let args = serde_json::to_string(&server.args).expect("string args serialize");
+            format!("mcp_servers.{name}={{ command = {command}, args = {args} }}")
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +679,7 @@ async fn run_session(session: Session) {
         // credentials and the tool directories are already on the child.
         push: _,
         bin_dirs: _,
+        mcp_servers: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -1676,6 +1698,19 @@ mod tests {
         assert!(!needs((0, 147, 0)), "the version it was verified fixed on");
         assert!(!needs((0, 148, 0)));
         assert!(!needs((1, 0, 0)));
+    }
+
+    #[test]
+    fn mcp_servers_are_complete_codex_config_overrides() {
+        assert_eq!(
+            mcp_config_overrides(&[comet_proto::McpServer {
+                name: "comet-board".into(),
+                command: "comet-board".into(),
+                args: vec!["mcp".into()],
+            }]),
+            [r#"mcp_servers."comet-board"={ command = "comet-board", args = ["mcp"] }"#]
+        );
+        assert!(mcp_config_overrides(&[]).is_empty());
     }
 
     #[test]
