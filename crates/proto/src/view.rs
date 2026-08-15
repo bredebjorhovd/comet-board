@@ -2,12 +2,15 @@
 //! of them should own — sort orders, staleness gating, sidebar grouping, the
 //! boot gate, relative times.
 //!
-//! This lives in `proto` rather than in a viewport crate because comet-native
-//! has two of them (the gpui app in `comet-ui`, the terminal app in
-//! `comet-tui`) and a *divergent* sort order between them is a real bug: the
-//! same workspace doc must produce the same row order on every surface. Both
-//! crates re-export from here, so there is exactly one implementation and one
-//! test suite per rule.
+//! This lives in `proto` rather than in a viewport crate because comet has two
+//! viewports (the gpui app in `comet-ui`, and the iOS app, which mirrors these
+//! derivations in Swift against the same wire shapes) and a *divergent* sort
+//! order between them is a real bug: the same workspace doc must produce the
+//! same row order on every surface. `comet-ui` re-exports from here and the
+//! phone's Swift twins are checked against the same rules, so there is exactly
+//! one implementation and one test suite per rule — which is also why this
+//! module must not be inlined into `comet-ui`: the derivations have to stay
+//! viewport-independent for a surface that cannot link the crate.
 //!
 //! Everything in this module is pure. `chat_indicator` (the status derivation
 //! these gate on) is in [`crate::entities`].
@@ -615,9 +618,9 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
 ///
 /// Colors live here rather than in either viewport because the *meaning* of a
 /// hue must not differ between surfaces — a session that reads "running" in the
-/// desktop app cannot read "error" in the terminal. Each frontend converts to
-/// its own color type; `comet-ui` has the oklch→sRGB math, `comet-tui` pins the
-/// converted values with a test.
+/// desktop app cannot read "error" on the phone. Each frontend converts to
+/// its own color type; `comet-ui` has the oklch→sRGB math, and the iOS theme
+/// mirrors the same anchors.
 ///
 /// The lightness is the point. Before the anchor the palette agreed on chroma
 /// (≈0.19) and nothing else: amber sat at L 0.828 and indigo at L 0.673, so the

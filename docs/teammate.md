@@ -112,7 +112,7 @@ stops it being the *only* way.
 Their runs have to spend a subscription. Without a slot of their own, that is
 whichever one the route names — normally the box owner's.
 
-On the **box**, desktop app or TUI → **Settings → Agent accounts** → sign in
+On the **box**, desktop app → **Settings → Agent accounts** → sign in
 their Claude (or Codex) login. It gets a slot id. Then either point the routes
 they will work on at it, or have them name it per dispatch:
 

@@ -18,7 +18,6 @@ comet-board.workspace = true
 comet-proto.workspace = true
 comet-rpc.workspace = true
 comet-ui.workspace = true
-comet-tui.workspace = true
 comet-update.workspace = true
 tokio.workspace = true
 clap.workspace = true

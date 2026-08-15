@@ -36,9 +36,6 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Terminal viewport over the same engine — attaches to a running app or
-    /// daemon, or starts one, and detaches (leaving work running) when it exits.
-    Tui(comet_tui::cli::TuiArgs),
 }
 
 #[derive(Subcommand)]
@@ -112,7 +109,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Tui(args)) => comet_tui::cli::run(args),
         Some(Command::Headless) => {
             warn_on_stale_board_cli();
             let runtime = tokio::runtime::Runtime::new()?;

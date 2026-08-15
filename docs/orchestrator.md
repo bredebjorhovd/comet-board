@@ -8,7 +8,7 @@ tells a human what happened — so the human's job reduces to reading summaries.
 ## Pinning one
 
 Open a session on the box, then **Pin as orchestrator** on its row (right-click
-in the desktop app, `m` in the TUI, long-press on the phone — or the chat
+in the desktop app, long-press on the phone — or the chat
 screen's ⋯ menu there, which is the surface an idle chat has). One per board;
 pinning another moves it, and the phone says whose pin it is moving before it
 does. Under the hood that is `[defaults] orchestrator_chat` in the board's

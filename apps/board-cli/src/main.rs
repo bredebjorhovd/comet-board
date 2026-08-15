@@ -2,7 +2,7 @@
 //! (§board-cli; the operator trio landed with §adopt-doctor-init).
 //!
 //! A thin binary over `crates/board`, attaching to the local engine exactly as
-//! `comet-tui` does: the engine owns the board loop and the workspace doc, and
+//! any viewport does: the engine owns the board loop and the workspace doc, and
 //! this speaks the typed RPC on the localhost IPC WebSocket — `WatchBoard` for
 //! `list`/`wait`, `DispatchTask`/`CancelTask` for the verbs, `WatchSpaces` for
 //! the one thing the setup commands cannot know (which spaces exist on this
@@ -12,7 +12,7 @@
 //! The board it drives need not be this device's. `--device` names the box that
 //! hosts it, and the board RPCs are relay-forwardable (gh#55), so the dial
 //! stays localhost and the local engine forwards — the same thing the desktop
-//! panel and the TUI pane do (gh#73).
+//! panel does (gh#73).
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -37,7 +37,7 @@ mod skill_doc;
 #[cfg(test)]
 mod board_docs;
 
-/// Same default as `apps/comet` and `comet-tui`.
+/// Same default as `apps/comet`.
 const DEFAULT_IPC_PORT: u16 = 27654;
 
 /// The engine answers a snapshot immediately; anything slower than this is a
