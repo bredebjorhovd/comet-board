@@ -90,6 +90,30 @@ async fn wait_stream<T>(
     }
 }
 
+/// [`wait_stream`] over `WatchDocMessages`, materializing its delta frames
+/// (gh#414) so the predicate keeps seeing the whole transcript as a JSON array.
+async fn wait_transcript<T>(
+    client: &RpcClient,
+    chat_id: &str,
+    what: &str,
+    predicate: impl Fn(&serde_json::Value) -> Option<T>,
+) -> T {
+    let entries = std::cell::RefCell::new(Vec::<comet_doc::SessionMessageEntry>::new());
+    wait_stream(
+        client,
+        methods::WATCH_DOC_MESSAGES,
+        serde_json::json!({ "chatId": chat_id }),
+        what,
+        move |item| {
+            let frame: comet_doc::TranscriptFrame = serde_json::from_value(item.clone()).ok()?;
+            let mut entries = entries.borrow_mut();
+            comet_doc::apply_transcript_frame(&mut entries, frame).ok()?;
+            predicate(&serde_json::to_value(&*entries).ok()?)
+        },
+    )
+    .await
+}
+
 /// Retry a device-addressed call until the host relay has finished joining.
 async fn call_until(
     client: &RpcClient,
@@ -249,13 +273,9 @@ async fn main() {
     )
     .await
     .unwrap_or_else(|err| fail(&format!("the brief on the box: {err}")));
-    wait_stream(
-        &a,
-        methods::WATCH_DOC_MESSAGES,
-        serde_json::json!({ "chatId": chat_id }),
-        "the box runs the brief",
-        |item| (!completed_assistants(item).is_empty()).then_some(()),
-    )
+    wait_transcript(&a, &chat_id, "the box runs the brief", |item| {
+        (!completed_assistants(item).is_empty()).then_some(())
+    })
     .await;
     pass("the box created a chat and ran its first turn");
 
@@ -278,10 +298,9 @@ async fn main() {
     pass("the chat is shared with the org");
 
     // ── gate 3: the teammate READS the shared chat ────────────────────────
-    let (wrote, text) = wait_stream(
+    let (wrote, text) = wait_transcript(
         &b,
-        methods::WATCH_DOC_MESSAGES,
-        serde_json::json!({ "chatId": chat_id }),
+        &chat_id,
         "the shared transcript on the teammate's laptop",
         |item| completed_assistants(item).into_iter().next(),
     )
@@ -309,16 +328,10 @@ async fn main() {
     )
     .await
     .unwrap_or_else(|err| fail(&format!("QueueCommand on the teammate's laptop: {err}")));
-    let answers = wait_stream(
-        &b,
-        methods::WATCH_DOC_MESSAGES,
-        serde_json::json!({ "chatId": chat_id }),
-        "the teammate's turn answered",
-        |item| {
-            let done = completed_assistants(item);
-            (done.len() >= 2).then_some(done)
-        },
-    )
+    let answers = wait_transcript(&b, &chat_id, "the teammate's turn answered", |item| {
+        let done = completed_assistants(item);
+        (done.len() >= 2).then_some(done)
+    })
     .await;
     for (device, entry) in &answers {
         if device != &a_dev {

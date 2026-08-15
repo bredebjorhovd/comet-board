@@ -1554,6 +1554,39 @@ where
     .boxed()
 }
 
+/// The transcript watch as delta frames (`comet_doc::transcript_delta`): a
+/// full `reset` first, then only changed entries per commit — the whole-Vec
+/// serialization here was the per-tick cost that scaled with transcript size.
+fn doc_messages_stream(
+    rx: watch::Receiver<Vec<comet_doc::SessionMessageEntry>>,
+) -> BoxStream<'static, serde_json::Value> {
+    use comet_doc::transcript_delta::{TranscriptFrame, diff_transcript};
+    futures::stream::unfold(
+        (rx, None::<Vec<comet_doc::SessionMessageEntry>>),
+        |(mut rx, mut prev)| async move {
+            loop {
+                if prev.is_some() {
+                    rx.changed().await.ok()?;
+                }
+                let current: Vec<_> = rx.borrow_and_update().clone();
+                let frame = match prev.as_deref() {
+                    None => TranscriptFrame::reset(&current),
+                    Some(prev) => diff_transcript(prev, &current),
+                };
+                prev = Some(current);
+                // No-op commits (a second watcher attaching, command-only
+                // changes) produce empty deltas — skip the frame entirely.
+                if frame.is_empty_delta() {
+                    continue;
+                }
+                let value = serde_json::to_value(&frame).ok()?;
+                return Some((value, (rx, prev)));
+            }
+        },
+    )
+    .boxed()
+}
+
 /// Authentication-only RPC surface used while the headed app is waiting for a
 /// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
 /// the UI show its sign-in and organization gates before identity-scoped Loro
@@ -1778,7 +1811,9 @@ impl RpcService for EngineRpc {
                     .doc_host
                     .open(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(watch_stream(handle.watch_messages())))
+                Ok(RpcReply::Stream(doc_messages_stream(
+                    handle.watch_messages(),
+                )))
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
