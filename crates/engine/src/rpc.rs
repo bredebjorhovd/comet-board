@@ -1313,12 +1313,14 @@ impl EngineRpc {
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
                 let sessions = self.sessions.clone();
+                let doc_host = self.doc_host.clone();
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
                         if let Err(err) = sessions.interrupt(&chat_id).await {
                             tracing::debug!(chat = %chat_id, error = %err, "deleteSpace interrupt skipped");
                         }
+                        doc_host.purge_chat(&chat_id);
                     }
                 });
                 Ok(())
@@ -1362,11 +1364,11 @@ impl EngineRpc {
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::DeleteChat { chat_id } => self
-                .workspace
-                .delete_chat(&chat_id)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::DeleteChat { chat_id } => {
+                self.workspace.delete_chat(&chat_id).map_err(failed)?;
+                self.doc_host.purge_chat(&chat_id);
+                Ok(())
+            }
             MutateParams::RenameDevice { device_id, name } => self
                 .workspace
                 .rename_device(&device_id, &name)
