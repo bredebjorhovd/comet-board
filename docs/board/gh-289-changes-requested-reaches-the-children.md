@@ -4,15 +4,23 @@ Stacks 8/9. Review delivery was strictly one pull request → one authoring atte
 → one chat. In a stack that contract is incomplete: `changes requested` on layer 2
 is not only about layer 2, because layers 3..N are built on code that is now
 wrong. Layer 2's agent got the review and started fixing; when it force-pushed,
-GitHub left every layer above it on the old history. Layer 3 then had to launch
-one ordered upstack rebase that carried itself and every higher layer onto the
-new base — moving those diffs under their authors *and* their reviewers.
+the implementation assumed GitHub replayed every layer above it on the new base
+— so their diffs moved under their authors *and* under their reviewers, with no
+explanation in either place.
 
-Landed as [`crate::stacks::Dependents`], [`crate::review::address`],
-[`crate::review::compose_notice`] and [`crate::review::compose_hold_notice`] in
-`crates/board/src/{stacks,review}.rs`, a `changes-below` verdict in
-[`comet_proto::view::board::landing`], and one arm in
+Landed as [`crate::stacks::Dependents`], [`crate::review::address`] and
+[`crate::review::compose_notice`] in `crates/board/src/{stacks,review}.rs`, a
+`changes-below` verdict in [`comet_proto::view::board::landing`], and one arm in
 [`crate::model::derive_state`].
+
+### Later correction: a force-push is not a merge
+
+The real-stack run in §gh#337 disproved that replay assumption. GitHub replays
+the layers above a merged pull request, but a force-push leaves every upper
+branch on its old history and its pull request can become `dirty`. §gh#407
+corrected the notice and gave the direct child one ordered `gh stack rebase
+--upstack`; farther dependents receive an informational hold notice. The rest of
+this write-up records gh#289's model and implementation as they landed.
 
 ### The mechanism, not the notice
 
@@ -32,9 +40,7 @@ So the two halves are separate and both are general:
   the fan-out both go through it, so the author check cannot drift from the
   fan-out of it. It replaces the inlined check `deliver_review_for` used to carry.
 
-The notices then split by topology, with one per-edge watermark: the direct child
-gets the actionable rebase command, while transitive dependents are told to wait
-for that ordered replay.
+The notice itself is then three lines of composition and a per-edge watermark.
 
 ### Direction: downward only
 
@@ -63,14 +69,12 @@ edge is an attempt id and not a branch string for gh#285's reason — a parent t
 merges has its branch deleted, and this is one of the two places that needs the
 edge precisely then.
 
-`above` is transitive and nearest-first. Transitive because rewriting layer 2
-requires layer 3 to replay itself and layer 4 in one ordered cascade: a notice
-that stopped at the direct child would leave every layer above it wondering why
-its diff was held and later moved, which is this bug one layer up. Only the
-direct child receives the command; farther layers receive information so they
-cannot race or repeat its replay. Both walks are bounded by the number of rows,
-so a malformed edge — two rows each recorded as the other's parent — costs a
-short answer and never a hung sync cycle.
+`above` is transitive and nearest-first. Under the original replay assumption,
+rewriting layer 2 moved layer 3, which moved layer 4: a notice that stopped at
+the direct child would leave every layer above it wondering why its diff moved,
+which is this bug one layer up. Both walks are bounded by the number of rows, so
+a malformed edge — two rows each recorded as the other's parent — costs a short
+answer and never a hung sync cycle.
 
 ### Question 1 — hold or inform: split by state
 
@@ -78,8 +82,8 @@ short answer and never a hung sync cycle.
   about to be rebased is wasted attention, and the worse outcome is not wasted
   reading: it is an *approval that outlives the diff it was given to*.
 - **A child still `working` is informed, not stopped.** Its run may produce work
-  that survives the ordered rebase, and killing an in-flight agent to save it a
-  rebase spends a context to save a `git rebase`.
+  that survives the replay, and killing an in-flight agent to save it a rebase
+  spends a context to save a `git rebase`.
 
 That split falls out of `derive_state` for free, because rule 3 already answers
 `working` for a live working attempt and only reaches the review decision for a
