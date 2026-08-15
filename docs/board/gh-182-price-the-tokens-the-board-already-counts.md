@@ -2,7 +2,7 @@
 
 §gh#151 made the board count tokens and closed with the sentence this ticket
 starts from: *"pricing is a separate ticket… whatever is shown must be labelled
-a list-price estimate of the same usage on the API, not a bill."* This is the
+a list-price API estimate of the same usage, not a bill."* This is the
 backend half of gh#179 — that ticket redesigns the Stats page around spend,
 this one makes spend a number the page can render, in `crates/board` and
 `crates/proto` so the two can run in parallel.
@@ -46,8 +46,9 @@ calling the total the board's spend.
   ticket only had to make the table a file with a date on it.
 - **Unknown model → unpriced, never zero.** `rate_for` answers `None`, the
   caller carries those tokens through as `unpriced`, and every surface prints
-  the headline *with* what it left out: `$12.06 at list price … 66k token(s) on
-  1 model(s) with no rate, and so not in that total: gpt-5.6-terra`. §gh#96's
+  the headline *with* what it left out: `$12.06 list-price API estimate … 66k
+  token(s) on 1 model(s) with no rate, and so not in that total:
+  gpt-5.6-terra`. §gh#96's
   lesson applied to money. The shipped table is Anthropic-only on purpose — this
   file will not carry a price nobody here checked against a published list, and
   a Codex box fixes that with three lines of config rather than by trusting a

@@ -224,6 +224,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // it, and the attempt row and the review read it from there.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage(_)
+        | AgentEvent::AgentUsage(_)
+        | AgentEvent::ModelUsage { .. }
         | AgentEvent::Sandbox(_)
         | AgentEvent::ContextUsage(_) => {}
     }

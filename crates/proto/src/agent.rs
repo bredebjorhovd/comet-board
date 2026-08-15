@@ -426,7 +426,9 @@ impl TokenUsage {
         Self {
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             output_tokens: self.output_tokens.saturating_add(other.output_tokens),
-            cache_read_tokens: self.cache_read_tokens.saturating_add(other.cache_read_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_add(other.cache_read_tokens),
             cache_creation_tokens: self
                 .cache_creation_tokens
                 .saturating_add(other.cache_creation_tokens),
@@ -442,6 +444,49 @@ impl std::iter::Sum for TokenUsage {
     fn sum<I: Iterator<Item = TokenUsage>>(iter: I) -> Self {
         iter.fold(Self::default(), Self::merged)
     }
+}
+
+/// Which part of a harness run spent a token (gh#426).
+///
+/// Kept separate from the agent's display name: `main` is a stable role, and
+/// `Explore` / `research` are harness-owned labels that may change between
+/// calls. A consumer can therefore group all delegated work without parsing a
+/// string, while still showing which kind of delegate did it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentKind {
+    Main,
+    Subagent,
+}
+
+/// One agent/model slice of token usage reported by a harness (gh#426).
+///
+/// This is attribution metadata beside [`AgentEvent::Usage`], never a second
+/// total. The result event remains the authority for how many tokens the turn
+/// spent; assistant-message usage says which agent and model spent a slice of
+/// it. Older journals simply contain no values of this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTokenUsage {
+    pub agent: AgentKind,
+    /// Harness-owned subagent type (`Explore`, `research`, …). `None` for the
+    /// main agent and for a delegate whose launch frame could not be matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub model: String,
+    pub usage: TokenUsage,
+}
+
+/// One model's exact share of a turn total (gh#426).
+///
+/// Claude's result frame reports this independently of per-message agent
+/// attribution. Keeping the two facts apart lets the board price a mixed-model
+/// attempt exactly even when an older CLI omitted agent detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTokenUsage {
+    pub model: String,
+    pub usage: TokenUsage,
 }
 
 /// How full the agent's context window is right now (gh#271).
@@ -574,6 +619,16 @@ pub enum AgentEvent {
     /// that is the one property both harnesses had to be settled on before
     /// anything could be added up.
     Usage(TokenUsage),
+    /// An assistant step's usage with the agent and model that spent it
+    /// (gh#426). Additive metadata beside the turn-level [`Usage`](Self::Usage)
+    /// total; journal readers must not add the two together.
+    AgentUsage(AgentTokenUsage),
+    /// The turn total split by model, as the harness reported it (gh#426).
+    /// Empty/absent on harnesses that expose only one undifferentiated total.
+    #[serde(rename_all = "camelCase")]
+    ModelUsage {
+        models: Vec<ModelTokenUsage>,
+    },
     /// How full the context window is at this moment (gh#271) — a level, not a
     /// flow. See [`ContextUsage`] for why it is not folded into `Usage`.
     ///

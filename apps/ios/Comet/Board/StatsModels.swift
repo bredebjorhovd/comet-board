@@ -283,6 +283,37 @@ struct ModelSpend: Decodable, Hashable, Identifiable {
     var cost: Double
 }
 
+/// Which part of a harness run spent a token (gh#426).
+enum AgentKind: String, Decodable, Hashable {
+    case main
+    case subagent
+}
+
+/// One main/subagent/model slice, where the journal exposed assistant-step
+/// attribution. The amount is named as a list-price API estimate on the wire
+/// because subscription runs are not billed per token.
+struct AgentSpend: Decodable, Hashable, Identifiable {
+    var agent: AgentKind
+    var name: String?
+    var model: String
+    var usage: TokenUsage
+    var listPriceApiEstimate: Double?
+    var unpricedTokens: UInt64
+
+    var id: String { "\(agent.rawValue)|\(name ?? "")|\(model)" }
+
+    var label: String {
+        let who = agent == .main ? "Main" : (name ?? "Subagent")
+        return "\(who) · \(model)"
+    }
+
+    var priceLabel: String {
+        guard let estimate = listPriceApiEstimate else { return "rates not configured" }
+        if unpricedTokens > 0 && estimate == 0 { return "unpriced" }
+        return humanUsd(estimate)
+    }
+}
+
 /// A plan a human wrote down: what an agent account costs its owner per month.
 struct AccountPlan: Decodable, Hashable {
     var label: String?
@@ -351,8 +382,8 @@ struct BoardSpend: Decodable, Hashable {
     /// Mirrors `stats::BoardSpend::headline`.
     var headline: String {
         let price = humanUsd(listPrice)
-        if isComplete { return "\(price) at list price" }
-        return "\(price) at list price, plus \(humanTokens(unpricedTokens)) "
+        if isComplete { return "\(price) list-price API estimate" }
+        return "\(price) list-price API estimate, plus \(humanTokens(unpricedTokens)) "
             + "unpriced token(s) across \(unpriced.count) model(s)"
     }
 
@@ -362,6 +393,13 @@ struct BoardSpend: Decodable, Hashable {
     var monthlySubscriptions: Double {
         accounts.compactMap { $0.plan?.monthly }.reduce(0, +)
     }
+}
+
+/// The semantic basis for every compatible `listPrice` / `cost` money field
+/// in a stats reply. Optional on `BoardStats` only so a new phone can still
+/// read an older box; every newly emitted reply carries this discriminator.
+enum PricingBasis: String, Decodable, Hashable {
+    case listPriceApiEstimate
 }
 
 /// Everything the board can say about its own throughput over a window.
@@ -397,6 +435,10 @@ struct BoardStats: Decodable, Hashable {
     /// That share, `0...1`. `nil` when nothing ran, never `0` — the same rule
     /// `completionRate` follows.
     var tokenCoverage: Double?
+    /// Optional for older boxes: no value means the journal exposed no
+    /// main/subagent attribution, never that those agents spent zero.
+    var attemptsWithAgentUsage: Int?
+    var agentUsage: [AgentSpend]?
 
     var landing: Landing
     var friction: Friction
@@ -435,6 +477,7 @@ struct BoardStats: Decodable, Hashable {
     /// arrives with a `spend` whose total is zero, and those are different
     /// facts.
     var spend: BoardSpend?
+    var pricingBasis: PricingBasis?
 
     /// How close this window's attempts ran to filling their agents' context
     /// windows (gh#271) — the other meter, and the one the spend cannot stand

@@ -29,6 +29,8 @@
   "boardStats": [
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": null,
@@ -65,6 +67,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 7 days"
@@ -72,7 +75,9 @@
       "name": "a board that has just started",
       "stats": {
         "agentDispatched": 0,
+        "agentUsage": [],
         "attempts": 0,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 0,
         "breakdown": [],
         "byAccount": {},
@@ -133,6 +138,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": null,
         "tasksTouched": 0,
@@ -151,6 +157,8 @@
     },
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": null,
@@ -187,6 +195,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "all time"
@@ -194,7 +203,9 @@
       "name": "all time, nothing in it",
       "stats": {
         "agentDispatched": 0,
+        "agentUsage": [],
         "attempts": 0,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 0,
         "breakdown": [],
         "byAccount": {},
@@ -255,6 +266,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": null,
         "spend": null,
         "tasksTouched": 0,
@@ -273,6 +285,8 @@
     },
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": null,
@@ -309,6 +323,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 24 hours"
@@ -316,7 +331,9 @@
       "name": "24 hours",
       "stats": {
         "agentDispatched": 0,
+        "agentUsage": [],
         "attempts": 0,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 0,
         "breakdown": [],
         "byAccount": {},
@@ -377,6 +394,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 1,
         "spend": null,
         "tasksTouched": 0,
@@ -395,6 +413,8 @@
     },
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": "0%",
@@ -431,6 +451,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 0,
         "windowLabel": "last 30 days"
@@ -438,7 +459,9 @@
       "name": "ran, and nothing reported usage",
       "stats": {
         "agentDispatched": 0,
+        "agentUsage": [],
         "attempts": 4,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 0,
         "breakdown": [],
         "byAccount": {},
@@ -499,6 +522,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 30,
         "spend": null,
         "tasksTouched": 0,
@@ -517,6 +541,8 @@
     },
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": "82%",
         "contextReported": true,
         "coveragePercent": "62%",
@@ -553,6 +579,7 @@
         ],
         "peakDispatches": 8,
         "peakTokens": 440,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "rates not configured",
         "tokenTotal": 185000,
         "windowLabel": "last 7 days"
@@ -560,7 +587,9 @@
       "name": "a busy week",
       "stats": {
         "agentDispatched": 5,
+        "agentUsage": [],
         "attempts": 13,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 8,
         "breakdown": [],
         "byAccount": {},
@@ -738,6 +767,7 @@
         "medianMinutes": 18,
         "outcomes": {},
         "p90Minutes": 74,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": null,
         "tasksTouched": 11,
@@ -769,6 +799,14 @@
     },
     {
       "expect": {
+        "agentLabels": [
+          "Main · claude-opus-5",
+          "Explore · gpt-5.6-luna"
+        ],
+        "agentPriceLabels": [
+          "$0.02",
+          "unpriced"
+        ],
         "completionPercent": "82%",
         "contextReported": true,
         "coveragePercent": "62%",
@@ -805,14 +843,43 @@
         ],
         "peakDispatches": 8,
         "peakTokens": 440,
-        "spendLabel": "$0.40 at list price, plus 1.0k unpriced token(s) across 1 model(s)",
+        "pricingBasis": "listPriceApiEstimate",
+        "spendLabel": "$0.40 list-price API estimate, plus 1.0k unpriced token(s) across 1 model(s)",
         "tokenTotal": 185000,
         "windowLabel": "last 7 days"
       },
       "name": "a busy week, priced",
       "stats": {
         "agentDispatched": 5,
+        "agentUsage": [
+          {
+            "agent": "main",
+            "listPriceApiEstimate": 0.016875,
+            "model": "claude-opus-5",
+            "unpricedTokens": 0,
+            "usage": {
+              "cacheCreationTokens": 300,
+              "cacheReadTokens": 10000,
+              "inputTokens": 1000,
+              "outputTokens": 200
+            }
+          },
+          {
+            "agent": "subagent",
+            "listPriceApiEstimate": 0.0,
+            "model": "gpt-5.6-luna",
+            "name": "Explore",
+            "unpricedTokens": 1000,
+            "usage": {
+              "cacheCreationTokens": 500,
+              "cacheReadTokens": 0,
+              "inputTokens": 400,
+              "outputTokens": 100
+            }
+          }
+        ],
         "attempts": 13,
+        "attemptsWithAgentUsage": 1,
         "attemptsWithTokens": 8,
         "breakdown": [
           {
@@ -1056,6 +1123,7 @@
         "medianMinutes": 18,
         "outcomes": {},
         "p90Minutes": 74,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": {
           "accounts": [
@@ -1275,6 +1343,8 @@
     },
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": "100%",
@@ -1311,6 +1381,7 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
+        "pricingBasis": "listPriceApiEstimate",
         "spendLabel": "no rate for any model in this window (1.0k unpriced token(s))",
         "tokenTotal": 1000,
         "windowLabel": "last 7 days"
@@ -1318,7 +1389,9 @@
       "name": "rates configured, nothing priceable",
       "stats": {
         "agentDispatched": 0,
+        "agentUsage": [],
         "attempts": 2,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 2,
         "breakdown": [],
         "byAccount": {},
@@ -1379,6 +1452,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": {
           "accounts": [],
@@ -1528,6 +1602,8 @@
     },
     {
       "expect": {
+        "agentLabels": [],
+        "agentPriceLabels": [],
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": "100%",
@@ -1564,14 +1640,17 @@
         ],
         "peakDispatches": 0,
         "peakTokens": 0,
-        "spendLabel": "$0.40 at list price, plus 2.90M unpriced token(s) across 1 model(s)",
+        "pricingBasis": "listPriceApiEstimate",
+        "spendLabel": "$0.40 list-price API estimate, plus 2.90M unpriced token(s) across 1 model(s)",
         "tokenTotal": 3084000,
         "windowLabel": "last 7 days"
       },
       "name": "one model the table has no rate for",
       "stats": {
         "agentDispatched": 0,
+        "agentUsage": [],
         "attempts": 12,
+        "attemptsWithAgentUsage": 0,
         "attemptsWithTokens": 12,
         "breakdown": [
           {
@@ -1664,6 +1743,7 @@
         "medianMinutes": null,
         "outcomes": {},
         "p90Minutes": null,
+        "pricingBasis": "listPriceApiEstimate",
         "sinceDays": 7,
         "spend": {
           "accounts": [],

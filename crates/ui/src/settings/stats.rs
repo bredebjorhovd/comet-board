@@ -125,9 +125,10 @@ use serde::{Deserialize, Serialize};
 use comet_proto::view::board;
 use comet_proto::view::rates::human_usd;
 use comet_proto::view::stats::{
-    BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit, Dimension, HostBoard, LandingKind,
-    WINDOWS, bar_fraction, day_captions_fit, day_columns, elsewhere_note, hour_grid, human_minutes,
-    human_multiple, human_tokens, other_boards_note, peak_tokens, percent,
+    AgentSpend, BREAKDOWN_ROWS, BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit,
+    Dimension, HostBoard, LandingKind, WINDOWS, bar_fraction, day_captions_fit, day_columns,
+    elsewhere_note, hour_grid, human_minutes, human_multiple, human_tokens, other_boards_note,
+    peak_tokens, percent,
 };
 use comet_rpc::methods;
 
@@ -922,6 +923,9 @@ impl StatsPage {
                      list prices are used when it names none.",
                 ));
             }
+            if let Some(agent_usage) = Self::render_agent_usage(stats, theme) {
+                card = card.child(agent_usage);
+            }
             return card
                 .child(Self::note(theme, Self::BILL_NOTE))
                 .into_any_element();
@@ -933,7 +937,7 @@ impl StatsPage {
         let price = Self::spend_cell(
             theme,
             human_usd(spend.list_price),
-            "list price for this work",
+            "list-price API estimate for this work",
             Some(format!(
                 "{} tokens over {window}",
                 human_tokens(split.tokens)
@@ -986,19 +990,21 @@ impl StatsPage {
             }
         };
 
-        Self::card(theme)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_stretch()
-                    .child(price)
-                    .child(Self::rule(theme))
-                    .child(plans)
-                    .child(Self::rule(theme))
-                    .child(Self::render_cost_split(&split, theme)),
-            )
-            .child(Self::spend_footer(stats, spend, theme))
+        let mut card = Self::card(theme).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_stretch()
+                .child(price)
+                .child(Self::rule(theme))
+                .child(plans)
+                .child(Self::rule(theme))
+                .child(Self::render_cost_split(&split, theme)),
+        );
+        if let Some(agent_usage) = Self::render_agent_usage(stats, theme) {
+            card = card.child(agent_usage);
+        }
+        card.child(Self::spend_footer(stats, spend, theme))
             .into_any_element()
     }
 
@@ -1053,7 +1059,7 @@ impl StatsPage {
             .into_any_element()
     }
 
-    /// Where the list price goes (gh#225): the four rates as a proportional
+    /// Where the list-price API estimate goes (gh#225): the four rates as a proportional
     /// bar, with what each one bought beneath it.
     ///
     /// This answers *which kind of token was expensive*, which no other view of
@@ -1074,7 +1080,10 @@ impl StatsPage {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .child(Self::caption(theme, "Where the list price goes".into()));
+            .child(Self::caption(
+                theme,
+                "Where the list-price API estimate goes".into(),
+            ));
 
         // The bar earns its room only when there is a shape to draw. A window
         // whose whole price rounds to nothing says so instead of drawing four
@@ -1153,10 +1162,83 @@ impl StatsPage {
     /// ordering said twice.
     const CLASS_TONES: [f32; 4] = [0.62, 0.44, 0.28, 0.16];
 
+    /// Main and delegated work, per model, where Claude's journal exposed the
+    /// assistant-step attribution (gh#426). It lives inside the spend card so
+    /// its figures inherit the card's token-coverage qualification and cannot
+    /// be mistaken for a second total.
+    fn spend_agent_rows(stats: &BoardStats) -> Option<&[AgentSpend]> {
+        (!stats.agent_usage.is_empty()).then_some(stats.agent_usage.as_slice())
+    }
+
+    fn render_agent_usage(stats: &BoardStats, theme: &Theme) -> Option<AnyElement> {
+        let agent_usage = Self::spend_agent_rows(stats)?;
+        let rows = div().flex().flex_col().gap(px(7.0)).children(
+            agent_usage
+                .iter()
+                .take(BREAKDOWN_ROWS)
+                .map(|row: &AgentSpend| {
+                    let price = row
+                        .price_label()
+                        .unwrap_or_else(|| "rates not configured".to_string());
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(Theme::TEXT_DENSE))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(row.label())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(Theme::TEXT_DENSE))
+                                .text_color(theme.text)
+                                .child(SharedString::from(format!(
+                                    "{} · {price}",
+                                    human_tokens(row.usage.total())
+                                ))),
+                        )
+                        .into_any_element()
+                }),
+        );
+        Some(
+            div()
+                .border_t_1()
+                .border_color(theme.border)
+                .px(px(CARD_PAD_X))
+                .py(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(Self::caption(
+                    theme,
+                    "By agent and model — list-price API estimates".into(),
+                ))
+                .child(rows)
+                .child(Self::footnote(
+                    theme,
+                    format!(
+                        "Agent detail from {} of {} attempts that reported usage.",
+                        stats.attempts_with_agent_usage, stats.attempts_with_tokens
+                    ) + &match agent_usage.len().saturating_sub(BREAKDOWN_ROWS) {
+                        0 => String::new(),
+                        remaining => format!(" Showing {BREAKDOWN_ROWS}; {remaining} more row(s)."),
+                    },
+                ))
+                .into_any_element(),
+        )
+    }
+
     /// The sentence that keeps the card from being read as a bill — one line,
     /// because a footnote that runs to a paragraph is a paragraph nobody reads.
-    const BILL_NOTE: &'static str = "What this work would cost at the list prices in \
-         Settings → Agents, not what you were billed.";
+    const BILL_NOTE: &'static str = "List-price API estimate using the rates in \
+         Settings → Agents — not a bill; subscription runs do not pay per token.";
 
     /// The one span of that sentence the canvas lifts a tone: the page the
     /// rates are on. Matched rather than re-spelled, so the two cannot drift.
@@ -2208,6 +2290,43 @@ impl Render for StatsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_all_unpriced_spend_still_has_desktop_agent_rows() {
+        let mut stats = BoardStats::empty(Some(7));
+        stats.spend = Some(BoardSpend {
+            rates: comet_proto::view::rates::builtin(),
+            list_price: comet_proto::view::rates::Usd::ZERO,
+            unpriced_tokens: 110,
+            by_model: Vec::new(),
+            unpriced: vec![comet_proto::view::stats::TokenTally {
+                label: "unknown-model".into(),
+                usage: comet_proto::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            }],
+            accounts: Vec::new(),
+        });
+        stats.agent_usage = vec![AgentSpend {
+            agent: comet_proto::AgentKind::Subagent,
+            name: Some("Explore".into()),
+            model: "unknown-model".into(),
+            usage: comet_proto::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            },
+            list_price_api_estimate: Some(comet_proto::view::rates::Usd::ZERO),
+            unpriced_tokens: 110,
+        }];
+        assert!(!stats.spend.as_ref().expect("configured").has_price());
+        assert_eq!(
+            StatsPage::spend_agent_rows(&stats),
+            Some(stats.agent_usage.as_slice())
+        );
+    }
 
     /// One candidate's answer. Only the attempt count separates them here —
     /// which board is which is the whole question. The evidence bit rides

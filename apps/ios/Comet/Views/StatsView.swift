@@ -393,6 +393,14 @@ struct StatsView: View {
                             .foregroundStyle(Theme.textSubtle)
                         Spacer(minLength: 0)
                     }
+                    Text(stats.spendLabel)
+                        .font(Theme.sans(Theme.textDense, weight: .medium))
+                        .foregroundStyle(Theme.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("List-price API estimate — not a bill; subscription runs do not pay per token.")
+                        .font(Theme.sans(Theme.textCaption))
+                        .foregroundStyle(Theme.textFaint)
+                        .fixedSize(horizontal: false, vertical: true)
                     ForEach(statsTokenLines(stats.tokens), id: \.label) { line in
                         factRow(line.label, line.value)
                     }
@@ -425,8 +433,35 @@ struct StatsView: View {
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 6, trailing: 12))
                 }
+
+                let agents = stats.agentUsage ?? []
+                if !agents.isEmpty {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("By agent and model · list-price API estimates")
+                            .font(Theme.sans(Theme.textCaption, weight: .medium))
+                            .foregroundStyle(Theme.textSubtle)
+                        ForEach(agents.prefix(Self.tallyRows)) { row in
+                            factRow(row.label,
+                                    "\(row.priceLabel) · \(humanTokens(row.usage.total))")
+                        }
+                        let remainingAgents = max(0, agents.count - Self.tallyRows)
+                        Text("Agent detail from \(stats.attemptsWithAgentUsage ?? 0) "
+                             + "of \(stats.attemptsWithTokens) attempts that reported usage."
+                             + (remainingAgents > 0
+                                ? " Showing \(Self.tallyRows); \(remainingAgents) more row(s)."
+                                : ""))
+                            .font(Theme.sans(Theme.textCaption))
+                            .foregroundStyle(Theme.textFaint)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 6, trailing: 12))
+                }
             } header: {
-                header("Tokens", aside: coverage)
+                header("Tokens & list-price API estimate", aside: coverage)
             }
         } else {
             Section {
@@ -435,7 +470,7 @@ struct StatsView: View {
                 note("No attempt in this window reported token usage. Attempts from "
                      + "before the board recorded it stay blank rather than reading as free.")
             } header: {
-                header("Tokens", aside: coverage)
+                header("Tokens & list-price API estimate", aside: coverage)
             }
         }
     }

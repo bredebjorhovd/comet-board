@@ -730,6 +730,10 @@ pub trait Runtime {
 pub struct RunTokens {
     pub usage: comet_proto::TokenUsage,
     pub model: Option<String>,
+    /// Exact result totals split by model, when the harness exposes them.
+    pub by_model: Option<Vec<comet_proto::ModelTokenUsage>>,
+    /// Assistant-step usage attributed to main/subagents and their models.
+    pub by_agent: Option<Vec<comet_proto::AgentTokenUsage>>,
 }
 
 #[cfg(test)]

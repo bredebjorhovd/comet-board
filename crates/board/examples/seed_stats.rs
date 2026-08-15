@@ -139,7 +139,13 @@ fn main() -> Result<()> {
         // band for (gh#252). Worth one branch: it is the case four reviews
         // could not see, because nobody had a board that produced it.
         if std::env::var("SEED_NO_TOKENS").is_err() {
-            db.set_attempt_tokens(attempt, usage(seed.megatokens), Some(seed.model))?;
+            db.set_attempt_tokens(
+                attempt,
+                usage(seed.megatokens),
+                Some(seed.model),
+                None,
+                None,
+            )?;
         }
         if let Some(outcome) = seed.outcome {
             db.close_attempt(attempt, outcome)?;

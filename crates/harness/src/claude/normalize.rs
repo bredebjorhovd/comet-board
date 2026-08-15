@@ -1,7 +1,12 @@
 //! Frame → [`AgentEvent`] normalization, ported from claude.ts's `normalize`
 //! (init dedupe, subagent filtering, tool decoding, error-code mapping).
 
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use std::collections::{HashMap, HashSet};
+
+use comet_proto::{
+    AgentEvent, AgentKind, AgentTokenUsage, DoneStatus, HarnessId, ModelTokenUsage, TodoItem,
+    ToolCall,
+};
 use serde_json::Value;
 
 use super::wire::{ContentBlock, Frame};
@@ -219,6 +224,14 @@ pub(crate) struct Normalizer {
     /// per run rather than random so a replayed stream folds to the same parts
     /// (`fold_event_into_parts` keys tool parts on the id).
     commands_seen: u64,
+    /// A complete assistant message may be repeated for every tool in one API
+    /// step. Its usage is the step's usage, so the stable message id is the
+    /// dedupe key (Claude Agent SDK cost-tracking contract).
+    usage_messages: HashSet<String>,
+    /// Parent Task/Agent tool id -> harness-owned subagent type. The nested
+    /// assistant frames carry only the id, so the launch frame is where the
+    /// human name has to be remembered.
+    subagents: HashMap<String, Option<String>>,
 }
 
 impl Normalizer {
@@ -228,7 +241,34 @@ impl Normalizer {
             assistant_message_id: new_message_id(),
             session_id: None,
             commands_seen: 0,
+            usage_messages: HashSet::new(),
+            subagents: HashMap::new(),
         }
+    }
+
+    fn agent_usage(&mut self, frame: &super::wire::MessageFrame) -> Option<AgentEvent> {
+        let message = &frame.message;
+        let usage = message.usage.normalized();
+        if message.id.is_empty()
+            || message.model.is_empty()
+            || usage.is_zero()
+            || !self.usage_messages.insert(message.id.clone())
+        {
+            return None;
+        }
+        let (agent, name) = match frame.parent_tool_use_id.as_deref() {
+            Some(parent) => (
+                AgentKind::Subagent,
+                self.subagents.get(parent).cloned().flatten(),
+            ),
+            None => (AgentKind::Main, None),
+        };
+        Some(AgentEvent::AgentUsage(AgentTokenUsage {
+            agent,
+            name,
+            model: message.model.clone(),
+            usage,
+        }))
     }
 
     fn next_command_id(&mut self) -> String {
@@ -309,6 +349,7 @@ impl Normalizer {
             }
 
             Frame::Assistant(f) => {
+                let attributed = self.agent_usage(&f);
                 // A subagent's assistant frame: one step of delegated work.
                 // Its tool calls are the countable unit — they are what the
                 // subagent spends its minutes on — so each becomes an activity
@@ -316,30 +357,47 @@ impl Normalizer {
                 // only carries text (the subagent's final answer to its
                 // parent) still beats as liveness.
                 if let Some(parent) = f.parent_tool_use_id {
-                    let steps: Vec<AgentEvent> = f
+                    let mut steps = Vec::new();
+                    for block in f
                         .message
                         .blocks()
                         .filter(|b: &ContentBlock| b.kind == "tool_use")
-                        .map(|_| AgentEvent::SubagentActivity {
+                    {
+                        // Delegates may delegate again. Their calls stay out
+                        // of the parent transcript, but the launch id is what
+                        // lets nested usage say `Plan`, not only `Subagent`.
+                        if let ToolCall::Task { subagent_type, .. } =
+                            decode_tool_use(&block.name, &block.input)
+                        {
+                            self.subagents.insert(block.id, subagent_type);
+                        }
+                        steps.push(AgentEvent::SubagentActivity {
                             parent_tool_use_id: parent.clone(),
-                        })
-                        .collect();
-                    if steps.is_empty() {
-                        return vec![AgentEvent::ReasoningDelta {
-                            text: String::new(),
-                        }];
+                        });
                     }
-                    return steps;
+                    if steps.is_empty() {
+                        return attributed
+                            .into_iter()
+                            .chain([AgentEvent::ReasoningDelta {
+                                text: String::new(),
+                            }])
+                            .collect();
+                    }
+                    return attributed.into_iter().chain(steps).collect();
                 }
-                let mut out: Vec<AgentEvent> = f
+                let mut out: Vec<AgentEvent> = attributed.into_iter().collect();
+                for block in f
                     .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_use")
-                    .map(|b| AgentEvent::ToolCall {
-                        id: b.id.clone(),
-                        call: decode_tool_use(&b.name, &b.input),
-                    })
-                    .collect();
+                {
+                    let call = decode_tool_use(&block.name, &block.input);
+                    if let ToolCall::Task { subagent_type, .. } = &call {
+                        self.subagents
+                            .insert(block.id.clone(), subagent_type.clone());
+                    }
+                    out.push(AgentEvent::ToolCall { id: block.id, call });
+                }
                 // A failed turn (usage limit, billing, auth, overloaded, …)
                 // carries a terse `error` code here — often with empty content
                 // and no `result` error — so surface it visibly.
@@ -419,11 +477,16 @@ impl Normalizer {
                 // Straight across: the CLI already reports the four buckets in
                 // the shape `TokenUsage` normalizes on (uncached input apart
                 // from the two cache figures), so nothing is derived here.
-                let usage = AgentEvent::Usage(comet_proto::TokenUsage {
-                    input_tokens: f.usage.input_tokens,
-                    output_tokens: f.usage.output_tokens,
-                    cache_read_tokens: f.usage.cache_read_input_tokens,
-                    cache_creation_tokens: f.usage.cache_creation_input_tokens,
+                let usage = AgentEvent::Usage(f.usage.normalized());
+                let model_usage = (!f.model_usage.is_empty()).then(|| AgentEvent::ModelUsage {
+                    models: f
+                        .model_usage
+                        .iter()
+                        .map(|(model, usage)| ModelTokenUsage {
+                            model: model.clone(),
+                            usage: usage.normalized(),
+                        })
+                        .collect(),
                 });
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
@@ -486,7 +549,7 @@ impl Normalizer {
                         session_id: f.session_id,
                     }
                 };
-                vec![usage, done]
+                model_usage.into_iter().chain([usage, done]).collect()
             }
 
             // Control frames are handled by the run loop, not normalized: it
@@ -717,6 +780,73 @@ mod tests {
                 subagent_type: None,
                 steps: 0
             }
+        );
+    }
+
+    #[test]
+    fn complete_messages_are_attributed_once_to_the_agent_and_model_that_ran_them() {
+        let mut normalizer = Normalizer::new();
+        let main = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"id":"msg-main","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"tool_use","id":"task-1","name":"Task","input":{"description":"research","subagent_type":"Explore"}}]}}"#,
+        )
+        .expect("main frame parses");
+        let main_events = normalizer.normalize(main, false);
+        assert!(
+            main_events.contains(&AgentEvent::AgentUsage(AgentTokenUsage {
+                agent: AgentKind::Main,
+                name: None,
+                model: "claude-opus-5".into(),
+                usage: comet_proto::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+            }))
+        );
+
+        let subagent_raw = r#"{"type":"assistant","parent_tool_use_id":"task-1","message":{"id":"msg-sub","model":"claude-haiku-4-5","usage":{"input_tokens":20,"output_tokens":4},"content":[{"type":"tool_use","id":"task-2","name":"Task","input":{"description":"plan","subagent_type":"Plan"}}]}}"#;
+        let subagent = crate::claude::wire::parse_frame(subagent_raw).expect("subagent parses");
+        let subagent_events = normalizer.normalize(subagent, false);
+        assert!(
+            subagent_events.contains(&AgentEvent::AgentUsage(AgentTokenUsage {
+                agent: AgentKind::Subagent,
+                name: Some("Explore".into()),
+                model: "claude-haiku-4-5".into(),
+                usage: comet_proto::TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 4,
+                    ..Default::default()
+                },
+            }))
+        );
+
+        let nested = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","parent_tool_use_id":"task-2","message":{"id":"msg-nested","model":"claude-sonnet-5","usage":{"input_tokens":30,"output_tokens":6},"content":[{"type":"text","text":"planned"}]}}"#,
+        )
+        .expect("nested subagent parses");
+        assert!(
+            normalizer
+                .normalize(nested, false)
+                .contains(&AgentEvent::AgentUsage(AgentTokenUsage {
+                    agent: AgentKind::Subagent,
+                    name: Some("Plan".into()),
+                    model: "claude-sonnet-5".into(),
+                    usage: comet_proto::TokenUsage {
+                        input_tokens: 30,
+                        output_tokens: 6,
+                        ..Default::default()
+                    },
+                }))
+        );
+
+        // Claude may repeat a complete assistant frame for one API step. Its
+        // stable message id makes that one charge, not two.
+        let repeated = crate::claude::wire::parse_frame(subagent_raw).expect("repeat parses");
+        assert!(
+            normalizer
+                .normalize(repeated, false)
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::AgentUsage(_)))
         );
     }
 
