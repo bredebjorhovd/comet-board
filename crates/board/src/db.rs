@@ -1205,6 +1205,23 @@ impl Db {
         Ok(())
     }
 
+    /// Remove an attempt whose dispatch was refused before it cut anything
+    /// (gh#410): no branch, no chat, no agent — nothing in the world refers to
+    /// this row, so it is deleted rather than closed `failed`. A `failed` row
+    /// here would burn an attempt on a pre-flight refusal, and the count is
+    /// what a reader uses to judge whether a task is going badly.
+    ///
+    /// Guarded to rows that never got a pane and are still open: a row a chat
+    /// ever ran under is history, and history closes through
+    /// [`Self::close_attempt`].
+    pub fn delete_attempt(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM attempts WHERE id = ?1 AND pane_id IS NULL AND outcome IS NULL",
+            params![attempt_id],
+        )?;
+        Ok(())
+    }
+
     /// Rewrite a closed attempt's outcome — the panel's cancel on a `failed`
     /// row (gh#42). The attempt is already over, so `ended_at` is left alone;
     /// only the verdict changes, and flipping `failed`/`orphaned` to `cancelled`
@@ -2231,6 +2248,35 @@ mod tests {
         seed(&db, "linear:LIN-142");
         let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
         assert!(!db.reopen_attempt(a).unwrap());
+    }
+
+    // ---- a refusal deleting the row it opened (gh#410) ------------------
+
+    #[test]
+    fn a_refused_dispatch_deletes_the_row_it_opened() {
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.delete_attempt(a).unwrap();
+        assert!(db.attempts_for("linear:LIN-142").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_only_reaches_rows_nothing_ever_ran_under() {
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        // A row with a pane is history: a chat ran under it.
+        let with_pane = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.set_attempt_pane(with_pane, "chat-1").unwrap();
+        db.delete_attempt(with_pane).unwrap();
+        db.close_attempt(with_pane, Outcome::Done).unwrap();
+        // A closed row is history too, pane or not.
+        let closed = db.insert_attempt(&attempt("linear:LIN-142")).unwrap();
+        db.close_attempt(closed, Outcome::Failed).unwrap();
+        db.delete_attempt(closed).unwrap();
+
+        let attempts = db.attempts_for("linear:LIN-142").unwrap();
+        assert_eq!(attempts.len(), 2, "both survive the delete");
     }
 
     #[test]

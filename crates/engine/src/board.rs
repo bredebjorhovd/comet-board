@@ -970,7 +970,17 @@ fn handle_dispatch(
         Err(e) => {
             // Never leave a live attempt behind for a dispatch that did not
             // happen — it would block every retry via the unique index.
-            engine.db.close_attempt(attempt_id, Outcome::Failed)?;
+            //
+            // A refusal that cut nothing (gh#410) goes further: the row is
+            // deleted, not failed. An attempt is recorded when a branch is
+            // cut, not when a release is asked for — a `--onto` against a
+            // parent that has not pushed must not read as a failed run, and
+            // must not make its own retry look expensive.
+            if e.is::<comet_board::runtime::RefusedBeforeCut>() {
+                engine.db.delete_attempt(attempt_id)?;
+            } else {
+                engine.db.close_attempt(attempt_id, Outcome::Failed)?;
+            }
             Err(e)
         }
     }
@@ -1131,6 +1141,12 @@ mod tests {
                 comet_board::runtime::RuntimeUnavailable,
             >,
         >,
+        /// When set, `dispatch` refuses before cutting anything — the typed
+        /// refusal `CometRuntime` raises for an unfetchable base (gh#410).
+        refuse_dispatch: std::sync::atomic::AtomicBool,
+        /// When set, `dispatch` fails plainly — a failure after the pre-flight,
+        /// which still burns the attempt.
+        fail_dispatch: std::sync::atomic::AtomicBool,
     }
 
     impl Default for FakeRuntime {
@@ -1143,12 +1159,27 @@ mod tests {
                 logins: Default::default(),
                 spawn_in_dispatch: std::sync::atomic::AtomicBool::new(false),
                 unavailable: Default::default(),
+                refuse_dispatch: std::sync::atomic::AtomicBool::new(false),
+                fail_dispatch: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
 
     impl Runtime for FakeRuntime {
         fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+            if self
+                .refuse_dispatch
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!(comet_board::runtime::RefusedBeforeCut(
+                    "could not fetch `board/gh-1-parent` from origin — refusing to \
+                     branch from a possibly stale local checkout"
+                        .into()
+                ));
+            }
+            if self.fail_dispatch.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("creating the chat failed");
+            }
             if self
                 .spawn_in_dispatch
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -2326,6 +2357,99 @@ max_concurrent_per_workspace = 1
         let db = Db::open(&paths.db()).unwrap();
         let task = db.get_task("gh:owner/widget#8").unwrap().unwrap();
         assert!(task.live_attempt().is_none());
+
+        service.shutdown();
+    }
+
+    /// gh#410: a dispatch refused before it cuts a branch burns no attempt.
+    /// The gh#337 rig released `--onto` an unpushed parent twice, was refused
+    /// twice, and the one real run then read `attempts = 3` — but a pre-flight
+    /// refusal is "push the parent and come back", not a failed run, and the
+    /// row it opened is deleted rather than closed `failed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_refused_before_the_cut_burns_no_attempt() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#63", "gh#63");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        runtime
+            .refuse_dispatch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Two refusals, as the rig produced them.
+        for _ in 0..2 {
+            let err = service
+                .dispatch_task(
+                    "gh:owner/widget#63",
+                    DispatchOrigin::default(),
+                    DispatchOverrides::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("refusing to branch"), "{err}");
+        }
+
+        {
+            let db = Db::open(&paths.db()).unwrap();
+            let task = db.get_task("gh:owner/widget#63").unwrap().unwrap();
+            assert_eq!(
+                task.attempt_count(),
+                0,
+                "a refused release is not an attempt"
+            );
+        }
+
+        // The parent pushes; the retry is attempt 1, not attempt 3.
+        runtime
+            .refuse_dispatch
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let d = service
+            .dispatch_task(
+                "gh:owner/widget#63",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(d.attempt, 1);
+
+        service.shutdown();
+    }
+
+    /// The other side of gh#410's line: a dispatch that fails *after* the
+    /// pre-flight — the chat, the brief — still closes its row `failed`. By
+    /// then the branch is cut, so the attempt happened and the record stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_failing_after_the_cut_records_a_failed_attempt() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#64", "gh#64");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        runtime
+            .fail_dispatch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#64",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap_err();
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#64").unwrap().unwrap();
+        assert_eq!(task.attempt_count(), 1);
+        assert!(task.live_attempt().is_none());
+        assert_eq!(
+            task.attempts.last().and_then(|a| a.outcome),
+            Some(Outcome::Failed)
+        );
 
         service.shutdown();
     }
